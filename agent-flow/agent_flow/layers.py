@@ -9,19 +9,36 @@ from claude_agent_sdk import tool
 from .backends import create_backend
 from .backends.base import Backend, BackendClient, ResultEvent
 from .config import AgentLayerConfig, HumanRequest, HumanRequestOption
-from .console import (print_agent_completed, print_agent_failed,
-                      print_agent_started, print_agent_text,
-                      print_compact_boundary, print_human_input_request,
-                      print_human_reply, print_rate_limit,
-                      print_server_tool_call, print_session_init,
-                      print_thinking, print_tool_call, print_user_prompt)
+from .console import (
+    print_agent_completed,
+    print_agent_failed,
+    print_agent_started,
+    print_agent_text,
+    print_compact_boundary,
+    print_human_input_request,
+    print_human_reply,
+    print_rate_limit,
+    print_server_tool_call,
+    print_session_init,
+    print_thinking,
+    print_tool_call,
+    print_user_prompt,
+)
 from .logger import Logger, get_logger
 from .module import Module
 from .runtime import PortalRunner, build_request
-from .types import (AgentRequest, AgentResponse, AgentTextEvent,
-                    CompactBoundaryEvent, RateLimitWarningEvent,
-                    ServerToolCallEvent, SessionInitEvent, ThinkingEvent,
-                    ToolCallEvent, UsageInfo)
+from .types import (
+    AgentRequest,
+    AgentResponse,
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    UsageInfo,
+)
 
 PromptBuilder = Callable[[str], AgentRequest]
 
@@ -66,7 +83,6 @@ def _read_human_reply(request: HumanRequest) -> str:
 
 
 class AgentLayer(Module):
-
     def __init__(
         self,
         config: AgentLayerConfig,
@@ -97,14 +113,16 @@ class AgentLayer(Module):
 
     def _build_request(self, content: str) -> AgentRequest:
         if self.prompt_builder is None:
-            return build_request(content,
-                                 system_prompt=self.config.system_prompt)
+            return build_request(content, system_prompt=self.config.system_prompt)
 
         request = self.prompt_builder(content)
         return AgentRequest(
             content=request.content,
-            system_prompt=(request.system_prompt if request.system_prompt
-                           is not None else self.config.system_prompt),
+            system_prompt=(
+                request.system_prompt
+                if request.system_prompt is not None
+                else self.config.system_prompt
+            ),
             metadata=dict(request.metadata),
         )
 
@@ -162,48 +180,47 @@ class AgentLayer(Module):
             "type": "object",
             "properties": {
                 "question": {
-                    "type":
-                    "string",
-                    "description":
-                    ("The complete question to ask the human. Should "
-                     "be clear, specific, and end with a question "
-                     "mark."),
+                    "type": "string",
+                    "description": (
+                        "The complete question to ask the human. Should "
+                        "be clear, specific, and end with a question "
+                        "mark."
+                    ),
                 },
                 "header": {
-                    "type":
-                    "string",
-                    "description":
-                    ("Optional very short label (≤12 chars) shown as a "
-                     "chip/tag next to the question. Examples: \"Auth "
-                     "method\", \"Library\", \"Approach\"."),
+                    "type": "string",
+                    "description": (
+                        "Optional very short label (≤12 chars) shown as a "
+                        'chip/tag next to the question. Examples: "Auth '
+                        'method", "Library", "Approach".'
+                    ),
                 },
                 "options": {
-                    "type":
-                    "array",
-                    "description":
-                    ("Optional list of mutually exclusive choices. When "
-                     "provided, the human is shown a numbered selection "
-                     "panel; their reply is the matching option "
-                     "``label`` (or free-form text if they type "
-                     "something that doesn't match — the framework "
-                     "always allows that escape hatch). Omit ``options`` "
-                     "for free-form input."),
+                    "type": "array",
+                    "description": (
+                        "Optional list of mutually exclusive choices. When "
+                        "provided, the human is shown a numbered selection "
+                        "panel; their reply is the matching option "
+                        "``label`` (or free-form text if they type "
+                        "something that doesn't match — the framework "
+                        "always allows that escape hatch). Omit ``options`` "
+                        "for free-form input."
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
                             "label": {
-                                "type":
-                                "string",
-                                "description":
-                                ("Display text for this option. Should "
-                                 "be concise (1-5 words)."),
+                                "type": "string",
+                                "description": (
+                                    "Display text for this option. Should be concise (1-5 words)."
+                                ),
                             },
                             "description": {
-                                "type":
-                                "string",
-                                "description":
-                                ("Explanation of what this option means "
-                                 "or what will happen if chosen."),
+                                "type": "string",
+                                "description": (
+                                    "Explanation of what this option means "
+                                    "or what will happen if chosen."
+                                ),
                             },
                         },
                         "required": ["label", "description"],
@@ -215,14 +232,16 @@ class AgentLayer(Module):
 
         @tool(
             "ask_human",
-            ("Ask the human operator a question and wait for their "
-             "reply. This is the drop-in replacement for "
-             "``AskUserQuestion`` in this app: supply a clear "
-             "``question``, optionally a short ``header`` chip, and — "
-             "when the answer is one of a small set of choices — an "
-             "``options`` list of ``{label, description}`` entries. The "
-             "reply is returned as free text (the chosen ``label``, or "
-             "whatever the human typed)."),
+            (
+                "Ask the human operator a question and wait for their "
+                "reply. This is the drop-in replacement for "
+                "``AskUserQuestion`` in this app: supply a clear "
+                "``question``, optionally a short ``header`` chip, and — "
+                "when the answer is one of a small set of choices — an "
+                "``options`` list of ``{label, description}`` entries. The "
+                "reply is returned as free text (the chosen ``label``, or "
+                "whatever the human typed)."
+            ),
             schema,
         )
         async def ask_human(args):
@@ -231,14 +250,18 @@ class AgentLayer(Module):
                 HumanRequestOption(
                     label=str(opt.get("label", "")),
                     description=str(opt.get("description", "")),
-                ) for opt in raw_options if isinstance(opt, dict))
+                )
+                for opt in raw_options
+                if isinstance(opt, dict)
+            )
             reply = await layer._dispatch_human_request(
                 HumanRequest(
                     layer_name=layer.layer_name,
                     prompt=str(args.get("question", "")),
                     options=options,
                     header=str(args.get("header", "")),
-                ))
+                )
+            )
             text = reply if reply else "(no response from human)"
             return {"content": [{"type": "text", "text": text}]}
 
@@ -251,24 +274,30 @@ class AgentLayer(Module):
         backend = create_backend(self.config.backend)
         async with backend:
             async with backend.create_client(
-                    system_prompt=system_prompt or "",
-                    model=self.config.backend.model,
-                    tools=self._resolve_tools(),
-                    hooks=self.config.backend.hooks,
-                    disallowed_tools=self._resolve_disallowed_tools(),
-                    extra_mcp_servers=self.config.backend.extra_mcp_servers,
+                system_prompt=system_prompt or "",
+                model=self.config.backend.model,
+                tools=self._resolve_tools(),
+                hooks=self.config.backend.hooks,
+                disallowed_tools=self._resolve_disallowed_tools(),
+                extra_mcp_servers=self.config.backend.extra_mcp_servers,
             ) as client:
                 yield backend, client
 
     async def _ensure_persistent_client(
-            self, system_prompt: str | None) -> BackendClient:
+        self, system_prompt: str | None
+    ) -> tuple[BackendClient, bool]:
+        """Return the persistent client and whether it was created just now.
+
+        The ``created`` flag lets the caller report the pre-input context
+        baseline only on the session's very first turn (later turns of a
+        persistent session already carry conversation history).
+        """
         if self._persistent_system_prompt is None:
             self._persistent_system_prompt = system_prompt
         elif self._persistent_system_prompt != system_prompt:
-            raise ValueError(
-                "Persistent AgentLayer sessions require a stable system prompt."
-            )
+            raise ValueError("Persistent AgentLayer sessions require a stable system prompt.")
 
+        created = False
         if self._persistent_client is None:
             backend = await self._ensure_backend()
             stack = AsyncExitStack()
@@ -281,10 +310,12 @@ class AgentLayer(Module):
                     hooks=self.config.backend.hooks,
                     disallowed_tools=self._resolve_disallowed_tools(),
                     extra_mcp_servers=self.config.backend.extra_mcp_servers,
-                ))
+                )
+            )
             self._persistent_client = client
             self._persistent_client_stack = stack
-        return self._persistent_client
+            created = True
+        return self._persistent_client, created
 
     async def _drop_persistent_client(self) -> None:
         if self._persistent_client_stack is not None:
@@ -328,8 +359,7 @@ class AgentLayer(Module):
                 if self.config.print_activity:
                     print_compact_boundary(self.layer_name, event, sink)
             else:
-                raise TypeError(
-                    f"Unexpected backend event: {type(event).__name__}")
+                raise TypeError(f"Unexpected backend event: {type(event).__name__}")
 
         return AgentResponse(
             content=result_text,
@@ -342,11 +372,18 @@ class AgentLayer(Module):
         request: AgentRequest,
         client: BackendClient,
         backend: Backend,
+        report_baseline: bool = False,
     ) -> str:
         logger = get_logger()
         sink = logger.console
 
         if self.config.print_activity:
+            # Surface the context already consumed by the system prompt,
+            # tools, and memory before this turn's input is added. Only
+            # meaningful on a session's first turn, so callers gate it via
+            # ``report_baseline``. Backends without a pre-input breakdown
+            # return ``None`` and the line is omitted.
+            baseline = await client.get_context_usage() if report_baseline else None
             print_agent_started(
                 self.layer_name,
                 self.config.backend.kind,
@@ -354,6 +391,9 @@ class AgentLayer(Module):
                 sink,
                 version=backend.version() or None,
                 reasoning_effort=backend.reasoning_effort() or None,
+                context_percentage=baseline.context_percentage if baseline else None,
+                context_tokens=baseline.context_tokens if baseline else None,
+                context_window=baseline.context_window if baseline else None,
             )
             print_user_prompt(self.layer_name, request.content, sink)
 
@@ -373,9 +413,8 @@ class AgentLayer(Module):
         if request.system_prompt is None:
             request.system_prompt = self.config.system_prompt
 
-        async with self._temporary_client(request.system_prompt) as (backend,
-                                                                     client):
-            return await self._run_with_client(request, client, backend)
+        async with self._temporary_client(request.system_prompt) as (backend, client):
+            return await self._run_with_client(request, client, backend, report_baseline=True)
 
     async def _invoke_persistent(self, content: str) -> str:
         request = self._build_request(content)
@@ -383,15 +422,16 @@ class AgentLayer(Module):
             request.system_prompt = self.config.system_prompt
 
         try:
-            client = await self._ensure_persistent_client(request.system_prompt)
+            client, created = await self._ensure_persistent_client(request.system_prompt)
             assert self._backend is not None
-            return await self._run_with_client(request, client, self._backend)
+            return await self._run_with_client(
+                request, client, self._backend, report_baseline=created
+            )
         except Exception:
             await self._drop_persistent_client()
             raise
 
-    async def _dispatch_human_request(self,
-                                      request: HumanRequest) -> str | None:
+    async def _dispatch_human_request(self, request: HumanRequest) -> str | None:
         """Surface an ``ask_human`` request to the human via stdin.
 
         Prints a panel so the user sees the agent's question and any
@@ -432,3 +472,55 @@ class AgentLayer(Module):
                 self._runner.close()
             return
         await self._aclose_owned_resources()
+
+    # ------------------------------------------------------------------
+    # Session inspection helpers
+    # ------------------------------------------------------------------
+
+    def fetch_session_init(self, ping: str = "ping") -> SessionInitEvent:
+        """Open a temporary client and capture the first SessionInitEvent.
+
+        Sends a minimal message so the backend bootstraps its session
+        (Claude Code only emits ``init`` while streaming a response;
+        Codex emits it from a cached value as soon as the turn starts),
+        reads the event stream until the init arrives, and aborts the
+        rest of the response. Returns the skills/plugins/agents the
+        backend actually loaded for a fresh session, or an empty event
+        if no init was seen.
+        """
+
+        async def run() -> SessionInitEvent:
+            async with self._temporary_client(self.config.system_prompt) as (_, client):
+                async for event in client.send_message(ping):
+                    if isinstance(event, SessionInitEvent):
+                        return event
+            return SessionInitEvent()
+
+        return anyio.run(run)
+
+    def fetch_baseline_context_usage(self) -> UsageInfo | None:
+        """Read the pre-input context usage for a fresh session.
+
+        Opens a temporary client and queries the backend's context-usage
+        breakdown *before sending any user message* — the baseline cost of
+        the system prompt, tools, and memory ("before any user input").
+        For Claude Code this is a local ``/context`` control request (no
+        model call), so it works wherever the CLI is available. Backends
+        without a pre-input breakdown return ``None``.
+
+        Some backends only populate the breakdown after the session has
+        streamed at least once; when the first query comes back empty we
+        bootstrap with a minimal ``ping`` turn (cf. ``fetch_session_init``)
+        and re-query.
+        """
+
+        async def run() -> UsageInfo | None:
+            async with self._temporary_client(self.config.system_prompt) as (_, client):
+                usage = await client.get_context_usage()
+                if usage is not None and usage.context_percentage is not None:
+                    return usage
+                async for _ in client.send_message("ping"):
+                    pass
+                return await client.get_context_usage()
+
+        return anyio.run(run)

@@ -19,10 +19,16 @@ Replies are read from stdin. When the agent supplies an ``options``
 list, the panel renders a numbered choice table — the human can pick a
 number, type a label, or write free-form text.
 """
+
 from __future__ import annotations
 
-from agent_flow import (CLAUDE_CODE_DEFAULT_MODEL, AgentLayer, AgentLayerConfig,
-                        BackendConfig, SessionConfig)
+from agent_flow import (
+    CLAUDE_CODE_DEFAULT_MODEL,
+    AgentLayer,
+    AgentLayerConfig,
+    BackendConfig,
+    SessionConfig,
+)
 
 if __name__ == "__main__":
     agent = AgentLayer(
@@ -45,9 +51,11 @@ if __name__ == "__main__":
                 "(the chosen label, or free text) comes back as the "
                 "tool result; treat it as authoritative and proceed.\n\n"
                 "Do not use the AskUserQuestion tool — it is intentionally "
-                "disabled in this app."),
+                "disabled in this app."
+            ),
             human_input_enabled=True,
-        ))
+        )
+    )
 
     with agent:
         # Intentionally vague: the agent should call ``ask_human`` mid-turn

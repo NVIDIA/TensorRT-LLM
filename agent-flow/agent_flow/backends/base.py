@@ -5,9 +5,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
-from ..types import (AgentTextEvent, CompactBoundaryEvent,
-                     RateLimitWarningEvent, ServerToolCallEvent,
-                     SessionInitEvent, ThinkingEvent, ToolCallEvent, UsageInfo)
+from ..types import (
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    UsageInfo,
+)
 
 
 @dataclass
@@ -19,20 +26,37 @@ class ResultEvent:
     permission_denials: list[Any] = field(default_factory=list)
 
 
-BackendEvent = (ToolCallEvent | ServerToolCallEvent | ThinkingEvent
-                | AgentTextEvent | SessionInitEvent | RateLimitWarningEvent
-                | CompactBoundaryEvent | ResultEvent)
+BackendEvent = (
+    ToolCallEvent
+    | ServerToolCallEvent
+    | ThinkingEvent
+    | AgentTextEvent
+    | SessionInitEvent
+    | RateLimitWarningEvent
+    | CompactBoundaryEvent
+    | ResultEvent
+)
 
 
 class BackendClient(ABC):
-
     @abstractmethod
     def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
         raise NotImplementedError
 
+    async def get_context_usage(self) -> UsageInfo | None:
+        """Pre-input context footprint for this client's session, if known.
+
+        Returns the context usage (tokens / window / percentage) the
+        backend reports *before any user message is sent* — i.e. the
+        baseline cost of the system prompt, tools, and memory. Backends
+        that cannot report this before a turn return ``None``; the default
+        does so. ``ClaudeCodeClient`` overrides it with the SDK's local
+        ``/context`` control request.
+        """
+        return None
+
 
 class Backend(ABC):
-
     async def __aenter__(self) -> "Backend":
         return self
 

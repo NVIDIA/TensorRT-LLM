@@ -1,10 +1,17 @@
 """Modeling-bringup-specific guidance appended to the PlanReviewer prompt."""
 
-from ._common import (ACCURACY_GATE_FRAMEWORK, ATTENTION_VALIDATION_POLICY,
-                      BUILD_VALIDATION_POLICY, DESIGN_REVIEW_POLICY,
-                      DOMAIN_PRIMING, MOE_VALIDATION_POLICY,
-                      REFERENCE_TEST_POLICY, SOURCE_BOUNDARY,
-                      VALIDATION_EVIDENCE_LABELS)
+from ._common import (
+    ACCURACY_GATE_FRAMEWORK,
+    ATTENTION_VALIDATION_POLICY,
+    BUILD_VALIDATION_POLICY,
+    DESIGN_REVIEW_POLICY,
+    DOMAIN_PRIMING,
+    MOE_VALIDATION_POLICY,
+    REFERENCE_TEST_POLICY,
+    SOURCE_BOUNDARY,
+    TRTLLM_TEST_SPECIALIST_INVOCATION,
+    VALIDATION_EVIDENCE_LABELS,
+)
 
 _PLAN_REVIEW_GUIDANCE = """\
 ## PlanReviewer guidance for TensorRT-LLM bring-up
@@ -60,8 +67,8 @@ REJECT if any of these is true:
   **validation_tier** (`static` / `unit` / `integration` /
   `real_runtime`), backend/device/runtime path, hard config,
   prefill/decode coverage, state-dict accounting if weights matter,
-  negative control or mutation check, expected failure signal, and the
-  command. `reference_tier=real_source` does **not** substitute for
+  expected failure signal, and the command.
+  `reference_tier=real_source` does **not** substitute for
   `validation_tier=real_runtime`.
 - Pass-critical unit or focused parity criteria are CPU-only or marked as
   optional/skipped. CUDA/GPU execution is required for those criteria;
@@ -155,15 +162,134 @@ REJECT if any of these is true:
   *only* valid route without a real source or TensorRT-LLM contract reason.
 """
 
-SYSTEM_PROMPT_EXTENSION = "\n".join([
-    DOMAIN_PRIMING,
-    SOURCE_BOUNDARY,
-    DESIGN_REVIEW_POLICY,
-    VALIDATION_EVIDENCE_LABELS,
-    REFERENCE_TEST_POLICY,
-    BUILD_VALIDATION_POLICY,
-    ATTENTION_VALIDATION_POLICY,
-    MOE_VALIDATION_POLICY,
-    ACCURACY_GATE_FRAMEWORK,
-    _PLAN_REVIEW_GUIDANCE,
-])
+_STAGE_GOAL_REVIEW_RULES = """\
+## Stage/Goal schema enforcement (initial review)
+
+In addition to the bring-up REJECT triggers above, REJECT the initial
+plan when its Stage/Goal layout is malformed:
+
+- `plan.md`'s `## Implementation Steps` section is **not** organized
+  into Stages and Goals: a `### Stage <N>: <label>` heading per Stage,
+  an `Exit criterion:` line per Stage, and `- Goal <N>.<M>: ...`
+  bullets nested under each Stage. A flat checklist or a single-Stage
+  plan that should plainly have more Stages (e.g. `task.yaml` configures
+  both accuracy and cuda_graph but only Stage 1 is present) is a
+  REJECT.
+- Stage labels in `plan.md` and `acceptance-criteria.md` disagree.
+  `acceptance-criteria.md` must use `## Stage <N> — <label>` subsection
+  headers (exact prefix `## Stage `, em-dash separator) for each Stage
+  in `plan.md`, with a flat `- [ ]` checklist under each. A single flat
+  checklist without `## Stage N — ...` subsections is a REJECT.
+- Goal bullets don't carry `<Stage>.<Goal>` IDs (e.g. `Goal 1.3`), or
+  Goal IDs skip / duplicate numbers within a Stage.
+- An `## Implementation Steps` Stage has no Goals, or Goals that do
+  not name a concrete module / debugging deliverable. "Goal 1.1:
+  improve accuracy" without naming a benchmark or component is a
+  REJECT.
+- The Stage progression contradicts `task.yaml`: e.g. `task.yaml`
+  configures a benchmark accuracy gate but no Stage in `plan.md`
+  validates accuracy, or `task.yaml` excludes cuda_graph but a Stage
+  was added for it anyway. Stages should encode the milestone
+  progression `task.yaml` implies; out-of-scope Stages are scope
+  creep.
+
+## Replan-review lock-matrix enforcement
+
+When called in `replan` mode (i.e. the PlanDrafter ran a replan turn
+after a build-phase QA), apply the lock matrix from `plan_drafter`'s
+prompt in **reverse**: REJECT any edit the matrix forbids.
+
+Procedure: read `status.md`'s `## Stages & Goals` table (use the
+generic `Read` tool) to identify each Stage's status, then diff the
+revised `plan.md` and `acceptance-criteria.md` against the prior
+versions. Auto-REJECT (with a rule citation) for any of:
+
+- A Stage marked `— CLOSED` in `status.md` had its title, exit
+  criterion, or Goal list changed in `plan.md`, OR its `## Stage <N>
+  — ...` subsection in `acceptance-criteria.md` had any item
+  added/removed/reworded. CLOSED Stages are fully locked; their
+  contract has already been verified by QA. This applies **even
+  after a QA REJECT on the just-closed Stage** — the only legal
+  remediation is inserting a gap-fix Stage immediately after the
+  failing CLOSED Stage (with downstream PENDING Stages renumbered);
+  the locked Stage itself must not be touched.
+- A `— CLOSED` Stage was demoted back to `— IN_PROGRESS` in
+  `status.md`, or a `[Failed]` / `[Done]` Goal row in a CLOSED
+  Stage was reset to `[Doing]`. CLOSED Stages and their Goal rows
+  are immutable; treat any demotion or row reset as a lock-matrix
+  violation regardless of what justification the PlanDrafter wrote.
+- A Stage marked `— IN_PROGRESS` had its title or exit criterion
+  changed, or a `[Done]` / `[Failed]` Goal's row was reworded.
+  Appending new Goals to an IN_PROGRESS Stage is only allowed for
+  a **forward-looking** plan touch-up (e.g., a new pitfall surfaced
+  by an in-progress Goal); appending a Goal as remediation for a
+  QA REJECT belongs in a separate gap-fix Stage inserted right
+  after the failing CLOSED Stage, not here.
+- A previously-existing acceptance item in an `IN_PROGRESS` Stage's
+  subsection was reworded or removed. New items may be appended;
+  existing ones are locked.
+- A CLOSED Stage's number changed, or the CLOSED-Stage ordering in
+  `plan.md` differs from `status.md`. CLOSED Stages are
+  permanently pinned at their original positions and numbers;
+  reorderings or renumberings of CLOSED Stages are not permitted.
+- A new Stage was inserted at a position **other than** (a) right
+  after the failing CLOSED Stage in a QA-REJECT gap-fix turn, or
+  (b) at the tail in a forward-looking turn. Specifically: a
+  gap-fix Stage that lives at the tail instead of immediately
+  after the failing CLOSED Stage is a lock-matrix violation, and a
+  forward-looking new Stage inserted between existing Stages is
+  also a lock-matrix violation.
+- A QA-REJECT gap-fix Stage was inserted but the downstream
+  PENDING Stages were **not** renumbered (Stage K → Stage K+1) in
+  `plan.md`, `acceptance-criteria.md`, **and** `status.md`'s
+  `## Stages & Goals` table consistently. Partial renumbering, or
+  renumbering that touches a CLOSED Stage, is auto-REJECT.
+- A downstream PENDING Stage's content was edited (title, exit
+  criterion, Goal list, or any acceptance item) during a gap-fix
+  replan turn **without** a per-edit justification in the
+  PlanDrafter's `summary` citing the QA finding or the gap-fix
+  Stage's new bar that made the prior plan stale. PENDING Stages
+  are fully editable, but every content change still needs an
+  auditable rationale; silent relaxations or silent Goal
+  deletions are auto-REJECT even though the lock matrix permits
+  the edit shape.
+- After a QA REJECT, the PlanDrafter did **not** insert a gap-fix
+  Stage immediately after the failing CLOSED Stage targeting the
+  QA-flagged items, OR the inserted gap-fix Stage's new
+  threshold/criterion is unjustified (no citation of best landed
+  score / HF-parity ceiling / capability evidence) or is weaker
+  than already-demonstrated landed evidence. A QA REJECT must be
+  answered with a concretely-justified gap-fix Stage; "relax the
+  gate without evidence" is auto-REJECT.
+
+These auto-REJECTs override the substantive review: do not approve a
+revision that violates the matrix even when its content is technically
+better. The orchestrator's replan PlanDrafter must justify each
+acceptance-criteria edit in its `summary` — REJECT a `DRAFT_READY`
+turn that changed criteria without a justification line in the
+PlanDrafter's progress entry.
+
+In non-replan workflows you never enter the replan-review phase; these
+rules apply only when the orchestrator routes you with `phase="replan"`.
+"""
+
+SYSTEM_PROMPT_EXTENSION = "\n".join(
+    [
+        DOMAIN_PRIMING,
+        SOURCE_BOUNDARY,
+        DESIGN_REVIEW_POLICY,
+        VALIDATION_EVIDENCE_LABELS,
+        REFERENCE_TEST_POLICY,
+        BUILD_VALIDATION_POLICY,
+        ATTENTION_VALIDATION_POLICY,
+        MOE_VALIDATION_POLICY,
+        ACCURACY_GATE_FRAMEWORK,
+        _PLAN_REVIEW_GUIDANCE,
+        TRTLLM_TEST_SPECIALIST_INVOCATION,
+    ]
+)
+
+# Stage/Goal control flow is only wired when the workflow runs with
+# --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
+# on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
+STAGE_GOAL_EXTENSION = _STAGE_GOAL_REVIEW_RULES

@@ -16,28 +16,37 @@ from rich.table import Table
 from rich.theme import Theme
 
 from .config import HumanRequest
-from .types import (AgentTextEvent, CompactBoundaryEvent, RateLimitWarningEvent,
-                    ServerToolCallEvent, SessionInitEvent, ThinkingEvent,
-                    ToolCallEvent, UsageInfo)
+from .types import (
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    UsageInfo,
+)
 
-_THEME = Theme({
-    "layer.planner": "bold cyan",
-    "layer.generator": "bold green",
-    "layer.evaluator": "bold yellow",
-    "layer.default": "bold magenta",
-    "status.started": "bold blue",
-    "status.completed": "bold green",
-    "status.failed": "bold red",
-    "status.warning": "bold yellow",
-    "info": "dim",
-    "target": "bold white",
-    "subagent.badge": "italic bright_black",
-    "subagent.label": "italic bright_white",
-    "thinking.body": "italic bright_black",
-    "todo.completed": "green",
-    "todo.in_progress": "bold yellow",
-    "todo.pending": "dim",
-})
+_THEME = Theme(
+    {
+        "layer.planner": "bold cyan",
+        "layer.generator": "bold green",
+        "layer.evaluator": "bold yellow",
+        "layer.default": "bold magenta",
+        "status.started": "bold blue",
+        "status.completed": "bold green",
+        "status.failed": "bold red",
+        "status.warning": "bold yellow",
+        "info": "dim",
+        "target": "bold white",
+        "subagent.badge": "italic bright_black",
+        "subagent.label": "italic bright_white",
+        "thinking.body": "italic bright_black",
+        "todo.completed": "green",
+        "todo.in_progress": "bold yellow",
+        "todo.pending": "dim",
+    }
+)
 
 _THINKING_MAX_CHARS = 2000
 
@@ -121,8 +130,7 @@ def _print_panel(renderable: object, extra: Console | None = None) -> None:
 def _subagent_title_suffix(suffix: str, agent_label: str | None) -> str:
     if not agent_label:
         return suffix
-    badge = (f"[subagent.badge]↳[/subagent.badge] "
-             f"[subagent.label]{agent_label}[/subagent.label]")
+    badge = f"[subagent.badge]↳[/subagent.badge] [subagent.label]{agent_label}[/subagent.label]"
     if suffix:
         return f"{badge} [info]·[/info] {suffix}"
     return badge
@@ -133,15 +141,16 @@ def _subagent_border(border: str) -> str:
     return f"dim {border}"
 
 
-def _emit_panel(layer_name: str,
-                title_suffix: str,
-                body: object,
-                agent_label: str | None,
-                extra: Console | None = None) -> None:
+def _emit_panel(
+    layer_name: str,
+    title_suffix: str,
+    body: object,
+    agent_label: str | None,
+    extra: Console | None = None,
+) -> None:
     border, _ = _layer_style(layer_name)
     is_subagent = agent_label is not None
-    title = _layer_title(layer_name,
-                         _subagent_title_suffix(title_suffix, agent_label))
+    title = _layer_title(layer_name, _subagent_title_suffix(title_suffix, agent_label))
     panel = Panel(
         body,
         title=title,
@@ -167,9 +176,7 @@ def print_message(text: str, extra: Console | None = None) -> None:
         extra.print(text)
 
 
-def print_user_prompt(layer_name: str,
-                      content: str,
-                      extra: Console | None = None) -> None:
+def print_user_prompt(layer_name: str, content: str, extra: Console | None = None) -> None:
     border, _ = _layer_style(layer_name)
     text = content.strip()
     body = Markdown(text) if text else "[info](empty)[/info]"
@@ -180,15 +187,22 @@ def print_user_prompt(layer_name: str,
             title_align="left",
             border_style=border,
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_agent_started(layer_name: str,
-                        backend: str,
-                        model: str,
-                        extra: Console | None = None,
-                        version: str | None = None,
-                        reasoning_effort: str | None = None) -> None:
+def print_agent_started(
+    layer_name: str,
+    backend: str,
+    model: str,
+    extra: Console | None = None,
+    version: str | None = None,
+    reasoning_effort: str | None = None,
+    context_percentage: float | None = None,
+    context_tokens: int | None = None,
+    context_window: int | None = None,
+) -> None:
     border, _ = _layer_style(layer_name)
     lines = [
         "[status.started]▸ started[/status.started]",
@@ -198,8 +212,10 @@ def print_agent_started(layer_name: str,
         lines.append(f"[info]version[/info] [target]{version}[/target]")
     lines.append(f"[info]model[/info] [target]{model}[/target]")
     if reasoning_effort:
-        lines.append(f"[info]reasoning effort[/info] "
-                     f"[target]{reasoning_effort}[/target]")
+        lines.append(f"[info]reasoning effort[/info] [target]{reasoning_effort}[/target]")
+    context_segment = _format_context_segment(context_percentage, context_tokens, context_window)
+    if context_segment:
+        lines.append(f"[info]context (pre-input)[/info] {context_segment}")
     body = "\n".join(lines)
     _print_panel(
         Panel(
@@ -208,13 +224,39 @@ def print_agent_started(layer_name: str,
             title_align="left",
             border_style=border,
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
 def _format_tokens(value: int | None) -> str | None:
     if value is None:
         return None
     return f"{value:,}"
+
+
+def _format_context_segment(
+    percentage: float | None,
+    tokens: int | None,
+    window: int | None,
+) -> str | None:
+    """Render the shared ``<pct>% <used>/<window>`` context fragment.
+
+    Returns ``None`` when there is nothing to show (no percentage and no
+    token count) so callers can omit the line entirely.
+    """
+    if percentage is None and tokens is None:
+        return None
+    segments: list[str] = []
+    if percentage is not None:
+        segments.append(f"[target]{percentage:.1f}%[/target]")
+    ctx_tokens = _format_tokens(tokens)
+    ctx_window = _format_tokens(window)
+    if ctx_tokens is not None and ctx_window is not None:
+        segments.append(f"[target]{ctx_tokens}[/target]/[target]{ctx_window}[/target]")
+    elif ctx_tokens is not None:
+        segments.append(f"[target]{ctx_tokens}[/target]")
+    return " ".join(segments) if segments else None
 
 
 def _format_usage_body(usage: UsageInfo) -> str:
@@ -237,24 +279,14 @@ def _format_usage_body(usage: UsageInfo) -> str:
     if tokens_parts:
         parts.append("[info]tokens[/info] " + " · ".join(tokens_parts))
 
-    if (usage.context_tokens is not None
-            or usage.context_percentage is not None):
-        segments: list[str] = []
-        if usage.context_percentage is not None:
-            segments.append(f"[target]{usage.context_percentage:.1f}%[/target]")
-        ctx_tokens = _format_tokens(usage.context_tokens)
-        ctx_window = _format_tokens(usage.context_window)
-        if ctx_tokens is not None and ctx_window is not None:
-            segments.append(f"[target]{ctx_tokens}[/target]"
-                            f"/[target]{ctx_window}[/target]")
-        elif ctx_tokens is not None:
-            segments.append(f"[target]{ctx_tokens}[/target]")
-        if segments:
-            parts.append("[info]context[/info] " + " ".join(segments))
+    context_segment = _format_context_segment(
+        usage.context_percentage, usage.context_tokens, usage.context_window
+    )
+    if context_segment:
+        parts.append("[info]context[/info] " + context_segment)
 
     if usage.cost_usd is not None:
-        parts.append(
-            f"[info]cost[/info] [target]${usage.cost_usd:.4f}[/target]")
+        parts.append(f"[info]cost[/info] [target]${usage.cost_usd:.4f}[/target]")
     if usage.num_turns is not None:
         parts.append(f"[info]turns[/info] [target]{usage.num_turns}[/target]")
     if usage.duration_ms is not None:
@@ -264,9 +296,9 @@ def _format_usage_body(usage: UsageInfo) -> str:
     return "\n".join(parts)
 
 
-def print_agent_completed(layer_name: str,
-                          extra: Console | None = None,
-                          usage: UsageInfo | None = None) -> None:
+def print_agent_completed(
+    layer_name: str, extra: Console | None = None, usage: UsageInfo | None = None
+) -> None:
     border, _ = _layer_style(layer_name)
     body_lines = ["[status.completed]✔ completed[/status.completed]"]
     if usage is not None:
@@ -280,12 +312,12 @@ def print_agent_completed(layer_name: str,
             title_align="left",
             border_style=border,
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_agent_failed(layer_name: str,
-                       error: Exception,
-                       extra: Console | None = None) -> None:
+def print_agent_failed(layer_name: str, error: Exception, extra: Console | None = None) -> None:
     _print_panel(
         Panel(
             f"[status.failed]✘ failed[/status.failed]: {error}",
@@ -293,53 +325,44 @@ def print_agent_failed(layer_name: str,
             title_align="left",
             border_style="status.failed",
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_tool_call(layer_name: str,
-                    event: ToolCallEvent,
-                    extra: Console | None = None) -> None:
+def print_tool_call(layer_name: str, event: ToolCallEvent, extra: Console | None = None) -> None:
     body = _tool_input_body(event.name, event.input)
-    _emit_panel(layer_name, f"tool · {event.name}", body, event.agent_label,
-                extra)
+    _emit_panel(layer_name, f"tool · {event.name}", body, event.agent_label, extra)
 
 
-def print_server_tool_call(layer_name: str,
-                           event: ServerToolCallEvent,
-                           extra: Console | None = None) -> None:
+def print_server_tool_call(
+    layer_name: str, event: ServerToolCallEvent, extra: Console | None = None
+) -> None:
     body = _tool_input_body(event.name, event.input)
-    _emit_panel(layer_name, f"server tool · {event.name}", body,
-                event.agent_label, extra)
+    _emit_panel(layer_name, f"server tool · {event.name}", body, event.agent_label, extra)
 
 
-def print_thinking(layer_name: str,
-                   event: ThinkingEvent,
-                   extra: Console | None = None) -> None:
+def print_thinking(layer_name: str, event: ThinkingEvent, extra: Console | None = None) -> None:
     text = event.text.strip()
     truncated = text[:_THINKING_MAX_CHARS]
     if len(text) > _THINKING_MAX_CHARS:
         truncated += "\n[info]…[/info]"
-    body = (f"[thinking.body]{truncated}[/thinking.body]"
-            if truncated else "[info](empty)[/info]")
+    body = f"[thinking.body]{truncated}[/thinking.body]" if truncated else "[info](empty)[/info]"
     _emit_panel(layer_name, "thinking", body, event.agent_label, extra)
 
 
-def print_rate_limit(layer_name: str,
-                     event: RateLimitWarningEvent,
-                     extra: Console | None = None) -> None:
+def print_rate_limit(
+    layer_name: str, event: RateLimitWarningEvent, extra: Console | None = None
+) -> None:
     parts: list[str] = [
-        f"[status.warning]⚠ rate limit[/status.warning] "
-        f"[target]{event.status}[/target]"
+        f"[status.warning]⚠ rate limit[/status.warning] [target]{event.status}[/target]"
     ]
     if event.rate_limit_type:
-        parts.append(f"[info]type[/info] [target]{event.rate_limit_type}"
-                     f"[/target]")
+        parts.append(f"[info]type[/info] [target]{event.rate_limit_type}[/target]")
     if event.utilization is not None:
-        parts.append(f"[info]utilization[/info] [target]{event.utilization:.1%}"
-                     f"[/target]")
+        parts.append(f"[info]utilization[/info] [target]{event.utilization:.1%}[/target]")
     if event.resets_at is not None:
-        parts.append(f"[info]resets_at[/info] [target]{event.resets_at}"
-                     f"[/target]")
+        parts.append(f"[info]resets_at[/info] [target]{event.resets_at}[/target]")
     body = "  ".join(parts)
     _print_panel(
         Panel(
@@ -348,18 +371,19 @@ def print_rate_limit(layer_name: str,
             title_align="left",
             border_style="status.warning",
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_compact_boundary(layer_name: str,
-                           event: CompactBoundaryEvent,
-                           extra: Console | None = None) -> None:
+def print_compact_boundary(
+    layer_name: str, event: CompactBoundaryEvent, extra: Console | None = None
+) -> None:
     parts: list[str] = ["[info]conversation auto-compacted[/info]"]
     if event.trigger:
         parts.append(f"[info]trigger[/info] [target]{event.trigger}[/target]")
     if event.pre_tokens is not None:
-        parts.append(f"[info]pre_tokens[/info] [target]"
-                     f"{event.pre_tokens:,}[/target]")
+        parts.append(f"[info]pre_tokens[/info] [target]{event.pre_tokens:,}[/target]")
     body = "  ".join(parts)
     border, _ = _layer_style(layer_name)
     _print_panel(
@@ -369,7 +393,9 @@ def print_compact_boundary(layer_name: str,
             title_align="left",
             border_style=border,
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
 def _format_session_init_body(event: SessionInitEvent) -> str:
@@ -390,9 +416,9 @@ def _format_session_init_body(event: SessionInitEvent) -> str:
     return "\n".join(lines)
 
 
-def print_session_init(layer_name: str,
-                       event: SessionInitEvent,
-                       extra: Console | None = None) -> None:
+def print_session_init(
+    layer_name: str, event: SessionInitEvent, extra: Console | None = None
+) -> None:
     border, _ = _layer_style(layer_name)
     _print_panel(
         Panel(
@@ -401,13 +427,14 @@ def print_session_init(layer_name: str,
             title_align="left",
             border_style=border,
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_layer_panel(layer_name: str,
-                      title_suffix: str,
-                      body: object,
-                      extra: Console | None = None) -> None:
+def print_layer_panel(
+    layer_name: str, title_suffix: str, body: object, extra: Console | None = None
+) -> None:
     """Print a layer-styled panel with an arbitrary body.
 
     ``body`` can be a string or any Rich renderable (``Syntax``,
@@ -422,7 +449,9 @@ def print_layer_panel(layer_name: str,
             title_align="left",
             border_style=border,
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
 def _build_options_table(request: HumanRequest) -> Table:
@@ -441,9 +470,9 @@ def _build_options_table(request: HumanRequest) -> Table:
     return table
 
 
-def print_human_input_request(layer_name: str,
-                              request: HumanRequest,
-                              extra: Console | None = None) -> None:
+def print_human_input_request(
+    layer_name: str, request: HumanRequest, extra: Console | None = None
+) -> None:
     question = request.prompt.strip() or "(no prompt)"
     header = request.header.strip()
     title_suffix = f"ask_human · {header}" if header else "ask_human"
@@ -453,8 +482,10 @@ def print_human_input_request(layer_name: str,
             "",
             _build_options_table(request),
             "",
-            ("[info]Reply with the option number, the exact label, or "
-             "free-form text. Empty line = no answer.[/info]"),
+            (
+                "[info]Reply with the option number, the exact label, or "
+                "free-form text. Empty line = no answer.[/info]"
+            ),
         )
     else:
         body = Markdown(question)
@@ -465,13 +496,14 @@ def print_human_input_request(layer_name: str,
             title_align="left",
             border_style="status.warning",
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_human_reply(layer_name: str,
-                      request: HumanRequest,
-                      reply: str,
-                      extra: Console | None = None) -> None:
+def print_human_reply(
+    layer_name: str, request: HumanRequest, reply: str, extra: Console | None = None
+) -> None:
     text = reply.strip()
     body = Markdown(text) if text else "[info](no reply)[/info]"
     _print_panel(
@@ -481,12 +513,12 @@ def print_human_reply(layer_name: str,
             title_align="left",
             border_style="status.completed",
             padding=(0, 1),
-        ), extra)
+        ),
+        extra,
+    )
 
 
-def print_agent_text(layer_name: str,
-                     event: AgentTextEvent,
-                     extra: Console | None = None) -> None:
+def print_agent_text(layer_name: str, event: AgentTextEvent, extra: Console | None = None) -> None:
     text = event.text.strip()
     body = Markdown(text) if text else "[info](empty)[/info]"
     _emit_panel(layer_name, "message", body, event.agent_label, extra)
@@ -533,8 +565,7 @@ def _render_bash_command(tool_input: dict[str, object]) -> object | None:
     for key in sorted(tool_input):
         if key in ("command", "description"):
             continue
-        header_lines.append(
-            f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
+        header_lines.append(f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
     if not header_lines:
         return syntax
     return Group(*header_lines, syntax)
@@ -629,8 +660,7 @@ def _render_read_call(tool_input: dict[str, object]) -> object | None:
     for key in sorted(tool_input):
         if key == "file_path":
             continue
-        header_lines.append(
-            f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
+        header_lines.append(f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
     return "\n".join(header_lines)
 
 
@@ -653,8 +683,7 @@ def _render_write_call(tool_input: dict[str, object]) -> object | None:
     for key in sorted(tool_input):
         if key in ("file_path", "content"):
             continue
-        header_lines.append(
-            f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
+        header_lines.append(f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
 
     lines = content.splitlines()
     if len(lines) > _WRITE_PREVIEW_MAX_LINES:
@@ -715,14 +744,12 @@ def _render_edit_call(tool_input: dict[str, object]) -> object | None:
     additions = len(new_string.splitlines())
     deletions = len(old_string.splitlines())
     header_lines = [
-        f"[target]{escape(file_path)}[/target] "
-        f"[green]+{additions}[/green] [red]-{deletions}[/red]"
+        f"[target]{escape(file_path)}[/target] [green]+{additions}[/green] [red]-{deletions}[/red]"
     ]
     for key in sorted(tool_input):
         if key in ("file_path", "old_string", "new_string"):
             continue
-        header_lines.append(
-            f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
+        header_lines.append(f"[info]{key}[/info] [target]{tool_input[key]}[/target]")
 
     diff_lines: list[str] = []
     omitted = 0
@@ -795,8 +822,7 @@ def _render_one_file_change(change: dict[str, object]) -> list[object]:
             move_path = candidate
 
     marker, color = _FILE_CHANGE_KIND_MARKERS.get(kind_type, ("?", "info"))
-    header = (f"[{color}]{marker}[/{color}] "
-              f"[target]{escape(path)}[/target]")
+    header = f"[{color}]{marker}[/{color}] [target]{escape(path)}[/target]"
     if move_path:
         header += f" [info]→[/info] [target]{escape(move_path)}[/target]"
     if kind_type:
@@ -806,8 +832,7 @@ def _render_one_file_change(change: dict[str, object]) -> list[object]:
     diff_text = diff if isinstance(diff, str) else ""
     if diff_text.strip():
         additions, deletions = _count_unified_diff_stats(diff_text)
-        header += (f" [green]+{additions}[/green] "
-                   f"[red]-{deletions}[/red]")
+        header += f" [green]+{additions}[/green] [red]-{deletions}[/red]"
 
     parts: list[object] = [header]
     if not diff_text.strip():
@@ -816,8 +841,7 @@ def _render_one_file_change(change: dict[str, object]) -> list[object]:
     if len(diff_lines) > _FILE_CHANGE_PREVIEW_MAX_LINES:
         body_text = "\n".join(diff_lines[:_FILE_CHANGE_PREVIEW_MAX_LINES])
         omitted = len(diff_lines) - _FILE_CHANGE_PREVIEW_MAX_LINES
-        footer: str | None = (
-            f"[info]… {omitted} more diff lines truncated[/info]")
+        footer: str | None = f"[info]… {omitted} more diff lines truncated[/info]"
     else:
         body_text = diff_text
         footer = None
@@ -829,8 +853,7 @@ def _render_one_file_change(change: dict[str, object]) -> list[object]:
 
 _TODO_STATUS_MARKERS = {
     "completed": ("[todo.completed]☑[/todo.completed]", "todo.completed"),
-    "in_progress":
-    ("[todo.in_progress]▸[/todo.in_progress]", "todo.in_progress"),
+    "in_progress": ("[todo.in_progress]▸[/todo.in_progress]", "todo.in_progress"),
     "pending": ("[todo.pending]☐[/todo.pending]", "todo.pending"),
 }
 
@@ -863,8 +886,7 @@ def _render_todowrite_call(tool_input: dict[str, object]) -> object | None:
             status if isinstance(status, str) else "",
             _TODO_STATUS_MARKERS["pending"],
         )
-        if status == "in_progress" and isinstance(active_form,
-                                                  str) and active_form.strip():
+        if status == "in_progress" and isinstance(active_form, str) and active_form.strip():
             display = active_form.strip()
         else:
             display = content

@@ -5,8 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_flow import (AgentLayer, AgentLayerConfig, AgentRequest,
-                        BackendConfig, SessionConfig)
+from agent_flow import AgentLayer, AgentLayerConfig, AgentRequest, BackendConfig, SessionConfig
 
 from .helpers import FakeBackend
 
@@ -34,14 +33,12 @@ def test_context_manager_releases_persistent_client_and_backend():
 
 
 def test_failed_persistent_send_recreates_client_on_next_call():
-    backend = FakeBackend([
-        {
-            "error": RuntimeError("boom")
-        },
-        {
-            "text": "recovered"
-        },
-    ])
+    backend = FakeBackend(
+        [
+            {"error": RuntimeError("boom")},
+            {"text": "recovered"},
+        ]
+    )
 
     with patch("agent_flow.layers.create_backend", return_value=backend):
         with AgentLayer(_config()) as layer:

@@ -6,6 +6,7 @@ against the same workspace (wipe with ``--clean`` to start over).
 Per-task isolation is handled by the workflow placing each task in its
 own workspace subdirectory.
 """
+
 from __future__ import annotations
 
 import json
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATE_FILENAME = ".agent_team_state.json"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Stages in the workflow.
 #
@@ -34,6 +35,21 @@ SCHEMA_VERSION = 4
 #   - ``qa``       — QA emits APPROVE/REJECT after independent validation
 #                    (only runs when the reviewer APPROVEs).
 #
+# Replan sub-cycle (only used when the workflow is run with
+# ``replan_on_qa=True``; otherwise these stages never appear in a
+# checkpoint). After every QA turn, the PlanDrafter is re-invoked in
+# ``replan`` mode to revise ``plan.md`` and ``acceptance-criteria.md``
+# based on the latest coder/reviewer/qa findings, and decides whether
+# the workflow is ``DONE``, needs a quick polish (back to coder), or a
+# major rewrite that needs another PlanReviewer / human check:
+#   - ``replan``          — PlanDrafter runs in replan mode.
+#   - ``replan_reviewer`` — PlanReviewer re-reviews the revised plan
+#                           (only entered when the PlanDrafter said the
+#                           replan is a major one).
+#   - ``replan_human``    — Human signs off on a major replan via
+#                           ``ask_human`` (only entered when
+#                           ``plan_human_review_enabled`` is set).
+#
 # ``stage`` always names the agent currently in progress (or pending) for
 # the active phase iteration; on resume the workflow jumps directly to
 # this stage instead of rerunning earlier stages.
@@ -43,7 +59,25 @@ STAGE_PLAN_HUMAN = "plan_human"
 STAGE_CODER = "coder"
 STAGE_REVIEWER = "reviewer"
 STAGE_QA = "qa"
+STAGE_REPLAN = "replan"
+STAGE_REPLAN_REVIEWER = "replan_reviewer"
+STAGE_REPLAN_HUMAN = "replan_human"
 _VALID_STAGES = (
+    STAGE_PLAN_DRAFTER,
+    STAGE_PLAN_REVIEWER,
+    STAGE_PLAN_HUMAN,
+    STAGE_CODER,
+    STAGE_REVIEWER,
+    STAGE_QA,
+    STAGE_REPLAN,
+    STAGE_REPLAN_REVIEWER,
+    STAGE_REPLAN_HUMAN,
+)
+# v4 predates the replan sub-cycle: same fields, same semantics, minus
+# the three replan stages. A v4 checkpoint therefore loads unchanged
+# under v5 (the next ``save_state`` re-stamps it as v5); it just must
+# not claim a replan stage it could never have reached.
+_V4_STAGES = (
     STAGE_PLAN_DRAFTER,
     STAGE_PLAN_REVIEWER,
     STAGE_PLAN_HUMAN,
@@ -66,15 +100,18 @@ class WorkflowState:
 def load_state(path: Path) -> WorkflowState:
     data = json.loads(path.read_text(encoding="utf-8"))
     version = data.get("version")
-    if version != SCHEMA_VERSION:
+    if version not in (SCHEMA_VERSION, 4):
         raise ValueError(
             f"Unsupported checkpoint version {version!r} in {path}; "
-            f"expected {SCHEMA_VERSION}. Delete the file to start fresh.")
+            f"expected {SCHEMA_VERSION}. Delete the file to start fresh."
+        )
+    valid_stages = _VALID_STAGES if version == SCHEMA_VERSION else _V4_STAGES
     stage = data.get("stage")
-    if stage not in _VALID_STAGES:
+    if stage not in valid_stages:
         raise ValueError(
             f"Unsupported stage {stage!r} in {path}; expected one of "
-            f"{_VALID_STAGES}. Delete the file to start fresh.")
+            f"{valid_stages}. Delete the file to start fresh."
+        )
     return WorkflowState(
         task_path=str(data["task_path"]),
         num_iterations=int(data.get("num_iterations", 0)),

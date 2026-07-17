@@ -1,54 +1,39 @@
 EVALUATION_CRITERIA = [
     {
-        "name":
-        "Functionality",
-        "description":
-        "Does the implementation work as specified? Are all features implemented and "
+        "name": "Functionality",
+        "description": "Does the implementation work as specified? Are all features implemented and "
         "operational? Do tests pass and produce correct results?",
-        "weight":
-        2.0,
+        "weight": 2.0,
     },
     {
-        "name":
-        "Code Quality",
-        "description":
-        "Is the code clean, well-organized, and following best practices? Proper separation "
+        "name": "Code Quality",
+        "description": "Is the code clean, well-organized, and following best practices? Proper separation "
         "of concerns, clear abstractions, consistent style?",
-        "weight":
-        1.0,
+        "weight": 1.0,
     },
     {
-        "name":
-        "Performance",
-        "description":
-        "Is the implementation efficient? Appropriate resource utilization, memory management, "
+        "name": "Performance",
+        "description": "Is the implementation efficient? Appropriate resource utilization, memory management, "
         "throughput, and latency characteristics?",
-        "weight":
-        1.5,
+        "weight": 1.5,
     },
     {
-        "name":
-        "Completeness",
-        "description":
-        "Is the implementation complete and buildable? No placeholder code, no missing "
+        "name": "Completeness",
+        "description": "Is the implementation complete and buildable? No placeholder code, no missing "
         "dependencies, no unimplemented functions?",
-        "weight":
-        1.0,
+        "weight": 1.0,
     },
     {
-        "name":
-        "Technical Sophistication",
-        "description":
-        "Does it demonstrate appropriate use of systems programming techniques? Efficient "
+        "name": "Technical Sophistication",
+        "description": "Does it demonstrate appropriate use of systems programming techniques? Efficient "
         "algorithms, proper concurrency, correct use of hardware capabilities?",
-        "weight":
-        1.0,
+        "weight": 1.0,
     },
 ]
 
 _criteria_text = "\n".join(
-    f"- **{c['name']}** (weight {c['weight']}): {c['description']}"
-    for c in EVALUATION_CRITERIA)
+    f"- **{c['name']}** (weight {c['weight']}): {c['description']}" for c in EVALUATION_CRITERIA
+)
 
 SYSTEM_PROMPT = f"""\
 You are **QA**. Your job is the heavyweight validation: build, run, test, \

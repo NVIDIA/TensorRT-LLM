@@ -1,4 +1,5 @@
 """Tests for the agent-team status.md tool flow."""
+
 from __future__ import annotations
 
 import asyncio
@@ -115,8 +116,7 @@ def test_coder_and_reviewer_share_same_path(tmp_path):
     tools = status.build_status_tools(ctx)
 
     coder_update = next(t for t in tools["coder"] if t.name == "update_status")
-    reviewer_read = next(t for t in tools["reviewer"]
-                         if t.name == "read_status")
+    reviewer_read = next(t for t in tools["reviewer"] if t.name == "read_status")
 
     _call(coder_update.handler, {"content": "coder wrote this\n"})
     out = _call(reviewer_read.handler, {})
@@ -138,11 +138,9 @@ def test_status_tools_log_panels(tmp_path, monkeypatch):
 
     tools = status.build_status_tools(ctx)
     coder_update = next(t for t in tools["coder"] if t.name == "update_status")
-    reviewer_update = next(t for t in tools["reviewer"]
-                           if t.name == "update_status")
+    reviewer_update = next(t for t in tools["reviewer"] if t.name == "update_status")
     coder_read = next(t for t in tools["coder"] if t.name == "read_status")
-    reviewer_read = next(t for t in tools["reviewer"]
-                         if t.name == "read_status")
+    reviewer_read = next(t for t in tools["reviewer"] if t.name == "read_status")
 
     _call(coder_update.handler, {"content": "c\n"})
     _call(reviewer_update.handler, {"content": "r\n"})

@@ -62,6 +62,7 @@ The orchestrator reads the resulting YAML to extract reviewer and QA
 ``decision`` fields, and the PlanDrafter's ``decision`` (HUMAN_APPROVED
 ends the plan phase) — no regex over prose.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -100,8 +101,7 @@ def _empty_progress() -> dict[str, list[dict[str, Any]]]:
 
 
 def read_progress(path: Path) -> dict[str, list[dict[str, Any]]]:
-    """Load the YAML mapping at ``path``; return an empty mapping if the
-    file is missing or empty.
+    """Load the YAML mapping at ``path``, returning an empty mapping if it is missing or empty.
 
     Always returns a dict with exactly the ``plan_stage``, ``build_stage``,
     and ``human_feedback`` keys, each a (possibly empty) list. Raises
@@ -121,15 +121,15 @@ def read_progress(path: Path) -> dict[str, list[dict[str, Any]]]:
         raise ValueError(
             f"{path} must contain a YAML mapping with `plan_stage`, "
             f"`build_stage`, and `human_feedback` keys, got "
-            f"{type(data).__name__}")
+            f"{type(data).__name__}"
+        )
     result = _empty_progress()
     for key in _TOP_LEVEL_KEYS:
         v = data.get(key, [])
         if v is None:
             v = []
         if not isinstance(v, list):
-            raise ValueError(
-                f"{path}: `{key}` must be a list, got {type(v).__name__}")
+            raise ValueError(f"{path}: `{key}` must be a list, got {type(v).__name__}")
         result[key] = v
     return result
 
@@ -138,10 +138,7 @@ def write_progress(path: Path, data: dict[str, list[dict[str, Any]]]) -> None:
     """Persist ``data`` with a fixed key order so diffs stay stable."""
     ordered = {key: data.get(key, []) for key in _TOP_LEVEL_KEYS}
     path.write_text(
-        yaml.safe_dump(ordered,
-                       sort_keys=False,
-                       allow_unicode=True,
-                       default_flow_style=False),
+        yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True, default_flow_style=False),
         encoding="utf-8",
     )
 
@@ -187,17 +184,23 @@ def find_entries(
     agent: str | None = None,
     last_iterations: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return progress entries from a single ``stage`` (``"plan_stage"`` or
-    ``"build_stage"``), optionally restricted by agent and/or by the most
-    recent ``last_iterations`` iteration numbers.
+    """Return progress entries from a single ``stage``, optionally filtered by agent and iteration.
+
+    ``stage`` is ``"plan_stage"`` or ``"build_stage"``. Iteration filtering keeps the most recent
+    ``last_iterations`` iterations by **append order**, not by numeric value.
 
     - ``agent=None`` keeps all agents in the stage; otherwise filters by
       ``entry["agent"]``. If ``agent`` is a name from a different stage,
       returns ``[]``.
-    - ``last_iterations=None`` keeps all iterations; otherwise keeps
-      entries whose ``iteration`` is in
-      ``[max_iter - last_iterations + 1, max_iter]`` where ``max_iter`` is
-      the highest iteration in the (already agent-filtered) result.
+    - ``last_iterations=None`` keeps all iterations; otherwise keeps the
+      trailing run of entries spanning the last ``last_iterations``
+      distinct ``iteration`` values counted from the end of the
+      (already agent-filtered) list. Recency must follow append order
+      because iteration numbers are not globally monotonic within a
+      stage: replan-mode PlanDrafter entries land in ``plan_stage``
+      stamped with *build* iteration numbers, interleaved with
+      plan-phase numbering, so the numerically largest iteration can
+      belong to an older phase.
     - Returns ``[]`` when the file is empty or nothing matches.
     """
     if stage not in _STAGES:
@@ -210,11 +213,18 @@ def find_entries(
     if agent is not None:
         entries = [e for e in entries if e.get("agent") == agent]
     if last_iterations is not None:
-        iter_values = [e["iteration"] for e in entries if "iteration" in e]
-        if not iter_values:
-            return []
-        cutoff = max(iter_values) - last_iterations + 1
-        entries = [e for e in entries if e.get("iteration", -1) >= cutoff]
+        keep_from = len(entries)
+        seen: list[Any] = []
+        for idx in range(len(entries) - 1, -1, -1):
+            iteration = entries[idx].get("iteration")
+            if iteration is None:
+                continue
+            if iteration not in seen:
+                if len(seen) == last_iterations:
+                    break
+                seen.append(iteration)
+            keep_from = idx
+        entries = entries[keep_from:]
     return entries
 
 
@@ -238,24 +248,17 @@ def _now_iso() -> str:
 
 
 def _yaml_dump(data: Any) -> str:
-    return yaml.safe_dump(data,
-                          sort_keys=False,
-                          allow_unicode=True,
-                          default_flow_style=False)
+    return yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
 def _log_progress_write(agent: str, entry: dict[str, Any]) -> None:
     """Log a freshly written progress entry as a styled YAML panel."""
-    body = Syntax(_yaml_dump([entry]),
-                  "yaml",
-                  theme="ansi_dark",
-                  word_wrap=True)
+    body = Syntax(_yaml_dump([entry]), "yaml", theme="ansi_dark", word_wrap=True)
     suffix = f"system · wrote iter {entry.get('iteration')}"
     print_layer_panel(agent, suffix, body, get_logger().console)
 
 
-def _log_progress_read(caller: str, agent_filter: str | None, iterations: int,
-                       text: str) -> None:
+def _log_progress_read(caller: str, agent_filter: str | None, iterations: int, text: str) -> None:
     """Log the content returned by ``read_latest_progress``.
 
     ``caller`` is the agent making the call (planner/coder/reviewer/qa) and
@@ -277,12 +280,11 @@ def _log_human_feedback_read(caller: str, count: int, text: str) -> None:
 
 def _log_human_feedback_write(entry: dict[str, Any]) -> None:
     """Log an orchestrator-side ``human_feedback`` append."""
-    body = Syntax(_yaml_dump([entry]),
-                  "yaml",
-                  theme="ansi_dark",
-                  word_wrap=True)
-    suffix = (f"system · appended human_feedback "
-              f"(stage={entry.get('stage')}, iter {entry.get('iteration')})")
+    body = Syntax(_yaml_dump([entry]), "yaml", theme="ansi_dark", word_wrap=True)
+    suffix = (
+        f"system · appended human_feedback "
+        f"(stage={entry.get('stage')}, iter {entry.get('iteration')})"
+    )
     print_layer_panel("orchestrator", suffix, body, get_logger().console)
 
 
@@ -297,12 +299,14 @@ class ProgressContext:
 
     path: Path
     current_iteration: int = 0
-    _tool_cache: list[Any] | None = field(default=None,
-                                          repr=False,
-                                          compare=False)
+    _tool_cache: list[Any] | None = field(default=None, repr=False, compare=False)
 
 
-def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
+def build_progress_tools(
+    ctx: ProgressContext,
+    *,
+    plan_drafter_replan_on_qa: bool = False,
+) -> dict[str, list[Any]]:
     """Build the per-agent tool lists for ``BackendConfig(tools=...)``.
 
     Returns a dict keyed by agent name (``"plan_drafter"`` /
@@ -310,42 +314,63 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     tool objects are ``SdkMcpTool`` instances, which the claude-code
     backend wraps into an in-process MCP server.
 
+    When ``plan_drafter_replan_on_qa`` is true, the ``plan_drafter``
+    bundle is augmented with read tools that reach across the plan/build
+    boundary so the PlanDrafter can ground its replan turn on the latest
+    coder/reviewer/qa findings and any user feedback:
+
+    - ``read_latest_build_progress`` — like ``read_latest_progress`` but
+      reads from ``build_stage`` (the plan_drafter's normal
+      ``read_latest_progress`` still only sees ``plan_stage`` entries so
+      replan-time access to the build phase is explicit, not accidental).
+    - ``read_human_feedback`` — same tool the build-phase agents get, so
+      the PlanDrafter can incorporate user feedback when revising
+      ``plan.md`` / ``acceptance-criteria.md``.
+
+    Off by default — when ``replan_on_qa=False`` on the workflow, the
+    PlanDrafter is plan-phase only and the plan/build isolation stays
+    intact.
     """
 
     @tool(
         "append_plan_drafter_progress",
-        ("Record a PlanDrafter progress entry in progress.yaml's "
-         "`plan_stage`. Call this exactly once as the last action of your "
-         "turn."),
+        (
+            "Record a PlanDrafter progress entry in progress.yaml's "
+            "`plan_stage`. Call this exactly once as the last action of your "
+            "turn."
+        ),
         {
             "type": "object",
             "properties": {
                 "summary": {
-                    "type":
-                    "string",
-                    "description":
-                    "Short human-readable summary of what you drafted or "
+                    "type": "string",
+                    "description": "Short human-readable summary of what you drafted or "
                     "polished this turn (and, in the human-review phase, "
                     "what the human asked for).",
                 },
                 "decision": {
-                    "type":
-                    "string",
-                    "enum": ["DRAFT_READY", "POLISHING", "HUMAN_APPROVED"],
-                    "description":
-                    "DRAFT_READY: plan.md is ready for the AI PlanReviewer "
-                    "(use this in the drafter↔reviewer phase). POLISHING: "
-                    "human asked for changes (or you couldn't reach the "
-                    "human this turn) and the plan is still being revised. "
-                    "HUMAN_APPROVED: the human approved the plan via "
-                    "ask_human — workflow advances to the build phase.",
+                    "type": "string",
+                    "enum": ["DRAFT_READY", "POLISHING", "HUMAN_APPROVED", "DONE"],
+                    "description": "DRAFT_READY: plan.md is ready for the AI PlanReviewer "
+                    "(use this in the drafter↔reviewer phase, or in "
+                    "replan mode when the revision is a major one that "
+                    "warrants another paper review). POLISHING: human "
+                    "asked for changes (or you couldn't reach the human "
+                    "this turn) and the plan is still being revised — "
+                    "also used in replan mode for a minor revision that "
+                    "skips the PlanReviewer and goes straight back to the "
+                    "Coder. HUMAN_APPROVED: the human approved the plan "
+                    "via ask_human — workflow advances to the build "
+                    "phase (or, in a replan cycle, continues with the "
+                    "Coder). DONE: replan mode only — every acceptance "
+                    "criterion has been verified at runtime and there is "
+                    "no further stage to push to; the workflow ends.",
                 },
             },
             "required": ["summary", "decision"],
         },
     )
-    async def append_plan_drafter_progress(
-            args: dict[str, Any]) -> dict[str, Any]:
+    async def append_plan_drafter_progress(args: dict[str, Any]) -> dict[str, Any]:
         entry: dict[str, Any] = {
             "iteration": ctx.current_iteration,
             "agent": "plan_drafter",
@@ -356,36 +381,37 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         _append(ctx.path, "plan_drafter", entry)
         _log_progress_write("plan_drafter", entry)
         return {
-            "content": [{
-                "type":
-                "text",
-                "text": (f"Recorded plan_drafter entry for iteration "
-                         f"{ctx.current_iteration} "
-                         f"(decision={entry['decision']})."),
-            }]
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Recorded plan_drafter entry for iteration "
+                        f"{ctx.current_iteration} "
+                        f"(decision={entry['decision']})."
+                    ),
+                }
+            ]
         }
 
     @tool(
         "append_plan_reviewer_progress",
-        ("Record a PlanReviewer progress entry in progress.yaml's "
-         "`plan_stage`. Call this exactly once as the last action of your "
-         "turn."),
+        (
+            "Record a PlanReviewer progress entry in progress.yaml's "
+            "`plan_stage`. Call this exactly once as the last action of your "
+            "turn."
+        ),
         {
             "type": "object",
             "properties": {
                 "summary": {
-                    "type":
-                    "string",
-                    "description":
-                    "Short rationale. On REJECT include the specific, "
+                    "type": "string",
+                    "description": "Short rationale. On REJECT include the specific, "
                     "actionable items the PlanDrafter must address.",
                 },
                 "decision": {
-                    "type":
-                    "string",
+                    "type": "string",
                     "enum": ["APPROVE", "REJECT"],
-                    "description":
-                    "APPROVE if the plan satisfies task.yaml and is concrete "
+                    "description": "APPROVE if the plan satisfies task.yaml and is concrete "
                     "enough for the Coder to execute; REJECT to loop back "
                     "to the PlanDrafter.",
                 },
@@ -393,8 +419,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             "required": ["summary", "decision"],
         },
     )
-    async def append_plan_reviewer_progress(
-            args: dict[str, Any]) -> dict[str, Any]:
+    async def append_plan_reviewer_progress(args: dict[str, Any]) -> dict[str, Any]:
         entry = {
             "iteration": ctx.current_iteration,
             "agent": "plan_reviewer",
@@ -405,27 +430,30 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         _append(ctx.path, "plan_reviewer", entry)
         _log_progress_write("plan_reviewer", entry)
         return {
-            "content": [{
-                "type":
-                "text",
-                "text": (f"Recorded plan_reviewer entry for iteration "
-                         f"{ctx.current_iteration} "
-                         f"(decision={entry['decision']})."),
-            }]
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Recorded plan_reviewer entry for iteration "
+                        f"{ctx.current_iteration} "
+                        f"(decision={entry['decision']})."
+                    ),
+                }
+            ]
         }
 
     @tool(
         "append_coder_progress",
-        ("Record a Coder progress entry in progress.yaml's `build_stage`. "
-         "Call this exactly once as the last action of your turn."),
+        (
+            "Record a Coder progress entry in progress.yaml's `build_stage`. "
+            "Call this exactly once as the last action of your turn."
+        ),
         {
             "type": "object",
             "properties": {
                 "summary": {
-                    "type":
-                    "string",
-                    "description":
-                    "Short human-readable summary of what you implemented "
+                    "type": "string",
+                    "description": "Short human-readable summary of what you implemented "
                     "or changed this iteration.",
                 },
             },
@@ -442,35 +470,33 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         _append(ctx.path, "coder", entry)
         _log_progress_write("coder", entry)
         return {
-            "content": [{
-                "type":
-                "text",
-                "text": (f"Recorded coder entry for iteration "
-                         f"{ctx.current_iteration}."),
-            }]
+            "content": [
+                {
+                    "type": "text",
+                    "text": (f"Recorded coder entry for iteration {ctx.current_iteration}."),
+                }
+            ]
         }
 
     @tool(
         "append_reviewer_progress",
-        ("Record a Reviewer progress entry in progress.yaml's "
-         "`build_stage`. Call this exactly once as the last action of your "
-         "turn."),
+        (
+            "Record a Reviewer progress entry in progress.yaml's "
+            "`build_stage`. Call this exactly once as the last action of your "
+            "turn."
+        ),
         {
             "type": "object",
             "properties": {
                 "summary": {
-                    "type":
-                    "string",
-                    "description":
-                    "Short rationale. On REJECT include the specific, "
+                    "type": "string",
+                    "description": "Short rationale. On REJECT include the specific, "
                     "actionable items the Coder must fix.",
                 },
                 "decision": {
-                    "type":
-                    "string",
+                    "type": "string",
                     "enum": ["APPROVE", "REJECT"],
-                    "description":
-                    "APPROVE if the change looks right and is ready for QA; "
+                    "description": "APPROVE if the change looks right and is ready for QA; "
                     "REJECT to loop back to the Coder.",
                 },
             },
@@ -488,46 +514,43 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         _append(ctx.path, "reviewer", entry)
         _log_progress_write("reviewer", entry)
         return {
-            "content": [{
-                "type":
-                "text",
-                "text": (f"Recorded reviewer entry for iteration "
-                         f"{ctx.current_iteration} "
-                         f"(decision={entry['decision']})."),
-            }]
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Recorded reviewer entry for iteration "
+                        f"{ctx.current_iteration} "
+                        f"(decision={entry['decision']})."
+                    ),
+                }
+            ]
         }
 
     @tool(
         "append_qa_progress",
-        ("Record a QA progress entry in progress.yaml's `build_stage`. "
-         "Call this exactly once as the last action of your turn."),
+        (
+            "Record a QA progress entry in progress.yaml's `build_stage`. "
+            "Call this exactly once as the last action of your turn."
+        ),
         {
             "type": "object",
             "properties": {
                 "summary": {
-                    "type":
-                    "string",
-                    "description":
-                    "QA report — per-criterion scores, strengths, weaknesses, "
+                    "type": "string",
+                    "description": "QA report — per-criterion scores, strengths, weaknesses, "
                     "and recommendation.",
                 },
                 "decision": {
-                    "type":
-                    "string",
+                    "type": "string",
                     "enum": ["APPROVE", "REJECT"],
-                    "description":
-                    "APPROVE ends the workflow; REJECT sends the work back to "
+                    "description": "APPROVE ends the workflow; REJECT sends the work back to "
                     "the Coder.",
                 },
                 "weighted_score": {
-                    "type":
-                    "number",
-                    "minimum":
-                    0,
-                    "maximum":
-                    10,
-                    "description":
-                    "Weighted overall score in [0, 10]. The orchestrator "
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": "Weighted overall score in [0, 10]. The orchestrator "
                     "applies a score floor: an APPROVE below the floor is "
                     "downgraded to a loop-back, so do not pad the score to "
                     "clear the gate.",
@@ -548,14 +571,17 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         _append(ctx.path, "qa", entry)
         _log_progress_write("qa", entry)
         return {
-            "content": [{
-                "type":
-                "text",
-                "text": (f"Recorded qa entry for iteration "
-                         f"{ctx.current_iteration} "
-                         f"(decision={entry['decision']}, "
-                         f"weighted_score={entry['weighted_score']})."),
-            }]
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"Recorded qa entry for iteration "
+                        f"{ctx.current_iteration} "
+                        f"(decision={entry['decision']}, "
+                        f"weighted_score={entry['weighted_score']})."
+                    ),
+                }
+            ]
         }
 
     # ``read_latest_progress`` is shared, but each caller gets a closure
@@ -569,32 +595,30 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
 
         @tool(
             "read_latest_progress",
-            (f"Return entries from progress.yaml's `{stage}` belonging to "
-             f"the most recent iteration(s), as YAML text. Use this "
-             f"instead of reading the full progress.yaml file when you "
-             f"only need the latest state for your own phase."),
+            (
+                f"Return entries from progress.yaml's `{stage}` belonging to "
+                f"the most recent iteration(s), as YAML text. Use this "
+                f"instead of reading the full progress.yaml file when you "
+                f"only need the latest state for your own phase."
+            ),
             {
                 "type": "object",
                 "properties": {
                     "iterations": {
-                        "type":
-                        "integer",
-                        "minimum":
-                        1,
-                        "description":
-                        "How many of the most recent iteration numbers to "
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many of the most recent iteration numbers to "
                         "include. Defaults to 1 (just the latest).",
                     },
                     "agent": {
-                        "type":
-                        "string",
-                        "enum":
-                        stage_agents,
-                        "description":
-                        (f"Optional filter: return only entries written "
-                         f"by this agent (must be one of {stage_agents}, "
-                         f"i.e. an agent in the same stage as the caller). "
-                         f"Omit to return all of {stage}'s entries."),
+                        "type": "string",
+                        "enum": stage_agents,
+                        "description": (
+                            f"Optional filter: return only entries written "
+                            f"by this agent (must be one of {stage_agents}, "
+                            f"i.e. an agent in the same stage as the caller). "
+                            f"Omit to return all of {stage}'s entries."
+                        ),
                     },
                 },
                 "required": [],
@@ -603,13 +627,11 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
         async def read_latest_progress(args: dict[str, Any]) -> dict[str, Any]:
             iterations = int(args.get("iterations") or 1)
             agent = args.get("agent") or None
-            selected = find_entries(ctx.path,
-                                    stage=stage,
-                                    agent=agent,
-                                    last_iterations=iterations)
+            selected = find_entries(ctx.path, stage=stage, agent=agent, last_iterations=iterations)
             if not selected:
-                text = (f"# No {stage} progress entries yet"
-                        f"{f' for agent={agent}' if agent else ''}.\n")
+                text = (
+                    f"# No {stage} progress entries yet{f' for agent={agent}' if agent else ''}.\n"
+                )
             else:
                 text = _yaml_dump(selected)
             _log_progress_read(caller, agent, iterations, text)
@@ -621,14 +643,15 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     # ``--feedback``. Build-phase agents share one schema; the caller name
     # only drives panel styling in the log.
     def _make_human_feedback_tool(caller: str):
-
         @tool(
             "read_human_feedback",
-            ("Return every entry in progress.yaml's `human_feedback` list "
-             "as YAML text. These are user-authored notes injected via "
-             "`--feedback` on resume; treat them as direct guidance from "
-             "the human. Call this at the start of your turn so you do "
-             "not miss feedback that arrived between iterations."),
+            (
+                "Return every entry in progress.yaml's `human_feedback` list "
+                "as YAML text. These are user-authored notes injected via "
+                "`--feedback` on resume; treat them as direct guidance from "
+                "the human. Call this at the start of your turn so you do "
+                "not miss feedback that arrived between iterations."
+            ),
             {
                 "type": "object",
                 "properties": {},
@@ -646,6 +669,73 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
 
         return read_human_feedback
 
+    def _make_build_read_tool(caller: str):
+        """Like ``_make_read_tool`` but reads from ``build_stage``.
+
+        Used to give the PlanDrafter cross-phase visibility during a
+        replan-on-qa turn. Named differently from ``read_latest_progress``
+        so the plan_drafter's plan-phase reads stay scoped to
+        ``plan_stage`` and replan-time reads are explicit.
+        """
+        stage = BUILD_STAGE
+        stage_agents = list(_AGENTS_BY_STAGE[stage])
+
+        @tool(
+            "read_latest_build_progress",
+            (
+                "Return entries from progress.yaml's `build_stage` belonging "
+                "to the most recent iteration(s), as YAML text. Use this in "
+                "replan mode to fetch the latest coder/reviewer/qa findings "
+                "you must respond to. (Your regular `read_latest_progress` "
+                "still only sees `plan_stage` entries.)"
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "iterations": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many of the most recent build-stage "
+                        "iteration numbers to include. Defaults to 1 "
+                        "(just the latest).",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "enum": stage_agents,
+                        "description": (
+                            f"Optional filter: return only entries written "
+                            f"by this build-phase agent (must be one of "
+                            f"{stage_agents}). Omit to return all "
+                            f"build-stage entries."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        )
+        async def read_latest_build_progress(args: dict[str, Any]) -> dict[str, Any]:
+            iterations = int(args.get("iterations") or 1)
+            agent = args.get("agent") or None
+            selected = find_entries(ctx.path, stage=stage, agent=agent, last_iterations=iterations)
+            if not selected:
+                text = (
+                    f"# No {stage} progress entries yet{f' for agent={agent}' if agent else ''}.\n"
+                )
+            else:
+                text = _yaml_dump(selected)
+            _log_progress_read(caller, agent, iterations, text)
+            return {"content": [{"type": "text", "text": text}]}
+
+        return read_latest_build_progress
+
+    plan_drafter_tools = [
+        append_plan_drafter_progress,
+        _make_read_tool("plan_drafter"),
+    ]
+    if plan_drafter_replan_on_qa:
+        plan_drafter_tools.append(_make_build_read_tool("plan_drafter"))
+        plan_drafter_tools.append(_make_human_feedback_tool("plan_drafter"))
+
     # QA intentionally does not get `read_latest_progress`: its verdict
     # must be grounded in ``task.yaml`` and the actual code it builds, not
     # downstream artifacts (plan.md, progress.yaml) that could drift.
@@ -654,10 +744,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
     # QA must be able to see it even though the rest of progress.yaml
     # stays out of reach.
     return {
-        "plan_drafter": [
-            append_plan_drafter_progress,
-            _make_read_tool("plan_drafter"),
-        ],
+        "plan_drafter": plan_drafter_tools,
         "plan_reviewer": [
             append_plan_reviewer_progress,
             _make_read_tool("plan_reviewer"),
@@ -672,6 +759,5 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
             _make_read_tool("reviewer"),
             _make_human_feedback_tool("reviewer"),
         ],
-        "qa": [append_qa_progress,
-               _make_human_feedback_tool("qa")],
+        "qa": [append_qa_progress, _make_human_feedback_tool("qa")],
     }

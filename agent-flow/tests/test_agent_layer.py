@@ -4,18 +4,27 @@ from unittest.mock import patch
 
 import anyio
 
-from agent_flow import (AgentLayer, AgentLayerConfig, AgentRequest,
-                        BackendConfig, SessionConfig, ToolCallEvent, UsageInfo)
+from agent_flow import (
+    AgentLayer,
+    AgentLayerConfig,
+    AgentRequest,
+    BackendConfig,
+    SessionConfig,
+    ToolCallEvent,
+    UsageInfo,
+)
 from agent_flow.config import HumanRequest, HumanRequestOption
 
 from .helpers import FakeBackend
 
 
-def _config(*,
-            session_mode: str = "stateless",
-            name: str = "agent",
-            human_input_enabled: bool = False,
-            print_activity: bool = True) -> AgentLayerConfig:
+def _config(
+    *,
+    session_mode: str = "stateless",
+    name: str = "agent",
+    human_input_enabled: bool = False,
+    print_activity: bool = True,
+) -> AgentLayerConfig:
     return AgentLayerConfig(
         name=name,
         system_prompt="You are helpful.",
@@ -60,11 +69,14 @@ def test_persistent_layer_reuses_client_across_calls():
 
 
 def test_one_forward_performs_one_backend_send_and_appends_response():
-    backend = FakeBackend([{
-        "text":
-        "done",
-        "tool_calls": [ToolCallEvent(name="Bash", input={"command": "ls"})],
-    }])
+    backend = FakeBackend(
+        [
+            {
+                "text": "done",
+                "tool_calls": [ToolCallEvent(name="Bash", input={"command": "ls"})],
+            }
+        ]
+    )
     layer = AgentLayer(_config())
 
     with patch("agent_flow.layers.create_backend", return_value=backend):
@@ -76,11 +88,14 @@ def test_one_forward_performs_one_backend_send_and_appends_response():
 
 
 def test_layer_prints_live_agent_activity(capsys):
-    backend = FakeBackend([{
-        "text":
-        "done",
-        "tool_calls": [ToolCallEvent(name="Bash", input={"command": "ls"})],
-    }])
+    backend = FakeBackend(
+        [
+            {
+                "text": "done",
+                "tool_calls": [ToolCallEvent(name="Bash", input={"command": "ls"})],
+            }
+        ]
+    )
     layer = AgentLayer(_config(name="planner"))
 
     with patch("agent_flow.layers.create_backend", return_value=backend):
@@ -95,12 +110,13 @@ def test_layer_prints_live_agent_activity(capsys):
 
 
 def test_layer_started_panel_includes_backend_version(capsys):
-    """The started panel surfaces whichever ``cli/sdk`` string the
-    backend reports. Uses a ``FakeBackend`` subclass whose ``version()``
-    returns a fixed string so tests do not spawn the real CLI."""
+    """The started panel surfaces whichever ``cli/sdk`` string the backend reports.
+
+    Uses a ``FakeBackend`` subclass whose ``version()`` returns a fixed string so
+    tests do not spawn the real CLI.
+    """
 
     class VersionedBackend(FakeBackend):
-
         def version(self) -> str:
             return "cli 9.9.9 · sdk 0.0.1"
 
@@ -116,10 +132,42 @@ def test_layer_started_panel_includes_backend_version(capsys):
     assert "sdk 0.0.1" in captured.out
 
 
+def test_codex_layer_started_panel_includes_version_and_reasoning_effort(capsys):
+    class CodexBackendWithInfo(FakeBackend):
+        def version(self) -> str:
+            return "cli 0.133.0 · sdk 0.1.0b2"
+
+        def reasoning_effort(self) -> str:
+            return "xhigh"
+
+    backend = CodexBackendWithInfo([{"text": "done"}])
+    layer = AgentLayer(
+        AgentLayerConfig(
+            name="planner",
+            system_prompt="You are helpful.",
+            backend=BackendConfig(kind="codex", model="gpt-test"),
+        )
+    )
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        layer("run")
+
+    captured = capsys.readouterr()
+    assert "codex" in captured.out
+    assert "gpt-test" in captured.out
+    assert "version" in captured.out
+    assert "cli 0.133.0" in captured.out
+    assert "sdk 0.1.0b2" in captured.out
+    assert "reasoning effort" in captured.out
+    assert "xhigh" in captured.out
+
+
 def test_layer_started_panel_omits_version_when_backend_returns_empty(capsys):
-    """``FakeBackend`` inherits the empty default — the started panel
-    should silently skip the version segment instead of emitting
-    ``version`` with a blank value."""
+    """``FakeBackend`` inherits the empty default, so the started panel skips the version segment.
+
+    The panel should silently skip the version segment instead of emitting
+    ``version`` with a blank value.
+    """
     backend = FakeBackend([{"text": "done"}])
     layer = AgentLayer(_config(name="planner"))
 
@@ -140,7 +188,8 @@ def test_layer_can_disable_activity_printing(capsys):
             system_prompt="You are helpful.",
             backend=BackendConfig(kind="claude-code", model="test-model"),
             print_activity=False,
-        ))
+        )
+    )
 
     with patch("agent_flow.layers.create_backend", return_value=backend):
         layer("run")
@@ -179,6 +228,40 @@ def test_completion_panel_includes_usage_and_cost(capsys):
     assert "25.0%" in out
     assert "50,000" in out
     assert "200,000" in out
+
+
+def test_codex_completion_panel_includes_context_ratio(capsys):
+    usage = UsageInfo(
+        input_tokens=100000,
+        output_tokens=50000,
+        cache_read_tokens=20000,
+        total_tokens=170000,
+        context_tokens=170000,
+        context_window=400000,
+        context_percentage=42.5,
+        num_turns=1,
+        duration_ms=2500,
+    )
+    backend = FakeBackend([{"text": "done", "usage": usage}])
+    layer = AgentLayer(
+        AgentLayerConfig(
+            name="planner",
+            system_prompt="You are helpful.",
+            backend=BackendConfig(kind="codex", model="gpt-test"),
+        )
+    )
+
+    with patch("agent_flow.layers.create_backend", return_value=backend):
+        layer("run")
+
+    out = capsys.readouterr().out
+    assert "codex" in out
+    assert "context" in out
+    assert "42.5%" in out
+    assert "170,000" in out
+    assert "400,000" in out
+    assert "turns" in out
+    assert "2.50s" in out
 
 
 def test_completion_panel_without_usage_does_not_error(capsys):
@@ -223,9 +306,12 @@ def test_no_post_turn_prompt_after_agent_completes_even_when_enabled():
 
     # Patch the stdin reader so a stray prompt would be obvious — this
     # test asserts it never runs.
-    with patch("agent_flow.layers.create_backend", return_value=backend), \
-            patch("agent_flow.layers._read_stdin",
-                  side_effect=AssertionError("stdin must not be read")):
+    with (
+        patch("agent_flow.layers.create_backend", return_value=backend),
+        patch(
+            "agent_flow.layers._read_stdin", side_effect=AssertionError("stdin must not be read")
+        ),
+    ):
         result = layer("hello")
 
     assert result == "done"
@@ -237,15 +323,19 @@ def test_no_post_turn_prompt_in_persistent_session_either():
     """Persistent sessions follow the same no-auto-prompt contract."""
     backend = FakeBackend([{"text": "first"}, {"text": "second"}])
 
-    with patch("agent_flow.layers.create_backend", return_value=backend), \
-            patch("agent_flow.layers._read_stdin",
-                  side_effect=AssertionError("stdin must not be read")):
+    with (
+        patch("agent_flow.layers.create_backend", return_value=backend),
+        patch(
+            "agent_flow.layers._read_stdin", side_effect=AssertionError("stdin must not be read")
+        ),
+    ):
         with AgentLayer(
-                _config(
-                    session_mode="persistent",
-                    print_activity=False,
-                    human_input_enabled=True,
-                )) as layer:
+            _config(
+                session_mode="persistent",
+                print_activity=False,
+                human_input_enabled=True,
+            )
+        ) as layer:
             first = layer("hello")
             second = layer("again")
 
@@ -281,8 +371,10 @@ def test_ask_human_tool_reads_reply_from_stdin():
 
 
 def test_ask_human_tool_empty_reply_returns_no_response_marker():
-    """Whitespace-only / empty reply is normalized so the agent gets a
-    deterministic placeholder rather than an empty tool result."""
+    """Whitespace-only or empty reply is normalized to a deterministic placeholder.
+
+    The agent gets a deterministic placeholder rather than an empty tool result.
+    """
     layer = AgentLayer(_config(print_activity=False, human_input_enabled=True))
 
     tool = layer._build_ask_human_tool()
@@ -318,20 +410,15 @@ def test_ask_human_tool_resolves_numeric_choice_to_label():
     tool = layer._build_ask_human_tool()
     with patch("agent_flow.layers._read_stdin", return_value="2"):
         result = anyio.run(
-            tool.handler, {
-                "question":
-                "Pick a color",
+            tool.handler,
+            {
+                "question": "Pick a color",
                 "options": [
-                    {
-                        "label": "red",
-                        "description": "warm"
-                    },
-                    {
-                        "label": "blue",
-                        "description": "cool"
-                    },
+                    {"label": "red", "description": "warm"},
+                    {"label": "blue", "description": "cool"},
                 ],
-            })
+            },
+        )
 
     assert result["content"][0]["text"] == "blue"
 
@@ -370,22 +457,16 @@ def test_ask_human_tool_propagates_header_into_request(capsys):
     tool = layer._build_ask_human_tool()
     with patch("agent_flow.layers._read_stdin", return_value="ok"):
         anyio.run(
-            tool.handler, {
-                "question":
-                "Pick a stack",
-                "header":
-                "Stack",
+            tool.handler,
+            {
+                "question": "Pick a stack",
+                "header": "Stack",
                 "options": [
-                    {
-                        "label": "Go",
-                        "description": "compiled, simpler"
-                    },
-                    {
-                        "label": "Rust",
-                        "description": "compiled, stricter"
-                    },
+                    {"label": "Go", "description": "compiled, simpler"},
+                    {"label": "Rust", "description": "compiled, stricter"},
                 ],
-            })
+            },
+        )
 
     out = capsys.readouterr().out
     assert "ask_human" in out
@@ -396,8 +477,7 @@ def test_ask_human_tool_returns_free_form_when_no_options():
     layer = AgentLayer(_config(print_activity=False, human_input_enabled=True))
 
     tool = layer._build_ask_human_tool()
-    with patch("agent_flow.layers._read_stdin",
-               return_value="free-form answer"):
+    with patch("agent_flow.layers._read_stdin", return_value="free-form answer"):
         result = anyio.run(tool.handler, {"question": "anything?"})
 
     assert result["content"][0]["text"] == "free-form answer"
@@ -418,9 +498,7 @@ def test_default_reader_resolves_numeric_choice_to_label():
         captured.append(prompt)
         return "2"
 
-    request = HumanRequest(layer_name="agent",
-                           prompt="Pick one",
-                           options=options)
+    request = HumanRequest(layer_name="agent", prompt="Pick one", options=options)
 
     with patch("agent_flow.layers._read_stdin", side_effect=fake_stdin):
         reply = anyio.run(layer._dispatch_human_request, request)
@@ -435,8 +513,7 @@ def test_default_reader_falls_back_to_free_text_when_input_not_a_number():
     request = HumanRequest(
         layer_name="agent",
         prompt="Pick one",
-        options=(HumanRequestOption(label="alpha"),
-                 HumanRequestOption(label="beta")),
+        options=(HumanRequestOption(label="alpha"), HumanRequestOption(label="beta")),
     )
 
     with patch("agent_flow.layers._read_stdin", return_value="something else"):
@@ -457,8 +534,7 @@ def test_default_reader_matches_label_case_insensitively():
     request = HumanRequest(
         layer_name="agent",
         prompt="Pick one",
-        options=(HumanRequestOption(label="Approve"),
-                 HumanRequestOption(label="Reject")),
+        options=(HumanRequestOption(label="Approve"), HumanRequestOption(label="Reject")),
     )
 
     with patch("agent_flow.layers._read_stdin", return_value="  approve "):
@@ -479,8 +555,7 @@ def test_default_reader_free_form_overrides_options_for_unmatched_input():
     request = HumanRequest(
         layer_name="agent",
         prompt="What now?",
-        options=(HumanRequestOption(label="Approve"),
-                 HumanRequestOption(label="Reject")),
+        options=(HumanRequestOption(label="Approve"), HumanRequestOption(label="Reject")),
     )
 
     custom = "Approve, but only after we sync with legal."

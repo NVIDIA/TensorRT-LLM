@@ -15,12 +15,12 @@ Example::
     from agent_flow.hooks import require_tool_call_stop_hook
 
     hooks = require_tool_call_stop_hook(["append_planner_progress"])
-    backend = BackendConfig(kind="claude-code",
-                            model=CLAUDE_CODE_DEFAULT_MODEL,
-                            tools=planner_tools,
-                            hooks=hooks)
+    backend = BackendConfig(
+        kind="claude-code", model=CLAUDE_CODE_DEFAULT_MODEL, tools=planner_tools, hooks=hooks
+    )
 
 """
+
 from __future__ import annotations
 
 import json
@@ -66,17 +66,14 @@ def _is_human_user_entry(entry: dict) -> bool:
         return True
     if isinstance(content, list):
         non_tool_result = [
-            c for c in content
-            if not (isinstance(c, dict) and c.get("type") == "tool_result")
+            c for c in content if not (isinstance(c, dict) and c.get("type") == "tool_result")
         ]
         return bool(non_tool_result)
     return False
 
 
 def _tool_uses_since_last_user(entries: list[dict]) -> list[str]:
-    """Return the tool-use names recorded after the most recent human user
-    message in ``entries``.
-    """
+    """Return the tool-use names recorded after the most recent human user message in ``entries``."""
     last_user_idx = -1
     for i, entry in enumerate(entries):
         if _is_human_user_entry(entry):
@@ -85,7 +82,7 @@ def _tool_uses_since_last_user(entries: list[dict]) -> list[str]:
         # No human user message yet — everything in the transcript counts.
         tail = entries
     else:
-        tail = entries[last_user_idx + 1:]
+        tail = entries[last_user_idx + 1 :]
 
     names: list[str] = []
     for entry in tail:
@@ -161,8 +158,8 @@ def require_tool_call_stop_hook(
     required_set = set(required)
     tool_list = ", ".join(f"`{name}`" for name in required)
     block_reason = reason or (
-        f"You must call one of {tool_list} before ending your turn. "
-        "Call it now, then stop.")
+        f"You must call one of {tool_list} before ending your turn. Call it now, then stop."
+    )
 
     async def _stop_hook(input_data, _tool_use_id, _context):
         # The stop hook re-fires after a block. ``stop_hook_active`` is True

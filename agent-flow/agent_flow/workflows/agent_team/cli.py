@@ -10,38 +10,44 @@ from .workflow import AgentTeamWorkflow
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the planner-module -> coder -> reviewer -> qa "
-        "workflow.")
-    parser.add_argument("--task",
-                        type=Path,
-                        required=True,
-                        help="Path to the task YAML file. The file is copied "
-                        "verbatim into `<workspace>/task.yaml` and read by "
-                        "every agent. The agent_team workflow itself "
-                        "imposes no schema on the YAML; wrappers (e.g. "
-                        "modeling_bringup) may enforce their own.")
-    parser.add_argument("--workspace",
-                        type=Path,
-                        default=Path("workspace/agent-team"),
-                        help="Workspace directory for shared state files "
-                        "(task.yaml, plan.md, acceptance-criteria.md, "
-                        "progress.yaml, status.md).")
-    parser.add_argument("--num-iterations",
-                        type=int,
-                        default=100,
-                        help="Maximum number of coder/reviewer/qa iterations.")
+        description="Run the planner-module -> coder -> reviewer -> qa workflow."
+    )
+    parser.add_argument(
+        "--task",
+        type=Path,
+        required=True,
+        help="Path to the task YAML file. The file is copied "
+        "verbatim into `<workspace>/task.yaml` and read by "
+        "every agent. The agent_team workflow itself "
+        "imposes no schema on the YAML; wrappers (e.g. "
+        "modeling_bringup) may enforce their own.",
+    )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path("workspace/agent-team"),
+        help="Workspace directory for shared state files "
+        "(task.yaml, plan.md, acceptance-criteria.md, "
+        "progress.yaml, status.md).",
+    )
+    parser.add_argument(
+        "--num-iterations",
+        type=int,
+        default=100,
+        help="Maximum number of coder/reviewer/qa iterations.",
+    )
     parser.add_argument(
         "--coder-context-reset-interval",
         type=int,
         default=2,
-        help="Recycle the coder's persistent session every N iterations. "
-        "Set to 0 to disable.")
+        help="Recycle the coder's persistent session every N iterations. Set to 0 to disable.",
+    )
     parser.add_argument(
         "--reviewer-context-reset-interval",
         type=int,
         default=2,
-        help="Recycle the reviewer's persistent session every N iterations. "
-        "Set to 0 to disable.")
+        help="Recycle the reviewer's persistent session every N iterations. Set to 0 to disable.",
+    )
     parser.add_argument(
         "--min-score",
         type=float,
@@ -49,7 +55,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Minimum QA weighted_score (0-10) for an APPROVE to terminate "
         "the workflow. An APPROVE below this floor is downgraded to a "
         "loop-back. Set to 0 to disable the gate (bool decision alone "
-        "terminates).")
+        "terminates).",
+    )
     parser.add_argument(
         "--plan-human-review",
         dest="plan_human_review_enabled",
@@ -58,7 +65,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the PlanReviewer APPROVEs the plan, the PlanDrafter pauses to "
         "ask the human for sign-off via ``ask_human`` before the build "
         "phase begins. Off by default — the plan phase runs unattended "
-        "and PlanReviewer APPROVE flows straight into the build phase.")
+        "and PlanReviewer APPROVE flows straight into the build phase.",
+    )
     parser.set_defaults(plan_human_review_enabled=False)
     parser.add_argument(
         "--build-human-review",
@@ -70,8 +78,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "default — the build phase is expected to be unattended once "
         "the plan is approved; only enable this when the task involves "
         "environment facts or user-only information the Coder cannot "
-        "deduce.")
+        "deduce.",
+    )
     parser.set_defaults(build_human_review_enabled=False)
+    parser.add_argument(
+        "--replan-on-qa",
+        dest="replan_on_qa",
+        action="store_true",
+        help="After each QA turn in the build phase, re-invoke the "
+        "PlanDrafter to revise plan.md and acceptance-criteria.md based "
+        "on the latest coder/reviewer/qa findings. The PlanDrafter (not "
+        "QA) decides task completion via a `DONE` decision; otherwise "
+        "the workflow either loops straight back to the Coder "
+        "(`POLISHING`) or runs the revised plan through the PlanReviewer "
+        "first (`DRAFT_READY`). With --plan-human-review the human also "
+        "signs off on `DRAFT_READY` revisions. Off by default — the "
+        "build phase terminates on QA APPROVE as it always has, and "
+        "--min-score gates termination directly.",
+    )
+    parser.set_defaults(replan_on_qa=False)
     parser.add_argument(
         "--clean",
         action="store_true",
@@ -79,7 +104,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         f"({STATE_FILENAME}, plan.md, acceptance-criteria.md, "
         "progress.yaml, status.md) and start fresh. Without this flag "
         "the workflow resumes from the checkpoint when one is present "
-        "in the workspace, and starts fresh otherwise.")
+        "in the workspace, and starts fresh otherwise.",
+    )
     parser.add_argument(
         "--plan",
         default=None,
@@ -92,7 +118,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "omitted, the plan phase still runs so the PlanDrafter can "
         "generate `acceptance-criteria.md`. Ignored when resuming from "
         "a checkpoint (the on-disk plan.md is preserved); pass --clean "
-        "to start fresh.")
+        "to start fresh.",
+    )
     parser.add_argument(
         "--acceptance-criteria",
         dest="acceptance_criteria",
@@ -104,7 +131,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "plan phase is skipped entirely. When --plan is omitted, the "
         "plan phase still runs so the PlanDrafter can generate "
         "`plan.md`. Ignored when resuming from a checkpoint; pass "
-        "--clean to start fresh.")
+        "--clean to start fresh.",
+    )
     parser.add_argument(
         "--feedback",
         default=None,
@@ -113,33 +141,45 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "either the literal feedback text or a path to a file containing "
         "it. Resume-only: requires an existing checkpoint in the workspace "
         "(fresh runs reject this flag). Typical use: stop the workflow "
-        "(Ctrl-C), re-run with `--feedback \"...\"`, and the build-phase "
+        '(Ctrl-C), re-run with `--feedback "..."`, and the build-phase '
         "agents (coder, reviewer, qa) will read it via `read_human_feedback` "
         "on their next turn. Each invocation appends — prior entries are "
         "preserved. Also re-engages the build phase when a previously "
-        "completed workflow is rerun (use --clean instead to start over).")
+        "completed workflow is rerun (use --clean instead to start over).",
+    )
+    parser.add_argument(
+        "--trigger-replan-with-feedback",
+        dest="trigger_replan_with_feedback",
+        action="store_true",
+        help="On resume, when --feedback is also supplied, jump straight "
+        "into the replan sub-cycle (the PlanDrafter folds the new feedback "
+        "and the latest coder/reviewer/qa findings into plan.md / "
+        "acceptance-criteria.md) instead of resuming at the saved build "
+        "stage. Requires --replan-on-qa. No-op on a fresh run or when "
+        "--feedback is absent. Off by default.",
+    )
+    parser.set_defaults(trigger_replan_with_feedback=False)
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None,
-         *,
-         prompts: PromptBundle | None = None) -> None:
+def main(argv: list[str] | None = None, *, prompts: PromptBundle | None = None) -> None:
     """Run the agent-team workflow as a CLI."""
     args = _parse_args(argv)
     with AgentTeamWorkflow(
-            workspace=args.workspace,
-            num_iterations=args.num_iterations,
-            coder_context_reset_interval=args.coder_context_reset_interval,
-            reviewer_context_reset_interval=args.
-            reviewer_context_reset_interval,
-            min_score=args.min_score,
-            plan_human_review_enabled=args.plan_human_review_enabled,
-            build_human_review_enabled=args.build_human_review_enabled,
-            clean=args.clean,
-            plan=args.plan,
-            acceptance_criteria=args.acceptance_criteria,
-            feedback=args.feedback,
-            prompts=prompts,
+        workspace=args.workspace,
+        num_iterations=args.num_iterations,
+        coder_context_reset_interval=args.coder_context_reset_interval,
+        reviewer_context_reset_interval=args.reviewer_context_reset_interval,
+        min_score=args.min_score,
+        plan_human_review_enabled=args.plan_human_review_enabled,
+        build_human_review_enabled=args.build_human_review_enabled,
+        replan_on_qa=args.replan_on_qa,
+        trigger_replan_with_feedback=args.trigger_replan_with_feedback,
+        clean=args.clean,
+        plan=args.plan,
+        acceptance_criteria=args.acceptance_criteria,
+        feedback=args.feedback,
+        prompts=prompts,
     ) as workflow:
         workflow.run(args.task)
 

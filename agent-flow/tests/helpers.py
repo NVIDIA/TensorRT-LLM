@@ -7,7 +7,6 @@ from agent_flow.types import ToolCallEvent, UsageInfo
 
 
 class FakeClient(BackendClient):
-
     def __init__(
         self,
         *,
@@ -35,7 +34,6 @@ class FakeClient(BackendClient):
 
 
 class FakeBackend(Backend):
-
     def __init__(self, plans: list[dict] | None = None) -> None:
         self.plans = plans or [{"text": "ok"}]
         self.create_client_calls = 0
