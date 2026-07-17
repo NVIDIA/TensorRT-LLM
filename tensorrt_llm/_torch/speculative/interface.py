@@ -526,16 +526,26 @@ class SpecMetadata:
     # Defaults to True so non-one-engine paths (where populate is a no-op)
     # never accidentally select the advanced graph variant.
     is_all_greedy_sample: bool = True
-    # Group-synchronized override for ``is_all_greedy_sample``. Under
-    # ADP + LM-head TP with rejection sampling, the sampling-path choice gates
-    # group collectives (the LM-head-TP stacked forward and its distributed
-    # argmax), so every rank in the group must take the same path even though
-    # each rank owns a different batch. The model engine all-gathers the
-    # per-rank local flags each iteration (BEFORE the CUDA graph key is built)
-    # and stores the group AND here; ``_scan_one_model_sampling`` then applies
-    # it on every rescan so later consumers (graph key, populate, worker
-    # branches) all observe the same value. ``None`` (default) means "no group
-    # sync configured": the local per-rank value is used as-is.
+    # Group-synchronized override for ``is_all_greedy_sample``. ANCHOR: this
+    # comment is the single authoritative description of the group-sync
+    # semantics; other sites (model engine sync, scan application, worker
+    # branch) keep only their local contract and point here.
+    #
+    # Under ADP + LM-head TP with rejection sampling, the greedy-vs-advanced
+    # sampling-path choice gates group collectives (the LM-head-TP stacked
+    # draft forward and its distributed argmax) and the CUDA graph variant
+    # recording them. Under attention DP each rank owns a different batch, so
+    # the local flags can diverge -- a diverged choice would leave part of the
+    # group waiting in a collective the rest never enters. The model engine
+    # (``_sync_group_all_greedy_sample``) therefore all-gathers the per-rank
+    # local flags each iteration BEFORE the CUDA graph key is built and stores
+    # the group AND here; ``_scan_one_model_sampling`` re-applies it on every
+    # rescan so all later consumers (graph key, populate, worker branches)
+    # observe the same value. AND semantics are conservative-safe: a locally
+    # all-greedy rank may be pulled onto the advanced path, where its sentinel
+    # sampling params still sample greedily -- never the reverse. ``None``
+    # (default) means "no group sync configured": the local per-rank value is
+    # used as-is.
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
@@ -841,14 +851,11 @@ class SpecMetadata:
                 for (_, _, _, num_tokens) in per_request_normalized
             ]
 
-        # Apply the group-synchronized override last. The synced value was
-        # computed (by the model engine, once per iteration) from the ranks'
-        # local flags with any capture override already applied, so it is the
-        # authoritative path choice; rescans (e.g. populate after the graph
-        # key) must converge to it rather than resurrect the local value.
-        # AND semantics make this conservative-safe: a locally all-greedy rank
-        # may be pulled onto the advanced path (where its sentinel sampling
-        # params still behave greedily), never the reverse.
+        # Apply the group-synchronized override last (semantics: see the
+        # ``group_all_greedy_sample`` field comment). Local contract: the
+        # synced value already incorporates any capture override, and rescans
+        # (e.g. populate after the graph key) must converge to it rather than
+        # resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
 

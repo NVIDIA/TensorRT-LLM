@@ -2699,30 +2699,22 @@ class PyTorchModelEngine(ModelEngine):
         return None
 
     def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
-        """Group-synchronize ``is_all_greedy_sample`` under ADP + LM-head TP.
+        """All-gather the per-rank greedy flags and store the group AND.
 
-        With rejection sampling enabled, the greedy-vs-advanced choice gates
-        the LM-head-TP group's collectives (stacked draft forward and its
-        distributed argmax) and the CUDA graph variant that records them.
-        Under attention DP each rank owns a different batch, so the local
-        flags can diverge; a diverged choice would leave part of the group
-        waiting in a collective the rest never enters. All-gather the local
-        flags and store the group AND, which _scan_one_model_sampling applies
-        on every rescan (see SpecMetadata.group_all_greedy_sample).
-
-        The sync condition is pure config -- identical on every rank -- so
-        ranks also agree on whether this exchange happens at all. The gather
-        spans the whole TP group (a superset of any LM-head-TP subgroup):
-        agreement over the superset implies agreement within each subgroup and
-        avoids depending on the per-forward LM-head-TP group construction.
-
-        This is a dedicated per-iteration host all-gather rather than a
-        piggyback on the ``all_rank_num_tokens`` exchange because that
-        exchange runs in ``_prepare_inputs``, AFTER the CUDA graph key is
-        built -- too late for the key to see the synced value.
+        Why the sampling-path choice must be group-uniform under
+        ADP + LM-head TP is documented on the anchor,
+        ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
+        per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
+        the CUDA graph key is built. The gate is pure config (identical on
+        every rank), so ranks also agree on whether the exchange happens; the
+        gather spans the whole TP group, a superset of any LM-head-TP
+        subgroup. A dedicated host all-gather rather than a piggyback on the
+        ``all_rank_num_tokens`` exchange, which runs in ``_prepare_inputs`` --
+        after the graph key, too late for the key to see the synced value.
         """
-        if not (self.enable_attention_dp
-                and getattr(self.mapping, 'enable_lm_head_tp_in_adp', False)
+        # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
+        # Mapping.__init__), so ADP needs no separate check here.
+        if not (self.mapping.enable_lm_head_tp_in_adp
                 and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)

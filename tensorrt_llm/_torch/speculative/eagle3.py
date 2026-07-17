@@ -864,26 +864,20 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # bypasses LM-head-TP and computes full-vocab logits locally --
                 # under ADP the lm_head weight is replicated (the sliced-shard
                 # trick is a runtime optimization), exactly like the target
-                # head. The bypass triggers only when rejection is enabled AND
-                # the batch is not all-greedy (wants_advanced_draft_sampling,
-                # shared with sample_draft_tokens' branch, so head selection
-                # and sampler branch cannot diverge); with rejection off,
-                # non-greedy batches keep the
+                # head. With rejection off, non-greedy batches keep the
                 # LM-head-TP argmax path unconditionally, where the per-rank
-                # greedy flag never enters control flow. The branch is CUDA-
-                # graph- and collective-safe because use_rejection_sampling is
-                # pure config and is_all_greedy_sample is group-synchronized
-                # whenever rejection+ADP+LM-head-TP are combined (see
-                # _sync_group_all_greedy_sample): the whole group takes the
-                # same branch, so the stacked forward's all-gather never loses
-                # participants.
+                # greedy flag never enters control flow. This branch is safe
+                # to take group-uniformly because is_all_greedy_sample is
+                # group-synchronized whenever rejection+ADP+LM-head-TP are
+                # combined -- see SpecMetadata.group_all_greedy_sample (anchor
+                # for the group-sync semantics).
                 advanced_draft_sampling = (
                     spec_metadata.wants_advanced_draft_sampling)
+                # enable_lm_head_tp_in_adp implies enable_attention_dp
+                # (asserted in Mapping.__init__); no separate ADP check.
                 lm_head_tp_in_adp_configured = (
                     self.is_mtp_eagle and self.model_config is not None
-                    and self.model_config.mapping.enable_attention_dp
-                    and getattr(self.model_config.mapping,
-                                'enable_lm_head_tp_in_adp', False))
+                    and self.model_config.mapping.enable_lm_head_tp_in_adp)
                 use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
                                          and not advanced_draft_sampling)
                 if self.is_mtp_eagle:
