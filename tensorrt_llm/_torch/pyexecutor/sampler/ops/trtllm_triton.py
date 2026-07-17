@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Repetition / presence / frequency penalty kernels (PyTorch-native).
+"""TRT-LLM-internal Triton kernels for the sampler ops layer.
 
-Ops for the occurrence penalties (repetition / presence / frequency), the torch/Triton
-counterpart of the C++ ``batchApplyPenalty`` kernel
+Triton kernels for the occurrence penalties (repetition / presence / frequency), the
+torch/Triton counterpart of the C++ ``batchApplyPenalty`` kernel
 (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``), with no dependency on the
 sampling_utils interface or other backend modules:
 

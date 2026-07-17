@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops.penalties import (
+from tensorrt_llm._torch.pyexecutor.sampler.ops.trtllm_triton import (
     apply_batched_occurrence_penalties_triton,
     update_occurrence_workspace,
 )

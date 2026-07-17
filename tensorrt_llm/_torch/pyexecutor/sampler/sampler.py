@@ -88,7 +88,10 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.penalties import apply_batched_occurrence_penalties_triton, update_occurrence_workspace
+from .ops.trtllm_triton import (
+    apply_batched_occurrence_penalties_triton,
+    update_occurrence_workspace,
+)
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
