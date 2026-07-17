@@ -1124,10 +1124,19 @@ class PyTorchModelEngine(ModelEngine):
 
         `context_lens.size(0)` is not always `num_generations`. For MTP
         with `use_expanded_buffers_for_mtp=True` the expanded call passes
-        `num_generations * (1 + max_draft_tokens)`, and for DSL expansion
-        it passes `num_generations * dsl_expand_factor`. Bucket range is
-        scaled by the max of these expansion factors so the expanded
-        paths are covered too. No-op on non-DSA models.
+        `num_generations * (1 + max_draft_tokens)`. For DSL expansion the
+        call passes `num_generations * dsl_expand_factor`, where
+        `dsl_expand_factor = next_n // eff` (`eff in kernel_atoms`, see
+        `_pick_dsl_expand` in `dsa.py`); its worst case is
+        `next_n = 1 + max_draft_tokens` when `eff == 1`. Reading the
+        current `dsl_expand_factor` off the metadata would under-estimate
+        the eventual max (it defaults to 1 before any prepare() has run,
+        and per-iter picks can differ across iters when CUDA graph is
+        off), so we use the static upper bound `1 + max_draft_tokens`
+        for both expansion paths. Bucket range is also scaled by
+        `max_beam_width` as a defense-in-depth ceiling for future beam
+        support (no-op today — DSA does not use beam). No-op on non-DSA
+        models.
 
         Best-effort: per-bucket JIT failures are logged and skipped so a
         single broken bucket does not abort PyExecutor startup.
@@ -1152,26 +1161,26 @@ class PyTorchModelEngine(ModelEngine):
 
         num_sms = attn_meta.num_sms
         max_bs = max(1, int(self.batch_size))
-        # Cover the two paths whose `context_lens.size(0)` exceeds
-        # `num_generations`: MTP-expanded (`num_generations * (1 +
-        # max_draft_tokens)`) and DSL-expanded (`num_generations *
-        # dsl_expand_factor`). Both fields are only meaningful on the DSA
-        # metadata; default to 1 when the attribute is missing / disabled.
-        expand_factor = 1
-        if getattr(attn_meta, "use_expanded_buffers_for_mtp", False):
-            expand_factor = max(
-                expand_factor,
-                1 + int(getattr(attn_meta, "max_draft_tokens", 0) or 0))
-        if getattr(attn_meta, "expand_for_dsl", False):
-            expand_factor = max(
-                expand_factor,
-                int(getattr(attn_meta, "dsl_expand_factor", 1) or 1))
-        max_aligned = ((max_bs * expand_factor + 31) // 32) * 32
+        beam_width = max(1, int(getattr(self, "max_beam_width", 1) or 1))
+        # Static upper bound on the row-count multiplier applied to
+        # `context_lens`. Both MTP-expanded and DSL-expanded call sites
+        # are bounded above by `(1 + max_draft_tokens)`; see the
+        # docstring for why we don't read the runtime `dsl_expand_factor`
+        # here.
+        max_draft_tokens = int(
+            getattr(attn_meta, "max_draft_tokens", 0) or 0)
+        expands_batch = (
+            getattr(attn_meta, "use_expanded_buffers_for_mtp", False)
+            or getattr(attn_meta, "expand_for_dsl", False))
+        expand_factor = 1 + max_draft_tokens if expands_batch else 1
+        max_aligned = ((max_bs * beam_width * expand_factor + 31) //
+                       32) * 32
         buckets = list(range(32, max_aligned + 32, 32))
         logger.info(f"[DG warmup] Pre-compiling paged_mqa_logits_metadata for "
                     f"{len(buckets)} aligned batch buckets up to {max_aligned} "
                     f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}, "
-                    f"max_bs={max_bs}, expand_factor={expand_factor})")
+                    f"max_bs={max_bs}, beam_width={beam_width}, "
+                    f"expand_factor={expand_factor})")
         for aligned_bs in buckets:
             # Kernel scans `context_lens` and prefix-sums schedules; a
             # zero-filled 2D tensor of shape (aligned_bs, 1) is enough to
@@ -1181,7 +1190,10 @@ class PyTorchModelEngine(ModelEngine):
             try:
                 _ = get_paged_mqa_logits_metadata(dummy, _DG_SCHEDULE_BLOCK_KV,
                                                   num_sms)
-            except Exception as e:
+            except RuntimeError as e:
+                # Narrow to RuntimeError so signature drifts in
+                # get_paged_mqa_logits_metadata (TypeError / ValueError)
+                # surface loudly instead of silently degrading perf.
                 logger.warning(
                     f"[DG warmup] paged_mqa_logits_metadata prewarm failed "
                     f"for aligned_bs={aligned_bs} "
