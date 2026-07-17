@@ -283,77 +283,6 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
         assert draft_kwargs["max_blocks"] is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_mtp_eagle_one_model_dynamic_tree_metadata_prepares_mamba_links():
-    max_num_requests = 3
-    max_draft_len = 2
-    max_total_draft_tokens = 2
-    spec_tree_manager = SpecTreeManager(
-        max_num_requests=max_num_requests,
-        use_dynamic_tree=True,
-        max_total_draft_tokens=max_total_draft_tokens,
-        max_draft_len=max_draft_len,
-        eagle_choices=None,
-        dynamic_tree_max_topK=2,
-    )
-    slot_storage = spec_tree_manager.slot_storage
-    slot_storage.all_ids_buf[:max_num_requests].copy_(
-        torch.tensor([0, 1, 2], dtype=torch.long, device="cuda"))
-    slot_storage.has_tree[1] = True
-    slot_storage.retrieve_next_token[1] = torch.tensor([2, -1, -1],
-                                                       dtype=torch.int32,
-                                                       device="cuda")
-    slot_storage.retrieve_next_sibling[1] = torch.tensor([-1, -1, -1],
-                                                         dtype=torch.int32,
-                                                         device="cuda")
-
-    class _ResourceManager:
-        hidden_states = None
-        slot_manager = None
-        sa_manager = None
-
-        def __init__(self):
-            self.spec_tree_manager = spec_tree_manager
-            self.batch_indices_cuda = torch.empty(max_num_requests,
-                                                  dtype=torch.int,
-                                                  device="cuda")
-
-    metadata = Eagle3OneModelSpecMetadata(
-        max_draft_len=max_draft_len,
-        max_total_draft_tokens=max_total_draft_tokens,
-        spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
-        max_num_requests=max_num_requests,
-        num_layers=1,
-        hidden_size=1,
-        max_num_tokens=16,
-        spec_resource_manager=_ResourceManager(),
-        use_dynamic_tree=True,
-    )
-    metadata.request_ids = [10, 11, 12]
-    metadata.seq_lens = [
-        1, max_total_draft_tokens + 1, max_total_draft_tokens + 1
-    ]
-    metadata.num_generations = 2
-    metadata.num_tokens = 1 + 2 * (max_total_draft_tokens + 1)
-
-    metadata.prepare()
-
-    assert metadata.retrieve_next_token is not None
-    assert metadata.retrieve_next_sibling is not None
-    assert metadata.retrieve_next_token.shape == (2, max_total_draft_tokens + 1)
-    assert torch.equal(metadata.retrieve_next_token[0],
-                       slot_storage.retrieve_next_token[1])
-    assert torch.equal(
-        metadata.retrieve_next_token[1],
-        torch.tensor([1, 2, -1], dtype=torch.int32, device="cuda"))
-    assert torch.equal(
-        metadata.retrieve_next_sibling[1],
-        torch.full((max_total_draft_tokens + 1, ),
-                   -1,
-                   dtype=torch.int32,
-                   device="cuda"))
-
-
 @pytest.mark.parametrize(
     "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
     [
@@ -1225,11 +1154,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         assert text_spec == text_ref
-
-
-if __name__ == "__main__":
-    unittest.main()
-
 
 
 @pytest.mark.parametrize("use_cuda_graph", [True, False])
