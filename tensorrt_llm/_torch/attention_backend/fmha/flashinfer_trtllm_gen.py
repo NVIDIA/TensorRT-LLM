@@ -67,28 +67,6 @@ if TYPE_CHECKING:
     )
 
 
-def _clear_multi_ctas_kv_counter_workspace(
-    fmha_workspace: torch.Tensor,
-    num_heads: int,
-    max_num_requests: int,
-    multi_processor_count: Optional[int],
-) -> None:
-    counter_size = _get_multi_ctas_kv_counter_size(
-        num_heads,
-        max_num_requests,
-        multi_processor_count,
-    )
-    fmha_workspace.flatten().narrow(0, 0, counter_size).zero_()
-
-
-def _get_multi_ctas_kv_counter_size(
-    num_heads: int,
-    max_num_requests: int,
-    multi_processor_count: Optional[int],
-) -> int:
-    return max(num_heads * max_num_requests, multi_processor_count or 0) * torch.int32.itemsize
-
-
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
@@ -1092,22 +1070,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             params.is_cross,  # is_cross
         )
 
-        # FIXME: Flashinfer trtllm-gen API doesn't support a separate
-        # multi CTAs counter buffer. We have to clear a small buffer
-        # before trtllm_gen_batch_decode_with_kv_cache.
-        #
-        # We must also avoid clearing the workspace only when it is
-        # resized. The warmup phase may have already cached the workspace
-        # pointer; if the capture phase skips the zeroing step, the
-        # CUDA graph will not include the counter initialization. We
-        # have already verified—specifically in the context of the GPTOSS-20B
-        # test graph replay scenario—that this skipping logic is unsafe.
-        #
-        # https://github.com/flashinfer-ai/flashinfer/issues/3433
-        _clear_multi_ctas_kv_counter_workspace(
-            fmha_workspace, attn.num_heads, meta.max_num_requests, self._multi_processor_count
-        )
-
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
         decode_max_q_len = max_q_len if is_multi_token_gen else None
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
@@ -1233,9 +1195,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             bmm1_scale = 1.0 / (attn.q_scaling * math.sqrt(qk_nope_head_dim + qk_rope_head_dim))
             bmm2_scale = 1.0
         workspace_buffer = params.workspace.view(-1, 4)
-        _clear_multi_ctas_kv_counter_workspace(
-            workspace_buffer, attn.num_heads, meta.max_num_requests, self._multi_processor_count
-        )
 
         flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
             query,  # query
