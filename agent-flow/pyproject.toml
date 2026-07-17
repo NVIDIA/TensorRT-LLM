@@ -21,7 +21,6 @@ test = [
 [project.scripts]
 agent-team = "agent_flow.workflows.agent_team.cli:main"
 modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
-pr-review = "agent_flow.workflows.pr_review.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
