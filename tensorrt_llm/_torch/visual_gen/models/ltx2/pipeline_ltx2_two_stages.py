@@ -1550,6 +1550,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 max_sequence_length=max_sequence_length,
                 image=image,
                 image_cond_strength=image_cond_strength,
+                gpu_tl=gpu_tl,
             )
         finally:
             gpu_tl.mark("stage2_denoise")
@@ -1624,6 +1625,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         max_sequence_length: int,
         image: Optional[Union[str, torch.Tensor]] = None,
         image_cond_strength: float = 1.0,
+        gpu_tl: Optional[_GpuTimeline] = None,
     ) -> tuple:
         """Run stage 2 refinement denoising on upsampled latents.
 
@@ -1752,6 +1754,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             audio_positions=audio_positions if a_working is not None else None,
             dtype=self.dtype,
         )
+
+        # Split the timeline so stage2_denoise measures ONLY the step loop
+        # (text-cache/scheduler/renoise prep lands in stage2_prep).
+        if gpu_tl is not None:
+            gpu_tl.mark("stage2_prep")
 
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
