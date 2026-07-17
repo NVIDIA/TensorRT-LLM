@@ -252,6 +252,7 @@ class SessionPrefetcher:
         self._patched = set()
         self._next_model = None  # item -> next model dir; built lazily
         self._warmed_dirs = set()
+        self._disposed = False
         # Activity counters, reported once per session by dispose(). pytest
         # captures per-test stdout (swallowing the per-event prints for
         # passing tests), but pytest_sessionfinish runs OUTSIDE capture, so
@@ -508,8 +509,13 @@ class SessionPrefetcher:
 
         60s (vs take()'s 180s): at session end there is no test left to hand
         the pool to, so a still-running build is only worth a short grace
-        before it is abandoned to its generation-bump cleanup.
+        before it is abandoned to its generation-bump cleanup. Idempotent: a
+        repository-root run dispatches sessionfinish from both the repo-root
+        and the subtree conftest.
         """
+        if self._disposed:
+            return
+        self._disposed = True
         built = self._drain(timeout=60)
         if built is not None:
             built.session.shutdown()
