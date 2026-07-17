@@ -536,8 +536,8 @@ def main():
     else:
         # Disaggregated (e2e or gen_only).
         base_prefix = (
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
-            f"HF_HOME=/tmp/hf_home"
+            "FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${SLURM_LOCALID} "
+            "HF_HOME=/tmp/hf_home"
         )
         # ctx / gen env vars: shared worker_env_var + optional per-role extras
         # from the yaml. get_env_config already merged them.
