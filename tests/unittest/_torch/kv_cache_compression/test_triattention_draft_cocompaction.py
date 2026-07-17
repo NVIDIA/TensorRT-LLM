@@ -21,11 +21,11 @@ import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
 
-from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
     BatchedKVCacheCompaction,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    TriAttention,
     _FixedScoreStagingBuffers,
     _PreparedEviction,
     _RequestCompressionState,

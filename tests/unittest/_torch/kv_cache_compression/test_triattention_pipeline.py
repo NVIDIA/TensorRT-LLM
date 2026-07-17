@@ -35,8 +35,8 @@ from pydantic import ValidationError
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
 # compression manager -- no attention classes or KV-cache-manager subclass.
-from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    TriAttention,
     _BatchedUnionKeepSetSelector,
     _PreparedEviction,
     _PreparedGenerationBatch,

@@ -2124,7 +2124,7 @@ def create_kv_cache_compression_manager(
     ``validate_kv_cache_compression_with_spec``.
     """
     if config.algorithm == "triattention":
-        from tensorrt_llm._torch.kv_cache_compression.triattention import \
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import \
             TriAttention
 
         return TriAttention(
