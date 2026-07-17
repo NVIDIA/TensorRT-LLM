@@ -35,8 +35,8 @@ mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 8 \
 ```
 
 Perf knobs:
-- ``--combine-format {bf16,fp8,fp4}`` -> ``create_moe(combine_format=...)``
-  backend constructor argument (bf16 / 32e4m3xe8m0 / 16e2m1xbf16)
+- ``--combine-format {bf16,fp8,fp4}`` -> sets ``MEGAMOE_COMBINE_FORMAT``
+  (bf16 / 32e4m3xe8m0 / 16e2m1xbf16)
 - ``--autotune``                      -> sets ``MEGAMOE_TACTIC_AUTOTUNE=1`` (otherwise 0)
   (the MegaMoE tactic-sweep opt-in, default OFF) + one forward inside
   ``autotune()`` (the real AutoTuner tuning mode: MERGE lockstep tactic
@@ -181,7 +181,9 @@ def _bench_one(tpr: int, mapping: Mapping, args, dtype) -> dict:
         moe_backend="MEGAMOE_CUTEDSL",
         moe_disable_finalize_fusion=False,
         moe_load_balancer=None,
-        max_num_tokens=tpr,
+        # Keep the engine cap fixed across the workload sweep so smaller
+        # points exercise the production adaptive-bucket selection.
+        max_num_tokens=max(args.tokens_per_rank),
     )
 
     with create_moe(
@@ -189,9 +191,6 @@ def _bench_one(tpr: int, mapping: Mapping, args, dtype) -> dict:
         reduce_results=True,
         model_config=mcfg,
         weight_loading_mode=MoEWeightLoadingMode.VANILLA,
-        # Same argv on every rank -> rank-identical combine format (required:
-        # it sizes the symmetric shared workspace / selects the kernel).
-        combine_format=_COMBINE[args.combine_format],
     ) as moe:
         weights = qutil.create_weights(**qkwargs)
         moe.load_weights([weights])
@@ -354,8 +353,10 @@ def main():
     )
     mapping.rank = rank
     _ensure_dist(rank, world_size)
-    # Override any inherited shell value so the reported mode is the mode
-    # actually used by every backend constructed by this benchmark.
+    # Override inherited values so the reported modes are the modes used by
+    # every backend. The same argv on every rank makes the combine format
+    # rank-identical, as required by the symmetric workspace and kernel.
+    os.environ["MEGAMOE_COMBINE_FORMAT"] = _COMBINE[args.combine_format]
     os.environ["MEGAMOE_TACTIC_AUTOTUNE"] = "1" if args.autotune else "0"
     if args.autotune:
         # The MERGE tuning strategy barriers the EP ranks in lockstep and
