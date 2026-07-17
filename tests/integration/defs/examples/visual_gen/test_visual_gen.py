@@ -1716,6 +1716,47 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
+def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
+    """Run the FLUX.2 example with the existing reference-image request argument."""
+    model_path = _lpips_model_path("FLUX.2-dev")
+    _skip_if_missing(model_path, "FLUX.2-dev checkpoint", is_dir=True)
+    reference_path = _golden_media_path(
+        tmp_path, "flux2_lpips_golden.png", "FLUX.2 reference image"
+    )
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "flux2_reference_image_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "flux2_reference_image_output.png")
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "flux2.py")
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "flux2-dev-fp4-1gpu.yaml"
+    )
+
+    _venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--reference_image",
+            str(reference_path),
+            "--height",
+            "256",
+            "--width",
+            "256",
+            "--num_inference_steps",
+            "4",
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
 def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/models/ltx2.py with NVFP4 config end-to-end.
 

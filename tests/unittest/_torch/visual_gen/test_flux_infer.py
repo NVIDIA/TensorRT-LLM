@@ -27,6 +27,7 @@ def test_infer_forwards_num_images_per_prompt(
             seed=42,
             max_sequence_length=512,
             num_images_per_prompt=2,
+            image=[b"reference"],
         ),
     )
 
@@ -35,3 +36,7 @@ def test_infer_forwards_num_images_per_prompt(
     assert result == "image"
     pipeline.forward.assert_called_once()
     assert pipeline.forward.call_args.kwargs["num_images_per_prompt"] == 2
+    if pipeline_cls is Flux2Pipeline:
+        assert pipeline.forward.call_args.kwargs["image"] == [b"reference"]
+    else:
+        assert "image" not in pipeline.forward.call_args.kwargs

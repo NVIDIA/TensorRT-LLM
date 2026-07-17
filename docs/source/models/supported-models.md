@@ -154,7 +154,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | HuggingFace Model ID | Tasks |
 |---|---|
 | `black-forest-labs/FLUX.1-dev` | Text-to-Image |
-| `black-forest-labs/FLUX.2-dev` | Text-to-Image |
+| `black-forest-labs/FLUX.2-dev` | Text-to-Image (optional reference-image conditioning) |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | Image-to-Video |
@@ -172,8 +172,8 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 | Model | FP8 blockwise | NVFP4 | TeaCache | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism |
 |---|---|---|---|---|---|---|---|---|---|--|--|--|
-| **FLUX.1** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
-| **FLUX.2** | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.1** | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
+| **FLUX.2** [^vg2] | Yes | Yes | Yes | No [^vg1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
@@ -181,3 +181,5 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Cosmos3** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
+
+[^vg2]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, rejects TeaCache, and requires the combined target/reference token count to be divisible across sequence-parallel ranks. Other parallel and CUDA Graph combinations remain under qualification.

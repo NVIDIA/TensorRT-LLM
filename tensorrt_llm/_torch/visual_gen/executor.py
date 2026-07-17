@@ -404,6 +404,12 @@ class DiffusionExecutor:
         # Universal field defaults
         for field_name, default_value in self.pipeline.default_generation_params.items():
             if hasattr(params, field_name) and getattr(params, field_name) is None:
+                if (
+                    params.image is not None
+                    and getattr(self.pipeline, "derive_output_size_from_reference", False) is True
+                    and field_name in ("height", "width")
+                ):
+                    continue
                 setattr(params, field_name, default_value)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
