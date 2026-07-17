@@ -466,8 +466,28 @@ class SessionPrefetcher:
             # wait_shutdown: this pool's shutdown must not return until its
             # workers exited (and released GPU memory) — the NEXT pool is
             # handed over instantly, without the ~50s sync spawn that used to
-            # hide the release window.
-            session = self.take(n_workers) or real_cls(n_workers=n_workers, wait_shutdown=True)
+            # hide the release window. Such spawns fail closed when identity
+            # collection cannot complete; a prefetch layer must not turn that
+            # into a test failure, so retry once and then degrade LOUDLY to a
+            # plain pool (pre-prefetch semantics: shutdown returns at
+            # disconnect).
+            session = self.take(n_workers)
+            if session is None:
+                try:
+                    session = real_cls(n_workers=n_workers, wait_shutdown=True)
+                except Exception as e:
+                    print(f"[session-prefetch] pool spawn failed, retrying once: {e}", flush=True)
+                    try:
+                        session = real_cls(n_workers=n_workers, wait_shutdown=True)
+                    except Exception as e2:
+                        print(
+                            "[session-prefetch] wait_shutdown spawn failed twice: "
+                            f"{e2}; falling back to a plain pool (handover "
+                            "protection degraded for the NEXT pool on this node)",
+                            flush=True,
+                        )
+                        self.stats["pools_spawned_degraded"] += 1
+                        session = real_cls(n_workers=n_workers)
             self.schedule_shadow(n_workers)  # re-arm for the NEXT test
             return session
 

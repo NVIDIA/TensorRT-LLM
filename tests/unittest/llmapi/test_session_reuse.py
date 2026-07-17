@@ -119,6 +119,23 @@ def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
     assert reuse_cache.prefetch.restocks  # shadow armed for the NEXT miss
 
 
+def test_spawn_failure_retries_once(reuse_cache):
+    # wait_shutdown spawns fail closed (identity collection must complete);
+    # one loud retry absorbs a transient slow node, a second failure means
+    # the node is genuinely broken and must propagate.
+    calls = []
+
+    class _FlakyPool(_FakePool):
+        def __init__(self, n_workers, wait_shutdown=False, env_overrides=None):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("identity collection incomplete")
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+
+    s = reuse_cache.acquire(_FlakyPool, 2)
+    assert isinstance(s._real, _FlakyPool) and len(calls) == 2
+
+
 def test_reuse_size_mismatch_builds_new(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     s1.shutdown()

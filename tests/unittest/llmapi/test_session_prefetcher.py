@@ -161,6 +161,26 @@ def test_take_wrong_size_in_flight_does_not_wait(prefetcher, monkeypatch):
     assert isinstance(taken, _FakePool) and taken.n_workers == 2
 
 
+def test_factory_degrades_loudly_when_wait_shutdown_spawn_fails(prefetcher):
+    # The library fails closed when identity collection cannot complete; the
+    # prefetch layer must not turn that into a test failure: retry once,
+    # then degrade LOUDLY to a plain pool (pre-prefetch semantics).
+    calls = []
+
+    class _FailingWaitPool(_FakePool):
+        def __init__(self, n_workers, wait_shutdown=False):
+            calls.append(wait_shutdown)
+            if wait_shutdown:
+                raise RuntimeError("identity collection incomplete")
+            super().__init__(n_workers, wait_shutdown)
+
+    factory = prefetcher._make_factory(_FailingWaitPool)
+    session = factory(2)
+    assert isinstance(session, _FailingWaitPool) and not session.wait_shutdown
+    assert calls == [True, True, False]  # two contract attempts, then plain
+    assert prefetcher.stats["pools_spawned_degraded"] == 1
+
+
 def test_factory_hit_hands_over_shadow(prefetcher):
     pool = _FakePool(4)
     _arm(prefetcher, pool, spec=4)

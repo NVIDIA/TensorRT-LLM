@@ -249,8 +249,13 @@ class MpiPoolSession(MpiSession):
     def _collect_worker_identities(self) -> Tuple:
         """(pid, start_time) of every worker, recorded right after spawn.
 
-        Best effort: on any failure the session simply behaves as
-        ``wait_shutdown=False`` (shutdown returns at disconnect, as before).
+        FAIL-CLOSED (review requirement): ``wait_shutdown=True`` is a
+        contract — shutdown blocks until the workers exited. A pool without
+        complete identities cannot honor it, and returning it anyway would
+        silently downgrade to the old non-waiting behavior (the timeout can
+        trip on a slow-but-healthy bootstrap, and ``futures_wait`` does not
+        cancel the pending tasks). Instead of handing out such a pool, tear
+        it down and raise; callers fall back to a fresh spawn.
         """
         try:
             futures = [
@@ -258,24 +263,48 @@ class MpiPoolSession(MpiSession):
                 for _ in range(self.n_workers)
             ]
             done, not_done = futures_wait(futures, timeout=60.0)
-            if not_done:
-                # A worker that never picked up its barrier task leaves the
-                # others blocked in the barrier: the pool itself is likely
-                # broken (a worker died during spawn) and later submits may
-                # hang — name that here so the eventual hang is attributable.
-                logger.warning(
-                    "MpiPoolSession(wait_shutdown=True): worker identity "
-                    "collection timed out; shutdown will not wait for worker "
-                    "exit, and the pool may be unusable (workers can be stuck "
-                    "in the collection barrier if one died during spawn)")
-                return ()
-            return tuple(f.result() for f in done)
+            identities = tuple(f.result() for f in done)
         except Exception as e:
-            logger.warning(
+            self._teardown_unidentified_pool(())
+            raise RuntimeError(
                 f"MpiPoolSession(wait_shutdown=True): worker identity "
-                f"collection failed ({e}); shutdown will not wait for "
-                f"worker exit")
-            return ()
+                f"collection failed ({e}); pool torn down") from e
+        if (not_done or len(identities) != self.n_workers
+                or len({pid
+                        for pid, _ in identities}) != self.n_workers
+                or any(start is None for _, start in identities)):
+            self._teardown_unidentified_pool(identities)
+            raise RuntimeError(
+                "MpiPoolSession(wait_shutdown=True): worker identity "
+                f"collection incomplete ({len(identities)}/{self.n_workers} "
+                "valid identities); pool torn down instead of handing out a "
+                "session that cannot honor the wait_shutdown contract")
+        return identities
+
+    def _teardown_unidentified_pool(self, partial_identities: Tuple) -> None:
+        """Dispose of a pool whose identity collection failed.
+
+        The workers may be stuck in the collection barrier (one of them
+        never picked up its task), so a graceful blocking shutdown could
+        hang; disconnect without waiting and SIGKILL the workers we did
+        identify (with the pid-recycling guard). Workers we never identified
+        exit with the MPI runtime teardown; if one is truly wedged it leaks
+        until job end — the same bounded leak class as any wedged pool.
+        """
+        import signal
+
+        try:
+            self.mpi_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        self.mpi_pool = None
+        for pid, start in partial_identities:
+            if start is None or _process_start_time(pid) != start:
+                continue  # gone already, or the PID was recycled
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     def _wait_workers_exit(self, timeout: float = 30.0) -> None:
         """Block until the spawned worker processes have actually exited.

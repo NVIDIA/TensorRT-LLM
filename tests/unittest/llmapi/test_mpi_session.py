@@ -214,3 +214,64 @@ def test_wait_workers_exit_bounded_by_timeout_on_live_worker():
     _wait_workers_exit((me, ), timeout=0.2)  # this process will not exit
     waited = _time.monotonic() - t0
     assert 0.2 <= waited < 2.0  # bounded: a wedged worker cannot hang teardown
+
+
+def _collect_identities(monkeypatch, results, pending=0, n_workers=2):
+    """Drive _collect_worker_identities on an inert stand-in (no MPI spawn)."""
+    import types
+    from concurrent.futures import Future
+
+    futs = []
+    for r in results:
+        f = Future()
+        f.set_result(r)
+        futs.append(f)
+    never = [Future() for _ in range(pending)]  # never resolve
+
+    from tensorrt_llm.llmapi import mpi_session as m
+
+    monkeypatch.setattr(m, "futures_wait", lambda fs, timeout: (futs, never))
+    killed = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+    it = iter(futs + never)
+    stand_in = types.SimpleNamespace(
+        n_workers=n_workers,
+        mpi_pool=types.SimpleNamespace(submit=lambda fn: next(it),
+                                       shutdown=lambda wait=True: None),
+        _teardown_unidentified_pool=lambda ids: MpiPoolSession.
+        _teardown_unidentified_pool(stand_in, ids),
+    )
+    result = MpiPoolSession._collect_worker_identities(stand_in)
+    return result, killed
+
+
+def test_identity_collection_complete_returns_identities(monkeypatch):
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    other = (1, b"1")  # pid 1: exists but start_time won't match -> unique pid
+    ids, killed = _collect_identities(monkeypatch, [me, other])
+    assert set(ids) == {me, other} and not killed
+
+
+def test_identity_collection_fails_closed_on_timeout(monkeypatch):
+    # A pending barrier task means the pool cannot honor wait_shutdown:
+    # the session must be torn down and rejected, NOT handed out with the
+    # contract silently downgraded (review requirement).
+    import pytest as _pytest
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    with _pytest.raises(RuntimeError, match="incomplete"):
+        _collect_identities(monkeypatch, [me], pending=1)
+
+
+def test_identity_collection_fails_closed_on_duplicate_pids(monkeypatch):
+    import pytest as _pytest
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    with _pytest.raises(RuntimeError, match="incomplete"):
+        _collect_identities(monkeypatch, [me, me])  # one worker answered twice

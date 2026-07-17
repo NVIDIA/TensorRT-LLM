@@ -375,7 +375,14 @@ class SessionReuseCache:
             except Exception:
                 pass
         if real is None:
-            real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+            try:
+                real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+            except Exception as e:
+                # wait_shutdown spawns fail closed (identity collection must
+                # complete); a transient slow node deserves one loud retry —
+                # a second failure means the node is genuinely broken.
+                print(f"[session-reuse] pool spawn failed, retrying once: {e}", flush=True)
+                real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
         # (pid, start_time) per worker, recorded by the library at spawn
