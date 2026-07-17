@@ -159,6 +159,7 @@ def ENABLE_CBTS_COVERAGE = true
 // enabled above while this remains off so a later pilot allowlist has fresh data.
 @Field
 def ENABLE_CBTS_COVERAGE_TIER = false
+@Field
 def OSS_COMPLIANCE_FILE_CHANGED = "oss_compliance_file_changed"
 
 def testFilter = [
@@ -1713,6 +1714,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     if (GEN_POST_MERGE_BUILDS_ONLY) {
                         echo "Skipping OSS Compliance Check (GenPostMergeBuilds mode: builds only)"
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
                         return
                     }
                     def ref = env.gitlabBranch ?: "main"
