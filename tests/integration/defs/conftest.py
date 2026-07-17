@@ -690,10 +690,7 @@ def llm_venv(llm_root, custom_user_workspace):
     # Remove the workspace directory
     if os.path.exists(workspace_dir):
         print(f"Cleaning up workspace: {workspace_dir}")
-        try:
-            shutil.rmtree(workspace_dir)
-        except Exception as e:
-            print(f"Failed to clean up workspace: {e}")
+        shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
