@@ -258,6 +258,100 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert int(worker._ctx_len[sa]) == 0
 
 
+def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
+    """Mixed (context + gen) batch: ``forward`` must route acceptance and
+    production through the unified ``SpecWorkerBase`` entries, one-hot-fill the
+    context requests' draft-prob rows, and assemble
+    ``next_draft_tokens = [ctx zeros ; gen argmax]``.
+
+    Spies replace the base sampling entries and the heavy sub-calls (context
+    seeding, per-request draft backbone) so this exercises the worker's
+    context/gen orchestration — the exact surface the #15775 refactor changed —
+    without a real draft model or MPI.
+    """
+    worker = _make_worker()
+    worker.guided_decoder = None
+    dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
+
+    K = worker.max_draft_len
+    vocab = 16
+    num_contexts, num_gens = 2, 3
+    batch_size = num_contexts + num_gens
+
+    meta = _make_metadata(max_num_requests=8)
+    meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
+    meta.prepare()
+
+    attn_metadata = types.SimpleNamespace(
+        num_seqs=batch_size,
+        num_contexts=num_contexts,
+        num_ctx_tokens=0,
+        num_tokens=batch_size,
+    )
+
+    # Acceptance: return a fixed verified prefix (one accepted token per request).
+    accepted = torch.arange(batch_size * (K + 1), dtype=torch.int32, device="cuda").reshape(
+        batch_size, K + 1
+    )
+    num_accepted = torch.ones(batch_size, dtype=torch.int32, device="cuda")
+    accept_calls = {}
+
+    def fake_accept(logits, am, sm):
+        accept_calls["args"] = (am, sm)
+        return accepted, num_accepted
+
+    monkeypatch.setattr(worker, "sample_and_accept_draft_tokens", fake_accept)
+    # Context-window seeding is covered by its own test; stub it out here.
+    monkeypatch.setattr(worker, "_seed_context_windows", lambda *a, **k: None)
+
+    # The gen-block helper now returns the corrected block logits [num_gens,K,vocab].
+    gen_logits = torch.randn(num_gens, K, vocab, device="cuda")
+    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: gen_logits)
+
+    sdt_calls = {}
+
+    def fake_sample_draft_tokens(gl, sm, bs, *, num_contexts):
+        sdt_calls["logits"] = gl
+        sdt_calls["batch_size"] = bs
+        sdt_calls["num_contexts"] = num_contexts
+        return gl.argmax(dim=-1).to(torch.int32)
+
+    monkeypatch.setattr(worker, "sample_draft_tokens", fake_sample_draft_tokens)
+
+    onehot_calls = {}
+    monkeypatch.setattr(
+        worker,
+        "write_context_onehot_draft_probs",
+        lambda sm, nc, ng, k, gv: onehot_calls.update(nc=nc, ng=ng, k=k, gv=gv),
+    )
+
+    input_ids = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    position_ids = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    hidden = torch.zeros(batch_size, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    logits = torch.zeros(batch_size, vocab, device="cuda")
+
+    out = worker.forward(input_ids, position_ids, hidden, logits, attn_metadata, meta, dm)
+
+    # Acceptance went through the unified entry with the right metadata objects.
+    assert accept_calls["args"] == (attn_metadata, meta)
+    # Production fed the [num_gens, K, vocab] block logits to the base sampler,
+    # with num_contexts so it slices the gen segment.
+    assert sdt_calls["num_contexts"] == num_contexts
+    assert sdt_calls["logits"].shape == (num_gens, K, vocab)
+    # Context rows one-hot-filled with the gen vocab width.
+    assert onehot_calls == {"nc": num_contexts, "ng": num_gens, "k": K, "gv": vocab}
+
+    # next_draft_tokens = [context zeros ; gen argmax]; gen subset is not polluted
+    # by the context rows.
+    nd = out["next_draft_tokens"]
+    assert nd.shape == (batch_size, K)
+    assert torch.all(nd[:num_contexts] == 0)
+    assert torch.equal(nd[num_contexts:], gen_logits.argmax(dim=-1).to(torch.int32))
+    # Verified tokens are surfaced unchanged.
+    assert torch.equal(out["new_tokens"], accepted)
+    assert torch.equal(out["new_tokens_lens"], num_accepted)
+
+
 def test_prepare_leaves_slots_untouched_on_legacy_real_mla_path():
     """With the real-fp8-MLA fallback (eager loop) prepare() doesn't recycle slots."""
     worker = _make_worker()

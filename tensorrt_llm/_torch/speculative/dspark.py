@@ -173,8 +173,9 @@ class DSparkWorker(SpecWorkerBase):
     Unlike DFlash, the draft does NOT use the paged KV cache or mask-token
     cross-attention: its attention K/V come from the worker-owned rolling window
     of projected captured context (one ``main_kv`` per decode step, per stage).
-    Acceptance of the previous block is the standard target-verify rule
-    (:meth:`_sample_and_accept_draft_tokens_base`), so greedy parity with no-spec
+    Acceptance of the previous block goes through the unified
+    :meth:`SpecWorkerBase.sample_and_accept_draft_tokens` (strict target-verify,
+    or rejection sampling for a non-greedy batch), so greedy parity with no-spec
     is preserved regardless of draft quality.
 
     The rolling window is kept consistent across the whole decode: it is seeded
@@ -345,7 +346,6 @@ class DSparkWorker(SpecWorkerBase):
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
-        block = int(draft_model.block_size)
         Kp1 = K + 1
         conf_thr = (
             float(getattr(self.spec_config, "confidence_threshold", 0.0))
@@ -356,11 +356,11 @@ class DSparkWorker(SpecWorkerBase):
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         gen_start = attn_metadata.num_ctx_tokens
 
-        out_tokens = torch.zeros((num_gens, block), dtype=torch.int32, device="cuda")
         if captured is None:
-            return out_tokens
+            return None
 
         gen_req_ids = spec_metadata.request_ids[num_contexts:batch_size]
+        block_logits_rows = []
         for i in range(num_gens):
             slot = self._assign_slot(gen_req_ids[i], reset=False)
             nacc = int(num_accepted_tokens[num_contexts + i].item())
@@ -386,19 +386,22 @@ class DSparkWorker(SpecWorkerBase):
             start_pos = int(self._ctx_len[slot].item())
             win_slice = self._kv_windows[slot : slot + 1]  # [1, num_stages, win, hd] view
 
-            # forward() returns (draft_tokens, num_proposed); the worker proposes
-            # the full block (confidence truncation off), so num_proposed is unused.
-            toks, _ = draft_model.forward(
+            # forward() returns (draft_tokens, num_proposed, block_logits); the
+            # worker proposes the full block (confidence truncation off, so
+            # num_proposed is unused) and surfaces the per-position corrected
+            # logits for SpecWorkerBase.sample_draft_tokens.
+            _toks, _num_proposed, logits_i = draft_model.forward(
                 main_hidden,
                 bonus,
                 start_pos,
                 kv_windows=win_slice,
                 temperature=0.0,
                 confidence_threshold=conf_thr,
+                return_logits=True,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
-            out_tokens[i] = toks[0].to(torch.int32)
-        return out_tokens
+            block_logits_rows.append(logits_i[0])
+        return torch.stack(block_logits_rows, dim=0)
 
     def _draft_gen_block_batched(
         self,
@@ -419,21 +422,21 @@ class DSparkWorker(SpecWorkerBase):
         ``main_hidden``, ``start_pos``, the multi-accept back-fill) are gathered as
         tensors, slots come from the host-built ``_batch_to_slot`` mirror, and the
         backbone runs once via ``DSparkDraftModel.forward_batched``. Returns the
-        ``[num_gens, block]`` draft tokens (confidence truncation stays disabled —
-        the worker proposes the full block, matching the eager baseline).
+        per-position corrected block logits ``[num_gens, K, vocab]`` (or ``None``
+        when there is nothing to draft); the worker feeds them to
+        ``SpecWorkerBase.sample_draft_tokens``. Confidence truncation stays
+        disabled — the full block is proposed, matching the eager baseline.
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
-        block = int(draft_model.block_size)
         Kp1 = K + 1
         device = accepted_tokens.device
 
-        out_tokens = torch.zeros((num_gens, block), dtype=torch.int32, device=device)
         if num_gens == 0:
-            return out_tokens
+            return None
         captured = spec_metadata.get_hidden_states(total_target_tokens)
         if captured is None:
-            return out_tokens
+            return None
 
         # gen-only graph batches have num_ctx_tokens == 0; mixed eager batches put
         # the gen tokens after the context tokens.
@@ -473,7 +476,10 @@ class DSparkWorker(SpecWorkerBase):
         start_pos = old + nacc  # [G]
         self._ctx_len[slots] = start_pos
 
-        toks, _num_proposed = draft_model.forward_batched(
+        # Surface the per-position corrected block logits ([num_gens, K, vocab])
+        # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
+        # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
+        _toks, _num_proposed, block_logits = draft_model.forward_batched(
             main_hidden,
             bonus,
             start_pos,
@@ -481,9 +487,10 @@ class DSparkWorker(SpecWorkerBase):
             slots=slots,
             temperature=0.0,
             confidence_threshold=0.0,
+            return_logits=True,
             all_rank_num_tokens=all_rank_num_tokens,
         )
-        return toks.to(torch.int32)
+        return block_logits
 
     def forward(
         self,
@@ -508,15 +515,13 @@ class DSparkWorker(SpecWorkerBase):
         spec_metadata._dspark_worker = self
         self._execute_guided_decoder_if_present(logits)
 
-        # Previous step stored K draft tokens per gen request.
-        if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
-
-        # Standard target-verify acceptance (preserves greedy parity).
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata
+        # Target-verify acceptance via the unified SpecWorkerBase entry: it
+        # reshapes the stored draft tokens (default (num_gens, runtime_draft_len)
+        # hook), then routes to strict or rejection sampling. Greedy parity with
+        # the previous hand-rolled path is preserved (rejection only engages for a
+        # non-greedy batch with valid draft_probs).
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
         )
 
         total_target_tokens = input_ids.shape[0]
@@ -578,13 +583,14 @@ class DSparkWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
-            # Both gen-block variants take the same args and return [num_gens, K]
-            # draft tokens; the batched one is the default (CUDA-graph-safe), the
-            # legacy per-request loop is the eager real-fp8-MLA fallback.
+            # Both gen-block variants return the per-position corrected block
+            # logits [num_gens, K, vocab]; the batched one is the default
+            # (CUDA-graph-safe), the legacy per-request loop is the eager
+            # real-fp8-MLA fallback.
             gen_block = (
                 self._draft_gen_block_batched if self._use_batched else self._draft_gen_block
             )
-            gen_draft_tokens = gen_block(
+            gen_logits = gen_block(
                 draft_model,
                 spec_metadata,
                 attn_metadata,
@@ -595,6 +601,17 @@ class DSparkWorker(SpecWorkerBase):
                 total_target_tokens,
                 all_rank_num_tokens=all_rank_draft_tokens,
             )
+            if gen_logits is not None:
+                # SpecWorkerBase samples the draft tokens (greedy argmax, or
+                # rejection sampling for a non-greedy batch), performs the TP
+                # gather, and scatters the proposal distribution into draft_probs.
+                gen_draft_tokens = self.sample_draft_tokens(
+                    gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+                )
+                gen_vocab = gen_logits.shape[-1]
+            else:
+                gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
+                gen_vocab = None
         else:
             # No local generation requests: if any peer EP rank has some, we must
             # still cross the draft MoE's cross-rank barrier the same number of
@@ -602,6 +619,12 @@ class DSparkWorker(SpecWorkerBase):
             if global_has_gen:
                 draft_model.run_moe_lockstep_noop(all_rank_draft_tokens, accepted_tokens.device)
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+            gen_vocab = None
+
+        # Context requests are not drafted by the block worker (zero placeholder
+        # token); fill their draft-prob slot rows with a legal one-hot so they are
+        # a valid distribution when they become gen requests next iteration.
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
 
         if num_contexts > 0:
             ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")

@@ -5197,6 +5197,7 @@ class TorchLlmArgs(BaseLlmArgs):
                                 or spec_mode == TorchSpeculativeDecodingMode.MTP
                                 or spec_mode.is_mtp_eagle_one_model()
                                 or spec_mode.is_pard() or spec_mode.is_dflash()
+                                or spec_mode.is_dspark()
                                 or spec_mode.is_draft_target_one_model())
 
                 # Combinations that break the proposal-distribution invariant.
@@ -5206,6 +5207,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 is_new_rejection_method = (
                     spec_mode == TorchSpeculativeDecodingMode.MTP
                     or spec_mode.is_pard() or spec_mode.is_dflash()
+                    or spec_mode.is_dspark()
                     or spec_mode.is_draft_target_one_model())
                 # Plain tensor parallelism is supported (the draft path
                 # all-gathers vocab-sharded draft logits before rejection, see
