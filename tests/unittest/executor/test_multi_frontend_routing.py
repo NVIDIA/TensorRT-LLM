@@ -50,9 +50,9 @@ class TestClientIdNamespacing:
 
     def test_knob_cap_matches_encoding(self):
         from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+
         meta = BaseLlmArgs.model_fields["num_serve_frontends"].metadata
-        assert any(
-            getattr(m, "le", None) == MAX_NUM_FRONTENDS for m in meta)
+        assert any(getattr(m, "le", None) == MAX_NUM_FRONTENDS for m in meta)
 
     def test_counter_wraparound_stays_in_namespace(self):
         # A counter overflowing its field must not leak into the frontend bits.

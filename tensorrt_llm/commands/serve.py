@@ -26,7 +26,7 @@ from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
-from tensorrt_llm.executor.utils import (LlmLauncherEnvs, MAX_NUM_FRONTENDS)
+from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
