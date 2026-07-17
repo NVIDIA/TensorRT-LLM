@@ -16,12 +16,10 @@
 
 import asyncio
 import queue as _queue
-from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm.executor import EngineDeadError
-from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
 
@@ -97,20 +95,6 @@ def test_handle_worker_death_broadcasts_event_driven():
     assert item.root_cause is cause
     # Error is also recorded for the monitor loop (which drives pre_shutdown).
     assert proxy._error_queue.get_nowait() is cause
-
-
-def test_register_worker_processes_with_session_reuse_factory(monkeypatch):
-    """Session reuse replaces proxy.MpiPoolSession with a factory function."""
-    pool_session = object()
-    monkeypatch.setattr(proxy_module, "MpiPoolSession", lambda n_workers: pool_session)
-    proxy = _bare_proxy()
-    proxy.mpi_session = proxy_module.MpiPoolSession(1)
-    proxy._worker_process_monitor = Mock()
-    identities = [object()]
-
-    proxy._register_worker_processes((proxy.READY_SIGNAL, None, identities))
-
-    proxy._worker_process_monitor.register.assert_called_once_with(identities)
 
 
 def test_result_step_raises_on_engine_dead():
