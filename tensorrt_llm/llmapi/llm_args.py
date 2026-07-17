@@ -4124,6 +4124,8 @@ class BaseLlmArgs(StrictBaseModel):
     num_serve_frontends: int = Field(
         default=1,
         ge=1,
+        # = executor.utils.MAX_NUM_FRONTENDS (cannot be imported here);
+        # test_multi_frontend_routing pins the two together.
         le=64,
         description=
         "The number of HTTP frontend processes serving one executor. Used by "

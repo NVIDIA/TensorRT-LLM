@@ -705,6 +705,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
 
+    def _get_next_client_id(self) -> int:
+        client_id = super()._get_next_client_id()
+        if self._num_frontends > 1:
+            # Lane 0 follows the same namespace rule as attached frontends
+            # so a long-lived counter can never bleed into the frontend-id
+            # bits (a no-op re-encode until the counter wraps).
+            client_id = namespace_client_id(0, client_id)
+        return client_id
+
     def _cleanup_multi_frontend_ipc_dir(self):
         """Remove the launcher-owned multi-frontend ipc directory.
 
@@ -1039,6 +1048,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             is_llm_executor=is_llm_executor)
 
         self._frontend_id = frontend_id
+        self._num_frontends = num_lanes
         self._results: Dict[int, GenerationResult] = {}
         self.garbage_collection_gen0_threshold = None
         self.workers_started = False

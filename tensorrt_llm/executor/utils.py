@@ -236,11 +236,16 @@ class WorkerCommIpcAddrs(NamedTuple):
                                                      Optional[bytes]]]] = None
 
 
-# Multi-frontend client_id namespacing: the top bits of the uint64 client id
-# carry the frontend id, the low FRONTEND_ID_SHIFT bits carry the per-frontend
-# request counter. Frontend id 0 keeps client ids bit-identical to the legacy
-# single-frontend scheme.
-FRONTEND_ID_SHIFT = 48
+# Multi-frontend client_id namespacing: a FRONTEND_ID_BITS-wide frontend id
+# sits just below the sign bit -- bit 63 stays clear so ids remain positive
+# in signed-int64 contexts -- and the low bits carry the per-frontend
+# request counter. A stray un-namespaced (small) id reads as frontend 0,
+# the launcher.
+FRONTEND_ID_BITS = 6
+# Keep llm_args.num_serve_frontends le= in sync (it cannot import this
+# module; test_multi_frontend_routing pins the two together).
+MAX_NUM_FRONTENDS = 1 << FRONTEND_ID_BITS
+FRONTEND_ID_SHIFT = 63 - FRONTEND_ID_BITS
 FRONTEND_COUNTER_MASK = (1 << FRONTEND_ID_SHIFT) - 1
 
 

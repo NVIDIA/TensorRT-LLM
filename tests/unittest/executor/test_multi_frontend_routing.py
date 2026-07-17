@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 from tensorrt_llm.executor.utils import (
     FRONTEND_COUNTER_MASK,
+    MAX_NUM_FRONTENDS,
     bucket_responses_by_frontend,
     frontend_lane_index,
     get_frontend_id,
@@ -39,15 +40,22 @@ class TestClientIdNamespacing:
             assert namespace_client_id(0, client_id) == client_id
 
     def test_roundtrip(self):
-        for frontend_id in (0, 1, 7, (1 << 16) - 1):
+        for frontend_id in (0, 1, 7, MAX_NUM_FRONTENDS - 1):
             for counter in (1, 12345, FRONTEND_COUNTER_MASK):
                 client_id = namespace_client_id(frontend_id, counter)
                 assert get_frontend_id(client_id) == frontend_id
                 assert client_id & FRONTEND_COUNTER_MASK == counter
-                assert client_id < (1 << 64)
+                # Bit 63 stays clear: ids remain positive as signed int64.
+                assert 0 < client_id < (1 << 63)
+
+    def test_knob_cap_matches_encoding(self):
+        from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
+        meta = BaseLlmArgs.model_fields["num_serve_frontends"].metadata
+        assert any(
+            getattr(m, "le", None) == MAX_NUM_FRONTENDS for m in meta)
 
     def test_counter_wraparound_stays_in_namespace(self):
-        # A counter larger than 48 bits must not leak into the frontend bits.
+        # A counter overflowing its field must not leak into the frontend bits.
         client_id = namespace_client_id(3, FRONTEND_COUNTER_MASK + 5)
         assert get_frontend_id(client_id) == 3
         assert client_id & FRONTEND_COUNTER_MASK == 4
