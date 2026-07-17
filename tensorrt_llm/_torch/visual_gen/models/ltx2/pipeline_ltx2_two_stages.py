@@ -1345,13 +1345,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             rescale_scale=rescale_scale,
             guidance_skip_step=guidance_skip_step,
             enhance_prompt=enhance_prompt,
-            _latents_on_all_ranks=True,
         )
 
         gpu_tl.mark("stage1")
         # Every rank computes the full stage-1 latents (all-rank denoise loop +
-        # per-forward gather); ``_latents_on_all_ranks`` keeps them on every rank
-        # so Stage 2 needs no handoff collective in either parallel-VAE mode.
+        # per-forward gather) and output_type="latent" returns them on every
+        # rank, so Stage 2 needs no handoff collective in either parallel-VAE mode.
         video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio  # (B, C, F_aud, M) or None
         assert video_latents is not None, "stage-1 latents missing on this rank"

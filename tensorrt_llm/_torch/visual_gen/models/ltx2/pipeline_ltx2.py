@@ -1465,7 +1465,6 @@ class LTX2Pipeline(BasePipeline):
         rescale_scale: float = 0.0,
         guidance_skip_step: int = 0,
         enhance_prompt: bool = False,
-        _latents_on_all_ranks: bool = False,
     ):
         """Generate video (and audio) from text, optionally conditioned on an image.
 
@@ -2073,11 +2072,12 @@ class LTX2Pipeline(BasePipeline):
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
-        if output_type == "latent" and _latents_on_all_ranks:
-            # Internal two-stage handoff: the latent "decode" is a cheap local
-            # unpatchify and every rank already holds the full latents — keep them
-            # on every rank (decode_latents' rank gate exists to skip real VAE
-            # decode only). The external latent contract stays rank-0-return.
+        if output_type == "latent":
+            # The latent "decode" is a cheap local unpatchify with no VAE work,
+            # and every rank already holds the full latents after the denoise
+            # loop — return them on every rank. decode_latents' vae_ranks/rank-0
+            # gate exists to skip real VAE decode only; the two-stage handoff
+            # consumes these latents in place with zero collectives.
             video = decode_video_fn(latents)
             audio = decode_audio_fn(audio_latents) if audio_latents is not None else None
         else:
