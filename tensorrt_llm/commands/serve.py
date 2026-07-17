@@ -27,8 +27,7 @@ from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
-from tensorrt_llm.executor.utils import (LlmLauncherEnvs,
-                                         get_num_serve_frontends)
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
@@ -384,25 +383,26 @@ def _init_multi_frontend_mode(llm_args: dict,
                               enabled: bool) -> MultiFrontendMode:
     """Resolve the multi-frontend serving mode (prototype).
 
-    num_serve_frontends=K (--num_serve_frontends / config yaml; the
-    TLLM_SERVE_NUM_FRONTENDS env is honored as a fallback when the knob is
-    unset) runs K HTTP frontend processes against ONE executor. The
-    launcher (frontend 0) launches the worker as usual and spawns K-1
-    attached frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set)
-    skip the spawning. Supported only on the classic IPC executor path
-    (the default orchestrator).
+    num_serve_frontends=K (--num_serve_frontends / config yaml) runs K
+    HTTP frontend processes against ONE executor. The launcher
+    (frontend 0) launches the worker as usual and spawns K-1 attached
+    frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set) skip
+    the spawning. Supported only on the classic IPC executor path (the
+    default orchestrator).
 
     The executor proxy reads num_serve_frontends from llm_args and
     provisions the shared ipc endpoints itself
-    (GenerationExecutorProxy._setup_queues); this function only normalizes
-    the knob into llm_args before the LLM is created.
+    (GenerationExecutorProxy._setup_queues).
 
     Entry points that reach launch_server but must not honor the knob
-    (e.g. disaggregated MPI workers, which inherit the caller's env under
-    Slurm export-all) pass enabled=False.
+    (e.g. disaggregated MPI workers) pass enabled=False.
     """
-    num_frontends = llm_args.get(
-        "num_serve_frontends") or get_num_serve_frontends()
+    if os.getenv("TLLM_SERVE_NUM_FRONTENDS") is not None:
+        logger.warning(
+            "TLLM_SERVE_NUM_FRONTENDS is not supported; use the "
+            "num_serve_frontends llm-args knob (--num_serve_frontends or "
+            "the config yaml) instead.")
+    num_frontends = llm_args.get("num_serve_frontends", 1)
     if not enabled:
         if num_frontends > 1:
             logger.warning(
@@ -415,15 +415,11 @@ def _init_multi_frontend_mode(llm_args: dict,
     mode = MultiFrontendMode(
         num_frontends,
         os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
-    if mode.is_launcher:
-        if llm_args.get("orchestrator_type") is not None:
-            raise ValueError(
-                "num_serve_frontends > 1 currently supports only the "
-                "default (classic IPC) executor path, not orchestrator_type="
-                f"{llm_args.get('orchestrator_type')!r}")
-        # Make the resolved count visible to the executor proxy even when it
-        # came from the env fallback.
-        llm_args["num_serve_frontends"] = num_frontends
+    if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
+        raise ValueError(
+            "num_serve_frontends > 1 currently supports only the "
+            "default (classic IPC) executor path, not orchestrator_type="
+            f"{llm_args.get('orchestrator_type')!r}")
     return mode
 
 
@@ -1049,7 +1045,7 @@ def launch_visual_gen_server(
                   "to comply with OpenAI protocol.",
                   status="prototype")
 @stability_option("--num_serve_frontends",
-                  type=click.IntRange(min=1, max=1 << 16),
+                  type=click.IntRange(min=1, max=64),
                   default=1,
                   help="Number of HTTP frontend processes serving one "
                   "executor; values > 1 share the serving port via "

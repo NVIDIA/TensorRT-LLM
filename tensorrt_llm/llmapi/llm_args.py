@@ -4124,7 +4124,7 @@ class BaseLlmArgs(StrictBaseModel):
     num_serve_frontends: int = Field(
         default=1,
         ge=1,
-        le=1 << 16,
+        le=64,
         description=
         "The number of HTTP frontend processes serving one executor. Used by "
         "trtllm-serve: values > 1 run additional attached frontend processes "

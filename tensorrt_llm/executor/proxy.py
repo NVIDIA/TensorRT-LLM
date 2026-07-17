@@ -1007,7 +1007,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
     """An attached serving frontend for the classic IPC executor path.
 
-    Used for multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1).
+    Used for multi-frontend serving (num_serve_frontends > 1).
     PUSH-connects to the request ingress bound by the rank0 worker and binds
     its own per-frontend result lane (PULL); the worker routes responses to
     this lane by the frontend id embedded in the top bits of client_id (see

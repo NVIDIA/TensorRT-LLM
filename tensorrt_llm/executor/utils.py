@@ -285,20 +285,6 @@ def bucket_responses_by_frontend(responses: list,
     return buckets
 
 
-def get_num_serve_frontends() -> int:
-    """The number of serving frontend processes from TLLM_SERVE_NUM_FRONTENDS.
-
-    Env fallback for the llm_args.num_serve_frontends knob, honored by
-    trtllm-serve when the knob is unset (see commands/serve.py
-    _init_multi_frontend_mode). 1 (single frontend) when unset.
-    """
-    num_frontends = int(os.getenv("TLLM_SERVE_NUM_FRONTENDS", "1") or "1")
-    if not 0 < num_frontends <= (1 << 16):
-        raise ValueError(
-            f"TLLM_SERVE_NUM_FRONTENDS out of range: {num_frontends}")
-    return num_frontends
-
-
 def multi_frontend_request_addr(ipc_dir: str) -> str:
     """The request ingress endpoint bound by the rank0 worker (PULL).
 

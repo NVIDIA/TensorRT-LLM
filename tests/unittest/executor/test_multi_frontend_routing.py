@@ -14,7 +14,7 @@
 # limitations under the License.
 """CPU-only tests for classic-path multi-frontend serving.
 
-Multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS) on the classic IPC
+Multi-frontend serving (num_serve_frontends) on the classic IPC
 executor path. Covers client-id namespacing, worker-side response-lane routing, and the
 attached-frontend proxy lifecycle over real ipc:// sockets.
 """
@@ -29,7 +29,6 @@ from tensorrt_llm.executor.utils import (
     bucket_responses_by_frontend,
     frontend_lane_index,
     get_frontend_id,
-    get_num_serve_frontends,
     namespace_client_id,
 )
 
@@ -60,25 +59,6 @@ class TestClientIdNamespacing:
         assert frontend_lane_index(namespace_client_id(2, 7), 3) == 2
         assert frontend_lane_index(namespace_client_id(7, 1), 2) == 0
         assert frontend_lane_index(None, 4) == 0
-
-
-class TestNumServeFrontendsEnv:
-    def test_defaults_to_one(self, monkeypatch):
-        monkeypatch.delenv("TLLM_SERVE_NUM_FRONTENDS", raising=False)
-        assert get_num_serve_frontends() == 1
-        monkeypatch.setenv("TLLM_SERVE_NUM_FRONTENDS", "")
-        assert get_num_serve_frontends() == 1
-
-    def test_parses_value(self, monkeypatch):
-        monkeypatch.setenv("TLLM_SERVE_NUM_FRONTENDS", "16")
-        assert get_num_serve_frontends() == 16
-
-    def test_rejects_out_of_range(self, monkeypatch):
-        import pytest
-        for bad in ("0", "-1", str((1 << 16) + 1)):
-            monkeypatch.setenv("TLLM_SERVE_NUM_FRONTENDS", bad)
-            with pytest.raises(ValueError):
-                get_num_serve_frontends()
 
 
 def _response(client_id):
