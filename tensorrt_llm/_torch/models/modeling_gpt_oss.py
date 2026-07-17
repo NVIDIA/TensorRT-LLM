@@ -60,10 +60,9 @@ class AttentionBlock(Attention):
                 beta_fast=pretrained_config.rope_scaling['beta_fast'],
                 beta_slow=pretrained_config.rope_scaling['beta_slow'],
                 duplicate_data=False),
-            # GPT-OSS pairs rotary dims NeoX-style (HF chunks halves). The
-            # fused kernel ignores this flag for YaRN and always applies the
-            # NeoX split, which masked the wrong value; the unfused Python
-            # path honors it, so False breaks any unfused-RoPE run.
+            # GPT-OSS applies NeoX-style (rotate-half) RoPE, matching the HF
+            # reference. The fused kernel ignores this flag for yarn (which
+            # masked the wrong value); the unfused path honors it.
             is_neox=True,
         )
 

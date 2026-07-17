@@ -1984,15 +1984,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
+        is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(
-            [req.is_dummy for req in self.requests])
+            is_dummy if requests is
+            self.requests else [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        for i, req in enumerate(requests):
-            self._request_id_to_state_index[
-                req.py_request_id] = self._host_state_indices[i].item()
-            self._request_id_to_is_dummy[req.py_request_id] = req.is_dummy
+        # Bulk tolist avoids a per-request tensor-index + .item() round-trip.
+        state_values = self._host_state_indices[:n].tolist()
+        for req, value, dummy in zip(requests, state_values, is_dummy):
+            self._request_id_to_state_index[req.py_request_id] = value
+            self._request_id_to_is_dummy[req.py_request_id] = dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
