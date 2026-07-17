@@ -198,15 +198,15 @@ class LTX2Attention(Attention):
         self._attn_default = self.attn
         self._attn_stage2 = self._attn_default
         if stage2_ulysses_group is not None and enable_sp:
-            # The stage-2 ulysses group lives inside one TP fiber, so the inner
-            # backend is sized from TP-local head counts (as the default stack is).
+            # Inner backend sized like the default stack (local head counts
+            # divided by the ulysses group size).
             s2 = torch_dist.get_world_size(group=stage2_ulysses_group)
             H = self.local_num_attention_heads
             H_kv = self.local_num_key_value_heads
             if H % s2 != 0 or H_kv % s2 != 0:
                 raise ValueError(
-                    f"stage-2 ulysses requires TP-local num_attention_heads ({H}) "
-                    f"and num_key_value_heads ({H_kv}) divisible by the stage-2 "
+                    f"stage-2 ulysses requires num_attention_heads ({H}) and "
+                    f"num_key_value_heads ({H_kv}) divisible by the stage-2 "
                     f"ulysses group size ({s2})"
                 )
             inner = create_attention(
