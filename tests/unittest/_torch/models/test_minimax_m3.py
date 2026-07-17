@@ -276,17 +276,12 @@ def test_get_moe_layer_ids_length_mismatch_raises():
 #    ``use_gemma=True`` and ``hidden_size=head_dim``; the
 #    :meth:`apply_qk_norm` reshape matches an independent hand-written
 #    reference.
-#  * Sparse index branch: ``index_q_proj`` is column-parallel and
-#    projects to ``num_index_heads * sparse_index_dim``;
-#    ``index_k_proj`` is **replicated** (tp_mode is None) and projects
-#    to **only** ``sparse_index_dim`` (single K per token, broadcast
-#    across all index heads for block-selection scoring) — this is the
-#    SGLang reference contract, confirmed by the M3 checkpoint shape
-#    ``(sparse_index_dim, hidden_size)``.
+#  * Sparse index branch: fused replicated (tp_mode None) index_qk_proj with
+#    output [idx_q | idx_k] = num_index_heads * sparse_index_dim + sparse_index_dim
+#    (idx_k is one K per token). Source weights (512, 6144) + (128, 6144) are
+#    concatenated into (640, 6144) at load time.
 #  * Dense layers do not expose any index branch attributes (negative
 #    control).
-#  * Real M3 checkpoint shape for ``index_k_proj.weight`` is
-#    ``(sparse_index_dim, hidden_size)`` = ``(128, 6144)``.
 
 
 def _make_attention_test_config():
@@ -401,6 +396,7 @@ def test_minimax_m3_attention_dense_construction_matches_config():
     for name in (
         "index_q_proj",
         "index_k_proj",
+        "index_qk_proj",
         "index_q_norm",
         "index_k_norm",
     ):
@@ -480,16 +476,12 @@ def test_minimax_m3_attention_apply_qk_norm_matches_reference():
 def test_minimax_m3_attention_sparse_construction_matches_config():
     """Sparse layer adds index branch with the SGLang-correct shapes.
 
-    Verifies the **bug fix** from the iter-4 work:
-      * ``index_q_proj`` is column-parallel and projects to
-        ``num_index_heads * sparse_index_dim``.
-      * ``index_k_proj`` is replicated (``tp_mode is None``) and projects
-        to **only** ``sparse_index_dim`` — a single replicated K per
-        token, *not* per-head. This matches SGLang's ``ReplicatedLinear``
-        and the M3 checkpoint's ``index_k_proj.weight`` shape
-        ``(sparse_index_dim, hidden_size)``.
-      * ``index_q_norm`` / ``index_k_norm`` are per-head Gemma RMSNorm
-        of width ``sparse_index_dim``.
+    Verifies the fused index projection:
+      * index_qk_proj is replicated (tp_mode None), out =
+        num_index_heads * sparse_index_dim (idx_q) + sparse_index_dim (idx_k),
+        where idx_k is one K per token (SGLang ReplicatedLinear contract).
+      * index_q_norm / index_k_norm are per-head Gemma RMSNorm of width
+        sparse_index_dim.
     """
     text_cfg, model_cfg = _make_attention_test_config()
     sparse_cfg = text_cfg.sparse_attention_config
@@ -506,33 +498,19 @@ def test_minimax_m3_attention_sparse_construction_matches_config():
     assert attn.is_sparse_attention_layer is True
     assert attn.disable_index_value is True
 
-    # index_q_proj: per-head Q for the index branch. As of iter-15 this
-    # is **replicated** (tp_mode=None) across TP ranks, not
-    # column-parallel: the sparse forward consumes ``idx_q`` reshaped to
-    # ``[num_tokens, num_index_heads, sparse_index_dim]`` and a
-    # column-parallel split would slice the head dimension (breaking the
-    # reshape at any ``tp_size > num_index_heads`` geometry, including
-    # the TP=8 configuration the real-checkpoint smoke test now uses).
-    # The replicated weight is small (~3 MiB BF16) so the per-rank
-    # memory cost is negligible.
-    assert attn.index_q_proj.in_features == hidden
-    assert attn.index_q_proj.out_features == num_index_heads * sparse_index_dim
-    assert attn.index_q_proj.tp_mode is None, (
-        f"index_q_proj must be replicated (tp_mode=None) so the sparse "
-        f"forward's `idx_q.view(num_tokens, num_index_heads, sparse_index_dim)` "
-        f"reshape is well-defined at any TP geometry, got "
-        f"{attn.index_q_proj.tp_mode!r}"
+    # index_qk_proj: fused [idx_q | idx_k], replicated (tp_mode None) so the
+    # idx_q -> [num_tokens, num_index_heads, sparse_index_dim] reshape holds at
+    # any TP geometry (column-parallel would slice the head dim).
+    assert attn.index_q_size == num_index_heads * sparse_index_dim
+    assert attn.index_k_size == sparse_index_dim
+    assert attn.index_qk_proj.in_features == hidden
+    assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
+    assert attn.index_qk_proj.tp_mode is None, (
+        f"index_qk_proj must be replicated, got {attn.index_qk_proj.tp_mode!r}"
     )
-
-    # index_k_proj: REPLICATED, only sparse_index_dim outputs.
-    assert attn.index_k_proj.in_features == hidden
-    assert attn.index_k_proj.out_features == sparse_index_dim, (
-        f"index_k_proj.out_features must be sparse_index_dim={sparse_index_dim}, "
-        f"got {attn.index_k_proj.out_features} (regression of the iter-4 fix)"
-    )
-    assert attn.index_k_proj.tp_mode is None, (
-        f"index_k_proj must be replicated (tp_mode=None), got {attn.index_k_proj.tp_mode!r}"
-    )
+    # The separate projections must be gone after fusion.
+    assert not hasattr(attn, "index_q_proj")
+    assert not hasattr(attn, "index_k_proj")
 
     # Per-head Gemma RMSNorm of width sparse_index_dim.
     assert attn.index_q_norm.use_gemma is True
@@ -625,17 +603,10 @@ def test_minimax_m3_attention_dense_apply_index_qk_norm_raises():
 def test_minimax_m3_attention_real_config_index_branch_shapes():
     """Real M3 config → sparse-layer index branch has the checkpoint's shapes.
 
-    Asserts the iter-4 fix in numbers:
-      * ``index_q_proj.out_features == 512`` (= 4 * 128
-        = ``num_index_heads * sparse_index_dim``).
-      * ``index_k_proj.out_features == 128`` (= ``sparse_index_dim``)
-        and ``tp_mode is None`` (replicated). The real
-        ``index_k_proj.weight`` in the checkpoint has shape
-        ``(128, 6144)``; a regression to the old
-        ``num_index_heads * sparse_index_dim`` (512) would break weight
-        loading at runtime.
-      * ``index_q_norm.weight.shape == (128,)`` and
-        ``index_k_norm.weight.shape == (128,)``.
+    Asserts the fused index projection in numbers:
+      * index_qk_proj.out_features == 640 (4 * 128 + 128), replicated. Source
+        weights (512, 6144) + (128, 6144) merge into (640, 6144) at load time.
+      * index_q_norm / index_k_norm weights have shape (128,).
     """
     pytest.importorskip("transformers")
     cfg = AutoConfig.from_pretrained(_checkpoint_path(), trust_remote_code=True)
@@ -668,22 +639,14 @@ def test_minimax_m3_attention_real_config_index_branch_shapes():
     assert num_index_heads == 4
     assert sparse_index_dim == 128
 
-    # index_q_proj: 4 * 128 = 512 out, replicated (tp_mode=None) as of
-    # iter-15. The downstream sparse forward reshapes ``idx_q`` to
-    # ``[num_tokens, num_index_heads, sparse_index_dim]``; a
-    # column-parallel split would slice the head dimension and break
-    # that reshape at any ``tp_size > num_index_heads`` geometry
-    # (including TP=8 used by the real-checkpoint smoke test). The
-    # replicated weight is ~3 MiB BF16 — the per-rank memory cost is
-    # negligible.
-    assert attn.index_q_proj.in_features == int(text_cfg.hidden_size)
-    assert attn.index_q_proj.out_features == num_index_heads * sparse_index_dim
-    assert attn.index_q_proj.tp_mode is None
-
-    # index_k_proj: 128 out (NOT 512), replicated.
-    assert attn.index_k_proj.in_features == int(text_cfg.hidden_size)
-    assert attn.index_k_proj.out_features == sparse_index_dim
-    assert attn.index_k_proj.tp_mode is None
+    # index_qk_proj: fused [idx_q | idx_k] = 4 * 128 + 128 = 640 out, replicated.
+    assert attn.index_q_size == num_index_heads * sparse_index_dim
+    assert attn.index_k_size == sparse_index_dim
+    assert attn.index_qk_proj.in_features == int(text_cfg.hidden_size)
+    assert attn.index_qk_proj.out_features == num_index_heads * sparse_index_dim + sparse_index_dim
+    assert attn.index_qk_proj.tp_mode is None
+    assert not hasattr(attn, "index_q_proj")
+    assert not hasattr(attn, "index_k_proj")
 
     # Per-head Gemma index norms: width sparse_index_dim.
     assert tuple(attn.index_q_norm.weight.shape) == (sparse_index_dim,)
