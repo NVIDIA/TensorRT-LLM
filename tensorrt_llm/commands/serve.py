@@ -9,7 +9,6 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
@@ -408,16 +407,13 @@ def _init_multi_frontend_mode(llm_args: dict,
     return mode
 
 
-def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
+def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
     Each child re-execs this trtllm-serve command line with env vars
-    pointing at the launcher executor's attach endpoints; its executor
+    carrying the launcher executor's attach endpoints; its executor
     attaches to the already-running worker instead of launching one (see
     GenerationExecutor.create / GenerationExecutorFrontendProxy).
-
-    Returns (children, attach_info_path); the caller owns terminating the
-    children and removing the secret-bearing attach-info file.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -427,18 +423,16 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
         raise ValueError(
             "num_serve_frontends > 1 requires the classic IPC executor "
             f"proxy in multi-frontend mode, got {type(executor).__name__}")
-    # mkstemp creates the file 0600: it carries the executor HMAC keys.
-    fd, attach_info_path = tempfile.mkstemp(prefix="trtllm_frontend_",
-                                            suffix=".json")
-    with os.fdopen(fd, "w") as f:
-        json.dump(attach_info, f)
+    # Carries the executor HMAC keys; the child deletes it from its env
+    # once consumed (GenerationExecutor.create).
+    attach_env = json.dumps(attach_info)
 
     children = []
     for frontend_id in range(1, num_frontends):
         # Strip MPI/SLURM identity vars: an inherited rank identity would
         # make the child's mpi4py try to (re-)join the launcher's job.
         env, _ = split_mpi_env()
-        env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_info_path
+        env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
         env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
         env["TLLM_DISABLE_MPI"] = "1"
         child = subprocess.Popen([sys.executable] + sys.argv,
@@ -447,7 +441,7 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
         logger.info(
             f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
         )
-    return children, attach_info_path
+    return children
 
 
 def _terminate_attached_frontends(children: list) -> None:
@@ -458,19 +452,6 @@ def _terminate_attached_frontends(children: list) -> None:
             child.wait(timeout=10)
         except subprocess.TimeoutExpired:
             child.kill()
-
-
-def _cleanup_multi_frontend_artifacts(attach_info_path: Optional[str]) -> None:
-    """Remove the attach-info file (it carries HMAC keys).
-
-    The shared ipc directory is owned and removed by the launcher's
-    executor proxy instead.
-    """
-    if attach_info_path is not None:
-        try:
-            os.unlink(attach_info_path)
-        except OSError:
-            pass
 
 
 def launch_server(
@@ -533,9 +514,8 @@ def launch_server(
                 param_hint="backend")
 
         frontend_children = []
-        attach_info_path = None
         if multi_frontend.is_launcher:
-            frontend_children, attach_info_path = _spawn_attached_frontends(
+            frontend_children = _spawn_attached_frontends(
                 llm, multi_frontend.num_frontends)
 
         server = OpenAIServer(
@@ -561,8 +541,6 @@ def launch_server(
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
-            if multi_frontend.is_launcher:
-                _cleanup_multi_frontend_artifacts(attach_info_path)
 
 
 def launch_grpc_server(host: str,

@@ -565,10 +565,12 @@ class GenerationExecutor(ABC):
         # Multi-frontend serving: attach to an already-running executor
         # instead of launching one (set by trtllm-serve for attached
         # frontend processes).
-        attach_info_path = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
-        if attach_info_path:
-            with open(attach_info_path) as f:
-                attach_info = json.load(f)
+        attach_env = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
+        if attach_env:
+            attach_info = json.loads(attach_env)
+            # Consumed: it carries the HMAC keys and must not leak into
+            # descendant processes.
+            os.environ.pop("TLLM_EXECUTOR_ATTACH_INFO", None)
             if attach_info.get("mode") != "classic":
                 raise ValueError(
                     "TLLM_EXECUTOR_ATTACH_INFO only supports the classic IPC "
@@ -582,7 +584,7 @@ class GenerationExecutor(ABC):
                     "by trtllm-serve when spawning attached frontends.")
             frontend_id = int(frontend_id_env)
             logger.info(f"Attaching executor frontend {frontend_id} to the "
-                        f"running classic IPC worker via {attach_info_path}")
+                        "running classic IPC worker")
             return GenerationExecutorFrontendProxy(
                 attach_info,
                 frontend_id=frontend_id,
