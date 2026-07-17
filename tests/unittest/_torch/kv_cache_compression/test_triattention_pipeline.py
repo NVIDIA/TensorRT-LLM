@@ -1288,6 +1288,7 @@ class TestFixedScoreMetadata:
         manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
         staging = SimpleNamespace(
             stage=mock.Mock(return_value=True),
+            max_requests=8,
         )
         prepared = [
             _prepared_eviction(
@@ -1310,8 +1311,11 @@ class TestFixedScoreMetadata:
             ),
         ]
 
-        manager._attach_page_ids(prepared, staging)
+        layout = SimpleNamespace(swa_layers=[], swa_window=None)
+        manager._attach_page_ids(prepared, staging, layout)
 
+        # top_B=8: per-request moves are keep + tail = [10, 11]; padded rows
+        # repeat the final offset out to the request capacity.
         staging.stage.assert_called_once_with(
             manager.kv_cache_manager,
             [7, 8],
@@ -1320,6 +1324,9 @@ class TestFixedScoreMetadata:
             [8, 9],
             [10, 12],
             draft_manager=None,
+            dense_move_offsets=[0, 10, 21, 21, 21, 21, 21, 21, 21],
+            swa_move_offsets=None,
+            draft_move_offsets=None,
         )
         assert all(not hasattr(item, "page_ids") for item in prepared)
 
