@@ -1301,8 +1301,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ) -> None:
-        """For compatibility with AttentionOp, copy only the SWA block offsets."""
+        """For compatibility with AttentionOp, copy only the SWA block offsets.
+
+        max_blocks is accepted for signature parity with KVCacheManager; the
+        copy below is already bounded by the precomputed SWA table width.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
         dst_tensor.fill_(BAD_PAGE_INDEX)
