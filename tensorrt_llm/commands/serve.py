@@ -13,7 +13,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Set
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -362,6 +362,65 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+class MultiFrontendMode(NamedTuple):
+    """Resolved multi-frontend serving mode for a launch_server invocation."""
+    num_frontends: int
+    is_attached_frontend: bool
+
+    @property
+    def active(self) -> bool:
+        """Any multi-frontend role: the launcher or an attached frontend."""
+        return self.num_frontends > 1 or self.is_attached_frontend
+
+    @property
+    def is_launcher(self) -> bool:
+        """The frontend that owns the engine and spawns/cleans the others."""
+        return self.active and not self.is_attached_frontend
+
+
+def _init_multi_frontend_mode(llm_args: dict,
+                              enabled: bool) -> MultiFrontendMode:
+    """Resolve the multi-frontend serving mode (prototype).
+
+    TLLM_SERVE_NUM_FRONTENDS=K runs K HTTP frontend processes against ONE
+    executor. The launcher (frontend 0) launches the worker as usual and
+    spawns K-1 attached frontends; attached frontends
+    (TLLM_EXECUTOR_ATTACH_INFO set) skip the spawning. Supported only on
+    the classic IPC executor path (the default orchestrator).
+
+    On the launcher this opts the executor into multi-frontend mode BEFORE
+    it is created: it pre-generates the shared ipc directory and HMAC key
+    (env) so the launcher proxy, the rank0 worker and the attached
+    frontends agree on deterministic endpoints
+    (GenerationExecutorProxy._setup_queues).
+
+    Entry points that reach launch_server but must not honor the env knob
+    (e.g. disaggregated MPI workers, which inherit the caller's env under
+    Slurm export-all) pass enabled=False.
+    """
+    if not enabled:
+        if os.getenv("TLLM_SERVE_NUM_FRONTENDS", "1") not in ("", "1"):
+            logger.warning(
+                "TLLM_SERVE_NUM_FRONTENDS is ignored on this entry point; "
+                "multi-frontend serving is only supported on plain "
+                "trtllm-serve.")
+        return MultiFrontendMode(1, False)
+
+    mode = MultiFrontendMode(
+        get_num_serve_frontends(),
+        os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
+    if mode.is_launcher:
+        if llm_args.get("orchestrator_type") is not None:
+            raise ValueError(
+                "TLLM_SERVE_NUM_FRONTENDS > 1 currently supports only the "
+                "default (classic IPC) executor path, not orchestrator_type="
+                f"{llm_args.get('orchestrator_type')!r}")
+        os.environ["TLLM_MULTI_FRONTEND_IPC_DIR"] = tempfile.mkdtemp(
+            prefix="trtllm_frontends_")
+        os.environ["TLLM_MULTI_FRONTEND_HMAC"] = os.urandom(32).hex()
+    return mode
+
+
 def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
@@ -458,41 +517,8 @@ def launch_server(
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
-    # Multi-frontend serving (prototype): TLLM_SERVE_NUM_FRONTENDS=K runs K
-    # HTTP frontend processes against ONE executor. The launcher (this
-    # process, frontend 0) launches the worker as usual and spawns K-1
-    # attached frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set)
-    # skip the spawning. Supported only on the classic IPC executor path
-    # (the default orchestrator). Entry points that reach launch_server but
-    # must not honor the env knob (e.g. disaggregated MPI workers, which
-    # inherit the caller's env under Slurm export-all) pass
-    # multi_frontend_enabled=False.
-    if multi_frontend_enabled:
-        num_frontends = get_num_serve_frontends()
-        is_attached_frontend = os.getenv(
-            "TLLM_EXECUTOR_ATTACH_INFO") is not None
-    else:
-        if os.getenv("TLLM_SERVE_NUM_FRONTENDS", "1") not in ("", "1"):
-            logger.warning(
-                "TLLM_SERVE_NUM_FRONTENDS is ignored on this entry point; "
-                "multi-frontend serving is only supported on plain "
-                "trtllm-serve.")
-        num_frontends = 1
-        is_attached_frontend = False
-    multi_frontend = num_frontends > 1 or is_attached_frontend
-    if multi_frontend and not is_attached_frontend:
-        if llm_args.get("orchestrator_type") is not None:
-            raise ValueError(
-                "TLLM_SERVE_NUM_FRONTENDS > 1 currently supports only the "
-                "default (classic IPC) executor path, not orchestrator_type="
-                f"{llm_args.get('orchestrator_type')!r}")
-        # Opt the launcher executor into multi-frontend mode BEFORE it is
-        # created: pre-generate the shared ipc directory and HMAC key so the
-        # launcher proxy, the rank0 worker and the attached frontends agree
-        # on deterministic endpoints (GenerationExecutorProxy._setup_queues).
-        os.environ["TLLM_MULTI_FRONTEND_IPC_DIR"] = tempfile.mkdtemp(
-            prefix="trtllm_frontends_")
-        os.environ["TLLM_MULTI_FRONTEND_HMAC"] = os.urandom(32).hex()
+    multi_frontend = _init_multi_frontend_mode(llm_args,
+                                               multi_frontend_enabled)
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
@@ -501,7 +527,7 @@ def launch_server(
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
         assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
-        if multi_frontend:
+        if multi_frontend.active:
             # Every frontend process binds its own listening socket on the
             # same port; the kernel load-balances accepts across them.
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
@@ -533,9 +559,9 @@ def launch_server(
 
         frontend_children = []
         attach_info_path = None
-        if multi_frontend and not is_attached_frontend:
+        if multi_frontend.is_launcher:
             frontend_children, attach_info_path = _spawn_attached_frontends(
-                llm, num_frontends)
+                llm, multi_frontend.num_frontends)
 
         server = OpenAIServer(
             generator=llm,
@@ -560,7 +586,7 @@ def launch_server(
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
-            if multi_frontend and not is_attached_frontend:
+            if multi_frontend.is_launcher:
                 _cleanup_multi_frontend_artifacts(attach_info_path)
 
 
