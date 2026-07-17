@@ -819,7 +819,7 @@ def prepare_per_head_scores(
 
 
 @triton.jit
-def _finalize_topk_indices_kernel(
+def _settle_ties_after_topk_kernel(
     scores,
     seq_lens,
     prompt_offsets,

@@ -118,7 +118,7 @@ class _PreparedDeterministicTopK:
 
         from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
-        from .triattention_kernels import _finalize_topk_indices_kernel
+        from .triattention_kernels import _settle_ties_after_topk_kernel
 
         self.device = scores.device
         self.scores = scores
@@ -140,8 +140,8 @@ class _PreparedDeterministicTopK:
             )
             runner._compile(*key)
             self.compiled_topk = runner.kernel_cache[key]
-        self.frozen_finalize = FrozenTritonKernelCall(
-            _finalize_topk_indices_kernel,
+        self.frozen_settle_ties = FrozenTritonKernelCall(
+            _settle_ties_after_topk_kernel,
             (scores, seq_lens, prompt_offsets, provisional_indices, output_indices),
             dict(
                 WIDTH=width,
@@ -163,7 +163,7 @@ class _PreparedDeterministicTopK:
             self.provisional_indices,
             None,
         )
-        self.frozen_finalize()
+        self.frozen_settle_ties()
 
 
 class _PreparedUnionScores:
