@@ -679,8 +679,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         self._msa_fields_ready = True
 
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
-        """Paged index-K view for the indexer; HND conversion is done there."""
-        return self.kv_cache_manager.get_index_k_buffer(layer_idx)
+        """Return the paged index-K cache in the HND layout MSA consumes."""
+        return self.kv_cache_manager.get_index_k_buffer(layer_idx, kv_layout="HND")
 
     def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
         """Write the new-token index-K into the side cache at out_cache_loc."""
@@ -691,6 +691,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             cache,
             self.msa_out_cache_loc[:num_tokens],
             idx_k.reshape(num_tokens, 1, sparse_index_dim),
+            layout="HND",
         )
 
     def msa_proxy_max_score_view(
