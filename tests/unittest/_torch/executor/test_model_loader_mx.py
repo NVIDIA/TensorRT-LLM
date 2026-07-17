@@ -510,6 +510,11 @@ def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
 def test_mx_artifact_identity_failure_falls_back_to_disk(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        _tiny_profile_registry(),
+    )
     artifact_error = ValueError(
         "Checkpoint manifests do not support nested symlinked directories: /ckpt/shards"
     )
