@@ -45,9 +45,8 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import EncoderGroup, MultimodalModelMixin
 from .modeling_multimodal_utils import (
-    EncoderGroup,
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
     fuse_input_embeds,

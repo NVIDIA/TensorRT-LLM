@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import (
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     _lengths_by_modality,
     _reorder_embeds_by_manifest,
     _synthesize_single_modality_manifest,
