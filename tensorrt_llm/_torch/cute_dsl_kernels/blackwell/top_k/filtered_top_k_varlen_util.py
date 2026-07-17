@@ -58,8 +58,6 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
 
-        # Note: now we only support top_k <= 2048, we could change the code here to support larger top_k.
-        self.filtered_topk_max_k = 2048
         # 8 bits for radix-based filter.
         self.radix = 256
 
@@ -963,13 +961,14 @@ class FilteredTopKKernelVarlen:
                             cute.arch.barrier()
 
             # Phase 3: Output phase
+            output_vector_width = 2 if self.top_k % 2 == 0 else 1
             vecsize_out = cutlass.const_expr(
                 min(
                     self.top_k,
                     cute.ceil_div(self.top_k, self.num_threads_per_cta),
                     self.num_copy_bits // self.dtype.width,
                     # TODO: only tested for float32. need to check for other dtypes.
-                    2,
+                    output_vector_width,
                 )
             )
             assert self.top_k % vecsize_out == 0
