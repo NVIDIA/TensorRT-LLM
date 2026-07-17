@@ -362,30 +362,22 @@ def _diagnose_port_in_use(port: int) -> str:
 
 
 class MultiFrontendMode(NamedTuple):
-    """Resolved multi-frontend serving mode for a launch_server invocation."""
+    """This process's role under multi-frontend serving (prototype)."""
     num_frontends: int
     is_attached_frontend: bool
 
     @property
-    def active(self) -> bool:
-        """Any multi-frontend role: the launcher or an attached frontend."""
-        return self.num_frontends > 1 or self.is_attached_frontend
-
-    @property
     def is_launcher(self) -> bool:
-        """The frontend that owns the engine and spawns/cleans the others."""
-        return self.active and not self.is_attached_frontend
+        """Owns the engine and spawns/cleans the attached frontends."""
+        return self.num_frontends > 1 and not self.is_attached_frontend
 
 
 def _init_multi_frontend_mode(llm_args: dict,
                               enabled: bool) -> MultiFrontendMode:
-    """Resolve the multi-frontend serving mode (prototype).
-
-    num_serve_frontends=K runs K HTTP frontend processes against ONE
+    """num_serve_frontends=K runs K HTTP frontend processes against ONE
     executor: the launcher (frontend 0) owns the engine and spawns K-1
-    attached frontends. Classic IPC executor path only. Entry points that
-    must not honor the knob (e.g. disaggregated MPI workers) pass
-    enabled=False.
+    attached frontends (classic IPC executor path only). Entry points
+    that must not honor the knob pass enabled=False.
     """
     num_frontends = llm_args.get("num_serve_frontends", 1)
     if not enabled:
@@ -483,7 +475,7 @@ def launch_server(
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
         assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
-        if multi_frontend.active:
+        if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
             # Every frontend process binds its own listening socket on the
             # same port; the kernel load-balances accepts across them.
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
