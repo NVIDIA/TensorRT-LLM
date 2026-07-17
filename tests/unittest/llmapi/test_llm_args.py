@@ -108,9 +108,11 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
 
 
 def test_rejection_sampling_allows_attention_dp(monkeypatch):
-    """ADP (incl. ADP+LM-head-TP) supports rejection sampling: the draft path
-    bypasses LM-head-TP for advanced sampling and the greedy flag is
-    group-synchronized, so the former attention-DP gate is lifted."""
+    """ADP (incl. ADP+LM-head-TP) supports rejection sampling.
+
+    The draft path bypasses LM-head-TP for advanced sampling and the greedy
+    flag is group-synchronized, so the former attention-DP gate is lifted.
+    """
     import tensorrt_llm._torch.flashinfer_utils as fi_utils
     monkeypatch.setattr(fi_utils, "IS_FLASHINFER_AVAILABLE", True)
 
@@ -137,10 +139,12 @@ def test_rejection_sampling_allows_attention_dp(monkeypatch):
 
 
 def test_rejection_sampling_still_gated_on_context_parallel():
-    """Context parallelism remains an unsupported rejection combination:
-    explicit opt-in raises; default-inherited silently disables. The parallel
+    """Context parallelism remains an unsupported rejection combination.
+
+    Explicit opt-in raises; default-inherited silently disables. The parallel
     gate applies to the newly wired methods (vanilla MTP, PARD, DFlash,
-    DraftTarget one-model), so use vanilla MTP here."""
+    DraftTarget one-model), so use vanilla MTP here.
+    """
     spec_cfg = MTPDecodingConfig(max_draft_len=2,
                                  use_rejection_sampling=True,
                                  use_mtp_vanilla=True)
