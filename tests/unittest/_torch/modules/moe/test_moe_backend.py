@@ -500,26 +500,23 @@ def _make_megamoe_cutedsl_for_ctor_test(**ctor_overrides):
     return MegaMoECuteDsl(**kwargs)
 
 
-def test_megamoe_cutedsl_rejects_unknown_combine_format():
-    with pytest.raises(ValueError, match=r"combine_format must be one of"):
-        _make_megamoe_cutedsl_for_ctor_test(combine_format="fp8")
+def test_megamoe_cutedsl_combine_format_defaults_to_bf16(monkeypatch):
+    monkeypatch.delenv("MEGAMOE_COMBINE_FORMAT", raising=False)
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    assert moe.combine_format == "bf16"
+
+
+def test_megamoe_cutedsl_rejects_unknown_combine_format(monkeypatch):
+    monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", "fp8")
+    with pytest.raises(ValueError, match=r"MEGAMOE_COMBINE_FORMAT must be one of"):
+        _make_megamoe_cutedsl_for_ctor_test()
 
 
 @pytest.mark.parametrize("combine_format", ["bf16", "32e4m3xe8m0", "16e2m1xbf16"])
-def test_megamoe_cutedsl_accepts_supported_combine_formats(combine_format):
-    moe = _make_megamoe_cutedsl_for_ctor_test(combine_format=combine_format)
+def test_megamoe_cutedsl_accepts_supported_combine_formats(monkeypatch, combine_format):
+    monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", combine_format)
+    moe = _make_megamoe_cutedsl_for_ctor_test()
     assert moe.combine_format == combine_format
-
-
-def test_megamoe_cutedsl_quantized_combine_disables_in_kernel_reduce():
-    # Quantized combine requires the separate-reduce path; the constructor
-    # must drop the incompatible in-kernel reduce (bf16 keeps it).
-    moe = _make_megamoe_cutedsl_for_ctor_test(
-        combine_format="32e4m3xe8m0", in_kernel_fc2_reduce=True
-    )
-    assert moe.in_kernel_fc2_reduce is False
-    moe_bf16 = _make_megamoe_cutedsl_for_ctor_test(combine_format="bf16", in_kernel_fc2_reduce=True)
-    assert moe_bf16.in_kernel_fc2_reduce is True
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(monkeypatch):

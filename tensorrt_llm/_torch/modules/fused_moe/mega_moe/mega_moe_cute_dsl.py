@@ -436,8 +436,6 @@ class MegaMoECuteDsl(MoE):
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_limit: Optional[torch.Tensor] = None,
-        in_kernel_fc2_reduce: bool = False,
-        combine_format: str = "bf16",
         **kwargs,
     ) -> None:
         # ``aux_stream_dict`` is accepted for ``create_moe_backend`` signature
@@ -498,35 +496,22 @@ class MegaMoECuteDsl(MoE):
 
         # topk-score application point. v2 default is the deepgemm graph
         # (apply_topk_in_fc1=True): the fused kernel folds the topk score into
-        # the SwiGLU output before the fc1-out NVFP4 quant and the host reduces
-        # combine_output.sum(dim=1). Kept as an internal backend constant until
-        # the transformers route is GPU-validated and promoted to MoeConfig.
+        # the SwiGLU output before the fc1-out NVFP4 quant. Kept as an internal
+        # backend constant until the transformers route is GPU-validated and
+        # promoted to MoeConfig.
         self.apply_topk_in_fc1 = True
 
-        # form-B (in-kernel REDG top-k reduce) opt-in; default off = form-A
-        # (standalone TopkReduce, deterministic). form-B is NON-deterministic
-        # (bf16 atomic-add), forces a NON-BULK fc2-store tactic (else silent
-        # corruption), and changes codegen + combine buffer shape, so it is
-        # part of the runner/workspace/symm-provider cache keys.
-        self.in_kernel_fc2_reduce = bool(in_kernel_fc2_reduce)
-
-        # Cross-rank combine wire format (bench-only beyond default bf16).
-        # MUST be rank-identical: it sizes the symmetric workspace and picks
-        # the compiled kernel, so divergence desyncs the rendezvous / NVLink
-        # barrier. Quantized formats auto-disable in_kernel_fc2_reduce.
+        # Cross-rank combine wire format is selected with
+        # MEGAMOE_COMBINE_FORMAT (default bf16). It MUST be rank-identical:
+        # it sizes the symmetric workspace and picks the compiled kernel, so
+        # divergence desyncs the rendezvous / NVLink barrier.
+        combine_format = os.environ.get("MEGAMOE_COMBINE_FORMAT", "bf16")
         if combine_format not in self._SUPPORTED_COMBINE_FORMATS:
             raise ValueError(
-                f"MegaMoECuteDsl combine_format must be one of "
+                f"MEGAMOE_COMBINE_FORMAT must be one of "
                 f"{sorted(self._SUPPORTED_COMBINE_FORMATS)}; got {combine_format!r}."
             )
-        self.combine_format = str(combine_format)
-        if self.combine_format != "bf16" and self.in_kernel_fc2_reduce:
-            logger.warning(
-                "[MegaMoECuteDsl] combine_format=%s is quantized; disabling "
-                "in_kernel_fc2_reduce (separate-reduce required).",
-                self.combine_format,
-            )
-            self.in_kernel_fc2_reduce = False
+        self.combine_format = combine_format
 
         # AutoTuner tactic-sweep opt-in via MEGAMOE_TACTIC_AUTOTUNE=1
         # (bench-only knob; default OFF so serving warmup never pays the
@@ -780,11 +765,9 @@ class MegaMoECuteDsl(MoE):
         The MPI orchestrator (trtllm-bench / mpirun) never calls
         ``init_process_group``, but the symmetric-memory rendezvous needs a
         ProcessGroup; for pure DEP a node-local NCCL WORLD suffices. No-op
-        under Ray or single-rank; opt out with MEGAMOE_MPI_INIT_TORCH_DIST=0.
+        under Ray or single-rank.
         """
         if not dist.is_available() or dist.is_initialized():
-            return
-        if os.environ.get("MEGAMOE_MPI_INIT_TORCH_DIST", "1") != "1":
             return
         from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 
@@ -961,7 +944,7 @@ class MegaMoECuteDsl(MoE):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
-                in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+                in_kernel_fc2_reduce=False,
                 combine_format=self.combine_format,
             )
             provider = get_megamoe_symm_provider(
@@ -1142,8 +1125,8 @@ class MegaMoECuteDsl(MoE):
         Casts ``token_selected_experts`` to ``int64`` (the scheduler keeps
         ``int32`` for the EPLB stats kernel; the MegaMoE kernel reads
         ``topk_idx`` as Int64) and delegates the staging + kernel launch
-        to :meth:`_run_moe`. The host then sums the form-A
-        ``(T, top_k, hidden)`` combine output along the top-k axis.
+        to :meth:`_run_moe`, which returns the reduced ``(T, hidden)``
+        output.
         """
         del unused_kwargs
         if output_dtype is None:
@@ -1263,7 +1246,7 @@ class MegaMoECuteDsl(MoE):
                     self.expand_intermediate_size_per_partition
                 ),
                 max_tokens_per_rank=max_T,
-                in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+                in_kernel_fc2_reduce=False,
                 combine_format=self.combine_format,
             )
             # zeros (not empty): the leading counter prefix is an atomic-add
@@ -1403,22 +1386,15 @@ class MegaMoECuteDsl(MoE):
         output_dtype: torch.dtype,
         launch_max_T: int,
     ) -> torch.Tensor:
-        """Launch the fused MegaMoE CuteDSL kernel and reduce form-A output.
+        """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
 
         Single-rank and multi-rank reach this point with identical kernel
         inputs; only the source of the staged buffers differs (decided
-        upstream by :meth:`_acquire_buffers`). The host-side top-k reduction
-        is the same across topologies. NVFP4 / FP8-SF dtype views happen
-        through the module-level :func:`_as_nvfp4` / :func:`_as_fp8_sf`
-        helpers (the kernel rejects raw uint8 byte tensors).
+        upstream by :meth:`_acquire_buffers`). NVFP4 / FP8-SF dtype views
+        happen through the module-level :func:`_as_nvfp4` /
+        :func:`_as_fp8_sf` helpers (the kernel rejects raw uint8 byte
+        tensors).
         """
-        # form-B accumulates onto the combine cells, so live rows MUST start
-        # at 0. Zeroing only ``[:num_tokens]`` is safe: the host reads only
-        # those rows and padded tail rows are never written (topk_idx == -1).
-        # The zero is stream-ordered before any peer push (dispatch barrier).
-        # form-A overwrites cells and needs no per-launch zero.
-        if self.in_kernel_fc2_reduce and num_tokens > 0:
-            combine_output[:num_tokens].zero_()
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
         # a later same-process call for a different shape never sees a stale
@@ -1489,7 +1465,9 @@ class MegaMoECuteDsl(MoE):
                 peer_offsets=peer_offsets,
                 apply_topk_in_fc1=bool(self.apply_topk_in_fc1),
                 gate_up_clamp=self.gate_up_clamp,
-                in_kernel_fc2_reduce=bool(self.in_kernel_fc2_reduce),
+                # Keep the deterministic standalone TopkReduce until form-B
+                # has dedicated GPU correctness and performance coverage.
+                in_kernel_fc2_reduce=False,
                 combine_format=self.combine_format,
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,

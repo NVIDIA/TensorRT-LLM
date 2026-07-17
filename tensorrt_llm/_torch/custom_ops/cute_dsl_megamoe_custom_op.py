@@ -647,7 +647,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # kernel sf_addr formula in dispatch_kernel.py.
         activation_sf: torch.Tensor  # (max_T, sf_bytes_per_row) uint8 (FP8 SF)
         topk_weights: torch.Tensor  # (max_T, num_topk) float32
-        # (max_T, combine_k, hidden): combine_k = num_topk (form-A) or 1 (form-B).
+        # (max_T, 1, hidden): both reduction forms collapse the top-k axis in-op.
         combine_output: torch.Tensor
         shared_workspace: torch.Tensor  # (shared_ws_bytes,) uint8
         peer_offsets: List[int]  # symmetric peer-pointer deltas
@@ -1713,11 +1713,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         aliasing any mutated input.
 
         ``in_kernel_fc2_reduce`` selects the reduction form: ``False``
-        (form-A) keeps ``combine_output`` at ``(T, num_topk, hidden)`` with
-        the caller doing ``.sum(dim=1)``; ``True`` (form-B) uses
-        ``(T, 1, hidden)`` (zeroed per launch), folds top-k in-kernel and is
-        NON-deterministic (float accumulation order). Perf knobs come from
-        the tactic, not op arguments.
+        (form-A) runs the deterministic standalone TopkReduce; ``True``
+        (form-B) folds top-k into the kernel and is NON-deterministic (float
+        accumulation order). Both write ``combine_output`` with shape
+        ``(T, 1, hidden)``. Perf knobs come from the tactic, not op
+        arguments.
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103):

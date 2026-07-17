@@ -258,7 +258,6 @@ def create_moe_backend(
     init_load_balancer: bool = True,
     without_comm: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
-    combine_format: str = "bf16",
 ) -> MoE:
     """
     Create MoE backend instance with validation.
@@ -282,8 +281,6 @@ def create_moe_backend(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
-        combine_format: MegaMoECuteDsl-only combine wire format (bench-only;
-            must be rank-identical); "bf16" for all other backends.
 
     Returns:
         MoE: MoE backend instance
@@ -347,12 +344,6 @@ def create_moe_backend(
             CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
             MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
-
-    if combine_format != "bf16" and moe_cls is not MegaMoECuteDsl:
-        # raise (not assert): a python -O run must not silently drop the knob.
-        raise ValueError(
-            f"combine_format={combine_format!r} is only supported by "
-            f"MegaMoECuteDsl, not {moe_cls.__name__}.")
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -535,7 +526,6 @@ def create_moe_backend(
             megamoe_kwargs["swiglu_limit"] = (swiglu_limit
                                               if swiglu_limit is not None else
                                               swiglu_limit_scalar)
-            megamoe_kwargs["combine_format"] = combine_format
         else:
             megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
         return moe_cls(**megamoe_kwargs)
@@ -562,7 +552,6 @@ def create_moe(
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
-    combine_format: str = "bf16",
 ) -> MoE:
     """
     Create MoE instance with automatic parameter inference from model_config.
@@ -586,8 +575,6 @@ def create_moe(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
-        combine_format: MegaMoECuteDsl-only combine wire format (bench-only;
-            must be rank-identical); "bf16" for all other backends.
 
     Returns:
         MoE: MoE instance
@@ -640,7 +627,6 @@ def create_moe(
                 swiglu_limit=swiglu_limit,
                 swiglu_limit_scalar=swiglu_limit_scalar,
                 activation_type=activation_type,
-                combine_format=combine_format,
             )
         else:
             # Check if this is a TRTLLM or CUTEDSL backend request that fell back to CutlassFusedMoE
@@ -681,5 +667,4 @@ def create_moe(
         swiglu_limit=swiglu_limit,
         swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
-        combine_format=combine_format,
     )
