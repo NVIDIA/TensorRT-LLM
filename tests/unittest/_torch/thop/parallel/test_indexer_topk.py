@@ -814,7 +814,7 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8])
-@pytest.mark.parametrize("index_topk", [8192, 16384])
+@pytest.mark.parametrize("index_topk", [4096, 8192, 16384])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
 def test_cute_dsl_topk_decode_high_k(batch_size, index_topk, num_tokens):
     """top_k above 4096 stays bit-exact (wrapper guard raised to 16384).
@@ -866,6 +866,61 @@ def test_cute_dsl_topk_decode_high_k(batch_size, index_topk, num_tokens):
             torch.float32,
             run_fn,
         )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("index_topk", [1023, 2047, 4095])
+def test_cute_dsl_indexer_topk_decode_odd_k(batch_size, index_topk):
+    """Odd top_k stays bit-exact on the indexer decode entry point."""
+    num_tokens = 32768
+
+    def run_indexer(logits, seq_lens):
+        output_indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device="cuda")
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            input_values=logits,
+            seq_lens=seq_lens,
+            output_indices=output_indices,
+            top_k=index_topk,
+            next_n=1,
+            num_copy_bits=256,
+        )
+        return output_indices
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        1,
+        index_topk,
+        num_tokens,
+        torch.float32,
+        run_indexer,
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("top_k", [1023, 2047, 2048])
+def test_filtered_topk_varlen_odd_k(top_k):
+    """The filtered varlen kernel supports odd top_k (scalar output tail).
+
+    The reference check inside the runner asserts bitwise agreement with a
+    torch reference; 2048 is the even control.
+    """
+    import cutlass
+
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
+        run_topk_decode,
+    )
+
+    run_topk_decode(
+        cutlass.Float32,
+        batch_size=16,
+        max_num_cols=4096,
+        top_k=top_k,
+        next_n=3,
+        do_benchmark=False,
+    )
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
