@@ -1697,10 +1697,7 @@ class TestFixedScoreMetadata:
         staging.offsets = offsets
         staging.omega = omega
         staging.stream = None
-        staging._phase_runner = None
-        staging._phase_args = ()
-        staging._score_runner = None
-        staging._score_args = ()
+        staging._frozen_score = None
         staging.bind_score_launcher(valid_widths, aggregation)
         group.output.fill_(score_sentinel)
         with (

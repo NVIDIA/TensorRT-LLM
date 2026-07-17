@@ -27,14 +27,9 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from .triattention_kernels import FrozenTritonKernelCall
+from .triattention_kernel_warmup import FrozenTritonKernelCall, frozen_move_index_pack
 
 _SUPPORTED_POOL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
-
-# Launch shape of the move-index packing kernel: tokens per program along the
-# move axis, and its warp count.
-_PACK_BLOCK_TOKENS = 256
-_PACK_NUM_WARPS = 4
 
 
 class _CppCompactGroup(NamedTuple):
@@ -221,110 +216,6 @@ def _compact_groups(
     return tuple(result)
 
 
-def _frozen_move_index_pack(
-    kept_token_ordinals: torch.Tensor,
-    valid_sequence_lengths: torch.Tensor,
-    move_source_offsets: torch.Tensor,
-    move_source_indices: torch.Tensor,
-    *,
-    eviction_mode: str,
-    decode_keep_count: int,
-    num_dense_layers: int,
-    num_kv_heads: int,
-    max_protected_tail: int,
-    swa_window: int,
-    swa_move_source_offsets: Optional[torch.Tensor],
-    swa_move_source_indices: Optional[torch.Tensor],
-) -> FrozenTritonKernelCall:
-    """Build one frozen call of the move-index packing kernel.
-
-    The kernel reads the kept-token ordinals and each request's valid length
-    and writes the packed per-(layer, head) move source indices consumed by
-    the C++ compact launches. Only the caller-provided selection tensors are
-    validated here; the move buffers are allocated by this module.
-    """
-    per_layer = eviction_mode == "per_layer_perhead"
-    union = eviction_mode == "union"
-    request_count = int(kept_token_ordinals.shape[0]) if kept_token_ordinals.ndim else 0
-    if union:
-        selection_rows = 1
-    elif per_layer:
-        selection_rows = num_dense_layers * num_kv_heads
-    else:
-        selection_rows = num_kv_heads
-    selection_prefix = (request_count,) if union else (request_count, selection_rows)
-    # Selection rows carry decode-only kept ordinals (already absolute), so
-    # the rectangle is prompt-length independent.
-    expected_selection = (*selection_prefix, decode_keep_count)
-    if (
-        request_count <= 0
-        or tuple(kept_token_ordinals.shape) != expected_selection
-        or valid_sequence_lengths.shape != (request_count,)
-    ):
-        raise ValueError(
-            f"prepared compaction packing expects kept ordinals of shape "
-            f"{expected_selection} and one valid length per request; got "
-            f"{tuple(kept_token_ordinals.shape)} and "
-            f"{tuple(valid_sequence_lengths.shape)}"
-        )
-
-    device = kept_token_ordinals.device
-    if not _cuda_int32_contiguous((kept_token_ordinals, valid_sequence_lengths), device):
-        raise ValueError("prepared compaction packing requires contiguous CUDA int32 tensors")
-
-    if swa_move_source_indices is not None:
-        swa_offsets_arg = swa_move_source_offsets
-        swa_indices_arg = swa_move_source_indices
-        swa_total = int(swa_move_source_indices.shape[-1])
-    else:
-        # HAS_SWA specializes all corresponding loads and stores away.
-        swa_offsets_arg = move_source_offsets
-        swa_indices_arg = move_source_indices
-        swa_total = 0
-
-    from .triattention_kernels import _pack_compaction_sources_kernel
-
-    max_move = decode_keep_count + max_protected_tail
-    if swa_total:
-        max_move = max(max_move, swa_window + max_protected_tail)
-    packed_row_count = num_dense_layers * num_kv_heads if per_layer else num_kv_heads
-    grid = (
-        request_count,
-        packed_row_count,
-        (max_move + _PACK_BLOCK_TOKENS - 1) // _PACK_BLOCK_TOKENS,
-    )
-    bound_tensors = (
-        kept_token_ordinals,
-        valid_sequence_lengths,
-        move_source_offsets,
-        move_source_indices,
-        swa_offsets_arg,
-        swa_indices_arg,
-    )
-    # Ordered to match the kernel's constexpr parameter declaration: the
-    # frozen call passes these by position.
-    constexpr_values = dict(
-        DENSE_TOTAL=int(move_source_indices.shape[-1]),
-        SWA_TOTAL=swa_total,
-        SELECTION_ROWS=selection_rows,
-        SELECTION_STRIDE=decode_keep_count,
-        KEEP_COUNT=decode_keep_count,
-        NUM_KV_HEADS=num_kv_heads,
-        SWA_WINDOW=swa_window,
-        UNION=union,
-        PER_LAYER=per_layer,
-        HAS_SWA=swa_total > 0,
-        BLOCK=_PACK_BLOCK_TOKENS,
-    )
-    return FrozenTritonKernelCall(
-        _pack_compaction_sources_kernel,
-        bound_tensors,
-        constexpr_values,
-        grid=grid,
-        num_warps=_PACK_NUM_WARPS,
-    )
-
-
 class BatchedKVCacheCompaction:
     """Batched physical compaction of the KV caches for one fixed geometry.
 
@@ -478,7 +369,7 @@ class BatchedKVCacheCompaction:
         dense_slots = (
             {layer: slot for slot, layer in enumerate(self.dense_layers)} if per_layer else None
         )
-        dense_pack = _frozen_move_index_pack(
+        dense_pack = frozen_move_index_pack(
             kept_token_ordinals,
             valid_sequence_lengths,
             dense_move_offsets,
@@ -600,7 +491,7 @@ class BatchedKVCacheCompaction:
         # packed row, so one more frozen kernel call broadcasts the target keep
         # set over the draft KV heads and appends the draft's own tail
         # ordinals (valid_seq_len + 0..tail-1).
-        draft_pack = _frozen_move_index_pack(
+        draft_pack = frozen_move_index_pack(
             kept_token_ordinals,
             valid_sequence_lengths,
             draft_move_offsets,

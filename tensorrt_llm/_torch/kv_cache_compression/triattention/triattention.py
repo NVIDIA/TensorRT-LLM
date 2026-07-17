@@ -58,7 +58,9 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernel_warmup import (
+    FrozenScoreCall,
+    _FixedScoreStreamMismatch,
     _PreparedDeterministicTopK,
     _PreparedUnionScores,
 )
@@ -414,10 +416,6 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         self.prepared_topk()
 
 
-class _FixedScoreStreamMismatch(RuntimeError):
-    """Raised when a fixed score staging buffers are used from another CUDA stream."""
-
-
 class _FixedScoreStagingBuffers:
     """Pool-bound fixed score metadata with one nonblocking page-table upload."""
 
@@ -667,114 +665,22 @@ class _FixedScoreStagingBuffers:
         self.copy_pending = False
         self.page_tables_active = False
         self.stream = None
-        self._phase_runner = None
-        self._phase_args: tuple = ()
-        self._score_runner = None
-        self._score_args: tuple = ()
+        self._frozen_score: Optional[FrozenScoreCall] = None
 
     def bind_score_launcher(self, valid_widths: torch.Tensor, score_aggregation: str) -> None:
-        """Compile and bind phase/score launches for this exact resource bucket."""
-        from .triattention_kernels import _prepare_mean_phase_kernel, _tri_score_perhead_kernel
-
-        if self._score_runner is not None:
+        """Compile and bind the phase and score launches for these buffers."""
+        if self._frozen_score is not None:
             raise RuntimeError("TriAttention score launcher is already bound")
-        if score_aggregation not in ("mean", "max"):
-            raise ValueError(f"unsupported score aggregation: {score_aggregation}")
-        group = self.fused_group
-        if (
-            valid_widths.shape != (self.max_requests,)
-            or valid_widths.dtype != torch.int32
-            or valid_widths.device != self.device
-            or not valid_widths.is_contiguous()
-        ):
-            raise ValueError("prepared score lengths do not match their exact bucket")
-
-        frequency_block = 1 << (group.num_freqs - 1).bit_length()
-        phase_pointer_args = (
-            self.round_starts_device,
-            self.offsets,
-            self.omega,
-            self.mean_cos,
-            self.mean_sin,
-        )
-        phase_constants = (
-            group.num_freqs,
-            int(self.offsets.numel()),
-            frequency_block,
-        )
-        score_pointer_args = (
-            *group.pointer_prefix,
-            self.valid_seq_lens_device,
-            valid_widths,
-            self.round_starts_device,
-            self.token_starts_device,
-            *group.pointer_middle,
-            self.mean_cos.view(-1),
-            self.mean_sin.view(-1),
-            *group.pointer_tail,
-            group.output,
-        )
-        score_geometry = (
-            group.output_width,
-            group.num_layers,
-            *group.geometry_args,
-        )
-        score_constants = (
-            score_aggregation == "max",
-            group.token_block,
-            frequency_block,
-        )
-        self._phase_args = (*phase_pointer_args, *phase_constants)
-        self._score_args = (*score_pointer_args, *score_geometry, *score_constants)
-        phase_grid = (self.max_requests, 1, 1)
-        score_segments = self.max_requests * group.num_layers
-        if score_segments > 65535:
-            # Segments sit on the y grid axis (CUDA caps y/z at 65535) so the
-            # unbounded x axis can hold the token tiles of long sequences.
-            raise ValueError("request*layer segment count exceeds the CUDA grid limit")
-        score_grid = (
-            group.max_ntblk,
-            score_segments,
-            group.num_kv_heads,
-        )
-        with torch.cuda.device(self.device):
-            self.stream = torch.cuda.current_stream(self.device)
-            if score_aggregation == "mean":
-                compiled = _prepare_mean_phase_kernel.warmup(
-                    *phase_pointer_args,
-                    NUM_FREQS=phase_constants[0],
-                    NUM_OFFSETS=phase_constants[1],
-                    F_BLOCK=phase_constants[2],
-                    num_warps=1,
-                    grid=phase_grid,
-                )
-                self._phase_runner = compiled[phase_grid]
-            compiled = _tri_score_perhead_kernel.warmup(
-                *score_pointer_args,
-                *score_geometry,
-                USE_MAX=score_constants[0],
-                T_BLOCK=score_constants[1],
-                F_BLOCK=score_constants[2],
-                grid=score_grid,
-            )
-            self._score_runner = compiled[score_grid]
+        self._frozen_score = FrozenScoreCall(self, valid_widths, score_aggregation)
+        # stage() binds this staging to its first CUDA stream; the frozen
+        # score call was just built on that same stream.
+        self.stream = self._frozen_score.stream
 
     def launch_prepared_score(self) -> torch.Tensor:
-        """Launch the phase and score runners bound to this exact bucket."""
-        if self._score_runner is None or self.stream is None:
+        """Launch the phase and score calls bound to these buffers."""
+        if self._frozen_score is None:
             raise RuntimeError("TriAttention score launcher is not bound")
-        current_stream = torch.cuda.current_stream(self.device)
-        if (current_stream.device, current_stream.cuda_stream) != (
-            self.stream.device,
-            self.stream.cuda_stream,
-        ):
-            raise _FixedScoreStreamMismatch(
-                "TriAttention prepared score is bound to its staging CUDA stream"
-            )
-        if self._phase_runner is not None:
-            self._phase_runner(*self._phase_args, stream=self.stream.cuda_stream)
-        self._score_runner(*self._score_args, stream=self.stream.cuda_stream)
-        return self.fused_group.output
+        return self._frozen_score()
 
     def stage(
         self,
@@ -1171,6 +1077,38 @@ class TriAttention(BaseKVCacheCompressionManager):
         if capacity <= 0:
             raise RuntimeError("draft KVCacheManagerV2 exposes an invalid protected-tail capacity")
         return capacity
+
+    def warmup_kernels(self) -> None:
+        """Build every eviction buffer set and compile all its kernels now.
+
+        One call compiles the whole pipeline: score, selection (CuTE top-k
+        plus the tie-settling call), and the compaction pack. The eviction
+        kernels never run inside the engine warmup forwards, so without this
+        the first due eviction round pays the one-time JIT compilation while
+        serving. Callable as soon as the KV pools exist; idempotent.
+        """
+        self._ensure_calibrated()
+        layout = self._runtime_kv_layout(self._num_layers_from_manager())
+        # A synthetic one-request cohort: the buffers are sized from the
+        # executor limits, so its geometry only has to be admissible (the
+        # prompt must cover the SWA landing window when SWA layers exist).
+        prompt_len = int(layout.swa_window or 0)
+        synthetic = _PreparedEviction(
+            request=None,
+            request_id=-1,
+            seq_len=prompt_len + 1,
+            round_start=prompt_len + 1,
+            prompt_len=prompt_len,
+            expected_keep_count=prompt_len + self.top_B,
+            protected_tail=0,
+        )
+        resources = self._eager_resources_for(layout, [synthetic])
+        self._batched_compaction_for(
+            layout=layout,
+            prepared=[synthetic],
+            score_staging=resources.score_staging,
+            keep_set_selector=resources.keep_set_selector,
+        )
 
     def _ensure_calibrated(self) -> None:
         """Resolve calibration once for the first request."""
