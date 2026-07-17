@@ -26,6 +26,7 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.modules.mla as mla_module
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, TunableRunner, autotune
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
@@ -81,76 +82,71 @@ def test_dsv4_fmha_epilogue_output_uses_fused_oproj() -> None:
     assert calls == [(attn_fp8, attn_scale, 4)]
 
 
+def test_dsv4_ob_cute_tactics_are_runtime_tuned() -> None:
+    runner_cls = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
+    runner = runner_cls()
+
+    assert issubclass(runner_cls, TunableRunner)
+    assert not hasattr(runner_cls, "_get_tactic")
+    for num_splits in (1, 2, 4):
+        config = runner.get_tuning_config(num_splits)
+        tactics = runner.get_valid_tactics([], OptimizationProfile(), num_splits=num_splits)
+        assert config.use_cuda_graph
+        assert config.exclude_from_cache
+        assert len(tactics) > 1
+        assert runner._get_fallback_tactic(num_splits) in tactics
+
+    split1_tiles = {tactic[0] for tactic in runner_cls._SPLIT_K1_TACTICS}
+    assert (256, 128) in split1_tiles
+    assert (256, 144) in split1_tiles
+
+
 @pytest.mark.parametrize(
-    ("num_tokens", "num_splits", "expected"),
+    ("num_splits", "num_tokens", "expected_bucket"),
     [
-        (1, 2, ((128, 32), (2, 1), True, None, True)),
-        (32, 2, ((128, 32), (2, 1), True, None, True)),
-        (64, 2, ((256, 64), (2, 1), True, 8, True)),
-        (96, 2, ((256, 128), (2, 1), True, None, True)),
-        (128, 2, ((256, 128), (2, 1), True, None, True)),
-        (192, 1, ((256, 144), (2, 1), True, None, True)),
-        (256, 1, ((256, 144), (2, 1), True, None, True)),
-        (320, 1, ((256, 160), (2, 1), True, None, True)),
-        (384, 1, ((256, 192), (2, 1), True, None, True)),
-        (448, 1, ((256, 208), (2, 1), False, None, True)),
-        (512, 1, ((256, 208), (2, 1), False, None, True)),
-        (704, 1, ((256, 144), (2, 1), True, None, True)),
-        (768, 1, ((256, 160), (2, 1), True, None, True)),
-        (1024, 1, ((256, 208), (2, 1), False, None, True)),
-        (1792, 1, ((256, 208), (2, 1), False, None, True)),
-        (1793, 1, ((256, 192), (2, 1), True, None, True)),
-        (2240, 1, ((256, 192), (2, 1), True, None, True)),
-        (4096, 1, ((256, 192), (2, 1), True, None, True)),
-        (16384, 1, ((256, 192), (2, 1), True, None, True)),
+        (4, 1, 1),
+        (4, 3, 4),
+        (4, 16, 16),
+        (2, 17, 32),
+        (2, 37, 64),
+        (2, 128, 128),
+        (1, 129, 192),
+        (1, 193, 256),
+        (1, 1025, 1280),
+        (1, 16384, 16384),
     ],
 )
-def test_dsv4_ob_cute_tactic(
-    num_tokens: int,
-    num_splits: int,
-    expected: tuple[tuple[int, int], tuple[int, int], bool, int | None, bool],
+def test_dsv4_ob_tuning_bucket_mapping(
+    num_splits: int, num_tokens: int, expected_bucket: int
 ) -> None:
-    runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
-    assert runner._get_tactic(num_tokens, 7168, num_splits, 74) == expected
+    config = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner.get_tuning_config(num_splits)
+    assert config.dynamic_tensor_specs[0].map_to_tuning_buckets(num_tokens) == expected_bucket
 
 
 def test_dsv4_ob_cute_compile_key_excludes_runtime_shapes() -> None:
     runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
-    warm_keys = set()
-    for num_tokens, num_splits in (
-        (1, 4),
-        (32, 2),
-        (64, 2),
-        (128, 2),
-        (192, 1),
-        (320, 1),
-        (384, 1),
-        (448, 1),
-    ):
-        tactic = runner._get_tactic(num_tokens, 7168, num_splits, 74)
-        warm_keys.add(runner._get_compile_key(16384, num_splits, *tactic, True))
+    tactic = runner._SPLIT_K1_TACTICS[0]
+    key = runner._get_compile_key(16384, 1, *tactic, 74, True)
 
-    runtime_keys = set()
-    for num_tokens, num_splits in (
-        (3, 4),
-        (17, 4),
-        (37, 2),
-        (73, 2),
-        (129, 1),
-        (193, 1),
-        (511, 1),
-        (704, 1),
-        (768, 1),
-        (1025, 1),
-        (1793, 1),
-        (4097, 1),
-        (16383, 1),
-    ):
-        tactic = runner._get_tactic(num_tokens, 7168, num_splits, 74)
-        runtime_keys.add(runner._get_compile_key(16384, num_splits, *tactic, True))
+    assert key == runner._get_compile_key(16384, 1, *tactic, 74, True)
+    assert key != runner._get_compile_key(16384, 1, *tactic, 80, True)
 
-    assert len(warm_keys) == 8
-    assert runtime_keys <= warm_keys
+
+def test_dsv4_ob_tuning_input_hook_restores_packed_scale_layout() -> None:
+    m, n, k, packed_k = 37, 128, 512, 1
+    inputs = [
+        torch.empty((m, k), dtype=torch.float8_e4m3fn),
+        torch.empty((m, packed_k), dtype=torch.int32),
+        torch.empty((n, k), dtype=torch.float8_e4m3fn),
+        torch.empty((n, packed_k), dtype=torch.int32),
+        torch.empty((2, m, n), dtype=torch.bfloat16),
+    ]
+
+    prepared = cute_dsl_custom_ops._prepare_dsv4_ob_tuning_inputs(inputs)
+
+    assert prepared[1].shape == (m, packed_k)
+    assert prepared[1].stride() == (1, 40)
+    assert prepared[4] is inputs[4]
 
 
 def _check_dsv4_oa_fp8out_tensor_contract() -> None:
@@ -380,8 +376,11 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
     sfb_storage = torch.full((n * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
     sfb = torch.as_strided(sfb_storage, (n, packed_k), (1, n))
     runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
+    tuner = AutoTuner.get()
     monkeypatch.delenv("TRTLLM_DSV4_OB_SPLIT_K", raising=False)
     monkeypatch.setattr(runner, "kernel_cache", {})
+    tuner.clear_cache()
+    tuner.stats.cache_misses = 0
 
     def run(num_tokens: int) -> torch.Tensor:
         aligned_m = (num_tokens + 3) // 4 * 4
@@ -392,21 +391,35 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
         sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
         return torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
 
-    # These are present in the default CUDA graph warmup list and cover every
-    # compile-time (split-K, tile) combination used by the standard path.
-    for num_tokens in (1, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024):
-        run(num_tokens)
-    assert len(runner.kernel_cache) == 8
+    # Context-only engine warmup must autotune and compile every generation
+    # output contract before capture begins.
+    with autotune():
+        run(256)
+    compiled_kernels = len(runner.kernel_cache)
+    assert compiled_kernels == sum(
+        len(tactics)
+        for tactics in (
+            runner._SPLIT_K1_TACTICS,
+            runner._SPLIT_K2_TACTICS,
+            runner._SPLIT_K4_TACTICS,
+        )
+    )
 
-    # Irregular context and generation token counts must reuse those kernels.
-    for num_tokens in (3, 17, 37, 73, 129, 193, 511, 704, 769, 1025, 1793, 4097):
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("CuTe JIT occurred after AutoTuner warmup")
+
+    monkeypatch.setattr(cute_dsl_custom_ops.cute, "compile", fail_compile)
+
+    # Cached M=1/128/256 contracts must not compile or fall back at runtime.
+    for num_tokens in (1, 37, 128, 256):
         output = run(num_tokens)
         num_splits = runner._select_num_splits(num_tokens)
         expected_partial = (k // num_splits) * 0.03125 * 0.03125
         torch.testing.assert_close(
             output[0, 0].float(), torch.tensor(expected_partial, device="cuda")
         )
-    assert len(runner.kernel_cache) == 8
+    assert len(runner.kernel_cache) == compiled_kernels
+    assert tuner.stats.cache_misses == 0
 
     # Capture an irregular shape after warmup and verify replay does not compile.
     num_tokens = 37
@@ -424,7 +437,8 @@ def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
     torch.testing.assert_close(
         graph_output[0, 0].float(), torch.tensor(expected_partial, device="cuda")
     )
-    assert len(runner.kernel_cache) == 8
+    assert len(runner.kernel_cache) == compiled_kernels
+    assert tuner.stats.cache_misses == 0
 
 
 @skip_pre_blackwell
