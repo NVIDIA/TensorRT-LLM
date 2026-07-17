@@ -467,10 +467,18 @@ class ServerConfig:
         self.moe_max_num_tokens = moe_config.get("max_num_tokens", 0)
         self.use_low_precision_moe_combine = moe_config.get("use_low_precision_moe_combine", False)
         load_balancer_config = moe_config.get("load_balancer", {})
-        self.load_balancer_num_slots = load_balancer_config.get("num_slots", 0)
-        self.load_balancer_layer_updates_per_iter = load_balancer_config.get(
-            "layer_updates_per_iter", 0
-        )
+        # load_balancer may be either an inline dict (num_slots + layer_updates_per_iter)
+        # or a path string to an offline-eplb YAML that the TRT-LLM engine loads at
+        # runtime. When it is a string, skip the inline attribute extraction — those
+        # metrics live inside the referenced YAML and aren't scraped by perf-sanity.
+        if isinstance(load_balancer_config, str):
+            self.load_balancer_num_slots = 0
+            self.load_balancer_layer_updates_per_iter = 0
+        else:
+            self.load_balancer_num_slots = load_balancer_config.get("num_slots", 0)
+            self.load_balancer_layer_updates_per_iter = load_balancer_config.get(
+                "layer_updates_per_iter", 0
+            )
 
         # cuda_graph_config
         cuda_graph_config = server_config_data.get("cuda_graph_config", {})
