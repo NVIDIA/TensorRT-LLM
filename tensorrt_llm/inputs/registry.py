@@ -1,3 +1,19 @@
+# Copyright 2026 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import enum
 import traceback
 from abc import ABC, abstractmethod
@@ -22,10 +38,21 @@ from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
+from .multimodal_data import serialize_item
 
 N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
+
+
+def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
+                              hash_lib=default_hasher) -> Optional[str]:
+    hasher = hash_lib()
+    try:
+        hasher.update(serialize_item(mm_processor_kwargs))
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    return hasher.hexdigest()
 
 
 class InputProcessor(Protocol):
@@ -614,6 +641,15 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        """Per-modality media-IO decode defaults for this model.
+
+        Applied under the server's ``--media_io_kwargs`` and any per-request
+        override, so a model can opt into a decode format it was tuned for
+        (e.g. ``{"video": {"format": "np"}}``) without operator config.
+        """
+        return {}
+
     def get_dummy_mm_data_for_tokens(
         self,
         *,
@@ -1042,6 +1078,8 @@ def maybe_compute_mm_embed_cumsum(
 def create_input_processor_with_hash(
     input_processor: BaseMultimodalInputProcessor,
     hash_lib=default_hasher,
+    *,
+    encoder_cache_enabled: bool = False,
 ) -> Callable[[TextPrompt, SamplingParams], Tuple[
         List[int], Optional[ExtraProcessedInputs]]]:
     """Creates a modified processor that applies additional logic like (hashing, find mm chunk positions) to the input processor
@@ -1049,6 +1087,8 @@ def create_input_processor_with_hash(
     Args:
         original_processor: The original input processor to wrap.
         hash_lib: hasher to use (default: blake3)
+        encoder_cache_enabled: Whether to generate processor-kwargs hashes for
+            persistent multimodal encoder-cache keys.
 
     Returns:
         A wrapped processor that modifies prompts before processing.
@@ -1079,6 +1119,17 @@ def create_input_processor_with_hash(
 
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
+        if extra_processed_inputs is None:
+            extra_processed_inputs = {}
+        multimodal_data = extra_processed_inputs.setdefault(
+            "multimodal_data", {})
+        if not isinstance(multimodal_data, dict):
+            raise TypeError(
+                "extra_processed_inputs['multimodal_data'] must be a dict")
+        if encoder_cache_enabled:
+            multimodal_data[
+                "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
+                    inputs.get("mm_processor_kwargs") or {}, hash_lib)
 
         # TODO: here we assume there is only one modality for now
         num_mm_tokens_by_key = find_mm_token_lengths(

@@ -14,6 +14,27 @@ from tensorrt_llm.scaffolding.task_collection import (TaskCollection,
 
 class ScaffoldingBenchRequest(BaseModel):
     prompt: str
+    scope_params: dict[str, str | list[str]] | None = None
+
+
+def _apply_scope_params(
+    scaffolding_llm: ScaffoldingLlm,
+    request: ScaffoldingBenchRequest,
+    result: ScaffoldingResult,
+) -> None:
+    if request.scope_params is None:
+        return
+
+    seen_workers: set[int] = set()
+    for worker in scaffolding_llm.workers.values():
+        worker_id = id(worker)
+        if worker_id in seen_workers:
+            continue
+        seen_workers.add(worker_id)
+
+        setter = getattr(worker, "set_scope_params", None)
+        if callable(setter):
+            setter(result.id, **request.scope_params)
 
 
 async def enqueue_requests(input_queue, requests):
@@ -32,6 +53,7 @@ async def process_request(scaffolding_llm: ScaffoldingLlm, request,
 
         request_start_time = time.time()
         result = scaffolding_llm.generate_async(request.prompt)
+        _apply_scope_params(scaffolding_llm, request, result)
         await result.aresult()
         request_execution_time = time.time() - request_start_time
         await output_queue.put(

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Test suite for DeepGEMM indexer kernels and some related utilities.
 
@@ -12,6 +26,7 @@ import builtins
 import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -39,7 +54,10 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
 
@@ -50,6 +68,51 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        indexer_k_dtype="fp8",
+    )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_metadata_params
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.TrtllmAttentionMetadata.__post_init__"
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+
+    assert metadata.indexer_head_dim == 96
+    assert metadata.compress_ratios == [1, 4, 128]
+    assert metadata._indexer_compress_ratio == 4
+    assert metadata._tokens_per_block == 64
+
+
+def test_indexer_post_load_weights_caches_fused_weight():
+    indexer = Indexer.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.wk = torch.nn.Linear(3, 2, bias=False)
+    indexer.weights_proj = torch.nn.Linear(3, 4, bias=False)
+    indexer.wk.weight.data.fill_(1.0)
+    indexer.weights_proj.weight.data.fill_(2.0)
+
+    indexer.post_load_weights()
+
+    assert indexer._fused_wk_wp_weight.shape == (6, 3)
+    assert torch.equal(indexer._fused_wk_wp_weight[:2], indexer.wk.weight.data)
+    assert torch.equal(indexer._fused_wk_wp_weight[2:], indexer.weights_proj.weight.data)
+    assert not hasattr(indexer, "_weights_transformed")
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -3100,3 +3163,170 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_blackwell
+def test_cutedsl_mqa_logits_output_buffer_persistent():
+    """Regression: the CuteDSL paged-MQA-logits output must have a STABLE address
+    across calls, not be a per-forward ``torch.empty``.
+
+    At long context the ``[B*next_n, kv_len]`` output is large; as a churning
+    transient it goes stale under CUDA-graph replay when another subsystem
+    co-captured in the same graph (e.g. the MTP / one-model spec sampler)
+    perturbs the shared pool. It must instead be drawn from the reserved
+    ``get_memory_buffers`` arena (like the CuteDSL topk runner), so its address is
+    identical across calls.
+
+    Fails before the fix (two distinct ``torch.empty`` addresses while the first
+    output is kept alive); passes after (same reserved-arena address).
+    """
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+    batch_size, next_n = 4, 1
+    head_dim, block_size, index_topk = 128, 64, 2048
+    heads = 32
+    kv_len = 4096
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=kv_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    create_indexer(sparse_attn_config, layer_idx=0)
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False, prepare_resource=True
+    )
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.full((batch_size,), next_n, dtype=torch.int32),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[kv_len - next_n] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size * next_n,
+        max_draft_tokens=next_n - 1,
+        index_topk=index_topk,
+        use_cute_dsl_paged_mqa_logits=True,
+    )
+    Indexer.prepare(metadata)
+
+    kv_cache = cache_manager.get_indexer_k_cache_buffers(0)
+    q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn((batch_size * next_n, heads), device="cuda", dtype=torch.float32)
+    context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+    block_table = metadata.indexer_k_cache_block_offsets[0:batch_size]
+    sched = metadata.scheduler_metadata_buffer
+
+    def _mqa():
+        return torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+            q, kv_cache, weights, context_lens, block_table, sched, kv_len
+        )
+
+    out1 = _mqa()
+    ptr1 = out1.data_ptr()
+    out2 = _mqa()  # out1 kept alive: a fresh torch.empty would land elsewhere
+    ptr2 = out2.data_ptr()
+
+    assert ptr1 == ptr2, (
+        f"CuteDSL mqa-logits output address changed across calls "
+        f"({ptr1:#x} -> {ptr2:#x}); it must be a persistent reserved-arena buffer "
+        f"to avoid stale-pointer IMA under CUDA-graph replay"
+    )
+    assert "cute_dsl_mqa_logits" in get_memory_buffers().buffers, (
+        "CuteDSL mqa-logits output must be drawn from the get_memory_buffers arena"
+    )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_topk_indices_buffer_cuda_graph():
+    from tensorrt_llm._torch.memory_buffer_utils import Buffers
+
+    batch_size, next_n = 4, 3
+    head_dim, block_size = 128, 64
+    index_topk = 2048
+    kv_len = 512
+    layer_idx = 0
+    num_tokens = batch_size * next_n
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=kv_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.tensor([kv_len] * batch_size, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=kv_lens.tolist(),
+        is_gen=False,
+        prepare_resource=True,
+    )
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.tensor([next_n] * batch_size, dtype=torch.int32),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[kv_len - next_n] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=num_tokens,
+        max_draft_tokens=next_n - 1,
+        index_topk=index_topk,
+        enable_indexer_skip=True,
+    )
+    assert metadata.skip_indexer_for_gen_reqs, (
+        "test setup must hit the skip-indexer path (kv_len <= index_topk)"
+    )
+
+    metadata.is_cuda_graph = True
+    metadata.cuda_graph_buffers = Buffers()
+
+    hidden_states = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.bfloat16)
+    dummy = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.bfloat16)
+
+    def _run_indexer():
+        return indexer.sparse_attn_indexer(
+            metadata,
+            hidden_states,
+            q_fp8=dummy,
+            k_fp8=dummy,
+            k_scale=dummy,
+            weights=dummy,
+            update_k_cache=False,
+        )
+
+    out1 = _run_indexer()
+    ptr1 = out1.data_ptr()
+    out2 = _run_indexer()
+    ptr2 = out2.data_ptr()
+
+    assert ptr1 == ptr2, (
+        f"indexer topk-output buffer address changed across calls "
+        f"({ptr1:#x} -> {ptr2:#x}); under CUDA-graph capture it must be a "
+        f"persistent reserved-arena buffer to avoid stale-pointer IMA"
+    )
+    assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
+        "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
+    )

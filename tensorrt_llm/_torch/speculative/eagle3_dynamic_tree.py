@@ -24,8 +24,8 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.sampler.sampling_utils import sampling_batch_spec_dec_one_model
 from .eagle3 import Eagle3OneModelWorker
-from .one_model_sampler import sampling_batch_spec_dec_one_model
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -585,7 +585,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
     ):
         """Dynamic tree draft loop with growing context."""
         spec_tree_manager = self.spec_tree_manager
-        self._d2t = getattr(draft_model.model, "d2t", None)
 
         assert batch_size <= self._max_batch_size, (
             f"batch_size {batch_size} exceeds pre-allocated max_batch_size {self._max_batch_size}"
@@ -636,9 +635,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
             )
 
-            new_draft_tokens, new_draft_scores = self.sample(
-                logits, self.K, draft_model=draft_model
-            )
+            new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
 
             previous_draft_scores = self.update_draft_tokens_and_scores(
                 cur_draft_idx=0,
@@ -698,9 +695,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                     selected_hs, draft_model.lm_head, attn_metadata, True
                 )
 
-                new_draft_tokens, new_draft_scores = self.sample(
-                    logits, self.K, draft_model=draft_model
-                )
+                new_draft_tokens, new_draft_scores = self.sample(logits, self.K)
 
                 # Reshape for update: [batch_size, K, K]
                 new_draft_tokens = new_draft_tokens.reshape(batch_size, self.K, self.K)
@@ -782,7 +777,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_flat_tokens],
                 top_ks,
                 spec_metadata.top_ps[:num_flat_tokens],
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset,
             )
@@ -891,7 +885,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,
                 spec_metadata.top_ps[:num_contexts],
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset,
             )
@@ -1017,14 +1010,12 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         ).to(torch.int32)
 
     @nvtx_range("eagle3_dyn.sample")
-    def sample(
-        self, logits: torch.Tensor, max_top_k: int, draft_model=None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample(self, logits: torch.Tensor, max_top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
         """TopK sampling with softmax for dynamic tree."""
         topk_indices, topk_values = _sample_softmax_topk(logits, max_top_k)
-        # Apply draft-to-target vocab mapping if the draft model has it
-        if draft_model is not None and hasattr(draft_model.model, "d2t"):
-            d2t = draft_model.model.d2t.data
+        # Apply draft-to-target vocab mapping when draft/target vocabs differ.
+        if self._d2t is not None:
+            d2t = self._d2t.data
             topk_indices = topk_indices + d2t[topk_indices]
         return topk_indices, topk_values
 

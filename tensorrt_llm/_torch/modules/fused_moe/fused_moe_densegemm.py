@@ -298,9 +298,6 @@ class DenseGEMMFusedMoE(MoE):
                     f"got {self.quant_config.quant_mode}."
                 )
 
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
-
     def _transform_w2_weight_scale_for_min_latency(self):
         """Transform w2_weight_scale for minimum latency path optimization."""
         # Calculate padded dimensions

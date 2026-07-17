@@ -5,7 +5,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import zmq
 
@@ -13,7 +13,6 @@ from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -28,6 +27,7 @@ from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
+from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -38,7 +38,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -69,8 +69,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # Setup RPC server for stats (skip init_rpc_worker to keep IPC response queue)
         # Only set up if rpc_addr is provided (for stats RPC support)
         if rpc_addr is not None:
-            if not hmac_key:
-                raise ValueError("hmac_key is required when rpc_addr is set")
+            assert hmac_key, "hmac_key is required when rpc_addr is set"
             self.rpc_addr = rpc_addr
             self.hmac_key = hmac_key
             self.start_rpc_server()  # Reuse from RpcWorkerMixin
@@ -166,7 +165,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -312,6 +311,8 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
+    worker_process_identities = mpi_comm().allgather(
+        capture_worker_process_identity(mpi_rank()))
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
@@ -352,7 +353,7 @@ def worker_main(
                     worker.set_result_queue(result_queue)
 
                 # Send ready signal with confirmation
-                ready_msg = (ready_signal, None)
+                ready_msg = (ready_signal, None, worker_process_identities)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"

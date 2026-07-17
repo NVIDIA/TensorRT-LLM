@@ -62,17 +62,16 @@ struct DispatchKernelPointers
     int* local_token_counter;      // Atomic counter for completed tokens
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks; // target rank per k, -1 for duplicates
-    int* topk_send_indices; // dst index per k, -1 for duplicates
+    int* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
+    int* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
     // Optional: Statistics for EPLB
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
-    // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
-    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Tokens routed to a masked
-    // rank are dropped (topk_*[k] = -1); flag writes/waits to/from masked peers are skipped.
-    // The local rank's own bit must always be set; this is checked at launch time.
+    // Active-rank bitmask: bit i set => rank i participates in this collective.
+    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. The masked kernel
+    // rejects inactive route targets and skips their peer counters, stats, and flags.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -89,12 +88,11 @@ struct CombineKernelPointers
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks; // target rank per k, -1 for duplicates
-    int const* topk_send_indices; // dst index per k, -1 for duplicates
+    int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
+    int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
-    // writes/waits to/from masked peers; per-token accumulation uses topk_send_indices[k] < 0
-    // (set by dispatch) to skip dead-targeted slots, so no explicit mask check is needed there.
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
+    // completion flag writes/waits to/from inactive peers.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -139,9 +137,14 @@ struct MoeA2ADispatchParams
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
-    // copies these words into the kernel pointers struct. Defaults to all-ones for
-    // backwards-compatible "no masking" behavior.
+    // Whether to instantiate a kernel with active-rank checks.
+    // This is a launch-lifetime mode, independent of future execution-abort handling.
+    bool enable_rank_mask{false};
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
+    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
+    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
+    // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // CUDA stream
@@ -189,9 +192,14 @@ struct MoeA2ACombineParams
                                            // rank has signaled the target rank
     void const* recv_buffers[kMaxRanks];   // Per-rank receive buffers (only for single payload)
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The launch function
-    // copies these words into the kernel pointers struct. Defaults to all-ones for
-    // backwards-compatible "no masking" behavior.
+    // Whether to instantiate a kernel with active-rank checks in peer synchronization.
+    // This is a launch-lifetime mode, independent of future execution-abort handling.
+    bool enable_rank_mask{false};
+
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Used only when
+    // enable_rank_mask is true; defaults to all-ones for backwards-compatible behavior.
+    // The mask is copied by value into kernel arguments. Rank-mask mode must reject
+    // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
     // CUDA stream

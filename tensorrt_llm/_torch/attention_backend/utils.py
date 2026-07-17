@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Sequence, Type, Union
+from typing import Optional, Sequence, Type
 
 import torch
 
@@ -14,36 +14,24 @@ from .sparse.params import SparseParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
 
-if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import \
-        SparseAttentionConfig as LlmSparseAttentionConfig
-    from tensorrt_llm.visual_gen.args import \
-        SparseAttentionConfig as VisualGenSparseAttentionConfig
-
-    SparseAttentionConfig = Union[LlmSparseAttentionConfig,
-                                  VisualGenSparseAttentionConfig]
-
 
 def get_attention_backend(
     backend_name: str,
-    sparse_attention_config: Optional["SparseAttentionConfig"] = None,
+    sparse_params: Optional[SparseParams] = None,
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
     if backend_name == "VANILLA":
-        if sparse_attention_config is not None:
-            return get_vanilla_sparse_attn_attention_backend(
-                sparse_attention_config)
+        if sparse_params is not None:
+            return get_vanilla_sparse_attn_attention_backend(sparse_params)
         return VanillaAttention
     elif backend_name == "TRTLLM":
-        if sparse_attention_config is not None:
-            return get_trtllm_sparse_attn_attention_backend(
-                sparse_attention_config)
+        if sparse_params is not None:
+            return get_trtllm_sparse_attn_attention_backend(sparse_params)
         return TrtllmAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
-        if sparse_attention_config is not None:
-            return get_flashinfer_sparse_attn_attention_backend(
-                sparse_attention_config)
+        if sparse_params is not None:
+            return get_flashinfer_sparse_attn_attention_backend(sparse_params)
         return FlashInferAttention
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
@@ -73,7 +61,6 @@ def create_attention(
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
     attention_chunk_size: Optional[int] = None,
-    attn_cls: Optional[Type[AttentionBackend]] = None,
     sparse_params: Optional[SparseParams] = None,
     dtype: Optional[torch.dtype] = None,
     aux_stream: Optional[torch.cuda.Stream] = None,
@@ -81,11 +68,7 @@ def create_attention(
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
             f"Backend {backend_name} does not support chunked attention.")
-    if sparse_params is not None and attn_cls is None:
-        raise ValueError("attn_cls is required when sparse_params is set.")
-
-    if attn_cls is None:
-        attn_cls = get_attention_backend(backend_name)
+    attn_cls = get_attention_backend(backend_name, sparse_params=sparse_params)
 
     if is_mla_enable:
         assert attn_cls.support_mla(
@@ -114,9 +97,8 @@ def create_attention(
         attention_chunk_size=attention_chunk_size,
         dtype=dtype,
         aux_stream=aux_stream,
+        sparse_params=sparse_params,
     )
-    if sparse_params is not None:
-        kwargs["sparse_params"] = sparse_params
 
     return attn_cls(
         layer_idx,

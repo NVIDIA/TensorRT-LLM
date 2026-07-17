@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 import asyncio
 import json
 import multiprocessing
@@ -15,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
 
 from tensorrt_llm.scaffolding.controller import ChatWithMCPController, NativeGenerationController
@@ -67,9 +64,13 @@ def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlett
         # Return an empty streaming response after SSE connection closes
         return StreamingResponse(iter([]), media_type="text/event-stream")
 
+    async def handle_health(_request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
     return Starlette(
         debug=debug,
         routes=[
+            Route("/health", endpoint=handle_health),
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
         ],
@@ -103,9 +104,13 @@ class RemoteMCPServer:
         )
         self.proc.start()
 
-        # Wait for server to be ready
-        # self._wait_for_server(url=self.sse_url,
-        #                      timeout=self.MAX_SERVER_START_WAIT_S)
+        try:
+            self._wait_for_server(
+                url=f"{self.url_root}/health", timeout=self.MAX_SERVER_START_WAIT_S
+            )
+        except RuntimeError:
+            self.terminate()
+            raise
 
     def __enter__(self):
         return self
@@ -166,9 +171,9 @@ class RemoteMCPServer:
 
 
 @pytest.fixture(scope="module")
-def mcp_server():
+def mcp_server(unused_tcp_port_factory):
     # Create and start MCP server (similar to RemoteOpenAIServer usage)
-    remote_server = RemoteMCPServer(host="0.0.0.0", port=8080)
+    remote_server = RemoteMCPServer(host="127.0.0.1", port=unused_tcp_port_factory())
 
     # Yield server instance for test use
     yield remote_server
@@ -185,6 +190,7 @@ class FunctionCall:
 
 class ToolCall:
     def __init__(self, name: str, arguments: dict):
+        self.id = f"call_{name}"
         self.function = FunctionCall(name, arguments)
 
 
@@ -220,7 +226,6 @@ class DummyWorker(Worker):
 # ============================================================
 
 
-@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_add_numbers(mcp_server):
     # 1. Initialize MCPWorker with mcp_server's SSE URL
@@ -254,10 +259,9 @@ async def test_mcp_worker_add_numbers(mcp_server):
 
     finally:
         # 6. Clean up worker resources
-        worker.shutdown()
+        await worker.async_shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_echo_message(mcp_server):
     # Initialize MCPWorker
@@ -284,10 +288,9 @@ async def test_mcp_worker_echo_message(mcp_server):
         print(f"✓ Test passed: echo_message returned '{task.result_str}'")
 
     finally:
-        worker.shutdown()
+        await worker.async_shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_mcp_worker_multiple_calls(mcp_server):
     import json
@@ -337,10 +340,9 @@ async def test_mcp_worker_multiple_calls(mcp_server):
         print(f"  - Call 3: echo_message returned '{task3.result_str}'")
 
     finally:
-        worker.shutdown()
+        await worker.async_shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_multiple_calls_to_same_tool(mcp_server):
     sse_url = mcp_server.get_sse_url()
@@ -368,10 +370,9 @@ async def test_multiple_calls_to_same_tool(mcp_server):
     print(f"  - Call 1: add_numbers(10, 20) = {result1}")
     print(f"  - Call 2: add_numbers(100, 200) = {result2}")
 
-    worker.shutdown()
+    await worker.async_shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/6337229")
 @pytest.mark.asyncio
 async def test_scaffolding_with_chat_mcp_controller(mcp_server):
     # Initialize workers
@@ -441,7 +442,7 @@ async def test_scaffolding_with_chat_mcp_controller(mcp_server):
 
     finally:
         # Clean up
-        await mcp_worker.shutdown()
+        await mcp_worker.async_shutdown()
         scaffolding_llm.shutdown(shutdown_workers=False)  # Don't shutdown workers again
 
 

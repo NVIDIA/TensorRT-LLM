@@ -44,8 +44,13 @@ from ._config import (
 from ._copy_engine import CopyTask, batched_copy
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
-from ._exceptions import OutOfPagesError
-from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
+from ._exceptions import LogicError, OutOfPagesError
+from ._life_cycle_registry import (
+    AttnLifeCycle,
+    LifeCycleId,
+    LifeCycleRegistry,
+    compute_scratch_range,
+)
 from ._page import CommittedPage, Page
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
@@ -79,6 +84,7 @@ from ._utils import (
     typed_len,
     typed_map,
     typed_range,
+    unwrap_optional,
 )
 
 if TYPE_CHECKING:
@@ -321,6 +327,8 @@ class StorageManager:
         lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
+            if num_slots[lc] < 0:
+                raise LogicError("StorageManager.new_slots: slot count must be non-negative")
             pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
         if any(
@@ -354,6 +362,10 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> list[Slot]:
+        if num_slots < 0:
+            raise LogicError(
+                "StorageManager.new_slots_for_pool_group: slot count must be non-negative"
+            )
         storage = self._levels[level].storage
         if num_slots > storage.get_num_free_slots(pg_idx):
             num_slots_list = filled_list(0, self.num_pool_groups)
@@ -898,12 +910,30 @@ class StorageManager:
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
-        Always returns at least 1 slot per life cycle in each pool group.
+        All returned elements are positive.
         """
-        # Default floor: 1 slot per life cycle in each pool group.
         max_slots = filled_list(0, self.num_pool_groups)
-        for pg_idx in self._life_cycle_grouping:
-            max_slots[pg_idx] += 1
+
+        def swa_floor_blocks(lc: AttnLifeCycle) -> int:
+            window = unwrap_optional(lc.window_size)
+            # Handle oscillation of slot count required by SWA while the window slides.
+            return lc.num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
+
+        # Full-attention lifecycles share the largest SWA floor: all attention
+        # lifecycles see the same seq_len, so this is a valid lower bound.
+        floor_num_blocks = 1
+        for _, lc in self.life_cycles.attention_life_cycles():
+            if lc.window_size is not None:
+                floor_num_blocks = max(floor_num_blocks, swa_floor_blocks(lc))
+        for lc_idx, lc in self.life_cycles.items():
+            pg_idx = self.get_pool_group_index(lc_idx)
+            if not isinstance(lc, AttnLifeCycle):
+                # SSM / non-attention: 1 slot floor per life cycle.
+                max_slots[pg_idx] += 1
+            elif lc.window_size is not None:
+                max_slots[pg_idx] += swa_floor_blocks(lc)
+            else:
+                max_slots[pg_idx] += floor_num_blocks
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):

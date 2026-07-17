@@ -1,6 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import concurrent.futures
+import ctypes
 import os
+import re
 import sys
 import threading
 import traceback
@@ -23,54 +40,40 @@ class LlmLauncherEnvs(StrEnum):
     # Spawn a process for the LLM-API Proxy
     TLLM_SPAWN_PROXY_PROCESS = "TLLM_SPAWN_PROXY_PROCESS"
     TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
-    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD = (
-        "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD")
+    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
 
     # Whether to use periodical responses handler in await_responses
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
 
 
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
-def _normalize_spawn_proxy_process_ipc_hmac_key(key: str | bytes) -> bytes:
-    if isinstance(key, bytes):
-        if len(key) == 32:
-            return key
-        key = key.decode("ascii")
+def _scrub_process_env_value(key_name: str, value: str) -> None:
+    if sys.platform != "linux":
+        return
 
-    key_bytes = bytes.fromhex(key)
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.getenv.restype = ctypes.c_void_p
+    value_ptr = libc.getenv(os.fsencode(key_name))
+    if value_ptr:
+        ctypes.memset(value_ptr, 0, len(os.fsencode(value)))
+
+
+def _normalize_spawn_proxy_process_ipc_hmac_key(key: str) -> bytes:
+    if not _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN.fullmatch(key):
+        raise ValueError("IPC HMAC key must be a 64-character hex string.")
+
+    try:
+        key_bytes = bytes.fromhex(key)
+    except ValueError as exc:
+        raise ValueError(
+            "IPC HMAC key must be a 64-character hex string.") from exc
+
     if len(key_bytes) != 32:
         raise ValueError("IPC HMAC key must be 32 bytes.")
     return key_bytes
-
-
-def set_spawn_proxy_process_ipc_hmac_key(key: str | bytes) -> None:
-    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
-    _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
-        _normalize_spawn_proxy_process_ipc_hmac_key(key))
-
-
-def _read_spawn_proxy_process_ipc_hmac_key_fd(fd_value: str) -> bytes:
-    fd = int(fd_value)
-    chunks: list[bytes] = []
-    try:
-        os.set_blocking(fd, True)
-        while True:
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    finally:
-        os.close(fd)
-
-    try:
-        key_hex = b"".join(chunks).decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ValueError(
-            "IPC HMAC key FD must contain an ASCII hex string.") from exc
-
-    return _normalize_spawn_proxy_process_ipc_hmac_key(key_hex)
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
@@ -84,16 +87,18 @@ def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     if _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY is not None:
         return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
-    key_fd = os.environ.pop(
-        LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD, None)
-    if key_fd is not None:
-        _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
-            _read_spawn_proxy_process_ipc_hmac_key_fd(key_fd))
-        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    env_name = LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    key = os.environ.get(env_name)
+    if key is None:
+        raise RuntimeError(
+            f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
+            "HMAC encryption is required for IPC communication.")
+    _scrub_process_env_value(env_name, key)
+    os.environ.pop(env_name, None)
 
-    raise RuntimeError(
-        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_FD} is not set. "
-        "HMAC encryption is required for IPC communication.")
+    _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+        _normalize_spawn_proxy_process_ipc_hmac_key(key))
+    return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
 
 def get_spawn_proxy_process_env() -> bool:
@@ -131,6 +136,23 @@ def has_event_loop() -> bool:
 
 class RequestError(RuntimeError):
     ''' The error raised when the request is failed. '''
+
+
+class EngineDeadError(RuntimeError):
+    """Raised by pending and new requests once the engine is known dead.
+
+    Sticky and engine-level (unlike the per-request ``RequestError``): when a
+    worker process dies, every queued ``GenerationResult`` is unblocked with this
+    error and every subsequent ``submit()`` raises it immediately, instead of
+    blocking forever on a response queue whose producer is gone.
+    """
+
+    def __init__(self, root_cause: Optional[BaseException] = None):
+        msg = "Engine has died"
+        if root_cause is not None:
+            msg += f": {type(root_cause).__name__}: {root_cause}"
+        super().__init__(msg)
+        self.root_cause = root_cause
 
 
 class ProcessPoolExecutorSession(MpiSession):
