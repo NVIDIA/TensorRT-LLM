@@ -2715,14 +2715,23 @@ class PyTorchModelEngine(ModelEngine):
         spans the whole TP group (a superset of any LM-head-TP subgroup):
         agreement over the superset implies agreement within each subgroup and
         avoids depending on the per-forward LM-head-TP group construction.
+
+        This is a dedicated per-iteration host all-gather rather than a
+        piggyback on the ``all_rank_num_tokens`` exchange because that
+        exchange runs in ``_prepare_inputs``, AFTER the CUDA graph key is
+        built -- too late for the key to see the synced value.
         """
         if not (self.enable_attention_dp
                 and getattr(self.mapping, 'enable_lm_head_tp_in_adp', False)
-                and getattr(spec_metadata, 'use_rejection_sampling', False)):
+                and spec_metadata.use_rejection_sampling):
             return
         local_flag = bool(spec_metadata.is_all_greedy_sample)
         all_flags = self.dist.tp_allgather(local_flag)
         spec_metadata.group_all_greedy_sample = all(all_flags)
+        # Also overwrite the live flag directly: this iteration's scan already
+        # ran (update_is_all_greedy_sample just returned) and the CUDA graph
+        # key reads the flag next -- the stored override only takes effect on
+        # the NEXT rescan (populate), which is after key selection.
         spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
 
     def _set_spec_metadata_all_rank_num_tokens(

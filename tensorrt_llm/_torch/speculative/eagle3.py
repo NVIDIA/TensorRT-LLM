@@ -865,8 +865,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # under ADP the lm_head weight is replicated (the sliced-shard
                 # trick is a runtime optimization), exactly like the target
                 # head. The bypass triggers only when rejection is enabled AND
-                # the batch is not all-greedy (mirroring sample_draft_tokens'
-                # `advanced`); with rejection off, non-greedy batches keep the
+                # the batch is not all-greedy (wants_advanced_draft_sampling,
+                # shared with sample_draft_tokens' branch, so head selection
+                # and sampler branch cannot diverge); with rejection off,
+                # non-greedy batches keep the
                 # LM-head-TP argmax path unconditionally, where the per-rank
                 # greedy flag never enters control flow. The branch is CUDA-
                 # graph- and collective-safe because use_rejection_sampling is
@@ -876,8 +878,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # same branch, so the stacked forward's all-gather never loses
                 # participants.
                 advanced_draft_sampling = (
-                    getattr(spec_metadata, 'use_rejection_sampling', False)
-                    and not spec_metadata.is_all_greedy_sample)
+                    spec_metadata.wants_advanced_draft_sampling)
                 lm_head_tp_in_adp_configured = (
                     self.is_mtp_eagle and self.model_config is not None
                     and self.model_config.mapping.enable_attention_dp
