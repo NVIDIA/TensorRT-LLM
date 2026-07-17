@@ -306,11 +306,17 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: gen_logits)
 
     sdt_calls = {}
+    # The gen scatter publishes the FULL (post-TP-gather) vocab width, which is
+    # wider than the sharded gen_logits width (`vocab`). The worker must pass this
+    # published width (draft_probs_last_dim) to write_context_onehot_draft_probs,
+    # NOT gen_logits.shape[-1].
+    FULL_VOCAB = 97
 
     def fake_sample_draft_tokens(gl, sm, bs, *, num_contexts):
         sdt_calls["logits"] = gl
         sdt_calls["batch_size"] = bs
         sdt_calls["num_contexts"] = num_contexts
+        sm.draft_probs_last_dim = FULL_VOCAB  # simulate the full-vocab scatter
         return gl.argmax(dim=-1).to(torch.int32)
 
     monkeypatch.setattr(worker, "sample_draft_tokens", fake_sample_draft_tokens)
@@ -335,8 +341,9 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     # with num_contexts so it slices the gen segment.
     assert sdt_calls["num_contexts"] == num_contexts
     assert sdt_calls["logits"].shape == (num_gens, K, vocab)
-    # Context rows one-hot-filled with the gen vocab width.
-    assert onehot_calls == {"nc": num_contexts, "ng": num_gens, "k": K, "gv": vocab}
+    # Context rows one-hot-filled with the *scatter* width (draft_probs_last_dim,
+    # FULL_VOCAB), not the sharded gen_logits width (vocab).
+    assert onehot_calls == {"nc": num_contexts, "ng": num_gens, "k": K, "gv": FULL_VOCAB}
 
     # next_draft_tokens = [context zeros ; gen argmax]; gen subset is not polluted
     # by the context rows.

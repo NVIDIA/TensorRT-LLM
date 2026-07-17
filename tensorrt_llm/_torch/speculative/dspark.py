@@ -514,7 +514,12 @@ class DSparkWorker(SpecWorkerBase):
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
                 )
-                gen_vocab = gen_logits.shape[-1]
+                # The context one-hot must match the width the gen scatter just
+                # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
+                # draft logits are vocab-sharded and sample_draft_tokens gathers
+                # them to full vocab before scattering, so the pre-gather shard
+                # width would leave stale columns and corrupt rejection.
+                gen_vocab = spec_metadata.draft_probs_last_dim
             else:
                 gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
                 gen_vocab = None
