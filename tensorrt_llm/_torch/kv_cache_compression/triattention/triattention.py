@@ -58,12 +58,6 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernel_warmup import (
-    FrozenScoreCall,
-    _FixedScoreStreamMismatch,
-    _PreparedDeterministicTopK,
-    _PreparedUnionScores,
-)
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import BaseKVCacheCompressionManager
@@ -93,6 +87,10 @@ def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Ten
         offsets.append(float(value))
         value *= 2
     return torch.tensor(offsets, device=device, dtype=torch.float32)
+
+
+class _FixedScoreStreamMismatch(RuntimeError):
+    """Raised when fixed score staging buffers are used from another CUDA stream."""
 
 
 class _CrossRequestSelectionPlan(NamedTuple):
@@ -129,7 +127,7 @@ class _RuntimeKVLayout(NamedTuple):
 
 
 class _BatchedKeepSetSelectorBase:
-    """Shared fixed buffers and frozen kernel calls for keep-set selectors."""
+    """Shared fixed buffers and row views for keep-set selectors."""
 
     def __init__(
         self,
@@ -208,21 +206,49 @@ class _BatchedKeepSetSelectorBase:
                 self.prompt_offsets.unsqueeze(1).expand(-1, self.selection_rows_per_request)
             )
 
-    def _build_prepared_selection_launchers(
+    def _bind_selection_rows(
         self,
         scores_rows: torch.Tensor,
         row_lengths: torch.Tensor,
         provisional_indices: torch.Tensor,
         keep_rows: torch.Tensor,
     ) -> None:
-        """Bind the deterministic top-k over row-major views of the buffers."""
-        self.prepared_topk = _PreparedDeterministicTopK(
-            scores_rows,
-            row_lengths,
-            self.row_prompt_offsets,
-            provisional_indices,
-            keep_rows,
+        """Keep row-major views of the buffers the top-k selection reads."""
+        self._selection_scores_rows = scores_rows
+        self._selection_row_lengths = row_lengths
+        self._provisional_rows = provisional_indices
+        self._keep_rows = keep_rows
+
+    def _select_top_tokens(self) -> None:
+        """Pick the top-k with the CuTE selector, then settle its output.
+
+        The CuTE top-k is fast but breaks score ties arbitrarily and emits
+        indices in arbitrary order; the settle kernel recomputes the threshold
+        membership with lowest-index-wins ties, rebases each row by its prompt
+        offset, and writes sorted ordinals.
+        """
+        from .triattention_kernels import _settle_ties_after_topk_kernel
+
+        rows = int(self._selection_scores_rows.shape[0])
+        # The trailing 1 is next_n: decode scores one query token per request.
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            self._selection_scores_rows,
+            self._selection_row_lengths,
+            self._provisional_rows,
             self.keep_count,
+            1,
+        )
+        _settle_ties_after_topk_kernel[(rows,)](
+            self._selection_scores_rows,
+            self._selection_row_lengths,
+            self.row_prompt_offsets,
+            self._provisional_rows,
+            self._keep_rows,
+            WIDTH=self.width,
+            KEEP_COUNT=self.keep_count,
+            OUTPUT_WIDTH=self.keep_count,
+            BLOCK=256,
+            num_warps=4,
         )
 
 
@@ -274,22 +300,25 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         self.keep = torch.empty(
             (max_requests, self.keep_count), dtype=torch.int32, device=self.device
         )
-        self._build_prepared_selection_launchers(
-            self.combined, self.valid_widths, self.final_indices, self.keep
-        )
-        self.prepared_scores = _PreparedUnionScores(
-            input_scores,
+        self._bind_selection_rows(self.combined, self.valid_widths, self.final_indices, self.keep)
+        # Callers select from exactly this tensor with exactly this flag.
+        self.input_scores = input_scores
+        self.normalize_scores = bool(normalize_scores)
+
+    def select_prepared_requests(self) -> None:
+        """Select from the CUDA score tensor bound to this fixed selector."""
+        from .triattention_kernels import prepare_union_scores
+
+        prepare_union_scores(
+            self.input_scores,
             self.valid_widths,
             self.row_mean,
             self.row_std,
             self.combined,
-            normalize_scores=normalize_scores,
+            self.max_requests,
+            normalize_scores=self.normalize_scores,
         )
-
-    def select_prepared_requests(self) -> None:
-        """Select from the CUDA score tensor bound to this fixed selector."""
-        self.prepared_scores()
-        self.prepared_topk()
+        self._select_top_tokens()
 
     def select_requests(
         self,
@@ -298,11 +327,8 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         normalize_scores: bool,
     ) -> None:
         """Select from the score tensor bound to this fixed selector."""
-        if (
-            scores is not self.prepared_scores.scores
-            or bool(normalize_scores) != self.prepared_scores.normalize_scores
-        ):
-            raise ValueError("union scores do not match their prepared fixed launcher")
+        if scores is not self.input_scores or bool(normalize_scores) != self.normalize_scores:
+            raise ValueError("union scores do not match this selector's bound input")
         self.select_prepared_requests()
 
 
@@ -378,7 +404,7 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         self.row_seq_lens_flat = self.row_seq_lens.view(-1)
         self.top_indices_i32_flat = self.top_indices_i32.view(-1, self.keep_count)
         self.keep_flat = self.keep.view(-1, self.keep_count)
-        self._build_prepared_selection_launchers(
+        self._bind_selection_rows(
             self.selection_scores_flat,
             self.row_seq_lens_flat,
             self.top_indices_i32_flat,
@@ -413,7 +439,7 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
             per_layer=self.eviction_mode == "per_layer_perhead",
             normalize_scores=normalize_scores,
         )
-        self.prepared_topk()
+        self._select_top_tokens()
 
 
 class _FixedScoreStagingBuffers:
@@ -675,22 +701,43 @@ class _FixedScoreStagingBuffers:
         self.copy_pending = False
         self.page_tables_active = False
         self.stream = None
-        self._frozen_score: Optional[FrozenScoreCall] = None
+        self._score_valid_widths: Optional[torch.Tensor] = None
+        self._score_aggregation: Optional[str] = None
 
     def bind_score_launcher(self, valid_widths: torch.Tensor, score_aggregation: str) -> None:
-        """Compile and bind the phase and score launches for these buffers."""
-        if self._frozen_score is not None:
+        """Bind the per-row score widths and aggregation for these buffers."""
+        if self._score_aggregation is not None:
             raise RuntimeError("TriAttention score launcher is already bound")
-        self._frozen_score = FrozenScoreCall(self, valid_widths, score_aggregation)
-        # stage() binds this staging to its first CUDA stream; the frozen
-        # score call was just built on that same stream.
-        self.stream = self._frozen_score.stream
+        if score_aggregation not in ("mean", "max"):
+            raise ValueError(f"unsupported score aggregation: {score_aggregation}")
+        self._score_valid_widths = valid_widths
+        self._score_aggregation = score_aggregation
 
     def launch_prepared_score(self) -> torch.Tensor:
-        """Launch the phase and score calls bound to these buffers."""
-        if self._frozen_score is None:
+        """Launch the phase and score kernels over these buffers."""
+        from .triattention_kernels import prepare_mean_phase
+
+        if self._score_aggregation is None:
             raise RuntimeError("TriAttention score launcher is not bound")
-        return self._frozen_score()
+        if self._score_aggregation == "mean":
+            prepare_mean_phase(
+                self.round_starts_device,
+                self.offsets,
+                self.omega,
+                self.mean_cos,
+                self.mean_sin,
+                self.max_requests,
+            )
+        return self.fused_group.launch(
+            self.max_requests,
+            self.valid_seq_lens_device,
+            self._score_valid_widths,
+            self.round_starts_device,
+            self.token_starts_device,
+            self.mean_cos,
+            self.mean_sin,
+            self._score_aggregation,
+        )
 
     def stage(
         self,
@@ -1101,38 +1148,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         if capacity <= 0:
             raise RuntimeError("draft KVCacheManagerV2 exposes an invalid protected-tail capacity")
         return capacity
-
-    def warmup_kernels(self) -> None:
-        """Build every eviction buffer set and compile all its kernels now.
-
-        One call compiles the whole pipeline: score, selection (CuTE top-k
-        plus the tie-settling call), and the compaction pack. The eviction
-        kernels never run inside the engine warmup forwards, so without this
-        the first due eviction round pays the one-time JIT compilation while
-        serving. Callable as soon as the KV pools exist; idempotent.
-        """
-        self._ensure_calibrated()
-        layout = self._runtime_kv_layout(self._num_layers_from_manager())
-        # A synthetic one-request cohort: the buffers are sized from the
-        # executor limits, so its geometry only has to be admissible (the
-        # prompt must cover the SWA landing window when SWA layers exist).
-        prompt_len = int(layout.swa_window or 0)
-        synthetic = _PreparedEviction(
-            request=None,
-            request_id=-1,
-            seq_len=prompt_len + 1,
-            round_start=prompt_len + 1,
-            prompt_len=prompt_len,
-            expected_keep_count=prompt_len + self.top_B,
-            protected_tail=0,
-        )
-        resources = self._eager_resources_for(layout, [synthetic])
-        self._batched_compaction_for(
-            layout=layout,
-            prepared=[synthetic],
-            score_staging=resources.score_staging,
-            keep_set_selector=resources.keep_set_selector,
-        )
 
     def _ensure_calibrated(self) -> None:
         """Resolve calibration once for the first request."""

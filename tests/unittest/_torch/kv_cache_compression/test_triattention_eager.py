@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest import mock
 
 import pytest
 import torch
@@ -201,12 +200,7 @@ def test_prepared_union_scores_match_checked_launch_and_exact_indices(normalize_
         normalize_scores=normalize_scores,
     )
     selector.valid_widths.copy_(valid_widths)
-    with mock.patch.object(
-        triattention_kernels,
-        "prepare_union_scores",
-        side_effect=AssertionError("checked Triton wrapper was called"),
-    ):
-        selector.select_prepared_requests()
+    selector.select_prepared_requests()
     actual_combined = selector.combined.cpu()
     actual_keep = selector.keep.cpu()
     expected_combined = reference_combined.cpu()

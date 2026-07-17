@@ -1704,22 +1704,11 @@ class TestFixedScoreMetadata:
         staging.offsets = offsets
         staging.omega = omega
         staging.stream = None
-        staging._frozen_score = None
+        staging._score_valid_widths = None
+        staging._score_aggregation = None
         staging.bind_score_launcher(valid_widths, aggregation)
         group.output.fill_(score_sentinel)
-        with (
-            mock.patch.object(
-                triattention_kernels,
-                "prepare_mean_phase",
-                side_effect=AssertionError("checked phase wrapper was called"),
-            ),
-            mock.patch.object(
-                group,
-                "launch",
-                side_effect=AssertionError("checked score wrapper was called"),
-            ),
-        ):
-            fixed = staging.launch_prepared_score().clone()
+        fixed = staging.launch_prepared_score().clone()
         torch.testing.assert_close(fixed, checked, rtol=0, atol=0)
         assert valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
@@ -1779,19 +1768,7 @@ class TestFixedScoreMetadata:
         ).clone()
         group.output.fill_(score_sentinel)
         valid_widths.fill_(-1)
-        with (
-            mock.patch.object(
-                triattention_kernels,
-                "prepare_mean_phase",
-                side_effect=AssertionError("checked phase wrapper was called"),
-            ),
-            mock.patch.object(
-                group,
-                "launch",
-                side_effect=AssertionError("checked score wrapper was called"),
-            ),
-        ):
-            second_launch = staging.launch_prepared_score().clone()
+        second_launch = staging.launch_prepared_score().clone()
         torch.testing.assert_close(second_launch, checked_second, rtol=0, atol=0)
         assert torch.equal(valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
