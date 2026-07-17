@@ -1894,6 +1894,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert filter_apply_order == "top_k_first"
             assert deterministic
@@ -1960,6 +1962,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -1991,6 +1995,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -2021,6 +2027,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"

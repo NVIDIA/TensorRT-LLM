@@ -304,6 +304,44 @@ def should_skip_trtllm(
             "see the comment above for reproduction."
         )
 
+    # [nvbug 6165866] The same uninitialized-trtllm-gen-scratch IMA cascade
+    # described above also poisons the whole `-k "TRTLLM"` pytest process on
+    # Blackwell (both SM100/B200 and SM103/B300) through two broader case
+    # families. They are skipped here (in addition to the specific SM103 case
+    # above) so the single-process run stays clean until the kernel is fixed.
+    # See https://nvbugspro.nvidia.com/bug/6165866
+    #
+    # (1) quant=None (BF16): the flashinfer BF16 GEMM
+    #     (`bmm_Bfloat16_..._sm100f`, trtllm_batched_gemm_runner.cu:305) is the
+    #     cascade victim once a block-scale case has run earlier in the same
+    #     process. Minimal repro (reproduces on both SM100 and SM103):
+    #       e60_k4_h2048_i1408-seq=1-quant=None,
+    #       e60_k4_h2048_i1408-seq=1-quant=FP8_BLOCK_SCALES,
+    #       e60_k4_h2048_i1408-seq=1-quant=W4A8_MXFP4_FP8,
+    #       then e8_k1_h512_i512-seq=1-quant=None  -> IMA on the last case.
+    #
+    # (2) e128 W4A16_MXFP4 (all seq / plain+gptoss): the four e128 shape
+    #     (num_experts=128, top_k=4, hidden=intermediate=2880) W4A16_MXFP4
+    #     cases poison each other (the SM103 gptoss-seq8 case above is one of
+    #     them; on SM100 the first observed FAIL is e128-seq1-W4A16_MXFP4).
+    is_e128_w4a16_mxfp4 = (
+        quant_algo == QuantAlgo.W4A16_MXFP4
+        and model_config is not None
+        and model_config.num_experts == 128
+        and model_config.top_k == 4
+        and model_config.hidden_size == 2880
+        and model_config.intermediate_size == 2880
+    )
+    if get_sm_version() in (100, 103) and (quant_algo is None or is_e128_w4a16_mxfp4):
+        return (
+            "[nvbug 6165866] TRTLLM-Gen MoE on Blackwell (SM100/SM103) hits a "
+            "CUDA illegal memory access that cascades across the whole pytest "
+            "process; the quant=None (flashinfer BF16 GEMM victim) and e128 "
+            "W4A16_MXFP4 (self-cascading tileN=32 tactic) families are skipped "
+            "until the kernel is fixed. "
+            "See https://nvbugspro.nvidia.com/bug/6165866"
+        )
+
     # Routing method compatibility check (used by test_moe_module.py)
     # TRTLLMGen C++ routing kernel (runner.cu) implements:
     # - DeepSeekV3 (nGroup<=1: SigmoidBias+ScaledSumNormalize; nGroup>1: full DeepSeek kernel)
