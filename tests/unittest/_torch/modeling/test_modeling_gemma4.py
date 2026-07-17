@@ -2453,6 +2453,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
             block_tables = wrappers.decode_wrapper._block_tables
             self.assertGreaterEqual(block_tables.size(1), 65)
+            self.assertEqual(block_tables.size(1), metadata.kv_cache_manager.max_blocks_per_seq)
             self.assertEqual(wrappers.host_decode_block_tables.size(1), 64)
             initial_state[plan_params.head_dim] = (
                 block_tables.data_ptr(),

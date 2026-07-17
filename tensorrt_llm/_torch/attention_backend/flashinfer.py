@@ -648,7 +648,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._host_pool_indices: Dict[int, torch.Tensor] = {}
         self._host_paged_kv_indices: Optional[torch.Tensor] = None
         self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
-        self._max_num_blocks = 0
+        self._max_num_blocks_per_seq = 0
 
         # VSWA (Variable Sliding Window Attention): models with per-layer
         # max_attention_window create separate V2 pool groups with independent
@@ -668,18 +668,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
             # Maximum block count across ALL pools: sizes the VSWA pool
-            # buffers below and bounds the per-request width of the
-            # persistent trtllm-gen decode block tables (a request can
-            # never reference more blocks than its pool holds).  Computed
-            # for every model, not just VSWA — non-VSWA managers have a
-            # single pool, so this stays blocks_in_primary_pool for them.
+            # buffers below. Computed for every model, not just VSWA —
+            # non-VSWA managers have a single pool, so this stays
+            # blocks_in_primary_pool for them.
             max_num_blocks = blocks_in_primary_pool
             if hasattr(self.kv_cache_manager, 'layer_offsets'):
                 for lid in self.kv_cache_manager.layer_offsets:
                     lbuf = self.kv_cache_manager.get_buffers(lid)
                     if lbuf is not None:
                         max_num_blocks = max(max_num_blocks, lbuf.shape[0])
-            self._max_num_blocks = max_num_blocks
+            self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
 
             # Layers may share one page-index list only when they are in the
             # same pool AND have the same page-index scale: VSWA splits pools,
@@ -1007,9 +1005,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         gen_num_blocks = np.asarray(self.num_blocks[self.num_contexts:],
                                     dtype=np.int64)
         max_n = int(gen_num_blocks.max())
-        if max_n > self._max_num_blocks:
-            # A request can never reference more blocks than any pool
-            # holds; defensive guard for inconsistent metadata.
+        if max_n > self._max_num_blocks_per_seq:
+            # A request can never reference more than max_blocks_per_seq;
+            # defensive guard for inconsistent metadata.
             return None
         block_tables = wrappers.decode_block_tables
         if (self.is_cuda_graph and block_tables is not None
@@ -1021,12 +1019,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if self.is_cuda_graph:
                 # Allocated once at capture warmup; full capacity width so
                 # replays never need a wider table.
-                width = self._max_num_blocks
+                width = self._max_num_blocks_per_seq
             else:
                 # Eager path replans (and re-reads the table) every step,
                 # so the buffer may grow geometrically as sequences do.
                 width = min(max(64, 1 << (max_n - 1).bit_length()),
-                            self._max_num_blocks)
+                            self._max_num_blocks_per_seq)
             try:
                 block_tables = torch.zeros((self.max_num_requests, width),
                                            dtype=torch.int32,
