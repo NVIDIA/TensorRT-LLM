@@ -667,6 +667,11 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
+@pytest.mark.skipif(
+    get_sm_version() < 90,
+    reason="DeepSeek-V3-Lite MLA disaggregation is not supported pre-Hopper "
+    "(SM<90): L40S OOMs on the full weights and A100/SM80 lacks MLA FMHA "
+    "kernels. https://nvbugs/6329052")
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
