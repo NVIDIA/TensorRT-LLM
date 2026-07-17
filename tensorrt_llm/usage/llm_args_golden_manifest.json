@@ -1615,13 +1615,6 @@
       "path": "speculative_config.block_size"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'float'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.confidence_threshold"
-    },
-    {
       "allowed_values": [
         "AUTO",
         "DFlash",
@@ -1680,13 +1673,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.eagle_choices"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.enable_confidence_head"
     },
     {
       "allowed_values": [],

@@ -2680,19 +2680,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
-    enable_confidence_head: bool = Field(
-        default=True,
-        description=
-        "Whether the draft model's confidence head is used to truncate the "
-        "proposed draft prefix. When False, the full block is always "
-        "proposed regardless of confidence_threshold.")
-
-    confidence_threshold: float = Field(
-        default=0.0,
-        description=
-        "Static confidence threshold for proposal-length truncation. A draft "
-        "position k is dropped when sigmoid(confidence_k) < threshold. 0.0 "
-        "disables truncation (propose the full block).")
+    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
+    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
+    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
+    # omitted and will be added when the feature is actually wired into the
+    # speculative scheduling/verification path. The confidence head module and its
+    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
+    # dspark_propose).
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 

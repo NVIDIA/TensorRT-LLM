@@ -229,7 +229,11 @@ class DSparkBlock(DeepseekV4DecoderLayer):
             self.confidence_head = DSparkConfidenceHead(
                 hidden_size=config.hidden_size,
                 markov_rank=self.markov_rank,
-                with_markov=True,
+                # Only concat the Markov prev-token embedding when a Markov head
+                # actually exists (build_markov_head returns None for
+                # markov_rank <= 0); otherwise dspark_propose passes no
+                # prev_embeddings and DSparkConfidenceHead.forward would assert.
+                with_markov=self.markov_rank > 0,
             )
 
     @property

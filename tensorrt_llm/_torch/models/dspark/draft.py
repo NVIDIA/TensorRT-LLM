@@ -98,6 +98,11 @@ def dspark_propose(
 
         draft_tokens = greedy_or_sample(base_logits, temperature)
 
+    # Scaffolding: confidence-based dynamic drafting is NOT enabled in this PR.
+    # The worker always calls with confidence_threshold=0.0, so the block below is
+    # inert and num_proposed stays == block_size (the full block is proposed). The
+    # returned num_proposed is intentionally not yet consumed by the speculative
+    # scheduler/verifier; wiring it through is a follow-up (see PR description).
     num_proposed = torch.full(
         (batch,), int(block_size), dtype=torch.int32, device=base_logits.device
     )
