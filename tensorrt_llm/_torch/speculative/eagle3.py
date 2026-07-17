@@ -130,7 +130,13 @@ class Eagle3ResourceManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            self.slot_manager.add_slot(rid)
+            # In two-model speculation the target and draft engines share this
+            # resource manager, and each registers its own padding dummy under
+            # the same draft-length-derived request ID. Reserve the slot once
+            # and share it between them; dummy outputs are discarded, so the
+            # slot contents never matter (mirrors SuffixAutomatonManager).
+            if self.slot_manager.get_slot(rid) is None:
+                self.slot_manager.add_slot(rid)
         if self.sa_manager is not None:
             self.sa_manager.add_dummy_requests(request_ids)
 

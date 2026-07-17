@@ -315,6 +315,11 @@ class KVCacheManager(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # Retained so consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
+        # can distinguish the throwaway estimation-phase managers from the
+        # final ones: the estimation cache is sized with no headroom for
+        # retained dummy requests.
+        self.is_estimating_kv_cache = is_estimating_kv_cache
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset

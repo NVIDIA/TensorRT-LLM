@@ -481,8 +481,6 @@ class CUDAGraphRunner:
     def _get_padded_batch(self, batch: ScheduledRequests,
                           resource_manager: ResourceManager,
                           runtime_draft_len: int) -> int:
-        kv_cache_manager = resource_manager.get_resource_manager(
-            self.config.kv_cache_manager_key)
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = batch.batch_size
         new_batch_size = batch_size
@@ -501,15 +499,12 @@ class CUDAGraphRunner:
                 or new_batch_size > self.max_supported_batch_size):
             return 0
 
-        # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
-        # as the source of truth and pad the batch size up to the nearest existing graph
-        # for that draft length.
-        if (self.spec_config and self.spec_config.draft_len_schedule
-                and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
-            padded_batch_size = self._round_up_batch_size_with_draft_len(
-                new_batch_size, runtime_draft_len)
-        else:
-            padded_batch_size = self._round_up_batch_size(new_batch_size)
+        # Pad the batch size up to the nearest existing graph for the runtime
+        # draft length. With dynamic draft length (one-model path) the runtime
+        # draft length is the source of truth for which graphs are eligible;
+        # otherwise this reduces to plain batch-size rounding.
+        padded_batch_size = self._round_up_batch_size_with_draft_len(
+            new_batch_size, runtime_draft_len)
 
         if batch_size == padded_batch_size:
             return 0
@@ -520,65 +515,147 @@ class CUDAGraphRunner:
         if padding_size + batch.batch_size > self.config.batch_size:
             return 0
 
+        # No padding if it would create too many concurrent requests.
+        # This is not strictly required, but we should probably
+        # respect the requirement just in case that changes in the future.
+        # Use per-draft-len dummy requests for dynamic draft length support.
+        padding_dummy_request = self._get_or_create_padding_dummy(
+            resource_manager, runtime_draft_len)
+        if padding_dummy_request is None:
+            logger.warning_once(
+                "Failed to allocate the CUDA graph padding dummy request "
+                f"(draft_len={runtime_draft_len}) from a saturated KV cache; "
+                "falling back to eager mode for padded batches.",
+                key=f"cuda_graph_padding_dummy_fallback_{runtime_draft_len}")
+            return 0
+
+        batch.generation_requests.extend([padding_dummy_request] * padding_size)
+        return padding_size
+
+    def _get_or_create_padding_dummy(
+            self, resource_manager: ResourceManager,
+            runtime_draft_len: int) -> Optional[LlmRequest]:
+        """Returns the padding dummy request for the given draft length,
+        allocating it from the KV cache manager on first use.
+
+        Returns None when the KV cache manager cannot allocate the dummy
+        (e.g. saturated cache); the batch cannot be padded until a retry
+        succeeds.
+        """
+        if runtime_draft_len in self.padding_dummy_requests:
+            return self.padding_dummy_requests[runtime_draft_len]
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+
         runtime_tokens_per_gen_step = (
             self.spec_config.get_runtime_tokens_per_gen_step(runtime_draft_len)
             if self.spec_config is not None else 1 + runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
-        # No padding if it would create too many concurrent requests.
-        # This is not strictly required, but we should probably
-        # respect the requirement just in case that changes in the future.
-        # Use per-draft-len dummy requests for dynamic draft length support.
-        if runtime_draft_len not in self.padding_dummy_requests:
-            dummy_encoder_output_len = None
-            if self.is_encoder_decoder:
-                cross_kv_cache_manager = resource_manager.get_resource_manager(
-                    ResourceManagerType.CROSS_KV_CACHE_MANAGER)
-                if cross_kv_cache_manager is None:
-                    return 0
-                dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
-                    cross_kv_cache_manager)
+        dummy_encoder_output_len = None
+        if self.is_encoder_decoder:
+            cross_kv_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+            if cross_kv_cache_manager is None:
+                return None
+            dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
+                cross_kv_cache_manager)
 
-            # Get draft KV cache manager only for one-model speculative decoding.
-            # In two-model mode, each model has its own KV cache manager, so
-            # draft_kv_cache_manager should be None.
-            draft_kv_cache_manager = get_draft_kv_cache_manager(
-                self.spec_config, resource_manager)
+        # Get draft KV cache manager only for one-model speculative decoding.
+        # In two-model mode, each model has its own KV cache manager, so
+        # draft_kv_cache_manager should be None.
+        draft_kv_cache_manager = get_draft_kv_cache_manager(
+            self.spec_config, resource_manager)
 
-            # Use unique dummy request ID per draft length
-            dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
-            dummy_request = kv_cache_manager.add_dummy_requests(
-                [dummy_request_id],
-                token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
-                if self.is_encoder_decoder else None,
-                is_gen=True,
-                max_num_draft_tokens=runtime_draft_token_buffer_width,
-                use_mrope=self.config.use_mrope,
-                max_beam_width=self.config.max_beam_width,
-                encoder_output_lens=[dummy_encoder_output_len]
-                if dummy_encoder_output_len is not None else None,
-                draft_kv_cache_manager=draft_kv_cache_manager)
+        # Use unique dummy request ID per draft length
+        dummy_request_id = CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len
+        dummy_request = kv_cache_manager.add_dummy_requests(
+            [dummy_request_id],
+            token_nums=[ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM]
+            if self.is_encoder_decoder else None,
+            is_gen=True,
+            max_num_draft_tokens=runtime_draft_token_buffer_width,
+            use_mrope=self.config.use_mrope,
+            max_beam_width=self.config.max_beam_width,
+            encoder_output_lens=[dummy_encoder_output_len]
+            if dummy_encoder_output_len is not None else None,
+            draft_kv_cache_manager=draft_kv_cache_manager)
 
-            if dummy_request is None:
-                return 0
+        if dummy_request is None:
+            return None
+        dummy_request = dummy_request[0]
+        dummy_request.is_cuda_graph_dummy = True
+        if self.is_encoder_decoder:
+            if not self._add_cross_dummy_request(
+                    dummy_request, resource_manager, dummy_encoder_output_len,
+                    draft_kv_cache_manager):
+                return None
+
+        spec_res_mgr = resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_res_mgr:
+            spec_res_mgr.add_dummy_requests([dummy_request_id])
+        self.padding_dummy_requests[runtime_draft_len] = dummy_request
+        return dummy_request
+
+    def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
+        """Returns True when _get_padded_batch can pad at least one feasible
+        batch size for the given draft length (mirrors its rounding and
+        capacity guards). For example, with graph batch sizes [1, 2, 4] and
+        max batch size 1, every batch already matches a graph size and no
+        padding dummy is ever needed.
+        """
+        max_unpadded_batch_size = min(self.config.batch_size,
+                                      self.max_supported_batch_size)
+        for batch_size in range(1, max_unpadded_batch_size + 1):
+            padded = self._round_up_batch_size_with_draft_len(
+                batch_size, runtime_draft_len)
+            if batch_size < padded <= self.config.batch_size:
+                return True
+        return False
+
+    def preallocate_padding_dummies(self,
+                                    resource_manager: ResourceManager) -> None:
+        """Eagerly allocates the padding dummies while the KV cache still has
+        free blocks (called at the end of ModelEngine.warmup, after graph
+        capture).
+
+        _get_padded_batch otherwise allocates the dummies lazily at the first
+        padded step; when the KV cache is already saturated by then, the
+        allocation fails on every step and padded batches permanently fall
+        back to eager mode.
+
+        Only the draft lengths of captured graphs are preallocated — those are
+        exactly the ones runtime padding requests — and only when padding can
+        actually occur for that draft length. Anything else would permanently
+        hold KV blocks (and spec/hybrid cache slots) that the lazy path never
+        consumes, regressing tightly-sized deployments.
+        """
+        if not (self.enabled and self.padding_enabled):
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+        if kv_cache_manager is None or getattr(kv_cache_manager,
+                                               'is_estimating_kv_cache', False):
+            # The estimation-phase KV cache is sized with no headroom for
+            # retained dummies; holding blocks there can leave the estimation
+            # requests unschedulable. That executor is discarded anyway, so
+            # preallocation only matters for the final one.
+            return
+        for draft_len in sorted({key[1] for key in self.graphs}):
+            if not self._can_pad_any_batch(draft_len):
+                continue
+            if self._get_or_create_padding_dummy(resource_manager,
+                                                 draft_len) is None:
+                logger.warning(
+                    "Could not pre-allocate the CUDA graph padding dummy "
+                    f"request (draft_len={draft_len}) at warmup; allocation "
+                    "will be retried at the first padded step.")
             else:
-                dummy_request = dummy_request[0]
-            dummy_request.is_cuda_graph_dummy = True
-            if self.is_encoder_decoder:
-                if not self._add_cross_dummy_request(
-                        dummy_request, resource_manager,
-                        dummy_encoder_output_len, draft_kv_cache_manager):
-                    return 0
-
-            spec_res_mgr = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            if spec_res_mgr:
-                spec_res_mgr.add_dummy_requests([dummy_request_id])
-            self.padding_dummy_requests[runtime_draft_len] = dummy_request
-
-        padding_dummy_request = self.padding_dummy_requests[runtime_draft_len]
-        batch.generation_requests.extend([padding_dummy_request] * padding_size)
-        return padding_size
+                logger.info(
+                    "Pre-allocated the CUDA graph padding dummy request "
+                    f"(draft_len={draft_len}) at warmup.")
 
     def _add_cross_dummy_request(
             self, dummy_request: LlmRequest, resource_manager: ResourceManager,
@@ -629,9 +706,14 @@ class CUDAGraphRunner:
 
     def _round_up_batch_size_with_draft_len(self, batch_size: int,
                                             draft_len: int) -> int:
-        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len."""
+        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
+
+        The dynamic draft length mapping exists exactly when the dynamic draft
+        length feature is active (see _compute_dynamic_draft_len_mapping);
+        without it, this ignores draft_len and reduces to plain batch-size
+        rounding.
+        """
         if not self.dynamic_draft_len_mapping:
-            # Fallback to regular round up if no mapping
             return self._round_up_batch_size(batch_size)
 
         start_idx = bisect.bisect_left(self.supported_batch_sizes, batch_size)
