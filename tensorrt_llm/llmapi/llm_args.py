@@ -1750,14 +1750,17 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_config(self):
-        """Disable rejection sampling when SA-enhanced configurations are
-        active, since SA may override the proposed draft tokens. This is a
-        silent fallback so the new default (True) does not break sa_config
-        users.
+        """Disable rejection sampling when SA-enhanced configurations are active.
+
+        Only silently disable a default-inherited value; an explicit
+        ``use_rejection_sampling=True`` is preserved so
+        ``TorchLlmArgs.validate_speculative_config`` can raise for the
+        unsupported SA combination.
         """
         if self.use_rejection_sampling and getattr(self, 'sa_config',
                                                    None) is not None:
-            self.use_rejection_sampling = False
+            if "use_rejection_sampling" not in self.model_fields_set:
+                self.use_rejection_sampling = False
         return self
 
     @model_validator(mode='before')
@@ -5080,17 +5083,127 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
-            if self.speculative_config.use_rejection_sampling and not isinstance(
-                    self.speculative_config, Eagle3DecodingConfig):
-                # Rejection sampling is only wired up for Eagle3 one-model paths.
-                # Silently fall back for other spec types so the new default
-                # (True) does not break them.
-                # TODO: extend rejection sampling to the remaining speculative
-                # decoding paths (MTP / DraftTarget / PARD / DFlash /
-                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
-                # so new spec algorithms get rejection sampling for free; once
-                # all paths are covered this whitelist guard can be removed.
-                self.speculative_config.use_rejection_sampling = False
+            if self.speculative_config.use_rejection_sampling:
+                # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
+                # vanilla MTP, PARD, DFlash, DraftTarget one-model. Classify by
+                # spec-dec mode; MTP-Eagle one-model shares the Eagle3 one-model
+                # worker/metadata/sampler, so it rides the same unified
+                # production/acceptance path.
+                #
+                # Every supported path runs a neural draft head that yields a
+                # per-token proposal distribution q(x). Rejection sampling needs
+                # q to form min(1, p/q) and the (p - q)+ residual correction, so
+                # retrieval-based drafters that emit only token ids with no q are
+                # excluded: NGram is simply absent from this whitelist, and SA
+                # (sa_config) is rejected below via rs_sa_active.
+                from tensorrt_llm._torch.speculative.interface import \
+                    SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+
+                spec_mode = self.speculative_config.spec_dec_mode
+                is_supported = (isinstance(self.speculative_config,
+                                           Eagle3DecodingConfig)
+                                or spec_mode == TorchSpeculativeDecodingMode.MTP
+                                or spec_mode.is_mtp_eagle_one_model()
+                                or spec_mode.is_pard() or spec_mode.is_dflash()
+                                or spec_mode.is_draft_target_one_model())
+
+                # Combinations that break the proposal-distribution invariant.
+                # SA is gated for every method; relaxed / parallel / guided gates
+                # apply only to the newly wired methods (vanilla MTP, PARD,
+                # DFlash, DraftTarget one-model).
+                is_new_rejection_method = (
+                    spec_mode == TorchSpeculativeDecodingMode.MTP
+                    or spec_mode.is_pard() or spec_mode.is_dflash()
+                    or spec_mode.is_draft_target_one_model())
+                # Plain tensor parallelism is supported (the draft path
+                # all-gathers vocab-sharded draft logits before rejection, see
+                # SpecWorkerBase.maybe_gather_sharded_draft_logits).
+                # attention-DP and context parallelism remain gated.
+                rs_parallel_active = (self.context_parallel_size > 1
+                                      or self.enable_attention_dp)
+                rs_guided_active = self.guided_decoding_backend is not None
+                rs_sa_active = getattr(self.speculative_config, "sa_config",
+                                       None) is not None
+                rs_relaxed_active = getattr(
+                    self.speculative_config,
+                    "use_relaxed_acceptance_for_thinking", False)
+                # Eagle3 dynamic-tree rejection records at most kMaxTriedPerLevel
+                # (=32, cpp/.../speculativeDecoding/dynamicTreeKernels.cu) tried
+                # siblings per level; dynamic_tree_max_topK > 32 yields a wrong
+                # correction distribution, so cap supported topK at 32.
+                _DYNAMIC_TREE_REJECTION_MAX_TOPK = 32
+                rs_dynamic_tree_active = getattr(self.speculative_config,
+                                                 "use_dynamic_tree", False)
+                rs_dynamic_tree_topk_unsupported = (
+                    rs_dynamic_tree_active
+                    and (self.speculative_config.dynamic_tree_max_topK
+                         or 0) > _DYNAMIC_TREE_REJECTION_MAX_TOPK)
+                mtp_unsupported_combo = (
+                    rs_sa_active or rs_dynamic_tree_topk_unsupported
+                    or (is_new_rejection_method and
+                        (rs_relaxed_active or rs_parallel_active
+                         or rs_guided_active)))
+
+                if not is_supported or mtp_unsupported_combo:
+                    # Explicit opt-in raises; a default-inherited value is
+                    # silently disabled for backward compatibility.
+                    explicitly_set = "use_rejection_sampling" in \
+                        self.speculative_config.model_fields_set
+                    if explicitly_set:
+                        reasons = []
+                        if not is_supported:
+                            reasons.append(
+                                f"spec mode {spec_mode.name} is not a supported "
+                                "rejection-sampling path (supported: the Eagle3 "
+                                "one-model path, vanilla MTP, PARD, DFlash, and "
+                                "DraftTarget one-model)")
+                        if rs_sa_active:
+                            reasons.append("SA (sa_config) is active")
+                        if rs_dynamic_tree_topk_unsupported:
+                            reasons.append(
+                                "dynamic_tree_max_topK="
+                                f"{self.speculative_config.dynamic_tree_max_topK}"
+                                " exceeds the dynamic-tree rejection kernel limit "
+                                f"of {_DYNAMIC_TREE_REJECTION_MAX_TOPK} tried "
+                                "siblings per level")
+                        if is_new_rejection_method:
+                            if rs_relaxed_active:
+                                reasons.append(
+                                    "relaxed-thinking acceptance is enabled")
+                            if rs_parallel_active:
+                                reasons.append(
+                                    "tensor/context parallelism or attention-DP "
+                                    "is active (the draft path resolves only "
+                                    "the global argmax, not full distributions)"
+                                )
+                            if rs_guided_active:
+                                reasons.append("guided decoding is enabled")
+                        raise ValueError(
+                            "use_rejection_sampling=True is not supported for "
+                            f"this configuration: {'; '.join(reasons)}.")
+                    self.speculative_config.use_rejection_sampling = False
+                elif self.speculative_config.use_rejection_sampling:
+                    # The non-dynamic-tree one-model rejection path depends on
+                    # FlashInfer (sampling_from_probs /
+                    # chain_speculative_sampling); fail fast if it is missing.
+                    # The dynamic-tree path uses
+                    # verify_dynamic_tree_rejection_out /
+                    # compute_probs_from_logits (CUDA op with a PyTorch
+                    # fallback) and does not require FlashInfer.
+                    rs_dynamic_tree_active = getattr(self.speculative_config,
+                                                     "use_dynamic_tree", False)
+                    if not rs_dynamic_tree_active:
+                        from tensorrt_llm._torch.flashinfer_utils import \
+                            IS_FLASHINFER_AVAILABLE
+                        if not IS_FLASHINFER_AVAILABLE:
+                            raise ValueError(
+                                "use_rejection_sampling=True requires FlashInfer, "
+                                "which is not available in this environment. "
+                                "Install flashinfer-python or set "
+                                "use_rejection_sampling=False.")
+                # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
+                # DraftTarget one-model) share the SpecMetadata slot-indexed
+                # dispatch.
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
