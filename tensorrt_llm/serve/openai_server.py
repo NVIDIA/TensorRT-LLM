@@ -1524,7 +1524,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.disaggregated_params)
 
             try:
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1533,7 +1533,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1575,6 +1575,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError(
                     "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the same time is not supported."
                 )
+            if mm_data and mm_item_order:
+                prompt["mm_item_order"] = mm_item_order
 
             if request.mm_processor_kwargs:
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
@@ -1712,7 +1714,7 @@ class OpenAIServer(_VideoRoutesMixin):
             ]
 
             try:
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     request.messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1721,7 +1723,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
-                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
@@ -1752,6 +1754,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise ValueError("Cannot use multimodal embeddings as input")
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
+                if mm_item_order:
+                    prompt["mm_item_order"] = mm_item_order
 
             promise = self.generator.generate_async(inputs=prompt, )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
