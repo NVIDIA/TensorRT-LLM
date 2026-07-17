@@ -646,7 +646,13 @@ def setup_disagg_cluster(
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
-    work_dir = tempfile.mkdtemp()
+    if save_log:
+        log_base = os.path.join(cwd or ".", "disagg-logs")
+        os.makedirs(log_base, exist_ok=True)
+        work_dir = tempfile.mkdtemp(dir=log_base)
+    else:
+        work_dir = tempfile.mkdtemp()
+    logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
     disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
 
     # Auto-deduce minimal_instances from num_instances
@@ -688,34 +694,38 @@ def setup_disagg_cluster(
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_ctx)))
-            print(
-                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}"
-            )
-            ctx_workers.append(
-                run_ctx_worker(model,
+            w = run_ctx_worker(model,
                                ctx_worker_config,
                                work_dir,
                                port=0,
                                device=device_ids,
                                env=env,
-                               save_log=save_log))
+                               save_log=save_log,
+                               worker_index=i)
+            ctx_workers.append(w)
+            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
+            print(
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}{log_suffix}"
+            )
             next_device += gpus_per_ctx
 
         for i in range(num_gen_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_gen)))
-            print(
-                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}"
-            )
-            gen_workers.append(
-                run_gen_worker(model,
+            w = run_gen_worker(model,
                                gen_worker_config,
                                work_dir,
                                port=0,
                                device=device_ids,
                                env=env,
-                               save_log=save_log))
+                               save_log=save_log,
+                               worker_index=i)
+            gen_workers.append(w)
+            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
+            print(
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}{log_suffix}"
+            )
             next_device += gpus_per_gen
 
         # Build minimal server config and launch
@@ -746,12 +756,17 @@ def setup_disagg_cluster(
                                           env=env,
                                           cwd=cwd)
 
+        all_workers = ctx_workers + gen_workers
+
         async def _wait_with_ticker():
             start = time.monotonic()
             last_tick = start
 
             async def _tick():
                 nonlocal last_tick
+                last_worker_count = 0
+                last_status_log = start
+
                 while True:
                     await asyncio.sleep(1)
                     now = time.monotonic()
@@ -759,17 +774,86 @@ def setup_disagg_cluster(
                         startup_callback(now - start)
                         last_tick = now
 
-            ticker = asyncio.create_task(_tick())
-            try:
-                await wait_for_disagg_server_ready(server_port,
-                                                   timeout=server_start_timeout)
-            finally:
-                ticker.cancel()
+                    if now - last_status_log >= 10:
+                        elapsed = int(now - start)
+                        remaining = int(server_start_timeout - elapsed)
+                        print(
+                            f"[startup] {elapsed}s elapsed, "
+                            f"{max(remaining, 0)}s remaining "
+                            f"(timeout={server_start_timeout}s, "
+                            f"workers registered: {last_worker_count}/"
+                            f"{num_ctx_instances + num_gen_instances})",
+                            flush=True,
+                        )
+                        last_status_log = now
+
+                    # Detect workers that have exited (crash/OOM).
+                    dead = [
+                        w for w in all_workers if w.process.poll() is not None
+                    ]
+                    if dead:
+                        details = ", ".join(
+                            f"{w.log_path or 'unknown'} (rc={w.process.poll()})"
+                            for w in dead)
+                        raise RuntimeError(
+                            f"{len(dead)} worker(s) exited during startup: "
+                            f"{details}")
+
+                    # Track worker registration count for the status log.
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=2)
+                        async with aiohttp.ClientSession(
+                                timeout=timeout) as session:
+                            async with session.get(
+                                    f"http://localhost:{server_port}/cluster_info"
+                            ) as info_resp:
+                                if info_resp.status == 200:
+                                    workers = (await info_resp.json()).get(
+                                        "current_workers", {})
+                                    count = (len(
+                                        workers.get("context_servers", [])) +
+                                             len(
+                                                 workers.get(
+                                                     "generation_servers", [])))
+                                    if count > last_worker_count:
+                                        last_worker_count = count
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        pass
+
+            # Run the readiness poller and the watchdog concurrently.
+            # asyncio.wait(FIRST_COMPLETED) means whichever finishes first
+            # (success or exception) immediately cancels the other, so a dead
+            # worker detected by _tick() doesn't leave wait_for_disagg_server_ready
+            # polling silently for up to server_start_timeout seconds.
+            ready_task = asyncio.create_task(
+                wait_for_disagg_server_ready(server_port,
+                                             timeout=server_start_timeout))
+            tick_task = asyncio.create_task(_tick())
+
+            done, pending = await asyncio.wait(
+                [ready_task, tick_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+
+            # Re-raise the first exception. Prefer tick_task's message (it names
+            # the dead worker); fall back to ready_task (timeout error).
+            for t in [tick_task, ready_task]:
+                if t in done and not t.cancelled() and t.exception(
+                ) is not None:
+                    raise t.exception()
 
         asyncio.run(_wait_with_ticker())
     except Exception:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if not save_log:
+            shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
@@ -3097,7 +3181,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                    concurrency: int = 512,
                                    accuracy_threshold: float = 0.42,
                                    profiles: list = None,
-                                   server_start_timeout: int = 7200,
+                                   server_start_timeout: int = 600,
                                    env=None,
                                    cwd=None,
                                    startup_callback=None,
@@ -3136,10 +3220,13 @@ def run_disaggregated_mixed_stress(example_dir: str,
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
+    setup_start = time.monotonic()
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
                              save_log=True, startup_callback=startup_callback)
+    print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
+          flush=True)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
@@ -3620,6 +3707,6 @@ def test_disaggregated_mixed_stress_test(disaggregated_test_root,
         total_requests=test_config.request_count,
         concurrency=test_config.concurrency,
         accuracy_threshold=test_config.accuracy_threshold,
-        server_start_timeout=7200,
+        server_start_timeout=600,
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory())
