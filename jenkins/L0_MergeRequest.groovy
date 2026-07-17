@@ -516,7 +516,7 @@ def launchReleaseCheck(pipeline, globalVars)
                     variable: 'DEFAULT_GIT_URL'
                 )
             ]) {
-                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
+                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.1"
             }
         }
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
