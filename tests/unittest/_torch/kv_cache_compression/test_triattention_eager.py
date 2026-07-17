@@ -1006,3 +1006,53 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
             swa_after.index_select(2, swa_destination),
             swa_before.index_select(2, swa_source),
         )
+
+
+def test_workbench_families_read_the_staged_move_offsets_rows():
+    """Every cache family must consume the caller-staged offsets row.
+
+    A family that silently falls back to its construction-time offsets
+    compacts workbench slots that are not in the staged cohort; on
+    sliding-window models the padded slots then produce negative source
+    ordinals and an illegal memory access. Binding the staged row by
+    reference is part of the constructor contract.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
+    swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
+    pools = [
+        torch.zeros(6, 2, 1, 4, 16, dtype=torch.float32, device=device),
+        torch.zeros(6, 2, 1, 4, 16, dtype=torch.float32, device=device),
+    ]
+    keep = torch.tensor([[2, 4, 5, 7], [2, 3, 5, 6]], dtype=torch.int32, device=device)
+    staged_rows = torch.zeros(2, 3, dtype=torch.int32, device=device)
+    dense_offsets_row = staged_rows[0]
+    swa_offsets_row = staged_rows[1]
+    compaction = BatchedKVCacheCompaction(
+        eviction_mode="union",
+        layer_pools=pools,
+        dense_layers=[0],
+        swa_layers=[1],
+        layer_group_representative={0: 0},
+        layer_pool_keys=[("dense", 0), ("swa", 0)],
+        kept_token_ordinals=keep,
+        valid_sequence_lengths=torch.tensor([8, 7], dtype=torch.int32, device=device),
+        kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
+        page_table_slots={0: 0, 1: 1},
+        request_count=2,
+        prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
+        decode_keep_count=4,
+        swa_window=2,
+        protected_tail_capacity=2,
+        dense_move_offsets=dense_offsets_row,
+        swa_move_offsets=swa_offsets_row,
+    )
+    assert (
+        compaction.target_dense_compaction.move_source_offsets.data_ptr()
+        == dense_offsets_row.data_ptr()
+    )
+    assert compaction.target_swa_compaction is not None
+    assert (
+        compaction.target_swa_compaction.move_source_offsets.data_ptr()
+        == swa_offsets_row.data_ptr()
+    )

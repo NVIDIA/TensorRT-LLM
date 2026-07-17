@@ -465,8 +465,12 @@ class BatchedKVCacheCompaction:
         self.swa_window = 0
         self.swa_destination_bases = None
         swa_move_indices = None
-        swa_move_offsets = None
         swa_entries = []
+        if not self.swa_layers:
+            # No SWA family: drop the unused offsets row. With SWA layers the
+            # constructor argument must stay live so the family reads the
+            # per-round staged offsets instead of its construction-time sizes.
+            swa_move_offsets = None
         if self.swa_layers:
             if swa_window is None or swa_window <= 0:
                 raise ValueError("SWA compaction requires a valid retained window")
