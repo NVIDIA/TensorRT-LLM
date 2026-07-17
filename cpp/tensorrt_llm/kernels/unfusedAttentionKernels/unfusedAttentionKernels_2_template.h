@@ -2060,7 +2060,7 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
 
 #define INSTANTIATE_SPARSE_KV_CACHE_COMPACT_V2_LAYERS(T)                                                               \
     template void invokeSparseKvCacheCompactV2Layers<T>(int64_t const*, int32_t const*, int32_t, int64_t,              \
-        int32_t const*, int32_t const*, int64_t, int32_t const*, int32_t, int32_t, int32_t, int32_t, int32_t,          \
+        int32_t const*, int32_t const*, int64_t, int32_t const*, int32_t const*, int32_t, int32_t, int32_t, int32_t,   \
         cudaStream_t);
 
 } // namespace kernels
