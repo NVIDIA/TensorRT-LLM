@@ -286,10 +286,7 @@ class BaseWorker(GenerationExecutor):
         self.postproc_queues = queues
 
     def set_frontend_result_queues(self, queues: List["IpcQueue"]):
-        """Multi-frontend serving: one result lane per frontend process.
-
-        The lane is selected by the frontend id in client_id's top bits.
-        """
+        """Multi-frontend serving: one result lane per frontend process."""
         assert self.result_queue is None
         assert self.postproc_queues is None
         self.frontend_result_queues = queues
@@ -1295,8 +1292,6 @@ class AwaitResponseHelper:
 
         if rsp_batch:
             if (lanes := self.worker.frontend_result_queues) is not None:
-                # Multi-frontend serving: route each response to its origin
-                # frontend's lane by the id in client_id's top bits.
                 for frontend_id, sub_batch in enumerate(
                         bucket_responses_by_frontend(rsp_batch, len(lanes))):
                     if sub_batch:
@@ -1417,9 +1412,8 @@ def _send_rsp(
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
 
     if worker.frontend_result_queues is not None:
-        # Multi-frontend serving: route to the origin frontend's result lane
-        # (client_id may be None for e.g. ADP dummy requests -- those go to
-        # lane 0, the launcher, which silently discards them like today).
+        # Route to the origin frontend's result lane; None/out-of-range ids
+        # fall back to lane 0 (see frontend_lane_index).
         if rsp_batch is not None:
             rsp_batch.append(response)
         else:

@@ -165,12 +165,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
-        # Multi-frontend serving (llm_args.num_serve_frontends > 1) on the
-        # classic IPC path: this launcher proxy owns the shared ipc directory
-        # + HMAC key for the per-frontend endpoints (see _setup_queues);
+        # Multi-frontend serving: this launcher proxy owns the shared ipc
+        # dir + HMAC key for the per-frontend endpoints (_setup_queues);
         # trtllm-serve hands them to the attached frontends via
-        # multi_frontend_attach_info(). Attached frontends never reach this
-        # class -- they construct GenerationExecutorFrontendProxy instead.
+        # multi_frontend_attach_info().
         self._num_frontends = getattr(_llm_args, "num_serve_frontends", 1) or 1
         self._multi_frontend_ipc_dir: Optional[str] = None
         self._multi_frontend_hmac: Optional[bytes] = None
@@ -420,12 +418,9 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _setup_queues(self) -> WorkerCommIpcAddrs:
         frontend_result_addrs = None
         if self._num_frontends > 1:
-            # Multi-frontend serving: deterministic endpoints shared with the
-            # attached frontends. The rank0 worker BINDS the request ingress
-            # (PULL) so every frontend can PUSH-connect; each frontend
-            # (including this launcher, frontend 0) binds its own result lane
-            # (PULL) that the worker / postproc processes PUSH-connect to,
-            # selected by the frontend id in client_id's top bits.
+            # The rank0 worker BINDS the request ingress (PULL) so every
+            # frontend can PUSH-connect; each frontend (incl. this launcher,
+            # frontend 0) binds its own result lane (PULL).
             ipc_dir = self._multi_frontend_ipc_dir
             hmac_key = self._multi_frontend_hmac
             request_addr = (multi_frontend_request_addr(ipc_dir), hmac_key)
@@ -1048,9 +1043,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         self.garbage_collection_gen0_threshold = None
         self.workers_started = False
         self.dispatch_result_thread: Optional[ManagedThread] = None
-        # The resource governor lives with the launcher frontend only; the
-        # inherited resource_governor_queue property must return None here so
-        # OpenAIServer takes its governor-disabled path (openai_server.py).
+        # Must be None: OpenAIServer reads the resource_governor_queue
+        # property at init; the governor lives with the launcher only.
         self._resource_governor_queue = None
 
         hmac_key = bytes.fromhex(attach_info["hmac_key"])
@@ -1067,8 +1061,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             name=f"frontend_{frontend_id}_result_queue")
 
         # Stats / KV events / disagg params share the rank0 worker's stats
-        # RPC server with the launcher (ROUTER socket, natively
-        # multi-client; per-frontend sampling).
+        # RPC server with the launcher (ROUTER socket, multi-client).
         self.rpc_client: Optional[RPCClient] = None
         if attach_info.get("rpc_addr"):
             self.rpc_client = RPCClient(attach_info["rpc_addr"],

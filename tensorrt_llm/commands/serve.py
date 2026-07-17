@@ -383,25 +383,12 @@ def _init_multi_frontend_mode(llm_args: dict,
                               enabled: bool) -> MultiFrontendMode:
     """Resolve the multi-frontend serving mode (prototype).
 
-    num_serve_frontends=K (--num_serve_frontends / config yaml) runs K
-    HTTP frontend processes against ONE executor. The launcher
-    (frontend 0) launches the worker as usual and spawns K-1 attached
-    frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set) skip
-    the spawning. Supported only on the classic IPC executor path (the
-    default orchestrator).
-
-    The executor proxy reads num_serve_frontends from llm_args and
-    provisions the shared ipc endpoints itself
-    (GenerationExecutorProxy._setup_queues).
-
-    Entry points that reach launch_server but must not honor the knob
-    (e.g. disaggregated MPI workers) pass enabled=False.
+    num_serve_frontends=K runs K HTTP frontend processes against ONE
+    executor: the launcher (frontend 0) owns the engine and spawns K-1
+    attached frontends. Classic IPC executor path only. Entry points that
+    must not honor the knob (e.g. disaggregated MPI workers) pass
+    enabled=False.
     """
-    if os.getenv("TLLM_SERVE_NUM_FRONTENDS") is not None:
-        logger.warning(
-            "TLLM_SERVE_NUM_FRONTENDS is not supported; use the "
-            "num_serve_frontends llm-args knob (--num_serve_frontends or "
-            "the config yaml) instead.")
     num_frontends = llm_args.get("num_serve_frontends", 1)
     if not enabled:
         if num_frontends > 1:
@@ -426,15 +413,10 @@ def _init_multi_frontend_mode(llm_args: dict,
 def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
-    Multi-frontend serving (num_serve_frontends > 1): each child
-    re-execs this trtllm-serve command line with env vars pointing at the
-    launcher executor's attach endpoints — the multi-frontend request
-    ingress plus per-frontend result lanes (see
-    GenerationExecutorProxy._setup_queues); the child's executor attaches to
-    the already-running worker instead of launching a new one (see
-    executor.py GenerationExecutor.create). All frontends bind the serving
-    port with SO_REUSEPORT, so the kernel load-balances accepted
-    connections across their independent processes (and GILs).
+    Each child re-execs this trtllm-serve command line with env vars
+    pointing at the launcher executor's attach endpoints; its executor
+    attaches to the already-running worker instead of launching one (see
+    GenerationExecutor.create / GenerationExecutorFrontendProxy).
 
     Returns (children, attach_info_path); the caller owns terminating the
     children and removing the secret-bearing attach-info file.
@@ -455,9 +437,8 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
 
     children = []
     for frontend_id in range(1, num_frontends):
-        # Attached frontends are plain RPC clients: keep them out of the
-        # launcher's MPI job (an inherited PMI/SLURM rank identity would
-        # make mpi4py try to (re-)join it at import time).
+        # Strip MPI/SLURM identity vars: an inherited rank identity would
+        # make the child's mpi4py try to (re-)join the launcher's job.
         env, _ = split_mpi_env()
         env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_info_path
         env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
@@ -484,9 +465,8 @@ def _terminate_attached_frontends(children: list) -> None:
 def _cleanup_multi_frontend_artifacts(attach_info_path: Optional[str]) -> None:
     """Remove the attach-info file (it carries HMAC keys).
 
-    Launcher-only, after the attached frontends have been terminated. The
-    shared ipc directory is owned and removed by the launcher's executor
-    proxy (GenerationExecutorProxy.shutdown).
+    The shared ipc directory is owned and removed by the launcher's
+    executor proxy instead.
     """
     if attach_info_path is not None:
         try:
@@ -1966,9 +1946,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
         port=server_cfg.port,
         llm_args=llm_args,
         allow_request_chat_template=disagg_config.allow_request_chat_template,
-        # Disagg ctx/gen workers must not enter multi-frontend mode (e.g.
-        # via a num_serve_frontends knob or an env fallback inherited under
-        # Slurm export-all).
+        # Disagg ctx/gen MPI workers must not enter multi-frontend mode.
         multi_frontend_enabled=False)
 
 

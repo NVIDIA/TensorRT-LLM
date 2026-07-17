@@ -563,9 +563,8 @@ class GenerationExecutor(ABC):
                 "green")
 
         # Multi-frontend serving: attach to an already-running executor
-        # instead of launching one. Set by trtllm-serve for the attached
-        # frontend processes (see commands/serve.py); the frontend id is
-        # picked up from TLLM_EXECUTOR_FRONTEND_ID.
+        # instead of launching one (set by trtllm-serve for attached
+        # frontend processes).
         attach_info_path = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
         if attach_info_path:
             with open(attach_info_path) as f:

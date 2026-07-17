@@ -96,10 +96,9 @@ class PostprocWorker:
         '''
         Args:
             pull_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the input IPC.
-            push_pipe_addr: The address and HMAC key of the output IPC, or a
-                list of them with multi-frontend serving -- one result lane
-                per frontend, selected by the frontend id in the output's
-                client_id top bits.
+            push_pipe_addr: The address and HMAC key of the output IPC, or
+                a list of them (one result lane per frontend) with
+                multi-frontend serving.
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
@@ -210,8 +209,6 @@ class PostprocWorker:
             if len(self._push_pipes) == 1:
                 await self._push_pipes[0].put_async(batch)
                 continue
-            # Multi-frontend serving: route each output to its origin
-            # frontend's result lane by the id in client_id's top bits.
             for frontend_id, sub_batch in enumerate(
                     bucket_responses_by_frontend(batch, len(self._push_pipes))):
                 if sub_batch:

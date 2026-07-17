@@ -221,8 +221,8 @@ def worker_main(
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
     is_leader: bool = mpi_rank() == 0
-    # Multi-frontend serving (classic IPC path): per-frontend result lanes;
-    # the request queue is bound here (PULL) so every frontend PUSH-connects.
+    # Multi-frontend serving: the worker binds the request ingress (PULL)
+    # and pushes responses to per-frontend result lanes.
     multi_frontend_addrs = worker_queues.frontend_result_queue_addrs
     frontend_result_queues: Optional[List[FusedIpcQueue]] = None
     if tracer_init_kwargs is not None and is_leader:
@@ -267,9 +267,7 @@ def worker_main(
                 for i in range(postproc_worker_config.num_postprocess_workers)
             ]
         elif multi_frontend_addrs is not None:
-            # Multi-frontend serving: one PUSH lane per frontend, selected by
-            # the frontend id in client_id's top bits (see base_worker
-            # _send_rsp).
+            # One PUSH lane per frontend (see base_worker._send_rsp).
             frontend_result_queues = [
                 FusedIpcQueue(addr,
                               is_server=False,
