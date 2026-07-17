@@ -14,17 +14,23 @@ from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
 
-from ..types import (AgentTextEvent, CompactBoundaryEvent,
-                     RateLimitWarningEvent, ServerToolCallEvent,
-                     SessionInitEvent, ThinkingEvent, ToolCallEvent, UsageInfo)
+from ..types import (
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    UsageInfo,
+)
 from .base import Backend, BackendClient, BackendEvent, ResultEvent
 
 # Dispatch table keyed by thread id. Populated when a CodexClient is created
 # with dynamic tools, drained when it is torn down. The AppServerClient's
 # approval handler reads this to route ``item/tool/call`` server requests to
 # the right handler without having to know about threads.
-_TOOL_HANDLERS: dict[str, dict[str, Callable[[dict[str, Any]],
-                                             Awaitable[dict[str, Any]]]]] = {}
+_TOOL_HANDLERS: dict[str, dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]]] = {}
 
 
 def _module_or_none(name: str) -> Any | None:
@@ -53,13 +59,13 @@ def _resolve_codex_bin() -> str:
     override = os.environ.get("CODEX_BIN")
     if override:
         if not Path(override).is_file():
-            raise FileNotFoundError(
-                f"CODEX_BIN={override!r} does not point to a file.")
+            raise FileNotFoundError(f"CODEX_BIN={override!r} does not point to a file.")
         return override
 
     codex_cli_bin = _module_or_none("codex_cli_bin")
-    bundled_codex_path = getattr(codex_cli_bin, "bundled_codex_path",
-                                 None) if codex_cli_bin is not None else None
+    bundled_codex_path = (
+        getattr(codex_cli_bin, "bundled_codex_path", None) if codex_cli_bin is not None else None
+    )
     if bundled_codex_path is not None:
         return str(bundled_codex_path())
 
@@ -69,9 +75,9 @@ def _resolve_codex_bin() -> str:
 
     raise FileNotFoundError(
         "Could not locate a Codex CLI binary. Install the pinned runtime "
-        "(the 'openai-codex-cli-bin' package shipped with "
-        "'openai-codex-app-server-sdk'), install the Codex CLI on PATH, or "
-        "set CODEX_BIN to the binary path.")
+        "(the 'openai-codex-cli-bin' package shipped with 'openai-codex'), "
+        "install the Codex CLI on PATH, or set CODEX_BIN to the binary path."
+    )
 
 
 def _usage_from_token_breakdown(breakdown: Any) -> UsageInfo:
@@ -109,9 +115,7 @@ def _plain(value: Any) -> Any:
 
     if hasattr(value, "__dict__"):
         return {
-            k: _plain(v)
-            for k, v in vars(value).items()
-            if not k.startswith("_") and v is not None
+            k: _plain(v) for k, v in vars(value).items() if not k.startswith("_") and v is not None
         }
 
     enum_value = getattr(value, "value", None)
@@ -197,8 +201,7 @@ def _reasoning_text(root: Any) -> str:
     for field in ("summary", "content", "text"):
         value = _get(root, field)
         if isinstance(value, (list, tuple)):
-            parts.extend(
-                str(part).strip() for part in value if str(part).strip())
+            parts.extend(str(part).strip() for part in value if str(part).strip())
         elif isinstance(value, str) and value.strip():
             parts.append(value.strip())
     return "\n".join(parts).strip()
@@ -230,9 +233,7 @@ def _tool_event_from_item(root: Any, item: Any) -> BackendEvent | None:
     tool_use_id = _item_id(item, root)
     if kind == "commandExecution":
         command = _get(root, "command", default="")
-        return ToolCallEvent(name="Bash",
-                             input={"command": command},
-                             tool_use_id=tool_use_id)
+        return ToolCallEvent(name="Bash", input={"command": command}, tool_use_id=tool_use_id)
 
     if kind in {"mcpToolCall", "dynamicToolCall"}:
         name = _get(root, "tool", default="tool")
@@ -255,9 +256,7 @@ def _tool_event_from_item(root: Any, item: Any) -> BackendEvent | None:
         status = _get(root, "status")
         if status is not None:
             body["status"] = _as_text(status)
-        return ToolCallEvent(name="FileChange",
-                             input=body,
-                             tool_use_id=tool_use_id)
+        return ToolCallEvent(name="FileChange", input=body, tool_use_id=tool_use_id)
 
     if kind == "webSearch":
         action = _get(root, "action")
@@ -270,16 +269,12 @@ def _tool_event_from_item(root: Any, item: Any) -> BackendEvent | None:
         query = _get(root, "query")
         if isinstance(query, str):
             body.setdefault("query", query)
-        return ServerToolCallEvent(name="web_search",
-                                   input=body,
-                                   tool_use_id=tool_use_id)
+        return ServerToolCallEvent(name="web_search", input=body, tool_use_id=tool_use_id)
 
     if kind == "imageView":
         path = _get(root, "path")
         body = {"path": path} if isinstance(path, str) else {}
-        return ServerToolCallEvent(name="view_image",
-                                   input=body,
-                                   tool_use_id=tool_use_id)
+        return ServerToolCallEvent(name="view_image", input=body, tool_use_id=tool_use_id)
 
     return None
 
@@ -289,21 +284,28 @@ def _status_is(root: Any, *statuses: str) -> bool:
     return _as_text(status) in statuses
 
 
-def _collect_item_errors(root: Any, item: Any, errors: list[str],
-                         permission_denials: list[Any]) -> None:
+def _collect_item_errors(
+    root: Any, item: Any, errors: list[str], permission_denials: list[Any]
+) -> None:
     kind = _thread_item_kind(root)
     if kind not in {
-            "collabAgentToolCall", "collabToolCall", "commandExecution",
-            "dynamicToolCall", "fileChange", "mcpToolCall"
+        "collabAgentToolCall",
+        "collabToolCall",
+        "commandExecution",
+        "dynamicToolCall",
+        "fileChange",
+        "mcpToolCall",
     }:
         return
 
     if _status_is(root, "declined"):
-        permission_denials.append({
-            "kind": kind,
-            "id": _item_id(item, root),
-            "item": _plain(root),
-        })
+        permission_denials.append(
+            {
+                "kind": kind,
+                "id": _item_id(item, root),
+                "item": _plain(root),
+            }
+        )
         return
 
     if _status_is(root, "failed"):
@@ -330,25 +332,22 @@ def _rate_limit_warning_from_error(error: Any) -> RateLimitWarningEvent | None:
     haystack = f"{_as_text(info)} {message}".lower()
     if "usagelimit" not in haystack and "rate limit" not in haystack:
         return None
-    return RateLimitWarningEvent(status="rejected",
-                                 rate_limit_type=_as_text(info) or None)
+    return RateLimitWarningEvent(status="rejected", rate_limit_type=_as_text(info) or None)
 
 
 def _is_final_answer_phase(phase: Any, final_answer: Any) -> bool:
     value = _as_text(phase)
-    return value in {"final_answer", "finalAnswer"
-                     } or value == _as_text(final_answer)
+    return value in {"final_answer", "finalAnswer"} or value == _as_text(final_answer)
 
 
 def _extract_final_response(items: list[object]) -> str:
-    MessagePhase = _symbol("codex_app_server.generated.v2_all", "MessagePhase")
+    MessagePhase = _symbol("openai_codex.generated.v2_all", "MessagePhase")
 
     last_unknown: str | None = None
     for item in reversed(items):
         root = _root(item)
         if _thread_item_kind(root) == "agentMessage":
-            if _is_final_answer_phase(_get(root, "phase"),
-                                      MessagePhase.final_answer):
+            if _is_final_answer_phase(_get(root, "phase"), MessagePhase.final_answer):
                 return root.text
             if _get(root, "phase") is None and last_unknown is None:
                 last_unknown = root.text
@@ -368,17 +367,70 @@ def _turn_failure_message(turn: Any) -> str:
     return f"turn ended with status {status!r}"
 
 
-class CodexClient(BackendClient):
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
 
-    def __init__(self,
-                 thread,
-                 session_init: SessionInitEvent | None = None) -> None:
+
+def _number_or_none(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+
+def _turn_duration_ms(turn: Any) -> int | None:
+    duration_ms = _int_or_none(_get(turn, "duration_ms", "durationMs"))
+    if duration_ms is not None:
+        return duration_ms
+
+    started_at = _number_or_none(_get(turn, "started_at", "startedAt"))
+    completed_at = _number_or_none(_get(turn, "completed_at", "completedAt"))
+    if started_at is None or completed_at is None or completed_at < started_at:
+        return None
+    return int((completed_at - started_at) * 1000)
+
+
+def _turn_num_turns(turn: Any) -> int:
+    num_turns = _int_or_none(_get(turn, "num_turns", "numTurns", "turn_count", "turnCount"))
+    return num_turns if num_turns is not None else 1
+
+
+def _usage_with_turn_metadata(usage: UsageInfo | None, turn: Any) -> UsageInfo | None:
+    duration_ms = _turn_duration_ms(turn)
+    if usage is None:
+        usage = UsageInfo()
+    usage.num_turns = _turn_num_turns(turn)
+    if duration_ms is None:
+        return usage
+    usage.duration_ms = duration_ms
+    return usage
+
+
+def _usage_from_thread_token_usage(token_usage: Any) -> UsageInfo | None:
+    total = _get(token_usage, "total")
+    if total is None:
+        return None
+
+    usage = _usage_from_token_breakdown(total)
+    context_tokens = _int_or_none(_get(total, "total_tokens", "totalTokens"))
+    context_window = _int_or_none(_get(token_usage, "model_context_window", "modelContextWindow"))
+
+    usage.context_tokens = context_tokens
+    usage.context_window = context_window
+    if context_tokens is not None and context_window:
+        usage.context_percentage = 100.0 * context_tokens / context_window
+    return usage
+
+
+class CodexClient(BackendClient):
+    def __init__(self, thread, session_init: SessionInitEvent | None = None) -> None:
         self._thread = thread
         self._session_init = session_init
         self._session_init_emitted = False
 
     async def send_message(self, message: str) -> AsyncIterator[BackendEvent]:
-        TextInput = _symbol("codex_app_server", "TextInput")
+        TextInput = _symbol("openai_codex", "TextInput")
 
         turn = await self._thread.turn(TextInput(message))
         items: list[object] = []
@@ -410,9 +462,10 @@ class CodexClient(BackendClient):
                         emitted_tool_items.add(item_id)
                     yield tool_event
 
-                if _thread_item_kind(root) in {
-                        "contextCompaction", "compacted"
-                } and item_id not in emitted_compaction_items:
+                if (
+                    _thread_item_kind(root) in {"contextCompaction", "compacted"}
+                    and item_id not in emitted_compaction_items
+                ):
                     if item_id is not None:
                         emitted_compaction_items.add(item_id)
                     yield _compact_boundary_from_item(root)
@@ -434,26 +487,15 @@ class CodexClient(BackendClient):
             elif kind == "item/reasoning/delta":
                 continue
             elif kind == "thread/tokenUsage/updated":
-                total = getattr(payload.token_usage, "total", None)
-                if total is not None:
-                    latest_usage = _usage_from_token_breakdown(total)
-                    window = getattr(payload.token_usage,
-                                     "model_context_window", None)
-                    if window:
-                        latest_usage.context_window = window
-                        latest_usage.context_tokens = getattr(
-                            total, "total_tokens", None)
-                        if latest_usage.context_tokens is not None:
-                            latest_usage.context_percentage = (
-                                100.0 * latest_usage.context_tokens / window)
+                usage = _usage_from_thread_token_usage(payload.token_usage)
+                if usage is not None:
+                    latest_usage = usage
             elif kind == "warning":
-                warning = _rate_limit_warning_from_error(
-                    _get(payload, "message", default=payload))
+                warning = _rate_limit_warning_from_error(_get(payload, "message", default=payload))
                 if warning is not None:
                     yield warning
             elif kind == "error":
-                warning = _rate_limit_warning_from_error(
-                    _get(payload, "error", default=payload))
+                warning = _rate_limit_warning_from_error(_get(payload, "error", default=payload))
                 if warning is not None:
                     yield warning
             elif kind == "turn/completed" and payload.turn.id == turn.id:
@@ -462,16 +504,13 @@ class CodexClient(BackendClient):
                     warning = _rate_limit_warning_from_error(turn_error)
                     if warning is not None:
                         yield warning
-                    message = getattr(turn_error, "message",
-                                      None) or str(turn_error)
+                    message = getattr(turn_error, "message", None) or str(turn_error)
                     raise RuntimeError(f"Codex turn failed: {message}")
                 if not _turn_completed_successfully(payload.turn):
-                    raise RuntimeError(
-                        f"Codex turn failed: {_turn_failure_message(payload.turn)}"
-                    )
+                    raise RuntimeError(f"Codex turn failed: {_turn_failure_message(payload.turn)}")
                 yield ResultEvent(
                     text=_extract_final_response(items),
-                    usage=latest_usage,
+                    usage=_usage_with_turn_metadata(latest_usage, payload.turn),
                     is_error=bool(errors),
                     errors=errors,
                     permission_denials=permission_denials,
@@ -504,10 +543,7 @@ def _mcp_to_codex_content(result: Any) -> tuple[list[dict[str, Any]], bool]:
                 continue
             kind = item.get("type")
             if kind == "text":
-                items.append({
-                    "type": "inputText",
-                    "text": item.get("text", "")
-                })
+                items.append({"type": "inputText", "text": item.get("text", "")})
             elif kind == "image":
                 url = item.get("data") or item.get("image_url") or ""
                 items.append({"type": "inputImage", "imageUrl": url})
@@ -529,34 +565,35 @@ def _handle_dynamic_tool_call(params: dict[str, Any]) -> dict[str, Any]:
     handler = handlers.get(tool_name)
     if handler is None:
         return {
-            "contentItems": [{
-                "type":
-                "inputText",
-                "text": (f"Tool {tool_name!r} is not registered for this "
-                         f"thread."),
-            }],
-            "success":
-            False,
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": (f"Tool {tool_name!r} is not registered for this thread."),
+                }
+            ],
+            "success": False,
         }
 
     try:
         result = asyncio.run(handler(arguments))
     except Exception as exc:  # noqa: BLE001 — surface any tool error to model
         return {
-            "contentItems": [{
-                "type": "inputText",
-                "text": f"Tool {tool_name!r} failed: {exc}",
-            }],
-            "success":
-            False,
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": f"Tool {tool_name!r} failed: {exc}",
+                }
+            ],
+            "success": False,
         }
 
     items, success = _mcp_to_codex_content(result)
     return {"contentItems": items, "success": success}
 
 
-async def _call_optional_client_method(client: Any, names: tuple[str, ...],
-                                       payload: dict[str, Any]) -> Any:
+async def _call_optional_client_method(
+    client: Any, names: tuple[str, ...], payload: dict[str, Any]
+) -> Any:
     for name in names:
         method = getattr(client, name, None)
         if method is None:
@@ -614,19 +651,16 @@ def _extract_codex_plugin_names(response: Any) -> list[str]:
     return names
 
 
-async def _build_session_init_event(client: Any,
-                                    cwd: Path) -> SessionInitEvent | None:
+async def _build_session_init_event(client: Any, cwd: Path) -> SessionInitEvent | None:
     try:
         skills_response = await _call_optional_client_method(
             client,
             ("skills_list", "skill_list"),
-            {
-                "cwds": [str(cwd)],
-                "forceReload": False
-            },
+            {"cwds": [str(cwd)], "forceReload": False},
         )
         plugins_response = await _call_optional_client_method(
-            client, ("plugin_list", "plugins_list"), {})
+            client, ("plugin_list", "plugins_list"), {}
+        )
     except Exception:
         return None
 
@@ -645,16 +679,11 @@ _VERSION_CACHE: str | None = None
 
 
 def _codex_sdk_version() -> str:
-    """Version of the Python Codex app-server SDK package, or ``""``."""
-    for package in (
-            "openai-codex-app-server-sdk",
-            "codex-app-server-sdk",
-    ):
-        try:
-            return _pkg_version(package)
-        except PackageNotFoundError:
-            continue
-    return ""
+    """Version of the Python ``openai-codex`` SDK package, or ``""``."""
+    try:
+        return _pkg_version("openai-codex")
+    except PackageNotFoundError:
+        return ""
 
 
 def _codex_cli_version() -> str:
@@ -669,10 +698,9 @@ def _codex_cli_version() -> str:
     except FileNotFoundError:
         return ""
     try:
-        out = subprocess.run([cli_path, "--version"],
-                             capture_output=True,
-                             text=True,
-                             timeout=_CLI_VERSION_TIMEOUT_S)
+        out = subprocess.run(
+            [cli_path, "--version"], capture_output=True, text=True, timeout=_CLI_VERSION_TIMEOUT_S
+        )
     except (OSError, subprocess.SubprocessError):
         return ""
     if out.returncode != 0:
@@ -695,8 +723,7 @@ def _codex_backend_version() -> str:
     """Cached ``cli X · sdk Y`` string for the Codex backend."""
     global _VERSION_CACHE
     if _VERSION_CACHE is None:
-        _VERSION_CACHE = _format_version(_codex_cli_version(),
-                                         _codex_sdk_version())
+        _VERSION_CACHE = _format_version(_codex_cli_version(), _codex_sdk_version())
     return _VERSION_CACHE
 
 
@@ -706,8 +733,9 @@ _SDK_PATCHED = False
 
 
 def _relax_service_tier_on_module(module: Any) -> int:
-    """Rewrite ``ServiceTier`` references to ``str`` on every pydantic model
-    in ``module``. Returns the number of models that were rebuilt.
+    """Rewrite ``ServiceTier`` references to ``str`` on every pydantic model in ``module``.
+
+    Returns the number of models that were rebuilt.
     """
     OldEnum = getattr(module, "ServiceTier", None)
     if OldEnum is None:
@@ -774,7 +802,7 @@ def _patch_codex_sdk_service_tier() -> None:
     if _SDK_PATCHED:
         return
     try:
-        v2_all = importlib.import_module("codex_app_server.generated.v2_all")
+        v2_all = importlib.import_module("openai_codex.generated.v2_all")
     except ImportError:
         return
     _relax_service_tier_on_module(v2_all)
@@ -782,11 +810,9 @@ def _patch_codex_sdk_service_tier() -> None:
 
 
 class CodexBackend(Backend):
-
     def __init__(self) -> None:
         self._codex = None
-        self._default_approval_handler: Callable[..., dict[str,
-                                                           Any]] | None = None
+        self._default_approval_handler: Callable[..., dict[str, Any]] | None = None
 
     def version(self) -> str:
         return _codex_backend_version()
@@ -796,15 +822,17 @@ class CodexBackend(Backend):
 
     async def __aenter__(self) -> "CodexBackend":
         _patch_codex_sdk_service_tier()
-        AsyncCodex = _symbol("codex_app_server", "AsyncCodex")
-        AppServerConfig = _symbol("codex_app_server.client", "AppServerConfig")
+        AsyncCodex = _symbol("openai_codex", "AsyncCodex")
+        CodexConfig = _symbol("openai_codex.client", "CodexConfig")
 
         codex_bin = _resolve_codex_bin()
 
-        self._codex = AsyncCodex(config=AppServerConfig(
-            codex_bin=codex_bin,
-            experimental_api=True,
-        ))
+        self._codex = AsyncCodex(
+            config=CodexConfig(
+                codex_bin=codex_bin,
+                experimental_api=True,
+            )
+        )
         await self._codex.__aenter__()
         self._install_server_request_handler()
         return self
@@ -816,22 +844,19 @@ class CodexBackend(Backend):
             self._default_approval_handler = None
 
     def _install_server_request_handler(self) -> None:
-        """Route ``item/tool/call`` requests to ``_handle_dynamic_tool_call``
-        and auto-accept every approval request the app-server sends.
+        """Route tool-call requests to the dynamic handler and auto-accept all approvals.
 
-        Combined with ``approval_policy=never`` and
-        ``sandbox=danger_full_access`` in ``create_client``, the agent never
-        prompts the user: any ``*/requestApproval`` JSON-RPC request is
-        answered with ``{"decision": "accept"}`` regardless of which item
-        kind raised it (commandExecution, fileChange, or anything new the
-        SDK adds later).
+        ``item/tool/call`` requests are routed to ``_handle_dynamic_tool_call``. Combined with
+        ``approval_policy=never`` and ``sandbox=danger_full_access`` in ``create_client``, the
+        agent never prompts the user: any ``*/requestApproval`` JSON-RPC request is answered with
+        ``{"decision": "accept"}`` regardless of which item kind raised it (commandExecution,
+        fileChange, or anything new the SDK adds later).
         """
         sync_client = self._codex._client._sync
         existing = sync_client._approval_handler
         self._default_approval_handler = existing
 
-        def _handler(method: str,
-                     params: dict[str, Any] | None) -> dict[str, Any]:
+        def _handler(method: str, params: dict[str, Any] | None) -> dict[str, Any]:
             if method == "item/tool/call":
                 return _handle_dynamic_tool_call(params or {})
             if method.endswith("/requestApproval"):
@@ -858,19 +883,14 @@ class CodexBackend(Backend):
         # accept and ignore them to keep ``Backend.create_client``
         # uniform.
         if self._codex is None:
-            raise RuntimeError(
-                "CodexBackend must be entered before creating clients.")
+            raise RuntimeError("CodexBackend must be entered before creating clients.")
 
-        AsyncThread = _symbol("codex_app_server.api", "AsyncThread")
-        _params_dict = _symbol("codex_app_server.client", "_params_dict")
-        AskForApproval = _symbol("codex_app_server.generated.v2_all",
-                                 "AskForApproval")
-        AskForApprovalValue = _symbol("codex_app_server.generated.v2_all",
-                                      "AskForApprovalValue")
-        SandboxMode = _symbol("codex_app_server.generated.v2_all",
-                              "SandboxMode")
-        ThreadStartParams = _symbol("codex_app_server.generated.v2_all",
-                                    "ThreadStartParams")
+        AsyncThread = _symbol("openai_codex.api", "AsyncThread")
+        _params_dict = _symbol("openai_codex.client", "_params_dict")
+        AskForApproval = _symbol("openai_codex.generated.v2_all", "AskForApproval")
+        AskForApprovalValue = _symbol("openai_codex.generated.v2_all", "AskForApprovalValue")
+        SandboxMode = _symbol("openai_codex.generated.v2_all", "SandboxMode")
+        ThreadStartParams = _symbol("openai_codex.generated.v2_all", "ThreadStartParams")
 
         params = ThreadStartParams(
             model=model,
@@ -885,20 +905,16 @@ class CodexBackend(Backend):
         )
         start_payload = _params_dict(params)
         if tools:
-            start_payload["dynamicTools"] = [
-                _dynamic_tool_spec(t) for t in tools
-            ]
+            start_payload["dynamicTools"] = [_dynamic_tool_spec(t) for t in tools]
 
         await self._codex._ensure_initialized()
-        session_init = await _build_session_init_event(self._codex._client,
-                                                       Path.cwd())
+        session_init = await _build_session_init_event(self._codex._client, Path.cwd())
         started = await self._codex._client.thread_start(start_payload)
         thread_id = started.thread.id
 
         if tools:
             _TOOL_HANDLERS[thread_id] = {t.name: t.handler for t in tools}
         try:
-            yield CodexClient(AsyncThread(self._codex, thread_id),
-                              session_init=session_init)
+            yield CodexClient(AsyncThread(self._codex, thread_id), session_init=session_init)
         finally:
             _TOOL_HANDLERS.pop(thread_id, None)

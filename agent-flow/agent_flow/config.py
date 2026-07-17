@@ -7,8 +7,7 @@ from typing import Any, Literal
 BackendKind = Literal["claude-code", "codex"]
 SessionMode = Literal["stateless", "persistent"]
 
-CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL",
-                                           "claude-opus-4-7[1m]")
+CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL", "fable")
 CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.5")
 
 

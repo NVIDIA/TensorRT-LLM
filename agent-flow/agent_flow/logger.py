@@ -15,7 +15,6 @@ _logger: "Logger | None" = None
 
 
 class Logger:
-
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)

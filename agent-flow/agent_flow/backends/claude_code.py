@@ -9,17 +9,35 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import claude_agent_sdk
-from claude_agent_sdk import (ClaudeAgentOptions, ClaudeSDKClient,
-                              PermissionResultAllow, create_sdk_mcp_server)
-from claude_agent_sdk.types import (AssistantMessage, RateLimitEvent,
-                                    ResultMessage, ServerToolUseBlock,
-                                    SystemMessage, SystemPromptPreset,
-                                    TextBlock, ThinkingBlock, ToolsPreset,
-                                    ToolUseBlock)
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    PermissionResultAllow,
+    create_sdk_mcp_server,
+)
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    RateLimitEvent,
+    ResultMessage,
+    ServerToolUseBlock,
+    SystemMessage,
+    SystemPromptPreset,
+    TextBlock,
+    ThinkingBlock,
+    ToolsPreset,
+    ToolUseBlock,
+)
 
-from ..types import (AgentTextEvent, CompactBoundaryEvent,
-                     RateLimitWarningEvent, ServerToolCallEvent,
-                     SessionInitEvent, ThinkingEvent, ToolCallEvent, UsageInfo)
+from ..types import (
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    UsageInfo,
+)
 from .base import Backend, BackendClient, BackendEvent, ResultEvent
 
 
@@ -39,10 +57,7 @@ def _usage_from_result_message(sdk_message: Any) -> UsageInfo:
     cache_read = _get("cache_read_input_tokens", "cache_read")
 
     total = None
-    parts = [
-        t for t in (input_tokens, output_tokens, cache_creation, cache_read)
-        if t is not None
-    ]
+    parts = [t for t in (input_tokens, output_tokens, cache_creation, cache_read) if t is not None]
     if parts:
         total = sum(parts)
 
@@ -68,8 +83,7 @@ async def _fetch_context_usage(sdk_client: Any) -> dict[str, Any] | None:
         return None
 
 
-def _apply_context_usage(usage: UsageInfo,
-                         context: dict[str, Any] | None) -> UsageInfo:
+def _apply_context_usage(usage: UsageInfo, context: dict[str, Any] | None) -> UsageInfo:
     if not context:
         return usage
     usage.context_tokens = context.get("totalTokens")
@@ -91,8 +105,7 @@ _SUBAGENT_SPAWN_TOOL_NAMES = frozenset({"Agent", "Task"})
 def _is_subagent_spawn(block: ToolUseBlock) -> bool:
     if block.name in _SUBAGENT_SPAWN_TOOL_NAMES:
         return True
-    return (isinstance(block.input, dict)
-            and isinstance(block.input.get("subagent_type"), str))
+    return isinstance(block.input, dict) and isinstance(block.input.get("subagent_type"), str)
 
 
 def _session_init_event_from_data(data: dict[str, Any]) -> SessionInitEvent:
@@ -109,14 +122,12 @@ def _session_init_event_from_data(data: dict[str, Any]) -> SessionInitEvent:
     skills = [s for s in skills_raw if isinstance(s, str)]
     agents = [a for a in agents_raw if isinstance(a, str)]
     plugins = [
-        p["name"] for p in plugins_raw
-        if isinstance(p, dict) and isinstance(p.get("name"), str)
+        p["name"] for p in plugins_raw if isinstance(p, dict) and isinstance(p.get("name"), str)
     ]
     return SessionInitEvent(skills=skills, plugins=plugins, agents=agents)
 
 
-def _compact_boundary_event_from_data(
-        data: dict[str, Any]) -> CompactBoundaryEvent:
+def _compact_boundary_event_from_data(data: dict[str, Any]) -> CompactBoundaryEvent:
     """Build a ``CompactBoundaryEvent`` from a ``compact_boundary`` payload.
 
     The SDK doesn't model the payload as a typed subclass, so we read
@@ -133,8 +144,7 @@ def _compact_boundary_event_from_data(
     return CompactBoundaryEvent(trigger=trigger, pre_tokens=pre_tokens)
 
 
-def _rate_limit_warning_from_event(
-        event: RateLimitEvent) -> RateLimitWarningEvent:
+def _rate_limit_warning_from_event(event: RateLimitEvent) -> RateLimitWarningEvent:
     info = event.rate_limit_info
     return RateLimitWarningEvent(
         status=info.status,
@@ -164,7 +174,6 @@ def _subagent_label_from_task_input(tool_input: dict[str, Any]) -> str:
 
 
 class ClaudeCodeClient(BackendClient):
-
     def __init__(self, sdk_client) -> None:
         self._client = sdk_client
         # Maps a subagent-spawning ToolUseBlock id (Agent/Task) to a
@@ -188,22 +197,20 @@ class ClaudeCodeClient(BackendClient):
                     if sdk_message.subtype == "init":
                         yield _session_init_event_from_data(sdk_message.data)
                     elif sdk_message.subtype == "compact_boundary":
-                        yield _compact_boundary_event_from_data(
-                            sdk_message.data)
+                        yield _compact_boundary_event_from_data(sdk_message.data)
                 elif isinstance(sdk_message, RateLimitEvent):
                     yield _rate_limit_warning_from_event(sdk_message)
                 elif isinstance(sdk_message, AssistantMessage):
                     if sdk_message.error is not None:
-                        raise RuntimeError(
-                            f"Claude Code turn failed: {sdk_message.error}")
+                        raise RuntimeError(f"Claude Code turn failed: {sdk_message.error}")
                     parent_id = sdk_message.parent_tool_use_id
                     label = self._resolve_label(parent_id)
                     for block in sdk_message.content:
                         if isinstance(block, ToolUseBlock):
                             if _is_subagent_spawn(block):
-                                self._subagent_labels[block.id] = (
-                                    _subagent_label_from_task_input(
-                                        block.input))
+                                self._subagent_labels[block.id] = _subagent_label_from_task_input(
+                                    block.input
+                                )
                             yield ToolCallEvent(
                                 name=block.name,
                                 input=block.input,
@@ -242,8 +249,7 @@ class ClaudeCodeClient(BackendClient):
                         usage=_usage_from_result_message(sdk_message),
                         is_error=bool(sdk_message.is_error),
                         errors=list(sdk_message.errors or []),
-                        permission_denials=list(sdk_message.permission_denials
-                                                or []),
+                        permission_denials=list(sdk_message.permission_denials or []),
                     )
         except Exception:
             if not got_result:
@@ -254,6 +260,20 @@ class ClaudeCodeClient(BackendClient):
             if pending_result.usage is not None:
                 _apply_context_usage(pending_result.usage, context)
             yield pending_result
+
+    async def get_context_usage(self) -> UsageInfo | None:
+        """Pre-input ``/context`` breakdown from the Claude Code CLI.
+
+        ``get_context_usage`` is a local control request (it does not call
+        the model), so it returns the baseline footprint — system prompt,
+        tools, memory — as soon as the session is connected, before any
+        user turn. Returns ``None`` when the CLI reports nothing usable.
+        """
+        context = await _fetch_context_usage(self._client)
+        usage = _apply_context_usage(UsageInfo(), context)
+        if usage.context_percentage is None and usage.context_tokens is None:
+            return None
+        return usage
 
 
 _CLI_VERSION_TIMEOUT_S = 5.0
@@ -275,7 +295,7 @@ def _find_claude_cli() -> str | None:
     Returns ``None`` when nothing is found so the caller can simply omit
     the CLI version from the rendered string.
     """
-    bundled = (Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude")
+    bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
     if bundled.is_file():
         return str(bundled)
     return shutil.which("claude")
@@ -292,10 +312,9 @@ def _claude_cli_version() -> str:
     if cli_path is None:
         return ""
     try:
-        out = subprocess.run([cli_path, "--version"],
-                             capture_output=True,
-                             text=True,
-                             timeout=_CLI_VERSION_TIMEOUT_S)
+        out = subprocess.run(
+            [cli_path, "--version"], capture_output=True, text=True, timeout=_CLI_VERSION_TIMEOUT_S
+        )
     except (OSError, subprocess.SubprocessError):
         return ""
     if out.returncode != 0:
@@ -318,8 +337,7 @@ def _claude_backend_version() -> str:
     """Cached ``cli X · sdk Y`` string for the Claude Code backend."""
     global _VERSION_CACHE
     if _VERSION_CACHE is None:
-        _VERSION_CACHE = _format_version(_claude_cli_version(),
-                                         _claude_sdk_version())
+        _VERSION_CACHE = _format_version(_claude_cli_version(), _claude_sdk_version())
     return _VERSION_CACHE
 
 
@@ -327,7 +345,6 @@ _REASONING_EFFORT = "max"
 
 
 class ClaudeCodeBackend(Backend):
-
     def version(self) -> str:
         return _claude_backend_version()
 
@@ -354,7 +371,8 @@ class ClaudeCodeBackend(Backend):
             raise ValueError(
                 "extra_mcp_servers must not contain a key named "
                 "'agent-tools'; that name is reserved for the in-process "
-                "MCP server that exposes the BackendConfig.tools list.")
+                "MCP server that exposes the BackendConfig.tools list."
+            )
         if tools:
             mcp_servers["agent-tools"] = create_sdk_mcp_server(
                 name="agent-tools",
@@ -365,7 +383,7 @@ class ClaudeCodeBackend(Backend):
             return PermissionResultAllow()
 
         options = ClaudeAgentOptions(
-            tools=ToolsPreset(type="tools_preset", preset="claude_code"),
+            tools=ToolsPreset(type="preset", preset="claude_code"),
             system_prompt=SystemPromptPreset(
                 type="preset",
                 preset="claude_code",

@@ -53,6 +53,7 @@ agent-team --clean \
 | `--min-score` | `8.0` | Floor on QA `weighted_score` (0–10). APPROVE below this floor is downgraded to a loop-back; `0` disables the gate. |
 | `--plan-human-review` | off | Enable the human-review stage of the plan phase — after PlanReviewer APPROVE, the PlanDrafter asks the human for sign-off via `ask_human` before the build phase begins. Off by default; PlanReviewer APPROVE flows straight into the build phase. |
 | `--build-human-review` | off | Enable the Coder's `ask_human` escape hatch during the build phase. The Coder may pause mid-iteration to ask the human a question via stdin and integrate the reply. Off by default; only enable when the task involves environment facts or user-only information the Coder cannot deduce. |
+| `--replan-on-qa` | off | After each QA turn, re-invoke the PlanDrafter in **replan mode** to revise `plan.md` / `acceptance-criteria.md` based on the latest coder/reviewer/qa findings. The PlanDrafter (not QA) decides task completion via a `DONE` decision; `POLISHING` loops straight back to the Coder, `DRAFT_READY` runs the revision through the PlanReviewer first (and the human if `--plan-human-review` is set). Off by default — the build phase terminates on QA APPROVE as it always has. |
 | `--clean` | off | Wipe the workspace checkpoint and workflow-managed files (`.agent_team_state.json`, `plan.md`, `acceptance-criteria.md`, `progress.yaml`, `status.md`) and start fresh. Without this flag the workflow auto-resumes from the checkpoint when one is present. |
 | `--plan` | unset | Pre-supply `plan.md` (text or file path). Combined with `--acceptance-criteria` it skips the plan phase entirely; alone it still runs the plan phase so the PlanDrafter generates the missing `acceptance-criteria.md`. Ignored when resuming from a checkpoint — pass `--clean` to start fresh. |
 | `--acceptance-criteria` | unset | Pre-supply `acceptance-criteria.md` (text or file path). Mirrors `--plan`: combined with `--plan` skips the plan phase; alone runs the plan phase to generate `plan.md`. |
@@ -100,6 +101,42 @@ agent-team --clean \
   bound context. The coder's session is additionally reset right after
   iteration 1 so the refinement phase always starts from a clean slate.
 
+### Replan-on-QA (opt-in via `--replan-on-qa`)
+
+When the flag is set the build phase changes shape: after every QA
+turn the PlanDrafter is re-invoked in **replan mode** to revise
+`plan.md` and `acceptance-criteria.md` based on the coder/reviewer/qa
+findings. The PlanDrafter — not QA — decides when the workflow
+terminates.
+
+```
+Coder → Reviewer → QA → PlanDrafter (replan)
+                          ├─ DONE          → exit loop
+                          ├─ POLISHING     → Coder              (fast path)
+                          ├─ DRAFT_READY   → PlanReviewer → ... (slow path)
+                          └─ HUMAN_APPROVED → Coder             (after human, if enabled)
+```
+
+Reviewer `REJECT` still loops straight back to the Coder without
+triggering replan — replan only runs after a QA turn. `--min-score`
+is no longer a termination gate when the flag is set; it is passed to
+the PlanDrafter as a prompt hint and enforced by the orchestrator as a
+hard floor on `DONE` (a `DONE` returned while `weighted_score` is
+below `--min-score` is downgraded to `POLISHING` with a warning).
+
+The PlanDrafter's persistent session is reused for replan turns, so
+the plan-phase context (the original rationale, considered-and-rejected
+directions, risk register) remains visible when it is rewriting after
+the build phase. In replan mode the PlanDrafter also gets a
+`read_latest_build_progress` MCP tool (a `build_stage`-scoped twin of
+`read_latest_progress`) and the same `read_human_feedback` the
+build-phase agents use, so it can ground its revision on the latest
+coder/reviewer/qa entries and any `--feedback` notes.
+
+With `--plan-human-review` on, a `DRAFT_READY` revision that the
+PlanReviewer APPROVEs runs through the same human-review sub-stage as
+the initial plan, before the next coder iteration starts.
+
 ## Shared workspace files
 
 All agents communicate through files in the workspace — user prompts
@@ -120,7 +157,7 @@ Each agent ends its turn by calling a per-agent progress tool exactly
 once. The tool writes a structured YAML entry, which the orchestrator
 reads directly to drive control flow:
 
-- `append_plan_drafter_progress` (decisions: `DRAFT_READY` / `POLISHING` / `HUMAN_APPROVED`)
+- `append_plan_drafter_progress` (decisions: `DRAFT_READY` / `POLISHING` / `HUMAN_APPROVED` / `DONE`; `DONE` is only emitted in `--replan-on-qa` mode)
 - `append_plan_reviewer_progress` (decisions: `APPROVE` / `REJECT`)
 - `append_coder_progress`
 - `append_reviewer_progress` (decisions: `APPROVE` / `REJECT`)

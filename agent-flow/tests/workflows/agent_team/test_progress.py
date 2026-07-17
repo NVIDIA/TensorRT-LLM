@@ -1,4 +1,5 @@
 """Tests for the agent-team progress.yaml tool flow."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,8 +11,7 @@ import yaml
 
 from agent_flow.workflows.agent_team import progress as progress_module
 from agent_flow.workflows.agent_team import workflow as _workflow_module
-from agent_flow.workflows.agent_team.state import (STAGE_CODER, WorkflowState,
-                                                   save_state)
+from agent_flow.workflows.agent_team.state import STAGE_CODER, WorkflowState, save_state
 
 
 def _load_progress_module():
@@ -48,11 +48,7 @@ def test_read_progress_handles_missing_empty_and_seeded(tmp_path):
     )
     assert progress.read_progress(path) == {
         "plan_stage": [
-            {
-                "iteration": 1,
-                "agent": "plan_drafter",
-                "summary": "hi"
-            },
+            {"iteration": 1, "agent": "plan_drafter", "summary": "hi"},
         ],
         "build_stage": [],
         "human_feedback": [],
@@ -60,8 +56,10 @@ def test_read_progress_handles_missing_empty_and_seeded(tmp_path):
 
 
 def test_read_progress_rejects_legacy_list(tmp_path):
-    """The legacy flat-list format must surface as an explicit error rather
-    than silently mis-routing entries."""
+    """The legacy flat-list format must surface as an explicit error.
+
+    It must not silently mis-route entries.
+    """
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     path.write_text("- iteration: 1\n  agent: plan_drafter\n", encoding="utf-8")
@@ -104,32 +102,46 @@ def test_tool_handlers_route_entries_to_their_stage(tmp_path):
     tools = progress.build_progress_tools(ctx)
 
     # PlanDrafter draft turn — DRAFT_READY.
-    _call(tools["plan_drafter"][0].handler, {
-        "summary": "initial plan draft",
-        "decision": "DRAFT_READY",
-    })
+    _call(
+        tools["plan_drafter"][0].handler,
+        {
+            "summary": "initial plan draft",
+            "decision": "DRAFT_READY",
+        },
+    )
     # PlanReviewer APPROVE.
-    _call(tools["plan_reviewer"][0].handler, {
-        "summary": "plan covers task.yaml",
-        "decision": "APPROVE",
-    })
+    _call(
+        tools["plan_reviewer"][0].handler,
+        {
+            "summary": "plan covers task.yaml",
+            "decision": "APPROVE",
+        },
+    )
     # PlanDrafter human turn — HUMAN_APPROVED.
-    _call(tools["plan_drafter"][0].handler, {
-        "summary": "human approved",
-        "decision": "HUMAN_APPROVED",
-    })
+    _call(
+        tools["plan_drafter"][0].handler,
+        {
+            "summary": "human approved",
+            "decision": "HUMAN_APPROVED",
+        },
+    )
 
     _call(tools["coder"][0].handler, {"summary": "implemented v1"})
-    _call(tools["reviewer"][0].handler, {
-        "summary": "looks right",
-        "decision": "APPROVE",
-    })
     _call(
-        tools["qa"][0].handler, {
+        tools["reviewer"][0].handler,
+        {
+            "summary": "looks right",
+            "decision": "APPROVE",
+        },
+    )
+    _call(
+        tools["qa"][0].handler,
+        {
             "summary": "per-criterion scores...",
             "decision": "APPROVE",
             "weighted_score": 9.2,
-        })
+        },
+    )
 
     data = progress.read_progress(path)
 
@@ -144,8 +156,7 @@ def test_tool_handlers_route_entries_to_their_stage(tmp_path):
         "reviewer",
         "qa",
     ]
-    assert all(e["iteration"] == 1
-               for e in data["plan_stage"] + data["build_stage"])
+    assert all(e["iteration"] == 1 for e in data["plan_stage"] + data["build_stage"])
 
     # Role-specific fields are present only where they belong.
     plan = data["plan_stage"]
@@ -179,10 +190,13 @@ def test_plan_drafter_tool_handler_validates_decision(tmp_path):
     # Each enum value writes the matching decision.
     for decision in ("DRAFT_READY", "POLISHING", "HUMAN_APPROVED"):
         progress.init_progress_file(path)
-        _call(tools["plan_drafter"][0].handler, {
-            "summary": f"r {decision}",
-            "decision": decision,
-        })
+        _call(
+            tools["plan_drafter"][0].handler,
+            {
+                "summary": f"r {decision}",
+                "decision": decision,
+            },
+        )
         plan = progress.read_progress(path)["plan_stage"]
         assert plan[0]["agent"] == "plan_drafter"
         assert plan[0]["decision"] == decision
@@ -195,10 +209,13 @@ def test_plan_reviewer_tool_handler_records_reject_decision(tmp_path):
     ctx = progress.ProgressContext(path=path, current_iteration=1)
     tools = progress.build_progress_tools(ctx)
 
-    _call(tools["plan_reviewer"][0].handler, {
-        "summary": "plan misses streaming requirement",
-        "decision": "REJECT",
-    })
+    _call(
+        tools["plan_reviewer"][0].handler,
+        {
+            "summary": "plan misses streaming requirement",
+            "decision": "REJECT",
+        },
+    )
 
     plan = progress.read_progress(path)["plan_stage"]
     assert plan[0]["agent"] == "plan_reviewer"
@@ -212,10 +229,13 @@ def test_reviewer_tool_handler_records_reject_decision(tmp_path):
     ctx = progress.ProgressContext(path=path, current_iteration=1)
     tools = progress.build_progress_tools(ctx)
 
-    _call(tools["reviewer"][0].handler, {
-        "summary": "missing ValueError for negative n",
-        "decision": "REJECT",
-    })
+    _call(
+        tools["reviewer"][0].handler,
+        {
+            "summary": "missing ValueError for negative n",
+            "decision": "REJECT",
+        },
+    )
 
     build = progress.read_progress(path)["build_stage"]
     assert build[0]["agent"] == "reviewer"
@@ -230,11 +250,13 @@ def test_qa_tool_handler_records_reject_decision(tmp_path):
     tools = progress.build_progress_tools(ctx)
 
     _call(
-        tools["qa"][0].handler, {
+        tools["qa"][0].handler,
+        {
             "summary": "2/4 tests fail; functionality incomplete",
             "decision": "REJECT",
             "weighted_score": 4.5,
-        })
+        },
+    )
 
     build = progress.read_progress(path)["build_stage"]
     assert build[0]["agent"] == "qa"
@@ -246,7 +268,8 @@ def test_find_entries(tmp_path):
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.write_progress(
-        path, {
+        path,
+        {
             "plan_stage": [
                 {
                     "iteration": 1,
@@ -268,44 +291,27 @@ def test_find_entries(tmp_path):
                 },
             ],
             "build_stage": [
-                {
-                    "iteration": 1,
-                    "agent": "coder",
-                    "summary": "c1"
-                },
-                {
-                    "iteration": 1,
-                    "agent": "reviewer",
-                    "summary": "r1",
-                    "decision": "APPROVE"
-                },
+                {"iteration": 1, "agent": "coder", "summary": "c1"},
+                {"iteration": 1, "agent": "reviewer", "summary": "r1", "decision": "APPROVE"},
                 {
                     "iteration": 1,
                     "agent": "qa",
                     "summary": "q1",
                     "decision": "REJECT",
-                    "weighted_score": 6.0
+                    "weighted_score": 6.0,
                 },
-                {
-                    "iteration": 2,
-                    "agent": "coder",
-                    "summary": "c2"
-                },
-                {
-                    "iteration": 2,
-                    "agent": "reviewer",
-                    "summary": "r2",
-                    "decision": "APPROVE"
-                },
+                {"iteration": 2, "agent": "coder", "summary": "c2"},
+                {"iteration": 2, "agent": "reviewer", "summary": "r2", "decision": "APPROVE"},
                 {
                     "iteration": 2,
                     "agent": "qa",
                     "summary": "q2",
                     "decision": "APPROVE",
-                    "weighted_score": 9.0
+                    "weighted_score": 9.0,
                 },
             ],
-        })
+        },
+    )
 
     # No filters → all build entries (within the requested stage).
     assert len(progress.find_entries(path, stage="build_stage")) == 6
@@ -313,49 +319,43 @@ def test_find_entries(tmp_path):
 
     # last_iterations=1 in the build stage → just iteration 2.
     assert [
-        e["agent"] for e in progress.find_entries(
-            path, stage="build_stage", last_iterations=1)
+        e["agent"] for e in progress.find_entries(path, stage="build_stage", last_iterations=1)
     ] == ["coder", "reviewer", "qa"]
 
     # last_iterations=2 in the build stage → iterations 1 and 2.
-    assert [(e["iteration"], e["agent"]) for e in progress.find_entries(
-        path, stage="build_stage", last_iterations=2)] == [
-            (1, "coder"),
-            (1, "reviewer"),
-            (1, "qa"),
-            (2, "coder"),
-            (2, "reviewer"),
-            (2, "qa"),
-        ]
+    assert [
+        (e["iteration"], e["agent"])
+        for e in progress.find_entries(path, stage="build_stage", last_iterations=2)
+    ] == [
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+    ]
 
     # Agent filter only (all iterations).
     coders = progress.find_entries(path, stage="build_stage", agent="coder")
     assert [e["iteration"] for e in coders] == [1, 2]
 
     # Combined filters.
-    qa_entries = progress.find_entries(path,
-                                       stage="build_stage",
-                                       agent="qa",
-                                       last_iterations=2)
+    qa_entries = progress.find_entries(path, stage="build_stage", agent="qa", last_iterations=2)
     assert [e["weighted_score"] for e in qa_entries] == [6.0, 9.0]
     assert [e["decision"] for e in qa_entries] == ["REJECT", "APPROVE"]
 
     # Plan-stage agent filter on plan stage.
-    drafts = progress.find_entries(path,
-                                   stage="plan_stage",
-                                   agent="plan_drafter")
+    drafts = progress.find_entries(path, stage="plan_stage", agent="plan_drafter")
     assert [e["iteration"] for e in drafts] == [1, 2]
 
     # Cross-stage agent filter returns empty (e.g. reviewer is build_stage).
-    assert progress.find_entries(path, stage="plan_stage",
-                                 agent="reviewer") == []
+    assert progress.find_entries(path, stage="plan_stage", agent="reviewer") == []
 
     # Empty file → empty list regardless of filters.
     empty = tmp_path / "empty.yaml"
     progress.init_progress_file(empty)
     assert progress.find_entries(empty, stage="plan_stage") == []
-    assert progress.find_entries(empty, stage="build_stage",
-                                 last_iterations=5) == []
+    assert progress.find_entries(empty, stage="build_stage", last_iterations=5) == []
 
     # Invalid last_iterations.
     with pytest.raises(ValueError):
@@ -367,15 +367,17 @@ def test_find_entries(tmp_path):
 
 
 def test_find_entries_uses_stage_local_iteration_cutoff(tmp_path):
-    """Plan and build phases keep independent iteration counters. A
-    build-stage coder entry at iteration 1 must not be hidden by plan-stage
+    """Plan and build phases keep independent iteration counters.
+
+    A build-stage coder entry at iteration 1 must not be hidden by plan-stage
     entries that have already advanced to iteration 2 — the cutoff is
     local to the stage being queried.
     """
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.write_progress(
-        path, {
+        path,
+        {
             "plan_stage": [
                 {
                     "iteration": 1,
@@ -415,22 +417,71 @@ def test_find_entries_uses_stage_local_iteration_cutoff(tmp_path):
                     "summary": "implemented",
                 },
             ],
-        })
+        },
+    )
 
-    coder_latest = progress.find_entries(path,
-                                         stage="build_stage",
-                                         agent="coder",
-                                         last_iterations=1)
+    coder_latest = progress.find_entries(
+        path, stage="build_stage", agent="coder", last_iterations=1
+    )
     assert len(coder_latest) == 1
     assert coder_latest[0]["agent"] == "coder"
     assert coder_latest[0]["iteration"] == 1
+
+
+def test_find_entries_recency_follows_append_order_not_numeric_max(tmp_path):
+    """Interleaved replan numbering must not hide the newest entry.
+
+    Replan-mode PlanDrafter entries land in ``plan_stage`` stamped with
+    *build* iteration numbers. When the plan phase took more iterations
+    than the current build iteration, the numerically largest iteration
+    belongs to the old draft phase; recency must follow append order so
+    the replan entry — the newest by position — is what a
+    ``last_iterations=1`` read returns.
+    """
+    progress = _load_progress_module()
+    path = tmp_path / "progress.yaml"
+    progress.write_progress(
+        path,
+        {
+            "plan_stage": [
+                # Plan phase converged in 3 iterations.
+                {"iteration": 1, "agent": "plan_drafter", "summary": "draft v1"},
+                {"iteration": 2, "agent": "plan_drafter", "summary": "draft v2"},
+                {"iteration": 3, "agent": "plan_drafter", "summary": "draft v3"},
+                # First replan turn, stamped with BUILD iteration 1.
+                {
+                    "iteration": 1,
+                    "agent": "plan_drafter",
+                    "summary": "REPLAN: revised criteria after QA gap",
+                },
+            ],
+            "build_stage": [],
+        },
+    )
+
+    latest = progress.find_entries(
+        path, stage="plan_stage", agent="plan_drafter", last_iterations=1
+    )
+    assert [e["summary"] for e in latest] == ["REPLAN: revised criteria after QA gap"]
+
+    # A wider window walks further back by append order: the replan entry
+    # (iteration value 1) and the draft-v3 entry (iteration value 3) are
+    # the last two distinct iteration values from the tail.
+    last_two = progress.find_entries(
+        path, stage="plan_stage", agent="plan_drafter", last_iterations=2
+    )
+    assert [e["summary"] for e in last_two] == [
+        "draft v3",
+        "REPLAN: revised criteria after QA gap",
+    ]
 
 
 def test_read_latest_progress_tool_handler_is_stage_scoped(tmp_path):
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.write_progress(
-        path, {
+        path,
+        {
             "plan_stage": [
                 {
                     "iteration": 1,
@@ -468,7 +519,8 @@ def test_read_latest_progress_tool_handler_is_stage_scoped(tmp_path):
                     "summary": "c2",
                 },
             ],
-        })
+        },
+    )
     ctx = progress.ProgressContext(path=path, current_iteration=2)
     tools = progress.build_progress_tools(ctx)
 
@@ -492,10 +544,8 @@ def test_read_latest_progress_tool_handler_is_stage_scoped(tmp_path):
     assert qa_names == ["append_qa_progress", "read_human_feedback"]
 
     # The read tool's `agent` enum is restricted to the caller's stage.
-    plan_read = next(t for t in tools["plan_drafter"]
-                     if t.name == "read_latest_progress")
-    build_read = next(t for t in tools["coder"]
-                      if t.name == "read_latest_progress")
+    plan_read = next(t for t in tools["plan_drafter"] if t.name == "read_latest_progress")
+    build_read = next(t for t in tools["coder"] if t.name == "read_latest_progress")
     plan_enum = plan_read.input_schema["properties"]["agent"]["enum"]
     build_enum = build_read.input_schema["properties"]["agent"]["enum"]
     assert sorted(plan_enum) == ["plan_drafter", "plan_reviewer"]
@@ -511,13 +561,15 @@ def test_read_latest_progress_tool_handler_is_stage_scoped(tmp_path):
     # Build-side: iterations=2, agent=reviewer → only iter-1 reviewer entry.
     out = _call(build_read.handler, {"iterations": 2, "agent": "reviewer"})
     rendered = yaml.safe_load(out["content"][0]["text"])
-    assert rendered == [{
-        "iteration": 1,
-        "agent": "reviewer",
-        "timestamp": "t2",
-        "summary": "r1",
-        "decision": "APPROVE",
-    }]
+    assert rendered == [
+        {
+            "iteration": 1,
+            "agent": "reviewer",
+            "timestamp": "t2",
+            "summary": "r1",
+            "decision": "APPROVE",
+        }
+    ]
 
     # Plan-side default: latest plan_stage iteration only.
     out = _call(plan_read.handler, {})
@@ -530,19 +582,24 @@ def test_read_latest_progress_tool_handler_is_stage_scoped(tmp_path):
     progress.init_progress_file(empty)
     ctx2 = progress.ProgressContext(path=empty)
     plan_read2 = next(
-        t for t in progress.build_progress_tools(ctx2)["plan_drafter"]
-        if t.name == "read_latest_progress")
+        t
+        for t in progress.build_progress_tools(ctx2)["plan_drafter"]
+        if t.name == "read_latest_progress"
+    )
     out = _call(plan_read2.handler, {})
     assert "No plan_stage progress entries yet" in out["content"][0]["text"]
 
 
 def test_append_human_feedback_stamps_metadata_and_appends(tmp_path):
-    """``append_human_feedback`` adds one entry per call, never overwrites,
-    and preserves prior plan/build entries."""
+    """``append_human_feedback`` adds one entry per call and never overwrites.
+
+    It also preserves prior plan/build entries.
+    """
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.write_progress(
-        path, {
+        path,
+        {
             "plan_stage": [
                 {
                     "iteration": 1,
@@ -559,7 +616,8 @@ def test_append_human_feedback_stamps_metadata_and_appends(tmp_path):
                 },
             ],
             "human_feedback": [],
-        })
+        },
+    )
 
     entry = progress.append_human_feedback(
         path,
@@ -609,12 +667,15 @@ def test_append_human_feedback_rejects_unknown_stage(tmp_path):
 
 
 def test_read_human_feedback_tool_returns_user_entries(tmp_path):
-    """The build-phase ``read_human_feedback`` tool returns the user's
-    feedback list as YAML text. The plan-phase agents do not get the tool."""
+    """The build-phase ``read_human_feedback`` tool returns the user's feedback list as YAML text.
+
+    The plan-phase agents do not get the tool.
+    """
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.write_progress(
-        path, {
+        path,
+        {
             "plan_stage": [],
             "build_stage": [],
             "human_feedback": [
@@ -631,7 +692,8 @@ def test_read_human_feedback_tool_returns_user_entries(tmp_path):
                     "summary": "support negative integers",
                 },
             ],
-        })
+        },
+    )
 
     ctx = progress.ProgressContext(path=path, current_iteration=3)
     tools = progress.build_progress_tools(ctx)
@@ -644,8 +706,7 @@ def test_read_human_feedback_tool_returns_user_entries(tmp_path):
     # Each build-phase agent has a read_human_feedback tool. Returned YAML
     # is structurally identical to the on-disk list.
     for role in ("coder", "reviewer", "qa"):
-        feedback_tool = next(t for t in tools[role]
-                             if t.name == "read_human_feedback")
+        feedback_tool = next(t for t in tools[role] if t.name == "read_human_feedback")
         out = _call(feedback_tool.handler, {})
         rendered = yaml.safe_load(out["content"][0]["text"])
         assert rendered == progress.read_progress(path)["human_feedback"]
@@ -657,19 +718,21 @@ def test_read_human_feedback_tool_handles_empty_list(tmp_path):
     progress.init_progress_file(path)
     ctx = progress.ProgressContext(path=path, current_iteration=1)
     tools = progress.build_progress_tools(ctx)
-    feedback_tool = next(t for t in tools["coder"]
-                         if t.name == "read_human_feedback")
+    feedback_tool = next(t for t in tools["coder"] if t.name == "read_human_feedback")
     out = _call(feedback_tool.handler, {})
     assert "No human_feedback entries yet" in out["content"][0]["text"]
 
 
 def test_read_human_feedback_logs_caller_and_count(tmp_path, monkeypatch):
-    """The read-feedback tool emits a styled panel attributed to the
-    calling agent so the user sees who read what."""
+    """The read-feedback tool emits a styled panel attributed to the calling agent.
+
+    This lets the user see who read what.
+    """
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.write_progress(
-        path, {
+        path,
+        {
             "plan_stage": [],
             "build_stage": [],
             "human_feedback": [
@@ -680,21 +743,24 @@ def test_read_human_feedback_logs_caller_and_count(tmp_path, monkeypatch):
                     "summary": "fix the bug",
                 },
             ],
-        })
+        },
+    )
 
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(progress,
-                        "print_layer_panel",
-                        lambda layer, suffix, body, _console=None: calls.append(
-                            {
-                                "layer": layer,
-                                "suffix": suffix,
-                            }))
+    monkeypatch.setattr(
+        progress,
+        "print_layer_panel",
+        lambda layer, suffix, body, _console=None: calls.append(
+            {
+                "layer": layer,
+                "suffix": suffix,
+            }
+        ),
+    )
 
     ctx = progress.ProgressContext(path=path)
     tools = progress.build_progress_tools(ctx)
-    reviewer_feedback = next(t for t in tools["reviewer"]
-                             if t.name == "read_human_feedback")
+    reviewer_feedback = next(t for t in tools["reviewer"] if t.name == "read_human_feedback")
     _call(reviewer_feedback.handler, {})
 
     assert calls
@@ -704,20 +770,25 @@ def test_read_human_feedback_logs_caller_and_count(tmp_path, monkeypatch):
 
 
 def test_append_human_feedback_logs_panel(tmp_path, monkeypatch):
-    """``append_human_feedback`` emits a styled orchestrator panel so the
-    user can see what landed in progress.yaml."""
+    """``append_human_feedback`` emits a styled orchestrator panel.
+
+    This lets the user see what landed in progress.yaml.
+    """
     progress = _load_progress_module()
     path = tmp_path / "progress.yaml"
     progress.init_progress_file(path)
 
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(progress,
-                        "print_layer_panel",
-                        lambda layer, suffix, body, _console=None: calls.append(
-                            {
-                                "layer": layer,
-                                "suffix": suffix,
-                            }))
+    monkeypatch.setattr(
+        progress,
+        "print_layer_panel",
+        lambda layer, suffix, body, _console=None: calls.append(
+            {
+                "layer": layer,
+                "suffix": suffix,
+            }
+        ),
+    )
 
     progress.append_human_feedback(
         path,
@@ -743,11 +814,13 @@ def test_tool_handlers_log_write_and_read(tmp_path, monkeypatch):
     calls: list[dict[str, Any]] = []
 
     def _capture(layer_name, title_suffix, body, extra=None):
-        calls.append({
-            "layer": layer_name,
-            "suffix": title_suffix,
-            "body": body,
-        })
+        calls.append(
+            {
+                "layer": layer_name,
+                "suffix": title_suffix,
+                "body": body,
+            }
+        )
 
     # The progress module captured ``print_layer_panel`` at import time, so
     # patch the name in that module's namespace.
@@ -756,36 +829,49 @@ def test_tool_handlers_log_write_and_read(tmp_path, monkeypatch):
     ctx = progress.ProgressContext(path=path, current_iteration=1)
     tools = progress.build_progress_tools(ctx)
 
-    _call(tools["plan_drafter"][0].handler, {
-        "summary": "d",
-        "decision": "DRAFT_READY",
-    })
-    _call(tools["plan_reviewer"][0].handler, {
-        "summary": "p",
-        "decision": "APPROVE",
-    })
+    _call(
+        tools["plan_drafter"][0].handler,
+        {
+            "summary": "d",
+            "decision": "DRAFT_READY",
+        },
+    )
+    _call(
+        tools["plan_reviewer"][0].handler,
+        {
+            "summary": "p",
+            "decision": "APPROVE",
+        },
+    )
     _call(tools["coder"][0].handler, {"summary": "c"})
-    _call(tools["reviewer"][0].handler, {
-        "summary": "r",
-        "decision": "APPROVE",
-    })
-    _call(tools["qa"][0].handler, {
-        "summary": "q",
-        "decision": "APPROVE",
-        "weighted_score": 8.0,
-    })
+    _call(
+        tools["reviewer"][0].handler,
+        {
+            "summary": "r",
+            "decision": "APPROVE",
+        },
+    )
+    _call(
+        tools["qa"][0].handler,
+        {
+            "summary": "q",
+            "decision": "APPROVE",
+            "weighted_score": 8.0,
+        },
+    )
 
-    plan_drafter_read = next(t for t in tools["plan_drafter"]
-                             if t.name == "read_latest_progress")
-    coder_read = next(t for t in tools["coder"]
-                      if t.name == "read_latest_progress")
+    plan_drafter_read = next(t for t in tools["plan_drafter"] if t.name == "read_latest_progress")
+    coder_read = next(t for t in tools["coder"] if t.name == "read_latest_progress")
 
     # PlanDrafter reads the PlanReviewer's entries → should be styled
     # PLAN_DRAFTER (the caller), not PLAN_REVIEWER (the filter).
-    _call(plan_drafter_read.handler, {
-        "iterations": 1,
-        "agent": "plan_reviewer",
-    })
+    _call(
+        plan_drafter_read.handler,
+        {
+            "iterations": 1,
+            "agent": "plan_reviewer",
+        },
+    )
     # Coder reads with no filter → CODER.
     _call(coder_read.handler, {})
 
@@ -818,17 +904,23 @@ def test_latest_entry_returns_most_recent_for_agent(tmp_path):
     ctx = progress.ProgressContext(path=path, current_iteration=1)
     tools = progress.build_progress_tools(ctx)
 
-    _call(tools["qa"][0].handler, {
-        "summary": "s1",
-        "decision": "REJECT",
-        "weighted_score": 5,
-    })
+    _call(
+        tools["qa"][0].handler,
+        {
+            "summary": "s1",
+            "decision": "REJECT",
+            "weighted_score": 5,
+        },
+    )
     ctx.current_iteration = 2
-    _call(tools["qa"][0].handler, {
-        "summary": "s2",
-        "decision": "APPROVE",
-        "weighted_score": 9.2,
-    })
+    _call(
+        tools["qa"][0].handler,
+        {
+            "summary": "s2",
+            "decision": "APPROVE",
+            "weighted_score": 9.2,
+        },
+    )
 
     latest = progress.latest_entry(path, "qa")
     assert latest is not None
@@ -858,10 +950,10 @@ class ScriptedAgent:
         pass
 
 
-def _install_scripted_agents(workflow, reviewer_decisions, qa_decisions,
-                             qa_scores):
-    """Replace workflow's real AgentLayers with scripted fakes that call the
-    real tool handlers — exercising the YAML path through the tool flow.
+def _install_scripted_agents(workflow, reviewer_decisions, qa_decisions, qa_scores):
+    """Replace workflow AgentLayers with scripted fakes that call the real tool handlers.
+
+    This exercises the YAML path through the tool flow.
 
     ``reviewer_decisions`` feeds the reviewer's per-iteration decision in
     order; ``qa_decisions`` and ``qa_scores`` do the same for QA. The
@@ -884,43 +976,51 @@ def _install_scripted_agents(workflow, reviewer_decisions, qa_decisions,
         workflow.plan_path.write_text("# Plan\nDo X.\n", encoding="utf-8")
         # First call is the draft phase; subsequent calls are the human
         # phase, which approves immediately.
-        decision = ("DRAFT_READY"
-                    if plan_drafter_calls["count"] == 1 else "HUMAN_APPROVED")
-        run_tool("plan_drafter", {
-            "summary": f"plan {decision}",
-            "decision": decision,
-        })
+        decision = "DRAFT_READY" if plan_drafter_calls["count"] == 1 else "HUMAN_APPROVED"
+        run_tool(
+            "plan_drafter",
+            {
+                "summary": f"plan {decision}",
+                "decision": decision,
+            },
+        )
 
     def plan_reviewer_action():
-        run_tool("plan_reviewer", {
-            "summary": "plan looks fine",
-            "decision": "APPROVE",
-        })
+        run_tool(
+            "plan_reviewer",
+            {
+                "summary": "plan looks fine",
+                "decision": "APPROVE",
+            },
+        )
 
     def coder_action():
         run_tool("coder", {"summary": "implemented the thing"})
 
     def reviewer_action():
         decision = next(reviewer_iter)
-        run_tool("reviewer", {
-            "summary": f"review {decision}",
-            "decision": decision,
-        })
+        run_tool(
+            "reviewer",
+            {
+                "summary": f"review {decision}",
+                "decision": decision,
+            },
+        )
 
     def qa_action():
         decision = next(qa_decision_iter)
         score = next(qa_score_iter)
         run_tool(
-            "qa", {
+            "qa",
+            {
                 "summary": f"qa {decision}",
                 "decision": decision,
                 "weighted_score": float(score),
-            })
+            },
+        )
 
-    workflow.plan_drafter = ScriptedAgent("plan_drafter reply",
-                                          plan_drafter_action)
-    workflow.plan_reviewer = ScriptedAgent("plan_reviewer reply",
-                                           plan_reviewer_action)
+    workflow.plan_drafter = ScriptedAgent("plan_drafter reply", plan_drafter_action)
+    workflow.plan_reviewer = ScriptedAgent("plan_reviewer reply", plan_reviewer_action)
     workflow.coder = ScriptedAgent("coder reply", coder_action)
     workflow.reviewer = ScriptedAgent("reviewer reply", reviewer_action)
     workflow.qa = ScriptedAgent("qa reply", qa_action)
@@ -967,8 +1067,11 @@ def test_workflow_uses_tool_entries_for_reviewer_and_qa_decisions(tmp_path):
     data = progress.read_progress(workflow.progress_path)
 
     # Plan-stage entries: drafter + reviewer + drafter human approve.
-    assert [e["agent"] for e in data["plan_stage"]
-            ] == ["plan_drafter", "plan_reviewer", "plan_drafter"]
+    assert [e["agent"] for e in data["plan_stage"]] == [
+        "plan_drafter",
+        "plan_reviewer",
+        "plan_drafter",
+    ]
     # Build-stage entries: iter 1 coder+reviewer (REJECT skips QA),
     # iter 2 coder+reviewer+qa (APPROVE ends).
     assert [e["agent"] for e in data["build_stage"]] == [
@@ -980,17 +1083,14 @@ def test_workflow_uses_tool_entries_for_reviewer_and_qa_decisions(tmp_path):
     ]
 
     # Orchestrator read decision values from YAML, not from text.
-    reviewer_decisions = [
-        e["decision"] for e in data["build_stage"] if e["agent"] == "reviewer"
-    ]
+    reviewer_decisions = [e["decision"] for e in data["build_stage"] if e["agent"] == "reviewer"]
     assert reviewer_decisions == ["REJECT", "APPROVE"]
     qa_entry = data["build_stage"][-1]
     assert qa_entry["decision"] == "APPROVE"
     assert qa_entry["weighted_score"] == 9.0
 
     plan_drafter_decisions = [
-        e["decision"] for e in data["plan_stage"]
-        if e["agent"] == "plan_drafter"
+        e["decision"] for e in data["plan_stage"] if e["agent"] == "plan_drafter"
     ]
     assert plan_drafter_decisions == ["DRAFT_READY", "HUMAN_APPROVED"]
 
@@ -999,7 +1099,7 @@ def test_workflow_uses_tool_entries_for_reviewer_and_qa_decisions(tmp_path):
     assert state_path.is_file()
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["done"] is True
-    assert state["version"] == 4
+    assert state["version"] == 5
 
 
 def test_latest_entry_drives_reviewer_and_qa_decisions(tmp_path):
@@ -1011,7 +1111,8 @@ def test_latest_entry_drives_reviewer_and_qa_decisions(tmp_path):
     # Seed progress.yaml with a reviewer APPROVE + qa APPROVE pair, then
     # verify the decision readers return the right values.
     progress.write_progress(
-        workflow.progress_path, {
+        workflow.progress_path,
+        {
             "plan_stage": [],
             "build_stage": [
                 {
@@ -1030,13 +1131,15 @@ def test_latest_entry_drives_reviewer_and_qa_decisions(tmp_path):
                     "weighted_score": 9.1,
                 },
             ],
-        })
+        },
+    )
     assert workflow._latest_reviewer_decision() == "APPROVE"
     assert workflow._latest_qa_decision() == "APPROVE"
 
     # Flip both to the negative side.
     progress.write_progress(
-        workflow.progress_path, {
+        workflow.progress_path,
+        {
             "plan_stage": [],
             "build_stage": [
                 {
@@ -1055,7 +1158,8 @@ def test_latest_entry_drives_reviewer_and_qa_decisions(tmp_path):
                     "weighted_score": 3.1,
                 },
             ],
-        })
+        },
+    )
     assert workflow._latest_reviewer_decision() == "REJECT"
     assert workflow._latest_qa_decision() == "REJECT"
 
@@ -1072,7 +1176,8 @@ def test_workflow_resume_preserves_progress_yaml(tmp_path):
     # Initial (fresh) construction writes an empty mapping.
     workflow = workflow_mod.AgentTeamWorkflow(tmp_path)
     progress.write_progress(
-        workflow.progress_path, {
+        workflow.progress_path,
+        {
             "plan_stage": [
                 {
                     "iteration": 1,
@@ -1083,14 +1188,14 @@ def test_workflow_resume_preserves_progress_yaml(tmp_path):
                 },
             ],
             "build_stage": [],
-        })
+        },
+    )
 
     # Persist a minimal state so resume is legal.
     save_state(
         tmp_path / ".agent_team_state.json",
-        WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                      num_iterations=1,
-                      stage=STAGE_CODER))
+        WorkflowState(task_path=str(tmp_path / "task.yaml"), num_iterations=1, stage=STAGE_CODER),
+    )
 
     # Resume must NOT clobber progress.yaml. With the checkpoint on disk
     # the constructor auto-detects resume mode — no explicit flag.

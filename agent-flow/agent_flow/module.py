@@ -31,7 +31,6 @@ def _run_async(coro_func, *args):
 
 
 class Module(ABC):
-
     def __init__(self) -> None:
         object.__setattr__(self, "_modules", {})
         object.__setattr__(self, "_closed", False)
@@ -107,7 +106,6 @@ class Module(ABC):
 
 
 class Sequential(Module):
-
     def __init__(self, *modules: Module) -> None:
         super().__init__()
         for index, module in enumerate(modules):

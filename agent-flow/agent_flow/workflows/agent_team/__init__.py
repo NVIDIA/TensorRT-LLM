@@ -18,11 +18,18 @@ live in their respective submodules and are imported on demand:
     from agent_flow.workflows.agent_team.progress import build_progress_tools
     from agent_flow.workflows.agent_team.state import WorkflowState
 """
+
 from typing import Any
 
 from .prompts import DEFAULT_PROMPTS, PromptBundle
-from .state import (STAGE_CODER, STAGE_PLAN_DRAFTER, STAGE_PLAN_HUMAN,
-                    STAGE_PLAN_REVIEWER, STAGE_QA, STAGE_REVIEWER)
+from .state import (
+    STAGE_CODER,
+    STAGE_PLAN_DRAFTER,
+    STAGE_PLAN_HUMAN,
+    STAGE_PLAN_REVIEWER,
+    STAGE_QA,
+    STAGE_REVIEWER,
+)
 
 __all__ = [
     "AgentTeamWorkflow",

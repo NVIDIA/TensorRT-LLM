@@ -8,8 +8,8 @@ dependencies = [
     "anyio>=4.0",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "claude-agent-sdk==0.2.82",
-    "openai-codex-app-server-sdk @ git+https://github.com/openai/codex.git@58573da43ab697e8b79f152c53df4b42230395a8#subdirectory=sdk/python",
+    "claude-agent-sdk==0.2.110",
+    "openai-codex==0.1.0b3",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +21,7 @@ test = [
 [project.scripts]
 agent-team = "agent_flow.workflows.agent_team.cli:main"
 modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
+pr-review = "agent_flow.workflows.pr_review.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -29,25 +30,69 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["agent_flow*"]
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-addopts = "-p no:rerunfailures"
-
 ####################################################################################################
 ###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################
 ####################################################################################################
-[tool.isort]
-line_length = 80
-
-[tool.yapf]
-based_on_style = "pep8"
-column_limit = 80
-
 [tool.codespell]
-skip = ".git,*.svg"
-ignore-words-list = "te"
+skip = ".git,3rdparty,triton_kernels,tests/integration/test_input_files**,**.jsonl,**.json"
+ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te,iteract,anythin,tru,Tracin,vEw,dOut,indext,asend,medias"
 
-[tool.autoflake]
-in-place = true
-remove_all_unused_imports = true
-remove_unused_variables = true
+[tool.ruff]
+line-length = 100
+fix = true
+force-exclude = true
+exclude = [
+    "codex/**",
+]
+
+[tool.ruff.format]
+skip-magic-trailing-comma = false
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+[tool.ruff.lint]
+select = [
+    "D",   # pydocstyle --> enforcing correct docstrings for existing docstrings
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "PLE", # pylint errors
+    "W",   # pycodestyle warnings
+]
+extend-ignore = [
+    # we don't enforce writing docstrings for public code to reduce the burden
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D417",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "F403"]
+"*/_[a-zA-Z]*" = ["D"]                       # Private packages (_abc/*.py) or modules (_xyz.py)
+# Long markdown report templates in f-strings — splitting hurts readability.
+"skills/internal-trtllm-l0-pre-merge-duration-analysis/scripts/run_analysis.py" = ["E501"]
+# Markdown tables in prompt string literals — a table row must stay on one line.
+"agent_flow/workflows/modeling_bringup/prompts/plan_drafter_extra.py" = ["E501"]
+"agent_flow/workflows/modeling_bringup/prompts/reviewer_extra.py" = ["E501"]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 120
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-p no:rerunfailures"

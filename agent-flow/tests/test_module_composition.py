@@ -4,7 +4,6 @@ from agent_flow import Module, Sequential
 
 
 class AppendLayer(Module):
-
     def __init__(self, text: str) -> None:
         super().__init__()
         self.text = text
@@ -15,7 +14,6 @@ class AppendLayer(Module):
 
 
 class ParentModule(Module):
-
     def __init__(self) -> None:
         super().__init__()
         self.left = AppendLayer("left")
@@ -40,7 +38,7 @@ def test_reassigning_non_module_unregisters_child():
 
     module.left = "not-a-module"
 
-    assert module.children() == (module.right, )
+    assert module.children() == (module.right,)
 
 
 def test_modules_recurses_in_assignment_order():

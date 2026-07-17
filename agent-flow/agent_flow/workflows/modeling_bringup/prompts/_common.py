@@ -6,6 +6,97 @@ Each ``*_extra.py`` imports the subset relevant to its role and composes
 ``SYSTEM_PROMPT_EXTENSION``.
 """
 
+from functools import lru_cache
+
+from agent_flow.utils import check_skill_via_agent_layer
+
+# Canonical trtllm-test-specialist invocation block. Every prompt that asks
+# an agent to run a functional, benchmark, partial-model, or evaluation test
+# points at this block so the parameter schema stays in sync with
+# ``.claude/skills/trtllm-test-specialist/SKILL.md``. Update this constant
+# when the skill's input schema changes; the prompts pick it up automatically.
+#
+# The block is only injected into prompts when the skill is actually
+# discoverable on this machine (in either the Claude or Codex search
+# paths). If neither harness can resolve it, the getter returns an empty
+# string so prompts don't direct agents to a skill that won't load. The
+# probe runs lazily on first call (cached via ``lru_cache``) — never at
+# module import — so importing the prompt package never spins up real
+# backend sessions.
+_TRTLLM_TEST_SPECIALIST_INVOCATION = """\
+## Running tests, benchmarks, and evaluations — `trtllm-test-specialist`
+
+`trtllm-test-specialist` is the **only** sanctioned runner for TensorRT-LLM
+tests, benchmarks, and evaluations — including pre-existing repo tests,
+ad-hoc `pytest`/`python`/`trtllm-bench`/`trtllm-eval` commands, and any
+test script the agent writes into the workspace. Do not run those from
+Bash, the IDE, or another skill; only the specialist's markdown report
+counts as pass evidence.
+
+Always supply `report_file` and cite its path (and key numbers) in
+`status.md` / `progress.yaml` / `summary`. Omit keys you don't need.
+
+### Model tests — functionality, benchmark, evaluation, partial_model
+
+```
+Skill(skill="trtllm-test-specialist", args=\"\"\"
+- model_name: <short_model_name>
+- checkpoint_path: <hf_dir_or_model_id>
+- test_type: <functionality|benchmark|evaluation|partial_model>
+- tp_size / pp_size / ep_size / dp_size: <N>   # parallelism; ep MoE-only, dp functionality-only
+- layer_ids: 0,1,2                              # partial_model only
+- eval_tasks: gsm8k,mmlu                        # evaluation only
+- dataset_path: <path>                          # benchmark/evaluation, optional
+- bench_subcommand: <throughput|latency>        # benchmark only
+- backend: <pytorch|tensorrt|_autodeploy>       # benchmark only
+- device_type / extra_llm_api_options_yaml: <…> # optional
+- report_file: <markdown_path>
+\"\"\")
+```
+
+### Module tests — caller-supplied pytest / python command
+
+For an existing pytest case or a workspace script you just wrote:
+
+```
+Skill(skill="trtllm-test-specialist", args=\"\"\"
+- test_cmd: <verbatim pytest or python command>
+- class_name: <ClassUnderTest>     # report header
+- required_devices: <N>            # default 1
+- report_file: <markdown_path>
+\"\"\")
+```
+
+### Config-file shortcut
+
+If a YAML super-config encodes the whole run, pass only
+`config_file: <path/to/config.yaml>` — all other keys are ignored.
+"""
+
+
+@lru_cache(maxsize=1)
+def get_trtllm_test_specialist_invocation() -> str:
+    """Return the invocation block when at least one configured backend's
+    live session reports ``trtllm-test-specialist`` loaded; ``""`` otherwise.
+
+    Calls ``check_skill_via_agent_layer`` to consult real Claude Code and
+    Codex sessions. The result is cached for the lifetime of the process —
+    callers can invoke this from a prompt builder without paying the
+    probe cost on every call. Any backend that errors out (no creds,
+    network unavailable, SDK missing) is treated as "skill not present
+    there"; the block is still kept if *any* other backend reports it.
+    """
+    skill = "trtllm-test-specialist"
+    try:
+        probes = check_skill_via_agent_layer(skill)
+    except Exception:
+        return ""
+    return _TRTLLM_TEST_SPECIALIST_INVOCATION if any(p.has(skill) for p in probes.values()) else ""
+
+
+TRTLLM_TEST_SPECIALIST_INVOCATION = get_trtllm_test_specialist_invocation()
+
+
 DOMAIN_PRIMING = """\
 ## TensorRT-LLM model bring-up frame
 
@@ -43,6 +134,43 @@ REFERENCE_TEST_POLICY = """\
   test helpers or golden functions.
 - Do not use local `transformers` shims, monkeypatches, or environment-specific
   installed `transformers` imports as pass evidence.
+"""
+
+HF_REFERENCE_GOLDEN_POLICY = """\
+## Hand-written HF reference — golden-generate cross-check
+
+Some source models cannot run their native `model.generate()` /
+`AutoModel` path under the repo's pinned `transformers` (the on-disk
+modeling code is older or newer than that pin), so the HF reference has
+to be driven by a hand-written prefill + greedy-decode loop. That loop
+is a reimplementation of generation: its `position_ids`, attention mask,
+KV-cache threading, and greedy tie-breaking can silently diverge from
+canonical HF `generate()`. And because the same loop usually produces
+both the reference logits and the reference dataset score, delta-based
+parity checks (TensorRT-LLM vs reference) cannot catch a bug that sits in
+the loop itself — both sides shift together and the delta stays small.
+Anchor the loop against canonical `generate()` before trusting it.
+
+- **Require a golden-generate cross-check whenever the HF reference is
+  driven by a hand-written generation loop.** Generate the canonical
+  greedy token ids for the fixed reference prompts once with the source
+  model's native `generate()` (`do_sample=False`, deterministic greedy),
+  commit those token ids as a checked-in golden fixture, and assert the
+  hand-written reference reproduces the fixture token-for-token under the
+  same fixed prompts. This turns "the loop matches HF generate" from an
+  unverified assumption into a pinned, re-runnable fact.
+- **Produce the golden in an isolated, throwaway environment** — a
+  separate venv/conda env (or a one-off container) whose `transformers`
+  can actually run the source model's native `generate()`. The fixture
+  is data: once committed, the test asserts against it and never needs
+  that environment again.
+- **Never mutate the repo's pinned `transformers` to obtain this
+  reference.** The runtime (LLM API, accuracy gates, every later stage)
+  depends on that pin; changing it to fix the reference risks breaking
+  the very bring-up the reference is meant to validate. An in-process
+  shim, monkeypatch, or environment-specific installed `transformers`
+  `generate()` is likewise not an acceptable golden source — only a
+  committed fixture from a clean native run is.
 """
 
 BUILD_VALIDATION_POLICY = """\
@@ -196,8 +324,7 @@ DESIGN_REVIEW_POLICY = """\
   Benchmarks validate behavior; they do not justify an architecturally
   rejected direction.
 - Treat validation as `validated`, `partially validated`, or `not validated`.
-  `validated` requires an independent reference, hard-path coverage, and a
-  mutation check or equivalent negative control when implementation changed.
+  `validated` requires an independent reference and hard-path coverage.
   Passing tests prove agreement with their reference, not source-model parity.
 - If an active or likely-active contract is `Unknown` and could change owner
   boundary, backend choice, runtime/cache contract, architecture direction,
@@ -272,9 +399,6 @@ ATTENTION_VALIDATION_POLICY = """\
 - Compare against HF attention outputs, not only a local SDPA golden or random
   hidden-state reference. Report `max_abs`, `mean_abs`, cosine similarity, and
   the prompt/layer/config used.
-- Include negative controls for wrong RoPE or position handling, wrong V or
-  K=V materialization, wrong score scale, wrong mask/window behavior, and
-  fake KV geometry when those contracts exist.
 - Pass-critical attention CUDA/runtime unit or smoke tests must cover both
   `cuda_graph=false, overlap_scheduler=false` and
   `cuda_graph=true, overlap_scheduler=true` for the selected backend with
@@ -346,9 +470,6 @@ MOE_VALIDATION_POLICY = """\
   SwiGLU), the op path (e.g. `torch.ops.trtllm.fused_moe`, TRTLLMGen, or
   Python fallback), and whether native rebuild was required and used. A
   generic "MoE parity passed" statement is not enough.
-- Include negative controls for wrong activation, wrong routing or scaling,
-  wrong expert selection, wrong packed-weight layout, and wrong parallel
-  sharding when those contracts exist.
 - If the current machine exposes only one GPU, multi-GPU TP/EP/NCCL sharding
   tests are deferred environment coverage rather than pass-critical local
   evidence — but single-GPU CUDA backend tests, source replay, LLM API
@@ -366,10 +487,6 @@ ACCURACY_GATE_FRAMEWORK = """\
   `overlap_scheduler` configurations:
   * baseline: `cuda_graph=false`, `overlap_scheduler=false`
   * enabled: `cuda_graph=true`, `overlap_scheduler=true`
-- Run configured accuracy gates only after required focused CUDA/runtime,
-  integration, and parity tests pass. If a required focused test is failing,
-  skipped, or unexecuted, fix that first instead of using accuracy evidence
-  as a substitute.
 - Run baseline first. If the baseline score is below the configured
   threshold, keep fixing baseline before running the enabled configuration.
 - Before running a long accuracy benchmark, run a short LLM API smoke for the
@@ -412,6 +529,59 @@ another full benchmark run:
 - After the bad-prompt set is fixed, follow the same sequence as the initial
   gate: rerun the LLM API smoke, then the accuracy canary, then the full
   configured dataset for both baseline and enabled configurations.
+"""
+
+GSM8K_REFERENCE_CONFIG_POLICY = """\
+## gsm8k accuracy run — reference-aligned config
+
+When a configured dataset accuracy gate is gsm8k, run a fixed
+100-sample subset (the same sample indices every run) so scores are
+comparable across iterations and between the PyTorch reference and the
+TensorRT-LLM path. A full-dataset sweep is not needed to gate progress.
+
+The PyTorch reference run and the TensorRT-LLM run must use a matched
+config — a score gap caused by config drift is not a model defect.
+Settle the config on the PyTorch reference first (find one that scores
+reasonably high on gsm8k), then run both the PyTorch reference and the
+TensorRT-LLM path with that identical config. Points that commonly open
+a spurious gap:
+
+- **`max_seq_length` long enough.** Too short truncates the generated
+  answer and silently depresses the score; default to 2048 to be safe.
+- **Tokenizer and prompt rendering matched.** Render prompts the same
+  way on both paths — e.g. apply `apply_chat_template` consistently
+  rather than feeding raw text on one side.
+- **Thinking mode.** Try whether enabling the model's thinking /
+  reasoning mode raises the score, and keep that choice identical on
+  both paths.
+- **`batch_size` 8 or 16.** Large enough to keep the run fast without
+  changing the score.
+"""
+
+ACCURACY_GAP_PARITY_POLICY = """\
+## Debugging a TensorRT-LLM vs PyTorch-reference accuracy gap
+
+When TensorRT-LLM's gsm8k score (or any dataset score) trails the
+PyTorch reference under the same matched config, localize the
+divergence rather than re-running the whole gate:
+
+- **Pick the discriminating cases.** Analyze the samples where the
+  PyTorch reference is correct but TensorRT-LLM is wrong — those are
+  the cases that drive the gap. Samples both paths get right, or both
+  get wrong, carry little signal. The per-sample diagnostic should
+  name these indices so you compare a handful of cases, not the whole
+  subset.
+- **Compare with teacher forcing, not free-running generation.** Two
+  free-running decodes fork at the first differing token, after which
+  every downstream position has a different prefix and is no longer
+  comparable. Instead, drive both paths with the PyTorch reference's
+  tokens: at each step feed the reference's chosen token to both the
+  reference and the TensorRT-LLM path, so when their outputs disagree
+  at a position both still continue on the reference token. With the
+  prefix held identical the whole sequence, compare the per-step
+  logits / next-token distribution to pin the exact step — and, with
+  deeper replay, the layer or module — where TensorRT-LLM first
+  diverges.
 """
 
 STATUS_DONE_TODO_RUBRIC = """\
