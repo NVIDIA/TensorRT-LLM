@@ -1252,8 +1252,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     // consecutive blocks of one sequence equals num_layers_in_this_pool * kv_factor
     // (KVCacheManagerV2's page-index scale). Computed before the op cache key / runner->prepare()
     // so the prepared cubin matches the runtime dispatch key.
-    if (tensorrt_llm::common::getEnvKvArenaLinearKernels() && op->useKVCache()
-        && host_kv_cache_pool_mapping.has_value() && beam_width == 1 && !op->mIsMLAEnabled)
+    if (tensorrt_llm::common::getEnvKvArenaLinearKernels() && op->useKVCache() && host_kv_cache_pool_mapping.has_value()
+        && beam_width == 1 && !op->mIsMLAEnabled)
     {
         auto const& pool_mapping = host_kv_cache_pool_mapping.value();
         int32_t const pool_index = pool_mapping.index({op->mLayerIdx, 0}).item<int32_t>();
@@ -1551,8 +1551,21 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedK
     auto options = at::TensorOptions()
                        .dtype(storageDtype)
                        .device(c10::Device(at::kCUDA, static_cast<c10::DeviceIndex>(at::cuda::current_device())));
-    auto kv_pool = torch::from_blob(
-        poolPointers.primaryPoolPtr, {total_num_blocks, num_kv_heads, tokens_per_block, containerDim}, options);
+    // The contiguous KV arena reserves one large VA range and maps physical
+    // pages on demand, so the pool base VA (slot 0) is not guaranteed resident
+    // when this view is built -- e.g. a tightly-sized KV-estimation pool at
+    // small max_batch_size leaves slot 0 unmapped at context-preprocess time.
+    // torch::from_blob's options-only overload resolves the device via
+    // getDeviceFromPtr, which throws "pointer resides on host memory" on an
+    // unmapped VA. The base is only an addressing origin (the kernel indexes
+    // into mapped blocks via block offsets and never dereferences offset 0
+    // unless a block table points there), so pin the device explicitly and
+    // skip the residency probe. Classic (fully-resident) pools are unaffected.
+    auto kv_pool
+        = at::for_blob(poolPointers.primaryPoolPtr, {total_num_blocks, num_kv_heads, tokens_per_block, containerDim})
+              .options(options)
+              .target_device(options.device())
+              .make_tensor();
 
     std::optional<at::Tensor> kvScalePool = std::nullopt;
     if (isFp4 && poolPointers.primaryBlockScalePoolPtr != nullptr)
@@ -1561,8 +1574,13 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedK
             = at::TensorOptions()
                   .dtype(at::kFloat8_e4m3fn)
                   .device(c10::Device(at::kCUDA, static_cast<c10::DeviceIndex>(at::cuda::current_device())));
-        kvScalePool = torch::from_blob(poolPointers.primaryBlockScalePoolPtr,
-            {total_num_blocks, num_kv_heads, tokens_per_block, head_dim / 16}, scaleOptions);
+        // See the kv_pool note above: pin the device to avoid getDeviceFromPtr
+        // probing a possibly-unmapped arena base VA.
+        kvScalePool = at::for_blob(
+            poolPointers.primaryBlockScalePoolPtr, {total_num_blocks, num_kv_heads, tokens_per_block, head_dim / 16})
+                          .options(scaleOptions)
+                          .target_device(scaleOptions.device())
+                          .make_tensor();
     }
 
     return {kv_pool, kvScalePool};
