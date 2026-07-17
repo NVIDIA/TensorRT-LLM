@@ -535,7 +535,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
         protected_tail_capacity=max(protected_tails),
     )
     compaction.set_protected_tails(protected_tails)
-    compaction.launch()
+    compaction.compact()
     torch.cuda.synchronize(device)
 
     for layer, (before_pool, after_pool) in enumerate(zip(initial_pools, pools)):
@@ -658,7 +658,7 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
         protected_tail_capacity=max(protected_tails),
     )
     cohort_compaction.set_protected_tails(protected_tails)
-    cohort_compaction.launch()
+    cohort_compaction.compact()
 
     expected_pools = [pool.clone() for pool in initial_pools]
     for request in range(request_count):
@@ -680,7 +680,7 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
             protected_tail_capacity=protected_tails[request],
         )
         single_compaction.set_protected_tails([protected_tails[request]])
-        single_compaction.launch()
+        single_compaction.compact()
     torch.cuda.synchronize(device)
 
     # The two requests own disjoint pages, so whole-pool equality proves the
@@ -801,7 +801,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         protected_tail_capacity=0,
     )
     batched_compaction.set_protected_tails([0])
-    batched_compaction.launch()
+    batched_compaction.compact()
     torch.cuda.synchronize(device)
 
     for layer, (before_pool, after_pool, table) in enumerate(
@@ -974,7 +974,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             score_staging.launch_prepared_score()
             keep_set_selector.select_prepared_requests()
             selected = keep_set_selector.keep[0].clone().to(torch.long)
-            batched_compaction.launch()
+            batched_compaction.compact()
             score_staging.mark_page_tables_consumed(manager._stream)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)
@@ -1078,7 +1078,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         protected_tail_capacity=max(protected_tails),
     )
     compaction.set_protected_tails(protected_tails)
-    compaction.launch()
+    compaction.compact()
     torch.cuda.synchronize(device)
 
     for request, (valid_seq_len, tail_length) in enumerate(

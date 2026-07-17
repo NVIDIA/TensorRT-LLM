@@ -160,7 +160,7 @@ def _launched_draft_compaction(draft_protected_tails):
         draft_page_table_slots={0: 0},
     )
     compaction.set_protected_tails(target_protected_tails, draft_protected_tails)
-    compaction.launch()
+    compaction.compact()
     torch.cuda.synchronize(device)
 
     return SimpleNamespace(
@@ -354,7 +354,7 @@ def _mocked_eviction_internals(manager):
         score_staging=score_staging,
         keep_set_selector=keep_set_selector,
     )
-    batched_compaction = SimpleNamespace(launch=mock.Mock())
+    batched_compaction = SimpleNamespace(compact=mock.Mock())
     with (
         mock.patch.object(manager, "_runtime_kv_layout", return_value=SimpleNamespace()),
         mock.patch.object(manager, "_eager_resources_for", return_value=resources),

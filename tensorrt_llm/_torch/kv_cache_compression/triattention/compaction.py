@@ -45,7 +45,7 @@ class _CppCompactGroup(NamedTuple):
     pool_pointers: torch.Tensor
     source_layer_indices: Optional[torch.Tensor]
 
-    def launch(
+    def compact(
         self, source: torch.Tensor, offsets: torch.Tensor, destination_bases: torch.Tensor
     ) -> None:
         torch.ops.trtllm.sparse_kv_cache_compact_layers(
@@ -64,23 +64,25 @@ class _SingleCacheCompaction(NamedTuple):
 
     Holds the prepared launch that packs this family's move indices (None
     when an earlier family's pack launch fills them in the same call), the
-    C++ launch groups that consume them, and the destination base the moved
+    C++ compact groups that consume them, and the destination base the moved
     tokens land at.
     """
 
     prepared_move_index_pack: Optional[PreparedTritonKernelLaunch]
-    cpp_launch_groups: Tuple[_CppCompactGroup, ...]
+    cpp_compact_groups: Tuple[_CppCompactGroup, ...]
     move_source_indices: torch.Tensor
     move_source_offsets: torch.Tensor
     # Per-request landing positions; may alias staged prompt lengths so the
     # values track the current round without a refresh.
     destination_bases: torch.Tensor
 
-    def launch(self) -> None:
+    def compact(self) -> None:
         if self.prepared_move_index_pack is not None:
             self.prepared_move_index_pack()
-        for group in self.cpp_launch_groups:
-            group.launch(self.move_source_indices, self.move_source_offsets, self.destination_bases)
+        for group in self.cpp_compact_groups:
+            group.compact(
+                self.move_source_indices, self.move_source_offsets, self.destination_bases
+            )
 
 
 def _cuda_int32_contiguous(tensors: Tuple[torch.Tensor, ...], device: torch.device) -> bool:
@@ -492,7 +494,7 @@ class BatchedKVCacheCompaction:
         )
         self.target_dense_compaction = _SingleCacheCompaction(
             prepared_move_index_pack=dense_pack,
-            cpp_launch_groups=_compact_groups(
+            cpp_compact_groups=_compact_groups(
                 dense_entries, self.layer_pool_keys, self.device, dense_slots
             ),
             move_source_indices=dense_move_indices,
@@ -504,7 +506,7 @@ class BatchedKVCacheCompaction:
         if self.swa_layers:
             self.target_swa_compaction = _SingleCacheCompaction(
                 prepared_move_index_pack=None,
-                cpp_launch_groups=_compact_groups(swa_entries, self.layer_pool_keys, self.device),
+                cpp_compact_groups=_compact_groups(swa_entries, self.layer_pool_keys, self.device),
                 move_source_indices=swa_move_indices,
                 move_source_offsets=swa_move_offsets,
                 destination_bases=self.swa_destination_bases,
@@ -614,7 +616,7 @@ class BatchedKVCacheCompaction:
         )
         return _SingleCacheCompaction(
             prepared_move_index_pack=draft_pack,
-            cpp_launch_groups=_compact_groups(
+            cpp_compact_groups=_compact_groups(
                 draft_entries, tuple(draft_layer_pool_keys), self.device
             ),
             move_source_indices=draft_move_indices,
@@ -668,7 +670,7 @@ class BatchedKVCacheCompaction:
                 [self.decode_keep_count + int(tail) for tail in draft_tail_lengths],
             )
 
-    def launch(self) -> None:
+    def compact(self) -> None:
         """Pack the move indices, then run every cache family's C++ compacts."""
         if self.swa_destination_bases is not None:
             # The prompt offsets may have been re-staged since construction;
@@ -679,4 +681,4 @@ class BatchedKVCacheCompaction:
                 out=self.swa_destination_bases,
             )
         for compaction in self.cache_compactions:
-            compaction.launch()
+            compaction.compact()

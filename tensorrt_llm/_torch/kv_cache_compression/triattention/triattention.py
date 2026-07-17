@@ -2689,7 +2689,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         normalize_scores=self.normalize_scores,
                     )
             with nvtx_range("triattention.compact", color="purple"):
-                batched_compaction.launch()
+                batched_compaction.compact()
         finally:
             consumer_streams = [self.kv_cache_manager._stream]
             if self.draft_kv_cache_manager is not None:

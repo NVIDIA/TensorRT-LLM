@@ -491,7 +491,7 @@ class TestCompressedTokenPublication:
             score_staging=score_staging,
             keep_set_selector=keep_set_selector,
         )
-        batched_compaction = SimpleNamespace(launch=mock.Mock())
+        batched_compaction = SimpleNamespace(compact=mock.Mock())
         with (
             mock.patch.object(manager, "_runtime_kv_layout", return_value=SimpleNamespace()),
             mock.patch.object(manager, "_eager_resources_for", return_value=resources),
@@ -525,7 +525,7 @@ class TestCompressedTokenPublication:
         # 10 confirmed - (2 pinned prompt + 4 decode budget) = 4 evicted.
         assert request.py_num_compressed_tokens == 4
         assert manager._request_states[7].confirmed_kv_length == 6
-        internals.batched_compaction.launch.assert_called_once_with()
+        internals.batched_compaction.compact.assert_called_once_with()
         internals.score_staging.mark_page_tables_consumed.assert_called_once_with(
             manager.kv_cache_manager._stream
         )
