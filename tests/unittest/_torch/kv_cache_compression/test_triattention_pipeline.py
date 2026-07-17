@@ -682,7 +682,7 @@ class TestStepEndHookRefactor:
         assert state.generation_steps == 127
         assert state.confirmed_kv_length == 1024 + 4096 + 1
 
-    def test_eager_eviction_chunks_large_due_cohort(self):
+    def test_eager_eviction_runs_large_due_cohort_in_one_round(self):
         manager, _, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         requests = []
         caches = {}
@@ -704,20 +704,24 @@ class TestStepEndHookRefactor:
         ):
             manager._periodic_evict(batch)
 
-        assert [len(call.args[0]) for call in evict.call_args_list] == [32, 32, 1]
-        assert resize.call_count == 3
+        assert [len(call.args[0]) for call in evict.call_args_list] == [65]
+        assert resize.call_count == 1
 
-    def test_last_request_finish_releases_eager_buffers(self):
+    def test_request_finish_keeps_eviction_buffers_resident(self):
         manager = _make_triattention()
         request = _make_request(7)
         _set_request_state(manager, 7)
-        manager._eviction_buckets[("score",)] = object()
-        manager._batched_compactions[("compact",)] = object()
+        buffers = object()
+        compaction = object()
+        manager._eviction_resources = buffers
+        manager._batched_compaction = compaction
 
         manager.on_request_finish(request)
 
-        assert manager._eviction_buckets == {}
-        assert manager._batched_compactions == {}
+        # The buffers are sized for the executor limits, not one cohort, so
+        # they stay resident for the next generation batch.
+        assert manager._eviction_resources is buffers
+        assert manager._batched_compaction is compaction
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
@@ -1054,7 +1058,7 @@ class TestTopKRouting:
 class TestFixedScoreMetadata:
     @pytest.mark.parametrize("normalize_scores", [False, True])
     @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-    def test_eager_bucket_binds_score_after_selection(self, eviction_mode, normalize_scores):
+    def test_eager_buffers_bind_score_after_selection(self, eviction_mode, normalize_scores):
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
         manager = _make_triattention(
@@ -1080,12 +1084,17 @@ class TestFixedScoreMetadata:
             storage_groups={0: [0, 1]},
             pool_view_fingerprint=(("fixed",),),
         )
+        # The buffers follow the executor limits: eight requests (max batch
+        # size) by 260 decode tokens (top_B plus two eviction periods).
         score_staging = SimpleNamespace(
-            fused_group=SimpleNamespace(output=torch.empty(1, 4, 8)),
+            fused_group=SimpleNamespace(output=torch.empty(8, 4, 260)),
             bind_score_launcher=mock.Mock(),
-            token_starts_device=torch.zeros(1, dtype=torch.int32),
+            token_starts_device=torch.zeros(8, dtype=torch.int32),
         )
-        keep_set_selector = SimpleNamespace(valid_widths=torch.empty(1, dtype=torch.int32))
+        keep_set_selector = SimpleNamespace(
+            valid_widths=torch.empty(8, dtype=torch.int32),
+            top_indices_i32=torch.zeros(8, 4, dtype=torch.int32),
+        )
         prepared = [
             _prepared_eviction(
                 _make_request(7),

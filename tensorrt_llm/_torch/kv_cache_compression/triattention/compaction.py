@@ -80,9 +80,7 @@ class _SingleCacheCompaction(NamedTuple):
         if self.prepared_move_index_pack is not None:
             self.prepared_move_index_pack()
         for group in self.cpp_launch_groups:
-            group.launch(
-                self.move_source_indices, self.move_source_offsets, self.destination_bases
-            )
+            group.launch(self.move_source_indices, self.move_source_offsets, self.destination_bases)
 
 
 def _cuda_int32_contiguous(tensors: Tuple[torch.Tensor, ...], device: torch.device) -> bool:
@@ -142,20 +140,6 @@ def _make_move_buffers(
         offsets.append(offsets[-1] + count)
     indices = torch.empty((*index_prefix, offsets[-1]), dtype=torch.int32, device=device)
     return indices, torch.tensor(offsets, dtype=torch.int32, device=device)
-
-
-def _validated_tail_lengths(
-    tail_lengths: Optional[List[int]],
-    request_count: int,
-    what: str,
-) -> Tuple[int, ...]:
-    if tail_lengths is None:
-        tail_lengths = [0] * request_count
-    if len(tail_lengths) != request_count:
-        raise ValueError(f"{what} lengths must match the request count")
-    if any(length < 0 for length in tail_lengths):
-        raise ValueError(f"{what} lengths must be non-negative")
-    return tuple(int(length) for length in tail_lengths)
 
 
 def _page_table_provider(
@@ -362,9 +346,11 @@ class BatchedKVCacheCompaction:
         `page_table_slots` / `layer_group_representative`: map each layer's
             group representative to its snapshot slot; layers that share a
             slot must share one block-offset table.
-        `protected_tail_lengths`: per-request KV positions past the valid
-            length reserved for a forward already in flight; they move with
-            the kept tokens.
+        `protected_tail_capacity`: widest per-request protected tail this
+            object must support. A protected tail covers KV positions past
+            the valid length reserved for a forward already in flight; the
+            actual per-round lengths are loaded via `set_protected_tails`
+            and move with the kept tokens.
         `draft_*`: co-compressed draft-cache layout (union mode only); the
             draft reuses the target keep set and pins the same prompt.
     """
@@ -385,13 +371,13 @@ class BatchedKVCacheCompaction:
         prompt_offsets: torch.Tensor,
         decode_keep_count: int,
         swa_window: Optional[int],
-        protected_tail_lengths: Optional[List[int]] = None,
+        protected_tail_capacity: int = 0,
         layer_pool_keys: Optional[List[object]] = None,
         draft_layer_pools: Optional[List[torch.Tensor]] = None,
         draft_layers: Optional[List[int]] = None,
         draft_layer_group_representative: Optional[Dict[int, int]] = None,
         draft_layer_pool_keys: Optional[List[object]] = None,
-        draft_protected_tail_lengths: Optional[List[int]] = None,
+        draft_protected_tail_capacity: Optional[int] = None,
         draft_kv_block_offsets: Optional[torch.Tensor] = None,
         draft_page_table_slots: Optional[Dict[int, int]] = None,
     ) -> None:
@@ -427,10 +413,9 @@ class BatchedKVCacheCompaction:
             raise ValueError("per-request prompt offsets do not match the cohort")
         self.prompt_offsets = prompt_offsets
         self.decode_keep_count = int(decode_keep_count)
-        self.protected_tail_lengths = _validated_tail_lengths(
-            protected_tail_lengths, self.request_count, "protected-tail"
-        )
-        self.max_protected_tail = max(self.protected_tail_lengths, default=0)
+        if protected_tail_capacity < 0:
+            raise ValueError("the protected-tail capacity must be non-negative")
+        self.protected_tail_capacity = int(protected_tail_capacity)
         self.dense_layers = tuple(int(layer) for layer in dense_layers)
         self.swa_layers = tuple(int(layer) for layer in swa_layers)
         if layer_pool_keys is None:
@@ -451,7 +436,7 @@ class BatchedKVCacheCompaction:
         )
         dense_move_indices, dense_move_offsets = _make_move_buffers(
             dense_index_prefix,
-            [self.decode_keep_count + length for length in self.protected_tail_lengths],
+            [self.decode_keep_count + self.protected_tail_capacity] * self.request_count,
             self.device,
         )
         page_table_for = _page_table_provider(
@@ -480,7 +465,7 @@ class BatchedKVCacheCompaction:
             self.swa_destination_bases = torch.empty_like(self.prompt_offsets)
             swa_move_indices, swa_move_offsets = _make_move_buffers(
                 (self.num_kv_heads,),
-                [self.swa_window + length for length in self.protected_tail_lengths],
+                [self.swa_window + self.protected_tail_capacity] * self.request_count,
                 self.device,
             )
             # SWA layers are staged as their own page-table representatives.
@@ -500,7 +485,7 @@ class BatchedKVCacheCompaction:
             decode_keep_count=self.decode_keep_count,
             num_dense_layers=len(self.dense_layers),
             num_kv_heads=self.num_kv_heads,
-            max_protected_tail=self.max_protected_tail,
+            max_protected_tail=self.protected_tail_capacity,
             swa_window=self.swa_window,
             swa_move_source_offsets=swa_move_offsets,
             swa_move_source_indices=swa_move_indices,
@@ -526,6 +511,7 @@ class BatchedKVCacheCompaction:
             )
 
         self.draft_compaction = None
+        self.draft_protected_tail_capacity = 0
         if draft_layers:
             self.draft_compaction = self._build_draft_compaction(
                 kept_token_ordinals,
@@ -534,7 +520,7 @@ class BatchedKVCacheCompaction:
                 draft_layers=draft_layers,
                 draft_layer_group_representative=draft_layer_group_representative,
                 draft_layer_pool_keys=draft_layer_pool_keys,
-                draft_protected_tail_lengths=draft_protected_tail_lengths,
+                draft_protected_tail_capacity=draft_protected_tail_capacity,
                 draft_kv_block_offsets=draft_kv_block_offsets,
                 draft_page_table_slots=draft_page_table_slots,
             )
@@ -558,7 +544,7 @@ class BatchedKVCacheCompaction:
         draft_layers: List[int],
         draft_layer_group_representative: Optional[Dict[int, int]],
         draft_layer_pool_keys: Optional[List[object]],
-        draft_protected_tail_lengths: Optional[List[int]],
+        draft_protected_tail_capacity: Optional[int],
         draft_kv_block_offsets: Optional[torch.Tensor],
         draft_page_table_slots: Optional[Dict[int, int]],
     ) -> _SingleCacheCompaction:
@@ -576,9 +562,9 @@ class BatchedKVCacheCompaction:
             raise ValueError("draft co-compaction requires the full draft layout")
         if draft_kv_block_offsets is None or draft_page_table_slots is None:
             raise ValueError("draft co-compaction requires staged draft page tables")
-        draft_tail_lengths = _validated_tail_lengths(
-            draft_protected_tail_lengths, self.request_count, "draft protected-tail"
-        )
+        if draft_protected_tail_capacity is not None and draft_protected_tail_capacity < 0:
+            raise ValueError("the draft protected-tail capacity must be non-negative")
+        self.draft_protected_tail_capacity = int(draft_protected_tail_capacity or 0)
         if len(draft_layer_pool_keys) != len(draft_layer_pools):
             raise ValueError("draft pool keys must match the draft layer-pool count")
         draft_layers = tuple(int(layer) for layer in draft_layers)
@@ -590,7 +576,7 @@ class BatchedKVCacheCompaction:
         )
         draft_move_indices, draft_move_offsets = _make_move_buffers(
             (draft_num_kv_heads,),
-            [self.decode_keep_count + length for length in draft_tail_lengths],
+            [self.decode_keep_count + self.draft_protected_tail_capacity] * self.request_count,
             self.device,
         )
         draft_page_table_for = _page_table_provider(
@@ -621,7 +607,7 @@ class BatchedKVCacheCompaction:
             decode_keep_count=self.decode_keep_count,
             num_dense_layers=1,
             num_kv_heads=draft_num_kv_heads,
-            max_protected_tail=max(draft_tail_lengths, default=0),
+            max_protected_tail=self.draft_protected_tail_capacity,
             swa_window=0,
             swa_move_source_offsets=None,
             swa_move_source_indices=None,
@@ -635,6 +621,52 @@ class BatchedKVCacheCompaction:
             move_source_offsets=draft_move_offsets,
             destination_bases=self.prompt_offsets,
         )
+
+    def _write_move_offsets(self, offsets: torch.Tensor, moves_per_request: List[int]) -> None:
+        cumulative = [0]
+        for count in moves_per_request:
+            cumulative.append(cumulative[-1] + count)
+        # Rows past the cohort are padding and contribute no moves.
+        cumulative.extend(cumulative[-1:] * (self.request_count - len(moves_per_request)))
+        offsets.copy_(torch.tensor(cumulative, dtype=torch.int32), non_blocking=True)
+
+    def set_protected_tails(
+        self,
+        tail_lengths: List[int],
+        draft_tail_lengths: Optional[List[int]] = None,
+    ) -> None:
+        """Load this cohort's per-request protected tails into the move offsets.
+
+        The pack kernel and the C++ compacts read every request's move range
+        from these offsets, so refreshing them retargets the fixed buffers to
+        the cohort at hand without any reallocation.
+        """
+        if len(tail_lengths) > self.request_count:
+            raise ValueError("the cohort exceeds the compaction request capacity")
+        if any(tail < 0 or tail > self.protected_tail_capacity for tail in tail_lengths):
+            raise ValueError("a protected tail exceeds the configured capacity")
+        self._write_move_offsets(
+            self.target_dense_compaction.move_source_offsets,
+            [self.decode_keep_count + int(tail) for tail in tail_lengths],
+        )
+        if self.target_swa_compaction is not None:
+            self._write_move_offsets(
+                self.target_swa_compaction.move_source_offsets,
+                [self.swa_window + int(tail) for tail in tail_lengths],
+            )
+        if self.draft_compaction is not None:
+            if draft_tail_lengths is None:
+                draft_tail_lengths = [0] * len(tail_lengths)
+            if len(draft_tail_lengths) != len(tail_lengths):
+                raise ValueError("draft protected tails must match the cohort")
+            if any(
+                tail < 0 or tail > self.draft_protected_tail_capacity for tail in draft_tail_lengths
+            ):
+                raise ValueError("a draft protected tail exceeds the configured capacity")
+            self._write_move_offsets(
+                self.draft_compaction.move_source_offsets,
+                [self.decode_keep_count + int(tail) for tail in draft_tail_lengths],
+            )
 
     def launch(self) -> None:
         """Pack the move indices, then run every cache family's C++ compacts."""

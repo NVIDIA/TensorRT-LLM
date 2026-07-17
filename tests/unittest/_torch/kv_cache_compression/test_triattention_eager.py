@@ -532,8 +532,9 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
         prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
         decode_keep_count=decode_keep_count,
         swa_window=None,
-        protected_tail_lengths=protected_tails,
+        protected_tail_capacity=max(protected_tails),
     )
+    compaction.set_protected_tails(protected_tails)
     compaction.launch()
     torch.cuda.synchronize(device)
 
@@ -654,8 +655,9 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
         prompt_offsets=torch.tensor(prompt_lens, dtype=torch.int32, device=device),
         decode_keep_count=decode_keep_count,
         swa_window=None,
-        protected_tail_lengths=protected_tails,
+        protected_tail_capacity=max(protected_tails),
     )
+    cohort_compaction.set_protected_tails(protected_tails)
     cohort_compaction.launch()
 
     expected_pools = [pool.clone() for pool in initial_pools]
@@ -675,8 +677,9 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
             prompt_offsets=torch.tensor([prompt_lens[request]], dtype=torch.int32, device=device),
             decode_keep_count=decode_keep_count,
             swa_window=None,
-            protected_tail_lengths=[protected_tails[request]],
+            protected_tail_capacity=protected_tails[request],
         )
+        single_compaction.set_protected_tails([protected_tails[request]])
         single_compaction.launch()
     torch.cuda.synchronize(device)
 
@@ -795,8 +798,9 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         prompt_offsets=torch.zeros(1, dtype=torch.int32, device=device),
         decode_keep_count=keep_count,
         swa_window=None,
-        protected_tail_lengths=[0],
+        protected_tail_capacity=0,
     )
+    batched_compaction.set_protected_tails([0])
     batched_compaction.launch()
     torch.cuda.synchronize(device)
 
@@ -952,8 +956,9 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             prompt_offsets=score_staging.token_starts_device[:1],
             decode_keep_count=compacted_capacity - prompt_len - protected_tail,
             swa_window=None,
-            protected_tail_lengths=[protected_tail],
+            protected_tail_capacity=protected_tail,
         )
+        batched_compaction.set_protected_tails([protected_tail])
 
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
@@ -1070,8 +1075,9 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
         decode_keep_count=4,
         swa_window=2,
-        protected_tail_lengths=protected_tails,
+        protected_tail_capacity=max(protected_tails),
     )
+    compaction.set_protected_tails(protected_tails)
     compaction.launch()
     torch.cuda.synchronize(device)
 

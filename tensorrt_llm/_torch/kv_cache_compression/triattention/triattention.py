@@ -53,7 +53,6 @@ the manager converts it to our runtime schema at load (see _resolve_calibration)
 The scoring math follows the same upstream reference (``methods/pruning_utils.py``).
 """
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -80,11 +79,6 @@ if TYPE_CHECKING:
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
 _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_sq"})
 
-# Bound eager staging memory. A large due cohort is processed as consecutive
-# request chunks with identical results.
-_EAGER_REQUEST_CHUNK_SIZE = 32
-_EAGER_RESOURCE_CACHE_LIMIT = 3
-_EAGER_COMPACTION_CACHE_LIMIT = 6
 _INT32_MAX = torch.iinfo(torch.int32).max
 
 
@@ -245,9 +239,7 @@ class _PreparedTopKFinalizer:
         provisional_indices: torch.Tensor,
         output_indices: torch.Tensor,
     ) -> None:
-        self._prepared_launch(
-            scores, seq_lens, prompt_offsets, provisional_indices, output_indices
-        )
+        self._prepared_launch(scores, seq_lens, prompt_offsets, provisional_indices, output_indices)
 
 
 class _PreparedUnionScores:
@@ -361,9 +353,7 @@ def _deterministic_topk_indices_into(
         tied = torch.nonzero(valid_scores == threshold, as_tuple=False).flatten()
         tie_count = keep_count - int(higher.numel())
         ordered = torch.sort(torch.cat((higher, tied[:tie_count]))).values
-        output_indices_i32[row_index, :keep_count].copy_(
-            ordered.to(torch.int32).add(prompt_len)
-        )
+        output_indices_i32[row_index, :keep_count].copy_(ordered.to(torch.int32).add(prompt_len))
 
 
 class _CrossRequestSelectionPlan(NamedTuple):
@@ -475,12 +465,8 @@ class _BatchedKeepSetSelectorBase:
         Called after the shared per-request buffer was staged externally.
         """
         if self.row_prompt_offsets is not self.prompt_offsets:
-            self.row_prompt_offsets.view(
-                self.max_requests, self.selection_rows_per_request
-            ).copy_(
-                self.prompt_offsets.unsqueeze(1).expand(
-                    -1, self.selection_rows_per_request
-                )
+            self.row_prompt_offsets.view(self.max_requests, self.selection_rows_per_request).copy_(
+                self.prompt_offsets.unsqueeze(1).expand(-1, self.selection_rows_per_request)
             )
 
     def _allocate_cpu_reference_buffers(
@@ -743,9 +729,7 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         if num_query_heads % num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
         selection_rows = (
-            num_kv_heads
-            if eviction_mode == "per_head"
-            else len(dense_layers) * num_kv_heads
+            num_kv_heads if eviction_mode == "per_head" else len(dense_layers) * num_kv_heads
         )
         super().__init__(
             eviction_mode=eviction_mode,
@@ -985,7 +969,7 @@ class _FixedScoreStagingBuffers:
         omega: torch.Tensor,
         page_table_keys: Optional[List[object]] = None,
         num_page_table_slots: Optional[int] = None,
-        min_prompt_len: int = 0,
+        decode_width: int = 0,
         page_table_token_capacity: Optional[int] = None,
         draft_layer_pools: Optional[List[torch.Tensor]] = None,
         draft_page_representatives: Optional[List[int]] = None,
@@ -1015,11 +999,11 @@ class _FixedScoreStagingBuffers:
         if page_table_token_capacity < seq_len:
             raise ValueError("page-table capacity cannot be smaller than the score bucket")
         self.page_table_token_capacity = int(page_table_token_capacity)
-        # The smallest cohort prompt only sizes the widest decode window;
-        # per-request prompt lengths are staged runtime metadata.
-        if min_prompt_len < 0 or min_prompt_len > seq_len:
-            raise ValueError("fixed score metadata prompt length is outside its bucket")
-        self.min_prompt_len = min_prompt_len
+        # Decode-width capacity of the score buffers; per-request prompt
+        # lengths are staged runtime metadata.
+        if decode_width <= 0 or decode_width > seq_len:
+            raise ValueError("fixed score decode width is outside its bucket")
+        self.decode_width = int(decode_width)
         q_real = q_real.to(device=self.device, dtype=torch.float32).contiguous()
         q_imag = q_imag.to(device=self.device, dtype=torch.float32).contiguous()
         mlr_coef = mlr_coef.to(device=self.device, dtype=torch.float32).contiguous()
@@ -1171,7 +1155,7 @@ class _FixedScoreStagingBuffers:
             freq_scale_sq,
             omega,
             offsets,
-            min_prompt_len=min_prompt_len,
+            output_width=decode_width,
         )
         self.copy_done = torch.cuda.Event()
         # First record publishes constructor allocations to the V2 copy stream;
@@ -1387,6 +1371,9 @@ class _FixedScoreStagingBuffers:
             ):
                 return False
         self.request_metadata_host[:, :request_count].copy_(request_metadata)
+        # Rows past this cohort are padding: zero lengths keep the score
+        # kernel and selection inert for them.
+        self.request_metadata_host[:, request_count:].zero_()
         try:
             # Copy the fixed backing once. Only the first ``request_count``
             # columns are consumed by this cohort.
@@ -1512,7 +1499,7 @@ class _PreparedGenerationBatch:
 
 
 @dataclass(kw_only=True, slots=True)
-class _EvictionBucketResources:
+class _EvictionBuffers:
     """Reusable eager score and selection buffers for one runtime shape."""
 
     score_staging: _FixedScoreStagingBuffers
@@ -1611,10 +1598,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         # exact fixed-linear generation width for that currently in-flight batch;
         # the final hook treats those slots as an opaque suffix.
         self._prepared_generation_batch: Optional[_PreparedGenerationBatch] = None
-        # Eager score/selection buffers are built from the first live cohort and
-        # reused for subsequent evictions with the same runtime geometry.
-        self._eviction_buckets = OrderedDict()
-        self._batched_compactions = OrderedDict()
+        # Eviction buffers are built once at the first eviction, sized to
+        # capacity bounds, and reused for the manager's lifetime.
+        self._eviction_resources: Optional[_EvictionBuffers] = None
+        self._eviction_pool_fingerprint: Optional[tuple] = None
+        self._batched_compaction = None
         self._local_to_global_layers_cache: Optional[List[int]] = None
         self._attention_layer_partition_cache: Optional[
             Tuple[List[int], List[int], Optional[int]]
@@ -1902,22 +1890,19 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         # (2) Compact all affected dense and kernel-masked SWA layers, then release
         # the unreachable tail directly through V2's public resize primitive.
-        # Prompt lengths are per-request metadata, so the whole due cohort runs
-        # as one batched round (chunked only by the staging memory bound).
+        # Prompt lengths and tails are per-request metadata, so the whole due
+        # cohort runs as one batched round (the workspace holds max_batch_size
+        # requests, which bounds any generation batch).
         if not due_requests:
             return
         num_layers = self._num_layers_from_manager()
-
-        for begin in range(0, len(due_requests), _EAGER_REQUEST_CHUNK_SIZE):
-            chunk = due_requests[begin : begin + _EAGER_REQUEST_CHUNK_SIZE]
-            chunk_tails = {rid: protected_tails[rid] for _, rid in chunk}
-            with nvtx_range_debug("triattention.evict_request_group", color="purple"):
-                capacity_targets = self._evict_requests(
-                    chunk,
-                    num_layers,
-                    protected_tail_lengths=chunk_tails,
-                )
-            self._resize_compacted_requests(capacity_targets, protected_tails)
+        with nvtx_range_debug("triattention.evict_request_group", color="purple"):
+            capacity_targets = self._evict_requests(
+                due_requests,
+                num_layers,
+                protected_tail_lengths=protected_tails,
+            )
+        self._resize_compacted_requests(capacity_targets, protected_tails)
 
     def _resize_compacted_requests(self, capacity_targets, protected_tails) -> None:
         if not capacity_targets:
@@ -2054,9 +2039,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         prepared = self._prepared_generation_batch
         if prepared is not None:
             prepared.growth_by_request.pop(request_id, None)
-        if not self._request_states:
-            self._eviction_buckets.clear()
-            self._batched_compactions.clear()
+        # The workspace stays resident across idle periods: its memory is a
+        # deliberate one-time cost and rebuilding it per burst would reintroduce
+        # allocation on the decode hot path.
 
     # ================================================================== #
     # Helpers (eviction / scoring / V2 cache access / calibration)       #
@@ -2368,20 +2353,63 @@ class TriAttention(BaseKVCacheCompressionManager):
         self,
         layout: _RuntimeKVLayout,
         prepared: Sequence[_PreparedEviction],
-    ) -> _EvictionBucketResources:
-        """Build or reuse eager score and selection buffers for one cohort."""
+    ) -> _EvictionBuffers:
+        """Return the eviction buffers, building them once at first use.
+
+        The request capacity follows the executor's max batch size (memory
+        scales linearly with it) and the decode-width capacity follows the
+        eviction bound (compaction keeps the scored decode region near
+        ``top_B`` plus one period of growth), so one set of buffers serves
+        every round. They are rebuilt only when the pool views change or a
+        round outgrows them (prompt-counting budgets score the prompt, whose
+        length is workload-defined).
+        """
         if not prepared:
             raise ValueError("TriAttention eviction requires at least one request")
-        # Prompt lengths are per-request runtime metadata; the smallest one
-        # only sizes the widest decode window of the shared buffers.
-        min_prompt_len = min(item.prompt_len for item in prepared)
-        seq_len = max(item.seq_len for item in prepared)
-        page_table_token_capacity = max(item.seq_len + item.protected_tail for item in prepared)
-        request_count = len(prepared)
+        needed_width = max(item.seq_len - item.prompt_len for item in prepared)
+        needed_page_tokens = max(item.seq_len + item.protected_tail for item in prepared)
+        needed_requests = len(prepared)
+        draft_fingerprint = None
+        if self.draft_kv_cache_manager is not None:
+            draft_layout = self._draft_runtime_kv_layout()
+            draft_fingerprint = (
+                draft_layout.pool_page_counts,
+                draft_layout.pool_view_fingerprint,
+            )
+        fingerprint = (
+            self.eviction_mode,
+            self.top_B,
+            tuple(layout.dense_layers),
+            layout.pool_view_fingerprint,
+            draft_fingerprint,
+        )
+        resources = self._eviction_resources
+        if resources is not None:
+            staging = resources.score_staging
+            if (
+                self._eviction_pool_fingerprint == fingerprint
+                and needed_width <= staging.decode_width
+                and needed_page_tokens <= staging.page_table_token_capacity
+                and needed_requests <= staging.max_requests
+            ):
+                return resources
+            # Pools changed or this round outgrew the buffers: rebuild.
+            self._eviction_resources = None
+            self._batched_compaction = None
+
+        mgr = self.kv_cache_manager
+        tail_capacity = self._configured_protected_tail_capacity()
+        request_capacity = max(needed_requests, int(mgr.max_batch_size))
+        decode_width = max(
+            needed_width,
+            self.top_B + 2 * self.beta + int(mgr.max_total_draft_tokens or 0),
+        )
+        seq_capacity = max(needed_page_tokens, int(mgr.max_seq_len))
+        page_table_token_capacity = max(needed_page_tokens, seq_capacity + tail_capacity)
+
         dense_groups = list(layout.storage_groups.values())
         representatives = [group[0] for group in dense_groups]
         representatives.extend(layer for layer in layout.swa_layers if layer not in representatives)
-        draft_key = None
         draft_kwargs = {}
         if self.draft_kv_cache_manager is not None:
             draft_layout = self._draft_runtime_kv_layout()
@@ -2394,29 +2422,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                     draft_layout.layer_pool_keys[layer] for layer in draft_representatives
                 ],
                 draft_num_page_table_slots=self.draft_kv_cache_manager.num_pools,
-                draft_page_table_token_capacity=seq_len + draft_tail_capacity,
+                draft_page_table_token_capacity=seq_capacity + draft_tail_capacity,
             )
-            draft_key = (
-                draft_tail_capacity,
-                draft_layout.pool_page_counts,
-                draft_layout.pool_view_fingerprint,
-            )
-        key = (
-            "triattention.eager.v1",
-            self.eviction_mode,
-            request_count,
-            seq_len,
-            min_prompt_len,
-            page_table_token_capacity,
-            self.top_B,
-            tuple(layout.dense_layers),
-            layout.pool_view_fingerprint,
-            draft_key,
-        )
-        resources = self._eviction_buckets.get(key)
-        if resources is not None:
-            self._eviction_buckets.move_to_end(key)
-            return resources
 
         first_pool = layout.layer_pools[layout.dense_layers[0]]
         if self._offsets is None:
@@ -2429,8 +2436,8 @@ class TriAttention(BaseKVCacheCompressionManager):
             dense_groups=dense_groups,
             dense_layers=layout.dense_layers,
             page_representatives=representatives,
-            max_requests=request_count,
-            seq_len=seq_len,
+            max_requests=request_capacity,
+            seq_len=seq_capacity,
             num_q_heads=int(self._H),
             num_freqs=int(self._F),
             q_real=q_real,
@@ -2441,7 +2448,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             omega=self.calibration["omega"],
             page_table_keys=self._page_table_pool_keys(representatives, layout.global_layers),
             num_page_table_slots=layout.manager.num_pools,
-            min_prompt_len=min_prompt_len,
+            decode_width=decode_width,
             page_table_token_capacity=page_table_token_capacity,
             **draft_kwargs,
         )
@@ -2452,35 +2459,36 @@ class TriAttention(BaseKVCacheCompressionManager):
                 num_query_heads=int(self._H),
                 num_kv_heads=int(first_pool.shape[2]),
                 rows=len(layout.dense_layers) * int(self._H),
-                width=seq_len - min_prompt_len,
+                width=decode_width,
                 keep_count=self.top_B,
                 dtype=torch.float32,
                 device=first_pool.device,
-                max_requests=request_count,
+                max_requests=request_capacity,
             ),
             input_scores=score_staging.fused_group.output.view(
-                request_count,
+                request_capacity,
                 len(layout.dense_layers) * int(self._H),
-                seq_len - min_prompt_len,
+                decode_width,
             ),
             normalize_scores=self.normalize_scores,
             prompt_offsets_buffer=score_staging.token_starts_device,
         )
+        # Padded rows carry zero valid width; their provisional TopK entries
+        # must still be in-range ordinals for the finalizer's score gather.
+        provisional = getattr(keep_set_selector, "final_indices", None)
+        if provisional is None:
+            provisional = keep_set_selector.top_indices_i32
+        provisional.zero_()
         score_staging.bind_score_launcher(
             keep_set_selector.valid_widths,
             self.score_aggregation,
         )
-        resources = _EvictionBucketResources(
+        resources = _EvictionBuffers(
             score_staging=score_staging,
             keep_set_selector=keep_set_selector,
         )
-        self._eviction_buckets[key] = resources
-        while len(self._eviction_buckets) > _EAGER_RESOURCE_CACHE_LIMIT:
-            _, stale = self._eviction_buckets.popitem(last=False)
-            stale_ids = (id(stale.score_staging), id(stale.keep_set_selector))
-            for compaction_key in tuple(self._batched_compactions):
-                if compaction_key[:2] == stale_ids:
-                    del self._batched_compactions[compaction_key]
+        self._eviction_resources = resources
+        self._eviction_pool_fingerprint = fingerprint
         return resources
 
     def _batched_compaction_for(
@@ -2494,21 +2502,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Build or reuse the eager C++ compaction launches for one cohort."""
         from .compaction import BatchedKVCacheCompaction
 
-        protected_tail_lengths = tuple(item.protected_tail for item in prepared)
-        draft_tail_lengths: Optional[Tuple[int, ...]] = None
-        draft_kwargs = {}
-        if self.draft_kv_cache_manager is not None:
-            draft_layout = self._draft_runtime_kv_layout()
-            draft_tail_lengths = (self._draft_protected_tail_capacity(),) * len(prepared)
-            draft_kwargs = dict(
-                draft_layer_pools=draft_layout.layer_pools,
-                draft_layers=draft_layout.dense_layers,
-                draft_layer_group_representative=draft_layout.layer_group_representative,
-                draft_layer_pool_keys=list(draft_layout.layer_pool_keys),
-                draft_protected_tail_lengths=list(draft_tail_lengths),
-                draft_kv_block_offsets=score_staging.draft_block_offsets_device,
-                draft_page_table_slots=score_staging.draft_representative_slots,
-            )
         if layout.swa_layers and layout.swa_window:
             # SWA landing positions are prompt-dependent; reject a request
             # whose retained span cannot cover the model window this round.
@@ -2519,16 +2512,20 @@ class TriAttention(BaseKVCacheCompressionManager):
                         f"{item.prompt_len + self.top_B} tokens, below the "
                         f"sliding window {layout.swa_window}"
                     )
-        key = (
-            id(score_staging),
-            id(keep_set_selector),
-            protected_tail_lengths,
-            draft_tail_lengths,
-        )
-        batched_compaction = self._batched_compactions.get(key)
-        if batched_compaction is not None:
-            self._batched_compactions.move_to_end(key)
-        else:
+        batched_compaction = self._batched_compaction
+        if batched_compaction is None:
+            draft_kwargs = {}
+            if self.draft_kv_cache_manager is not None:
+                draft_layout = self._draft_runtime_kv_layout()
+                draft_kwargs = dict(
+                    draft_layer_pools=draft_layout.layer_pools,
+                    draft_layers=draft_layout.dense_layers,
+                    draft_layer_group_representative=draft_layout.layer_group_representative,
+                    draft_layer_pool_keys=list(draft_layout.layer_pool_keys),
+                    draft_protected_tail_capacity=self._draft_protected_tail_capacity(),
+                    draft_kv_block_offsets=score_staging.draft_block_offsets_device,
+                    draft_page_table_slots=score_staging.draft_representative_slots,
+                )
             batched_compaction = BatchedKVCacheCompaction(
                 eviction_mode=self.eviction_mode,
                 layer_pools=layout.layer_pools,
@@ -2536,20 +2533,26 @@ class TriAttention(BaseKVCacheCompressionManager):
                 swa_layers=layout.swa_layers,
                 layer_group_representative=layout.layer_group_representative,
                 layer_pool_keys=list(layout.layer_pool_keys),
-                kept_token_ordinals=keep_set_selector.keep[: len(prepared)],
-                valid_sequence_lengths=score_staging.valid_seq_lens_device[: len(prepared)],
+                kept_token_ordinals=keep_set_selector.keep,
+                valid_sequence_lengths=score_staging.valid_seq_lens_device,
                 kv_block_offsets=score_staging.block_offsets_device,
                 page_table_slots=score_staging.representative_slots,
-                request_count=len(prepared),
-                prompt_offsets=score_staging.token_starts_device[: len(prepared)],
+                request_count=score_staging.max_requests,
+                prompt_offsets=score_staging.token_starts_device,
                 decode_keep_count=self.top_B,
                 swa_window=layout.swa_window,
-                protected_tail_lengths=list(protected_tail_lengths),
+                protected_tail_capacity=self._configured_protected_tail_capacity(),
                 **draft_kwargs,
             )
-            self._batched_compactions[key] = batched_compaction
-            while len(self._batched_compactions) > _EAGER_COMPACTION_CACHE_LIMIT:
-                self._batched_compactions.popitem(last=False)
+            self._batched_compaction = batched_compaction
+        # Tails vary per round (in-flight growth); padded rows move nothing.
+        draft_tails = None
+        if self.draft_kv_cache_manager is not None:
+            draft_tails = [self._draft_protected_tail_capacity()] * len(prepared)
+        batched_compaction.set_protected_tails(
+            [item.protected_tail for item in prepared],
+            draft_tails,
+        )
         return batched_compaction
 
     def _page_table_pool_keys(

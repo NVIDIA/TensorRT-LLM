@@ -763,7 +763,7 @@ def _launch_tri_score_perhead(
 
 
 class _FixedScoreGroup:
-    """Persistent score metadata/output for one sequence bucket.
+    """Persistent score metadata/output for one fixed geometry.
 
     Since the per-layer absolute-address ABI, ONE group can span dense layers
     living in DISTINCT storages with DISTINCT block tables. ``block_offsets``
@@ -787,18 +787,18 @@ class _FixedScoreGroup:
         freq_scale_sq: torch.Tensor,
         omega: torch.Tensor,
         offsets: torch.Tensor,
-        min_prompt_len: int = 0,
+        output_width: int = 0,
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
-        if min_prompt_len < 0 or min_prompt_len >= seq_len:
-            raise ValueError("fixed score prompt length must leave a non-empty decode region")
+        if output_width <= 0 or output_width > seq_len:
+            raise ValueError("fixed score group requires a decode width within its capacity")
         if len(page_table_slots) != len(layer_indices):
             raise ValueError("page_table_slots must align with layer_indices")
         self.max_requests = max_requests
-        # Prompt lengths are per-request kernel inputs; the smallest one only
+        # Prompt lengths are per-request kernel inputs; this capacity only
         # sizes the widest possible decode window of the output buffer.
-        self.output_width = seq_len - min_prompt_len
+        self.output_width = int(output_width)
         self.num_layers = len(layer_indices)
         p0 = layer_pools[layer_indices[0]]
         if p0.ndim != 5:

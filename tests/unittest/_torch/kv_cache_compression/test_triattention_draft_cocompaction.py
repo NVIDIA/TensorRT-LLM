@@ -150,15 +150,16 @@ def _launched_draft_compaction(draft_protected_tails):
         prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
         decode_keep_count=decode_keep_count,
         swa_window=None,
-        protected_tail_lengths=target_protected_tails,
+        protected_tail_capacity=max(target_protected_tails),
         draft_layer_pools=[draft_pool],
         draft_layers=[0],
         draft_layer_group_representative={0: 0},
         draft_layer_pool_keys=[("draft_pool", 0)],
-        draft_protected_tail_lengths=draft_protected_tails,
+        draft_protected_tail_capacity=max(draft_protected_tails),
         draft_kv_block_offsets=_encode_block_offsets(draft_tables),
         draft_page_table_slots={0: 0},
     )
+    compaction.set_protected_tails(target_protected_tails, draft_protected_tails)
     compaction.launch()
     torch.cuda.synchronize(device)
 
@@ -428,7 +429,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     )
 
 
-def test_lru_score_staging_eviction_drops_dependent_batched_compactions():
+def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
     manager = _make_triattention(top_B=4)
@@ -463,28 +464,18 @@ def test_lru_score_staging_eviction_drops_dependent_batched_compactions():
         pool_view_fingerprint=(("fixed",),),
     )
 
-    stale = [SimpleNamespace(score_staging=object(), keep_set_selector=object()) for _ in range(3)]
-    for index, resources in enumerate(stale):
-        manager._eviction_buckets[("stale", index)] = resources
-    oldest_ids = (id(stale[0].score_staging), id(stale[0].keep_set_selector))
-    dependent_draft_key = (*oldest_ids, (0,), (1,))
-    dependent_plain_key = (*oldest_ids, (2,), None)
-    surviving_key = (
-        id(stale[1].score_staging),
-        id(stale[1].keep_set_selector),
-        (0,),
-        (1,),
-    )
-    manager._batched_compactions[dependent_draft_key] = object()
-    manager._batched_compactions[dependent_plain_key] = object()
-    manager._batched_compactions[surviving_key] = object()
-
     score_staging = SimpleNamespace(
-        fused_group=SimpleNamespace(output=torch.empty(1, 4, 8)),
+        fused_group=SimpleNamespace(output=torch.empty(8, 4, 260)),
         bind_score_launcher=mock.Mock(),
-        token_starts_device=torch.zeros(1, dtype=torch.int32),
+        token_starts_device=torch.zeros(8, dtype=torch.int32),
+        decode_width=260,
+        page_table_token_capacity=65537,
+        max_requests=8,
     )
-    keep_set_selector = SimpleNamespace(valid_widths=torch.empty(1, dtype=torch.int32))
+    keep_set_selector = SimpleNamespace(
+        valid_widths=torch.empty(8, dtype=torch.int32),
+        top_indices_i32=torch.zeros(8, 4, dtype=torch.int32),
+    )
     prepared = [
         _PreparedEviction(
             request=_make_request(7),
@@ -511,14 +502,26 @@ def test_lru_score_staging_eviction_drops_dependent_batched_compactions():
     ):
         resources = manager._eager_resources_for(layout, prepared)
 
-    assert resources.score_staging is score_staging
-    # The new bucket carries a draft page-table plane sized for the draft tail.
-    assert score_cls.call_args.kwargs["draft_page_table_token_capacity"] == 8 + 1
-    # The oldest score staging fell out of the LRU, taking every dependent
-    # compaction staging (draft-carrying included) with it.
-    assert ("stale", 0) not in manager._eviction_buckets
-    assert dependent_draft_key not in manager._batched_compactions
-    assert dependent_plain_key not in manager._batched_compactions
-    assert surviving_key in manager._batched_compactions
-    assert ("stale", 1) in manager._eviction_buckets
-    assert ("stale", 2) in manager._eviction_buckets
+        # The buffers follow the executor limits, not this one-request cohort.
+        assert resources.score_staging is score_staging
+        assert score_cls.call_args.kwargs["max_requests"] == 8
+        assert score_cls.call_args.kwargs["decode_width"] == 4 + 2 * 128
+        assert score_cls.call_args.kwargs["seq_len"] == 65536
+        assert score_cls.call_args.kwargs["page_table_token_capacity"] == 65536 + 1
+        assert score_cls.call_args.kwargs["draft_page_table_token_capacity"] == 65536 + 1
+
+        # A second round with unchanged pools reuses the resident buffers and
+        # keeps the cached compaction launches.
+        cached_compaction = object()
+        manager._batched_compaction = cached_compaction
+        assert manager._eager_resources_for(layout, prepared) is resources
+        assert score_cls.call_count == 1
+        assert manager._batched_compaction is cached_compaction
+
+        # A pool change invalidates both the buffers and the compaction
+        # launches that alias them.
+        layout.pool_view_fingerprint = (("moved",),)
+        rebuilt = manager._eager_resources_for(layout, prepared)
+        assert rebuilt is not resources
+        assert score_cls.call_count == 2
+        assert manager._batched_compaction is None
