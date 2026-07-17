@@ -40,9 +40,11 @@ __global__ void toppDecayUpdateKernel(float* __restrict__ runtimeTopP, float con
         return;
     }
     int32_t const tok = stepTokens[slot * stepTokenStride]; // gather in-kernel (strided new_tokens view)
-    int32_t const rid = resetIds[slot];
     float updated;
-    if (rid >= 0 && tok == rid)
+    // Sampled token ids are non-negative, so a negative resetIds sentinel (-1,
+    // "reset disabled") never matches -- no explicit gate needed (parity with
+    // the legacy computeToppDecay kernel).
+    if (tok == resetIds[slot])
     {
         updated = initialTopP[slot];
     }

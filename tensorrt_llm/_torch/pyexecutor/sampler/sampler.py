@@ -4639,7 +4639,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Apply the C++ ``computeToppDecay`` update for sampled decay-active slots.
 
         For each slot sampled this iteration that is decay-active:
-          runtime_p = initial_p          if sampled_token == reset_id and reset_id >= 0
+          runtime_p = initial_p          if sampled_token == reset_id
           runtime_p = max(runtime_p * decay, top_p_min)   otherwise
 
         Restricting to the sampled slots avoids reading stale new_tokens_cuda
@@ -4656,7 +4656,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # sampled token in-kernel from the slot-indexed strided view of this
         # iteration's new-tokens buffer (decay is single-token-only, so the
         # token is at local step 0, beam 0), and applies
-        #   runtime_p = (reset_id>=0 && tok==reset_id) ? initial_p
+        #   runtime_p = (tok == reset_id) ? initial_p
         #             : max(runtime_p*decay, top_p_min)
         # in place -- no separate gather/cast launches on the hot path.
         top_p_decay_update(

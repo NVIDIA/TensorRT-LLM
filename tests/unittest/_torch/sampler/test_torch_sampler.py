@@ -2812,8 +2812,9 @@ class TestTopPDecay:
         assert s is GREEDY
 
     def test_runtime_update_parity(self):
-        # Post-sample update parity with the C++ computeToppDecay recurrence:
-        #   runtime = initial                    if reset_id >= 0 and token == reset_id
+        # Post-sample update parity with the C++ computeToppDecay recurrence
+        # (a negative reset_id never matches, since token ids are non-negative):
+        #   runtime = initial                    if token == reset_id
         #           = max(runtime * decay, min)  otherwise
         sampler = self._make_sampler()
         store = sampler.store.top_p_decay_store
@@ -2844,7 +2845,7 @@ class TestTopPDecay:
             got = store.runtime_top_p_decay_cuda.cpu()
             for slot, cfg in zip(slots, configs):
                 tok = token_steps[slot][step]
-                if cfg["reset_id"] >= 0 and tok == cfg["reset_id"]:
+                if tok == cfg["reset_id"]:
                     runtime[slot] = cfg["initial"]
                 else:
                     runtime[slot] = max(runtime[slot] * cfg["decay"], cfg["top_p_min"])

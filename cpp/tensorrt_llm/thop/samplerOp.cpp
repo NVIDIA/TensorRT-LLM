@@ -34,7 +34,7 @@ namespace torch_ext
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Fused post-sample runtime top-p update for the TorchSampler Top-P Decay
 // feature. Applies, in place, for every sampled row whose slot is decay-active:
-//   runtime_top_p[slot] = (reset_id >= 0 && last_token == reset_id)
+//   runtime_top_p[slot] = (last_token == reset_id)
 //                           ? initial_top_p[slot]
 //                           : max(runtime_top_p[slot] * top_p_decay[slot], top_p_min[slot])
 // The decay-active gate is applied on-device via is_decay_slot, so the hot path

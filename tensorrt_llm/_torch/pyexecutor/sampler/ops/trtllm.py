@@ -37,8 +37,11 @@ def top_p_decay_update(
 
     For each sampled row whose slot is decay-active (per ``is_decay_slot``)::
 
-        runtime_top_p[slot] = initial_top_p[slot]                         if reset_id >= 0 and token == reset_id
+        runtime_top_p[slot] = initial_top_p[slot]                          if token == reset_id
                             = max(runtime_top_p[slot] * decay, top_p_min)  otherwise
+
+    A negative ``reset_ids`` sentinel (-1, "reset disabled") never matches,
+    since sampled token ids are non-negative.
 
     All per-slot tensors are 1-D of length ``max_num_sequences``;
     ``step_tokens`` is a slot-indexed 1-D (possibly strided) int32 view of the

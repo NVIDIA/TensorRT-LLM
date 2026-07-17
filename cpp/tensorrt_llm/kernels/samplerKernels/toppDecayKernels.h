@@ -30,12 +30,12 @@ namespace kernels
 //! Unlike the legacy invokeComputeToppDecay (samplingTopPKernels.h), this variant
 //! gathers the sampled token in-kernel from a slot-indexed strided view of the
 //! new-tokens buffer (\p stepTokens with element stride \p stepTokenStride, i.e.
-//! new_tokens[step, slot, beam] for a fixed step/beam), applies a gated reset
-//! (reset_id < 0 disables the reset), and filters decay-active slots on-device
-//! via \p isDecaySlot.
+//! new_tokens[step, slot, beam] for a fixed step/beam) and filters decay-active
+//! slots on-device via \p isDecaySlot. A negative resetIds entry (-1, "reset
+//! disabled") never matches a sampled token, since token ids are non-negative.
 //!
 //! For each sampled row i with slot s = sampledSlots[i] where isDecaySlot[s]:
-//!   runtimeTopP[s] = (resetIds[s] >= 0 && stepTokens[s * stride] == resetIds[s])
+//!   runtimeTopP[s] = (stepTokens[s * stride] == resetIds[s])
 //!                      ? initialTopP[s]
 //!                      : max(runtimeTopP[s] * topPDecay[s], topPMin[s])
 //!
