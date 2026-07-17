@@ -109,50 +109,6 @@ def _prepared_eviction(
     )
 
 
-def _fake_cute_dsl_topk(
-    values: torch.Tensor,
-    seq_lens: torch.Tensor,
-    output: torch.Tensor,
-    top_k: int,
-    next_n: int,
-) -> None:
-    """CPU oracle for the CUDA-only CuTE-DSL selector custom op."""
-    assert next_n == 1
-    for row in range(int(values.shape[0])):
-        width = int(seq_lens[row])
-        selected = _TORCH_TOPK_ORACLE(
-            values[row, :width],
-            top_k,
-            sorted=False,
-        ).indices
-        output[row].copy_(selected.to(torch.int32))
-
-
-@contextmanager
-def _mock_cute_topk_without_fallbacks():
-    """Provide the CuTE op while making both retired fallbacks fatal."""
-    with (
-        mock.patch.object(
-            torch.ops.trtllm,
-            "cute_dsl_indexer_topk_decode",
-            side_effect=_fake_cute_dsl_topk,
-            create=True,
-        ) as cute_topk,
-        mock.patch.object(
-            torch.ops.trtllm,
-            "indexer_topk_decode",
-            side_effect=AssertionError("native IndexerTopK fallback is forbidden"),
-            create=True,
-        ),
-        mock.patch.object(
-            torch,
-            "topk",
-            side_effect=AssertionError("torch.topk production fallback is forbidden"),
-        ),
-    ):
-        yield cute_topk
-
-
 def _union_oracle(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
     """Independent expected-result implementation of union selection."""
     combined = scores.max(dim=0).values
@@ -1027,32 +983,30 @@ class TestStepEndHookRefactor:
 
 class TestTopKRouting:
     @pytest.mark.parametrize("keep_count", [4096, 8192])
-    def test_cross_request_union_uses_cute_without_fallback(self, keep_count):
+    def test_cross_request_union_matches_oracle_at_high_keep_counts(self, keep_count):
         width = keep_count + 64
         request_scores = [
             _distinct_topk_scores(width),
             _distinct_topk_scores(width).roll(17, dims=1) + 0.000007,
         ]
         expected = [_union_oracle(scores, keep_count) for scores in request_scores]
+        device = torch.device("cuda", torch.cuda.current_device())
+        scores = torch.stack(request_scores).to(device)
         selector = _BatchedUnionKeepSetSelector(
             request_scores[0].shape[0],
             width,
             keep_count,
-            dtype=request_scores[0].dtype,
-            device=request_scores[0].device,
+            dtype=scores.dtype,
+            device=device,
             max_requests=len(request_scores),
+            input_scores=scores,
+            normalize_scores=False,
         )
+        selector.select_requests(scores, normalize_scores=False)
+        selected = selector.keep.cpu()
 
-        with _mock_cute_topk_without_fallbacks() as cute_topk:
-            selector.select_requests(
-                torch.stack(request_scores),
-                normalize_scores=False,
-            )
-            selected = selector.keep[: len(request_scores)].clone()
-
-        assert cute_topk.call_count == 1
         for actual, expected_keep in zip(selected, expected):
-            assert torch.equal(actual, expected_keep)
+            assert torch.equal(actual, expected_keep.to(torch.int32))
 
 
 class TestFixedScoreMetadata:

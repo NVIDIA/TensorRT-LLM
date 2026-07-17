@@ -29,30 +29,38 @@ def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor
     return torch.tensor(selected[:keep_count], dtype=torch.int32, device=row.device)
 
 
-def _fake_cute_topk(scores, seq_lens, output, top_k, next_n):
-    assert next_n == 1
-    for row_index, row in enumerate(scores):
-        output[row_index].copy_(_stable_topk(row, int(seq_lens[row_index]), int(top_k)))
-
-
-class _AdversarialTieTopK:
-    """Prefer high-index boundary ties so finalization must correct membership."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def __call__(self, scores, seq_lens, output, top_k, next_n):
-        assert next_n == 1
-        self.calls += 1
-        for row_index, row in enumerate(scores):
-            width = int(seq_lens[row_index])
-            values = row[:width]
-            threshold = torch.sort(values, descending=True).values[int(top_k) - 1]
-            higher = torch.nonzero(values > threshold, as_tuple=False).flatten()
-            tied = torch.nonzero(values == threshold, as_tuple=False).flatten()
-            tied = tied.flip(0)
-            remaining = int(top_k) - int(higher.numel())
-            output[row_index].copy_(torch.cat((higher, tied[:remaining])).to(torch.int32))
+def _per_head_keep_oracle(
+    scores: torch.Tensor,
+    valid_widths: torch.Tensor,
+    keep_count: int,
+    eviction_mode: str,
+    normalize_scores: bool,
+) -> torch.Tensor:
+    """Independent torch implementation of per-head selection."""
+    request_count, num_layers, num_query_heads, width = scores.shape
+    num_kv_heads = 2
+    rows = []
+    for request in range(request_count):
+        valid_width = int(valid_widths[request])
+        valid = scores[request, ..., :valid_width].clone()
+        if normalize_scores:
+            mean = valid.mean(dim=-1, keepdim=True)
+            valid = valid - mean
+            std = valid.norm(dim=-1, keepdim=True) / (valid_width**0.5)
+            valid = valid / std.clamp_min(1e-6)
+        grouped = valid.view(
+            num_layers, num_kv_heads, num_query_heads // num_kv_heads, valid_width
+        ).amax(dim=2)
+        if eviction_mode == "per_head":
+            selection = grouped.mean(dim=0)
+        else:
+            selection = grouped.reshape(num_layers * num_kv_heads, valid_width)
+        rows.append(
+            torch.stack(
+                [torch.sort(_stable_topk(row, valid_width, keep_count)).values for row in selection]
+            )
+        )
+    return torch.stack(rows)
 
 
 def _legacy_union(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
@@ -85,92 +93,12 @@ def test_direct_union_topk_matches_legacy_union_with_heavy_ties(rows, width, kee
         assert torch.equal(direct, _legacy_union(scores, keep_count))
 
 
-@pytest.mark.parametrize("keep_count,width", [(4, 8), (4096, 4224), (8192, 9216)])
-def test_union_eager_uses_one_deterministic_cute_selection(keep_count, width):
-    prompt_len = 17
-    generator = torch.Generator().manual_seed(keep_count)
-    scores = torch.randint(
-        -8,
-        9,
-        (2, width),
-        generator=generator,
-        dtype=torch.int32,
-    ).to(torch.float32)
-    selector = _BatchedUnionKeepSetSelector(
-        rows=2,
-        width=width,
-        keep_count=keep_count,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        max_requests=1,
-    )
-    selector.set_prompt_offsets(torch.tensor([prompt_len], dtype=torch.int32))
-    raw_topk = _AdversarialTieTopK()
-    with (
-        mock.patch.object(
-            torch.ops.trtllm,
-            "cute_dsl_indexer_topk_decode",
-            side_effect=raw_topk,
-            create=True,
-        ),
-        mock.patch.object(
-            torch.ops.trtllm,
-            "indexer_topk_decode",
-            side_effect=AssertionError("legacy selector was called"),
-            create=True,
-        ),
-    ):
-        selector.select_requests(scores.unsqueeze(0), normalize_scores=False)
-
-    expected = _stable_topk(scores.max(dim=0).values, width, keep_count)
-    assert torch.equal(
-        selector.keep[0],
-        torch.sort(expected + prompt_len).values,
-    )
-    assert raw_topk.calls == 1
-
-
-@pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
-def test_per_head_eager_keeps_stable_indices(eviction_mode):
-    selector = _BatchedPerHeadKeepSetSelector(
-        eviction_mode=eviction_mode,
-        dense_layers=(0, 1),
-        num_query_heads=4,
-        num_kv_heads=2,
-        width=16,
-        keep_count=5,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        max_requests=1,
-    )
-    selector.set_prompt_offsets(torch.tensor([3], dtype=torch.int32))
-    scores = torch.arange(2 * 4 * 16, dtype=torch.float32).reshape(2, 4, 16)
-    with mock.patch.object(
-        torch.ops.trtllm,
-        "cute_dsl_indexer_topk_decode",
-        side_effect=_fake_cute_topk,
-        create=True,
-    ):
-        selector.select_requests(scores.unsqueeze(0), normalize_scores=False)
-    assert tuple(selector.keep.shape) == (
-        1,
-        selector.selection_rows,
-        selector.keep_count,
-    )
-    # Scores increase with the token index, so every row keeps the last five
-    # decode ordinals, rebased by the pinned prompt length.
-    expected_row = torch.arange(16 - 5, 16, dtype=torch.int32) + 3
-    assert torch.equal(
-        selector.keep,
-        expected_row.expand(1, selector.selection_rows, -1),
-    )
-
-
 @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
 @pytest.mark.parametrize("normalize_scores", [False, True])
-def test_per_head_eager_cuda_matches_cpu_reference_on_selector_stream(
+def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     eviction_mode, normalize_scores
 ):
+    _require_cute_topk_op()
     request_count, layers, query_heads, kv_heads = 2, 3, 4, 2
     width, keep_count = 96, 64
     generator = torch.Generator().manual_seed(41)
@@ -183,26 +111,9 @@ def test_per_head_eager_cuda_matches_cpu_reference_on_selector_stream(
     ).to(torch.float32)
     valid_widths = torch.tensor([83, 91], dtype=torch.int32)
 
-    reference = _BatchedPerHeadKeepSetSelector(
-        eviction_mode=eviction_mode,
-        dense_layers=tuple(range(layers)),
-        num_query_heads=query_heads,
-        num_kv_heads=kv_heads,
-        width=width,
-        keep_count=keep_count,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        max_requests=request_count,
+    expected = _per_head_keep_oracle(
+        scores_cpu, valid_widths, keep_count, eviction_mode, normalize_scores
     )
-    reference.valid_widths.copy_(valid_widths)
-    with mock.patch.object(
-        torch.ops.trtllm,
-        "cute_dsl_indexer_topk_decode",
-        side_effect=_fake_cute_topk,
-        create=True,
-    ):
-        reference.select_requests(scores_cpu, normalize_scores=normalize_scores)
-    expected = reference.keep.clone()
 
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
@@ -309,7 +220,7 @@ def test_prepared_union_scores_match_checked_launch_and_exact_indices(normalize_
         assert torch.equal(actual_keep[request], expected_keep)
 
 
-@pytest.mark.parametrize("keep_count,width", [(4096, 4224), (8192, 9216)])
+@pytest.mark.parametrize("keep_count,width", [(4, 64), (4096, 4224), (8192, 9216)])
 def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, width):
     _require_cute_topk_op()
     device = torch.device("cuda", torch.cuda.current_device())
@@ -590,18 +501,8 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
     decode_widths = [seq_len - prompt_len for prompt_len in prompt_lens]
     width = max(decode_widths)
 
-    # CPU-oracle selection: decode-relative scores per request, rebased to
+    # Oracle selection: decode-relative scores per request, rebased to
     # absolute ordinals by each request's own prompt offset.
-    selector = _BatchedUnionKeepSetSelector(
-        rows=1,
-        width=width,
-        keep_count=decode_keep_count,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        max_requests=request_count,
-    )
-    selector.valid_widths.copy_(torch.tensor(decode_widths, dtype=torch.int32))
-    selector.set_prompt_offsets(torch.tensor(prompt_lens, dtype=torch.int32))
     generator = torch.Generator().manual_seed(11)
     scores = torch.randint(
         -8,
@@ -610,20 +511,14 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
         generator=generator,
         dtype=torch.int32,
     ).to(torch.float32)
-    reference_scores = scores.clone()
-    with mock.patch.object(
-        torch.ops.trtllm,
-        "cute_dsl_indexer_topk_decode",
-        side_effect=_fake_cute_topk,
-        create=True,
-    ):
-        selector.select_requests(scores, normalize_scores=False)
-    keep = selector.keep.clone()
-    for request, (prompt_len, decode_width) in enumerate(zip(prompt_lens, decode_widths)):
-        expected = torch.sort(
-            _stable_topk(reference_scores[request, 0], decode_width, decode_keep_count) + prompt_len
-        ).values
-        assert torch.equal(keep[request], expected)
+    keep = torch.stack(
+        [
+            torch.sort(
+                _stable_topk(scores[request, 0], decode_width, decode_keep_count) + prompt_len
+            ).values
+            for request, (prompt_len, decode_width) in enumerate(zip(prompt_lens, decode_widths))
+        ]
+    )
 
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
     initial_pools = [

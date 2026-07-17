@@ -79,8 +79,6 @@ if TYPE_CHECKING:
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
 _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_sq"})
 
-_INT32_MAX = torch.iinfo(torch.int32).max
-
 
 def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Tensor:
     """Upstream pruning_utils.build_geometric_offsets: [1, 2, 4, ... <=max]."""
@@ -94,77 +92,16 @@ def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Ten
     return torch.tensor(offsets, device=device, dtype=torch.float32)
 
 
-class _PreparedCuteTopK:
-    """Run the existing fixed-shape CuTe TopK with owned scratch storage."""
+class _PreparedDeterministicTopK:
+    """Deterministic top-k over fixed row-major buffers, built once.
 
-    def __init__(self, max_rows: int, width: int, keep_count: int, device: torch.device) -> None:
-        if max_rows <= 0 or width <= 0 or not 1 <= keep_count <= width:
-            raise ValueError("prepared CuTe TopK requires valid fixed dimensions")
-        if device.type != "cuda":
-            raise ValueError("prepared CuTe TopK requires a CUDA device")
-
-        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
-
-        self.max_rows = max_rows
-        self.width = width
-        self.keep_count = keep_count
-        self.device = device
-        with torch.cuda.device(device):
-            self.stream = torch.cuda.current_stream(device)
-            self.scratch = torch.empty((max_rows, 2, width), dtype=torch.int32, device=device)
-            runner = cute_dsl_custom_ops.CuteDSLTopKDecodeSingleCTARunner
-            key = (
-                cute_dsl_custom_ops._TORCH_TO_CUTLASS_DTYPE[torch.float32],
-                1 << (width - 1).bit_length(),
-                keep_count,
-                1,
-                False,
-                256,
-                False,
-                max_rows > cute_dsl_custom_ops._get_num_sms(),
-            )
-            runner._compile(*key)
-            self.compiled = runner.kernel_cache[key]
-
-    def __call__(
-        self,
-        scores: torch.Tensor,
-        seq_lens: torch.Tensor,
-        output_indices: torch.Tensor,
-    ) -> None:
-        rows = int(scores.shape[0])
-        if (
-            rows != self.max_rows
-            or scores.shape != (self.max_rows, self.width)
-            or scores.dtype != torch.float32
-            or scores.device != self.device
-            or seq_lens.shape != (self.max_rows,)
-            or seq_lens.dtype != torch.int32
-            or seq_lens.device != self.device
-            or output_indices.shape != (self.max_rows, self.keep_count)
-            or output_indices.dtype != torch.int32
-            or output_indices.device != self.device
-        ):
-            raise ValueError("prepared CuTe TopK inputs do not match their fixed buffers")
-        current_stream = torch.cuda.current_stream(self.device)
-        if (current_stream.device, current_stream.cuda_stream) != (
-            self.stream.device,
-            self.stream.cuda_stream,
-        ):
-            raise RuntimeError("prepared CuTe TopK must run on the stream it was built on")
-        self.compiled(
-            scores,
-            None,
-            self.scratch,
-            None,
-            seq_lens,
-            output_indices,
-            None,
-        )
-
-
-class _PreparedTopKFinalizer:
-    """Launch the fixed deterministic finalizer without Triton JIT dispatch."""
+    The CuTE top-k kernel is fast but breaks score ties arbitrarily and emits
+    indices in arbitrary order, so a frozen Triton finalizer recomputes the
+    threshold membership with lowest-index-wins ties, rebases each row by its
+    prompt offset, and writes sorted ordinals. The CuTE kernel is compiled
+    here once with owned scratch storage; every later call runs both kernels
+    over the bound buffers with no dispatch work and no allocations.
+    """
 
     def __init__(
         self,
@@ -176,32 +113,34 @@ class _PreparedTopKFinalizer:
         keep_count: int,
     ) -> None:
         rows, width = scores.shape
-        if (
-            not scores.is_cuda
-            or scores.dtype != torch.float32
-            or not scores.is_contiguous()
-            or seq_lens.shape != (rows,)
-            or seq_lens.dtype != torch.int32
-            or seq_lens.device != scores.device
-            or prompt_offsets.shape != (rows,)
-            or prompt_offsets.dtype != torch.int32
-            or prompt_offsets.device != scores.device
-            or provisional_indices.shape != (rows, keep_count)
-            or provisional_indices.dtype != torch.int32
-            or provisional_indices.device != scores.device
-            or output_indices.shape != (rows, keep_count)
-            or output_indices.dtype != torch.int32
-            or output_indices.device != scores.device
-            or not seq_lens.is_contiguous()
-            or not prompt_offsets.is_contiguous()
-            or not provisional_indices.is_contiguous()
-            or not output_indices.is_contiguous()
-        ):
-            raise ValueError("prepared TopK finalizer tensors do not share one fixed geometry")
+        if not 1 <= keep_count <= width:
+            raise ValueError("deterministic top-k requires 1 <= keep_count <= width")
+
+        from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
         from .triattention_kernels import _finalize_topk_indices_kernel
 
-        self._frozen_call = FrozenTritonKernelCall(
+        self.device = scores.device
+        self.scores = scores
+        self.seq_lens = seq_lens
+        self.provisional_indices = provisional_indices
+        with torch.cuda.device(self.device):
+            self.stream = torch.cuda.current_stream(self.device)
+            self.scratch = torch.empty((rows, 2, width), dtype=torch.int32, device=self.device)
+            runner = cute_dsl_custom_ops.CuteDSLTopKDecodeSingleCTARunner
+            key = (
+                cute_dsl_custom_ops._TORCH_TO_CUTLASS_DTYPE[torch.float32],
+                1 << (width - 1).bit_length(),
+                keep_count,
+                1,
+                False,
+                256,
+                False,
+                rows > cute_dsl_custom_ops._get_num_sms(),
+            )
+            runner._compile(*key)
+            self.compiled_topk = runner.kernel_cache[key]
+        self.frozen_finalize = FrozenTritonKernelCall(
             _finalize_topk_indices_kernel,
             (scores, seq_lens, prompt_offsets, provisional_indices, output_indices),
             dict(
@@ -214,15 +153,17 @@ class _PreparedTopKFinalizer:
             num_warps=4,
         )
 
-    def __call__(
-        self,
-        scores: torch.Tensor,
-        seq_lens: torch.Tensor,
-        prompt_offsets: torch.Tensor,
-        provisional_indices: torch.Tensor,
-        output_indices: torch.Tensor,
-    ) -> None:
-        self._frozen_call(scores, seq_lens, prompt_offsets, provisional_indices, output_indices)
+    def __call__(self) -> None:
+        self.compiled_topk(
+            self.scores,
+            None,
+            self.scratch,
+            None,
+            self.seq_lens,
+            self.provisional_indices,
+            None,
+        )
+        self.frozen_finalize()
 
 
 class _PreparedUnionScores:
@@ -294,52 +235,6 @@ class _PreparedUnionScores:
         if self._frozen_stats_call is not None:
             self._frozen_stats_call()
         self._frozen_union_call()
-
-
-def _deterministic_topk_indices_into(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    prompt_offsets: torch.Tensor,
-    provisional_indices_i32: torch.Tensor,
-    output_indices_i32: torch.Tensor,
-    keep_count: int,
-    prepared_topk: Optional[_PreparedCuteTopK] = None,
-    prepared_finalizer: Optional[_PreparedTopKFinalizer] = None,
-) -> None:
-    """Write stable, increasing physical indices around one CuTE TopK call.
-
-    Scores are decode-relative; ``prompt_offsets`` rebases each row's emitted
-    ordinals to absolute positions, so one call may mix prompt lengths.
-    """
-    if scores.is_cuda:
-        if prepared_topk is None or prepared_finalizer is None:
-            raise ValueError("CUDA selection requires prepared TopK launchers")
-        prepared_topk(scores, seq_lens, provisional_indices_i32)
-        prepared_finalizer(
-            scores,
-            seq_lens,
-            prompt_offsets,
-            provisional_indices_i32,
-            output_indices_i32,
-        )
-        return
-
-    # CPU selectors only exercise the selector contract in unit tests.
-    # The trailing 1 is next_n: decode scores one query token per request.
-    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-        scores, seq_lens, provisional_indices_i32, keep_count, 1
-    )
-    for row_index, row_scores in enumerate(scores):
-        valid_width = int(seq_lens[row_index])
-        prompt_len = int(prompt_offsets[row_index])
-        selected = provisional_indices_i32[row_index].to(torch.long)
-        threshold = torch.amin(row_scores[selected])
-        valid_scores = row_scores[:valid_width]
-        higher = torch.nonzero(valid_scores > threshold, as_tuple=False).flatten()
-        tied = torch.nonzero(valid_scores == threshold, as_tuple=False).flatten()
-        tie_count = keep_count - int(higher.numel())
-        ordered = torch.sort(torch.cat((higher, tied[:tie_count]))).values
-        output_indices_i32[row_index, :keep_count].copy_(ordered.to(torch.int32).add(prompt_len))
 
 
 class _CrossRequestSelectionPlan(NamedTuple):
@@ -455,22 +350,6 @@ class _BatchedKeepSetSelectorBase:
                 self.prompt_offsets.unsqueeze(1).expand(-1, self.selection_rows_per_request)
             )
 
-    def _allocate_cpu_reference_buffers(
-        self,
-        scale_shape: Tuple[int, ...],
-        mask_shape: Tuple[int, ...],
-        index_dtype: torch.dtype,
-    ) -> None:
-        """CPU-only oracle scratch; None on CUDA, where prepared kernels run."""
-        if self.device.type == "cpu":
-            self.valid_scale = torch.empty(scale_shape, dtype=self.dtype, device=self.device)
-            self.token_indices = torch.arange(self.width, dtype=index_dtype, device=self.device)
-            self.invalid_mask = torch.empty(mask_shape, dtype=torch.bool, device=self.device)
-        else:
-            self.valid_scale = None
-            self.token_indices = None
-            self.invalid_mask = None
-
     def _build_prepared_selection_launchers(
         self,
         scores_rows: torch.Tensor,
@@ -478,15 +357,8 @@ class _BatchedKeepSetSelectorBase:
         provisional_indices: torch.Tensor,
         keep_rows: torch.Tensor,
     ) -> None:
-        """Bind the CuTE topk and the deterministic finalizer over row-major views."""
-        if self.device.type != "cuda":
-            self.prepared_topk = None
-            self.prepared_finalizer = None
-            return
-        self.prepared_topk = _PreparedCuteTopK(
-            int(scores_rows.shape[0]), self.width, self.keep_count, self.device
-        )
-        self.prepared_finalizer = _PreparedTopKFinalizer(
+        """Bind the deterministic top-k over row-major views of the buffers."""
+        self.prepared_topk = _PreparedDeterministicTopK(
             scores_rows,
             row_lengths,
             self.row_prompt_offsets,
@@ -494,14 +366,6 @@ class _BatchedKeepSetSelectorBase:
             keep_rows,
             self.keep_count,
         )
-
-    def _validated_request_count(self, scores: torch.Tensor, what: str) -> int:
-        request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
-        if request_count <= 0 or request_count > self.max_requests:
-            raise ValueError(f"request count exceeds the {what} selection capacity")
-        if scores.is_cuda and request_count != self.max_requests:
-            raise ValueError("CUDA selection requires the selector's fixed request count")
-        return request_count
 
 
 class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
@@ -538,8 +402,8 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             max_requests=max_requests,
         )
         self.rows = rows
-        if self.device.type == "cuda" and input_scores is None:
-            raise ValueError("CUDA union selection requires its fixed score input")
+        if input_scores is None:
+            raise ValueError("union selection requires its fixed score input")
 
         self.row_mean = torch.empty((max_requests, rows, 1), dtype=dtype, device=self.device)
         self.row_std = torch.empty_like(self.row_mean)
@@ -552,112 +416,22 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         self.keep = torch.empty(
             (max_requests, self.keep_count), dtype=torch.int32, device=self.device
         )
-        self._allocate_cpu_reference_buffers(
-            (max_requests, 1, 1), (max_requests, 1, width), torch.int32
-        )
         self._build_prepared_selection_launchers(
             self.combined, self.valid_widths, self.final_indices, self.keep
         )
-        self.prepared_scores = (
-            _PreparedUnionScores(
-                input_scores,
-                self.valid_widths,
-                self.row_mean,
-                self.row_std,
-                self.combined,
-                normalize_scores=normalize_scores,
-            )
-            if self.device.type == "cuda" and input_scores is not None
-            else None
-        )
-
-    def _select_input_scores(
-        self,
-        input_scores: torch.Tensor,
-        request_count: int,
-        *,
-        normalize_scores: bool,
-    ) -> None:
-        valid_widths = self.valid_widths[:request_count]
-        combined = self.combined[:request_count]
-        if input_scores.is_cuda:
-            raise RuntimeError("CUDA union scores must use their prepared fixed launcher")
-        else:
-            self._select_input_scores_reference(
-                input_scores,
-                request_count,
-                normalize_scores=normalize_scores,
-            )
-
-        final_indices = self.final_indices[:request_count]
-        _deterministic_topk_indices_into(
-            combined,
-            valid_widths,
-            self.prompt_offsets[:request_count],
-            final_indices,
-            self.keep[:request_count],
-            self.keep_count,
-            self.prepared_topk,
-            self.prepared_finalizer,
+        self.prepared_scores = _PreparedUnionScores(
+            input_scores,
+            self.valid_widths,
+            self.row_mean,
+            self.row_std,
+            self.combined,
+            normalize_scores=normalize_scores,
         )
 
     def select_prepared_requests(self) -> None:
         """Select from the CUDA score tensor bound to this fixed selector."""
-        if self.prepared_scores is None:
-            raise RuntimeError("prepared union scores are unavailable")
         self.prepared_scores()
-        final_indices = self.final_indices
-        _deterministic_topk_indices_into(
-            self.combined,
-            self.valid_widths,
-            self.prompt_offsets,
-            final_indices,
-            self.keep,
-            self.keep_count,
-            self.prepared_topk,
-            self.prepared_finalizer,
-        )
-
-    def _select_input_scores_reference(
-        self,
-        input_scores: torch.Tensor,
-        request_count: int,
-        *,
-        normalize_scores: bool,
-    ) -> None:
-        """Keep a CPU-only reference for selector contract tests."""
-        valid_widths = self.valid_widths[:request_count]
-        assert self.invalid_mask is not None
-        assert self.token_indices is not None
-        assert self.valid_scale is not None
-        invalid_mask = self.invalid_mask[:request_count]
-        torch.ge(
-            self.token_indices.view(1, 1, self.width),
-            valid_widths.view(request_count, 1, 1),
-            out=invalid_mask,
-        )
-        if normalize_scores:
-            row_mean = self.row_mean[:request_count]
-            row_std = self.row_std[:request_count]
-            input_scores.masked_fill_(invalid_mask, 0.0)
-            torch.sum(input_scores, dim=2, keepdim=True, out=row_mean)
-            self.valid_scale[:request_count].view(request_count).copy_(valid_widths)
-            row_mean.div_(self.valid_scale[:request_count])
-            torch.sub(input_scores, row_mean, out=input_scores)
-            input_scores.masked_fill_(invalid_mask, 0.0)
-            torch.linalg.vector_norm(
-                input_scores,
-                dim=2,
-                keepdim=True,
-                out=row_std,
-            )
-            self.valid_scale[:request_count].sqrt_()
-            row_std.div_(self.valid_scale[:request_count])
-            row_std.clamp_min_(1e-6)
-            torch.div(input_scores, row_std, out=input_scores)
-        input_scores.masked_fill_(invalid_mask, float("-inf"))
-
-        torch.amax(input_scores, dim=1, out=self.combined[:request_count])
+        self.prepared_topk()
 
     def select_requests(
         self,
@@ -665,30 +439,13 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         *,
         normalize_scores: bool,
     ) -> None:
-        """Select from request-major score output without repacking it."""
-        request_count = self._validated_request_count(scores, "cross-request")
+        """Select from the score tensor bound to this fixed selector."""
         if (
-            scores.numel() != request_count * self.rows * self.width
-            or int(scores.shape[-1]) != self.width
-            or scores.dtype != self.dtype
-            or scores.device != self.device
-            or not scores.is_contiguous()
+            scores is not self.prepared_scores.scores
+            or bool(normalize_scores) != self.prepared_scores.normalize_scores
         ):
-            raise ValueError("cross-request scores do not match the selector geometry")
-        if scores.is_cuda:
-            if (
-                self.prepared_scores is None
-                or scores is not self.prepared_scores.scores
-                or bool(normalize_scores) != self.prepared_scores.normalize_scores
-            ):
-                raise ValueError("CUDA union scores do not match their prepared fixed launcher")
-            self.select_prepared_requests()
-            return
-        self._select_input_scores(
-            scores.view(request_count, self.rows, self.width),
-            request_count,
-            normalize_scores=normalize_scores,
-        )
+            raise ValueError("union scores do not match their prepared fixed launcher")
+        self.select_prepared_requests()
 
 
 class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
@@ -731,26 +488,16 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
             max_requests=max_requests,
         )
         self.num_layers = len(self.dense_layers)
-        self.query_group_size = self.num_query_heads // self.num_kv_heads
         self.rows = self.num_layers * self.num_query_heads
         self.selection_rows = selection_rows
 
         score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
-        grouped_shape = (self.max_requests, self.num_layers, self.num_kv_heads, self.width)
         self.row_mean = torch.empty(score_shape[:-1] + (1,), dtype=dtype, device=self.device)
         self.row_std = torch.empty_like(self.row_mean)
         self.selection_scores = torch.empty(
             (self.max_requests, self.selection_rows, self.width),
             dtype=dtype,
             device=self.device,
-        )
-        self._allocate_cpu_reference_buffers(
-            (self.max_requests, 1, 1, 1), (self.max_requests, 1, 1, self.width), torch.long
-        )
-        self.grouped_scores = (
-            torch.empty(grouped_shape, dtype=dtype, device=self.device)
-            if self.device.type == "cpu"
-            else None
         )
         self.row_seq_lens = torch.full(
             (self.max_requests, self.selection_rows),
@@ -780,126 +527,35 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
             self.keep_flat,
         )
 
-    def _select_input_scores(
-        self,
-        input_scores: torch.Tensor,
-        request_count: int,
-        *,
-        normalize_scores: bool,
-    ) -> None:
-        valid_widths = self.valid_widths[:request_count]
-        selection_scores = self.selection_scores[:request_count]
-        row_seq_lens = self.row_seq_lens[:request_count]
-        if input_scores.is_cuda:
-            from .triattention_kernels import prepare_per_head_scores
-
-            prepare_per_head_scores(
-                input_scores,
-                valid_widths,
-                self.row_mean[:request_count],
-                self.row_std[:request_count],
-                selection_scores,
-                row_seq_lens,
-                request_count,
-                num_kv_heads=self.num_kv_heads,
-                per_layer=self.eviction_mode == "per_layer_perhead",
-                normalize_scores=normalize_scores,
-            )
-        else:
-            self._select_input_scores_reference(
-                input_scores,
-                request_count,
-                normalize_scores=normalize_scores,
-            )
-
-        _deterministic_topk_indices_into(
-            self.selection_scores_flat,
-            self.row_seq_lens_flat,
-            self.row_prompt_offsets,
-            self.top_indices_i32_flat,
-            self.keep_flat,
-            self.keep_count,
-            self.prepared_topk,
-            self.prepared_finalizer,
-        )
-
-    def _select_input_scores_reference(
-        self,
-        input_scores: torch.Tensor,
-        request_count: int,
-        *,
-        normalize_scores: bool,
-    ) -> None:
-        """Keep the explicit PyTorch implementation as the CPU oracle."""
-        valid_widths = self.valid_widths[:request_count]
-        assert self.invalid_mask is not None
-        assert self.token_indices is not None
-        assert self.valid_scale is not None
-        assert self.grouped_scores is not None
-        invalid_mask = self.invalid_mask[:request_count]
-        torch.ge(
-            self.token_indices.view(1, 1, 1, self.width),
-            valid_widths.view(request_count, 1, 1, 1),
-            out=invalid_mask,
-        )
-        if normalize_scores:
-            row_mean = self.row_mean[:request_count]
-            row_std = self.row_std[:request_count]
-            input_scores.masked_fill_(invalid_mask, 0.0)
-            torch.sum(input_scores, dim=3, keepdim=True, out=row_mean)
-            self.valid_scale[:request_count].view(request_count).copy_(valid_widths)
-            row_mean.div_(self.valid_scale[:request_count])
-            torch.sub(input_scores, row_mean, out=input_scores)
-            input_scores.masked_fill_(invalid_mask, 0.0)
-            torch.linalg.vector_norm(input_scores, dim=3, keepdim=True, out=row_std)
-            self.valid_scale[:request_count].sqrt_()
-            row_std.div_(self.valid_scale[:request_count])
-            row_std.clamp_min_(1e-6)
-            torch.div(input_scores, row_std, out=input_scores)
-        input_scores.masked_fill_(invalid_mask, float("-inf"))
-
-        grouped_scores = self.grouped_scores[:request_count]
-        torch.amax(
-            input_scores.view(
-                request_count,
-                self.num_layers,
-                self.num_kv_heads,
-                self.query_group_size,
-                self.width,
-            ),
-            dim=3,
-            out=grouped_scores,
-        )
-        if self.eviction_mode == "per_head":
-            torch.mean(grouped_scores, dim=1, out=self.selection_scores[:request_count])
-        else:
-            self.selection_scores[:request_count].copy_(
-                grouped_scores.view(request_count, self.selection_rows, self.width)
-            )
-        row_seq_lens = self.row_seq_lens[:request_count]
-        row_seq_lens.copy_(valid_widths.view(request_count, 1).expand(-1, self.selection_rows))
-
     def select_requests(
         self,
         scores: torch.Tensor,
         *,
         normalize_scores: bool,
     ) -> None:
-        request_count = self._validated_request_count(scores, "per-head")
+        from .triattention_kernels import prepare_per_head_scores
+
         expected_shape = (
-            request_count,
+            self.max_requests,
             self.num_layers,
             self.num_query_heads,
             self.width,
         )
-        if (
-            tuple(scores.shape) != expected_shape
-            or scores.dtype != self.dtype
-            or scores.device != self.device
-            or not scores.is_contiguous()
-        ):
+        if tuple(scores.shape) != expected_shape or not scores.is_contiguous():
             raise ValueError("per-head scores do not match the selector geometry")
-        self._select_input_scores(scores, request_count, normalize_scores=normalize_scores)
+        prepare_per_head_scores(
+            scores,
+            self.valid_widths,
+            self.row_mean,
+            self.row_std,
+            self.selection_scores,
+            self.row_seq_lens,
+            self.max_requests,
+            num_kv_heads=self.num_kv_heads,
+            per_layer=self.eviction_mode == "per_layer_perhead",
+            normalize_scores=normalize_scores,
+        )
+        self.prepared_topk()
 
 
 class _FixedScoreStreamMismatch(RuntimeError):
@@ -1286,17 +942,6 @@ class _FixedScoreStagingBuffers:
             or request_count > self.max_requests
             or len(round_starts) != request_count
             or len(token_starts) != request_count
-            or any(
-                round_start != round_start
-                or round_start < 0
-                or round_start > _INT32_MAX
-                or round_start != int(round_start)
-                for round_start in round_starts
-            )
-            or any(
-                token_start < 0 or token_start > _INT32_MAX or token_start != int(token_start)
-                for token_start in token_starts
-            )
         ):
             return False
         if (draft_manager is None) != (self.draft_block_offsets_device is None):
@@ -1315,16 +960,9 @@ class _FixedScoreStagingBuffers:
             raise RuntimeError("previous page-table cohort is still active")
         if seq_lens is None:
             seq_lens = [self.bucket_seq_len] * request_count
-        if len(seq_lens) != request_count or any(
-            seq_len <= 0 or seq_len > self.bucket_seq_len for seq_len in seq_lens
-        ):
-            return False
         if page_table_seq_lens is None:
             page_table_seq_lens = seq_lens
-        if len(page_table_seq_lens) != request_count or any(
-            page_seq_len < seq_len or page_seq_len > self.page_table_token_capacity
-            for seq_len, page_seq_len in zip(seq_lens, page_table_seq_lens)
-        ):
+        if len(seq_lens) != request_count or len(page_table_seq_lens) != request_count:
             return False
         if manager.enable_swa_scratch_reuse:
             raise RuntimeError("TriAttention does not support V2 SWA scratch page-table remapping")
