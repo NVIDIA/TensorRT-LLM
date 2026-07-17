@@ -5,14 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_flow.hooks import (_is_human_user_entry, _tool_uses_since_last_user,
-                              called_required_tool_this_turn,
-                              require_tool_call_stop_hook)
+from agent_flow.hooks import (
+    _is_human_user_entry,
+    _tool_uses_since_last_user,
+    called_required_tool_this_turn,
+    require_tool_call_stop_hook,
+)
 
 
 def _write_transcript(path: Path, entries: list[dict]) -> Path:
-    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n",
-                    encoding="utf-8")
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
     return path
 
 
@@ -24,13 +26,14 @@ def _user_tool_result(tool_use_id: str, result: str = "ok") -> dict:
     return {
         "type": "user",
         "message": {
-            "role":
-            "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": result,
-            }],
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result,
+                }
+            ],
         },
     }
 
@@ -39,14 +42,15 @@ def _assistant_tool_use(name: str, tool_use_id: str = "tu_1") -> dict:
     return {
         "type": "assistant",
         "message": {
-            "role":
-            "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": tool_use_id,
-                "name": name,
-                "input": {},
-            }],
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": {},
+                }
+            ],
         },
     }
 
@@ -56,16 +60,12 @@ def _assistant_text(text: str) -> dict:
         "type": "assistant",
         "message": {
             "role": "assistant",
-            "content": [{
-                "type": "text",
-                "text": text
-            }],
+            "content": [{"type": "text", "text": text}],
         },
     }
 
 
 class TestHumanUserEntryDetection:
-
     def test_plain_string_user_is_human(self):
         assert _is_human_user_entry(_user("hello")) is True
 
@@ -77,14 +77,8 @@ class TestHumanUserEntryDetection:
             "type": "user",
             "message": {
                 "content": [
-                    {
-                        "type": "text",
-                        "text": "please"
-                    },
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "tu_1"
-                    },
+                    {"type": "text", "text": "please"},
+                    {"type": "tool_result", "tool_use_id": "tu_1"},
                 ],
             },
         }
@@ -95,7 +89,6 @@ class TestHumanUserEntryDetection:
 
 
 class TestToolUsesSinceLastUser:
-
     def test_collects_tool_uses_after_last_human_message(self):
         entries = [
             _user("first turn"),
@@ -104,22 +97,20 @@ class TestToolUsesSinceLastUser:
             _assistant_tool_use("mcp__agent-tools__append_planner_progress"),
             _assistant_text("done"),
         ]
-        assert _tool_uses_since_last_user(entries) == [
-            "mcp__agent-tools__append_planner_progress"
-        ]
+        assert _tool_uses_since_last_user(entries) == ["mcp__agent-tools__append_planner_progress"]
 
     def test_tool_result_user_is_not_a_boundary(self):
         entries = [
             _user("task"),
             _assistant_tool_use("Read", "tu_1"),
             _user_tool_result("tu_1"),
-            _assistant_tool_use("mcp__agent-tools__append_planner_progress",
-                                "tu_2"),
+            _assistant_tool_use("mcp__agent-tools__append_planner_progress", "tu_2"),
         ]
         # Boundary is the first (real) user message; both tool uses
         # count — including the one between the tool_result echo.
         assert _tool_uses_since_last_user(entries) == [
-            "Read", "mcp__agent-tools__append_planner_progress"
+            "Read",
+            "mcp__agent-tools__append_planner_progress",
         ]
 
     def test_empty_when_no_assistant_activity_this_turn(self):
@@ -128,69 +119,69 @@ class TestToolUsesSinceLastUser:
 
 
 class TestCalledRequiredToolThisTurn:
-
     def test_matches_fully_qualified_name(self, tmp_path):
         transcript = _write_transcript(
             tmp_path / "t.jsonl",
             [
                 _user("hi"),
-                _assistant_tool_use(
-                    "mcp__agent-tools__append_planner_progress"),
+                _assistant_tool_use("mcp__agent-tools__append_planner_progress"),
             ],
         )
-        assert called_required_tool_this_turn(
-            transcript, ["mcp__agent-tools__append_planner_progress"]) is True
+        assert (
+            called_required_tool_this_turn(
+                transcript, ["mcp__agent-tools__append_planner_progress"]
+            )
+            is True
+        )
 
     def test_matches_short_name(self, tmp_path):
         transcript = _write_transcript(
             tmp_path / "t.jsonl",
             [
                 _user("hi"),
-                _assistant_tool_use(
-                    "mcp__agent-tools__append_planner_progress"),
+                _assistant_tool_use("mcp__agent-tools__append_planner_progress"),
             ],
         )
-        assert called_required_tool_this_turn(
-            transcript, ["append_planner_progress"]) is True
+        assert called_required_tool_this_turn(transcript, ["append_planner_progress"]) is True
 
     def test_returns_false_when_tool_not_called(self, tmp_path):
-        transcript = _write_transcript(tmp_path / "t.jsonl", [
-            _user("hi"),
-            _assistant_tool_use("Read"),
-            _assistant_text("done"),
-        ])
-        assert called_required_tool_this_turn(
-            transcript, ["append_planner_progress"]) is False
+        transcript = _write_transcript(
+            tmp_path / "t.jsonl",
+            [
+                _user("hi"),
+                _assistant_tool_use("Read"),
+                _assistant_text("done"),
+            ],
+        )
+        assert called_required_tool_this_turn(transcript, ["append_planner_progress"]) is False
 
     def test_previous_turn_calls_dont_count(self, tmp_path):
         transcript = _write_transcript(
             tmp_path / "t.jsonl",
             [
                 _user("turn 1"),
-                _assistant_tool_use("mcp__agent-tools__append_planner_progress",
-                                    "tu_1"),
+                _assistant_tool_use("mcp__agent-tools__append_planner_progress", "tu_1"),
                 _user("turn 2"),
                 _assistant_text("done without calling tool"),
             ],
         )
-        assert called_required_tool_this_turn(
-            transcript, ["append_planner_progress"]) is False
+        assert called_required_tool_this_turn(transcript, ["append_planner_progress"]) is False
 
     def test_missing_transcript_returns_false(self, tmp_path):
         missing = tmp_path / "missing.jsonl"
-        assert called_required_tool_this_turn(
-            missing, ["append_planner_progress"]) is False
+        assert called_required_tool_this_turn(missing, ["append_planner_progress"]) is False
 
     def test_malformed_lines_are_skipped(self, tmp_path):
         path = tmp_path / "t.jsonl"
         path.write_text(
-            "not json\n" + json.dumps(_user("hi")) + "\n" + json.dumps(
-                _assistant_tool_use(
-                    "mcp__agent-tools__append_planner_progress")) + "\n",
+            "not json\n"
+            + json.dumps(_user("hi"))
+            + "\n"
+            + json.dumps(_assistant_tool_use("mcp__agent-tools__append_planner_progress"))
+            + "\n",
             encoding="utf-8",
         )
-        assert called_required_tool_this_turn(
-            path, ["append_planner_progress"]) is True
+        assert called_required_tool_this_turn(path, ["append_planner_progress"]) is True
 
     def test_empty_required_is_vacuously_true(self, tmp_path):
         transcript = _write_transcript(tmp_path / "t.jsonl", [_user("hi")])
@@ -198,7 +189,6 @@ class TestCalledRequiredToolThisTurn:
 
 
 class TestRequireToolCallStopHook:
-
     def test_builds_stop_hook_structure(self, tmp_path):
         config = require_tool_call_stop_hook(["append_planner_progress"])
 
@@ -217,8 +207,7 @@ class TestRequireToolCallStopHook:
             tmp_path / "t.jsonl",
             [
                 _user("hi"),
-                _assistant_tool_use(
-                    "mcp__agent-tools__append_planner_progress"),
+                _assistant_tool_use("mcp__agent-tools__append_planner_progress"),
             ],
         )
         config = require_tool_call_stop_hook(["append_planner_progress"])

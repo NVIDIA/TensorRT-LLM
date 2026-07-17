@@ -1,5 +1,4 @@
-"""Domain specialization of :mod:`agent_flow.workflows.agent_team` for
-TensorRT-LLM model bring-up.
+"""Domain specialization of :mod:`agent_flow.workflows.agent_team` for TensorRT-LLM model bring-up.
 
 This subpackage layers modeling-bringup guidance (source boundary,
 validation policies, attention/MoE/full-model scope, accuracy gate, …)
@@ -17,6 +16,7 @@ Public surface:
   ``modeling-bringup`` and ``python -m
   agent_flow.workflows.modeling_bringup.cli``).
 """
+
 from typing import Any
 
 from .prompts import MODELING_BRINGUP_PROMPTS, build_modeling_bringup_prompts

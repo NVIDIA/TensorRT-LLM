@@ -48,8 +48,7 @@ def test_fresh_start_raises_when_plan_is_non_empty(tmp_path):
 
 def test_fresh_start_raises_when_acceptance_criteria_is_non_empty(tmp_path):
     module = _load_module()
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n", encoding="utf-8")
 
     with pytest.raises(FileExistsError, match="acceptance-criteria.md"):
         _make_workflow(module, tmp_path)
@@ -57,8 +56,7 @@ def test_fresh_start_raises_when_acceptance_criteria_is_non_empty(tmp_path):
 
 def test_fresh_start_raises_when_progress_is_non_empty(tmp_path):
     module = _load_module()
-    (tmp_path / "progress.yaml").write_text("- iteration: 1\n",
-                                            encoding="utf-8")
+    (tmp_path / "progress.yaml").write_text("- iteration: 1\n", encoding="utf-8")
 
     with pytest.raises(FileExistsError, match="progress.yaml"):
         _make_workflow(module, tmp_path)
@@ -87,8 +85,7 @@ def test_fresh_start_allows_empty_plan_and_progress(tmp_path):
     workflow = _make_workflow(module, tmp_path)
     try:
         assert (tmp_path / "plan.md").read_text(encoding="utf-8") == ""
-        assert (tmp_path /
-                "acceptance-criteria.md").read_text(encoding="utf-8") == ""
+        assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == ""
         # Fresh start seeds progress.yaml with all top-level keys empty.
         assert _empty_progress_yaml(tmp_path / "progress.yaml") == {
             "plan_stage": [],
@@ -108,8 +105,7 @@ def test_fresh_start_allows_missing_files(tmp_path):
     try:
         assert (tmp_path / "plan.md").read_text(encoding="utf-8") == ""
         # Fresh start also initializes an empty acceptance-criteria.md.
-        assert (tmp_path /
-                "acceptance-criteria.md").read_text(encoding="utf-8") == ""
+        assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == ""
         assert _empty_progress_yaml(tmp_path / "progress.yaml") == {
             "plan_stage": [],
             "build_stage": [],
@@ -122,8 +118,10 @@ def test_fresh_start_allows_missing_files(tmp_path):
 
 
 class _PromptStub:
-    """Stand-in for an ``AgentLayer`` that captures the prompt and is a
-    no-op context manager — drop-in safe for ``workflow.close()``."""
+    """Stand-in for an ``AgentLayer`` that captures the prompt.
+
+    A no-op context manager — drop-in safe for ``workflow.close()``.
+    """
 
     def __init__(self) -> None:
         self.prompts: list[str] = []
@@ -136,9 +134,11 @@ class _PromptStub:
 
 
 def test_run_coder_prompt_does_not_mention_test_command_md(tmp_path):
-    """Base agent_team should not know about ``test_command.md``; that
-    file is a modeling-bringup-only mechanism layered in via prompt
-    extensions, not by the base workflow."""
+    """Base agent_team should not know about ``test_command.md``.
+
+    That file is a modeling-bringup-only mechanism layered in via prompt
+    extensions, not by the base workflow.
+    """
     module = _load_module()
     workflow = _make_workflow(module, tmp_path)
 
@@ -187,9 +187,11 @@ def test_run_qa_prompt_does_not_mention_test_command_md(tmp_path):
 
 
 def test_fresh_start_does_not_create_test_command_md(tmp_path):
-    """Base agent_team must not create ``test_command.md`` on a fresh
-    run; the file is bring-up-only and the build-phase agents create it
-    on first write only when their domain extension tells them to."""
+    """Base agent_team must not create ``test_command.md`` on a fresh run.
+
+    The file is bring-up-only and the build-phase agents create it
+    on first write only when their domain extension tells them to.
+    """
     module = _load_module()
 
     workflow = _make_workflow(module, tmp_path)
@@ -239,13 +241,14 @@ def test_should_reset_coder_interval_zero_still_resets_after_first(tmp_path):
 def test_auto_resume_skips_non_empty_guard(tmp_path):
     module = _load_module()
     (tmp_path / "plan.md").write_text("# kept plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] kept\n",
-                                                     encoding="utf-8")
-    seeded = ("plan_stage:\n"
-              "  - iteration: 1\n"
-              "    agent: plan_drafter\n"
-              "    decision: DRAFT_READY\n"
-              "build_stage: []\n")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] kept\n", encoding="utf-8")
+    seeded = (
+        "plan_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: plan_drafter\n"
+        "    decision: DRAFT_READY\n"
+        "build_stage: []\n"
+    )
     (tmp_path / "progress.yaml").write_text(seeded, encoding="utf-8")
 
     # Presence of the checkpoint flips the workflow into resume mode; the
@@ -253,37 +256,31 @@ def test_auto_resume_skips_non_empty_guard(tmp_path):
     # progress.yaml are non-empty.
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=1))
+        module.WorkflowState(task_path=str(tmp_path / "task.yaml"), num_iterations=1),
+    )
 
     workflow = _make_workflow(module, tmp_path)
     try:
         # Non-empty files must be preserved on resume.
         assert workflow.resume is True
-        assert (tmp_path /
-                "plan.md").read_text(encoding="utf-8") == "# kept plan\n"
-        assert (tmp_path / "acceptance-criteria.md").read_text(
-            encoding="utf-8") == "- [ ] kept\n"
-        assert (tmp_path /
-                "progress.yaml").read_text(encoding="utf-8") == seeded
+        assert (tmp_path / "plan.md").read_text(encoding="utf-8") == "# kept plan\n"
+        assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == "- [ ] kept\n"
+        assert (tmp_path / "progress.yaml").read_text(encoding="utf-8") == seeded
     finally:
         workflow.close()
 
 
 def test_clean_wipes_checkpoint_and_managed_files(tmp_path):
-    """``--clean`` deletes the checkpoint plus the workflow-managed files
-    so the constructor proceeds as a fresh run."""
+    """``--clean`` deletes the checkpoint and workflow-managed files so the constructor starts fresh."""
     module = _load_module()
     (tmp_path / "plan.md").write_text("# stale plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n",
-                                                     encoding="utf-8")
-    (tmp_path / "progress.yaml").write_text("- iteration: 1\n",
-                                            encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n", encoding="utf-8")
+    (tmp_path / "progress.yaml").write_text("- iteration: 1\n", encoding="utf-8")
     (tmp_path / "status.md").write_text("# stale snapshot\n", encoding="utf-8")
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=1))
+        module.WorkflowState(task_path=str(tmp_path / "task.yaml"), num_iterations=1),
+    )
 
     # Construction with clean=True must succeed even though every managed
     # file is non-empty.
@@ -295,8 +292,7 @@ def test_clean_wipes_checkpoint_and_managed_files(tmp_path):
         # Managed files were wiped and re-initialized to empty by the
         # fresh-start path.
         assert (tmp_path / "plan.md").read_text(encoding="utf-8") == ""
-        assert (tmp_path /
-                "acceptance-criteria.md").read_text(encoding="utf-8") == ""
+        assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == ""
         assert (tmp_path / "status.md").read_text(encoding="utf-8") == ""
     finally:
         workflow.close()
@@ -326,18 +322,23 @@ def test_stage_roundtrips_through_save_and_load(tmp_path):
     module = _load_module()
     path = tmp_path / module.STATE_FILENAME
     for stage in (
-            module.STAGE_PLAN_DRAFTER,
-            module.STAGE_PLAN_REVIEWER,
-            module.STAGE_PLAN_HUMAN,
-            module.STAGE_CODER,
-            module.STAGE_REVIEWER,
-            module.STAGE_QA,
+        module.STAGE_PLAN_DRAFTER,
+        module.STAGE_PLAN_REVIEWER,
+        module.STAGE_PLAN_HUMAN,
+        module.STAGE_CODER,
+        module.STAGE_REVIEWER,
+        module.STAGE_QA,
+        module.STAGE_REPLAN,
+        module.STAGE_REPLAN_REVIEWER,
+        module.STAGE_REPLAN_HUMAN,
     ):
-        state = module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                                     num_iterations=3,
-                                     next_iteration_index=1,
-                                     plan_next_iteration_index=2,
-                                     stage=stage)
+        state = module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=3,
+            next_iteration_index=1,
+            plan_next_iteration_index=2,
+            stage=stage,
+        )
         module.save_state(path, state)
         loaded = module.load_state(path)
         assert loaded.stage == stage
@@ -363,8 +364,7 @@ def test_load_state_rejects_schema_v2(tmp_path):
     module = _load_module()
     path = tmp_path / module.STATE_FILENAME
     path.write_text(
-        '{"version": 2, "task_path": "t", "num_iterations": 1, '
-        '"stage": "coder"}',
+        '{"version": 2, "task_path": "t", "num_iterations": 1, "stage": "coder"}',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unsupported checkpoint version"):
@@ -372,8 +372,10 @@ def test_load_state_rejects_schema_v2(tmp_path):
 
 
 def test_load_state_rejects_schema_v3(tmp_path):
-    """v3 checkpoints (carrying ``plan_iterations``) are rejected so the
-    user restarts cleanly under the current schema."""
+    """v3 checkpoints (carrying ``plan_iterations``) are rejected.
+
+    This forces the user to restart cleanly under the current schema.
+    """
     module = _load_module()
     path = tmp_path / module.STATE_FILENAME
     path.write_text(
@@ -390,10 +392,12 @@ def test_save_state_round_trips_task_path(tmp_path):
     path = tmp_path / module.STATE_FILENAME
     module.save_state(
         path,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=5,
-                             next_iteration_index=2,
-                             stage=module.STAGE_REVIEWER),
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=5,
+            next_iteration_index=2,
+            stage=module.STAGE_REVIEWER,
+        ),
     )
     # The persisted JSON must carry the path, not a duplicated task string.
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -403,11 +407,51 @@ def test_save_state_round_trips_task_path(tmp_path):
     assert loaded.task_path == str(tmp_path / "task.yaml")
 
 
+def test_load_state_migrates_schema_v4(tmp_path):
+    """v4 checkpoints load unchanged and re-save as v5.
+
+    v5 only *added* the replan stages (``STAGE_REPLAN``,
+    ``STAGE_REPLAN_REVIEWER``, ``STAGE_REPLAN_HUMAN``); every v4 field
+    and stage value is unchanged, so an in-flight v4 run migrates
+    instead of being hard-rejected.
+    """
+    module = _load_module()
+    path = tmp_path / module.STATE_FILENAME
+    path.write_text(
+        '{"version": 4, "task_path": "t", "num_iterations": 1, "stage": "coder"}',
+        encoding="utf-8",
+    )
+    loaded = module.load_state(path)
+    assert loaded.stage == module.STAGE_CODER
+    assert loaded.num_iterations == 1
+
+    # The next checkpoint re-stamps the file as v5.
+    module.save_state(path, loaded)
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 5
+
+
+def test_load_state_rejects_v4_with_replan_stage(tmp_path):
+    """A v4 checkpoint could never have reached a replan stage.
+
+    A ``version: 4`` file claiming ``stage: replan`` is corrupt or
+    hand-edited — reject it rather than resuming into a sub-cycle the
+    original run never entered.
+    """
+    module = _load_module()
+    path = tmp_path / module.STATE_FILENAME
+    path.write_text(
+        '{"version": 4, "task_path": "t", "num_iterations": 1, "stage": "replan"}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unsupported stage"):
+        module.load_state(path)
+
+
 def test_load_state_rejects_unknown_stage(tmp_path):
     module = _load_module()
     path = tmp_path / module.STATE_FILENAME
     path.write_text(
-        '{"version": 4, "task_path": "t", "num_iterations": 1, "stage": "bogus"}',
+        '{"version": 5, "task_path": "t", "num_iterations": 1, "stage": "bogus"}',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unsupported stage"):
@@ -433,7 +477,9 @@ def _stub_agents(
     ``plan_drafter_decisions[mode]`` (cycled).
 
     ``plan_drafter_decisions`` defaults to ``{"draft": ["DRAFT_READY"],
-    "human": ["HUMAN_APPROVED"]}`` (one entry per call, cycled).
+    "human": ["HUMAN_APPROVED"]}`` (one entry per call, cycled). A
+    ``"replan"`` key is also recognized for replan-on-qa tests; it has
+    no default since the replan loop only runs when the workflow opts in.
     ``plan_reviewer_decisions``, ``reviewer_decisions``, ``qa_decisions``
     are consumed per stub call in order. Defaults: all ``APPROVE`` for
     both reviewers and QA.
@@ -460,22 +506,38 @@ def _stub_agents(
 
     def plan_drafter(iteration: int, mode: str):
         trace.append((iteration, f"plan_drafter:{mode}"))
+        if mode not in drafter_iters:
+            raise AssertionError(
+                f"plan_drafter stub was invoked with mode={mode!r} but "
+                f"no decision sequence was supplied for that mode. "
+                f"Pass plan_drafter_decisions={{{mode!r}: [...]}} from "
+                f"the test."
+            )
         decision = next(drafter_iters[mode], plan_drafter_decisions[mode][-1])
-        _append("plan_drafter", {
-            "iteration": iteration,
-            "agent": "plan_drafter",
-            "decision": decision,
-        })
+        _append(
+            "plan_drafter",
+            {
+                "iteration": iteration,
+                "agent": "plan_drafter",
+                "decision": decision,
+            },
+        )
 
-    def plan_reviewer(iteration: int):
-        trace.append((iteration, "plan_reviewer"))
+    def plan_reviewer(iteration: int, phase: str = "initial"):
+        # Tag the trace entry so replan-review calls are distinguishable
+        # from initial plan-phase reviews, but keep the initial-mode tag
+        # bare so the existing tests' trace assertions still match.
+        label = "plan_reviewer" if phase == "initial" else f"plan_reviewer:{phase}"
+        trace.append((iteration, label))
         decision = next(plan_reviewer_iter, "APPROVE")
         _append(
-            "plan_reviewer", {
+            "plan_reviewer",
+            {
                 "iteration": iteration,
                 "agent": "plan_reviewer",
                 "decision": decision,
-            })
+            },
+        )
 
     def coder(iteration: int):
         trace.append((iteration, "coder"))
@@ -483,23 +545,29 @@ def _stub_agents(
     def reviewer(iteration: int):
         trace.append((iteration, "reviewer"))
         decision = next(reviewer_iter, "APPROVE")
-        _append("reviewer", {
-            "iteration": iteration,
-            "agent": "reviewer",
-            "decision": decision,
-        })
+        _append(
+            "reviewer",
+            {
+                "iteration": iteration,
+                "agent": "reviewer",
+                "decision": decision,
+            },
+        )
 
     def qa(iteration: int):
         trace.append((iteration, "qa"))
         decision = next(qa_iter, "APPROVE")
         score = next(score_iter, 9.5)
-        _append(
-            "qa", {
-                "iteration": iteration,
-                "agent": "qa",
-                "decision": decision,
-                "weighted_score": float(score),
-            })
+        entry = {
+            "iteration": iteration,
+            "agent": "qa",
+            "decision": decision,
+        }
+        # A ``None`` score models a QA turn that omitted
+        # ``weighted_score`` entirely.
+        if score is not None:
+            entry["weighted_score"] = float(score)
+        _append("qa", entry)
 
     workflow._run_plan_drafter = plan_drafter
     workflow._run_plan_reviewer = plan_reviewer
@@ -515,9 +583,11 @@ def _stub_agents(
 
 
 def test_fresh_run_executes_stages_in_order(tmp_path):
-    """Happy path with plan-stage human review enabled: plan APPROVE +
-    human approve + reviewer APPROVE + qa APPROVE ends the workflow
-    immediately."""
+    """Happy path with plan-stage human review enabled.
+
+    plan APPROVE + human approve + reviewer APPROVE + qa APPROVE ends the
+    workflow immediately.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -547,9 +617,10 @@ def test_fresh_run_executes_stages_in_order(tmp_path):
 
 
 def test_no_plan_human_review_skips_plan_human_stage(tmp_path):
-    """With ``plan_human_review_enabled=False``, PlanReviewer APPROVE
-    jumps straight to the build phase without invoking the PlanDrafter
-    in human mode."""
+    """With ``plan_human_review_enabled=False``, PlanReviewer APPROVE jumps straight to the build phase.
+
+    The PlanDrafter is not invoked in human mode.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -576,8 +647,7 @@ def test_no_plan_human_review_skips_plan_human_stage(tmp_path):
 
 
 def test_no_plan_human_review_loops_back_on_plan_reviewer_reject(tmp_path):
-    """Plan-reviewer REJECT still loops back to PlanDrafter even when
-    plan-stage human review is disabled."""
+    """Plan-reviewer REJECT still loops back to PlanDrafter even when plan-stage human review is off."""
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -609,9 +679,11 @@ def test_no_plan_human_review_loops_back_on_plan_reviewer_reject(tmp_path):
 
 
 def test_no_plan_human_review_resume_from_plan_human_skips_to_coder(tmp_path):
-    """A checkpoint at STAGE_PLAN_HUMAN resumed with plan-stage human
-    review now disabled must skip straight to the build phase without
-    running the PlanDrafter in human mode."""
+    """A checkpoint at STAGE_PLAN_HUMAN resumed with plan-stage human review disabled skips to build.
+
+    It must skip straight to the build phase without running the
+    PlanDrafter in human mode.
+    """
     module = _load_module()
     (tmp_path / "plan.md").write_text("# plan\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
@@ -661,8 +733,7 @@ _TASK_CLI = ["--task", "task.yaml"]
 
 
 def test_plan_and_build_human_review_cli_flags(tmp_path):
-    """The dual human-review flags parse independently with the
-    expected defaults: both OFF."""
+    """The dual human-review flags parse independently with the expected defaults: both OFF."""
     module = _load_cli_module()
     args = module._parse_args(_TASK_CLI)
     assert args.plan_human_review_enabled is False
@@ -677,7 +748,8 @@ def test_plan_and_build_human_review_cli_flags(tmp_path):
     assert args.build_human_review_enabled is True
 
     args = module._parse_args(
-        _TASK_CLI + ["--plan-human-review", "--build-human-review"], )
+        _TASK_CLI + ["--plan-human-review", "--build-human-review"],
+    )
     assert args.plan_human_review_enabled is True
     assert args.build_human_review_enabled is True
 
@@ -696,8 +768,7 @@ def test_feedback_cli_flag_default_and_value():
     module = _load_cli_module()
     args = module._parse_args(_TASK_CLI)
     assert args.feedback is None
-    args = module._parse_args(_TASK_CLI +
-                              ["--feedback", "please add streaming"])
+    args = module._parse_args(_TASK_CLI + ["--feedback", "please add streaming"])
     assert args.feedback == "please add streaming"
 
 
@@ -711,8 +782,7 @@ def test_feedback_on_fresh_run_raises(tmp_path):
     """
     module = _load_module()
     with pytest.raises(ValueError, match="--feedback is only valid") as exc:
-        module.AgentTeamWorkflow(workspace=tmp_path,
-                                 feedback="please add streaming")
+        module.AgentTeamWorkflow(workspace=tmp_path, feedback="please add streaming")
     # The error redirects the user to put initial guidance into the task
     # description, since --feedback on a fresh run would otherwise look
     # like the right knob for "tell the workflow what to do up front".
@@ -723,17 +793,16 @@ def test_feedback_on_fresh_run_raises(tmp_path):
 
 
 def test_feedback_with_clean_raises_even_when_checkpoint_existed(tmp_path):
-    """``--clean`` wipes the checkpoint *before* the resume check, so passing
-    ``--feedback`` alongside ``--clean`` is still a fresh run and must error.
+    """``--clean`` wipes the checkpoint *before* the resume check.
+
+    So passing ``--feedback`` alongside ``--clean`` is still a fresh run and must error.
     Otherwise the user would think they were course-correcting an existing
     workflow while actually starting over.
     """
     module = _load_module()
     _seed_build_phase_resume(module, tmp_path)
     with pytest.raises(ValueError, match="--feedback is only valid"):
-        module.AgentTeamWorkflow(workspace=tmp_path,
-                                 clean=True,
-                                 feedback="please add streaming")
+        module.AgentTeamWorkflow(workspace=tmp_path, clean=True, feedback="please add streaming")
 
 
 def _seed_build_phase_resume(module, tmp_path, *, next_iteration_index=0):
@@ -745,8 +814,7 @@ def _seed_build_phase_resume(module, tmp_path, *, next_iteration_index=0):
     """
     (tmp_path / "task.yaml").write_text("Do it.\n", encoding="utf-8")
     (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
         "plan_stage: []\nbuild_stage: []\nhuman_feedback: []\n",
         encoding="utf-8",
@@ -754,10 +822,13 @@ def _seed_build_phase_resume(module, tmp_path, *, next_iteration_index=0):
     (tmp_path / "status.md").write_text("", encoding="utf-8")
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=0,
-                             next_iteration_index=next_iteration_index,
-                             stage=module.STAGE_CODER))
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=0,
+            next_iteration_index=next_iteration_index,
+            stage=module.STAGE_CODER,
+        ),
+    )
 
 
 def _stub_workflow_agents(workflow):
@@ -768,7 +839,6 @@ def _stub_workflow_agents(workflow):
     """
 
     class _Stub:
-
         def __call__(self, _prompt):
             return None
 
@@ -804,43 +874,47 @@ def _run_workflow_with_feedback(module, tmp_path, feedback):
 
 def _load_progress_yaml(path):
     import yaml
+
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def test_feedback_text_appends_to_progress_yaml_on_resume(tmp_path):
-    """Resuming with ``--feedback "..."`` appends a ``human_feedback`` entry
-    stamped with the upcoming build iteration, without disturbing prior
-    plan/build entries.
+    """Resuming with ``--feedback "..."`` appends a ``human_feedback`` entry.
+
+    The entry is stamped with the upcoming build iteration, without
+    disturbing prior plan/build entries.
     """
     module = _load_module()
     # Seed prior plan + build entries so we can verify they survive.
-    seeded = ("plan_stage:\n"
-              "  - iteration: 1\n"
-              "    agent: plan_drafter\n"
-              "    timestamp: \"t1\"\n"
-              "    summary: drafted\n"
-              "    decision: HUMAN_APPROVED\n"
-              "build_stage:\n"
-              "  - iteration: 1\n"
-              "    agent: coder\n"
-              "    timestamp: \"t2\"\n"
-              "    summary: implemented v1\n"
-              "human_feedback: []\n")
+    seeded = (
+        "plan_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: plan_drafter\n"
+        '    timestamp: "t1"\n'
+        "    summary: drafted\n"
+        "    decision: HUMAN_APPROVED\n"
+        "build_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: coder\n"
+        '    timestamp: "t2"\n'
+        "    summary: implemented v1\n"
+        "human_feedback: []\n"
+    )
     (tmp_path / "task.yaml").write_text("Do the thing.\n", encoding="utf-8")
     (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(seeded, encoding="utf-8")
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=0,
-                             next_iteration_index=1,
-                             stage=module.STAGE_CODER))
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=0,
+            next_iteration_index=1,
+            stage=module.STAGE_CODER,
+        ),
+    )
 
-    _run_workflow_with_feedback(module,
-                                tmp_path,
-                                feedback="please add streaming output")
+    _run_workflow_with_feedback(module, tmp_path, feedback="please add streaming output")
 
     data = _load_progress_yaml(tmp_path / "progress.yaml")
     # Prior plan/build entries are preserved.
@@ -870,8 +944,7 @@ def test_feedback_path_reads_file_contents(tmp_path):
     data = _load_progress_yaml(tmp_path / "progress.yaml")
     assert len(data["human_feedback"]) == 1
     # Trailing whitespace is trimmed but interior newlines are preserved.
-    assert data["human_feedback"][0]["summary"].strip() == (
-        "multi\nline feedback")
+    assert data["human_feedback"][0]["summary"].strip() == ("multi\nline feedback")
 
 
 def test_feedback_resolves_to_text_when_path_does_not_exist(tmp_path):
@@ -879,9 +952,7 @@ def test_feedback_resolves_to_text_when_path_does_not_exist(tmp_path):
     module = _load_module()
     _seed_build_phase_resume(module, tmp_path)
 
-    _run_workflow_with_feedback(module,
-                                tmp_path,
-                                feedback="not/a/real/file.txt")
+    _run_workflow_with_feedback(module, tmp_path, feedback="not/a/real/file.txt")
 
     data = _load_progress_yaml(tmp_path / "progress.yaml")
     assert len(data["human_feedback"]) == 1
@@ -900,9 +971,9 @@ def test_feedback_empty_input_records_nothing(tmp_path):
 
 
 def test_feedback_accumulates_across_invocations(tmp_path):
-    """Re-running with another ``--feedback`` appends a new entry rather
-    than overwriting the previous one — supporting iterative course
-    correction.
+    """Re-running with another ``--feedback`` appends a new entry rather than overwriting.
+
+    This supports iterative course correction.
 
     Real usage: the user Ctrl-Cs mid-iteration, leaving ``state.done=False``;
     re-running with another ``--feedback`` appends. Between the two
@@ -923,13 +994,17 @@ def test_feedback_accumulates_across_invocations(tmp_path):
     _run_workflow_with_feedback(module, tmp_path, feedback="second feedback")
 
     data = _load_progress_yaml(tmp_path / "progress.yaml")
-    assert [e["summary"].strip() for e in data["human_feedback"]
-            ] == ["first feedback", "second feedback"]
+    assert [e["summary"].strip() for e in data["human_feedback"]] == [
+        "first feedback",
+        "second feedback",
+    ]
 
 
 def test_resume_done_without_feedback_is_noop(tmp_path):
-    """Re-running a completed workflow with no ``--feedback`` short-circuits:
-    no agent runs, no feedback is recorded, the checkpoint stays done."""
+    """Re-running a completed workflow with no ``--feedback`` short-circuits.
+
+    No agent runs, no feedback is recorded, the checkpoint stays done.
+    """
     module = _load_module()
     _seed_build_phase_resume(module, tmp_path, next_iteration_index=2)
     # Mark the checkpoint as already-completed.
@@ -955,14 +1030,15 @@ def test_resume_done_without_feedback_is_noop(tmp_path):
 
 
 def test_resume_done_with_feedback_re_engages_build_phase(tmp_path):
-    """Re-running a completed workflow with ``--feedback`` flips done back
-    to False, records the feedback, and lets the build phase pick up at
-    the next iteration to address it."""
+    """Re-running a completed workflow with ``--feedback`` flips done back to False.
+
+    It records the feedback and lets the build phase pick up at the next
+    iteration to address it.
+    """
     module = _load_module()
     (tmp_path / "task.yaml").write_text("Do it.\n", encoding="utf-8")
     (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
         "plan_stage: []\nbuild_stage: []\nhuman_feedback: []\n",
         encoding="utf-8",
@@ -972,11 +1048,14 @@ def test_resume_done_with_feedback_re_engages_build_phase(tmp_path):
     # stage=STAGE_CODER (the post-APPROVE bookkeeping in run()).
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=5,
-                             next_iteration_index=2,
-                             stage=module.STAGE_CODER,
-                             done=True))
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=5,
+            next_iteration_index=2,
+            stage=module.STAGE_CODER,
+            done=True,
+        ),
+    )
 
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1007,15 +1086,15 @@ def test_resume_done_with_feedback_re_engages_build_phase(tmp_path):
     assert fb["stage"] == "build_stage"
 
 
-def test_resume_done_with_feedback_checkpoints_done_false_before_running(
-        tmp_path):
-    """The done→not-done flip must hit disk before any agent runs so a
-    crash mid-iteration doesn't strand the workflow in the done branch."""
+def test_resume_done_with_feedback_checkpoints_done_false_before_running(tmp_path):
+    """The done->not-done flip must hit disk before any agent runs.
+
+    This ensures a crash mid-iteration doesn't strand the workflow in the done branch.
+    """
     module = _load_module()
     (tmp_path / "task.yaml").write_text("Do it.\n", encoding="utf-8")
     (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
         "plan_stage: []\nbuild_stage: []\nhuman_feedback: []\n",
         encoding="utf-8",
@@ -1025,11 +1104,14 @@ def test_resume_done_with_feedback_checkpoints_done_false_before_running(
     # exactly one build iteration regardless of reviewer/qa decisions.
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=2,
-                             next_iteration_index=1,
-                             stage=module.STAGE_CODER,
-                             done=True))
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=2,
+            next_iteration_index=1,
+            stage=module.STAGE_CODER,
+            done=True,
+        ),
+    )
 
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1039,8 +1121,7 @@ def test_resume_done_with_feedback_checkpoints_done_false_before_running(
     observed: list[bool] = []
 
     def coder(_iteration: int):
-        observed.append(
-            module.load_state(tmp_path / module.STATE_FILENAME).done)
+        observed.append(module.load_state(tmp_path / module.STATE_FILENAME).done)
 
     workflow._run_coder = coder
     workflow._run_reviewer = lambda _it: None
@@ -1048,9 +1129,11 @@ def test_resume_done_with_feedback_checkpoints_done_false_before_running(
     workflow._reset_coder = lambda: None
     workflow._reset_reviewer = lambda: None
     workflow._run_plan_drafter = lambda *a, **kw: pytest.fail(
-        "plan phase must not run when resuming a completed build")
+        "plan phase must not run when resuming a completed build"
+    )
     workflow._run_plan_reviewer = lambda *a, **kw: pytest.fail(
-        "plan phase must not run when resuming a completed build")
+        "plan phase must not run when resuming a completed build"
+    )
 
     try:
         workflow.run(_write_task_yaml(workflow.workspace))
@@ -1063,8 +1146,9 @@ def test_resume_done_with_feedback_checkpoints_done_false_before_running(
 
 
 def test_resume_done_with_feedback_extends_budget_when_exhausted(tmp_path):
-    """Re-engaging a budget-exhausted completed run with ``--feedback``
-    must grant a fresh budget so the build loop actually runs.
+    """Re-engaging a budget-exhausted completed run with ``--feedback`` must grant a fresh budget.
+
+    This ensures the build loop actually runs.
 
     Without the extension, ``range(next_iteration_index, num_iterations)``
     is empty when the prior run finished at the iteration cap, so the
@@ -1075,8 +1159,7 @@ def test_resume_done_with_feedback_extends_budget_when_exhausted(tmp_path):
     module = _load_module()
     (tmp_path / "task.yaml").write_text("Do it.\n", encoding="utf-8")
     (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
         "plan_stage: []\nbuild_stage: []\nhuman_feedback: []\n",
         encoding="utf-8",
@@ -1087,11 +1170,14 @@ def test_resume_done_with_feedback_extends_budget_when_exhausted(tmp_path):
     # next_iteration_index == num_iterations.
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=3,
-                             next_iteration_index=3,
-                             stage=module.STAGE_CODER,
-                             done=True))
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=3,
+            next_iteration_index=3,
+            stage=module.STAGE_CODER,
+            done=True,
+        ),
+    )
 
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1124,9 +1210,9 @@ def test_resume_done_with_feedback_extends_budget_when_exhausted(tmp_path):
 
 
 def test_feedback_long_literal_falls_back_when_path_probe_errors(tmp_path):
-    """A long literal ``--feedback`` value that exceeds the OS path-length
-    limit must be treated as text, not raise ``OSError`` from the
-    path-existence probe.
+    """A long literal ``--feedback`` value exceeding the OS path-length limit must be treated as text.
+
+    It must not raise ``OSError`` from the path-existence probe.
 
     ``--feedback`` advertises that the value is either the literal text
     or a path to a file. ``Path.is_file`` raises ``OSError: [Errno 36]
@@ -1148,7 +1234,7 @@ def test_feedback_long_literal_falls_back_when_path_probe_errors(tmp_path):
 
 
 def test_resolve_feedback_input_handles_overlong_string():
-    """Direct unit test for the path-probe ``OSError`` guard.
+    """Test the path-probe ``OSError`` guard directly.
 
     ``_resolve_feedback_input`` is called with raw CLI values; if the
     user pastes a long free-form note, the ``Path(...).is_file`` probe
@@ -1157,20 +1243,20 @@ def test_resolve_feedback_input_handles_overlong_string():
     """
     module = _load_module()
     long_text = "y" * 5000
-    assert module.AgentTeamWorkflow._resolve_feedback_input(
-        long_text) == long_text
+    assert module.AgentTeamWorkflow._resolve_feedback_input(long_text) == long_text
 
 
 def test_feedback_iteration_uses_plan_next_when_in_plan_stage(tmp_path):
-    """If the workflow is mid-plan when --feedback lands, the entry's
-    ``stage`` reflects the plan phase and the iteration is the upcoming
+    """If the workflow is mid-plan when --feedback lands, the entry reflects the plan phase.
+
+    The ``stage`` reflects the plan phase and the iteration is the upcoming
     plan iteration. (Build agents won't read it until the build phase,
-    but the metadata stays honest.)"""
+    but the metadata stays honest.)
+    """
     module = _load_module()
     (tmp_path / "task.yaml").write_text("Do it.\n", encoding="utf-8")
     (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
         "plan_stage: []\nbuild_stage: []\nhuman_feedback: []\n",
         encoding="utf-8",
@@ -1178,10 +1264,13 @@ def test_feedback_iteration_uses_plan_next_when_in_plan_stage(tmp_path):
     (tmp_path / "status.md").write_text("", encoding="utf-8")
     module.save_state(
         tmp_path / module.STATE_FILENAME,
-        module.WorkflowState(task_path=str(tmp_path / "task.yaml"),
-                             num_iterations=0,
-                             plan_next_iteration_index=2,
-                             stage=module.STAGE_PLAN_DRAFTER))
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=0,
+            plan_next_iteration_index=2,
+            stage=module.STAGE_PLAN_DRAFTER,
+        ),
+    )
 
     _run_workflow_with_feedback(module, tmp_path, feedback="reconsider X")
 
@@ -1192,8 +1281,7 @@ def test_feedback_iteration_uses_plan_next_when_in_plan_stage(tmp_path):
 
 
 def test_plan_reviewer_reject_loops_back_to_drafter(tmp_path):
-    """PlanReviewer REJECT must loop back to PlanDrafter without entering
-    the human-review stage."""
+    """PlanReviewer REJECT must loop back to PlanDrafter without entering the human-review stage."""
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1226,9 +1314,11 @@ def test_plan_reviewer_reject_loops_back_to_drafter(tmp_path):
 
 
 def test_plan_human_polish_loop_does_not_rerun_plan_reviewer(tmp_path):
-    """When the human asks for changes (plan_drafter decision != HUMAN_APPROVED),
-    the orchestrator re-invokes the PlanDrafter in human mode without
-    rerunning the AI PlanReviewer."""
+    """When the human asks for changes (plan_drafter decision != HUMAN_APPROVED), the drafter reruns.
+
+    The orchestrator re-invokes the PlanDrafter in human mode without
+    rerunning the AI PlanReviewer.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1397,7 +1487,8 @@ def test_min_score_zero_disables_score_gate(tmp_path):
 
 
 def test_status_tools_wired_only_to_coder_and_reviewer(tmp_path):
-    """Coder and Reviewer must have ``update_status`` / ``read_status``;
+    """Coder and Reviewer must have ``update_status`` / ``read_status``.
+
     PlanDrafter, PlanReviewer, and QA must not.
     """
     module = _load_module()
@@ -1429,9 +1520,11 @@ def test_status_tools_wired_only_to_coder_and_reviewer(tmp_path):
 
 
 def test_coder_human_input_disabled_by_default(tmp_path):
-    """Build-stage human review is OFF by default — the Coder must NOT
-    have ``human_input_enabled`` unless ``--build-human-review`` is
-    passed."""
+    """Build-stage human review is OFF by default.
+
+    The Coder must NOT have ``human_input_enabled`` unless
+    ``--build-human-review`` is passed.
+    """
     module = _load_module()
     workflow = _make_workflow(module, tmp_path)
     try:
@@ -1441,9 +1534,10 @@ def test_coder_human_input_disabled_by_default(tmp_path):
 
 
 def test_coder_human_input_enabled_with_build_human_review(tmp_path):
-    """``--build-human-review`` (constructor arg
-    ``build_human_review_enabled=True``) gives the Coder
-    ``human_input_enabled`` so it can call ``ask_human``."""
+    """``--build-human-review`` gives the Coder ``human_input_enabled`` so it can call ``ask_human``.
+
+    The matching constructor arg is ``build_human_review_enabled=True``.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1456,10 +1550,13 @@ def test_coder_human_input_enabled_with_build_human_review(tmp_path):
 
 
 def test_coder_human_input_independent_of_plan_human_review(tmp_path):
-    """The two flags are independent: turning off plan-stage human
-    review does NOT disable the Coder's ``ask_human`` if the build-stage
-    opt-in is set; and turning on plan-stage human review does NOT
-    enable the Coder's ``ask_human`` on its own."""
+    """The two flags are independent.
+
+    Turning off plan-stage human review does NOT disable the Coder's
+    ``ask_human`` if the build-stage opt-in is set; and turning on
+    plan-stage human review does NOT enable the Coder's ``ask_human`` on
+    its own.
+    """
     module = _load_module()
 
     plan_off_build_on = module.AgentTeamWorkflow(
@@ -1484,8 +1581,10 @@ def test_coder_human_input_independent_of_plan_human_review(tmp_path):
 
 
 def test_plan_drafter_always_has_human_input_enabled(tmp_path):
-    """PlanDrafter's flag is unconditional regardless of either review
-    flag; PlanReviewer/Reviewer/QA stay off in all combinations."""
+    """PlanDrafter's flag is unconditional regardless of either review flag.
+
+    PlanReviewer/Reviewer/QA stay off in all combinations.
+    """
     module = _load_module()
     combos = [
         (True, False),
@@ -1501,18 +1600,18 @@ def test_plan_drafter_always_has_human_input_enabled(tmp_path):
         )
         try:
             assert workflow.plan_drafter.config.human_input_enabled is True
-            for layer in (workflow.plan_reviewer, workflow.reviewer,
-                          workflow.qa):
+            for layer in (workflow.plan_reviewer, workflow.reviewer, workflow.qa):
                 assert layer.config.human_input_enabled is False
         finally:
             workflow.close()
 
 
 def test_reset_coder_preserves_human_input_flag(tmp_path):
-    """After ``_reset_coder``, the rebuilt Coder must keep
-    ``human_input_enabled`` aligned with ``build_human_review_enabled``;
-    otherwise mid-run resets would silently drop the ``ask_human``
-    tool."""
+    """After ``_reset_coder``, the rebuilt Coder keeps ``human_input_enabled`` aligned with the flag.
+
+    It must stay aligned with ``build_human_review_enabled``; otherwise
+    mid-run resets would silently drop the ``ask_human`` tool.
+    """
     module = _load_module()
 
     enabled = module.AgentTeamWorkflow(
@@ -1536,9 +1635,11 @@ def test_reset_coder_preserves_human_input_flag(tmp_path):
 
 
 def test_coder_prompt_documents_ask_human():
-    """Coder system prompt must mention ``ask_human``, the strict
-    last-resort framing, the build-stage opt-in flag, and the no-reply
-    contract."""
+    """Coder system prompt must mention ``ask_human`` and its surrounding contract.
+
+    It must cover the strict last-resort framing, the build-stage opt-in
+    flag, and the no-reply contract.
+    """
     module = _load_module()
     text = module.DEFAULT_PROMPTS.coder
     assert "ask_human" in text
@@ -1587,13 +1688,11 @@ def test_compose_required_tools_hooks_handles_empty_and_single(tmp_path):
 
     assert module._compose_required_tools_hooks([]) is None
 
-    single = module._compose_required_tools_hooks(
-        ["append_plan_drafter_progress"])
+    single = module._compose_required_tools_hooks(["append_plan_drafter_progress"])
     assert single is not None
     assert len(single["Stop"]) == 1
 
-    pair = module._compose_required_tools_hooks(
-        ["append_coder_progress", "update_status"])
+    pair = module._compose_required_tools_hooks(["append_coder_progress", "update_status"])
     assert pair is not None
     assert len(pair["Stop"]) == 2
 
@@ -1657,35 +1756,36 @@ def test_fresh_run_checkpoints_stage_between_agents(tmp_path):
         # readers see HUMAN_APPROVED in the human phase.
         decision = "HUMAN_APPROVED" if mode == "human" else "DRAFT_READY"
         data = progress_module.read_progress(workflow.progress_path)
-        data["plan_stage"].append({
-            "iteration": iteration,
-            "agent": "plan_drafter",
-            "decision": decision,
-        })
+        data["plan_stage"].append(
+            {
+                "iteration": iteration,
+                "agent": "plan_drafter",
+                "decision": decision,
+            }
+        )
         progress_module.write_progress(workflow.progress_path, data)
 
     def plan_reviewer(iteration: int):
         trace.append((iteration, "plan_reviewer"))
         data = progress_module.read_progress(workflow.progress_path)
-        data["plan_stage"].append({
-            "iteration": iteration,
-            "agent": "plan_reviewer",
-            "decision": "APPROVE",
-        })
+        data["plan_stage"].append(
+            {
+                "iteration": iteration,
+                "agent": "plan_reviewer",
+                "decision": "APPROVE",
+            }
+        )
         progress_module.write_progress(workflow.progress_path, data)
 
     def coder(iteration: int):
         trace.append((iteration, "coder"))
-        captured.append(
-            module.load_state(tmp_path /
-                              module.STATE_FILENAME).stage)  # pre-coder
+        captured.append(module.load_state(tmp_path / module.STATE_FILENAME).stage)  # pre-coder
 
     def reviewer(iteration: int):
         trace.append((iteration, "reviewer"))
         # After coder completes, the checkpoint must now point at the
         # reviewer so a crash here resumes at the reviewer, not the coder.
-        captured.append(
-            module.load_state(tmp_path / module.STATE_FILENAME).stage)
+        captured.append(module.load_state(tmp_path / module.STATE_FILENAME).stage)
         raise KeyboardInterrupt
 
     workflow._run_plan_drafter = plan_drafter
@@ -1723,8 +1823,7 @@ def test_fresh_run_checkpoints_plan_drafter_stage_before_running(tmp_path):
         # Checkpoint written in _init_state *before* the PlanDrafter call
         # must reflect the plan_drafter stage so a crash here resumes
         # there.
-        observed.append(
-            module.load_state(tmp_path / module.STATE_FILENAME).stage)
+        observed.append(module.load_state(tmp_path / module.STATE_FILENAME).stage)
         raise RuntimeError("plan_drafter blew up")
 
     workflow._run_plan_drafter = plan_drafter
@@ -1742,8 +1841,7 @@ def test_fresh_run_checkpoints_plan_drafter_stage_before_running(tmp_path):
 
 
 def test_resume_from_plan_human_skips_drafter_and_reviewer(tmp_path):
-    """A crash in the human stage resumes at the human stage; drafter/reviewer
-    don't re-run."""
+    """A crash in the human stage resumes at the human stage; drafter/reviewer don't re-run."""
     module = _load_module()
     # Pre-populate as if drafter+reviewer already ran for plan iteration 1.
     (tmp_path / "plan.md").write_text("# plan\n", encoding="utf-8")
@@ -1796,11 +1894,8 @@ def test_resume_from_reviewer_skips_coder(tmp_path):
     # Pre-populate the workspace as if iteration 1's coder already ran.
     (tmp_path / "plan.md").write_text("plan\n", encoding="utf-8")
     (tmp_path / "progress.yaml").write_text(
-        "plan_stage: []\n"
-        "build_stage:\n"
-        "  - iteration: 1\n"
-        "    agent: coder\n",
-        encoding="utf-8")
+        "plan_stage: []\nbuild_stage:\n  - iteration: 1\n    agent: coder\n", encoding="utf-8"
+    )
     module.save_state(
         tmp_path / module.STATE_FILENAME,
         module.WorkflowState(
@@ -1834,9 +1929,11 @@ def test_resume_from_reviewer_skips_coder(tmp_path):
 
 
 def test_both_presets_skip_plan_phase_and_start_at_coder(tmp_path):
-    """Supplying both ``plan`` and ``acceptance_criteria`` on a fresh run
-    must populate both files, set the initial stage to coder, and run
-    only the build phase."""
+    """Supplying both ``plan`` and ``acceptance_criteria`` on a fresh run skips the plan phase.
+
+    It must populate both files, set the initial stage to coder, and run
+    only the build phase.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1856,17 +1953,21 @@ def test_both_presets_skip_plan_phase_and_start_at_coder(tmp_path):
         (1, "reviewer"),
         (1, "qa"),
     ]
-    assert (tmp_path / "plan.md").read_text(
-        encoding="utf-8") == ("# pre-supplied plan\nstep one.\n")
-    assert (tmp_path / "acceptance-criteria.md").read_text(
-        encoding="utf-8") == ("- [ ] hello world prints\n")
+    assert (tmp_path / "plan.md").read_text(encoding="utf-8") == (
+        "# pre-supplied plan\nstep one.\n"
+    )
+    assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == (
+        "- [ ] hello world prints\n"
+    )
     state = module.load_state(tmp_path / module.STATE_FILENAME)
     assert state.done is True
 
 
 def test_both_presets_initial_checkpoint_starts_at_coder(tmp_path):
-    """Even before ``run`` is called, the first checkpoint must reflect
-    that the plan phase is being skipped when both presets are supplied."""
+    """Even before ``run`` is called, the first checkpoint reflects a skipped plan phase.
+
+    This holds when both presets are supplied.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1877,8 +1978,7 @@ def test_both_presets_initial_checkpoint_starts_at_coder(tmp_path):
     captured: list[str] = []
 
     def coder(_iteration: int):
-        captured.append(
-            module.load_state(tmp_path / module.STATE_FILENAME).stage)
+        captured.append(module.load_state(tmp_path / module.STATE_FILENAME).stage)
 
     workflow._run_coder = coder
     workflow._run_reviewer = lambda _it: None
@@ -1887,9 +1987,11 @@ def test_both_presets_initial_checkpoint_starts_at_coder(tmp_path):
     workflow._reset_reviewer = lambda: None
     # Plan-phase agents must never be invoked when both presets are set.
     workflow._run_plan_drafter = lambda *a, **kw: pytest.fail(
-        "plan_drafter must not run when both presets are set")
+        "plan_drafter must not run when both presets are set"
+    )
     workflow._run_plan_reviewer = lambda *a, **kw: pytest.fail(
-        "plan_reviewer must not run when both presets are set")
+        "plan_reviewer must not run when both presets are set"
+    )
 
     try:
         workflow.run(_write_task_yaml(workflow.workspace))
@@ -1901,10 +2003,11 @@ def test_both_presets_initial_checkpoint_starts_at_coder(tmp_path):
 
 
 def test_only_plan_preset_runs_plan_phase(tmp_path):
-    """Supplying only ``plan`` (no acceptance_criteria) must still run
-    the plan phase so the PlanDrafter can generate
-    `acceptance-criteria.md`. plan.md is materialized from the preset
-    before the plan phase runs."""
+    """Supplying only ``plan`` (no acceptance_criteria) must still run the plan phase.
+
+    The PlanDrafter can generate `acceptance-criteria.md`. plan.md is
+    materialized from the preset before the plan phase runs.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1928,17 +2031,19 @@ def test_only_plan_preset_runs_plan_phase(tmp_path):
         (1, "qa"),
     ]
     # plan.md was materialized from the preset before the plan phase ran.
-    assert (tmp_path / "plan.md").read_text(
-        encoding="utf-8") == ("# pre-supplied plan\nstep one.\n")
+    assert (tmp_path / "plan.md").read_text(encoding="utf-8") == (
+        "# pre-supplied plan\nstep one.\n"
+    )
     # acceptance-criteria.md exists but is empty (the stub PlanDrafter
     # doesn't actually generate content; the real one would).
-    assert (tmp_path /
-            "acceptance-criteria.md").read_text(encoding="utf-8") == ""
+    assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == ""
 
 
 def test_only_acceptance_criteria_preset_runs_plan_phase(tmp_path):
-    """Symmetric: supplying only ``acceptance_criteria`` must still run
-    the plan phase so the PlanDrafter can generate `plan.md`."""
+    """Supplying only ``acceptance_criteria`` must still run the plan phase (symmetric case).
+
+    This lets the PlanDrafter generate `plan.md`.
+    """
     module = _load_module()
     workflow = module.AgentTeamWorkflow(
         workspace=tmp_path,
@@ -1961,13 +2066,16 @@ def test_only_acceptance_criteria_preset_runs_plan_phase(tmp_path):
         (1, "qa"),
     ]
     assert (tmp_path / "acceptance-criteria.md").read_text(
-        encoding="utf-8") == "- [ ] pre-supplied criterion\n"
+        encoding="utf-8"
+    ) == "- [ ] pre-supplied criterion\n"
     assert (tmp_path / "plan.md").read_text(encoding="utf-8") == ""
 
 
 def test_plan_arg_accepts_path_to_file(tmp_path):
-    """Passing a path to an existing file copies that file's content into
-    plan.md verbatim (mirrors how ``--task`` handles a path)."""
+    """Passing a path to an existing file copies that file's content into plan.md verbatim.
+
+    This mirrors how ``--task`` handles a path.
+    """
     module = _load_module()
     src = tmp_path / "external_plan.md"
     src.write_text("# from a file\n- bullet\n", encoding="utf-8")
@@ -1989,15 +2097,14 @@ def test_plan_arg_accepts_path_to_file(tmp_path):
 
     # Both plan-phase outputs must match their source files byte-for-byte
     # after ``run`` materializes them.
-    assert (work / "plan.md").read_text(
-        encoding="utf-8") == ("# from a file\n- bullet\n")
-    assert (work / "acceptance-criteria.md").read_text(
-        encoding="utf-8") == ("- [ ] from-file criterion\n")
+    assert (work / "plan.md").read_text(encoding="utf-8") == ("# from a file\n- bullet\n")
+    assert (work / "acceptance-criteria.md").read_text(encoding="utf-8") == (
+        "- [ ] from-file criterion\n"
+    )
 
 
 def test_acceptance_criteria_arg_accepts_path_to_file(tmp_path):
-    """``--acceptance-criteria`` accepts a path to an existing file just
-    like ``--plan`` does."""
+    """``--acceptance-criteria`` accepts a path to an existing file just like ``--plan`` does."""
     module = _load_module()
     src = tmp_path / "external_criteria.md"
     src.write_text("- [ ] one\n- [ ] two\n", encoding="utf-8")
@@ -2017,17 +2124,19 @@ def test_acceptance_criteria_arg_accepts_path_to_file(tmp_path):
     finally:
         workflow.close()
 
-    assert (work / "acceptance-criteria.md").read_text(
-        encoding="utf-8") == ("- [ ] one\n- [ ] two\n")
+    assert (work / "acceptance-criteria.md").read_text(encoding="utf-8") == (
+        "- [ ] one\n- [ ] two\n"
+    )
 
 
 def test_presets_allow_existing_files_and_overwrite_them(tmp_path):
-    """Stale plan.md and acceptance-criteria.md are allowed when their
-    matching presets are set; ``run`` overwrites them."""
+    """Stale plan.md and acceptance-criteria.md are allowed when their matching presets are set.
+
+    ``run`` overwrites them.
+    """
     module = _load_module()
     (tmp_path / "plan.md").write_text("# stale plan\n", encoding="utf-8")
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n", encoding="utf-8")
 
     # Construction must not raise — both guards relaxed because the
     # matching presets are provided.
@@ -2043,18 +2152,14 @@ def test_presets_allow_existing_files_and_overwrite_them(tmp_path):
     finally:
         workflow.close()
 
-    assert (tmp_path /
-            "plan.md").read_text(encoding="utf-8") == "# fresh plan\n"
-    assert (tmp_path / "acceptance-criteria.md").read_text(
-        encoding="utf-8") == "- [ ] fresh\n"
+    assert (tmp_path / "plan.md").read_text(encoding="utf-8") == "# fresh plan\n"
+    assert (tmp_path / "acceptance-criteria.md").read_text(encoding="utf-8") == "- [ ] fresh\n"
 
 
 def test_plan_arg_still_guards_progress_and_status(tmp_path):
-    """``--plan`` only relaxes the plan.md guard; non-empty progress.yaml
-    or status.md must still raise."""
+    """``--plan`` only relaxes the plan.md guard; non-empty progress.yaml or status.md must raise."""
     module = _load_module()
-    (tmp_path / "progress.yaml").write_text("- iteration: 1\n",
-                                            encoding="utf-8")
+    (tmp_path / "progress.yaml").write_text("- iteration: 1\n", encoding="utf-8")
     with pytest.raises(FileExistsError, match="progress.yaml"):
         module.AgentTeamWorkflow(
             workspace=tmp_path,
@@ -2063,12 +2168,13 @@ def test_plan_arg_still_guards_progress_and_status(tmp_path):
 
 
 def test_plan_arg_alone_still_guards_acceptance_criteria(tmp_path):
-    """``--plan`` does NOT relax the acceptance-criteria.md guard; a
-    non-empty `acceptance-criteria.md` must still raise unless
-    ``--acceptance-criteria`` is also set."""
+    """``--plan`` does NOT relax the acceptance-criteria.md guard.
+
+    A non-empty `acceptance-criteria.md` must still raise unless
+    ``--acceptance-criteria`` is also set.
+    """
     module = _load_module()
-    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n",
-                                                     encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] stale\n", encoding="utf-8")
     with pytest.raises(FileExistsError, match="acceptance-criteria.md"):
         module.AgentTeamWorkflow(
             workspace=tmp_path,
@@ -2077,8 +2183,7 @@ def test_plan_arg_alone_still_guards_acceptance_criteria(tmp_path):
 
 
 def test_acceptance_criteria_arg_alone_still_guards_plan(tmp_path):
-    """``--acceptance-criteria`` does NOT relax the plan.md guard
-    symmetrically."""
+    """``--acceptance-criteria`` does NOT relax the plan.md guard symmetrically."""
     module = _load_module()
     (tmp_path / "plan.md").write_text("# stale\n", encoding="utf-8")
     with pytest.raises(FileExistsError, match="plan.md"):
@@ -2098,13 +2203,11 @@ def test_plan_cli_flag_default_and_value(tmp_path):
 
 
 def test_acceptance_criteria_cli_flag_default_and_value(tmp_path):
-    """``--acceptance-criteria`` parses to None by default and to the
-    supplied string."""
+    """``--acceptance-criteria`` parses to None by default and to the supplied string."""
     module = _load_cli_module()
     args = module._parse_args(_TASK_CLI)
     assert args.acceptance_criteria is None
-    args = module._parse_args(_TASK_CLI +
-                              ["--acceptance-criteria", "/path/to/criteria.md"])
+    args = module._parse_args(_TASK_CLI + ["--acceptance-criteria", "/path/to/criteria.md"])
     assert args.acceptance_criteria == "/path/to/criteria.md"
 
 
@@ -2119,7 +2222,8 @@ def test_resume_from_qa_skips_coder_and_reviewer(tmp_path):
         "  - iteration: 1\n"
         "    agent: reviewer\n"
         "    decision: APPROVE\n",
-        encoding="utf-8")
+        encoding="utf-8",
+    )
     module.save_state(
         tmp_path / module.STATE_FILENAME,
         module.WorkflowState(
@@ -2146,3 +2250,884 @@ def test_resume_from_qa_skips_coder_and_reviewer(tmp_path):
     ]
     state = module.load_state(tmp_path / module.STATE_FILENAME)
     assert state.done is True
+
+
+def test_claude_agents_baseline_context_under_20_percent(tmp_path):
+    """Each Claude-backed team agent's pre-input context must stay < 20%.
+
+    Guards against system-prompt / tool-schema bloat: the baseline an
+    agent carries *before any user input* (Claude Code preset + built-in
+    tools + our role prompt + MCP tool schemas + memory) should leave most
+    of the context window free for real work.
+
+    Uses the live local ``/context`` control request via
+    ``fetch_baseline_context_usage`` (no model call), so it runs for real
+    wherever the ``claude`` CLI is installed and skips cleanly when the
+    backend cannot be reached. A baseline at or above 20% fails; an
+    unreachable backend skips.
+    """
+    module = _load_module()
+    workflow = _make_workflow(module, tmp_path)
+    try:
+        claude_agents = {
+            name: agent
+            for name, agent in (
+                ("coder", workflow.coder),
+                ("plan_reviewer", workflow.plan_reviewer),
+                ("qa", workflow.qa),
+            )
+            if agent.config.backend.kind == "claude-code"
+        }
+        assert claude_agents, "expected at least one Claude Code-backed team agent"
+        for name, agent in claude_agents.items():
+            try:
+                usage = agent.fetch_baseline_context_usage()
+            except Exception as exc:  # CLI missing / backend unreachable
+                pytest.skip(f"live Claude Code backend unavailable: {exc}")
+            if usage is None or usage.context_percentage is None:
+                pytest.skip(f"{name}: backend reported no pre-input context usage")
+            assert usage.context_percentage < 20.0, (
+                f"{name} pre-input context {usage.context_percentage:.1f}% exceeds the "
+                f"20% budget ({usage.context_tokens}/{usage.context_window} tokens)"
+            )
+    finally:
+        workflow.close()
+
+
+# ---------------------------------------------------------------- replan-on-qa
+
+
+def test_replan_on_qa_cli_flag_default_and_value():
+    """``--replan-on-qa`` parses to False by default and to True when set."""
+    module = _load_cli_module()
+    args = module._parse_args(_TASK_CLI)
+    assert args.replan_on_qa is False
+    args = module._parse_args(_TASK_CLI + ["--replan-on-qa"])
+    assert args.replan_on_qa is True
+
+
+def test_replan_on_qa_default_is_classic_termination(tmp_path):
+    """The classic flow is unchanged when ``replan_on_qa`` is off.
+
+    With ``replan_on_qa=False`` (the default) the build phase still
+    terminates on QA APPROVE without invoking the PlanDrafter in replan
+    mode.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(workflow)
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # No ``plan_drafter:replan`` entry — QA APPROVE ends the run directly.
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_done_terminates_after_qa_approve(tmp_path):
+    """QA APPROVE alone no longer terminates in replan mode.
+
+    With ``replan_on_qa=True`` the PlanDrafter runs in replan mode after
+    QA and only its ``DONE`` decision terminates the workflow.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=3,
+        replan_on_qa=True,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DONE"]},
+        # qa_decisions/qa_scores default to APPROVE / 9.5 — well above
+        # the default min_score=8.0 so DONE is not downgraded.
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+    assert state.next_iteration_index == 1
+
+
+def test_replan_on_qa_polishing_fast_path_loops_to_coder(tmp_path):
+    """A replan ``POLISHING`` decision loops straight back to the Coder.
+
+    The workflow proceeds to the next iteration without invoking the
+    PlanReviewer on the revised plan.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        # Replan iter 1: POLISHING → back to coder. Replan iter 2: DONE.
+        plan_drafter_decisions={"replan": ["POLISHING", "DONE"]},
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),
+        # POLISHING → no plan_reviewer:replan; straight to iter 2's coder.
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_draft_ready_runs_plan_reviewer(tmp_path):
+    """A replan ``DRAFT_READY`` decision escalates to the PlanReviewer.
+
+    An APPROVE there continues to the next iteration (with no
+    human-review step when ``plan_human_review_enabled`` is off).
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DRAFT_READY", "DONE"]},
+        # Initial plan_reviewer APPROVE, then replan_reviewer APPROVE.
+        plan_reviewer_decisions=["APPROVE", "APPROVE"],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),
+        (1, "plan_reviewer:replan"),
+        # APPROVE on the replan review → iter 2's coder; no human stage.
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_replan_reviewer_reject_loops_back_to_replan(tmp_path):
+    """A replan-review REJECT loops back to the PlanDrafter.
+
+    The rewrite happens within the same build iteration; no new
+    coder/reviewer/qa cycle runs until the revision is approved or
+    downgraded to POLISHING.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        # Iter 1 replan: DRAFT_READY then (after REJECT) POLISHING.
+        # Iter 2 replan: DONE.
+        plan_drafter_decisions={"replan": ["DRAFT_READY", "POLISHING", "DONE"]},
+        # Initial plan_reviewer APPROVE; replan_reviewer REJECT first then n/a.
+        plan_reviewer_decisions=["APPROVE", "REJECT"],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),  # DRAFT_READY
+        (1, "plan_reviewer:replan"),  # REJECT
+        (1, "plan_drafter:replan"),  # POLISHING after REJECT
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),  # DONE
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_human_review_in_replan_chain(tmp_path):
+    """An approved ``DRAFT_READY`` revision still passes human review.
+
+    When both ``replan_on_qa`` and ``plan_human_review_enabled`` are set,
+    a ``DRAFT_READY`` revision that PlanReviewer APPROVEs then runs
+    through the human-review sub-stage before returning to the Coder.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        plan_human_review_enabled=True,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={
+            "draft": ["DRAFT_READY"],
+            "human": ["HUMAN_APPROVED"],
+            "replan": ["DRAFT_READY", "DONE"],
+            "replan_human": ["HUMAN_APPROVED"],
+        },
+        plan_reviewer_decisions=["APPROVE", "APPROVE"],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Plan phase runs the full chain (drafter → reviewer → human); the
+    # replan chain mirrors it for the iter-1 revision; iter-2 DONE ends
+    # the workflow without a third replan chain.
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "plan_drafter:human"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),
+        (1, "plan_reviewer:replan"),
+        (1, "plan_drafter:replan_human"),  # replan-human sub-stage
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_done_below_min_score_downgrades_to_polishing(tmp_path):
+    """The workflow downgrades a below-floor ``DONE`` to ``POLISHING``.
+
+    The score floor is enforced at the workflow layer: if QA's
+    ``weighted_score`` is below ``min_score`` and the PlanDrafter
+    nevertheless returns ``DONE``, the workflow continues with the Coder
+    instead of exiting.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        min_score=8.0,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DONE", "DONE"]},
+        # QA approves but with a low score (below min_score=8.0) on
+        # iter 1, then a passing score on iter 2.
+        qa_decisions=["APPROVE", "APPROVE"],
+        qa_scores=[5.0, 9.0],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Iter 1: DONE is downgraded to POLISHING → next coder runs.
+    # Iter 2: score is fine, DONE terminates.
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_resume_from_stage_replan_skips_qa(tmp_path):
+    """Resume from ``STAGE_REPLAN`` jumps straight to the replan turn.
+
+    No rerun of coder/reviewer/qa happens for that iteration.
+    """
+    module = _load_module()
+    (tmp_path / "plan.md").write_text("plan\n", encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
+    (tmp_path / "progress.yaml").write_text(
+        "plan_stage: []\n"
+        "build_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: coder\n"
+        "    summary: did it\n"
+        "  - iteration: 1\n"
+        "    agent: reviewer\n"
+        "    decision: APPROVE\n"
+        "  - iteration: 1\n"
+        "    agent: qa\n"
+        "    decision: APPROVE\n"
+        "    weighted_score: 9.0\n"
+        "human_feedback: []\n",
+        encoding="utf-8",
+    )
+    module.save_state(
+        tmp_path / module.STATE_FILENAME,
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=2,
+            next_iteration_index=0,
+            stage=module.STAGE_REPLAN,
+        ),
+    )
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DONE"]},
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Resume picked up directly at the replan stage; no coder/reviewer/qa.
+    assert trace == [
+        (1, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_resume_from_stage_replan_reviewer(tmp_path):
+    """Resume from ``STAGE_REPLAN_REVIEWER`` reruns only the PlanReviewer.
+
+    The resume jumps straight into the PlanReviewer turn for the
+    in-flight replan — neither the prior coder/reviewer/qa nor the
+    PlanDrafter's replan turn reruns.
+    """
+    module = _load_module()
+    (tmp_path / "plan.md").write_text("plan\n", encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
+    (tmp_path / "progress.yaml").write_text(
+        "plan_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: plan_drafter\n"
+        "    decision: DRAFT_READY\n"
+        "build_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: coder\n"
+        "  - iteration: 1\n"
+        "    agent: reviewer\n"
+        "    decision: APPROVE\n"
+        "  - iteration: 1\n"
+        "    agent: qa\n"
+        "    decision: APPROVE\n"
+        "    weighted_score: 9.0\n"
+        "human_feedback: []\n",
+        encoding="utf-8",
+    )
+    module.save_state(
+        tmp_path / module.STATE_FILENAME,
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=2,
+            next_iteration_index=0,
+            stage=module.STAGE_REPLAN_REVIEWER,
+        ),
+    )
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DONE"]},
+        plan_reviewer_decisions=["APPROVE"],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Resume picked up at the replan-reviewer stage, then iter 2 ran
+    # one full cycle ending in DONE.
+    assert trace == [
+        (1, "plan_reviewer:replan"),
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_on_qa_exposes_extra_plan_drafter_tools(tmp_path):
+    """``replan_on_qa=True`` widens the PlanDrafter's tool set.
+
+    ``read_latest_build_progress`` and ``read_human_feedback`` let the
+    replan turn ground itself on the build-phase outputs; with the flag
+    off, neither tool is exposed (plan/build isolation preserved).
+    """
+    module = _load_module()
+
+    workflow_off = module.AgentTeamWorkflow(workspace=tmp_path)
+    try:
+        names = {t.name for t in workflow_off._progress_tools["plan_drafter"]}
+        assert "append_plan_drafter_progress" in names
+        assert "read_latest_progress" in names
+        assert "read_latest_build_progress" not in names
+        assert "read_human_feedback" not in names
+    finally:
+        workflow_off.close()
+
+    workflow_on = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        replan_on_qa=True,
+        clean=True,
+    )
+    try:
+        names = {t.name for t in workflow_on._progress_tools["plan_drafter"]}
+        assert "append_plan_drafter_progress" in names
+        assert "read_latest_progress" in names
+        assert "read_latest_build_progress" in names
+        assert "read_human_feedback" in names
+    finally:
+        workflow_on.close()
+
+
+def test_reviewer_user_prompt_surfaces_replan_mode_flag(tmp_path):
+    """``_run_reviewer`` threads the replan flag into the user prompt.
+
+    The Reviewer's per-turn prompt carries a literal ``Replan mode:
+    enabled.`` or ``Replan mode: disabled.`` line. Prompt-only consumers
+    (e.g. the modeling-bringup Stage/Goal protocol) branch on this line
+    to switch APPROVE-gate behavior, so the line is load-bearing
+    contract — assert both branches.
+    """
+    module = _load_module()
+
+    for flag, expected in ((False, "Replan mode: disabled."), (True, "Replan mode: enabled.")):
+        captured: list[str] = []
+
+        workflow = module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            clean=True,
+            replan_on_qa=flag,
+        )
+        # Snapshot the real reviewer so ``workflow.close()`` still has
+        # an object that responds to ``__exit__``. Replace the
+        # callable-side of the agent only for the duration of the
+        # ``_run_reviewer`` call.
+        real_reviewer = workflow.reviewer
+        try:
+            workflow.reviewer = lambda prompt: captured.append(prompt) or ""
+            workflow._run_reviewer(iteration=1)
+        finally:
+            workflow.reviewer = real_reviewer
+            workflow.close()
+
+        assert len(captured) == 1, "stub recorded the prompt exactly once"
+        assert expected in captured[0], (
+            f"expected {expected!r} in reviewer prompt when "
+            f"replan_on_qa={flag!r}; got: {captured[0][:200]!r}"
+        )
+
+
+def test_replan_on_qa_done_decision_is_recognized(tmp_path):
+    """``_latest_plan_drafter_decision`` must surface ``DONE``.
+
+    The replan sub-cycle acts on ``DONE``; pre-existing decision values
+    still parse the same.
+    """
+    module = _load_module()
+    progress = progress_module
+
+    workflow = module.AgentTeamWorkflow(workspace=tmp_path)
+    try:
+        for decision in ("DRAFT_READY", "POLISHING", "HUMAN_APPROVED", "DONE"):
+            progress.write_progress(
+                workflow.progress_path,
+                {
+                    "plan_stage": [
+                        {
+                            "iteration": 1,
+                            "agent": "plan_drafter",
+                            "decision": decision,
+                        }
+                    ],
+                    "build_stage": [],
+                    "human_feedback": [],
+                },
+            )
+            assert workflow._latest_plan_drafter_decision() == decision
+    finally:
+        workflow.close()
+
+
+def test_replan_done_with_missing_score_downgraded(tmp_path):
+    """A QA entry without ``weighted_score`` cannot terminate via ``DONE``.
+
+    The classic gate blocks termination when QA omits the score
+    (``score_ok`` requires present-and-passing); the replan ``DONE``
+    gate must be symmetric — a missing score counts as below-floor and
+    the ``DONE`` is downgraded to ``POLISHING``.
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        min_score=8.0,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DONE", "DONE"]},
+        qa_decisions=["APPROVE", "APPROVE"],
+        # Iter 1: QA omits weighted_score entirely; iter 2 passes.
+        qa_scores=[None, 9.0],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Iter 1: DONE downgraded (missing score) → coder runs again.
+    # Iter 2: score present and passing → DONE terminates.
+    assert trace == [
+        (1, "plan_drafter:draft"),
+        (1, "plan_reviewer"),
+        (1, "coder"),
+        (1, "reviewer"),
+        (1, "qa"),
+        (1, "plan_drafter:replan"),
+        (2, "coder"),
+        (2, "reviewer"),
+        (2, "qa"),
+        (2, "plan_drafter:replan"),
+    ]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_replan_done_after_qa_reject_warns_but_terminates(tmp_path, monkeypatch):
+    """``DONE`` overriding a QA REJECT is accepted but never silent.
+
+    The replan PlanDrafter is the terminator by design, so the override
+    stands — the orchestrator must surface a warning banner so the human
+    can audit it, mirroring the downgrade path's visibility.
+    """
+    module = _load_module()
+    messages: list[str] = []
+    real_print_message = module.print_message
+
+    def recording_print_message(msg, log=None):
+        messages.append(str(msg))
+        return real_print_message(msg, log)
+
+    monkeypatch.setattr(module, "print_message", recording_print_message)
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        num_iterations=2,
+        replan_on_qa=True,
+        min_score=8.0,
+        plan_human_review_enabled=False,
+    )
+    trace = _stub_agents(
+        workflow,
+        plan_drafter_decisions={"replan": ["DONE"]},
+        qa_decisions=["REJECT"],
+        qa_scores=[9.5],
+    )
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # The run terminates on DONE despite the REJECT...
+    assert trace[-1] == (1, "plan_drafter:replan")
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+    # ...but the override is called out in the log.
+    assert any("overriding a QA REJECT" in m for m in messages)
+
+
+def test_replan_human_prompt_uses_build_framing(tmp_path):
+    """The replan human sub-stage must not reuse plan-phase framing.
+
+    Mid-build the human is signing off on a plan *revision*: the prompt
+    must say build iteration / continue-the-build, not "Plan iteration"
+    or "proceed to implementation".
+    """
+    module = _load_module()
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        replan_on_qa=True,
+        plan_human_review_enabled=True,
+    )
+    prompts_seen: list[str] = []
+    real_plan_drafter = workflow.plan_drafter
+    workflow.plan_drafter = prompts_seen.append
+    try:
+        workflow._run_plan_drafter(3, mode="replan_human")
+        replan_prompt = prompts_seen[-1]
+        assert "Build iteration: 3" in replan_prompt
+        assert "replan human review" in replan_prompt
+        assert "continue the build" in replan_prompt
+        assert "Plan iteration" not in replan_prompt
+        assert "proceed to implementation" not in replan_prompt
+        # The ask/reply protocol is shared with plan-phase human mode.
+        assert "ask_human" in replan_prompt
+        assert "HUMAN_APPROVED" in replan_prompt
+
+        workflow._run_plan_drafter(3, mode="human")
+        plan_prompt = prompts_seen[-1]
+        assert "Plan iteration: 3" in plan_prompt
+        assert "proceed to implementation" in plan_prompt
+        assert "replan human review" not in plan_prompt
+    finally:
+        workflow.plan_drafter = real_plan_drafter
+        workflow.close()
+
+
+def test_replan_prompt_surfaces_reviewer_reject(tmp_path):
+    """A re-invoked replan turn must learn it was REJECTed and why.
+
+    When the replan sub-cycle loops back to the drafter after a
+    replan-review REJECT, the newest ``plan_stage`` entry is the
+    PlanReviewer's REJECT; the replan prompt must then tell the drafter
+    to fetch that feedback. On a fresh post-QA replan turn (last entry
+    is not a reviewer REJECT) the block must be absent.
+    """
+    module = _load_module()
+    progress = progress_module
+
+    workflow = module.AgentTeamWorkflow(workspace=tmp_path, replan_on_qa=True)
+    prompts_seen: list[str] = []
+    real_plan_drafter = workflow.plan_drafter
+    workflow.plan_drafter = prompts_seen.append
+    try:
+        # Fresh replan turn: last plan_stage entry is the drafter's own.
+        progress.write_progress(
+            workflow.progress_path,
+            {
+                "plan_stage": [
+                    {"iteration": 1, "agent": "plan_drafter", "decision": "DRAFT_READY"},
+                ],
+                "build_stage": [
+                    {"iteration": 1, "agent": "qa", "decision": "REJECT", "weighted_score": 6.0},
+                ],
+                "human_feedback": [],
+            },
+        )
+        workflow._run_plan_drafter(1, mode="replan")
+        assert "REJECTed by the PlanReviewer" not in prompts_seen[-1]
+
+        # Loop-back turn: the replan reviewer just REJECTed.
+        progress.write_progress(
+            workflow.progress_path,
+            {
+                "plan_stage": [
+                    {"iteration": 1, "agent": "plan_drafter", "decision": "DRAFT_READY"},
+                    {"iteration": 1, "agent": "plan_reviewer", "decision": "REJECT"},
+                ],
+                "build_stage": [
+                    {"iteration": 1, "agent": "qa", "decision": "REJECT", "weighted_score": 6.0},
+                ],
+                "human_feedback": [],
+            },
+        )
+        workflow._run_plan_drafter(1, mode="replan")
+        assert "REJECTed by the PlanReviewer" in prompts_seen[-1]
+        assert "read_latest_progress" in prompts_seen[-1]
+    finally:
+        workflow.plan_drafter = real_plan_drafter
+        workflow.close()
+
+
+def _seed_replan_feedback_resume(module, tmp_path, *, stage, done=False, next_iteration_index=1):
+    """Seed a build-phase resume checkpoint with one prior QA turn.
+
+    The seeded ``build_stage`` carries a ``qa`` entry with a passing
+    ``weighted_score`` so the replan PlanDrafter's DONE decision is not
+    downgraded by the score floor.
+    """
+    (tmp_path / "task.yaml").write_text("Do it.\n", encoding="utf-8")
+    (tmp_path / "plan.md").write_text("# Plan\n", encoding="utf-8")
+    (tmp_path / "acceptance-criteria.md").write_text("- [ ] x\n", encoding="utf-8")
+    (tmp_path / "progress.yaml").write_text(
+        "plan_stage: []\n"
+        "build_stage:\n"
+        "  - iteration: 1\n"
+        "    agent: qa\n"
+        "    decision: REJECT\n"
+        "    weighted_score: 9.5\n"
+        "human_feedback: []\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "status.md").write_text("", encoding="utf-8")
+    module.save_state(
+        tmp_path / module.STATE_FILENAME,
+        module.WorkflowState(
+            task_path=str(tmp_path / "task.yaml"),
+            num_iterations=1,
+            next_iteration_index=next_iteration_index,
+            done=done,
+            stage=stage,
+        ),
+    )
+
+
+def test_trigger_replan_with_feedback_requires_replan_on_qa(tmp_path):
+    """The flag is rejected unless --replan-on-qa is also enabled.
+
+    It reuses the post-QA replan sub-cycle, so the constructor enforces
+    the pairing.
+    """
+    module = _load_module()
+    with pytest.raises(ValueError, match="--replan-on-qa"):
+        module.AgentTeamWorkflow(
+            workspace=tmp_path,
+            replan_on_qa=False,
+            trigger_replan_with_feedback=True,
+        )
+
+
+def test_trigger_replan_with_feedback_enters_replan_subcycle_on_resume(tmp_path):
+    """Resuming with --feedback + the flag enters the replan sub-cycle.
+
+    The replan PlanDrafter runs first (no coder).
+    """
+    module = _load_module()
+    _seed_replan_feedback_resume(module, tmp_path, stage=module.STAGE_CODER)
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        replan_on_qa=True,
+        trigger_replan_with_feedback=True,
+        feedback="fold this into the plan",
+    )
+    trace = _stub_agents(workflow, plan_drafter_decisions={"replan": ["DONE"]})
+    workflow._run_plan_phase = lambda *_a, **_kw: None  # defense
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # The first (and only) build-phase agent is the replan PlanDrafter at
+    # the upcoming iteration — the coder was skipped entirely.
+    assert trace == [(2, "plan_drafter:replan")]
+    state = module.load_state(tmp_path / module.STATE_FILENAME)
+    assert state.done is True
+
+
+def test_trigger_replan_with_feedback_is_noop_without_feedback(tmp_path):
+    """Without --feedback the flag is a no-op on resume.
+
+    Resume proceeds normally at the saved build stage (coder) rather
+    than jumping to the replan sub-cycle.
+    """
+    module = _load_module()
+    _seed_replan_feedback_resume(module, tmp_path, stage=module.STAGE_CODER, next_iteration_index=0)
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        replan_on_qa=True,
+        trigger_replan_with_feedback=True,
+        # no feedback
+    )
+    trace = _stub_agents(workflow, plan_drafter_decisions={"replan": ["DONE"]})
+    workflow._run_plan_phase = lambda *_a, **_kw: None  # defense
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    # Resumed at the coder (did NOT jump straight to the replan sub-cycle).
+    assert trace[0] == (1, "coder")
+
+
+def test_trigger_replan_with_feedback_replans_after_completed_run(tmp_path):
+    """A completed run resumed with --feedback + the flag replans first.
+
+    It re-engages in the replan sub-cycle (not at the coder).
+    """
+    module = _load_module()
+    _seed_replan_feedback_resume(module, tmp_path, stage=module.STAGE_CODER, done=True)
+
+    workflow = module.AgentTeamWorkflow(
+        workspace=tmp_path,
+        replan_on_qa=True,
+        trigger_replan_with_feedback=True,
+        feedback="address this regression",
+    )
+    trace = _stub_agents(workflow, plan_drafter_decisions={"replan": ["DONE"]})
+    workflow._run_plan_phase = lambda *_a, **_kw: None  # defense
+    try:
+        workflow.run(_write_task_yaml(workflow.workspace))
+    finally:
+        workflow.close()
+
+    assert trace[0] == (2, "plan_drafter:replan")

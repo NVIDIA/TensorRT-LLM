@@ -5,9 +5,15 @@ import io
 from rich.console import Console
 
 from agent_flow import console as console_module
-from agent_flow.types import (AgentTextEvent, CompactBoundaryEvent,
-                              RateLimitWarningEvent, ServerToolCallEvent,
-                              SessionInitEvent, ThinkingEvent, ToolCallEvent)
+from agent_flow.types import (
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+)
 
 
 def _capture_console(monkeypatch) -> Console:
@@ -96,9 +102,7 @@ def test_bash_tool_call_prefixes_command_with_shell_prompt(monkeypatch):
     fake = _capture_console(monkeypatch)
     console_module.print_tool_call(
         "planner",
-        ToolCallEvent(name="Bash",
-                      input={"command": "ls -la"},
-                      tool_use_id="t-prompt"),
+        ToolCallEvent(name="Bash", input={"command": "ls -la"}, tool_use_id="t-prompt"),
     )
     output = fake._buffer_text.getvalue()  # type: ignore[attr-defined]
     assert "$ ls -la" in output
@@ -345,29 +349,21 @@ def test_file_change_tool_call_renders_each_patch(monkeypatch):
         ToolCallEvent(
             name="FileChange",
             input={
-                "status":
-                "completed",
+                "status": "completed",
                 "changes": [
                     {
                         "path": "/repo/added.py",
-                        "kind": {
-                            "type": "add"
-                        },
+                        "kind": {"type": "add"},
                         "diff": "@@ -0,0 +1,2 @@\n+def hi():\n+    return 1\n",
                     },
                     {
                         "path": "/repo/old.py",
-                        "kind": {
-                            "type": "update",
-                            "move_path": "/repo/new.py"
-                        },
+                        "kind": {"type": "update", "move_path": "/repo/new.py"},
                         "diff": "@@ -1 +1 @@\n-old line\n+new line\n",
                     },
                     {
                         "path": "/repo/gone.py",
-                        "kind": {
-                            "type": "delete"
-                        },
+                        "kind": {"type": "delete"},
                         "diff": "@@ -1 +0,0 @@\n-removed line\n",
                     },
                 ],
@@ -404,20 +400,16 @@ def test_file_change_tool_call_shows_added_and_deleted_line_counts(monkeypatch):
                 "changes": [
                     {
                         "path": "/repo/added.py",
-                        "kind": {
-                            "type": "add"
-                        },
+                        "kind": {"type": "add"},
                         "diff": "@@ -0,0 +1,2 @@\n+def hi():\n+    return 1\n",
                     },
                     {
-                        "path":
-                        "/repo/edit.py",
-                        "kind": {
-                            "type": "update"
-                        },
-                        "diff":
-                        ("--- a/repo/edit.py\n+++ b/repo/edit.py\n"
-                         "@@ -1,3 +1,2 @@\n-old1\n-old2\n-old3\n+new1\n"),
+                        "path": "/repo/edit.py",
+                        "kind": {"type": "update"},
+                        "diff": (
+                            "--- a/repo/edit.py\n+++ b/repo/edit.py\n"
+                            "@@ -1,3 +1,2 @@\n-old1\n-old2\n-old3\n+new1\n"
+                        ),
                     },
                 ],
             },
@@ -446,9 +438,7 @@ def test_file_change_tool_call_truncates_long_diffs(monkeypatch):
                 "changes": [
                     {
                         "path": "/repo/big.py",
-                        "kind": {
-                            "type": "add"
-                        },
+                        "kind": {"type": "add"},
                         "diff": huge_diff,
                     },
                 ],
@@ -493,9 +483,11 @@ def test_todowrite_tool_call_handles_empty_list(monkeypatch):
 
 
 def test_unknown_tool_with_command_field_does_not_render_as_bash(monkeypatch):
-    """An MCP/custom tool that happens to carry a ``command`` field
-    should render as JSON, not as a shell prompt — name-based dispatch
-    prevents the field-shape collision."""
+    """An MCP/custom tool that happens to carry a ``command`` field should render as JSON.
+
+    It should not render as a shell prompt — name-based dispatch prevents the
+    field-shape collision.
+    """
     fake = _capture_console(monkeypatch)
     console_module.print_tool_call(
         "planner",
@@ -516,8 +508,10 @@ def test_unknown_tool_with_command_field_does_not_render_as_bash(monkeypatch):
 
 
 def test_unknown_tool_with_file_path_does_not_render_as_write(monkeypatch):
-    """A custom tool that ships ``file_path`` + ``content`` should fall
-    through to the JSON dump rather than being misrendered as a Write."""
+    """A custom tool that ships ``file_path`` + ``content`` should fall through to the JSON dump.
+
+    It should fall through rather than being misrendered as a Write.
+    """
     fake = _capture_console(monkeypatch)
     console_module.print_tool_call(
         "planner",
@@ -539,9 +533,11 @@ def test_unknown_tool_with_file_path_does_not_render_as_write(monkeypatch):
 
 
 def test_known_tool_with_wrong_shape_falls_through_to_json(monkeypatch):
-    """If a tool name matches the dispatch table but the payload shape
-    doesn't, the renderer returns ``None`` and we fall back to JSON
-    rather than crashing or producing garbled output."""
+    """A tool whose name matches the dispatch table but whose payload shape doesn't falls back to JSON.
+
+    The renderer returns ``None`` and we fall back to JSON rather than crashing or
+    producing garbled output.
+    """
     fake = _capture_console(monkeypatch)
     console_module.print_tool_call(
         "planner",
@@ -576,12 +572,12 @@ def test_subagent_tool_call_renders_label_and_indent(monkeypatch):
     assert "Explore" in output
     assert "tool · Bash" in output
     # Each line of the rendered panel should be indented.
-    panel_lines = [l for l in output.splitlines() if l.strip()]
-    assert all(
-        line.startswith(" " * console_module._SUBAGENT_INDENT)
-        for line in panel_lines), output
+    panel_lines = [line for line in output.splitlines() if line.strip()]
+    assert all(line.startswith(" " * console_module._SUBAGENT_INDENT) for line in panel_lines), (
+        output
+    )
     # The bottom border should be just the frame — no subtitle text.
-    bottom = next(l for l in panel_lines if "╯" in l)
+    bottom = next(line for line in panel_lines if "╯" in line)
     assert "subagent" not in bottom
 
 
@@ -635,9 +631,7 @@ def test_server_tool_call_renders_distinct_label(monkeypatch):
     fake = _capture_console(monkeypatch)
     console_module.print_server_tool_call(
         "planner",
-        ServerToolCallEvent(name="web_search",
-                            input={"query": "claude"},
-                            tool_use_id="srv-1"),
+        ServerToolCallEvent(name="web_search", input={"query": "claude"}, tool_use_id="srv-1"),
     )
     output = fake._buffer_text.getvalue()  # type: ignore[attr-defined]
     # Server-side tools are rendered with a different prefix so the UI
@@ -760,9 +754,11 @@ def test_started_panel_omits_reasoning_effort_when_blank(monkeypatch):
 
 
 def test_console_write_recovers_from_blocking_io_error(monkeypatch):
-    """When ``rich.Console`` raises ``BlockingIOError`` (because a Node.js
-    subprocess put the shared stdout FD into non-blocking mode), the
-    wrapper should restore blocking mode and retry the write."""
+    """When ``rich.Console`` raises ``BlockingIOError``, the wrapper restores blocking mode and retries.
+
+    The error happens because a Node.js subprocess put the shared stdout FD into
+    non-blocking mode; the wrapper should restore blocking mode and retry the write.
+    """
     calls: list[str] = []
     restored: list[bool] = []
 
@@ -798,12 +794,13 @@ def test_console_write_passes_through_when_no_error(monkeypatch):
 
 
 def test_print_message_recovers_from_blocking_io_error(monkeypatch):
-    """End-to-end: ``print_message`` should not crash when the underlying
-    rich Console raises ``BlockingIOError`` once."""
+    """End-to-end: ``print_message`` should not crash when the rich Console raises ``BlockingIOError``.
+
+    The underlying rich Console raises ``BlockingIOError`` once and the call must still succeed.
+    """
     calls: list[object] = []
 
     class FlakyConsole:
-
         def print(self, payload):
             calls.append(payload)
             if len(calls) == 1:
@@ -814,15 +811,16 @@ def test_print_message_recovers_from_blocking_io_error(monkeypatch):
 
     monkeypatch.setattr(console_module, "console", FlakyConsole())
     # Avoid actually touching real stdout in the test.
-    monkeypatch.setattr(console_module, "_ensure_blocking_streams",
-                        lambda: None)
+    monkeypatch.setattr(console_module, "_ensure_blocking_streams", lambda: None)
     console_module.print_message("hello")
     assert calls == ["hello", "hello"]
 
 
 def test_ensure_blocking_streams_sets_flag(monkeypatch):
-    """``_ensure_blocking_streams`` should call ``os.set_blocking(True)``
-    on stdout/stderr file descriptors and tolerate failures."""
+    """``_ensure_blocking_streams`` should call ``os.set_blocking(True)`` on the stream FDs.
+
+    It targets the stdout/stderr file descriptors and tolerates failures.
+    """
     set_calls: list[tuple[int, bool]] = []
 
     def fake_set_blocking(fd, blocking):

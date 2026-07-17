@@ -5,6 +5,16 @@ Each layer implements `forward`, and each `AgentLayer.forward` performs one
 Claude Code or Codex SDK execution. Modules can be composed directly or used
 to build small orchestration harnesses.
 
+## Prerequisites
+
+`agent-flow` drives the official **Claude Code** or **Codex** command-line
+tool through its SDK. The `pip install` below pulls in the Python SDKs,
+but the CLIs themselves must be installed and signed in beforehand. Set up
+whichever backend(s) you plan to use:
+
+1. Install **Claude Code**: https://code.claude.com/docs/en/overview#get-started
+2. Install **Codex**: https://developers.openai.com/codex/quickstart
+
 ## Installation
 
 Since `agent-flow` is not a published wheel package, use the following way to install:
@@ -13,7 +23,7 @@ Since `agent-flow` is not a published wheel package, use the following way to in
 pip install -e /path/to/agent-flow
 ```
 
-This will automatically install two SDK runtimes as dependencies: [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) and [Codex App Server Python SDK](https://github.com/openai/codex/tree/main/sdk/python).
+This pulls in the two Python SDK runtimes as dependencies — [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) and [Codex App Server Python SDK](https://github.com/openai/codex/tree/main/sdk/python) — which drive the CLIs you set up in [Prerequisites](#prerequisites).
 
 ## Quick start
 
@@ -70,6 +80,11 @@ Three ready-to-run multi-agent workflows ship as subpackages of
   verbatim, and only swaps the prompt bundle (source boundary, validation
   policy, attention/MoE/full-model scope, accuracy-gate framework).
   Launch via `modeling-bringup`.
+- [`agent_flow.workflows.pr_review`](agent_flow/workflows/pr_review) —
+  two-stage cross-model PR/MR review: Claude Code reviews ↔ Codex addresses,
+  then the roles swap (Codex reviews ↔ Claude Code addresses). The
+  conversation stays local (nothing is posted to the PR/MR) and edits are left
+  in the working tree. Launch via `pr-review`.
 
 ```
 PlanDrafter ⇄ PlanReviewer [⇄ Human]  →  Coder ⇄ Reviewer  →  QA  ✔
@@ -123,6 +138,16 @@ checkpoint and start over.
   the human a question when it hits user-only information (credentials,
   environment facts, etc.). Off by default — the build phase is
   expected to be unattended once the plan is approved.
+- **Replan after every QA turn:** pass `--replan-on-qa` to re-invoke
+  the PlanDrafter after each QA turn so it can rewrite `plan.md` and
+  `acceptance-criteria.md` based on the latest coder/reviewer/qa
+  findings. In this mode the PlanDrafter — not QA — decides when the
+  task is `DONE`; otherwise it loops back to the Coder either directly
+  (`POLISHING`) or after another PlanReviewer pass (`DRAFT_READY`).
+  Off by default — the build phase terminates on QA APPROVE as it
+  always has. See
+  [`agent_flow/workflows/agent_team/README.md`](agent_flow/workflows/agent_team/README.md)
+  for the full state machine.
 
 All flags from `agent-team` are accepted by `modeling-bringup`
 as-is. See [`agent_flow/workflows/agent_team/README.md`](agent_flow/workflows/agent_team/README.md)

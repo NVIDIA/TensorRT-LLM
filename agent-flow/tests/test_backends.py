@@ -8,39 +8,51 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from claude_agent_sdk import types as sdk_types
-from claude_agent_sdk.types import (AssistantMessage, RateLimitEvent,
-                                    RateLimitInfo, ResultMessage, SystemMessage,
-                                    TextBlock, ThinkingBlock, ToolUseBlock)
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    RateLimitEvent,
+    RateLimitInfo,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+)
 
 from agent_flow.backends import claude_code as cc_mod
 from agent_flow.backends import codex as codex_mod
 from agent_flow.backends import create_backend
 from agent_flow.backends.base import ResultEvent
 from agent_flow.backends.claude_code import ClaudeCodeBackend, ClaudeCodeClient
-from agent_flow.backends.codex import (CodexBackend, CodexClient,
-                                       _dynamic_tool_spec,
-                                       _extract_final_response,
-                                       _mcp_to_codex_content)
-from agent_flow.types import (AgentTextEvent, CompactBoundaryEvent,
-                              RateLimitWarningEvent, ServerToolCallEvent,
-                              SessionInitEvent, ThinkingEvent, ToolCallEvent)
+from agent_flow.backends.codex import (
+    CodexBackend,
+    CodexClient,
+    _dynamic_tool_spec,
+    _extract_final_response,
+    _mcp_to_codex_content,
+)
+from agent_flow.types import (
+    AgentTextEvent,
+    CompactBoundaryEvent,
+    RateLimitWarningEvent,
+    ServerToolCallEvent,
+    SessionInitEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+)
 
 
 class ServerToolUseBlock:
-
     def __init__(self, id: str, name: str, input: dict[str, Any]):
         self.id = id
         self.name = name
         self.input = input
 
 
-ServerToolUseBlock = getattr(sdk_types, "ServerToolUseBlock",
-                             ServerToolUseBlock)
+ServerToolUseBlock = getattr(sdk_types, "ServerToolUseBlock", ServerToolUseBlock)
 
 
-def _make_assistant_message(content,
-                            parent_tool_use_id: str | None = None
-                            ) -> AssistantMessage:
+def _make_assistant_message(content, parent_tool_use_id: str | None = None) -> AssistantMessage:
     return AssistantMessage(
         content=content,
         model="test-model",
@@ -62,25 +74,21 @@ def _make_result_message(result: str, **kwargs) -> ResultMessage:
     return ResultMessage(**defaults)
 
 
-def _make_tool_use_block(name: str,
-                         input: dict,
-                         id: str = "tool-1") -> ToolUseBlock:
+def _make_tool_use_block(name: str, input: dict, id: str = "tool-1") -> ToolUseBlock:
     return ToolUseBlock(id=id, name=name, input=input)
 
 
 def _install_codex_sdk_modules():
-    package = ModuleType("codex_app_server")
-    client_module = ModuleType("codex_app_server.client")
-    api_module = ModuleType("codex_app_server.api")
-    generated = ModuleType("codex_app_server.generated.v2_all")
+    package = ModuleType("openai_codex")
+    client_module = ModuleType("openai_codex.client")
+    api_module = ModuleType("openai_codex.api")
+    generated = ModuleType("openai_codex.generated.v2_all")
 
     class TextInput:
-
         def __init__(self, text):
             self.text = text
 
     class AsyncCodex:
-
         def __init__(self, config):
             self.config = config
 
@@ -90,19 +98,16 @@ def _install_codex_sdk_modules():
         async def __aexit__(self, *args):
             return None
 
-    class AppServerConfig:
-
+    class CodexConfig:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
     class AgentMessageThreadItem:
-
         def __init__(self, text, phase=None):
             self.text = text
             self.phase = phase
 
     class AskForApproval:
-
         def __init__(self, root):
             self.root = root
 
@@ -111,24 +116,24 @@ def _install_codex_sdk_modules():
         never = "never"
 
     class CommandExecutionThreadItem:
-
         def __init__(self, command, id="cmd-1", status="completed"):
             self.id = id
             self.command = command
             self.status = status
 
     class CollabAgentToolCallThreadItem:
-
-        def __init__(self,
-                     tool,
-                     id="collab-1",
-                     status="completed",
-                     prompt=None,
-                     model=None,
-                     reasoning_effort=None,
-                     sender_thread_id="sender-1",
-                     receiver_thread_ids=None,
-                     agents_states=None):
+        def __init__(
+            self,
+            tool,
+            id="collab-1",
+            status="completed",
+            prompt=None,
+            model=None,
+            reasoning_effort=None,
+            sender_thread_id="sender-1",
+            receiver_thread_ids=None,
+            agents_states=None,
+        ):
             self.id = id
             self.tool = tool
             self.status = status
@@ -140,14 +145,12 @@ def _install_codex_sdk_modules():
             self.agents_states = agents_states or {}
 
     class ContextCompactionThreadItem:
-
         def __init__(self, id="compact-1", trigger=None, pre_tokens=None):
             self.id = id
             self.trigger = trigger
             self.pre_tokens = pre_tokens
 
     class DynamicToolCallThreadItem:
-
         def __init__(self, tool, arguments, id="dyn-1", status="completed"):
             self.id = id
             self.tool = tool
@@ -155,35 +158,22 @@ def _install_codex_sdk_modules():
             self.status = status
 
     class FileChangeThreadItem:
-
-        def __init__(self,
-                     changes,
-                     id="file-1",
-                     status="completed",
-                     error=None):
+        def __init__(self, changes, id="file-1", status="completed", error=None):
             self.id = id
             self.changes = changes
             self.status = status
             self.error = error
 
     class ItemCompletedNotification:
-
         def __init__(self, item):
             self.item = item
 
     class ItemStartedNotification:
-
         def __init__(self, item):
             self.item = item
 
     class McpToolCallThreadItem:
-
-        def __init__(self,
-                     tool,
-                     arguments,
-                     id="mcp-1",
-                     status="completed",
-                     error=None):
+        def __init__(self, tool, arguments, id="mcp-1", status="completed", error=None):
             self.id = id
             self.tool = tool
             self.arguments = arguments
@@ -191,14 +181,12 @@ def _install_codex_sdk_modules():
             self.error = error
 
     class ReasoningThreadItem:
-
         def __init__(self, summary=None, content=None, id="reason-1"):
             self.id = id
             self.summary = summary or []
             self.content = content or []
 
     class WebSearchThreadItem:
-
         def __init__(self, query, action=None, id="web-1"):
             self.id = id
             self.query = query
@@ -215,7 +203,6 @@ def _install_codex_sdk_modules():
         pass
 
     class TurnCompletedNotification:
-
         def __init__(self, turn):
             self.turn = turn
 
@@ -226,13 +213,14 @@ def _install_codex_sdk_modules():
         interrupted = "interrupted"
 
     class TokenUsageBreakdown:
-
-        def __init__(self,
-                     input_tokens=0,
-                     output_tokens=0,
-                     cached_input_tokens=0,
-                     total_tokens=0,
-                     reasoning_output_tokens=0):
+        def __init__(
+            self,
+            input_tokens=0,
+            output_tokens=0,
+            cached_input_tokens=0,
+            total_tokens=0,
+            reasoning_output_tokens=0,
+        ):
             self.input_tokens = input_tokens
             self.output_tokens = output_tokens
             self.cached_input_tokens = cached_input_tokens
@@ -240,30 +228,29 @@ def _install_codex_sdk_modules():
             self.reasoning_output_tokens = reasoning_output_tokens
 
     class ThreadTokenUsage:
-
         def __init__(self, last, total, model_context_window=None):
             self.last = last
             self.total = total
             self.model_context_window = model_context_window
 
     class ThreadTokenUsageUpdatedNotification:
-
         def __init__(self, thread_id, token_usage, turn_id):
             self.thread_id = thread_id
             self.token_usage = token_usage
             self.turn_id = turn_id
 
     class ThreadStartParams:
-
-        def __init__(self,
-                     model=None,
-                     base_instructions=None,
-                     developer_instructions=None,
-                     config=None,
-                     cwd=None,
-                     sandbox=None,
-                     approval_policy=None,
-                     **kwargs):
+        def __init__(
+            self,
+            model=None,
+            base_instructions=None,
+            developer_instructions=None,
+            config=None,
+            cwd=None,
+            sandbox=None,
+            approval_policy=None,
+            **kwargs,
+        ):
             self.model = model
             self.base_instructions = base_instructions
             self.developer_instructions = developer_instructions
@@ -291,14 +278,13 @@ def _install_codex_sdk_modules():
         return out
 
     class AsyncThread:
-
         def __init__(self, codex, thread_id):
             self.codex = codex
             self.thread_id = thread_id
 
     package.TextInput = TextInput
     package.AsyncCodex = AsyncCodex
-    client_module.AppServerConfig = AppServerConfig
+    client_module.CodexConfig = CodexConfig
     client_module._params_dict = _params_dict
     api_module.AsyncThread = AsyncThread
     generated.AgentMessageThreadItem = AgentMessageThreadItem
@@ -320,15 +306,14 @@ def _install_codex_sdk_modules():
     generated.WebSearchThreadItem = WebSearchThreadItem
     generated.TokenUsageBreakdown = TokenUsageBreakdown
     generated.ThreadTokenUsage = ThreadTokenUsage
-    generated.ThreadTokenUsageUpdatedNotification = (
-        ThreadTokenUsageUpdatedNotification)
+    generated.ThreadTokenUsageUpdatedNotification = ThreadTokenUsageUpdatedNotification
     generated.ThreadStartParams = ThreadStartParams
     generated.TurnStatus = TurnStatus
 
-    sys.modules["codex_app_server"] = package
-    sys.modules["codex_app_server.client"] = client_module
-    sys.modules["codex_app_server.api"] = api_module
-    sys.modules["codex_app_server.generated.v2_all"] = generated
+    sys.modules["openai_codex"] = package
+    sys.modules["openai_codex.client"] = client_module
+    sys.modules["openai_codex.api"] = api_module
+    sys.modules["openai_codex.generated.v2_all"] = generated
 
     return {
         "TextInput": TextInput,
@@ -347,17 +332,14 @@ def _install_codex_sdk_modules():
         "WebSearchThreadItem": WebSearchThreadItem,
         "TokenUsageBreakdown": TokenUsageBreakdown,
         "ThreadTokenUsage": ThreadTokenUsage,
-        "ThreadTokenUsageUpdatedNotification":
-        ThreadTokenUsageUpdatedNotification,
+        "ThreadTokenUsageUpdatedNotification": ThreadTokenUsageUpdatedNotification,
         "TurnStatus": TurnStatus,
     }
 
 
 class TestCreateBackend:
-
     def test_factory_returns_expected_backend_types(self):
-        assert create_backend(
-            "claude-code").__class__.__name__ == "ClaudeCodeBackend"
+        assert create_backend("claude-code").__class__.__name__ == "ClaudeCodeBackend"
         assert create_backend("codex").__class__.__name__ == "CodexBackend"
 
     def test_factory_rejects_unknown_backends(self):
@@ -366,15 +348,12 @@ class TestCreateBackend:
 
 
 class TestClaudeBackend:
-
     async def test_client_maps_tool_use_and_result_messages(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
         async def receive_response():
-            yield _make_assistant_message(
-                [_make_tool_use_block("Bash", {"command": "ls"})])
+            yield _make_assistant_message([_make_tool_use_block("Bash", {"command": "ls"})])
             yield _make_result_message("done")
 
         sdk_client.receive_response = receive_response
@@ -393,9 +372,7 @@ class TestClaudeBackend:
         assert isinstance(events[1], ResultEvent)
         assert events[1].text == "done"
 
-    async def test_client_emits_session_init_event_from_init_system_message(
-            self):
-
+    async def test_client_emits_session_init_event_from_init_system_message(self):
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -420,14 +397,11 @@ class TestClaudeBackend:
                             "path": "/x/trtllm",
                             "source": "trtllm@x",
                         },
-                        {
-                            "path": "/x/no-name"
-                        },  # missing name -> filtered
+                        {"path": "/x/no-name"},  # missing name -> filtered
                     ],
                 },
             )
-            yield _make_assistant_message(
-                [_make_tool_use_block("Bash", {"command": "ls"})])
+            yield _make_assistant_message([_make_tool_use_block("Bash", {"command": "ls"})])
             yield _make_result_message("done")
 
         sdk_client.receive_response = receive_response
@@ -448,7 +422,6 @@ class TestClaudeBackend:
         assert isinstance(events[-1], ResultEvent)
 
     async def test_client_ignores_non_init_system_messages(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -463,30 +436,28 @@ class TestClaudeBackend:
         assert not any(isinstance(e, SessionInitEvent) for e in events)
 
     async def test_client_tags_subagent_events_with_task_label(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
         async def receive_response():
             # Main agent spawns an Explore subagent via the Task tool.
-            yield _make_assistant_message([
-                _make_tool_use_block(
-                    "Task",
-                    {
-                        "subagent_type": "Explore",
-                        "description": "search repo",
-                        "prompt": "find foo",
-                    },
-                    id="task-42",
-                )
-            ])
+            yield _make_assistant_message(
+                [
+                    _make_tool_use_block(
+                        "Task",
+                        {
+                            "subagent_type": "Explore",
+                            "description": "search repo",
+                            "prompt": "find foo",
+                        },
+                        id="task-42",
+                    )
+                ]
+            )
             # Subagent executes a Bash call; SDK marks it with the parent
             # tool_use id of the Task call above.
             yield _make_assistant_message(
-                [
-                    _make_tool_use_block("Bash", {"command": "rg foo"},
-                                         id="tool-9")
-                ],
+                [_make_tool_use_block("Bash", {"command": "rg foo"}, id="tool-9")],
                 parent_tool_use_id="task-42",
             )
             # Subagent emits a text message before returning.
@@ -521,18 +492,19 @@ class TestClaudeBackend:
         assert text_events[0].agent_label == "Explore"
 
     async def test_client_falls_back_to_description_when_no_subagent_type(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
         async def receive_response():
-            yield _make_assistant_message([
-                _make_tool_use_block(
-                    "Task",
-                    {"description": "fix bug"},
-                    id="task-1",
-                )
-            ])
+            yield _make_assistant_message(
+                [
+                    _make_tool_use_block(
+                        "Task",
+                        {"description": "fix bug"},
+                        id="task-1",
+                    )
+                ]
+            )
             yield _make_assistant_message(
                 [_make_tool_use_block("Bash", {"command": "ls"}, id="t-2")],
                 parent_tool_use_id="task-1",
@@ -543,12 +515,10 @@ class TestClaudeBackend:
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
-        sub_event = next(e for e in events
-                         if isinstance(e, ToolCallEvent) and e.name == "Bash")
+        sub_event = next(e for e in events if isinstance(e, ToolCallEvent) and e.name == "Bash")
         assert sub_event.agent_label == "fix bug"
 
     async def test_client_uses_generic_label_for_unrecognized_parent(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -564,8 +534,7 @@ class TestClaudeBackend:
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
-        bash_event = next(e for e in events
-                          if isinstance(e, ToolCallEvent) and e.name == "Bash")
+        bash_event = next(e for e in events if isinstance(e, ToolCallEvent) and e.name == "Bash")
         assert bash_event.parent_tool_use_id == "phantom-task"
         assert bash_event.agent_label == "subagent"
 
@@ -578,18 +547,19 @@ class TestClaudeBackend:
         sdk_client.query = AsyncMock()
 
         async def receive_response():
-            yield _make_assistant_message([
-                _make_tool_use_block(
-                    "Agent",
-                    {
-                        "subagent_type":
-                        "trtllm-agent-toolkit:exec-compile-specialist",
-                        "description": "Compile TRT-LLM",
-                        "prompt": "compile it",
-                    },
-                    id="agent-77",
-                )
-            ])
+            yield _make_assistant_message(
+                [
+                    _make_tool_use_block(
+                        "Agent",
+                        {
+                            "subagent_type": "trtllm-agent-toolkit:exec-compile-specialist",
+                            "description": "Compile TRT-LLM",
+                            "prompt": "compile it",
+                        },
+                        id="agent-77",
+                    )
+                ]
+            )
             yield _make_assistant_message(
                 [_make_tool_use_block("Bash", {"command": "ls"}, id="t-3")],
                 parent_tool_use_id="agent-77",
@@ -600,20 +570,20 @@ class TestClaudeBackend:
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
-        sub_event = next(e for e in events
-                         if isinstance(e, ToolCallEvent) and e.name == "Bash")
+        sub_event = next(e for e in events if isinstance(e, ToolCallEvent) and e.name == "Bash")
         assert sub_event.parent_tool_use_id == "agent-77"
         assert sub_event.agent_label == "exec-compile-specialist"
 
     async def test_client_extracts_usage_and_cost_from_result_message(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
-        sdk_client.get_context_usage = AsyncMock(return_value={
-            "totalTokens": 50000,
-            "maxTokens": 200000,
-            "percentage": 25.0,
-        })
+        sdk_client.get_context_usage = AsyncMock(
+            return_value={
+                "totalTokens": 50000,
+                "maxTokens": 200000,
+                "percentage": 25.0,
+            }
+        )
 
         async def receive_response():
             yield _make_result_message(
@@ -651,11 +621,9 @@ class TestClaudeBackend:
         assert result.usage.context_percentage == 25.0
 
     async def test_client_survives_context_usage_errors(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
-        sdk_client.get_context_usage = AsyncMock(
-            side_effect=RuntimeError("boom"))
+        sdk_client.get_context_usage = AsyncMock(side_effect=RuntimeError("boom"))
 
         async def receive_response():
             yield _make_result_message("done", usage={"input_tokens": 1})
@@ -671,15 +639,16 @@ class TestClaudeBackend:
         assert events[0].usage.context_percentage is None
 
     async def test_client_emits_thinking_event_from_thinking_block(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
         async def receive_response():
-            yield _make_assistant_message([
-                ThinkingBlock(thinking="  reasoning step  ", signature="sig"),
-                TextBlock(text="answer"),
-            ])
+            yield _make_assistant_message(
+                [
+                    ThinkingBlock(thinking="  reasoning step  ", signature="sig"),
+                    TextBlock(text="answer"),
+                ]
+            )
             yield _make_result_message("answer")
 
         sdk_client.receive_response = receive_response
@@ -696,13 +665,11 @@ class TestClaudeBackend:
         assert text_events and text_events[0].text == "answer"
 
     async def test_client_drops_empty_thinking_blocks(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
         async def receive_response():
-            yield _make_assistant_message(
-                [ThinkingBlock(thinking="   ", signature="sig")])
+            yield _make_assistant_message([ThinkingBlock(thinking="   ", signature="sig")])
             yield _make_result_message("done")
 
         sdk_client.receive_response = receive_response
@@ -712,18 +679,19 @@ class TestClaudeBackend:
         assert not any(isinstance(e, ThinkingEvent) for e in events)
 
     async def test_client_emits_server_tool_call_event(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
         async def receive_response():
-            yield _make_assistant_message([
-                ServerToolUseBlock(
-                    id="srv-1",
-                    name="web_search",
-                    input={"query": "claude code"},
-                ),
-            ])
+            yield _make_assistant_message(
+                [
+                    ServerToolUseBlock(
+                        id="srv-1",
+                        name="web_search",
+                        input={"query": "claude code"},
+                    ),
+                ]
+            )
             yield _make_result_message("done")
 
         sdk_client.receive_response = receive_response
@@ -741,7 +709,6 @@ class TestClaudeBackend:
         assert server_calls[0].agent_label is None
 
     async def test_client_emits_rate_limit_warning_event(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -770,7 +737,6 @@ class TestClaudeBackend:
         assert warnings[0].utilization == 0.85
 
     async def test_client_emits_compact_boundary_event(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -794,7 +760,6 @@ class TestClaudeBackend:
         assert boundaries[0].pre_tokens == 150000
 
     async def test_client_compact_boundary_handles_missing_fields(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -806,13 +771,11 @@ class TestClaudeBackend:
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
-        boundary = next(e for e in events
-                        if isinstance(e, CompactBoundaryEvent))
+        boundary = next(e for e in events if isinstance(e, CompactBoundaryEvent))
         assert boundary.trigger is None
         assert boundary.pre_tokens is None
 
     async def test_client_raises_on_assistant_message_error(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -826,8 +789,7 @@ class TestClaudeBackend:
         sdk_client.receive_response = receive_response
         client = ClaudeCodeClient(sdk_client)
 
-        with pytest.raises(RuntimeError,
-                           match="Claude Code turn failed: billing_error"):
+        with pytest.raises(RuntimeError, match="Claude Code turn failed: billing_error"):
             async for _ in client.send_message("hi"):
                 pass
 
@@ -854,7 +816,6 @@ class TestClaudeBackend:
         assert any(isinstance(e, ResultEvent) for e in events)
 
     async def test_client_threads_error_fields_through_result_event(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -863,9 +824,7 @@ class TestClaudeBackend:
                 "",
                 is_error=True,
                 errors=["transient upstream"],
-                permission_denials=[{
-                    "tool": "Bash"
-                }],
+                permission_denials=[{"tool": "Bash"}],
             )
 
         sdk_client.receive_response = receive_response
@@ -878,7 +837,6 @@ class TestClaudeBackend:
         assert result.permission_denials == [{"tool": "Bash"}]
 
     async def test_client_result_event_defaults_when_no_errors(self):
-
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
@@ -896,7 +854,6 @@ class TestClaudeBackend:
 
 
 class TestClaudeBackendCreateClient:
-
     async def _capture_options(self, monkeypatch, **kwargs):
         # Stand-in for ``ClaudeSDKClient`` that just records the options
         # ``create_client`` would have launched the real SDK with.
@@ -904,7 +861,6 @@ class TestClaudeBackendCreateClient:
         captured: dict[str, Any] = {}
 
         class FakeSdkClient:
-
             def __init__(self, options):
                 captured["options"] = options
 
@@ -917,13 +873,10 @@ class TestClaudeBackendCreateClient:
         monkeypatch.setattr(cc_mod, "ClaudeSDKClient", FakeSdkClient)
         # Skip MCP server creation; ``tools=None`` means it isn't called,
         # but we patch defensively in case that changes.
-        monkeypatch.setattr(cc_mod, "create_sdk_mcp_server",
-                            lambda **_: object())
+        monkeypatch.setattr(cc_mod, "create_sdk_mcp_server", lambda **_: object())
 
         backend = ClaudeCodeBackend()
-        async with backend.create_client(system_prompt="hi",
-                                         model="claude-test",
-                                         **kwargs):
+        async with backend.create_client(system_prompt="hi", model="claude-test", **kwargs):
             pass
         return captured["options"]
 
@@ -944,20 +897,17 @@ class TestClaudeBackendCreateClient:
         # Defense-in-depth: even if a tool ends up being routed through
         # the ``can_use_tool`` hook, it must approve every call.
         options = await self._capture_options(monkeypatch)
-        result = await options.can_use_tool("Bash", {"command": "rm -rf /"},
-                                            None)
+        result = await options.can_use_tool("Bash", {"command": "rm -rf /"}, None)
         assert isinstance(result, cc_mod.PermissionResultAllow)
 
-    async def test_create_client_no_extra_mcp_servers_by_default(
-            self, monkeypatch):
+    async def test_create_client_no_extra_mcp_servers_by_default(self, monkeypatch):
         # Without ``extra_mcp_servers``, ``mcp_servers`` stays empty
         # (the in-process ``agent-tools`` server is only added when
         # ``tools`` is provided).
         options = await self._capture_options(monkeypatch)
         assert options.mcp_servers == {}
 
-    async def test_create_client_extra_mcp_servers_merged_alongside_agent_tools(
-            self, monkeypatch):
+    async def test_create_client_extra_mcp_servers_merged_alongside_agent_tools(self, monkeypatch):
         # ``extra_mcp_servers`` values are passed verbatim into
         # ``ClaudeAgentOptions.mcp_servers``; the in-process
         # ``agent-tools`` server is layered on top when ``tools`` is set.
@@ -965,10 +915,7 @@ class TestClaudeBackendCreateClient:
             monkeypatch,
             tools=[object()],
             extra_mcp_servers={
-                "Glean": {
-                    "type": "http",
-                    "url": "https://example.test/mcp"
-                },
+                "Glean": {"type": "http", "url": "https://example.test/mcp"},
             },
         )
         assert set(options.mcp_servers.keys()) == {"Glean", "agent-tools"}
@@ -984,23 +931,18 @@ class TestClaudeBackendCreateClient:
         # overwrote the in-process server.
         assert not isinstance(options.mcp_servers["agent-tools"], dict)
 
-    async def test_create_client_extra_mcp_servers_without_tools(
-            self, monkeypatch):
+    async def test_create_client_extra_mcp_servers_without_tools(self, monkeypatch):
         # With only ``extra_mcp_servers`` and no ``tools``, ``mcp_servers``
         # carries just the external entries — no implicit ``agent-tools``.
         options = await self._capture_options(
             monkeypatch,
             extra_mcp_servers={
-                "Glean": {
-                    "type": "http",
-                    "url": "https://example.test/mcp"
-                },
+                "Glean": {"type": "http", "url": "https://example.test/mcp"},
             },
         )
         assert set(options.mcp_servers.keys()) == {"Glean"}
 
-    async def test_create_client_rejects_reserved_agent_tools_key(
-            self, monkeypatch):
+    async def test_create_client_rejects_reserved_agent_tools_key(self, monkeypatch):
         # The ``agent-tools`` key is reserved for the in-process MCP
         # server built from ``tools``; user-supplied values under that
         # name would silently get overwritten, so we surface it as an
@@ -1008,20 +950,14 @@ class TestClaudeBackendCreateClient:
         backend = ClaudeCodeBackend()
         with pytest.raises(ValueError, match="agent-tools"):
             async with backend.create_client(
-                    system_prompt="hi",
-                    model="claude-test",
-                    extra_mcp_servers={
-                        "agent-tools": {
-                            "type": "http",
-                            "url": "x"
-                        }
-                    },
+                system_prompt="hi",
+                model="claude-test",
+                extra_mcp_servers={"agent-tools": {"type": "http", "url": "x"}},
             ):
                 pass
 
 
 class TestCodexBackend:
-
     async def test_client_maps_command_and_final_response(self):
         sdk = _install_codex_sdk_modules()
 
@@ -1032,11 +968,11 @@ class TestCodexBackend:
         async def stream():
             cmd_item = sdk["CommandExecutionThreadItem"]("echo hello")
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=cmd_item)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=cmd_item))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1045,9 +981,9 @@ class TestCodexBackend:
         events = [event async for event in client.send_message("hello")]
 
         thread.turn.assert_awaited_once()
-        assert events[0] == ToolCallEvent(name="Bash",
-                                          input={"command": "echo hello"},
-                                          tool_use_id="cmd-1")
+        assert events[0] == ToolCallEvent(
+            name="Bash", input={"command": "echo hello"}, tool_use_id="cmd-1"
+        )
         assert isinstance(events[1], ResultEvent)
 
     async def test_client_captures_token_usage_from_notifications(self):
@@ -1059,10 +995,10 @@ class TestCodexBackend:
 
         async def stream():
             total = sdk["TokenUsageBreakdown"](
-                input_tokens=100,
-                output_tokens=50,
-                cached_input_tokens=20,
-                total_tokens=170,
+                input_tokens=100000,
+                output_tokens=50000,
+                cached_input_tokens=20000,
+                total_tokens=170000,
             )
             usage = sdk["ThreadTokenUsage"](
                 last=total,
@@ -1074,10 +1010,13 @@ class TestCodexBackend:
                     thread_id="t-1",
                     token_usage=usage,
                     turn_id="turn-1",
-                ))
+                )
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](
+                    SimpleNamespace(id="turn-1", duration_ms=2500)
+                )
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1089,13 +1028,42 @@ class TestCodexBackend:
         result = events[0]
         assert isinstance(result, ResultEvent)
         assert result.usage is not None
-        assert result.usage.input_tokens == 100
-        assert result.usage.output_tokens == 50
-        assert result.usage.cache_read_tokens == 20
-        assert result.usage.total_tokens == 170
-        assert result.usage.context_tokens == 170
+        assert result.usage.input_tokens == 100000
+        assert result.usage.output_tokens == 50000
+        assert result.usage.cache_read_tokens == 20000
+        assert result.usage.total_tokens == 170000
+        assert result.usage.context_tokens == 170000
         assert result.usage.context_window == 400000
-        assert result.usage.context_percentage == pytest.approx(0.0425)
+        assert result.usage.context_percentage == pytest.approx(42.5)
+        assert result.usage.num_turns == 1
+        assert result.usage.duration_ms == 2500
+
+    async def test_client_surfaces_turn_duration_without_token_usage(self):
+        sdk = _install_codex_sdk_modules()
+
+        thread = MagicMock()
+        turn = MagicMock()
+        turn.id = "turn-1"
+
+        async def stream():
+            yield SimpleNamespace(
+                payload=sdk["TurnCompletedNotification"](
+                    SimpleNamespace(id="turn-1", duration_ms=3200)
+                )
+            )
+
+        turn.stream = stream
+        thread.turn = AsyncMock(return_value=turn)
+
+        client = CodexClient(thread)
+        events = [event async for event in client.send_message("hi")]
+
+        assert len(events) == 1
+        result = events[0]
+        assert isinstance(result, ResultEvent)
+        assert result.usage is not None
+        assert result.usage.num_turns == 1
+        assert result.usage.duration_ms == 3200
 
     async def test_client_emits_final_answer_as_agent_text_event(self):
         sdk = _install_codex_sdk_modules()
@@ -1107,16 +1075,17 @@ class TestCodexBackend:
         async def stream():
             draft = sdk["AgentMessageThreadItem"]("draft")
             final = sdk["AgentMessageThreadItem"](
-                "final answer", phase=sdk["MessagePhase"].final_answer)
+                "final answer", phase=sdk["MessagePhase"].final_answer
+            )
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=draft)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=draft))
+            )
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=final)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=final))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1130,12 +1099,10 @@ class TestCodexBackend:
         assert len(result_events) == 1
         assert result_events[0].text == "final answer"
 
-    async def test_client_ignores_token_deltas_and_emits_completed_message(
-            self):
+    async def test_client_ignores_token_deltas_and_emits_completed_message(self):
         sdk = _install_codex_sdk_modules()
 
         class AgentMessageDeltaNotification:
-
             def __init__(self, itemId, delta):
                 self.itemId = itemId
                 self.delta = delta
@@ -1145,19 +1112,16 @@ class TestCodexBackend:
         turn.id = "turn-1"
 
         async def stream():
-            yield SimpleNamespace(
-                payload=AgentMessageDeltaNotification("msg-1", "A"))
-            yield SimpleNamespace(
-                payload=AgentMessageDeltaNotification("msg-1", "B"))
-            final = sdk["AgentMessageThreadItem"](
-                "AB", phase=sdk["MessagePhase"].final_answer)
+            yield SimpleNamespace(payload=AgentMessageDeltaNotification("msg-1", "A"))
+            yield SimpleNamespace(payload=AgentMessageDeltaNotification("msg-1", "B"))
+            final = sdk["AgentMessageThreadItem"]("AB", phase=sdk["MessagePhase"].final_answer)
             final.id = "msg-1"
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=final)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=final))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1176,14 +1140,15 @@ class TestCodexBackend:
         turn.id = "turn-1"
 
         async def stream():
-            reasoning = sdk["ReasoningThreadItem"](summary=["checking tests"],
-                                                   content=["raw detail"])
+            reasoning = sdk["ReasoningThreadItem"](
+                summary=["checking tests"], content=["raw detail"]
+            )
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=reasoning)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=reasoning))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1205,18 +1170,15 @@ class TestCodexBackend:
         async def stream():
             search = sdk["WebSearchThreadItem"](
                 query="codex app-server",
-                action={
-                    "type": "search",
-                    "query": "codex app-server"
-                },
+                action={"type": "search", "query": "codex app-server"},
                 id="web-7",
             )
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=search)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=search))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1251,11 +1213,11 @@ class TestCodexBackend:
                 receiver_thread_ids=["child-1"],
             )
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=collab)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=collab))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1275,8 +1237,7 @@ class TestCodexBackend:
         assert result.is_error is True
         assert result.errors == ["collabAgentToolCall failed"]
 
-    async def test_client_emits_compact_boundary_for_context_compaction_item(
-            self):
+    async def test_client_emits_compact_boundary_for_context_compaction_item(self):
         sdk = _install_codex_sdk_modules()
 
         thread = MagicMock()
@@ -1284,14 +1245,13 @@ class TestCodexBackend:
         turn.id = "turn-1"
 
         async def stream():
-            compact = sdk["ContextCompactionThreadItem"](trigger="auto",
-                                                         pre_tokens=150000)
+            compact = sdk["ContextCompactionThreadItem"](trigger="auto", pre_tokens=150000)
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=compact)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=compact))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1313,19 +1273,16 @@ class TestCodexBackend:
 
         async def stream():
             file_change = sdk["FileChangeThreadItem"](
-                changes=[{
-                    "path": "app.py",
-                    "kind": "update"
-                }],
+                changes=[{"path": "app.py", "kind": "update"}],
                 status="declined",
                 id="file-9",
             )
             yield SimpleNamespace(
-                payload=sdk["ItemCompletedNotification"](SimpleNamespace(
-                    root=file_change)))
+                payload=sdk["ItemCompletedNotification"](SimpleNamespace(root=file_change))
+            )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1")))
+                payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1337,10 +1294,7 @@ class TestCodexBackend:
         assert file_event.name == "FileChange"
         assert file_event.tool_use_id == "file-9"
         assert file_event.input == {
-            "changes": [{
-                "path": "app.py",
-                "kind": "update"
-            }],
+            "changes": [{"path": "app.py", "kind": "update"}],
             "status": "declined",
         }
         result = next(e for e in events if isinstance(e, ResultEvent))
@@ -1360,10 +1314,13 @@ class TestCodexBackend:
                 codex_error_info="UsageLimitExceeded",
             )
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1",
-                    error=error,
-                )))
+                payload=sdk["TurnCompletedNotification"](
+                    SimpleNamespace(
+                        id="turn-1",
+                        error=error,
+                    )
+                )
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1388,18 +1345,20 @@ class TestCodexBackend:
 
         async def stream():
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1",
-                    error=SimpleNamespace(message="model does not exist"),
-                )))
+                payload=sdk["TurnCompletedNotification"](
+                    SimpleNamespace(
+                        id="turn-1",
+                        error=SimpleNamespace(message="model does not exist"),
+                    )
+                )
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
 
         client = CodexClient(thread)
 
-        with pytest.raises(RuntimeError,
-                           match="Codex turn failed: model does not exist"):
+        with pytest.raises(RuntimeError, match="Codex turn failed: model does not exist"):
             async for _ in client.send_message("hi"):
                 pass
 
@@ -1412,10 +1371,13 @@ class TestCodexBackend:
 
         async def stream():
             yield SimpleNamespace(
-                payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                    id="turn-1",
-                    status=sdk["TurnStatus"].interrupted,
-                )))
+                payload=sdk["TurnCompletedNotification"](
+                    SimpleNamespace(
+                        id="turn-1",
+                        status=sdk["TurnStatus"].interrupted,
+                    )
+                )
+            )
 
         turn.stream = stream
         thread.turn = AsyncMock(return_value=turn)
@@ -1426,14 +1388,11 @@ class TestCodexBackend:
             async for _ in client.send_message("hi"):
                 pass
 
-    async def test_enter_passes_resolved_binary_to_app_server_config(
-            self, monkeypatch):
+    async def test_enter_passes_resolved_binary_to_app_server_config(self, monkeypatch):
         _install_codex_sdk_modules()
 
-        monkeypatch.setattr(codex_mod, "_resolve_codex_bin",
-                            lambda: "/bin/codex")
-        monkeypatch.setattr(CodexBackend, "_install_server_request_handler",
-                            lambda self: None)
+        monkeypatch.setattr(codex_mod, "_resolve_codex_bin", lambda: "/bin/codex")
+        monkeypatch.setattr(CodexBackend, "_install_server_request_handler", lambda self: None)
 
         backend = CodexBackend()
         async with backend:
@@ -1448,8 +1407,7 @@ class TestCodexBackend:
 
         items = [
             sdk["AgentMessageThreadItem"]("draft"),
-            sdk["AgentMessageThreadItem"](
-                "final", phase=sdk["MessagePhase"].final_answer),
+            sdk["AgentMessageThreadItem"]("final", phase=sdk["MessagePhase"].final_answer),
         ]
 
         assert _extract_final_response(items) == "final"
@@ -1469,8 +1427,7 @@ class TestCodexBackend:
             _client=SimpleNamespace(thread_start=fake_thread_start),
         )
 
-        async with backend.create_client(system_prompt=system_prompt,
-                                         model="gpt-5.4"):
+        async with backend.create_client(system_prompt=system_prompt, model="gpt-5.4"):
             pass
 
         return captured["payload"]
@@ -1485,8 +1442,7 @@ class TestCodexBackend:
         assert "baseInstructions" not in payload
         assert "developerInstructions" not in payload
 
-    async def test_create_client_appends_user_prompt_via_developer_message(
-            self):
+    async def test_create_client_appends_user_prompt_via_developer_message(self):
         # User-provided prompts ride on developer_instructions so they
         # layer on top of Codex's default base prompt, mirroring how the
         # Claude Code backend appends to its preset.
@@ -1527,14 +1483,14 @@ class TestCodexBackend:
         )
 
         async with backend.create_client(
-                system_prompt="hi",
-                model="gpt-5.4",
-                extra_mcp_servers={
-                    "Glean": {
-                        "type": "http",
-                        "url": "https://example.test/mcp",
-                    },
+            system_prompt="hi",
+            model="gpt-5.4",
+            extra_mcp_servers={
+                "Glean": {
+                    "type": "http",
+                    "url": "https://example.test/mcp",
                 },
+            },
         ):
             pass
 
@@ -1552,18 +1508,24 @@ class TestCodexBackend:
             return SimpleNamespace(thread=SimpleNamespace(id="t-1"))
 
         async def fake_skills_list(payload):
-            return SimpleNamespace(data=[
-                SimpleNamespace(skills=[
-                    SimpleNamespace(name="skill-a", enabled=True),
-                    SimpleNamespace(name="skill-disabled", enabled=False),
-                ])
-            ])
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        skills=[
+                            SimpleNamespace(name="skill-a", enabled=True),
+                            SimpleNamespace(name="skill-disabled", enabled=False),
+                        ]
+                    )
+                ]
+            )
 
         async def fake_plugin_list(payload):
-            return SimpleNamespace(plugins=[
-                SimpleNamespace(name="plugin-a"),
-                SimpleNamespace(name="plugin-b"),
-            ])
+            return SimpleNamespace(
+                plugins=[
+                    SimpleNamespace(name="plugin-a"),
+                    SimpleNamespace(name="plugin-b"),
+                ]
+            )
 
         backend._codex = SimpleNamespace(
             _ensure_initialized=AsyncMock(),
@@ -1574,16 +1536,15 @@ class TestCodexBackend:
             ),
         )
 
-        async with backend.create_client(system_prompt="hi",
-                                         model="gpt-5.4") as client:
+        async with backend.create_client(system_prompt="hi", model="gpt-5.4") as client:
             thread = client._thread
             turn = MagicMock()
             turn.id = "turn-1"
 
             async def stream():
                 yield SimpleNamespace(
-                    payload=sdk["TurnCompletedNotification"](SimpleNamespace(
-                        id="turn-1")))
+                    payload=sdk["TurnCompletedNotification"](SimpleNamespace(id="turn-1"))
+                )
 
             turn.stream = stream
             thread.turn = AsyncMock(return_value=turn)
@@ -1595,7 +1556,6 @@ class TestCodexBackend:
 
 
 class TestCodexApprovalBypass:
-
     def _make_backend_with_handler(self):
         # Wire a CodexBackend up to a fake AsyncCodex whose sync client
         # exposes ``_approval_handler`` so we can exercise the override
@@ -1609,8 +1569,7 @@ class TestCodexApprovalBypass:
 
         sync_client = SimpleNamespace(_approval_handler=existing_handler)
         backend = CodexBackend()
-        backend._codex = SimpleNamespace(_client=SimpleNamespace(
-            _sync=sync_client))
+        backend._codex = SimpleNamespace(_client=SimpleNamespace(_sync=sync_client))
         backend._install_server_request_handler()
         return backend, sync_client, captured_methods
 
@@ -1628,10 +1587,7 @@ class TestCodexApprovalBypass:
         _, sync_client, captured = self._make_backend_with_handler()
         result = sync_client._approval_handler(
             "item/fileChange/requestApproval",
-            {"changes": [{
-                "path": "x",
-                "kind": "delete"
-            }]},
+            {"changes": [{"path": "x", "kind": "delete"}]},
         )
         assert result == {"decision": "accept"}
         assert captured == []
@@ -1660,10 +1616,7 @@ class TestCodexApprovalBypass:
         monkeypatch.setattr(codex_mod, "_handle_dynamic_tool_call", fake_handle)
         result = sync_client._approval_handler(
             "item/tool/call",
-            {
-                "threadId": "t-1",
-                "tool": "x"
-            },
+            {"threadId": "t-1", "tool": "x"},
         )
         assert result == {"contentItems": [], "success": True}
         assert captured_tool_params == [{"threadId": "t-1", "tool": "x"}]
@@ -1680,58 +1633,44 @@ class TestCodexApprovalBypass:
 
 
 class TestCodexDynamicTools:
-
     def test_dynamic_tool_spec_serializes_sdk_tool(self):
-
         tool = SimpleNamespace(
             name="do_thing",
             description="Does a thing.",
-            input_schema={
-                "type": "object",
-                "properties": {}
-            },
+            input_schema={"type": "object", "properties": {}},
         )
 
         assert _dynamic_tool_spec(tool) == {
             "name": "do_thing",
             "description": "Does a thing.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            },
+            "inputSchema": {"type": "object", "properties": {}},
             "deferLoading": False,
         }
 
     def test_mcp_to_codex_content_maps_text_and_errors(self):
-
-        items, success = _mcp_to_codex_content({
-            "content": [{
-                "type": "text",
-                "text": "ok"
-            }],
-        })
+        items, success = _mcp_to_codex_content(
+            {
+                "content": [{"type": "text", "text": "ok"}],
+            }
+        )
         assert items == [{"type": "inputText", "text": "ok"}]
         assert success is True
 
-        items, success = _mcp_to_codex_content({
-            "content": [{
-                "type": "text",
-                "text": "boom"
-            }],
-            "is_error":
-            True,
-        })
+        items, success = _mcp_to_codex_content(
+            {
+                "content": [{"type": "text", "text": "boom"}],
+                "is_error": True,
+            }
+        )
         assert items == [{"type": "inputText", "text": "boom"}]
         assert success is False
 
     def test_mcp_to_codex_content_emits_placeholder_when_empty(self):
-
         items, success = _mcp_to_codex_content({"content": []})
         assert items == [{"type": "inputText", "text": ""}]
         assert success is True
 
     def test_handle_dynamic_tool_call_dispatches_to_registered_handler(self):
-
         calls: list[dict[str, Any]] = []
 
         async def handler(args):
@@ -1740,50 +1679,49 @@ class TestCodexDynamicTools:
 
         codex_mod._TOOL_HANDLERS["t-1"] = {"my_tool": handler}
         try:
-            response = codex_mod._handle_dynamic_tool_call({
-                "threadId": "t-1",
-                "turnId": "turn-1",
-                "callId": "call-1",
-                "tool": "my_tool",
-                "arguments": {
-                    "x": 7
-                },
-            })
+            response = codex_mod._handle_dynamic_tool_call(
+                {
+                    "threadId": "t-1",
+                    "turnId": "turn-1",
+                    "callId": "call-1",
+                    "tool": "my_tool",
+                    "arguments": {"x": 7},
+                }
+            )
         finally:
             codex_mod._TOOL_HANDLERS.pop("t-1", None)
 
         assert calls == [{"x": 7}]
         assert response == {
-            "contentItems": [{
-                "type": "inputText",
-                "text": "got 7"
-            }],
+            "contentItems": [{"type": "inputText", "text": "got 7"}],
             "success": True,
         }
 
     def test_handle_dynamic_tool_call_reports_unknown_tool(self):
-
-        response = codex_mod._handle_dynamic_tool_call({
-            "threadId": "nobody",
-            "tool": "ghost",
-            "arguments": {},
-        })
+        response = codex_mod._handle_dynamic_tool_call(
+            {
+                "threadId": "nobody",
+                "tool": "ghost",
+                "arguments": {},
+            }
+        )
 
         assert response["success"] is False
         assert "not registered" in response["contentItems"][0]["text"]
 
     def test_handle_dynamic_tool_call_captures_handler_exceptions(self):
-
         async def handler(_args):
             raise RuntimeError("explode")
 
         codex_mod._TOOL_HANDLERS["t-1"] = {"broken": handler}
         try:
-            response = codex_mod._handle_dynamic_tool_call({
-                "threadId": "t-1",
-                "tool": "broken",
-                "arguments": {},
-            })
+            response = codex_mod._handle_dynamic_tool_call(
+                {
+                    "threadId": "t-1",
+                    "tool": "broken",
+                    "arguments": {},
+                }
+            )
         finally:
             codex_mod._TOOL_HANDLERS.pop("t-1", None)
 
@@ -1792,21 +1730,19 @@ class TestCodexDynamicTools:
 
 
 class TestResolveCodexBin:
-
     def test_env_override_wins(self, tmp_path, monkeypatch):
-
         fake = tmp_path / "codex"
         fake.write_text("#!/bin/sh\n")
         monkeypatch.setenv("CODEX_BIN", str(fake))
         monkeypatch.setitem(
-            sys.modules, "codex_cli_bin",
-            SimpleNamespace(
-                bundled_codex_path=lambda: Path("/nope/should-not-be-used")))
+            sys.modules,
+            "codex_cli_bin",
+            SimpleNamespace(bundled_codex_path=lambda: Path("/nope/should-not-be-used")),
+        )
 
         assert codex_mod._resolve_codex_bin() == str(fake)
 
     def test_env_override_missing_file_raises(self, tmp_path, monkeypatch):
-
         missing = tmp_path / "missing"
         monkeypatch.setenv("CODEX_BIN", str(missing))
 
@@ -1814,31 +1750,27 @@ class TestResolveCodexBin:
             codex_mod._resolve_codex_bin()
 
     def test_prefers_bundled_pinned_runtime(self, tmp_path, monkeypatch):
-
         monkeypatch.delenv("CODEX_BIN", raising=False)
         bundled = tmp_path / "bundled-codex"
         bundled.write_text("#!/bin/sh\n")
-        monkeypatch.setitem(sys.modules, "codex_cli_bin",
-                            SimpleNamespace(bundled_codex_path=lambda: bundled))
-        monkeypatch.setattr(codex_mod.shutil, "which",
-                            lambda _: "/some/system/codex")
+        monkeypatch.setitem(
+            sys.modules, "codex_cli_bin", SimpleNamespace(bundled_codex_path=lambda: bundled)
+        )
+        monkeypatch.setattr(codex_mod.shutil, "which", lambda _: "/some/system/codex")
 
         assert codex_mod._resolve_codex_bin() == str(bundled)
 
     def test_falls_back_to_path_when_bundle_missing(self, monkeypatch):
-
         monkeypatch.delenv("CODEX_BIN", raising=False)
         sys.modules.pop("codex_cli_bin", None)
         # Make the import fail even if the package is installed for real.
         monkeypatch.setitem(sys.modules, "codex_cli_bin", None)
-        monkeypatch.setattr(codex_mod.shutil, "which",
-                            lambda _: "/usr/bin/codex")
+        monkeypatch.setattr(codex_mod.shutil, "which", lambda _: "/usr/bin/codex")
 
         assert codex_mod._resolve_codex_bin() == "/usr/bin/codex"
         sys.modules.pop("codex_cli_bin", None)
 
     def test_raises_when_nothing_found(self, monkeypatch):
-
         monkeypatch.delenv("CODEX_BIN", raising=False)
         monkeypatch.setitem(sys.modules, "codex_cli_bin", None)
         monkeypatch.setattr(codex_mod.shutil, "which", lambda _: None)
@@ -1849,9 +1781,10 @@ class TestResolveCodexBin:
 
 
 class TestRelaxServiceTier:
-    """``_relax_service_tier_on_module`` rewrites ``ServiceTier`` references
-    to ``str`` so the SDK accepts new wire values like ``"priority"`` that
-    the generated enum hasn't been regenerated to include yet.
+    """``_relax_service_tier_on_module`` rewrites ``ServiceTier`` references to ``str``.
+
+    This lets the SDK accept new wire values like ``"priority"`` that the generated
+    enum hasn't been regenerated to include yet.
     """
 
     def _build_fake_sdk_module(self) -> ModuleType:
@@ -1869,8 +1802,7 @@ class TestRelaxServiceTier:
         class ThreadStartResponse(BaseModel):
             model_config = ConfigDict(populate_by_name=True)
             model: str
-            service_tier: Annotated[ServiceTier | None,
-                                    Field(alias="serviceTier")] = None
+            service_tier: Annotated[ServiceTier | None, Field(alias="serviceTier")] = None
 
         class TurnEvent(BaseModel):
             model_config = ConfigDict(populate_by_name=True)
@@ -1888,10 +1820,7 @@ class TestRelaxServiceTier:
     def test_priority_value_rejected_before_patch(self):
         module = self._build_fake_sdk_module()
         with pytest.raises(Exception):
-            module.ThreadStartResponse.model_validate({
-                "model": "m",
-                "serviceTier": "priority"
-            })
+            module.ThreadStartResponse.model_validate({"model": "m", "serviceTier": "priority"})
 
     def test_relax_accepts_arbitrary_string(self):
         module = self._build_fake_sdk_module()
@@ -1899,10 +1828,7 @@ class TestRelaxServiceTier:
         # Two models referenced ServiceTier; Unrelated did not.
         assert affected == 2
 
-        ok = module.ThreadStartResponse.model_validate({
-            "model": "m",
-            "serviceTier": "priority"
-        })
+        ok = module.ThreadStartResponse.model_validate({"model": "m", "serviceTier": "priority"})
         assert ok.service_tier == "priority"
 
         ok2 = module.TurnEvent.model_validate({"service_tier": "anything"})
@@ -1914,13 +1840,10 @@ class TestRelaxServiceTier:
 
 
 class TestClaudeBackendVersion:
-
     def _reset_cache(self, monkeypatch):
-
         monkeypatch.setattr(cc_mod, "_VERSION_CACHE", None)
 
     def test_version_combines_cli_and_sdk(self, monkeypatch):
-
         self._reset_cache(monkeypatch)
         monkeypatch.setattr(cc_mod, "_claude_cli_version", lambda: "2.1.123")
         monkeypatch.setattr(cc_mod, "_claude_sdk_version", lambda: "0.1.65")
@@ -1928,7 +1851,6 @@ class TestClaudeBackendVersion:
         assert ClaudeCodeBackend().version() == "cli 2.1.123 · sdk 0.1.65"
 
     def test_version_handles_missing_cli(self, monkeypatch):
-
         self._reset_cache(monkeypatch)
         monkeypatch.setattr(cc_mod, "_claude_cli_version", lambda: "")
         monkeypatch.setattr(cc_mod, "_claude_sdk_version", lambda: "0.1.65")
@@ -1936,7 +1858,6 @@ class TestClaudeBackendVersion:
         assert ClaudeCodeBackend().version() == "sdk 0.1.65"
 
     def test_version_returns_empty_when_nothing_resolves(self, monkeypatch):
-
         self._reset_cache(monkeypatch)
         monkeypatch.setattr(cc_mod, "_claude_cli_version", lambda: "")
         monkeypatch.setattr(cc_mod, "_claude_sdk_version", lambda: "")
@@ -1950,15 +1871,12 @@ class TestClaudeBackendVersion:
         monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/bin/claude")
 
         def fake_run(cmd, **kwargs):
-            return SimpleNamespace(returncode=0,
-                                   stdout="2.1.123 (Claude Code)\n",
-                                   stderr="")
+            return SimpleNamespace(returncode=0, stdout="2.1.123 (Claude Code)\n", stderr="")
 
         monkeypatch.setattr(cc_mod.subprocess, "run", fake_run)
         assert cc_mod._claude_cli_version() == "2.1.123"
 
     def test_cli_version_returns_empty_on_failure(self, monkeypatch):
-
         monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: "/bin/claude")
 
         def fake_run(cmd, **kwargs):
@@ -1968,16 +1886,16 @@ class TestClaudeBackendVersion:
         assert cc_mod._claude_cli_version() == ""
 
     def test_cli_version_returns_empty_when_binary_missing(self, monkeypatch):
-
         monkeypatch.setattr(cc_mod, "_find_claude_cli", lambda: None)
         # Should never reach subprocess; explode if it does.
         monkeypatch.setattr(
-            cc_mod.subprocess, "run",
-            lambda *a, **k: pytest.fail("subprocess.run should not be called"))
+            cc_mod.subprocess,
+            "run",
+            lambda *a, **k: pytest.fail("subprocess.run should not be called"),
+        )
         assert cc_mod._claude_cli_version() == ""
 
     def test_version_is_cached_across_calls(self, monkeypatch):
-
         self._reset_cache(monkeypatch)
         calls: list[int] = []
 
@@ -1996,53 +1914,53 @@ class TestClaudeBackendVersion:
 
 
 class TestCodexBackendVersion:
-
     def _reset_cache(self, monkeypatch):
-
         monkeypatch.setattr(codex_mod, "_VERSION_CACHE", None)
 
     def test_version_combines_cli_and_sdk(self, monkeypatch):
-
         self._reset_cache(monkeypatch)
-        monkeypatch.setattr(codex_mod, "_codex_cli_version",
-                            lambda: "0.116.0-alpha.1")
+        monkeypatch.setattr(codex_mod, "_codex_cli_version", lambda: "0.116.0-alpha.1")
         monkeypatch.setattr(codex_mod, "_codex_sdk_version", lambda: "0.2.0")
 
         assert CodexBackend().version() == "cli 0.116.0-alpha.1 · sdk 0.2.0"
 
-    def test_sdk_version_prefers_current_distribution_name(self, monkeypatch):
-
+    def test_sdk_version_reads_openai_codex_distribution(self, monkeypatch):
         seen: list[str] = []
 
         def fake_pkg_version(name):
             seen.append(name)
-            if name == "openai-codex-app-server-sdk":
-                return "0.116.0a1"
+            if name == "openai-codex":
+                return "0.1.0b3"
             raise codex_mod.PackageNotFoundError(name)
 
         monkeypatch.setattr(codex_mod, "_pkg_version", fake_pkg_version)
 
-        assert codex_mod._codex_sdk_version() == "0.116.0a1"
-        assert seen == ["openai-codex-app-server-sdk"]
+        assert codex_mod._codex_sdk_version() == "0.1.0b3"
+        assert seen == ["openai-codex"]
+
+    def test_sdk_version_empty_when_distribution_missing(self, monkeypatch):
+        def fake_pkg_version(name):
+            raise codex_mod.PackageNotFoundError(name)
+
+        monkeypatch.setattr(codex_mod, "_pkg_version", fake_pkg_version)
+
+        assert codex_mod._codex_sdk_version() == ""
 
     def test_cli_version_parses_last_token_of_stdout(self, monkeypatch):
         # The codex CLI prints "codex-cli 0.116.0-alpha.1" — the trailing
         # token is the version.
 
-        monkeypatch.setattr(codex_mod, "_resolve_codex_bin",
-                            lambda: "/bin/codex")
+        monkeypatch.setattr(codex_mod, "_resolve_codex_bin", lambda: "/bin/codex")
 
         def fake_run(cmd, **kwargs):
-            return SimpleNamespace(returncode=0,
-                                   stdout="codex-cli 0.116.0-alpha.1\n",
-                                   stderr="some warning")
+            return SimpleNamespace(
+                returncode=0, stdout="codex-cli 0.116.0-alpha.1\n", stderr="some warning"
+            )
 
         monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
         assert codex_mod._codex_cli_version() == "0.116.0-alpha.1"
 
-    def test_cli_version_returns_empty_when_binary_unresolvable(
-            self, monkeypatch):
-
+    def test_cli_version_returns_empty_when_binary_unresolvable(self, monkeypatch):
         def boom():
             raise FileNotFoundError("no codex")
 
@@ -2050,12 +1968,12 @@ class TestCodexBackendVersion:
         assert codex_mod._codex_cli_version() == ""
 
     def test_cli_version_returns_empty_on_nonzero_exit(self, monkeypatch):
-
-        monkeypatch.setattr(codex_mod, "_resolve_codex_bin",
-                            lambda: "/bin/codex")
+        monkeypatch.setattr(codex_mod, "_resolve_codex_bin", lambda: "/bin/codex")
         monkeypatch.setattr(
-            codex_mod.subprocess, "run", lambda *a, **k: SimpleNamespace(
-                returncode=1, stdout="", stderr="boom"))
+            codex_mod.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+        )
         assert codex_mod._codex_cli_version() == ""
 
 
@@ -2063,9 +1981,9 @@ class TestCodexBackendVersion:
 def cleanup_fake_sdk_modules():
     yield
     for name in [
-            "codex_app_server",
-            "codex_app_server.api",
-            "codex_app_server.client",
-            "codex_app_server.generated.v2_all",
+        "openai_codex",
+        "openai_codex.api",
+        "openai_codex.client",
+        "openai_codex.generated.v2_all",
     ]:
         sys.modules.pop(name, None)

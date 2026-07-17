@@ -51,6 +51,7 @@ class ServerToolCallEvent:
     a result back. Surfaced as its own event (rather than ``ToolCallEvent``)
     so consumers can treat it differently — typically as informational.
     """
+
     name: str
     input: dict[str, Any]
     tool_use_id: str | None = None
@@ -65,6 +66,7 @@ class ThinkingEvent:
     Surfaced separately from ``AgentTextEvent`` so a UI can collapse
     or dim it without affecting the user-facing message stream.
     """
+
     text: str
     parent_tool_use_id: str | None = None
     agent_label: str | None = None
@@ -88,6 +90,7 @@ class SessionInitEvent:
     plugin prefixes) are intentionally preserved so the surfaced view
     matches what the model itself sees.
     """
+
     skills: list[str] = field(default_factory=list)
     plugins: list[str] = field(default_factory=list)
     agents: list[str] = field(default_factory=list)
@@ -101,6 +104,7 @@ class RateLimitWarningEvent:
     ``allowed_warning`` / ``rejected``. Consumers can use this to warn
     users before a hard cap or to back off gracefully.
     """
+
     status: str
     rate_limit_type: str | None = None
     resets_at: int | None = None
@@ -115,5 +119,6 @@ class CompactBoundaryEvent:
     post-compaction context, so prior usage figures should not be
     compared directly across this boundary.
     """
+
     trigger: str | None = None
     pre_tokens: int | None = None

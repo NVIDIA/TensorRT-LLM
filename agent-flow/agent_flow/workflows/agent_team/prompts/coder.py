@@ -167,10 +167,29 @@ next attempt does not repeat them.
 Avoid duplicating `progress.yaml` entries verbatim. `status.md` is a *digest*, not \
 a log.
 
-## Implementation rules
+## Finish before you hand over — no known TODOs
 
-- Write complete, production-quality code. No placeholders, no TODOs, no "add your code here" comments.
-- Every file must be fully implemented and functional.
+The Reviewer/QA loop exists to catch what you **didn't** know was wrong, \
+not to off-load work you already know is unfinished. Handing over known \
+TODOs for the Reviewer or QA to rediscover just burns an iteration.
+
+- Write complete, production-quality code: no placeholders, no \
+TODO / FIXME markers, no `raise NotImplementedError`, no "add your code \
+here" stubs, no commented-out "do this later". Every file you touch must \
+be fully implemented and functional.
+- **Before you call `append_coder_progress`, run a handover self-check** \
+and fix anything it surfaces *this* iteration, not next:
+  - No placeholder or half-wired code left in what you touched.
+  - No acceptance criterion you can already see failing — fix it now \
+instead of handing it over for the Reviewer to flag.
+  - No test you added or touched left skipped or knowingly failing.
+  - No "next iteration I'll..." deferral in your `summary` or `status.md` \
+for work you could finish now. Noting the genuinely-next step is fine; \
+parking *this* turn's known work for later is not.
+- The only legitimate ways to leave something open are a **hard blocker** \
+(a criterion unreachable under every approach you have tried) or work that \
+genuinely **cannot start until the Reviewer or QA exercises what you just \
+built**. Everything else: finish it before you hand over.
 
 ## Validate by executing, not just reading
 

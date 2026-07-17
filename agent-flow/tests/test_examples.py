@@ -8,10 +8,10 @@ from pathlib import Path
 
 
 def _load_example_module():
-    path = (Path(__file__).resolve().parents[1] / "examples" /
-            "planner_generator_evaluator_workflow.py")
-    spec = importlib.util.spec_from_file_location(
-        "planner_generator_evaluator_workflow", path)
+    path = (
+        Path(__file__).resolve().parents[1] / "examples" / "planner_generator_evaluator_workflow.py"
+    )
+    spec = importlib.util.spec_from_file_location("planner_generator_evaluator_workflow", path)
     assert spec is not None
     assert spec.loader is not None
 
@@ -27,11 +27,9 @@ def test_workflow_feeds_agent_final_responses_forward(tmp_path):
 
     planner_progress = "## planner\n\nPlanned the work.\n\n"
     generator_progress = planner_progress + "## generator\n\nImplemented it.\n\n"
-    evaluator_progress = (generator_progress +
-                          "## evaluator\n\nScore: 9/10.\n\n")
+    evaluator_progress = generator_progress + "## evaluator\n\nScore: 9/10.\n\n"
 
     class ScriptedAgent:
-
         def __init__(self, response_text, action):
             self.response_text = response_text
             self.action = action
@@ -49,19 +47,16 @@ def test_workflow_feeds_agent_final_responses_forward(tmp_path):
                 "# Plan From File\n\n- Build the feature.\n",
                 encoding="utf-8",
             ),
-            workflow.progress_path.write_text(planner_progress,
-                                              encoding="utf-8"),
+            workflow.progress_path.write_text(planner_progress, encoding="utf-8"),
         ),
     )
     workflow.generator = ScriptedAgent(
         "generator final answer",
-        lambda: workflow.progress_path.write_text(generator_progress,
-                                                  encoding="utf-8"),
+        lambda: workflow.progress_path.write_text(generator_progress, encoding="utf-8"),
     )
     workflow.evaluator = ScriptedAgent(
         "evaluator final answer",
-        lambda: workflow.progress_path.write_text(evaluator_progress,
-                                                  encoding="utf-8"),
+        lambda: workflow.progress_path.write_text(evaluator_progress, encoding="utf-8"),
     )
 
     workflow.run("Build a small Hello World script.")
@@ -78,8 +73,7 @@ def test_workflow_feeds_agent_final_responses_forward(tmp_path):
     assert "Generator final response:" in evaluator_prompt
     assert "planner final answer" in evaluator_prompt
     assert "generator final answer" in evaluator_prompt
-    assert workflow.progress_path.read_text(
-        encoding="utf-8") == evaluator_progress
+    assert workflow.progress_path.read_text(encoding="utf-8") == evaluator_progress
 
 
 def test_default_model_constants_respect_env_overrides():
@@ -92,10 +86,12 @@ def test_default_model_constants_respect_env_overrides():
         [
             sys.executable,
             "-c",
-            ("from agent_flow import CLAUDE_CODE_DEFAULT_MODEL, "
-             "CODEX_DEFAULT_MODEL; "
-             "print(CLAUDE_CODE_DEFAULT_MODEL); "
-             "print(CODEX_DEFAULT_MODEL)"),
+            (
+                "from agent_flow import CLAUDE_CODE_DEFAULT_MODEL, "
+                "CODEX_DEFAULT_MODEL; "
+                "print(CLAUDE_CODE_DEFAULT_MODEL); "
+                "print(CODEX_DEFAULT_MODEL)"
+            ),
         ],
         cwd=root,
         capture_output=True,
@@ -163,9 +159,9 @@ def test_quick_start_entrypoint_imports_without_module_error():
 def test_workflow_entrypoint_modules_run_without_import_warnings():
     root = Path(__file__).resolve().parents[1]
     for module in (
-            "agent_flow.workflows.agent_team.cli",
-            "agent_flow.workflows.agent_team.workflow",
-            "agent_flow.workflows.modeling_bringup.cli",
+        "agent_flow.workflows.agent_team.cli",
+        "agent_flow.workflows.agent_team.workflow",
+        "agent_flow.workflows.modeling_bringup.cli",
     ):
         result = subprocess.run(
             [sys.executable, "-W", "error", "-m", module, "--help"],
