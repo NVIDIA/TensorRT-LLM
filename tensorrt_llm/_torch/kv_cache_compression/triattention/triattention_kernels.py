@@ -85,6 +85,11 @@ class FrozenTritonKernelCall:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Scoring: trig-score every cached token across all dense layers.             #
+# --------------------------------------------------------------------------- #
+
+
 @triton.jit
 def _prepare_mean_phase_kernel(
     round_starts,
@@ -154,418 +159,6 @@ def prepare_mean_phase(
         F_BLOCK=triton.next_power_of_2(num_freqs),
         num_warps=1,
     )
-
-
-@triton.jit
-def _score_row_stats_kernel(
-    scores,
-    valid_widths,
-    row_mean,
-    row_inv_std,
-    ROWS: tl.constexpr,
-    WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Compute one valid-prefix mean and inverse standard deviation per score row."""
-    flat_row = tl.program_id(0)
-    request = flat_row // ROWS
-    valid_width = tl.load(valid_widths + request)
-    score_row = scores + flat_row * WIDTH
-    lane = tl.arange(0, BLOCK)
-    score_sum = 0.0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token = start + lane
-        valid = token < valid_width
-        value = tl.load(score_row + token, mask=valid, other=0.0).to(tl.float32)
-        score_sum += tl.sum(value, axis=0)
-    mean = score_sum / valid_width
-    square_sum = 0.0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token = start + lane
-        valid = token < valid_width
-        value = tl.load(score_row + token, mask=valid, other=0.0).to(tl.float32)
-        centered = tl.where(valid, value - mean, 0.0)
-        square_sum += tl.sum(centered * centered, axis=0)
-    std = tl.sqrt(square_sum / valid_width)
-    tl.store(row_mean + flat_row, mean)
-    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, 1e-6))
-
-
-@triton.jit
-def _score_union_kernel(
-    scores,
-    valid_widths,
-    row_mean,
-    row_inv_std,
-    combined,
-    ROWS: tl.constexpr,
-    WIDTH: tl.constexpr,
-    NORMALIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Normalize score rows and reduce them directly to one request-level union."""
-    request = tl.program_id(0)
-    token = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    valid_width = tl.load(valid_widths + request)
-    valid_token = token < valid_width
-    union_max = tl.full((BLOCK,), -float("inf"), tl.float32)
-    for row in tl.range(0, ROWS):
-        flat_row = request * ROWS + row
-        value = tl.load(
-            scores + flat_row * WIDTH + token,
-            mask=valid_token,
-            other=-float("inf"),
-        ).to(tl.float32)
-        if NORMALIZE:
-            mean = tl.load(row_mean + flat_row)
-            inv_std = tl.load(row_inv_std + flat_row)
-            value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
-        union_max = tl.maximum(union_max, value)
-    tl.store(combined + request * WIDTH + token, union_max, mask=token < WIDTH)
-
-
-def prepare_union_scores(
-    scores: torch.Tensor,
-    valid_widths: torch.Tensor,
-    row_mean: torch.Tensor,
-    row_inv_std: torch.Tensor,
-    combined: torch.Tensor,
-    request_count: int,
-    *,
-    normalize_scores: bool,
-) -> None:
-    """Mask, normalize, and union-reduce score rows in two or three launches."""
-    request_count = int(request_count)
-    if not scores.is_cuda or scores.ndim != 3 or scores.dtype != torch.float32:
-        raise ValueError("union score preparation requires contiguous CUDA FP32 rows")
-    if not scores.is_contiguous() or request_count != scores.shape[0]:
-        raise ValueError("union score preparation request geometry does not match")
-    _, rows, width = scores.shape
-    if (
-        valid_widths.shape != (request_count,)
-        or valid_widths.dtype != torch.int32
-        or valid_widths.device != scores.device
-        or row_mean.numel() < request_count * rows
-        or row_inv_std.shape != row_mean.shape
-        or combined.shape != (request_count, width)
-    ):
-        raise ValueError("union score preparation buffers do not match")
-    stats_block = 256
-    if normalize_scores:
-        _score_row_stats_kernel[(request_count * rows,)](
-            scores,
-            valid_widths,
-            row_mean,
-            row_inv_std,
-            ROWS=rows,
-            WIDTH=width,
-            BLOCK=stats_block,
-            num_warps=4,
-        )
-    union_block = 32
-    _score_union_kernel[(request_count, triton.cdiv(width, union_block))](
-        scores,
-        valid_widths,
-        row_mean,
-        row_inv_std,
-        combined,
-        ROWS=rows,
-        WIDTH=width,
-        NORMALIZE=normalize_scores,
-        BLOCK=union_block,
-        num_warps=1,
-    )
-
-
-@triton.jit
-def _score_per_head_reduce_kernel(
-    scores,
-    valid_widths,
-    row_mean,
-    row_inv_std,
-    selection_scores,
-    selection_seq_lens,
-    NUM_LAYERS: tl.constexpr,
-    NUM_QUERY_HEADS: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    QUERY_GROUP_SIZE: tl.constexpr,
-    SELECTION_ROWS: tl.constexpr,
-    WIDTH: tl.constexpr,
-    PER_LAYER: tl.constexpr,
-    NORMALIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Reduce query-head score rows into one selector row per KV-head domain."""
-    request = tl.program_id(0)
-    selection_row = tl.program_id(1)
-    token_block = tl.program_id(2)
-    token = token_block * BLOCK + tl.arange(0, BLOCK)
-    valid_width = tl.load(valid_widths + request)
-    valid_token = token < valid_width
-
-    if token_block == 0:
-        tl.store(
-            selection_seq_lens + request * SELECTION_ROWS + selection_row,
-            valid_width,
-        )
-
-    kv_head = selection_row % NUM_KV_HEADS
-    if PER_LAYER:
-        layer = selection_row // NUM_KV_HEADS
-        reduced = tl.full((BLOCK,), -float("inf"), tl.float32)
-        for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
-            query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
-            flat_row = (request * NUM_LAYERS + layer) * NUM_QUERY_HEADS + query_head
-            value = tl.load(
-                scores + flat_row * WIDTH + token,
-                mask=valid_token,
-                other=-float("inf"),
-            ).to(tl.float32)
-            if NORMALIZE:
-                mean = tl.load(row_mean + flat_row)
-                inv_std = tl.load(row_inv_std + flat_row)
-                value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
-            reduced = tl.maximum(reduced, value)
-    else:
-        reduced = tl.zeros((BLOCK,), tl.float32)
-        for layer in tl.static_range(0, NUM_LAYERS):
-            layer_max = tl.full((BLOCK,), -float("inf"), tl.float32)
-            for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
-                query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
-                flat_row = (request * NUM_LAYERS + layer) * NUM_QUERY_HEADS + query_head
-                value = tl.load(
-                    scores + flat_row * WIDTH + token,
-                    mask=valid_token,
-                    other=-float("inf"),
-                ).to(tl.float32)
-                if NORMALIZE:
-                    mean = tl.load(row_mean + flat_row)
-                    inv_std = tl.load(row_inv_std + flat_row)
-                    value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
-                layer_max = tl.maximum(layer_max, value)
-            reduced += layer_max
-        reduced /= NUM_LAYERS
-
-    output = (request * SELECTION_ROWS + selection_row) * WIDTH + token
-    tl.store(selection_scores + output, reduced, mask=token < WIDTH)
-
-
-def prepare_per_head_scores(
-    scores: torch.Tensor,
-    valid_widths: torch.Tensor,
-    row_mean: torch.Tensor,
-    row_inv_std: torch.Tensor,
-    selection_scores: torch.Tensor,
-    selection_seq_lens: torch.Tensor,
-    request_count: int,
-    *,
-    num_kv_heads: int,
-    per_layer: bool,
-    normalize_scores: bool,
-) -> None:
-    """Normalize and reduce score rows for either per-head eviction mode."""
-    request_count = int(request_count)
-    num_kv_heads = int(num_kv_heads)
-    if not scores.is_cuda or scores.ndim != 4 or scores.dtype != torch.float32:
-        raise ValueError("per-head score preparation requires CUDA FP32 rows")
-    if not scores.is_contiguous() or request_count != scores.shape[0]:
-        raise ValueError("per-head score preparation request geometry does not match")
-    _, num_layers, num_query_heads, width = scores.shape
-    if num_kv_heads <= 0 or num_query_heads % num_kv_heads:
-        raise ValueError("per-head score preparation requires valid GQA geometry")
-    selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
-    if (
-        valid_widths.shape != (request_count,)
-        or valid_widths.dtype != torch.int32
-        or valid_widths.device != scores.device
-        or row_mean.numel() < request_count * num_layers * num_query_heads
-        or row_inv_std.shape != row_mean.shape
-        or selection_scores.shape != (request_count, selection_rows, width)
-        or selection_scores.dtype != torch.float32
-        or selection_scores.device != scores.device
-        or selection_seq_lens.shape != (request_count, selection_rows)
-        or selection_seq_lens.dtype != torch.int32
-        or selection_seq_lens.device != scores.device
-    ):
-        raise ValueError("per-head score preparation buffers do not match")
-
-    stats_block = 256
-    rows = num_layers * num_query_heads
-    if normalize_scores:
-        _score_row_stats_kernel[(request_count * rows,)](
-            scores,
-            valid_widths,
-            row_mean,
-            row_inv_std,
-            ROWS=rows,
-            WIDTH=width,
-            BLOCK=stats_block,
-            num_warps=4,
-        )
-    reduction_block = 256
-    _score_per_head_reduce_kernel[
-        (request_count, selection_rows, triton.cdiv(width, reduction_block))
-    ](
-        scores,
-        valid_widths,
-        row_mean,
-        row_inv_std,
-        selection_scores,
-        selection_seq_lens,
-        NUM_LAYERS=num_layers,
-        NUM_QUERY_HEADS=num_query_heads,
-        NUM_KV_HEADS=num_kv_heads,
-        QUERY_GROUP_SIZE=num_query_heads // num_kv_heads,
-        SELECTION_ROWS=selection_rows,
-        WIDTH=width,
-        PER_LAYER=per_layer,
-        NORMALIZE=normalize_scores,
-        BLOCK=reduction_block,
-        num_warps=4,
-    )
-
-
-@triton.jit
-def _pack_compaction_sources_kernel(
-    selected_indices,
-    valid_seq_lens,
-    dense_offsets,
-    dense_indices,
-    swa_offsets,
-    swa_indices,
-    DENSE_TOTAL: tl.constexpr,
-    SWA_TOTAL: tl.constexpr,
-    SELECTION_ROWS: tl.constexpr,
-    SELECTION_STRIDE: tl.constexpr,
-    KEEP_COUNT: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    SWA_WINDOW: tl.constexpr,
-    UNION: tl.constexpr,
-    PER_LAYER: tl.constexpr,
-    HAS_SWA: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Pack selected decode ordinals and protected tails for the C++ updater."""
-    request = tl.program_id(0)
-    domain = tl.program_id(1)
-    move = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
-
-    dense_begin = tl.load(dense_offsets + request)
-    dense_end = tl.load(dense_offsets + request + 1)
-    dense_count = dense_end - dense_begin
-    seq_len = tl.load(valid_seq_lens + request)
-
-    if UNION:
-        selection_domain = 0
-    else:
-        selection_domain = domain
-    # Selection rows carry decode-only kept ordinals (already absolute), so
-    # rows are prompt-length independent and one cohort may mix prompt sizes.
-    selection_row = request * SELECTION_ROWS + selection_domain
-    selected = tl.load(
-        selected_indices + selection_row.to(tl.int64) * SELECTION_STRIDE + move,
-        mask=move < KEEP_COUNT,
-        other=0,
-    )
-    dense_source = tl.where(move < KEEP_COUNT, selected, seq_len + move - KEEP_COUNT)
-    dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
-    tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
-
-    if HAS_SWA:
-        # Per-layer selection has one dense domain per (layer, head). SWA uses
-        # one shared source row per head, so only the first layer writes it.
-        if PER_LAYER:
-            write_swa = domain < NUM_KV_HEADS
-        else:
-            write_swa = move >= 0
-        swa_begin = tl.load(swa_offsets + request)
-        swa_end = tl.load(swa_offsets + request + 1)
-        swa_count = swa_end - swa_begin
-        head = domain % NUM_KV_HEADS
-        swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
-        swa_source = seq_len - SWA_WINDOW + move
-        tl.store(
-            swa_indices + swa_output,
-            swa_source,
-            mask=write_swa & (move < swa_count),
-        )
-
-
-@triton.jit
-def _finalize_topk_indices_kernel(
-    scores,
-    seq_lens,
-    prompt_offsets,
-    provisional_indices,
-    output_indices,
-    WIDTH: tl.constexpr,
-    KEEP_COUNT: tl.constexpr,
-    OUTPUT_WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Resolve boundary ties and emit increasing physical token indices."""
-    row = tl.program_id(0)
-    row_scores = scores + row * WIDTH
-    row_selected = provisional_indices + row * KEEP_COUNT
-    row_output = output_indices + row * OUTPUT_WIDTH
-    # Scores are decode-relative; this row's pinned prompt length rebases the
-    # emitted ordinals to absolute positions (per row, so one launch may mix
-    # prompt lengths).
-    prompt_len = tl.load(prompt_offsets + row)
-
-    threshold = float("inf")
-    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
-        selected_offset = start + tl.arange(0, BLOCK)
-        selected_mask = selected_offset < KEEP_COUNT
-        token_index = tl.load(
-            row_selected + selected_offset,
-            mask=selected_mask,
-            other=0,
-        )
-        selected_score = tl.load(
-            row_scores + token_index,
-            mask=selected_mask,
-            other=float("inf"),
-        ).to(tl.float32)
-        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
-
-    seq_len = tl.load(seq_lens + row)
-    greater_count = 0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
-        score = tl.load(
-            row_scores + token_index,
-            mask=valid,
-            other=float("-inf"),
-        ).to(tl.float32)
-        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
-
-    tie_quota = KEEP_COUNT - greater_count
-    output_count = 0
-    ties_seen = 0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
-        score = tl.load(
-            row_scores + token_index,
-            mask=valid,
-            other=float("-inf"),
-        ).to(tl.float32)
-        greater = valid & (score > threshold)
-        tied = valid & (score == threshold)
-        tied_i32 = tied.to(tl.int32)
-        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
-        selected = greater | (tied & (tie_rank < tie_quota))
-        selected_i32 = selected.to(tl.int32)
-        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
-        tl.store(
-            row_output + write_offset,
-            token_index + prompt_len,
-            mask=selected,
-        )
-        output_count += tl.sum(selected_i32)
-        ties_seen += tl.sum(tied_i32)
 
 
 @triton.jit
@@ -949,3 +542,425 @@ class _FixedScoreGroup:
             num_freqs=self.num_freqs,
         )
         return output
+
+
+# --------------------------------------------------------------------------- #
+# Selection: combine scores per mode, then finalize the top-k set.            #
+# --------------------------------------------------------------------------- #
+
+
+@triton.jit
+def _score_row_stats_kernel(
+    scores,
+    valid_widths,
+    row_mean,
+    row_inv_std,
+    ROWS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Compute one valid-prefix mean and inverse standard deviation per score row."""
+    flat_row = tl.program_id(0)
+    request = flat_row // ROWS
+    valid_width = tl.load(valid_widths + request)
+    score_row = scores + flat_row * WIDTH
+    lane = tl.arange(0, BLOCK)
+    score_sum = 0.0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token = start + lane
+        valid = token < valid_width
+        value = tl.load(score_row + token, mask=valid, other=0.0).to(tl.float32)
+        score_sum += tl.sum(value, axis=0)
+    mean = score_sum / valid_width
+    square_sum = 0.0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token = start + lane
+        valid = token < valid_width
+        value = tl.load(score_row + token, mask=valid, other=0.0).to(tl.float32)
+        centered = tl.where(valid, value - mean, 0.0)
+        square_sum += tl.sum(centered * centered, axis=0)
+    std = tl.sqrt(square_sum / valid_width)
+    tl.store(row_mean + flat_row, mean)
+    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, 1e-6))
+
+
+@triton.jit
+def _score_union_kernel(
+    scores,
+    valid_widths,
+    row_mean,
+    row_inv_std,
+    combined,
+    ROWS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Normalize score rows and reduce them directly to one request-level union."""
+    request = tl.program_id(0)
+    token = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid_width = tl.load(valid_widths + request)
+    valid_token = token < valid_width
+    union_max = tl.full((BLOCK,), -float("inf"), tl.float32)
+    for row in tl.range(0, ROWS):
+        flat_row = request * ROWS + row
+        value = tl.load(
+            scores + flat_row * WIDTH + token,
+            mask=valid_token,
+            other=-float("inf"),
+        ).to(tl.float32)
+        if NORMALIZE:
+            mean = tl.load(row_mean + flat_row)
+            inv_std = tl.load(row_inv_std + flat_row)
+            value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
+        union_max = tl.maximum(union_max, value)
+    tl.store(combined + request * WIDTH + token, union_max, mask=token < WIDTH)
+
+
+def prepare_union_scores(
+    scores: torch.Tensor,
+    valid_widths: torch.Tensor,
+    row_mean: torch.Tensor,
+    row_inv_std: torch.Tensor,
+    combined: torch.Tensor,
+    request_count: int,
+    *,
+    normalize_scores: bool,
+) -> None:
+    """Mask, normalize, and union-reduce score rows in two or three launches."""
+    request_count = int(request_count)
+    if not scores.is_cuda or scores.ndim != 3 or scores.dtype != torch.float32:
+        raise ValueError("union score preparation requires contiguous CUDA FP32 rows")
+    if not scores.is_contiguous() or request_count != scores.shape[0]:
+        raise ValueError("union score preparation request geometry does not match")
+    _, rows, width = scores.shape
+    if (
+        valid_widths.shape != (request_count,)
+        or valid_widths.dtype != torch.int32
+        or valid_widths.device != scores.device
+        or row_mean.numel() < request_count * rows
+        or row_inv_std.shape != row_mean.shape
+        or combined.shape != (request_count, width)
+    ):
+        raise ValueError("union score preparation buffers do not match")
+    stats_block = 256
+    if normalize_scores:
+        _score_row_stats_kernel[(request_count * rows,)](
+            scores,
+            valid_widths,
+            row_mean,
+            row_inv_std,
+            ROWS=rows,
+            WIDTH=width,
+            BLOCK=stats_block,
+            num_warps=4,
+        )
+    union_block = 32
+    _score_union_kernel[(request_count, triton.cdiv(width, union_block))](
+        scores,
+        valid_widths,
+        row_mean,
+        row_inv_std,
+        combined,
+        ROWS=rows,
+        WIDTH=width,
+        NORMALIZE=normalize_scores,
+        BLOCK=union_block,
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _score_per_head_reduce_kernel(
+    scores,
+    valid_widths,
+    row_mean,
+    row_inv_std,
+    selection_scores,
+    selection_seq_lens,
+    NUM_LAYERS: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    QUERY_GROUP_SIZE: tl.constexpr,
+    SELECTION_ROWS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    PER_LAYER: tl.constexpr,
+    NORMALIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Reduce query-head score rows into one selector row per KV-head domain."""
+    request = tl.program_id(0)
+    selection_row = tl.program_id(1)
+    token_block = tl.program_id(2)
+    token = token_block * BLOCK + tl.arange(0, BLOCK)
+    valid_width = tl.load(valid_widths + request)
+    valid_token = token < valid_width
+
+    if token_block == 0:
+        tl.store(
+            selection_seq_lens + request * SELECTION_ROWS + selection_row,
+            valid_width,
+        )
+
+    kv_head = selection_row % NUM_KV_HEADS
+    if PER_LAYER:
+        layer = selection_row // NUM_KV_HEADS
+        reduced = tl.full((BLOCK,), -float("inf"), tl.float32)
+        for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
+            query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
+            flat_row = (request * NUM_LAYERS + layer) * NUM_QUERY_HEADS + query_head
+            value = tl.load(
+                scores + flat_row * WIDTH + token,
+                mask=valid_token,
+                other=-float("inf"),
+            ).to(tl.float32)
+            if NORMALIZE:
+                mean = tl.load(row_mean + flat_row)
+                inv_std = tl.load(row_inv_std + flat_row)
+                value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
+            reduced = tl.maximum(reduced, value)
+    else:
+        reduced = tl.zeros((BLOCK,), tl.float32)
+        for layer in tl.static_range(0, NUM_LAYERS):
+            layer_max = tl.full((BLOCK,), -float("inf"), tl.float32)
+            for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
+                query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
+                flat_row = (request * NUM_LAYERS + layer) * NUM_QUERY_HEADS + query_head
+                value = tl.load(
+                    scores + flat_row * WIDTH + token,
+                    mask=valid_token,
+                    other=-float("inf"),
+                ).to(tl.float32)
+                if NORMALIZE:
+                    mean = tl.load(row_mean + flat_row)
+                    inv_std = tl.load(row_inv_std + flat_row)
+                    value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
+                layer_max = tl.maximum(layer_max, value)
+            reduced += layer_max
+        reduced /= NUM_LAYERS
+
+    output = (request * SELECTION_ROWS + selection_row) * WIDTH + token
+    tl.store(selection_scores + output, reduced, mask=token < WIDTH)
+
+
+def prepare_per_head_scores(
+    scores: torch.Tensor,
+    valid_widths: torch.Tensor,
+    row_mean: torch.Tensor,
+    row_inv_std: torch.Tensor,
+    selection_scores: torch.Tensor,
+    selection_seq_lens: torch.Tensor,
+    request_count: int,
+    *,
+    num_kv_heads: int,
+    per_layer: bool,
+    normalize_scores: bool,
+) -> None:
+    """Normalize and reduce score rows for either per-head eviction mode."""
+    request_count = int(request_count)
+    num_kv_heads = int(num_kv_heads)
+    if not scores.is_cuda or scores.ndim != 4 or scores.dtype != torch.float32:
+        raise ValueError("per-head score preparation requires CUDA FP32 rows")
+    if not scores.is_contiguous() or request_count != scores.shape[0]:
+        raise ValueError("per-head score preparation request geometry does not match")
+    _, num_layers, num_query_heads, width = scores.shape
+    if num_kv_heads <= 0 or num_query_heads % num_kv_heads:
+        raise ValueError("per-head score preparation requires valid GQA geometry")
+    selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
+    if (
+        valid_widths.shape != (request_count,)
+        or valid_widths.dtype != torch.int32
+        or valid_widths.device != scores.device
+        or row_mean.numel() < request_count * num_layers * num_query_heads
+        or row_inv_std.shape != row_mean.shape
+        or selection_scores.shape != (request_count, selection_rows, width)
+        or selection_scores.dtype != torch.float32
+        or selection_scores.device != scores.device
+        or selection_seq_lens.shape != (request_count, selection_rows)
+        or selection_seq_lens.dtype != torch.int32
+        or selection_seq_lens.device != scores.device
+    ):
+        raise ValueError("per-head score preparation buffers do not match")
+
+    stats_block = 256
+    rows = num_layers * num_query_heads
+    if normalize_scores:
+        _score_row_stats_kernel[(request_count * rows,)](
+            scores,
+            valid_widths,
+            row_mean,
+            row_inv_std,
+            ROWS=rows,
+            WIDTH=width,
+            BLOCK=stats_block,
+            num_warps=4,
+        )
+    reduction_block = 256
+    _score_per_head_reduce_kernel[
+        (request_count, selection_rows, triton.cdiv(width, reduction_block))
+    ](
+        scores,
+        valid_widths,
+        row_mean,
+        row_inv_std,
+        selection_scores,
+        selection_seq_lens,
+        NUM_LAYERS=num_layers,
+        NUM_QUERY_HEADS=num_query_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        QUERY_GROUP_SIZE=num_query_heads // num_kv_heads,
+        SELECTION_ROWS=selection_rows,
+        WIDTH=width,
+        PER_LAYER=per_layer,
+        NORMALIZE=normalize_scores,
+        BLOCK=reduction_block,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _finalize_topk_indices_kernel(
+    scores,
+    seq_lens,
+    prompt_offsets,
+    provisional_indices,
+    output_indices,
+    WIDTH: tl.constexpr,
+    KEEP_COUNT: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Resolve boundary ties and emit increasing physical token indices."""
+    row = tl.program_id(0)
+    row_scores = scores + row * WIDTH
+    row_selected = provisional_indices + row * KEEP_COUNT
+    row_output = output_indices + row * OUTPUT_WIDTH
+    # Scores are decode-relative; this row's pinned prompt length rebases the
+    # emitted ordinals to absolute positions (per row, so one launch may mix
+    # prompt lengths).
+    prompt_len = tl.load(prompt_offsets + row)
+
+    threshold = float("inf")
+    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
+        selected_offset = start + tl.arange(0, BLOCK)
+        selected_mask = selected_offset < KEEP_COUNT
+        token_index = tl.load(
+            row_selected + selected_offset,
+            mask=selected_mask,
+            other=0,
+        )
+        selected_score = tl.load(
+            row_scores + token_index,
+            mask=selected_mask,
+            other=float("inf"),
+        ).to(tl.float32)
+        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
+
+    seq_len = tl.load(seq_lens + row)
+    greater_count = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
+
+    tie_quota = KEEP_COUNT - greater_count
+    output_count = 0
+    ties_seen = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater = valid & (score > threshold)
+        tied = valid & (score == threshold)
+        tied_i32 = tied.to(tl.int32)
+        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
+        selected = greater | (tied & (tie_rank < tie_quota))
+        selected_i32 = selected.to(tl.int32)
+        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
+        tl.store(
+            row_output + write_offset,
+            token_index + prompt_len,
+            mask=selected,
+        )
+        output_count += tl.sum(selected_i32)
+        ties_seen += tl.sum(tied_i32)
+
+
+# --------------------------------------------------------------------------- #
+# Compaction: pack the kept ordinals into per-request move indices.           #
+# --------------------------------------------------------------------------- #
+
+
+@triton.jit
+def _pack_compaction_sources_kernel(
+    selected_indices,
+    valid_seq_lens,
+    dense_offsets,
+    dense_indices,
+    swa_offsets,
+    swa_indices,
+    DENSE_TOTAL: tl.constexpr,
+    SWA_TOTAL: tl.constexpr,
+    SELECTION_ROWS: tl.constexpr,
+    SELECTION_STRIDE: tl.constexpr,
+    KEEP_COUNT: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    SWA_WINDOW: tl.constexpr,
+    UNION: tl.constexpr,
+    PER_LAYER: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Pack selected decode ordinals and protected tails for the C++ updater."""
+    request = tl.program_id(0)
+    domain = tl.program_id(1)
+    move = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+
+    dense_begin = tl.load(dense_offsets + request)
+    dense_end = tl.load(dense_offsets + request + 1)
+    dense_count = dense_end - dense_begin
+    seq_len = tl.load(valid_seq_lens + request)
+
+    if UNION:
+        selection_domain = 0
+    else:
+        selection_domain = domain
+    # Selection rows carry decode-only kept ordinals (already absolute), so
+    # rows are prompt-length independent and one cohort may mix prompt sizes.
+    selection_row = request * SELECTION_ROWS + selection_domain
+    selected = tl.load(
+        selected_indices + selection_row.to(tl.int64) * SELECTION_STRIDE + move,
+        mask=move < KEEP_COUNT,
+        other=0,
+    )
+    dense_source = tl.where(move < KEEP_COUNT, selected, seq_len + move - KEEP_COUNT)
+    dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
+    tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
+
+    if HAS_SWA:
+        # Per-layer selection has one dense domain per (layer, head). SWA uses
+        # one shared source row per head, so only the first layer writes it.
+        if PER_LAYER:
+            write_swa = domain < NUM_KV_HEADS
+        else:
+            write_swa = move >= 0
+        swa_begin = tl.load(swa_offsets + request)
+        swa_end = tl.load(swa_offsets + request + 1)
+        swa_count = swa_end - swa_begin
+        head = domain % NUM_KV_HEADS
+        swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
+        swa_source = seq_len - SWA_WINDOW + move
+        tl.store(
+            swa_indices + swa_output,
+            swa_source,
+            mask=write_swa & (move < swa_count),
+        )
