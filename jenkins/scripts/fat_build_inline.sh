@@ -67,8 +67,6 @@ echo "[fat_build] Installing apt deps..."
 apt-get install -y libffi-dev
 echo "[fat_build] Installing requirements-dev.txt..."
 pip3 install --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
-echo "[fat_build] Installed Python packages:"
-pip3 list
 echo "[fat_build] Installing trtllm wheel..."
 pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
 echo "[fat_build] Installed TensorRT-LLM version:"
