@@ -681,7 +681,7 @@ class GvrTopKKernel:
         lane,
         smem_gath=None,  # cute.Tensor [top_k] f32 or None (p1b_cache): stash
         # the gathered value per preIdx slot so P1b skips a 2nd GMEM gather.
-        s_mt_thr=None,   # r0_vseed: P1 also parks pmean in the last rung
+        s_mt_thr=None,  # r0_vseed: P1 also parks pmean in the last rung
         # column (visibility via P1's own trailing barrier -> zero extra sync).
     ):
         """preIdx scan + warp reduce + block aggregate + initial threshold.
@@ -2278,9 +2278,7 @@ class GvrTopKKernel:
                                                 pmatch = cutlass.Int32(0)
                                         if pmatch == cutlass.Int32(1):
                                             dg = (uk >> cutlass.Int32(shift)) & cutlass.Int32(0xFF)
-                                            atomicAdd(
-                                                smem_hist.iterator + dg, cutlass.Int32(1)
-                                            )
+                                            atomicAdd(smem_hist.iterator + dg, cutlass.Int32(1))
                                 it2 = it2 + cutlass.Int32(num_threads)
                             cute.arch.barrier()
                             # Two-stage descending digit scan (mirrors the
@@ -3291,7 +3289,7 @@ class GvrTopKKernel:
             warp_id,
             lane,
             smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
-            s_mt_thr=s_mt_thr,    # r0_vseed: park pmean in the last rung column
+            s_mt_thr=s_mt_thr,  # r0_vseed: park pmean in the last rung column
         )
 
         # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
@@ -3394,8 +3392,11 @@ class GvrTopKKernel:
                     best_c = cutlass.Int32(2147483647)
                     for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
                         cm = s_mt_cnt[m]
-                        if (cm >= cutlass.Int32(self.top_k) and cm <= cutlass.Int32(self.kC)
-                                and cm < best_c):
+                        if (
+                            cm >= cutlass.Int32(self.top_k)
+                            and cm <= cutlass.Int32(self.kC)
+                            and cm < best_c
+                        ):
                             best_m = cutlass.Int32(m)
                             best_c = cm
                     s_r0col[0] = best_m
@@ -3443,11 +3444,13 @@ class GvrTopKKernel:
                                 cm = s_mt_cnt[m]
                                 tm = s_mt_thr[m]
                                 if cm > cutlass.Int32(self.kC) and (
-                                        clo < cutlass.Int32(0) or tm > blo):
+                                    clo < cutlass.Int32(0) or tm > blo
+                                ):
                                     blo = tm
                                     clo = cm
                                 if cm < cutlass.Int32(self.top_k) and (
-                                        chi < cutlass.Int32(0) or tm < bhi):
+                                    chi < cutlass.Int32(0) or tm < bhi
+                                ):
                                     bhi = tm
                                     chi = cm
                             s_thr[1] = blo

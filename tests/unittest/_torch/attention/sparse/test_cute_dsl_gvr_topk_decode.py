@@ -908,14 +908,12 @@ def test_cute_dsl_gvr_topk_decode_p4_exact_tail_ties(top_k, N, cluster_size, ban
     n_tie = 2400 if band == "sub_resolution" else 2000
     plant = torch.randperm(N)[:n_tie]
     if band == "sub_resolution":
-        tie_vals = boundary + (
-            torch.arange(n_tie, dtype=torch.float32, device="cuda") - n_tie // 2
-        ) * 5e-8
+        tie_vals = (
+            boundary + (torch.arange(n_tie, dtype=torch.float32, device="cuda") - n_tie // 2) * 5e-8
+        )
     else:
         tie_vals = torch.full((n_tie,), boundary, device="cuda")
-        tie_vals[::2] = torch.nextafter(
-            tie_vals[::2], torch.tensor(float("inf"), device="cuda")
-        )
+        tie_vals[::2] = torch.nextafter(tie_vals[::2], torch.tensor(float("inf"), device="cuda"))
     logits[0, plant] = tie_vals
     seq_lens = torch.full((1,), N, dtype=torch.int32, device="cuda")
     pre_idx = _make_r0_pre_idx(logits, top_k, "real", seed=4)
