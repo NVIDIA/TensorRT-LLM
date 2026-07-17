@@ -1152,7 +1152,7 @@ def test_fastwan_lpips_against_golden(tmp_path):
         tmp_path, "fastwan_lpips_golden_video.mp4", "FastWan LPIPS golden video"
     )
     _generate_wan_lpips_video(
-        _lpips_model_path("FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers"),
+        _lpips_model_path("FastWan2.2-TI2V-5B-FullAttn-Diffusers"),
         generated_path,
         FASTWAN_LPIPS_PROMPT,
         FASTWAN_LPIPS_NEGATIVE_PROMPT,

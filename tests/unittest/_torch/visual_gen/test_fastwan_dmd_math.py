@@ -113,7 +113,7 @@ def _run(pipe, latents, zero_noise=False):
     gen = torch.Generator(device=latents.device).manual_seed(42)
     embeds = torch.zeros(1, 8, 4096, device=latents.device, dtype=torch.bfloat16)
     if zero_noise:
-        zeros = torch.zeros(_LATENT_SHAPE, device=latents.device, dtype=torch.float32)
+        zeros = torch.zeros_like(latents)
         with mock.patch(_RANDN_PATH, return_value=zeros):
             return pipe._denoise(latents, embeds, gen)
     return pipe._denoise(latents, embeds, gen)
