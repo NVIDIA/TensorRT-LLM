@@ -83,7 +83,10 @@ def _pipeline_with_test_doubles():
     pipe.vae_scale_factor = 8
     pipe.transformer = _RecordingTransformer()
     pipe.scheduler = _RecordingScheduler()
-    pipe.pipeline_config = SimpleNamespace(visual_gen_mapping=None)
+    pipe.pipeline_config = SimpleNamespace(
+        visual_gen_mapping=None,
+        cuda_graph=SimpleNamespace(enable=False),
+    )
     captured = {"encoded_prompts": []}
 
     def _encode_prompt(prompt, device, max_sequence_length):
