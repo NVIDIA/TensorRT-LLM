@@ -46,6 +46,7 @@ from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..utils import is_gdn_replay_enabled
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
                            is_hybrid_linear, is_mla, is_nemotron_hybrid,
                            is_qwen3_hybrid)
@@ -1994,7 +1995,7 @@ def _create_kv_cache_manager(
             use_replay = False
 
         # Replay is opt-in because its end-to-end benefit is workload-dependent.
-        if os.environ.get('TRTLLM_USE_GDN_REPLAY', '0') == '0':
+        if not is_gdn_replay_enabled():
             logger.info("GDN replay kernel is disabled; set "
                         "TRTLLM_USE_GDN_REPLAY=1 to enable it")
             use_replay = False

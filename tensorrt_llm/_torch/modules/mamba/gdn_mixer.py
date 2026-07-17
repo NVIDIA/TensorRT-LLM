@@ -32,7 +32,7 @@ from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...speculative import SpecMetadata
-from ...utils import EventType, get_model_extra_attrs, is_torch_compiling
+from ...utils import EventType, get_model_extra_attrs, is_gdn_replay_enabled, is_torch_compiling
 from ..linear import Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -252,7 +252,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         config = model_config.pretrained_config
         self.model_config = model_config
         self.pretrained_config = config
-        replay_enabled = os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") != "0"
+        replay_enabled = is_gdn_replay_enabled()
         if replay_enabled:
             logger.info_once(
                 "Configured GDN MTP replay implementation: cached",

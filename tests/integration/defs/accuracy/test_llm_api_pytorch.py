@@ -6363,6 +6363,42 @@ class TestQwen3_5_397B_A17B(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @pytest.mark.skip_less_device(4)
+    def test_nvfp4_mtp3_gdn_replay_tep4(self, mocker):
+        model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
+        if not os.path.exists(model_path):
+            pytest.skip(f"Model directory {model_path} does not exist")
+
+        replay_env = {"TRTLLM_USE_GDN_REPLAY": "1"}
+        mocker.patch.dict(os.environ, replay_env)
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False,
+                                        dtype="fp8",
+                                        mamba_ssm_cache_dtype="bfloat16")
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=128)
+        mtp_config = MTPDecodingConfig(max_draft_len=3)
+
+        with LLM(model_path,
+                 trust_remote_code=True,
+                 tensor_parallel_size=4,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=4,
+                 max_num_tokens=16384,
+                 max_batch_size=128,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 enable_attention_dp=False,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
     def _run_nvfp4_4gpus_eplb(self, eplb_config, moe_backend, mocker):
         model_path = f"{llm_models_root()}/Qwen3.5-397B-A17B-NVFP4"
         if not os.path.exists(model_path):
