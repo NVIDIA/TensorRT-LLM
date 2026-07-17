@@ -1159,6 +1159,17 @@ class PyTorchModelEngine(ModelEngine):
         with self.cuda_graph_runner.allow_capture():
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
+        # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
+        # batch bucket the runtime can produce (max_batch_size scaled by the
+        # MTP / DSL expansion factor when applicable). CUDA-graph warmup only
+        # exercises the batch sizes in cuda_graph_batch_sizes, which round
+        # up to a subset of buckets; any inference iter whose
+        # context_lens.size(0) lands on an uncovered bucket triggers an
+        # nvcc-driven JIT compile (~3s stall inside _prepare_inputs) on
+        # first touch. Pre-touching every bucket funnels that cost into
+        # warmup. No-op on non-DSA models.
+        self._warmup_dg_paged_mqa_logits_metadata()
+        log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
@@ -1166,6 +1177,102 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
+
+    def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
+        """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
+        every 32-aligned batch bucket the runtime can produce.
+
+        DSA's `Indexer.prepare_scheduler_metadata` calls
+        `deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv,
+        num_sms)` inside `_prepare_inputs` every iteration. The underlying
+        kernel is templated on `<kAlignedBatchSize, split_kv, num_sms>`
+        where `kAlignedBatchSize = align(context_lens.size(0), 32)` and
+        `split_kv` / `num_sms` are fixed for a given (block_kv, device).
+        deep_gemm's Python-side JIT compiles a fresh cubin (spawning
+        nvcc/cicc/ptxas, ~3s on GB300) the first time each `aligned_bs`
+        is requested. CUDA-graph warmup exercises only the batch sizes in
+        `cuda_graph_batch_sizes`, which round up to a subset of the 32-
+        aligned buckets; every uncovered bucket that the inference
+        workload later touches produces a 3s stall on that iteration.
+        Pre-touching every bucket here funnels those compiles into the
+        deterministic warmup phase.
+
+        `context_lens.size(0)` is not always `num_generations`. For MTP
+        with `use_expanded_buffers_for_mtp=True` the expanded call passes
+        `num_generations * (1 + max_draft_tokens)`. For DSL expansion the
+        call passes `num_generations * dsl_expand_factor`, where
+        `dsl_expand_factor = next_n // eff` (`eff in kernel_atoms`, see
+        `_pick_dsl_expand` in `dsa.py`); its worst case is
+        `next_n = 1 + max_draft_tokens` when `eff == 1`. Reading the
+        current `dsl_expand_factor` off the metadata would under-estimate
+        the eventual max (it defaults to 1 before any prepare() has run,
+        and per-iter picks can differ across iters when CUDA graph is
+        off), so we use the static upper bound `1 + max_draft_tokens`
+        for both expansion paths. Bucket range is also scaled by
+        `max_beam_width` as a defense-in-depth ceiling for future beam
+        support (no-op today — DSA does not use beam). No-op on non-DSA
+        models.
+
+        Best-effort: per-bucket JIT failures are logged and skipped so a
+        single broken bucket does not abort PyExecutor startup.
+        """
+        attn_meta = getattr(self, "attn_metadata", None)
+        if attn_meta is None:
+            return
+        try:
+            from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+                _DG_SCHEDULE_BLOCK_KV, DSAtrtllmAttentionMetadata)
+        except ImportError:
+            return
+        if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
+            return
+        try:
+            from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+        except ImportError:
+            logger.info(
+                "[DG warmup] deep_gemm.get_paged_mqa_logits_metadata not "
+                "available; skipping paged_mqa_logits_metadata prewarm.")
+            return
+
+        num_sms = attn_meta.num_sms
+        max_bs = max(1, int(self.batch_size))
+        beam_width = max(1, int(getattr(self, "max_beam_width", 1) or 1))
+        # Static upper bound on the row-count multiplier applied to
+        # `context_lens`. Both MTP-expanded and DSL-expanded call sites
+        # are bounded above by `(1 + max_draft_tokens)`; see the
+        # docstring for why we don't read the runtime `dsl_expand_factor`
+        # here.
+        max_draft_tokens = int(getattr(attn_meta, "max_draft_tokens", 0) or 0)
+        expands_batch = (getattr(attn_meta, "use_expanded_buffers_for_mtp",
+                                 False)
+                         or getattr(attn_meta, "expand_for_dsl", False))
+        expand_factor = 1 + max_draft_tokens if expands_batch else 1
+        max_aligned = ((max_bs * beam_width * expand_factor + 31) // 32) * 32
+        buckets = list(range(32, max_aligned + 32, 32))
+        logger.info(f"[DG warmup] Pre-compiling paged_mqa_logits_metadata for "
+                    f"{len(buckets)} aligned batch buckets up to {max_aligned} "
+                    f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}, "
+                    f"max_bs={max_bs}, beam_width={beam_width}, "
+                    f"expand_factor={expand_factor})")
+        for aligned_bs in buckets:
+            # Kernel scans `context_lens` and prefix-sums schedules; a
+            # zero-filled 2D tensor of shape (aligned_bs, 1) is enough to
+            # trigger dispatch and compile — the metadata output is
+            # discarded.
+            dummy = torch.zeros(aligned_bs, 1, dtype=torch.int32, device="cuda")
+            try:
+                _ = get_paged_mqa_logits_metadata(dummy, _DG_SCHEDULE_BLOCK_KV,
+                                                  num_sms)
+            except RuntimeError as e:
+                # Narrow to RuntimeError so signature drifts in
+                # get_paged_mqa_logits_metadata (TypeError / ValueError)
+                # surface loudly instead of silently degrading perf.
+                logger.warning(
+                    f"[DG warmup] paged_mqa_logits_metadata prewarm failed "
+                    f"for aligned_bs={aligned_bs} "
+                    f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}); "
+                    f"skipping bucket. {type(e).__name__}: {e}")
+        torch.cuda.synchronize()
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -3630,6 +3737,7 @@ class PyTorchModelEngine(ModelEngine):
                     request, self._mm_encoder_cache_enabled),
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
+                mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx)
             # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
             # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
@@ -4620,6 +4728,7 @@ class PyTorchModelEngine(ModelEngine):
                     multimodal_input=_build_request_multimodal_input(
                         request, self._mm_encoder_cache_enabled),
                     multimodal_data=request.py_multimodal_data,
+                    mm_item_order=getattr(request, "py_mm_item_order", None),
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
