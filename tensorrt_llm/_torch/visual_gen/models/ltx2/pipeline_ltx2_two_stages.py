@@ -1678,9 +1678,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             dtype=self.dtype,
         )
 
-        # stage2_denoise measures ONLY the step loop; everything since
-        # stage-1 end (upsample, LoRA bind, text-cache/scheduler prep)
-        # lands in the timer's gap interval.
+        # stage2_denoise measures ONLY the step loop (upsample, LoRA bind,
+        # and text-cache/scheduler prep stay outside the bracket).
         if timer is not None:
             timer.mark_stage2_start()
 

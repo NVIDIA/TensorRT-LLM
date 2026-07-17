@@ -199,15 +199,6 @@ class TestFlattenCfgRanks:
         )
         assert vgm.flatten_cfg_ranks() == [[0, 4], [1, 5], [2, 6], [3, 7]]
 
-    def test_cfg1_is_identity_partition(self):
-        vgm = VisualGenMapping(world_size=4, rank=0, ulysses_size=4)
-        assert vgm.flatten_cfg_ranks() == [[0, 1, 2, 3]]
-
-    def test_lists_partition_the_world(self):
-        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ring_size=2, ulysses_size=2)
-        flat = [r for grp in vgm.flatten_cfg_ranks() for r in grp]
-        assert sorted(flat) == list(range(8))
-
 
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):

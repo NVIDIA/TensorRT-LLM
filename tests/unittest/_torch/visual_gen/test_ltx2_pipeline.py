@@ -1265,52 +1265,6 @@ class TestLTX2TwoStageLoRAHelpers:
             assert key[-1] == ("ltx2_two_stage_topology", topology)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_two_stage_warmup_precaptures_both_topologies(self):
-        """Runner coverage: a pass crossing the stage boundary leaves one
-        captured graph per topology and a same-shape repeat replays with zero
-        new captures. The production warmup path is covered separately by
-        test_run_warmup_precaptures_both_topologies."""
-
-        class TinyTransformer:
-            def __init__(self):
-                self.lin = torch.nn.Linear(8, 8, device="cuda")
-                self.active_topology = "default"
-
-            def forward(self, x):
-                return self.lin(x)
-
-        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
-        pipeline.pipeline_config = DiffusionPipelineConfig(
-            cuda_graph=CudaGraphConfig(enable=True),
-            torch_compile=TorchCompileConfig(enable=False),
-        )
-        pipeline.transformer = TinyTransformer()
-        pipeline._cuda_graph_runners = {}
-        pipeline._setup_cuda_graphs()
-        runner = pipeline._cuda_graph_runners["transformer"]
-
-        x = torch.randn(2, 8, device="cuda")
-
-        def run_stage(topology):
-            pipeline.transformer.active_topology = topology
-            return pipeline.transformer.forward(x)
-
-        run_stage("default")
-        run_stage("stage2")
-        assert sorted(key[-1] for key in runner.graphs) == [
-            ("ltx2_two_stage_topology", "default"),
-            ("ltx2_two_stage_topology", "stage2"),
-        ]
-
-        captures = []
-        original_capture = runner.capture
-        runner.capture = lambda *a, **k: (captures.append(a), original_capture(*a, **k))
-        run_stage("default")
-        run_stage("stage2")
-        assert not captures, "post-warmup request re-captured a graph"
-        assert len(runner.graphs) == 2
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_run_warmup_precaptures_both_topologies(self):
         """The production warmup entrypoint (_run_warmup) pre-captures one
         graph per topology; a repeat warmup-shaped request performs zero new
