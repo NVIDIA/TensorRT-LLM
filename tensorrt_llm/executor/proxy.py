@@ -1020,12 +1020,11 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ) -> None:
-        if not 0 < frontend_id < (1 << 16):
-            raise ValueError(f"frontend_id out of range: {frontend_id}")
-        if frontend_id >= len(attach_info["result_addrs"]):
+        num_lanes = len(attach_info["result_addrs"])
+        if not 0 < frontend_id < num_lanes:
             raise ValueError(
-                f"frontend_id {frontend_id} has no result lane: only "
-                f"{len(attach_info['result_addrs'])} lanes were provisioned")
+                f"frontend_id {frontend_id} out of range: attached frontends "
+                f"use ids 1..{num_lanes - 1} (id 0 is the launcher)")
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
         # Deliberately skip GenerationExecutorProxy.__init__: it creates an
