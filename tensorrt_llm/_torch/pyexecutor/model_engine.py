@@ -1167,14 +1167,12 @@ class PyTorchModelEngine(ModelEngine):
         # are bounded above by `(1 + max_draft_tokens)`; see the
         # docstring for why we don't read the runtime `dsl_expand_factor`
         # here.
-        max_draft_tokens = int(
-            getattr(attn_meta, "max_draft_tokens", 0) or 0)
-        expands_batch = (
-            getattr(attn_meta, "use_expanded_buffers_for_mtp", False)
-            or getattr(attn_meta, "expand_for_dsl", False))
+        max_draft_tokens = int(getattr(attn_meta, "max_draft_tokens", 0) or 0)
+        expands_batch = (getattr(attn_meta, "use_expanded_buffers_for_mtp",
+                                 False)
+                         or getattr(attn_meta, "expand_for_dsl", False))
         expand_factor = 1 + max_draft_tokens if expands_batch else 1
-        max_aligned = ((max_bs * beam_width * expand_factor + 31) //
-                       32) * 32
+        max_aligned = ((max_bs * beam_width * expand_factor + 31) // 32) * 32
         buckets = list(range(32, max_aligned + 32, 32))
         logger.info(f"[DG warmup] Pre-compiling paged_mqa_logits_metadata for "
                     f"{len(buckets)} aligned batch buckets up to {max_aligned} "
