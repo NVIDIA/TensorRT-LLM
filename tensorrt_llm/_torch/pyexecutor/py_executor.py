@@ -247,6 +247,29 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     strip_mm_data_for_generation(mm_data)
 
 
+_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER_ENV = (
+    "TRTLLM_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER")
+
+
+def _get_diagnostic_disagg_admission_budget_multiplier() -> int:
+    raw_multiplier = os.getenv(
+        _DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER_ENV)
+    if raw_multiplier is None:
+        return 1
+
+    try:
+        multiplier = int(raw_multiplier)
+    except ValueError as error:
+        raise ValueError(
+            f"{_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER_ENV} must be "
+            "a positive integer") from error
+    if multiplier <= 0:
+        raise ValueError(
+            f"{_DIAGNOSTIC_DISAGG_ADMISSION_BUDGET_MULTIPLIER_ENV} must be "
+            "a positive integer")
+    return multiplier
+
+
 @dataclasses.dataclass
 class DisaggTransferAdmissionResult:
     admitted_requests: List[LlmRequest]
@@ -263,11 +286,31 @@ class DisaggTransferAdmissionResult:
 class DisaggTransferAdmissionController:
     """FCFS admission gate for disaggregated generation KV transfers."""
 
-    def __init__(self, max_tokens_in_buffer: Optional[int],
-                 tokens_per_block: Optional[int]) -> None:
-        self.max_transfer_blocks = self._to_block_budget(
+    def __init__(self,
+                 max_tokens_in_buffer: Optional[int],
+                 tokens_per_block: Optional[int],
+                 admission_budget_multiplier: int = 1) -> None:
+        if (isinstance(admission_budget_multiplier, bool)
+                or not isinstance(admission_budget_multiplier, int)
+                or admission_budget_multiplier <= 0):
+            raise ValueError("admission_budget_multiplier must be a positive "
+                             "integer")
+
+        self.base_max_transfer_blocks = self._to_block_budget(
             max_tokens_in_buffer, tokens_per_block)
+        self.admission_budget_multiplier = admission_budget_multiplier
+        self.max_transfer_blocks = (None if self.base_max_transfer_blocks
+                                    is None else self.base_max_transfer_blocks *
+                                    admission_budget_multiplier)
         self.tokens_per_block = tokens_per_block or 0
+        self.diagnostic_budget_multiplier_observed = False
+        if (self.admission_budget_multiplier != 1
+                and self.base_max_transfer_blocks is not None):
+            logger.info(
+                "DIAGNOSTIC ONLY: disaggregated admission base window="
+                f"{self.base_max_transfer_blocks} transfer blocks, effective "
+                f"window={self.max_transfer_blocks} transfer blocks, "
+                f"multiplier={self.admission_budget_multiplier}")
 
     def enabled(self) -> bool:
         return self.max_transfer_blocks is not None
@@ -346,7 +389,33 @@ class DisaggTransferAdmissionController:
 
         result.deferred_request_count = len(candidates) - len(
             result.admitted_requests)
+        self._observe_diagnostic_budget_multiplier(result)
         return result
+
+    def _observe_diagnostic_budget_multiplier(
+            self, result: DisaggTransferAdmissionResult) -> None:
+        if (self.diagnostic_budget_multiplier_observed
+                or self.admission_budget_multiplier == 1
+                or self.base_max_transfer_blocks is None):
+            return
+
+        used_blocks = (result.active_transfer_blocks +
+                       result.admitted_transfer_blocks)
+        oversized_idle_head_only = (result.active_transfer_blocks == 0
+                                    and len(result.admitted_requests) == 1
+                                    and result.admitted_transfer_blocks
+                                    > self.base_max_transfer_blocks)
+        if (result.admitted_transfer_blocks == 0
+                or used_blocks <= self.base_max_transfer_blocks
+                or oversized_idle_head_only):
+            return
+
+        self.diagnostic_budget_multiplier_observed = True
+        logger.info(
+            "DIAGNOSTIC OBSERVED: disaggregated admission used "
+            f"{used_blocks} transfer blocks, exceeding the base window of "
+            f"{self.base_max_transfer_blocks} blocks with admission budget "
+            f"multiplier={self.admission_budget_multiplier}")
 
 
 @dataclasses.dataclass
@@ -929,7 +998,8 @@ class PyExecutor:
         tokens_per_block = getattr(self.kv_cache_manager, "tokens_per_block",
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
-            max_tokens_in_buffer, tokens_per_block)
+            max_tokens_in_buffer, tokens_per_block,
+            _get_diagnostic_disagg_admission_budget_multiplier())
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -3361,6 +3431,7 @@ class PyExecutor:
         return DisaggTransferAdmissionController(
             getattr(cache_transceiver_config, "max_tokens_in_buffer", None),
             getattr(kv_cache_manager, "tokens_per_block", None),
+            _get_diagnostic_disagg_admission_budget_multiplier(),
         )
 
     @staticmethod
