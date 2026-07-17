@@ -32,13 +32,9 @@ namespace torch_ext
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Fused post-sample runtime top-p update for the TorchSampler Top-P Decay
-// feature. Applies, in place, for every sampled row whose slot is decay-active:
-//   runtime_top_p[slot] = (last_token == reset_id)
-//                           ? initial_top_p[slot]
-//                           : max(runtime_top_p[slot] * top_p_decay[slot], top_p_min[slot])
-// The decay-active gate is applied on-device via is_decay_slot, so the hot path
-// needs no host-side .tolist() / set intersection.
+// Fused post-sample runtime top-p update for the TorchSampler Top-P Decay feature.
+// Semantics and update rule: see invokeToppDecayUpdate (kernels/samplerKernels/toppDecayKernels.h).
+// This wrapper only validates the tensor contract and dispatches.
 void top_p_decay_update(th::Tensor runtime_top_p, th::Tensor initial_top_p, th::Tensor top_p_decay,
     th::Tensor top_p_min, th::Tensor reset_ids, th::Tensor is_decay_slot, th::Tensor step_tokens,
     th::Tensor sampled_slots)
@@ -82,10 +78,9 @@ void top_p_decay_update(th::Tensor runtime_top_p, th::Tensor initial_top_p, th::
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Fused pre-sample per-row top-p gather for the Top-P Decay feature. Returns
-//   row_top_p[i] = is_decay_slot[slots[i]] ? runtime_top_p[slots[i]] : static_top_p[i]
-// replacing the index_select(runtime) + index_select(gate) + where(static) chain
-// with a single launch.
+// Fused pre-sample per-row top-p gather for the Top-P Decay feature.
+// Semantics: see invokeToppDecayGather (kernels/samplerKernels/toppDecayKernels.h).
+// This wrapper only validates the tensor contract and dispatches.
 th::Tensor top_p_decay_gather(
     th::Tensor runtime_top_p, th::Tensor is_decay_slot, th::Tensor static_top_p, th::Tensor slots)
 {

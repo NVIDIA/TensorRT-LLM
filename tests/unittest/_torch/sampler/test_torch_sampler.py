@@ -58,7 +58,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     TopK,
     TopKTopP,
     TopP,
-    TopPDecayOverride,
     UtilsSamplingParams,
     resolve_sampling_strategy,
 )
@@ -1795,7 +1794,6 @@ class TestBatchedSampling:
             generator: Optional[torch.Generator] = None,
             return_probs: bool,
             group_metadata: StrategyMetadata | None = None,
-            decay_override: Optional[TopPDecayOverride] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
             assert generator is sampler.get_generator(logits.device)
             if isinstance(group_key, tuple):
@@ -1814,7 +1812,6 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                     group_metadata=group_metadata,
-                    decay_override=decay_override,
                 )
             )
             return result
@@ -2862,6 +2859,23 @@ class TestTopPDecay:
         )
         req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
         return cast(LlmRequest, req)
+
+    @pytest.mark.parametrize(
+        "bad_kwargs",
+        [
+            {"top_p_decay": 1.5},
+            {"top_p_decay": -0.5},
+            {"top_p_decay": 0.0},
+            {"top_p_min": 0.0},
+            {"top_p_min": 1.5},
+            {"top_p_reset_ids": -1},
+        ],
+    )
+    def test_out_of_range_decay_params_rejected(self, bad_kwargs):
+        # Out-of-range decay params raise (mirroring the executor::SamplingConfig
+        # constructor's hard checks) instead of the former warn-and-default.
+        with pytest.raises(ValueError):
+            SamplingParams(**bad_kwargs)
 
     def test_reject_speculative_draft_tokens(self):
         # Decay + draft tokens through TorchSampler is rejected per-request at

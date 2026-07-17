@@ -105,7 +105,8 @@ llm.generate(["Hello, my name is",
 * Top-P decay is supported: if `top_p_decay < 1` is specified, the effective `top_p` is
   multiplied by `top_p_decay` after every sampled token, bounded from below by `top_p_min`
   (default `1e-6`), and reset to the initial `top_p` whenever the token `top_p_reset_ids`
-  is sampled (default `-1`, which never matches a token).
+  is sampled (default `-1`, which never matches a token). Out-of-range values
+  (`top_p_decay` or `top_p_min` outside `(0, 1]`, negative `top_p_reset_ids`) are rejected.
 
   * An active top-p decay implies top-p sampling even if `top_p` is unspecified or `top_p = 1`
     (the initial `top_p` then defaults to 1). However, explicitly requested greedy sampling
