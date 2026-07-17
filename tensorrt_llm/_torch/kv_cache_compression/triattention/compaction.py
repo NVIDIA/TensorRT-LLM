@@ -130,12 +130,20 @@ def _make_move_buffers(
     index_prefix: Tuple[int, ...],
     moves_per_request: List[int],
     device: torch.device,
+    external_offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Allocate the packed source-index buffer and its per-request offsets."""
+    """Allocate the packed source-index buffer and its per-request offsets.
+
+    ``external_offsets`` shares a caller-owned device row (refreshed together
+    with the round metadata in one copy) instead of allocating one here; the
+    index buffer is always sized for the widest per-request move counts.
+    """
     offsets = [0]
     for count in moves_per_request:
         offsets.append(offsets[-1] + count)
     indices = torch.empty((*index_prefix, offsets[-1]), dtype=torch.int32, device=device)
+    if external_offsets is not None:
+        return indices, external_offsets
     return indices, torch.tensor(offsets, dtype=torch.int32, device=device)
 
 
@@ -273,6 +281,9 @@ class BatchedKVCacheCompaction:
         draft_protected_tail_capacity: Optional[int] = None,
         draft_kv_block_offsets: Optional[torch.Tensor] = None,
         draft_page_table_slots: Optional[Dict[int, int]] = None,
+        dense_move_offsets: Optional[torch.Tensor] = None,
+        swa_move_offsets: Optional[torch.Tensor] = None,
+        draft_move_offsets: Optional[torch.Tensor] = None,
     ) -> None:
         if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
             raise ValueError(f"unsupported compaction mode: {eviction_mode}")
@@ -331,6 +342,7 @@ class BatchedKVCacheCompaction:
             dense_index_prefix,
             [self.decode_keep_count + self.protected_tail_capacity] * self.request_count,
             self.device,
+            external_offsets=dense_move_offsets,
         )
         page_table_for = _page_table_provider(
             page_table_slots,
@@ -360,6 +372,7 @@ class BatchedKVCacheCompaction:
                 (self.num_kv_heads,),
                 [self.swa_window + self.protected_tail_capacity] * self.request_count,
                 self.device,
+                external_offsets=swa_move_offsets,
             )
             # SWA layers are staged as their own page-table representatives.
             swa_entries = [
@@ -416,6 +429,7 @@ class BatchedKVCacheCompaction:
                 draft_protected_tail_capacity=draft_protected_tail_capacity,
                 draft_kv_block_offsets=draft_kv_block_offsets,
                 draft_page_table_slots=draft_page_table_slots,
+                draft_move_offsets=draft_move_offsets,
             )
 
         self.cache_compactions = tuple(
@@ -440,6 +454,7 @@ class BatchedKVCacheCompaction:
         draft_protected_tail_capacity: Optional[int],
         draft_kv_block_offsets: Optional[torch.Tensor],
         draft_page_table_slots: Optional[Dict[int, int]],
+        draft_move_offsets: Optional[torch.Tensor] = None,
     ) -> _SingleCacheCompaction:
         """Build the co-compressed draft cache's own pack and launch groups.
 
@@ -471,6 +486,7 @@ class BatchedKVCacheCompaction:
             (draft_num_kv_heads,),
             [self.decode_keep_count + self.draft_protected_tail_capacity] * self.request_count,
             self.device,
+            external_offsets=draft_move_offsets,
         )
         draft_page_table_for = _page_table_provider(
             draft_page_table_slots,

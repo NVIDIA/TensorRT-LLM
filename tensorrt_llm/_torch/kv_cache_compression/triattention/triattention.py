@@ -538,8 +538,13 @@ class _FixedScoreStagingBuffers:
             2,
             self.copy_block_count,
         )
+        # One table carries every per-round host value: three metadata rows
+        # (logical position, valid length, prompt length) plus one move-offsets
+        # row per compacted cache family, so each round pays exactly one
+        # host-to-device copy. Offsets rows have request_capacity + 1 entries,
+        # hence the extra column.
         self.request_metadata_host = torch.empty(
-            (3, max_requests),
+            (6, max_requests + 1),
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
@@ -621,13 +626,18 @@ class _FixedScoreStagingBuffers:
                 device=self.device,
             )
         self.request_metadata_device = torch.empty(
-            (3, max_requests), dtype=torch.int32, device=self.device
+            (6, max_requests + 1), dtype=torch.int32, device=self.device
         )
-        self.round_starts_device = self.request_metadata_device[0]
-        self.valid_seq_lens_device = self.request_metadata_device[1]
+        self.round_starts_device = self.request_metadata_device[0, :max_requests]
+        self.valid_seq_lens_device = self.request_metadata_device[1, :max_requests]
         # Per-request pinned prompt lengths: the score kernel starts each
         # request's decode window here, so one bucket may mix prompt lengths.
-        self.token_starts_device = self.request_metadata_device[2]
+        self.token_starts_device = self.request_metadata_device[2, :max_requests]
+        # Per-family move offsets consumed by the compaction pack kernel and
+        # the C++ compact launches; refreshed with the metadata each round.
+        self.dense_move_offsets = self.request_metadata_device[3]
+        self.swa_move_offsets = self.request_metadata_device[4]
+        self.draft_move_offsets = self.request_metadata_device[5]
         self.mean_cos = torch.empty(
             (max_requests, num_freqs), dtype=torch.float32, device=self.device
         )
@@ -691,6 +701,9 @@ class _FixedScoreStagingBuffers:
         seq_lens: Optional[List[int]] = None,
         page_table_seq_lens: Optional[List[int]] = None,
         draft_manager: Optional[KVCacheManagerV2] = None,
+        dense_move_offsets: Optional[List[int]] = None,
+        swa_move_offsets: Optional[List[int]] = None,
+        draft_move_offsets: Optional[List[int]] = None,
     ) -> bool:
         """Copy one eager eviction cohort into reusable device buffers.
 
@@ -759,10 +772,21 @@ class _FixedScoreStagingBuffers:
                 self.draft_copy_block_count,
             ):
                 return False
-        self.request_metadata_host[:, :request_count].copy_(request_metadata)
+        self.request_metadata_host[:3, :request_count].copy_(request_metadata)
         # Rows past this cohort are padding: zero lengths keep the score
         # kernel and selection inert for them.
-        self.request_metadata_host[:, request_count:].zero_()
+        self.request_metadata_host[:3, request_count:].zero_()
+        # This round's per-family move offsets ride the same table, so the
+        # single device copy below carries them too.
+        for row, family_offsets in (
+            (3, dense_move_offsets),
+            (4, swa_move_offsets),
+            (5, draft_move_offsets),
+        ):
+            if family_offsets is not None:
+                self.request_metadata_host[row, : len(family_offsets)].copy_(
+                    torch.as_tensor(family_offsets, dtype=torch.int32)
+                )
         try:
             # Copy the fixed backing once. Only the first ``request_count``
             # columns are consumed by this cohort.
@@ -1963,18 +1987,45 @@ class TriAttention(BaseKVCacheCompressionManager):
                 decode_keep_count=self.top_B,
                 swa_window=layout.swa_window,
                 protected_tail_capacity=self._configured_protected_tail_capacity(),
+                dense_move_offsets=score_staging.dense_move_offsets,
+                swa_move_offsets=score_staging.swa_move_offsets,
+                draft_move_offsets=score_staging.draft_move_offsets,
                 **draft_kwargs,
             )
             self._batched_compaction = batched_compaction
-        # Tails vary per round (in-flight growth); padded rows move nothing.
-        draft_tails = None
-        if self.draft_kv_cache_manager is not None:
-            draft_tails = [self._draft_protected_tail_capacity()] * len(prepared)
-        batched_compaction.set_protected_tails(
-            [item.protected_tail for item in prepared],
-            draft_tails,
-        )
+        # Tails vary per round (in-flight growth), so the per-family move
+        # offsets ride the staged metadata table each round.
         return batched_compaction
+
+    def _move_offsets_for(
+        self,
+        layout: _RuntimeKVLayout,
+        prepared: Sequence[_PreparedEviction],
+        capacity: int,
+    ) -> Tuple[List[int], Optional[List[int]], Optional[List[int]]]:
+        """Build this round's per-family move offsets, padded to the capacity.
+
+        Rows past the cohort repeat the final offset, so padded requests move
+        nothing in the pack kernel and the C++ compact launches.
+        """
+
+        def padded_offsets(moves_per_request: List[int]) -> List[int]:
+            offsets = [0]
+            for moves in moves_per_request:
+                offsets.append(offsets[-1] + moves)
+            offsets.extend(offsets[-1:] * (capacity - len(moves_per_request)))
+            return offsets
+
+        tails = [item.protected_tail for item in prepared]
+        dense = padded_offsets([self.top_B + tail for tail in tails])
+        swa = None
+        if layout.swa_layers and layout.swa_window:
+            swa = padded_offsets([int(layout.swa_window) + tail for tail in tails])
+        draft = None
+        if self.draft_kv_cache_manager is not None:
+            draft_tail = self._draft_protected_tail_capacity()
+            draft = padded_offsets([self.top_B + draft_tail] * len(prepared))
+        return dense, swa, draft
 
     def _page_table_pool_keys(
         self,
@@ -2013,7 +2064,11 @@ class TriAttention(BaseKVCacheCompressionManager):
         self,
         prepared: Sequence[_PreparedEviction],
         staging: _FixedScoreStagingBuffers,
+        layout: _RuntimeKVLayout,
     ) -> None:
+        dense_offsets, swa_offsets, draft_offsets = self._move_offsets_for(
+            layout, prepared, staging.max_requests
+        )
         try:
             staged = staging.stage(
                 self.kv_cache_manager,
@@ -2023,6 +2078,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                 [item.seq_len for item in prepared],
                 [item.seq_len + item.protected_tail for item in prepared],
                 draft_manager=self.draft_kv_cache_manager,
+                dense_move_offsets=dense_offsets,
+                swa_move_offsets=swa_offsets,
+                draft_move_offsets=draft_offsets,
             )
         except _FixedScoreStreamMismatch:
             raise
@@ -2093,7 +2151,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 keep_set_selector=keep_set_selector,
             )
         with nvtx_range_debug("triattention.page_table_stage", color="orange"):
-            self._attach_page_ids(prepared, score_staging)
+            self._attach_page_ids(prepared, score_staging, layout)
             # The staged per-request prompt lengths are shared with the
             # selector; per-head modes re-expand them to selection rows here.
             keep_set_selector.refresh_row_prompt_offsets()
