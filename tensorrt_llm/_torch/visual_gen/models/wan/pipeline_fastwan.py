@@ -20,7 +20,6 @@ FastWan shares Wan 2.2 TI2V-5B's architecture exactly — only the weights
 """
 
 import time
-from typing import List, Optional, Union
 
 import PIL.Image
 import torch
@@ -57,31 +56,53 @@ class WanDMDPipeline(WanPipeline):
 
     @property
     def default_generation_params(self):
+        """Return FastWan-specific default generation parameters (steps, guidance, frame rate)."""
         return get_fastwan_default_params()
 
     @nvtx_range("WanDMDPipeline.forward")
     @torch.no_grad()
     def forward(
         self,
-        prompt: Union[str, List[str]],
+        prompt: str | list[str],
         seed: int,
-        negative_prompt: Optional[str] = None,
+        negative_prompt: str | None = None,
         height: int = 704,
         width: int = 1280,
         num_frames: int = 121,
-        num_inference_steps: Optional[int] = None,
-        guidance_scale: Optional[float] = None,
-        guidance_scale_2: Optional[float] = None,
-        boundary_ratio: Optional[float] = None,
+        num_inference_steps: int | None = None,
+        guidance_scale: float | None = None,
+        guidance_scale_2: float | None = None,
+        boundary_ratio: float | None = None,
         max_sequence_length: int = 512,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
-    ):
-        # FastWan is text-to-video only for now; CFG-free, so guidance_scale and
-        # the Wan-2.2 two-stage knobs (guidance_scale_2/boundary_ratio) are
-        # accepted for infer()/base-class compatibility but unused.
+        image: PIL.Image.Image | torch.Tensor | str | None = None,
+    ) -> PipelineOutput:
+        """Generate a video from a text prompt using the 3-step DMD sampling loop.
+
+        CFG-free: one transformer forward pass per step, no negative prompt support.
+        Unsupported parameters (num_inference_steps, guidance_scale, guidance_scale_2,
+        boundary_ratio) are accepted for base-class compatibility but logged as warnings
+        and ignored.
+        """
         if image is not None:
             raise NotImplementedError(
                 "FastWan currently supports text-to-video only (no image conditioning)."
+            )
+        if num_inference_steps not in (None, len(self.DMD_TIMESTEPS)):
+            logger.warning(
+                f"FastWan always uses {len(self.DMD_TIMESTEPS)} DMD steps; "
+                f"ignoring num_inference_steps={num_inference_steps}."
+            )
+        if guidance_scale not in (None, 1.0):
+            logger.warning(
+                f"FastWan is CFG-free; ignoring guidance_scale={guidance_scale}."
+            )
+        if guidance_scale_2 is not None:
+            logger.warning(
+                f"FastWan does not support guidance_scale_2; ignoring guidance_scale_2={guidance_scale_2}."
+            )
+        if boundary_ratio is not None:
+            logger.warning(
+                f"FastWan does not support boundary_ratio; ignoring boundary_ratio={boundary_ratio}."
             )
 
         pipeline_start = time.time()
@@ -119,7 +140,7 @@ class WanDMDPipeline(WanPipeline):
         return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
 
     @nvtx_range("WanDMDPipeline._denoise", color="blue")
-    def _denoise(self, latents, prompt_embeds, generator):
+    def _denoise(self, latents: torch.Tensor, prompt_embeds: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
         """3-step DMD loop: predict x0, then re-noise with fresh noise.
 
         The per-step sigma reduces to ``sigma = t / NUM_TRAIN_TIMESTEPS`` because
