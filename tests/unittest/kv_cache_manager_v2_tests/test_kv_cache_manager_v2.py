@@ -698,7 +698,8 @@ class TestNoBatching(TestKVCacheManagerV2):
         kv2.close()
 
     def test_planned_drop_handle(self) -> None:
-        self.prepare(16 << 20, 0, 0, 2, 8, 0, tokens_per_block=8)
+        window_size = 8
+        self.prepare(16 << 20, 0, 0, 2, window_size, 0, tokens_per_block=8)
         long_tokens = [self.next_token() for _ in range(24)]
         short_tokens = long_tokens[:8]
 
@@ -729,7 +730,10 @@ class TestNoBatching(TestKVCacheManagerV2):
         self.assertEqual(self.manager.probe_reuse(None, long_tokens), len(long_tokens))
 
         long_handle.drop()
-        self.assertEqual(self.manager.probe_reuse(None, long_tokens), 0)
+        # The SWA window is dropped, while older full-attention blocks remain reusable.
+        self.assertEqual(
+            self.manager.probe_reuse(None, long_tokens), len(long_tokens) - window_size
+        )
         with self.assertRaisesRegex(ValueError, "already been dropped"):
             long_handle.drop()
 

@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -22,6 +23,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
+MAX_SEQ_LEN = 16
 
 
 class _FakeKVCache:
@@ -178,16 +180,17 @@ def manager() -> KVCacheManagerV2:
         KvCacheConfig(
             enable_block_reuse=True,
             enable_partial_reuse=True,
-            max_gpu_total_bytes=8 << 20,
+            max_gpu_total_bytes=16 << 20,
+            max_attention_window=[MAX_SEQ_LEN, TOKENS_PER_BLOCK],
             max_util_for_resume=1.0,
             block_reuse_policy="per_conversation",
         ),
         CacheType.SELF,
-        num_layers=1,
+        num_layers=2,
         num_kv_heads=128,
         head_dim=1024,
         tokens_per_block=TOKENS_PER_BLOCK,
-        max_seq_len=16,
+        max_seq_len=MAX_SEQ_LEN,
         max_batch_size=2,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=DataType.HALF,
@@ -302,7 +305,6 @@ def test_per_conversation_policy_without_params_uses_per_request_commit(
 
 
 def test_per_conversation_policy_releases_cancelled_request(
-    caplog: pytest.LogCaptureFixture,
     manager: KVCacheManagerV2,
 ) -> None:
     request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
@@ -317,10 +319,12 @@ def test_per_conversation_policy_releases_cancelled_request(
         _update_context_resources(manager, batch_a)
         _free_if_active(manager, request_a)
 
-        caplog.clear()
         batch_b = _prepare_context_resources(manager, request_b)
-        assert manager.prepare_context(request_b)
-        assert "already has current request" not in caplog.text
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning"
+        ) as mock_warning:
+            assert manager.prepare_context(request_b)
+            mock_warning.assert_not_called()
         assert manager.resize_context(request_b, num_tokens=request_b.prompt_len)
         request_b.context_current_position = request_b.prompt_len
         request_b.context_remaining_length = 0
@@ -334,18 +338,23 @@ def test_per_conversation_policy_drops_previous_divergent_blocks(
     manager: KVCacheManagerV2,
 ) -> None:
     request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
-    request_b = _ContextRequest(2, [0, 1, 2, 3, 100, 101, 102, 103], 8, "conv-1")
+    request_b = _ContextRequest(
+        2,
+        [*range(8), 100, 101, 102, 103],
+        12,
+        "conv-1",
+    )
     request_old_prompt = _ContextRequest(3, list(range(8)), 8, "conv-2")
     try:
         _run_context(manager, request_a)
         _free_if_active(manager, request_a)
 
         _run_context(manager, request_b)
-        assert request_b.prepopulated_prompt_len == TOKENS_PER_BLOCK
+        assert request_b.prepopulated_prompt_len == 8
         _free_if_active(manager, request_b)
 
         assert manager.prepare_context(request_old_prompt)
-        assert request_old_prompt.prepopulated_prompt_len == TOKENS_PER_BLOCK
+        assert request_old_prompt.prepopulated_prompt_len == 0
     finally:
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
@@ -353,7 +362,6 @@ def test_per_conversation_policy_drops_previous_divergent_blocks(
 
 
 def test_per_conversation_policy_ignores_overlapping_request(
-    caplog: pytest.LogCaptureFixture,
     manager: KVCacheManagerV2,
 ) -> None:
     request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
@@ -370,9 +378,15 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _update_context_resources(manager, batch_a)
 
         batch_b = _prepare_context_resources(manager, request_b)
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2.logger.warning"
+        ) as mock_warning:
+            assert manager.prepare_context(request_b)
+            mock_warning.assert_called_once_with(
+                "Conversation conv-1 already has current request 1. "
+                "Request 2 will ignore conversation params."
+            )
         assert request_b.py_conversation_params is conversation_params
-        assert "already has current request" in caplog.text
-        assert manager.prepare_context(request_b)
         assert manager.resize_context(request_b, num_tokens=request_b.prompt_len)
         request_b.context_current_position = request_b.prompt_len
         request_b.context_remaining_length = 0
@@ -389,7 +403,7 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_a)
 
         assert manager.prepare_context(request_old_prompt)
-        assert request_old_prompt.prepopulated_prompt_len == 8
+        assert request_old_prompt.prepopulated_prompt_len == request_old_prompt.prompt_len - 1
     finally:
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
