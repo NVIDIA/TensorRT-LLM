@@ -736,6 +736,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
+        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        self.py_needs_onehot_draft_probs = False
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
