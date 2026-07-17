@@ -478,37 +478,58 @@ def _load_video_by_cv2(
 
         indices = np.linspace(0, frame_count - 1, num_frames_to_sample, dtype=int).tolist()
 
-        H = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        W = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        # Preallocate the stacked buffer and let cvtColor write each RGB frame
-        # straight into its slice, so decode does one memory pass instead of a
-        # per-frame alloc + trailing np.stack.
-        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
+        # Defer allocating the stacked buffer until the first frame is actually
+        # decoded: container metadata (CAP_PROP_FRAME_WIDTH/HEIGHT) can be 0
+        # or stale before the first decode for some codecs.
+        stacked_rgb: Optional[np.ndarray] = None
+        H = W = None
 
         target_set = set(indices)
         max_idx = indices[-1]
         bgr_scratch: Optional[np.ndarray] = None
         valid_indices: list[int] = []
+        # Log at most once per decode to avoid spamming when a whole stream is
+        # affected (e.g. every frame retrieves with a drifted shape).
+        skip_warned = False
         frame_idx = 0
         while frame_idx <= max_idx and vidcap.grab():
             if frame_idx in target_set:
                 # Reuse a single BGR buffer across retrieves; cv2 replaces its
                 # contents in place when the argument is shape-compatible.
                 ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
-                if ok and bgr_scratch.shape[:2] == (H, W):
-                    cv2.cvtColor(
-                        bgr_scratch, cv2.COLOR_BGR2RGB, dst=stacked_rgb[len(valid_indices)]
+                if ok:
+                    fh, fw = bgr_scratch.shape[:2]
+                    if stacked_rgb is None:
+                        H, W = fh, fw
+                        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
+                    if (fh, fw) == (H, W):
+                        cv2.cvtColor(
+                            bgr_scratch,
+                            cv2.COLOR_BGR2RGB,
+                            dst=stacked_rgb[len(valid_indices)],
+                        )
+                        valid_indices.append(frame_idx)
+                    elif not skip_warned:
+                        logger.warning(
+                            f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
+                            f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                        )
+                        skip_warned = True
+                elif not skip_warned:
+                    logger.warning(
+                        f"Skipping frame {frame_idx} and subsequent retrieve failures: retrieve returned ok=False."
                     )
-                    valid_indices.append(frame_idx)
+                    skip_warned = True
             frame_idx += 1
         vidcap.release()
 
-        if not valid_indices:
+        if stacked_rgb is None or not valid_indices:
             raise ValueError("Video has no readable frames.")
         stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
-            stacked_f32 = stacked_rgb.astype(np.float32) * (1.0 / 255.0)
+            stacked_f32 = stacked_rgb.astype(np.float32)
+            stacked_f32 *= 1.0 / 255.0
             tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
