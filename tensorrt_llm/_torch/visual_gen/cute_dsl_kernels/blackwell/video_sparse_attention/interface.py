@@ -38,7 +38,10 @@ try:
     )
 
     CUTE_AVAILABLE = True
-except ImportError:  # cuda-bindings / cutlass-dsl not installed
+except (ImportError, OSError, AttributeError):
+    # The VSA CuTe kernel is optional. Besides missing packages, tolerate binary
+    # and API version skew so an unavailable VSA backend does not break unrelated
+    # VisualGen paths such as the Wan VAE.
     _cuda = None
     cute = None
     from_dlpack = None
