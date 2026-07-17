@@ -80,6 +80,37 @@ def get_build_dir(build_dir, build_type):
     return build_dir
 
 
+def stage_msa_package(project_dir: Path, build_dir: Path) -> Path:
+    """Copy pinned MSA sources and apply TensorRT-LLM's downstream patch."""
+    msa_source_dir = project_dir / "3rdparty" / "MSA"
+    msa_package_dir = msa_source_dir / "python" / "fmha_sm100"
+    msa_patch = project_dir / "3rdparty" / "patches" / "msa_strided_paged_kv.patch"
+    if not msa_package_dir.is_dir():
+        raise FileNotFoundError(
+            f"MSA sources are missing at {msa_package_dir}; initialize 3rdparty/MSA"
+        )
+
+    staging_dir = build_dir / "msa_patched"
+    if staging_dir.exists():
+        rmtree(staging_dir)
+    copytree(msa_source_dir, staging_dir, ignore=shutil.ignore_patterns(".git"))
+    git_env = os.environ.copy()
+    git_env["GIT_CEILING_DIRECTORIES"] = str(staging_dir.parent.resolve())
+    run(
+        ["git", "apply", "--check", str(msa_patch)],
+        cwd=staging_dir,
+        env=git_env,
+        check=True,
+    )
+    run(
+        ["git", "apply", str(msa_patch)],
+        cwd=staging_dir,
+        env=git_env,
+        check=True,
+    )
+    return staging_dir / "python" / "fmha_sm100"
+
+
 def clear_folder(folder_path):
     for item in os.listdir(folder_path):
         item_path = os.path.join(folder_path, item)
@@ -1173,10 +1204,14 @@ def main(*,
                 f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
             )
 
+        msa_package_dir = stage_msa_package(project_dir, build_dir)
+        wheel_env = os.environ.copy()
+        wheel_env["TRTLLM_MSA_PACKAGE_DIR"] = str(msa_package_dir)
+
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
-        )
-        env = os.environ.copy()
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"',
+            env=wheel_env)
+        env = wheel_env.copy()
         if mypyc:
             env["TRTLLM_ENABLE_MYPYC"] = "1"
         else:
