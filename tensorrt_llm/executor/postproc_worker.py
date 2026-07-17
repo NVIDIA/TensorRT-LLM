@@ -86,8 +86,7 @@ class PostprocWorker:
     def __init__(
         self,
         pull_pipe_addr: tuple[str, Optional[bytes]],
-        push_pipe_addr: Union[tuple[str, Optional[bytes]],
-                              List[tuple[str, Optional[bytes]]]],
+        push_pipe_addrs: List[tuple[str, Optional[bytes]]],
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
@@ -96,9 +95,9 @@ class PostprocWorker:
         '''
         Args:
             pull_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the input IPC.
-            push_pipe_addr: The address and HMAC key of the output IPC, or
-                a list of them (one result lane per frontend) with
-                multi-frontend serving.
+            push_pipe_addrs: The addresses and HMAC keys of the output IPC
+                lanes, one per frontend (a single-element list in
+                single-frontend mode).
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
@@ -111,8 +110,6 @@ class PostprocWorker:
                                       is_async=True,
                                       is_server=False,
                                       name="postprocess_pull_pipe")
-        push_pipe_addrs = (push_pipe_addr if isinstance(push_pipe_addr, list)
-                           else [push_pipe_addr])
         self._push_pipes = [
             ZeroMqQueue(address=addr,
                         is_async=True,
@@ -305,15 +302,13 @@ class PostprocWorker:
 
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
-                         feedout_ipc_addr: Union[tuple[str, Optional[bytes]],
-                                                 List[tuple[str,
-                                                            Optional[bytes]]]],
+                         feedout_ipc_addrs: List[tuple[str, Optional[bytes]]],
                          tokenizer_dir: str,
                          record_creator: Callable,
                          post_processor_hook: Optional[str] = None):
     # Pass the hook import path; PostprocWorker builds it once.
     worker = PostprocWorker(feedin_ipc_addr,
-                            feedout_ipc_addr,
+                            feedout_ipc_addrs,
                             tokenizer_dir=tokenizer_dir,
                             record_creator=record_creator,
                             post_processor_hook=post_processor_hook)

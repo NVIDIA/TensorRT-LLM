@@ -300,20 +300,20 @@ def worker_main(
     if is_leader and postproc_worker_config.enabled:
         logger_debug(f"initiate postprocess workers...", "yellow")
 
-        # With multi-frontend serving each postproc worker gets every
-        # frontend's result lane and routes outputs by client_id's top bits.
-        proxy_result_queue = (multi_frontend_addrs if multi_frontend_addrs
-                              is not None else worker_queues.result_queue_addr)
+        # Each postproc worker pushes to every frontend result lane (a
+        # single lane in single-frontend mode).
+        proxy_result_addrs = (multi_frontend_addrs
+                              if multi_frontend_addrs is not None else
+                              [worker_queues.result_queue_addr])
 
         assert result_queues is not None
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
-        assert isinstance(proxy_result_queue, (tuple, list))
         for i in range(postproc_worker_config.num_postprocess_workers):
             fut = postproc_worker_pool.submit(
                 postproc_worker_main,
                 result_queues[i].address,
-                proxy_result_queue,
+                proxy_result_addrs,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
                 postproc_worker_config.post_processor_hook,
