@@ -94,16 +94,6 @@ def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Ten
     return torch.tensor(offsets, device=device, dtype=torch.float32)
 
 
-def _topk_indices_into(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    indices_i32: torch.Tensor,
-    keep_count: int,
-) -> None:
-    """Write per-row top-k indices with the CuTE-DSL selector."""
-    torch.ops.trtllm.cute_dsl_indexer_topk_decode(scores, seq_lens, indices_i32, keep_count, 1)
-
-
 class _PreparedCuteTopK:
     """Run the existing fixed-shape CuTe TopK with owned scratch storage."""
 
@@ -335,7 +325,10 @@ def _deterministic_topk_indices_into(
         return
 
     # CPU selectors only exercise the selector contract in unit tests.
-    _topk_indices_into(scores, seq_lens, provisional_indices_i32, keep_count)
+    # The trailing 1 is next_n: decode scores one query token per request.
+    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+        scores, seq_lens, provisional_indices_i32, keep_count, 1
+    )
     for row_index, row_scores in enumerate(scores):
         valid_width = int(seq_lens[row_index])
         prompt_len = int(prompt_offsets[row_index])
