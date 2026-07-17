@@ -40,10 +40,12 @@ post-drain rebuild, post-retire replacement) via ``take``/``schedule_shadow``
 — the two layers compose: reuse covers the steady state, prefetch covers the
 misses.
 
-Enabled by default; ``TRTLLM_TEST_PREFETCH_SESSION=0`` disables BOTH pool
-prefetch and weight warming (one kill switch for the whole plugin). Suites
-that never import tensorrt_llm's executor modules pay nothing — not even
-the tensorrt_llm import.
+Rollout: currently in a CANARY phase (reviewer request) — with no explicit
+setting the plugin is active only on the stage groups in
+``_CANARY_STAGE_PREFIXES`` (CI exports the stage name as ``stageName``).
+``TRTLLM_TEST_PREFETCH_SESSION=1``/``0`` overrides in either direction and
+remains the permanent kill switch. Suites that never import tensorrt_llm's
+executor modules pay nothing — not even the tensorrt_llm import.
 """
 
 import glob
@@ -68,6 +70,17 @@ _PATCH_TARGETS = (
     "tensorrt_llm.executor.proxy",
     "tensorrt_llm.executor.rpc_proxy",
     "tensorrt_llm.llmapi.llm",
+)
+
+# Canary rollout stage GROUPS (one multi-GPU LLM-dense, one single-GPU
+# LLM-dense). Prefixes, not exact names: the numbered shard suffix (-1/-2/…)
+# is assigned by dynamic load balancing and cannot be targeted stably.
+# Graduation plan: after a week of clean canary runs (zero failures
+# attributed to the plugin, healthy session-summary counters) this gate is
+# removed and the plugin returns to enabled-by-default.
+_CANARY_STAGE_PREFIXES = (
+    "DGX_H100-4_GPUs-PyTorch-DeepSeek",
+    "A10-PyTorch",
 )
 
 
@@ -267,12 +280,17 @@ class SessionPrefetcher:
         # pool plus a spare. Disable in xdist workers.
         if os.environ.get("PYTEST_XDIST_WORKER"):
             return False
-        return os.environ.get("TRTLLM_TEST_PREFETCH_SESSION", "1").lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        explicit = os.environ.get("TRTLLM_TEST_PREFETCH_SESSION")
+        if explicit is not None:
+            return explicit.lower() in ("1", "true", "yes", "on")
+        # Canary rollout (reviewer request): with no explicit setting, enable
+        # only on the canary stage GROUPS. CI exports the stage name as
+        # ``stageName``; prefix matching covers dynamically numbered shards
+        # (per-shard targeting is impossible — the split is rebalanced as the
+        # test list changes). Everywhere else (including runs without a
+        # stageName) the plugin stays off until the canary graduates.
+        stage = os.environ.get("stageName", "")
+        return any(stage.startswith(p) for p in _CANARY_STAGE_PREFIXES)
 
     @staticmethod
     def _next_model_map(items):

@@ -83,10 +83,34 @@ def _arm(prefetcher, pool, spec=4):
     prefetcher._publish(spec, pool, session_prefetcher._spawn_snapshot(), prefetcher._build_gen)
 
 
-def test_enabled_by_default(monkeypatch):
+def test_canary_enabled_on_canary_stage_groups(monkeypatch):
+    # Canary phase: with no explicit setting, active only on the canary
+    # stage groups; prefix match covers dynamically numbered shards.
     monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("stageName", "A10-PyTorch-2")
     assert SessionPrefetcher().enabled
+    monkeypatch.setenv("stageName", "DGX_H100-4_GPUs-PyTorch-DeepSeek-1")
+    assert SessionPrefetcher().enabled
+
+
+def test_canary_disabled_elsewhere(monkeypatch):
+    monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("stageName", "DGX_B200-PyTorch-4")
+    assert not SessionPrefetcher().enabled
+    monkeypatch.delenv("stageName", raising=False)  # local run, no stage
+    assert not SessionPrefetcher().enabled
+
+
+def test_explicit_env_overrides_canary_gate(monkeypatch):
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("stageName", "DGX_B200-PyTorch-4")  # not a canary stage
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    assert SessionPrefetcher().enabled  # manual opt-in anywhere
+    monkeypatch.setenv("stageName", "A10-PyTorch-1")  # canary stage
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
+    assert not SessionPrefetcher().enabled  # kill switch beats the canary
 
 
 def test_disabled_is_noop(monkeypatch):
