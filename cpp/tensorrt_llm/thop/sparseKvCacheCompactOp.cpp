@@ -42,7 +42,7 @@ namespace torch_ext
 //! safe.
 void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor const& poolPointers,
     th::Tensor const& pageTable, th::Tensor const& sourceIndices, th::Tensor const& sourceOffsets,
-    std::optional<th::Tensor> const& sourceLayerIndices, th::Tensor const& destinationBases)
+    th::Tensor const& destinationBases, std::optional<th::Tensor> const& sourceLayerIndices)
 {
     TORCH_CHECK(!pools.empty(), "sparse_kv_cache_compact_layers: pools must be non-empty");
 
@@ -162,8 +162,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "sparse_kv_cache_compact_layers(Tensor(a!)[] pools, Tensor pool_pointers, Tensor page_table, Tensor "
-        "source_indices, Tensor source_offsets, Tensor? source_layer_indices=None, "
-        "Tensor destination_bases) -> ()");
+        "source_indices, Tensor source_offsets, Tensor destination_bases, "
+        "Tensor? source_layer_indices=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

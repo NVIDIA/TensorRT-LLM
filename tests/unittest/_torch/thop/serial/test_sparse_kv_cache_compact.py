@@ -162,8 +162,8 @@ def _compact(
         page_tables[0],
         arguments.source_indices,
         arguments.source_offsets,
-        arguments.source_layer_indices,
         destination_bases,
+        arguments.source_layer_indices,
     )
 
 

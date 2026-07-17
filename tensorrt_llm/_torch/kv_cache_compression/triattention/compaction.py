@@ -54,8 +54,8 @@ class _CppCompactGroup(NamedTuple):
             self.page_table,
             source,
             offsets,
-            self.source_layer_indices,
             destination_bases,
+            self.source_layer_indices,
         )
 
 
