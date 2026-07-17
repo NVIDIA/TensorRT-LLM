@@ -409,7 +409,9 @@ class MiniCPMV4_6DownsampleMLP(nn.Module):
         super().__init__()
         dtype = model_config.pretrained_config.vision_config.torch_dtype
         mapping = model_config.mapping
-        merged_hidden_size = hidden_size * 4
+        merge_kernel_size = tuple(model_config.pretrained_config.merge_kernel_size)
+        merge_factor = merge_kernel_size[0] * merge_kernel_size[1]
+        merged_hidden_size = hidden_size * merge_factor
         self.pre_norm = LayerNorm(hidden_size=merged_hidden_size, eps=1e-6, dtype=dtype)
         self.linear_1 = Linear(
             merged_hidden_size,
