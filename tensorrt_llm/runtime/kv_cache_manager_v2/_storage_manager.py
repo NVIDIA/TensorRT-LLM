@@ -44,7 +44,7 @@ from ._config import (
 from ._copy_engine import CopyTask, batched_copy
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
-from ._exceptions import OutOfPagesError
+from ._exceptions import LogicError, OutOfPagesError
 from ._life_cycle_registry import (
     AttnLifeCycle,
     LifeCycleId,
@@ -327,6 +327,8 @@ class StorageManager:
         lc2pg = self._life_cycle_grouping
         pg_num_slots = filled_list(0, self.num_pool_groups)
         for lc in typed_range(self.num_life_cycles):
+            if num_slots[lc] < 0:
+                raise LogicError("StorageManager.new_slots: slot count must be non-negative")
             pg_num_slots[lc2pg[lc]] += num_slots[lc]
         storage = self._levels[level].storage
         if any(
@@ -360,6 +362,10 @@ class StorageManager:
         migration_recorder: MigrationRecorder | None = None,
         drop_recorder: DropRecorder | None = None,
     ) -> list[Slot]:
+        if num_slots < 0:
+            raise LogicError(
+                "StorageManager.new_slots_for_pool_group: slot count must be non-negative"
+            )
         storage = self._levels[level].storage
         if num_slots > storage.get_num_free_slots(pg_idx):
             num_slots_list = filled_list(0, self.num_pool_groups)

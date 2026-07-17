@@ -141,6 +141,11 @@ class ModelConfig(Generic[TConfig]):
     skip_create_weights_in_init: bool = False
 
     spec_config: Optional["DecodingBaseConfig"] = None
+    # When False, the column-parallel LM head keeps its vocab-sharded output
+    # instead of all-gathering to full vocab. Used for one-model speculative
+    # draft models so greedy draft sampling can do a lighter TP gather. Defaults
+    # to True to preserve behavior for every non-draft model.
+    lm_head_gather_output: bool = True
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
@@ -189,6 +194,13 @@ class ModelConfig(Generic[TConfig]):
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
+
+    # If true, the multimodal encoder of a multimodal checkpoint is NOT
+    # instantiated/loaded and the model serves text-only requests. This is
+    # opt-in per model: each model implementation must honor this flag when
+    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
+    # model that does not check it simply ignores the flag (no-op).
+    disable_mm_encoder: bool = False
 
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None

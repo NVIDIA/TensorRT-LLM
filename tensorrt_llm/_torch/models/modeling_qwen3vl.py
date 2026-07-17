@@ -1253,11 +1253,18 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.mm_encoder = None
-        # Normal workers own the encoder. MM E/P handoff uses attached embeddings.
-        if not _is_mm_disagg():
+        # Normal workers own the encoder. MM E/P handoff uses attached
+        # embeddings; disable_mm_encoder serves the checkpoint text-only and
+        # saves the encoder's GPU memory for the KV cache pool.
+        if not (_is_mm_disagg() or model_config.disable_mm_encoder):
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
+        elif model_config.disable_mm_encoder:
+            logger.info(
+                f"{type(self).__name__}: multimodal encoder disabled "
+                "(disable_mm_encoder=True); serving text-only requests."
+            )
 
         self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
         self.deepstack_num_level = (
