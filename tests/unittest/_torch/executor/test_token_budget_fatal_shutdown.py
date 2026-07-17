@@ -54,6 +54,9 @@ def _make_executor():
     ex.executor_request_queue = _FakeExecQueue()
     ex.active_requests = []
     ex.gather_all_responses = False
+    # The fatal-shutdown drain path gates an attention-DP collective on this
+    # flag (py_executor._handle_errors); single-rank test path never collects.
+    ex.enable_attention_dp = False
     enqueued = []
     terminated = []
     ex._enqueue_responses = lambda items: enqueued.extend(items)
