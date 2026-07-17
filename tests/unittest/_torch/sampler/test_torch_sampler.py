@@ -2578,6 +2578,11 @@ class TestBatchedSampling:
                 result: Optional[UutResult] = None
 
             res = UutResultWrapper()
+            # Precomputed outside the no-sync region (mirrors the production
+            # resident device copy of seq_slots).
+            seq_slots_tensor_cuda = (
+                seq_slots_tensor.to(torch.int64).pin_memory().to("cuda", non_blocking=True)
+            )
 
             def _uut(res=res):
                 new_tokens_host = sampler._unbatch_sampling_results(
@@ -2585,6 +2590,7 @@ class TestBatchedSampling:
                     new_tokens_cuda=new_tokens_cuda,
                     req_num_generated_tokens=req_num_steps,
                     seq_slots=seq_slots_tensor,
+                    seq_slots_cuda=seq_slots_tensor_cuda,
                 )
                 res.result = UutResult(new_tokens_host=new_tokens_host)
 
