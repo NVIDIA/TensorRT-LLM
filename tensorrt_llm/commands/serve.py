@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import subprocess  # nosec B404
@@ -361,7 +362,7 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
-def _spawn_attached_frontends(llm, num_frontends: int) -> list:
+def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
     Multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1): each child
@@ -373,6 +374,9 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     executor.py GenerationExecutor.create). All frontends bind the serving
     port with SO_REUSEPORT, so the kernel load-balances accepted
     connections across their independent processes (and GILs).
+
+    Returns (children, attach_info_path); the caller owns terminating the
+    children and removing the secret-bearing attach-info file.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -403,7 +407,7 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
         logger.info(
             f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
         )
-    return children
+    return children, attach_info_path
 
 
 def _terminate_attached_frontends(children: list) -> None:
@@ -414,6 +418,24 @@ def _terminate_attached_frontends(children: list) -> None:
             child.wait(timeout=10)
         except subprocess.TimeoutExpired:
             child.kill()
+
+
+def _cleanup_multi_frontend_artifacts(attach_info_path: Optional[str]) -> None:
+    """Remove the attach-info file (it carries HMAC keys) and the ipc dir.
+
+    Launcher-only, after the attached frontends have been terminated.
+    Unlinking ipc socket paths does not disturb established zmq connections
+    (the engine may still be draining its result lanes at teardown); it only
+    prevents new connects.
+    """
+    if attach_info_path is not None:
+        try:
+            os.unlink(attach_info_path)
+        except OSError:
+            pass
+    ipc_dir = os.environ.get("TLLM_MULTI_FRONTEND_IPC_DIR")
+    if ipc_dir:
+        shutil.rmtree(ipc_dir, ignore_errors=True)
 
 
 def launch_server(
@@ -430,7 +452,8 @@ def launch_server(
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
-        num_media_load_workers: int = 8):
+        num_media_load_workers: int = 8,
+        multi_frontend_enabled: bool = True):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -440,9 +463,22 @@ def launch_server(
     # process, frontend 0) launches the worker as usual and spawns K-1
     # attached frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set)
     # skip the spawning. Supported only on the classic IPC executor path
-    # (the default orchestrator).
-    num_frontends = get_num_serve_frontends()
-    is_attached_frontend = os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None
+    # (the default orchestrator). Entry points that reach launch_server but
+    # must not honor the env knob (e.g. disaggregated MPI workers, which
+    # inherit the caller's env under Slurm export-all) pass
+    # multi_frontend_enabled=False.
+    if multi_frontend_enabled:
+        num_frontends = get_num_serve_frontends()
+        is_attached_frontend = os.getenv(
+            "TLLM_EXECUTOR_ATTACH_INFO") is not None
+    else:
+        if os.getenv("TLLM_SERVE_NUM_FRONTENDS", "1") not in ("", "1"):
+            logger.warning(
+                "TLLM_SERVE_NUM_FRONTENDS is ignored on this entry point; "
+                "multi-frontend serving is only supported on plain "
+                "trtllm-serve.")
+        num_frontends = 1
+        is_attached_frontend = False
     multi_frontend = num_frontends > 1 or is_attached_frontend
     if multi_frontend and not is_attached_frontend:
         if llm_args.get("orchestrator_type") is not None:
@@ -496,8 +532,10 @@ def launch_server(
                 param_hint="backend")
 
         frontend_children = []
+        attach_info_path = None
         if multi_frontend and not is_attached_frontend:
-            frontend_children = _spawn_attached_frontends(llm, num_frontends)
+            frontend_children, attach_info_path = _spawn_attached_frontends(
+                llm, num_frontends)
 
         server = OpenAIServer(
             generator=llm,
@@ -522,6 +560,8 @@ def launch_server(
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
+            if multi_frontend and not is_attached_frontend:
+                _cleanup_multi_frontend_artifacts(attach_info_path)
 
 
 def launch_grpc_server(host: str,
@@ -1892,7 +1932,11 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
         host=server_cfg.hostname,
         port=server_cfg.port,
         llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template)
+        allow_request_chat_template=disagg_config.allow_request_chat_template,
+        # Disagg ctx/gen workers inherit the submitter's env (e.g. Slurm
+        # export-all); an exported TLLM_SERVE_NUM_FRONTENDS must not switch
+        # them into multi-frontend mode.
+        multi_frontend_enabled=False)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
