@@ -1183,10 +1183,9 @@ class FusedCommMoEScheduler(MoEScheduler):
             # quantize_input contracts.
             moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
 
-        # Adaptive max_tokens_per_rank bucket hint; only MegaMoECuteDsl exposes
-        # the hook. ``max(all_rank_num_tokens)`` is allgathered and identical on
-        # every EP rank, so every rank selects the same bucket -- required for
-        # the in-kernel NVLink barrier. ``None`` -> backend full bucket.
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier.
         set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
         if set_adaptive is not None:
             set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)

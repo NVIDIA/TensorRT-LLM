@@ -31,7 +31,7 @@ from .backend import MoeBackendType, get_backend_class
 from .mapping import _PARALLEL_MODE_LAYOUTS, _resolve_mapping_layout
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
-_FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM"})
+_FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"})
 
 
 def _is_deepep_feasible(num_ranks: int) -> bool:
@@ -170,10 +170,10 @@ def is_candidate_valid(
             "use TEP/DEP only with other backends"
         )
 
-    # MegaMoEDeepGemm is EP-only (asserts moe_tp_size == 1 in __init__); DTP/TTP are invalid.
-    if config.backend.upper() == "MEGAMOE_DEEPGEMM" and moe_tp > 1:
+    # MegaMoE backends are EP-only; DTP/TTP are invalid.
+    if config.backend.upper() in _FUSED_COMM_BACKENDS and moe_tp > 1:
         return False, (
-            f"MEGAMOE_DEEPGEMM does not support MoE-TP (moe_tp_size={moe_tp}); "
+            f"{config.backend.upper()} does not support MoE-TP (moe_tp_size={moe_tp}); "
             "use DEP/TEP modes only"
         )
 

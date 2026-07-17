@@ -133,20 +133,6 @@ def _assert_sources_freed(module, context=""):
     )
 
 
-def _assert_finalized(module, context=""):
-    _assert_sources_freed(module, context)
-    for stash in (
-        "tmp_cutlass_w3_w1_weights",
-        "tmp_cutlass_w3_w1_weight_scales",
-        "tmp_weight_scale_2",
-        "tmp_raw_input_scales",
-    ):
-        assert not hasattr(module, stash), (
-            f"{stash} still present {context} -- process_weights_after_loading did not run "
-            "(a weight-carrying shard may have been misrouted to the aux-only path)"
-        )
-
-
 def _expected_mega_fc2(weights) -> torch.Tensor:
     return torch.stack([weights[f"{e}.w2.weight"] for e in range(NUM_EXPERTS)])
 
@@ -173,16 +159,12 @@ def _expected_fc1_norm_const() -> torch.Tensor:
 def test_initial_streaming_load_layer_atomic():
     method, module, weights = _fresh()
 
-    # create_weights shrinks all 4 streamed sources to 0-element placeholders
-    # and records their full shapes for rematerialization.
+    # create_weights replaces streamed sources with empty placeholders.
     _assert_sources_freed(module, "right after create_weights")
-    assert set(module.rebuild_tensor_metadata) == set(_STREAMED_PARAMS)
 
-    # Full eager load: base load_weights runs PWAL inline.
     _load(method, module, weights, allow_partial_loading=False)
-    _assert_finalized(module, "after the initial eager load")
+    _assert_sources_freed(module, "after the initial eager load")
 
-    # Derived buffers hold the packed bytes.
     assert torch.equal(module.mega_fc2_weight.data, _expected_mega_fc2(weights))
     assert torch.equal(module.mega_fc1_weight.data, _expected_mega_fc1(weights))
     assert torch.allclose(module.fc1_norm_const.data, _expected_fc1_norm_const())

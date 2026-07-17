@@ -58,6 +58,13 @@ def _run_autotune(
         with torch.inference_mode(), autotune(cache_path=cache_path):
             moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
         torch.cuda.synchronize()
+        inner_backend = getattr(moe, "backend", moe)
+        if getattr(inner_backend, "tactic_autotune", False):
+            from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+                release_megamoe_profiling_scratch,
+            )
+
+            release_megamoe_profiling_scratch()
         return "success:fast" if fast_autotune else "success"
     finally:
         tuner.warmup = saved_warmup
