@@ -420,8 +420,6 @@ unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4" SKIP (https://nvbugs/6437410)
 unittest/_torch/sampler/test_beam_search.py::test_beam_search_e2e[multi_process-TRTLLMSampler-cuda_graph_and_overlap-None-1-1-True-True-False] SKIP (https://nvbugs/6463819)
-unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6451032)
-unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6451032)
 unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-TRTLLM-True-False-True-True-True-False-False-False] SKIP (https://nvbugs/6451425)
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype1] SKIP (https://nvbugs/6301807)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_no_autotune[use_score_as_input-RoutingDSv3-swiglu-1024-1024-1] SKIP (https://nvbugs/5908070)
