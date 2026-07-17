@@ -375,3 +375,35 @@ def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
 
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # pool survived and was reused
+
+
+def test_seam_shim_is_isinstance_transparent():
+    # Reproduces the #16338 breakage class: library code doing
+    # isinstance(x, MpiPoolSession) against the PATCHED seam attribute. A
+    # plain function there raised TypeError and killed every LLM creation;
+    # the shim must behave as a type that answers for the real class.
+    class _Real:
+        pass
+
+    made = []
+    shim = session_reuse._isinstance_transparent_shim(
+        _Real, lambda *a, **k: (made.append((a, k)), _Real())[1]
+    )
+    obj = shim(2, key="v")  # construction still routed to the factory
+    assert made == [((2,), {"key": "v"})]
+    assert isinstance(obj, shim)  # instance checks answer for the real class
+    assert isinstance(_Real(), shim)
+    assert not isinstance(object(), shim)
+    assert issubclass(_Real, shim)
+
+
+def test_patched_library_seam_survives_isinstance(reuse_cache):
+    # End to end against the real seam: whatever currently sits on
+    # tensorrt_llm.executor.proxy.MpiPoolSession (the real class, or the
+    # shim installed by the session-reuse plugin active in this test
+    # session), the proxy.py isinstance pattern must not raise. On the
+    # pre-fix code (function at the seam) this raises TypeError.
+    proxy = pytest.importorskip("tensorrt_llm.executor.proxy")
+    reuse_cache.install_pool_factory_if_loaded()
+    assert isinstance(object(), proxy.MpiPoolSession) in (False, True)
+    assert issubclass(type(object()), proxy.MpiPoolSession) in (False, True)
