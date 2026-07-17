@@ -107,6 +107,49 @@ def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     assert "max_draft_len" in explicit_config.model_fields_set
 
 
+def test_rejection_sampling_allows_attention_dp(monkeypatch):
+    """ADP (incl. ADP+LM-head-TP) supports rejection sampling: the draft path
+    bypasses LM-head-TP for advanced sampling and the greedy flag is
+    group-synchronized, so the former attention-DP gate is lifted."""
+    import tensorrt_llm._torch.flashinfer_utils as fi_utils
+    monkeypatch.setattr(fi_utils, "IS_FLASHINFER_AVAILABLE", True)
+
+    # Vanilla MTP is one of the "newly wired" methods the parallel gate used
+    # to cover: lifting the ADP gate is the actual behavior change here.
+    for lm_head_tp in (False, True):
+        spec_cfg = MTPDecodingConfig(max_draft_len=2,
+                                     use_rejection_sampling=True,
+                                     use_mtp_vanilla=True)
+        args = TorchLlmArgs(model=llama_model_path,
+                            enable_attention_dp=True,
+                            enable_lm_head_tp_in_adp=lm_head_tp,
+                            speculative_config=spec_cfg)
+        assert args.speculative_config.use_rejection_sampling is True
+
+    # MTP-Eagle (default) was never parallel-gated; keep it as a regression
+    # guard that the gate rework did not accidentally start rejecting it.
+    spec_cfg = MTPDecodingConfig(max_draft_len=2, use_rejection_sampling=True)
+    args = TorchLlmArgs(model=llama_model_path,
+                        enable_attention_dp=True,
+                        enable_lm_head_tp_in_adp=True,
+                        speculative_config=spec_cfg)
+    assert args.speculative_config.use_rejection_sampling is True
+
+
+def test_rejection_sampling_still_gated_on_context_parallel():
+    """Context parallelism remains an unsupported rejection combination:
+    explicit opt-in raises; default-inherited silently disables. The parallel
+    gate applies to the newly wired methods (vanilla MTP, PARD, DFlash,
+    DraftTarget one-model), so use vanilla MTP here."""
+    spec_cfg = MTPDecodingConfig(max_draft_len=2,
+                                 use_rejection_sampling=True,
+                                 use_mtp_vanilla=True)
+    with pytest.raises(ValueError, match="context parallelism"):
+        TorchLlmArgs(model=llama_model_path,
+                     context_parallel_size=2,
+                     speculative_config=spec_cfg)
+
+
 class TestYaml:
 
     def _yaml_to_dict(self, yaml_content: str) -> dict:

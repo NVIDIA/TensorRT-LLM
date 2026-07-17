@@ -854,11 +854,37 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 #   ADP+LM-head-TP padding to ``max_num_requests`` so every TP
                 #   rank produces logits of the same shape.
                 # Eagle3: logits_processor of the EAGLE draft model.
-                use_lm_head_tp_in_adp = (
+                #
+                # The LM-head-TP fast path (group-stacked rows, vocab-sharded
+                # weight) is only usable when the consumer is an argmax: the
+                # distributed greedy sampler recovers the global argmax from
+                # vocab-shard maxima without materializing full distributions.
+                # Advanced (rejection) sampling needs each request's full-vocab
+                # distribution, so a batch headed for the advanced path
+                # bypasses LM-head-TP and computes full-vocab logits locally --
+                # under ADP the lm_head weight is replicated (the sliced-shard
+                # trick is a runtime optimization), exactly like the target
+                # head. The bypass triggers only when rejection is enabled AND
+                # the batch is not all-greedy (mirroring sample_draft_tokens'
+                # `advanced`); with rejection off, non-greedy batches keep the
+                # LM-head-TP argmax path unconditionally, where the per-rank
+                # greedy flag never enters control flow. The branch is CUDA-
+                # graph- and collective-safe because use_rejection_sampling is
+                # pure config and is_all_greedy_sample is group-synchronized
+                # whenever rejection+ADP+LM-head-TP are combined (see
+                # _sync_group_all_greedy_sample): the whole group takes the
+                # same branch, so the stacked forward's all-gather never loses
+                # participants.
+                advanced_draft_sampling = (
+                    getattr(spec_metadata, 'use_rejection_sampling', False)
+                    and not spec_metadata.is_all_greedy_sample)
+                lm_head_tp_in_adp_configured = (
                     self.is_mtp_eagle and self.model_config is not None
                     and self.model_config.mapping.enable_attention_dp
                     and getattr(self.model_config.mapping,
                                 'enable_lm_head_tp_in_adp', False))
+                use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
+                                         and not advanced_draft_sampling)
                 if self.is_mtp_eagle:
                     if use_lm_head_tp_in_adp:
                         hidden_states_gathered = hidden_states[gather_ids]
@@ -884,6 +910,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         logits = draft_model.mtp_layers[0].shared_head(
                             padded_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
+                    elif lm_head_tp_in_adp_configured:
+                        # Advanced-sampling bypass: the model's shared_head
+                        # would re-apply the LM-head-TP stacked/sharded path
+                        # from config on its own, so call lm_head directly.
+                        # Under ADP the LMHead weight is replicated and
+                        # is_spec_decoding_head defaults to False, so this is
+                        # a plain local full-vocab GEMM over this rank's own
+                        # rows -- the same computation the target head runs.
+                        logits = draft_model.lm_head(hidden_states[gather_ids])
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
                             hidden_states[gather_ids], draft_model.lm_head,

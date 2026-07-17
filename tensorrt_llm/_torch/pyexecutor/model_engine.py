@@ -2698,6 +2698,33 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(num_ctx_requests))
         return None
 
+    def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
+        """Group-synchronize ``is_all_greedy_sample`` under ADP + LM-head TP.
+
+        With rejection sampling enabled, the greedy-vs-advanced choice gates
+        the LM-head-TP group's collectives (stacked draft forward and its
+        distributed argmax) and the CUDA graph variant that records them.
+        Under attention DP each rank owns a different batch, so the local
+        flags can diverge; a diverged choice would leave part of the group
+        waiting in a collective the rest never enters. All-gather the local
+        flags and store the group AND, which _scan_one_model_sampling applies
+        on every rescan (see SpecMetadata.group_all_greedy_sample).
+
+        The sync condition is pure config -- identical on every rank -- so
+        ranks also agree on whether this exchange happens at all. The gather
+        spans the whole TP group (a superset of any LM-head-TP subgroup):
+        agreement over the superset implies agreement within each subgroup and
+        avoids depending on the per-forward LM-head-TP group construction.
+        """
+        if not (self.enable_attention_dp
+                and getattr(self.mapping, 'enable_lm_head_tp_in_adp', False)
+                and getattr(spec_metadata, 'use_rejection_sampling', False)):
+            return
+        local_flag = bool(spec_metadata.is_all_greedy_sample)
+        all_flags = self.dist.tp_allgather(local_flag)
+        spec_metadata.group_all_greedy_sample = all(all_flags)
+        spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
     def _set_spec_metadata_all_rank_num_tokens(
             self,
             spec_metadata: SpecMetadata,
@@ -5840,6 +5867,7 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(
                     padded_requests.all_requests())
+                self._sync_group_all_greedy_sample(spec_metadata)
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
