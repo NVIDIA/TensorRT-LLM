@@ -604,11 +604,11 @@ class Stage2Groups:
     order follow the cp-major fold layout, which ``dist.new_group``'s rank
     sorting does not preserve)."""
 
-    ulysses_group: Any
-    seq_group: Any
+    ulysses_group: torch_dist.ProcessGroup
+    seq_group: torch_dist.ProcessGroup
     seq_rank: int
     seq_size: int
-    gather_index: Optional[list] = None
+    gather_index: Optional[list[int]] = None
 
 
 class BasicAVTransformerBlock(nn.Module):

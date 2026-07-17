@@ -1009,7 +1009,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     def _current_topology_state(self) -> str:
         return getattr(self, "_stage2_topology_state", "default")
 
-    def _stage2_transformer_groups(self) -> Optional[Stage2Groups]:
+    def _build_stage2_dit_groups(self) -> Optional[Stage2Groups]:
         """Build the stage-2 dual-topology groups (once, collectively, at load).
 
         cfg is flattened into ulysses while every other mesh dim's groups are

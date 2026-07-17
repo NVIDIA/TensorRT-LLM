@@ -793,11 +793,11 @@ class LTX2Pipeline(BasePipeline):
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
             model_config=model_config,
-            stage2_groups=self._stage2_transformer_groups(),
+            stage2_groups=self._build_stage2_dit_groups(),
         )
         self.transformer._transformer_config = vars(cfg)
 
-    def _stage2_transformer_groups(self):
+    def _build_stage2_dit_groups(self):
         """Two-stage pipeline override supplies the dual-topology groups;
         single-stage builds none."""
         return None

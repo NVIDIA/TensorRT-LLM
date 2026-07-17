@@ -357,7 +357,7 @@ def _make_model_config_cfg(
 
 
 def _build_stage2_groups_for_test(vgm):
-    """Mirror of LTX2TwoStagesPipeline._stage2_transformer_groups."""
+    """Mirror of LTX2TwoStagesPipeline._build_stage2_dit_groups."""
     from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import Stage2Groups
 
     rank = dist.get_rank()
