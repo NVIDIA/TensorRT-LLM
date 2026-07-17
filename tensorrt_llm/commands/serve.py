@@ -38,8 +38,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
-from tensorrt_llm.llmapi.mpi_session import (find_free_ipc_addr,
-                                             split_mpi_env)
+from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
@@ -399,9 +398,8 @@ def _init_multi_frontend_mode(llm_args: dict,
         llm_args.pop("num_serve_frontends", None)
         return MultiFrontendMode(1, False)
 
-    mode = MultiFrontendMode(
-        num_frontends,
-        os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
+    mode = MultiFrontendMode(num_frontends,
+                             os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
     if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
         raise ValueError(
             "num_serve_frontends > 1 currently supports only the "
@@ -495,8 +493,7 @@ def launch_server(
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
-    multi_frontend = _init_multi_frontend_mode(llm_args,
-                                               multi_frontend_enabled)
+    multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
@@ -1212,30 +1209,30 @@ def launch_visual_gen_server(
     help=
     "Types of agents to schedule. Now Only Support Open Deep Research agent.",
     status="prototype")
-def serve(
-        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        post_processor_hook: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tensor_parallel_size: int,
-        pipeline_parallel_size: int, context_parallel_size: int,
-        moe_expert_parallel_size: Optional[int],
-        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, num_serve_frontends: int,
-        num_input_processor_workers: int,
-        num_media_load_workers: int, trust_remote_code: bool,
-        revision: Optional[str], extra_llm_api_options: Optional[str],
-        reasoning_parser: Optional[str], tool_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str], agent_percentage: float,
-        agent_types: Optional[str], video_pruning_rate: Optional[float],
-        telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], allow_request_chat_template: bool,
-        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-        served_model_name: Optional[str], visual_gen_args: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
+          post_processor_hook: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tensor_parallel_size: int, pipeline_parallel_size: int,
+          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          moe_cluster_parallel_size: Optional[int],
+          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
+          kv_cache_dtype: str, num_postprocess_workers: int,
+          num_serve_frontends: int, num_input_processor_workers: int,
+          num_media_load_workers: int, trust_remote_code: bool,
+          revision: Optional[str], extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool,
+          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
+          media_io_kwargs: Optional[str], agent_percentage: float,
+          agent_types: Optional[str], video_pruning_rate: Optional[float],
+          telemetry: bool, custom_module_dirs: list[Path],
+          chat_template: Optional[str], allow_request_chat_template: bool,
+          middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
+          served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
