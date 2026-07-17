@@ -94,13 +94,6 @@ def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Ten
     return torch.tensor(offsets, device=device, dtype=torch.float32)
 
 
-def _canonical_device(device: torch.device) -> torch.device:
-    device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
-        return torch.device("cuda", torch.cuda.current_device())
-    return device
-
-
 def _topk_indices_into(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -418,7 +411,7 @@ class _BatchedKeepSetSelectorBase:
         self.width = int(width)
         self.keep_count = int(keep_count)
         self.dtype = dtype
-        self.device = _canonical_device(device)
+        self.device = device
         self.max_requests = int(max_requests)
         self.valid_widths = torch.full(
             (self.max_requests,), self.width, dtype=torch.int32, device=self.device
@@ -989,7 +982,7 @@ class _FixedScoreStagingBuffers:
             or set(dense_layers) != set(grouped_layers)
         ):
             raise ValueError("dense layer order must cover every grouped layer exactly once")
-        self.device = _canonical_device(layer_pools[page_representatives[0]].device)
+        self.device = layer_pools[page_representatives[0]].device
         if self.device.type != "cuda":
             raise ValueError("fixed score metadata is CUDA-only")
         self.max_requests = max_requests

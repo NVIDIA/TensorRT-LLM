@@ -95,7 +95,7 @@ def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
 
 def _launched_draft_compaction(draft_protected_tails):
     """Build target and draft pools with distinct head counts, then compact."""
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     target_kv_heads = 2
     draft_kv_heads = 4
@@ -274,7 +274,7 @@ def test_draft_pack_matches_keep_broadcast_and_tail_ordinal_oracle(draft_protect
 
 def test_mark_page_tables_consumed_orders_both_manager_streams():
     staging = _FixedScoreStagingBuffers.__new__(_FixedScoreStagingBuffers)
-    staging.device = torch.device("cuda")
+    staging.device = torch.device("cuda", torch.cuda.current_device())
     staging.page_tables_active = True
     event = mock.Mock()
     staging.bulk_consume_done = event

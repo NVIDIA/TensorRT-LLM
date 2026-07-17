@@ -1133,7 +1133,7 @@ class TestFixedScoreMetadata:
             _FixedScoreStagingBuffers,
         )
 
-        device = torch.device("cuda")
+        device = torch.device("cuda", torch.cuda.current_device())
         current_stream = torch.cuda.current_stream(device)
         manager_stream = torch.cuda.Stream(device=device)
         host_table = torch.zeros(
@@ -1238,7 +1238,7 @@ class TestFixedScoreMetadata:
             _FixedScoreStagingBuffers,
         )
 
-        device = torch.device("cuda")
+        device = torch.device("cuda", torch.cuda.current_device())
         current_stream = torch.cuda.current_stream(device)
         manager_stream = torch.cuda.Stream(device=device)
         host_table = torch.zeros(1, 1, 2, 4, dtype=torch.int32, device="cpu", pin_memory=True)
@@ -1312,7 +1312,7 @@ class TestFixedScoreMetadata:
         )
 
         staging = _FixedScoreStagingBuffers.__new__(_FixedScoreStagingBuffers)
-        staging.device = torch.device("cuda")
+        staging.device = torch.device("cuda", torch.cuda.current_device())
         staging.max_requests = 8
         staging.stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=4)
         staging.page_tables_active = False
@@ -1376,7 +1376,7 @@ class TestFixedScoreMetadata:
             _FixedScoreStreamMismatch,
         )
 
-        device = torch.device("cuda")
+        device = torch.device("cuda", torch.cuda.current_device())
         max_requests = 8
         page_count = 3
         seq_len = 7
@@ -1535,7 +1535,7 @@ class TestFixedScoreMetadata:
             _FixedScoreGroup,
         )
 
-        device = torch.device("cuda")
+        device = torch.device("cuda", torch.cuda.current_device())
         torch.manual_seed(20260703 + request_count)
         max_requests = 8
         page_count = 2
@@ -1652,7 +1652,7 @@ class TestFixedScoreMetadata:
             _FixedScoreGroup,
         )
 
-        device = torch.device("cuda")
+        device = torch.device("cuda", torch.cuda.current_device())
         torch.manual_seed(20260707 + request_count)
         max_requests = request_count
         page_count = 2

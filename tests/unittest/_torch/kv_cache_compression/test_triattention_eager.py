@@ -204,7 +204,7 @@ def test_per_head_eager_cuda_matches_cpu_reference_on_selector_stream(
         reference.select_requests(scores_cpu, normalize_scores=normalize_scores)
     expected = reference.keep.clone()
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
         selector = _BatchedPerHeadKeepSetSelector(
@@ -232,7 +232,7 @@ def test_per_head_eager_cuda_matches_cpu_reference_on_selector_stream(
 
 def test_union_eager_runs_the_registered_cute_op():
     _require_cute_topk_op()
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     scores = torch.randn(2, 4, 96, dtype=torch.float32, device=device)
     selector = _BatchedUnionKeepSetSelector(
         rows=4,
@@ -254,7 +254,7 @@ def test_prepared_union_scores_match_checked_launch_and_exact_indices(normalize_
     _require_cute_topk_op()
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention_kernels
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_count, rows, width, keep_count = 2, 7, 97, 64
     generator = torch.Generator(device=device).manual_seed(53)
     scores = torch.randn(
@@ -312,7 +312,7 @@ def test_prepared_union_scores_match_checked_launch_and_exact_indices(normalize_
 @pytest.mark.parametrize("keep_count,width", [(4096, 4224), (8192, 9216)])
 def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, width):
     _require_cute_topk_op()
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     prompt_len = 17
     request_count, rows = 2, 4
     generator = torch.Generator(device=device).manual_seed(keep_count)
@@ -355,7 +355,7 @@ def test_fused_union_preparation_matches_ragged_torch_reference():
         prepare_union_scores,
     )
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_count, rows, width = 2, 7, 97
     generator = torch.Generator(device=device).manual_seed(17)
     scores = torch.randn(
@@ -399,7 +399,7 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
         prepare_per_head_scores,
     )
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_count, layers, query_heads, kv_heads, width = 2, 3, 4, 2, 97
     generator = torch.Generator(device=device).manual_seed(29)
     scores = torch.randn(
@@ -464,7 +464,7 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
 
 @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
 def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode):
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     num_layers = 2
     num_kv_heads = 2
@@ -577,7 +577,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
 def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
     """One union cohort mixing prompt lengths compacts byte-identically to
     running the same two requests as two single-request compactions."""
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     num_layers = 2
     num_kv_heads = 2
@@ -695,7 +695,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         _FixedScoreStagingBuffers,
     )
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     num_layers = 3
     seq_len = 8
     keep_count = 2
@@ -825,7 +825,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     request_id = 7
     prompt_len = 2
     seq_len = 10
@@ -1043,7 +1043,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
 
 
 def test_eager_compaction_rebases_masked_swa_window_and_tail():
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
     swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
     initial_pools = [
