@@ -76,6 +76,8 @@ class TensorEncoderMultimodalModel(DummyMultimodalModel):
 
 
 class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     @property
     def embedding_dim(self) -> int:
         raise NotImplementedError
@@ -86,6 +88,8 @@ class NoEmbeddingMetadataMultimodalModel(DummyMultimodalModel):
 
 
 class CountingEncoderMultimodalModel(DummyMultimodalModel):
+    supports_encoder_cache = True
+
     def __init__(
         self,
         embedding: Embedding,
@@ -253,6 +257,15 @@ def test_encoder_cache_first_request_writes_per_item_entries():
     assert model.encode_calls == 1
     assert embeddings.shape == (3, 4)
     assert len(model._multimodal_encoder_cache) == 2
+
+
+def test_encoder_cache_requires_model_opt_in():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    assert not model.encoder_cache_active
 
 
 def test_encoder_cache_creation_logs_embedding_row_capacity():

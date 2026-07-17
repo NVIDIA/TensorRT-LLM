@@ -640,13 +640,10 @@ class KvCacheCreator:
         """Reserve encoder-cache capacity when the model implements that cache."""
         model = self._model_engine.model
         if (not isinstance(model, MultimodalModelMixin)
-                or not model.supports_encoder_cache):
+                or not model.encoder_cache_active):
             return peak_memory
 
-        multimodal_config = model.model_config.multimodal_config
-        if multimodal_config is None:
-            return peak_memory
-        return peak_memory + multimodal_config.encoder_cache_max_bytes
+        return peak_memory + model.model_config.multimodal_config.encoder_cache_max_bytes
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""

@@ -180,3 +180,82 @@ def test_parallel_operations_keep_cache_metadata_consistent() -> None:
         hit = cache.get(index)
         if hit is not None:
             assert hit.numel() * hit.element_size() == 8
+
+
+def test_stream_aware_mode_leaves_cpu_cache_behavior_unchanged() -> None:
+    cache = TensorLRUCache[str](max_bytes=16, cuda_stream_aware=True)
+    source = torch.arange(4, dtype=torch.float32)
+
+    assert cache.put("key", source)
+    cached = cache.get("key")
+
+    assert cached is not None
+    assert cached.device.type == "cpu"
+    torch.testing.assert_close(cached, source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_stream_aware_cache_orders_cross_stream_producer_and_consumer() -> None:
+    cache = TensorLRUCache[str](max_bytes=16, cuda_stream_aware=True)
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+    source = torch.zeros(4, device="cuda")
+
+    with torch.cuda.stream(producer_stream):
+        torch.cuda._sleep(10_000_000)
+        source.fill_(7)
+        assert cache.put("key", source)
+
+    with torch.cuda.stream(consumer_stream):
+        cached = cache.get("key")
+        assert cached is not None
+        observed = cached.clone()
+
+    consumer_stream.synchronize()
+    torch.testing.assert_close(observed, torch.full_like(observed, 7))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_stream_aware_cache_pop_orders_cross_stream_consumer() -> None:
+    cache = TensorLRUCache[str](max_bytes=16, cuda_stream_aware=True)
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+    source = torch.zeros(4, device="cuda")
+
+    with torch.cuda.stream(producer_stream):
+        torch.cuda._sleep(10_000_000)
+        source.fill_(5)
+        assert cache.put("key", source)
+
+    with torch.cuda.stream(consumer_stream):
+        popped = cache.pop("key")
+        assert popped is not None
+        observed = popped.clone()
+
+    consumer_stream.synchronize()
+    assert len(cache) == 0
+    torch.testing.assert_close(observed, torch.full_like(observed, 5))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_stream_aware_cache_preserves_evicted_consumer_storage() -> None:
+    cache = TensorLRUCache[str](max_bytes=4 * 1024, cuda_stream_aware=True)
+    producer_stream = torch.cuda.Stream()
+    consumer_stream = torch.cuda.Stream()
+    source = torch.full((1024,), 3.0, device="cuda")
+
+    with torch.cuda.stream(producer_stream):
+        assert cache.put("key", source)
+
+    with torch.cuda.stream(consumer_stream):
+        cached = cache.get("key")
+        assert cached is not None
+        torch.cuda._sleep(10_000_000)
+        observed = cached.clone()
+    del cached
+
+    with torch.cuda.stream(producer_stream):
+        assert cache.put("key", torch.full_like(source, 9.0))
+
+    consumer_stream.synchronize()
+    torch.testing.assert_close(observed, torch.full_like(observed, 3.0))
