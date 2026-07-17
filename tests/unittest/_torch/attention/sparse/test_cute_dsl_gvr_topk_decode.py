@@ -771,7 +771,7 @@ def _make_r0_pre_idx(logits, top_k, hint, seed):
         pre = noised.topk(top_k, dim=1).indices.int()
     else:
         pre = torch.randint(0, N, (num_rows, top_k), generator=g, device="cuda").int()
-    return (pre - 1).clamp(min=0).contiguous()
+    return (pre - 1).contiguous()
 
 
 @skip_not_sm100
