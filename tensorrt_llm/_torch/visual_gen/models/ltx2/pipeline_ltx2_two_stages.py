@@ -1361,7 +1361,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         snapshot_required = 0
         n = 0
         dense_lora_merge_completed = False
-        stage2_start = time.time()
         try:
             if using_persistent_lora:
                 lora_cache.bind_merged()
@@ -1406,8 +1405,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 timer=timer,
             )
         finally:
-            stage2_denoise_time = time.time() - stage2_start
-            logger.info(f"Stage 2 refinement time: {stage2_denoise_time:.2f}s (incl. prep)")
             if self.transformer._has_stage2:
                 self.transformer.set_ulysses_topology(is_stage2=False)
             if using_persistent_lora:
