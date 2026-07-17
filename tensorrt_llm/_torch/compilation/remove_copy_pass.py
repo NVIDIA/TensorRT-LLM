@@ -43,18 +43,18 @@ def remove_copy_for_mutates_args(graph: Graph):
                 if arg.alias_info is None or not arg.alias_info.is_write:
                     continue
                 base_index_key = f"_{arg.name}_base_index"
-                if base_index_key not in node.kwargs:
-                    continue
                 base_index = node.kwargs[base_index_key]
                 kwargs[arg.name] = (None if base_index is None else
                                     all_bases[base_index])
-            for k, v in mutates_args.items():
-                if v not in kwargs:
-                    kwargs[v] = all_bases[k - 1]
 
         for getitem_node in getitem_nodes:
             idx = getitem_node.args[1]
-            getitem_node.replace_all_uses_with(kwargs[mutates_args[idx]])
+            mutated_arg = mutates_args[idx]
+            replacement = kwargs[mutated_arg]
+            assert replacement is not None, (
+                f"getitem user for optional output '{mutated_arg}' "
+                "has no base tensor -- graph is malformed")
+            getitem_node.replace_all_uses_with(replacement)
             nodes_to_remove.append(getitem_node)
 
         with graph.inserting_before(node):
