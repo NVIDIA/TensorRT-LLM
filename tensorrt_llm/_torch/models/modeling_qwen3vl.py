@@ -303,11 +303,23 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             videos = [video_data.frames for video_data in video_datas]
         else:
             videos = None
-        do_rescale = True
-        if images and isinstance(images[0], torch.Tensor):
-            do_rescale = False
-        if videos and isinstance(videos[0][0], torch.Tensor):
-            do_rescale = False
+        # HF's Qwen3-VL processor takes a single `do_rescale` kwarg that is
+        # applied to both images and videos. Mixed pre-rescale states leave
+        # the raw side at 0-255 while the pre-rescaled side gets skipped —
+        # the ViT then produces garbage for the raw modality. Fail fast; the
+        # default `get_preferred_media_io_kwargs` ships `np` for both, so a
+        # divergence here means a caller override drifted.
+        image_is_pre = not images or isinstance(images[0], torch.Tensor)
+        video_is_pre = not videos or isinstance(videos[0][0], torch.Tensor)
+        if image_is_pre != video_is_pre:
+            raise ValueError(
+                "Qwen3-VL requires image and video items to arrive in the same "
+                "pre-rescaled state (both torch.Tensor, or both uint8 numpy). "
+                f"Got image_is_pre_rescaled={image_is_pre}, "
+                f"video_is_pre_rescaled={video_is_pre}. Configure consistent "
+                "formats via `media_io_kwargs`."
+            )
+        do_rescale = not image_is_pre
 
         do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
@@ -398,9 +410,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
 
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
-        # uint8 HWC frames let the HF processor rescale/permute once, skipping
-        # the per-frame CHW-float conversion in the IO loader.
-        return {"video": {"format": "np"}}
+        # uint8 HWC arrays for both modalities so the HF processor rescales
+        # and normalizes uniformly in one pass. A single `do_rescale` kwarg
+        # controls both modalities; if they arrive in mismatched
+        # pre-rescale states (e.g. image=Tensor pre-rescaled, video=uint8
+        # np), the raw side is left at 0-255 and the ViT sees garbage.
+        return {"image": {"format": "np"}, "video": {"format": "np"}}
 
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
