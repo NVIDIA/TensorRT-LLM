@@ -17,7 +17,7 @@
 
 Given each request's kept-token ordinals, its valid sequence length, and the
 staged V2 block offsets, this module packs per-request move indices with one
-prepared Triton launch and then moves the surviving KV in place with batched
+frozen Triton kernel call and then moves the surviving KV in place with batched
 C++ compact launches. Inputs are plain tensors, so any eviction method that
 produces a kept-token set per request can drive it.
 """
@@ -27,7 +27,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from .prepared_launch import PreparedTritonKernelLaunch
+from .triattention_kernels import FrozenTritonKernelCall
 
 _SUPPORTED_POOL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
@@ -62,13 +62,13 @@ class _CppCompactGroup(NamedTuple):
 class _SingleCacheCompaction(NamedTuple):
     """One compacted cache family (target dense, target SWA, or draft).
 
-    Holds the prepared launch that packs this family's move indices (None
-    when an earlier family's pack launch fills them in the same call), the
+    Holds the frozen kernel call that packs this family's move indices (None
+    when an earlier family's pack call fills them in the same run), the
     C++ compact groups that consume them, and the destination base the moved
     tokens land at.
     """
 
-    prepared_move_index_pack: Optional[PreparedTritonKernelLaunch]
+    frozen_move_index_pack: Optional[FrozenTritonKernelCall]
     cpp_compact_groups: Tuple[_CppCompactGroup, ...]
     move_source_indices: torch.Tensor
     move_source_offsets: torch.Tensor
@@ -77,8 +77,8 @@ class _SingleCacheCompaction(NamedTuple):
     destination_bases: torch.Tensor
 
     def compact(self) -> None:
-        if self.prepared_move_index_pack is not None:
-            self.prepared_move_index_pack()
+        if self.frozen_move_index_pack is not None:
+            self.frozen_move_index_pack()
         for group in self.cpp_compact_groups:
             group.compact(
                 self.move_source_indices, self.move_source_offsets, self.destination_bases
@@ -221,7 +221,7 @@ def _compact_groups(
     return tuple(result)
 
 
-def _prepared_move_index_pack_launch(
+def _frozen_move_index_pack(
     kept_token_ordinals: torch.Tensor,
     valid_sequence_lengths: torch.Tensor,
     move_source_offsets: torch.Tensor,
@@ -235,8 +235,8 @@ def _prepared_move_index_pack_launch(
     swa_window: int,
     swa_move_source_offsets: Optional[torch.Tensor],
     swa_move_source_indices: Optional[torch.Tensor],
-) -> PreparedTritonKernelLaunch:
-    """Build one prepared launch of the move-index packing kernel.
+) -> FrozenTritonKernelCall:
+    """Build one frozen call of the move-index packing kernel.
 
     The kernel reads the kept-token ordinals and each request's valid length
     and writes the packed per-(layer, head) move source indices consumed by
@@ -302,7 +302,7 @@ def _prepared_move_index_pack_launch(
         swa_indices_arg,
     )
     # Ordered to match the kernel's constexpr parameter declaration: the
-    # prepared launch replays these by position.
+    # frozen call passes these by position.
     constexpr_values = dict(
         DENSE_TOTAL=int(move_source_indices.shape[-1]),
         SWA_TOTAL=swa_total,
@@ -316,7 +316,7 @@ def _prepared_move_index_pack_launch(
         HAS_SWA=swa_total > 0,
         BLOCK=_PACK_BLOCK_TOKENS,
     )
-    return PreparedTritonKernelLaunch(
+    return FrozenTritonKernelCall(
         _pack_compaction_sources_kernel,
         bound_tensors,
         constexpr_values,
@@ -478,7 +478,7 @@ class BatchedKVCacheCompaction:
         dense_slots = (
             {layer: slot for slot, layer in enumerate(self.dense_layers)} if per_layer else None
         )
-        dense_pack = _prepared_move_index_pack_launch(
+        dense_pack = _frozen_move_index_pack(
             kept_token_ordinals,
             valid_sequence_lengths,
             dense_move_offsets,
@@ -493,7 +493,7 @@ class BatchedKVCacheCompaction:
             swa_move_source_indices=swa_move_indices,
         )
         self.target_dense_compaction = _SingleCacheCompaction(
-            prepared_move_index_pack=dense_pack,
+            frozen_move_index_pack=dense_pack,
             cpp_compact_groups=_compact_groups(
                 dense_entries, self.layer_pool_keys, self.device, dense_slots
             ),
@@ -501,11 +501,11 @@ class BatchedKVCacheCompaction:
             move_source_offsets=dense_move_offsets,
             destination_bases=self.prompt_offsets,
         )
-        # The dense pack launch fills the SWA move buffers in the same call.
+        # The dense pack call fills the SWA move buffers in the same run.
         self.target_swa_compaction = None
         if self.swa_layers:
             self.target_swa_compaction = _SingleCacheCompaction(
-                prepared_move_index_pack=None,
+                frozen_move_index_pack=None,
                 cpp_compact_groups=_compact_groups(swa_entries, self.layer_pool_keys, self.device),
                 move_source_indices=swa_move_indices,
                 move_source_offsets=swa_move_offsets,
@@ -597,10 +597,10 @@ class BatchedKVCacheCompaction:
             for layer in draft_layers
         ]
         # In union mode the pack kernel reads selection row 0 for every
-        # packed row, so one more prepared launch broadcasts the target keep
+        # packed row, so one more frozen kernel call broadcasts the target keep
         # set over the draft KV heads and appends the draft's own tail
         # ordinals (valid_seq_len + 0..tail-1).
-        draft_pack = _prepared_move_index_pack_launch(
+        draft_pack = _frozen_move_index_pack(
             kept_token_ordinals,
             valid_sequence_lengths,
             draft_move_offsets,
@@ -615,7 +615,7 @@ class BatchedKVCacheCompaction:
             swa_move_source_indices=None,
         )
         return _SingleCacheCompaction(
-            prepared_move_index_pack=draft_pack,
+            frozen_move_index_pack=draft_pack,
             cpp_compact_groups=_compact_groups(
                 draft_entries, tuple(draft_layer_pool_keys), self.device
             ),

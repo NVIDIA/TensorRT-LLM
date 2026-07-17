@@ -58,8 +58,8 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.prepared_launch import (
-    PreparedTritonKernelLaunch,
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    FrozenTritonKernelCall,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
@@ -218,7 +218,7 @@ class _PreparedTopKFinalizer:
 
         from .triattention_kernels import _finalize_topk_indices_kernel
 
-        self._prepared_launch = PreparedTritonKernelLaunch(
+        self._frozen_call = FrozenTritonKernelCall(
             _finalize_topk_indices_kernel,
             (scores, seq_lens, prompt_offsets, provisional_indices, output_indices),
             dict(
@@ -239,7 +239,7 @@ class _PreparedTopKFinalizer:
         provisional_indices: torch.Tensor,
         output_indices: torch.Tensor,
     ) -> None:
-        self._prepared_launch(scores, seq_lens, prompt_offsets, provisional_indices, output_indices)
+        self._frozen_call(scores, seq_lens, prompt_offsets, provisional_indices, output_indices)
 
 
 class _PreparedUnionScores:
@@ -288,10 +288,10 @@ class _PreparedUnionScores:
         # this launcher before dispatching to it.
         self.scores = scores
         self.normalize_scores = normalize_scores
-        self._prepared_stats_launch = None
+        self._frozen_stats_call = None
         if normalize_scores:
             stats_grid = (request_count * rows, 1, 1)
-            self._prepared_stats_launch = PreparedTritonKernelLaunch(
+            self._frozen_stats_call = FrozenTritonKernelCall(
                 _score_row_stats_kernel,
                 (scores, valid_widths, row_mean, row_inv_std),
                 dict(ROWS=rows, WIDTH=width, BLOCK=256),
@@ -299,7 +299,7 @@ class _PreparedUnionScores:
                 num_warps=4,
             )
         union_grid = (request_count, (width + 31) // 32, 1)
-        self._prepared_union_launch = PreparedTritonKernelLaunch(
+        self._frozen_union_call = FrozenTritonKernelCall(
             _score_union_kernel,
             (scores, valid_widths, row_mean, row_inv_std, combined),
             dict(ROWS=rows, WIDTH=width, NORMALIZE=normalize_scores, BLOCK=32),
@@ -308,9 +308,9 @@ class _PreparedUnionScores:
         )
 
     def __call__(self) -> None:
-        if self._prepared_stats_launch is not None:
-            self._prepared_stats_launch()
-        self._prepared_union_launch()
+        if self._frozen_stats_call is not None:
+            self._frozen_stats_call()
+        self._frozen_union_call()
 
 
 def _deterministic_topk_indices_into(
@@ -390,7 +390,7 @@ class _RuntimeKVLayout(NamedTuple):
 
 
 class _BatchedKeepSetSelectorBase:
-    """Shared fixed buffers and prepared launchers for keep-set selectors."""
+    """Shared fixed buffers and frozen kernel calls for keep-set selectors."""
 
     def __init__(
         self,

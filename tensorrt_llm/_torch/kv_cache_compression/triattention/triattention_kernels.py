@@ -16,11 +16,73 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List, Tuple
 
 import torch
 import triton
 import triton.language as tl
+
+
+class FrozenTritonKernelCall:
+    """Call one Triton kernel frozen at build time.
+
+    Triton's standard dispatch costs tens of microseconds of host work per
+    call; eviction fires its kernels every round, so the grid, bound tensor
+    set, and constexpr set are frozen once here. ``warmup`` (Triton's own
+    API) JIT-compiles the kernel at build time and ``__call__`` runs the
+    compiled binary directly. Constexpr values are passed positionally on
+    each call, so their order is validated against the kernel's constexpr
+    parameter declaration order at build time.
+    """
+
+    def __init__(
+        self,
+        triton_kernel,
+        bound_tensors: Tuple[torch.Tensor, ...],
+        constexpr_values: Dict[str, object],
+        *,
+        grid: Tuple[int, ...],
+        num_warps: int,
+    ) -> None:
+        params = getattr(triton_kernel, "params", None)
+        if params is not None:
+            declared = [param.name for param in params if param.is_constexpr]
+            if list(constexpr_values.keys()) != declared:
+                raise ValueError(
+                    f"constexpr order {list(constexpr_values.keys())} must match the "
+                    f"kernel's declaration order {declared}: the frozen call passes "
+                    "them positionally"
+                )
+        self.device = bound_tensors[0].device
+        self.bound_tensors = tuple(bound_tensors)
+        self.constexpr_values = dict(constexpr_values)
+        with torch.cuda.device(self.device):
+            self.build_stream = torch.cuda.current_stream(self.device)
+            # warmup() then indexing the compiled cache by grid is the
+            # documented-by-use Triton pattern for dispatch-free calls; if a
+            # Triton upgrade changes it, this raises here at build time rather
+            # than corrupting a later call.
+            compiled = triton_kernel.warmup(
+                *self.bound_tensors,
+                **self.constexpr_values,
+                num_warps=num_warps,
+                grid=grid,
+            )
+            self.compiled_kernel_runner = compiled[grid]
+
+    def __call__(self, *call_tensors: torch.Tensor) -> None:
+        """Run the kernel; ``call_tensors``, if given, substitute the bound tensors."""
+        current_stream = torch.cuda.current_stream(self.device)
+        if (current_stream.device, current_stream.cuda_stream) != (
+            self.build_stream.device,
+            self.build_stream.cuda_stream,
+        ):
+            raise RuntimeError("a frozen Triton kernel call must run on the stream it was built on")
+        self.compiled_kernel_runner(
+            *(call_tensors if call_tensors else self.bound_tensors),
+            *self.constexpr_values.values(),
+            stream=self.build_stream.cuda_stream,
+        )
 
 
 @triton.jit
