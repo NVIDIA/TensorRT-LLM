@@ -2031,7 +2031,7 @@ def test_qwen_image_edit_example(_visual_gen_deps, llm_root, llm_venv):
     configs/qwen-image-edit-2511-bf16-1gpu.yaml work together as documented.
     """
     model_path = os.environ.get("QWEN_IMAGE_EDIT_MODEL_PATH") or os.path.join(
-        conftest.llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
+        _llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
     )
     _skip_if_missing(model_path, "Qwen-Image-Edit-2511 checkpoint", is_dir=True)
     model_index_path = os.path.join(model_path, "model_index.json")
