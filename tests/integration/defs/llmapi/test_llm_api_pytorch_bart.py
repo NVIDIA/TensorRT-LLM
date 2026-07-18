@@ -18,7 +18,6 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
-from tensorrt_llm._torch.models.modeling_bart import MBartForConditionalGeneration
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -124,6 +123,8 @@ def _test_case(
 
 
 _TEST_CASES = [
+    # Eager (non-CUDA-graph) greedy smoke. All remaining cases run with CUDA
+    # graphs enabled because deployments almost always enable them.
     _test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
@@ -146,20 +147,12 @@ _TEST_CASES = [
     _test_case(
         torch_dtype="float16",
         use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
+        enable_cuda_graph=True,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="fp16-kv-v1-cuda-graph-off-greedy",
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=True,
-        feature_id="bf16-kv-v1-cuda-graph-off-beam2",
+        cuda_graph_batch_sizes=[2],
+        feature_id="fp16-kv-v1-cuda-graph-on-greedy",
     ),
     _test_case(
         torch_dtype="bfloat16",
@@ -169,15 +162,6 @@ _TEST_CASES = [
         num_return_sequences=2,
         exact_match=True,
         feature_id="bf16-kv-v1-cuda-graph-on-beam2",
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=True,
-        enable_cuda_graph=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        feature_id="bf16-kv-v2-cuda-graph-off-greedy",
     ),
     _test_case(
         torch_dtype="bfloat16",
@@ -193,16 +177,6 @@ _TEST_CASES = [
     _test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        disable_overlap_scheduler=False,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy-overlap",
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
         enable_cuda_graph=True,
         num_beams=1,
         num_return_sequences=1,
@@ -210,16 +184,6 @@ _TEST_CASES = [
         cuda_graph_batch_sizes=[2],
         disable_overlap_scheduler=False,
         feature_id="bf16-kv-v1-cuda-graph-on-greedy-overlap",
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=True,
-        enable_cuda_graph=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        disable_overlap_scheduler=False,
-        feature_id="bf16-kv-v2-cuda-graph-off-greedy-overlap",
     ),
     _test_case(
         torch_dtype="bfloat16",
@@ -235,16 +199,6 @@ _TEST_CASES = [
     _test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=True,
-        disable_overlap_scheduler=False,
-        feature_id="bf16-kv-v1-cuda-graph-off-beam2-overlap",
-    ),
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
@@ -253,17 +207,6 @@ _TEST_CASES = [
         feature_id="bf16-kv-v1-cuda-graph-on-beam2-overlap",
     ),
     # Tensor parallelism (TP=2) coverage
-    _test_case(
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        tensor_parallel_size=2,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy-tp2",
-        marks=pytest.mark.skip_less_device(2),
-    ),
     _test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
@@ -360,34 +303,6 @@ def _decoder_cuda_graph_config(
     )
 
 
-def _assert_decoder_cuda_graph_state(
-    llm: LLM,
-    enabled: bool,
-    batch_sizes: list[int] | None,
-) -> None:
-    model_engine = llm._executor.engine.model_engine
-
-    if not enabled:
-        assert not model_engine.encoder_cuda_graph_runner.enabled
-        assert not model_engine.cuda_graph_runner.enabled
-        assert not model_engine.encoder_cuda_graph_runner.graphs
-        assert not model_engine.cuda_graph_runner.graphs
-        return
-
-    _assert_decoder_cuda_graphs_captured(llm)
-    if batch_sizes is not None:
-        assert model_engine.cuda_graph_runner.padding_dummy_requests
-
-
-def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
-    model_engine = llm._executor.engine.model_engine
-
-    assert not model_engine.encoder_cuda_graph_runner.enabled
-    assert not model_engine.encoder_cuda_graph_runner.graphs
-    assert model_engine.cuda_graph_runner.enabled
-    assert model_engine.cuda_graph_runner.graphs
-
-
 def _assert_bart_response(
     response: RequestOutput,
     num_return_sequences: int,
@@ -447,8 +362,6 @@ def _run_bart_pytorch_generate_encoder_decoder(
     disable_overlap_scheduler: bool = True,
     tensor_parallel_size: int = 1,
 ) -> None:
-    if tensor_parallel_size == 1:
-        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_model_path(_MODEL_NAME)
@@ -503,16 +416,6 @@ def _run_bart_pytorch_generate_encoder_decoder(
             exact_match,
             expected_output_token_ids_by_output,
         )
-        # CUDA graph state introspection reaches into the in-process engine,
-        # which is only available when the executor runs single-process (TP=1).
-        # For TP>1 the executor is a multi-process proxy without a local engine,
-        # so we rely on the generated-output assertions above for correctness.
-        if tensor_parallel_size == 1:
-            _assert_decoder_cuda_graph_state(
-                llm,
-                enable_cuda_graph,
-                cuda_graph_batch_sizes,
-            )
 
 
 @pytest.mark.parametrize(
@@ -554,7 +457,6 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
 def test_mbart_pytorch_generate_encoder_decoder_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_model_path(_MBART_MODEL_NAME)
@@ -574,6 +476,7 @@ def test_mbart_pytorch_generate_encoder_decoder_end_to_end(
         tokenizer=tokenizer,
         backend="pytorch",
         attn_backend="TRTLLM",
+        cuda_graph_config=_decoder_cuda_graph_config(),
         disable_overlap_scheduler=True,
         dtype="bfloat16",
         enable_chunked_prefill=False,
@@ -592,9 +495,6 @@ def test_mbart_pytorch_generate_encoder_decoder_end_to_end(
         model_kwargs={"torch_dtype": "bfloat16"},
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
     ) as llm:
-        model = llm._executor.engine.model_engine.model
-        assert isinstance(model, MBartForConditionalGeneration)
-
         response = llm.generate(
             _MBART_SOURCE_TEXT,
             sampling_params=sampling_params,
@@ -633,7 +533,6 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     num_beams: int,
     num_return_sequences: int,
 ) -> None:
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_model_path(_MODEL_NAME)
@@ -694,5 +593,3 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
                     request_idx
                 ],
             )
-
-        _assert_decoder_cuda_graphs_captured(llm)

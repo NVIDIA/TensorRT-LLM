@@ -765,9 +765,10 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations in both executor loops. Reject pp_size > 1 for parity
-        # with the legacy TRT path because encoder PP send/recv support is
-        # intentionally out of scope for this port.
+        # iterations in both executor loops. PP usage is very rare for these
+        # models, so encoder PP send/recv support is not implemented in the
+        # PyTorch path for now. Reject pp_size > 1.
+        # TODO: Add support for pp + encoder models
         is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
@@ -2577,6 +2578,9 @@ class PyExecutor:
                     f'{scheduled_batch.num_context_requests} context requests and '
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
+
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:

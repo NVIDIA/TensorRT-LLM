@@ -23,9 +23,6 @@ architectures:
 Whisper is not currently supported by the PyTorch encoder-decoder path. Support
 is in progress.
 
-This is the PyTorch LLM path, not the legacy TensorRT encoder-decoder workflow
-under `examples/models/core/enc_dec/`.
-
 mBART architecture loading is available. When a BART or mBART checkpoint
 defines `forced_bos_token_id`, the PyTorch backend seeds that token in the
 decoder prefix. Source- and target-language selection remains
@@ -88,10 +85,6 @@ model = "google/flan-t5-small"
 with LLM(
     model=model,
     backend="pytorch",
-    attn_backend="TRTLLM",
-    dtype="bfloat16",
-    disable_overlap_scheduler=False,
-    enable_chunked_prefill=False,
     max_batch_size=4,
     max_input_len=512,
     max_num_tokens=2048,

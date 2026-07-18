@@ -201,6 +201,7 @@ class BartEncoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
+            residual_in_fp32=False,
         )
 
         self.mlp = MLP(
@@ -218,6 +219,7 @@ class BartEncoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
+            residual_in_fp32=False,
         )
 
     def forward(
@@ -236,17 +238,19 @@ class BartEncoderLayer(nn.Module):
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.FULL,
         )
-        hidden_states = residual + hidden_states
-        if not self.normalize_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
+        if self.normalize_before:
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states, _ = self.self_attn_layer_norm(hidden_states, residual)
 
         residual = hidden_states
         if self.normalize_before:
             hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        if not self.normalize_before:
-            hidden_states = self.final_layer_norm(hidden_states)
+        if self.normalize_before:
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states, _ = self.final_layer_norm(hidden_states, residual)
 
         return hidden_states
 
@@ -278,6 +282,7 @@ class BartDecoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
+            residual_in_fp32=False,
         )
 
         self.cross_attn = BartCrossAttention(model_config, layer_idx=layer_idx)
@@ -287,6 +292,7 @@ class BartDecoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
+            residual_in_fp32=False,
         )
 
         self.mlp = MLP(
@@ -304,6 +310,7 @@ class BartDecoderLayer(nn.Module):
             eps=1e-5,
             dtype=config.torch_dtype,
             has_bias=True,
+            residual_in_fp32=False,
         )
 
     def forward(
@@ -326,9 +333,10 @@ class BartDecoderLayer(nn.Module):
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.CAUSAL,
         )
-        hidden_states = residual + hidden_states
-        if not self.normalize_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
+        if self.normalize_before:
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states, _ = self.self_attn_layer_norm(hidden_states, residual)
 
         # Cross-attention
         residual = hidden_states
@@ -341,18 +349,20 @@ class BartDecoderLayer(nn.Module):
             cross_attn_metadata=cross_attn_metadata,
             skip_cross_kv_projection=skip_cross_kv_projection,
         )
-        hidden_states = residual + hidden_states
-        if not self.normalize_before:
-            hidden_states = self.cross_attn_layer_norm(hidden_states)
+        if self.normalize_before:
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states, _ = self.cross_attn_layer_norm(hidden_states, residual)
 
         # MLP
         residual = hidden_states
         if self.normalize_before:
             hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        if not self.normalize_before:
-            hidden_states = self.final_layer_norm(hidden_states)
+        if self.normalize_before:
+            hidden_states = residual + hidden_states
+        else:
+            hidden_states, _ = self.final_layer_norm(hidden_states, residual)
 
         return hidden_states
 
