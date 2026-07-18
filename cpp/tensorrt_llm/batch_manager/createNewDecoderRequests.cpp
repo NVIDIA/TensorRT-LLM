@@ -659,6 +659,13 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     for (auto const& llmReq : finishedContextRequests)
     {
         llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
+        // Stamp the global LogitsPostProcessorConfig::returnsLogProbs flag onto
+        // each per-request SamplingConfig so PenaltyLayer can read it during
+        // setup. Forward the value as-is (including std::nullopt → no override).
+        if (mLogitsPostProcessorReturnsLogProbs)
+        {
+            llmReq->mSamplingConfig.logitsPostProcessorReturnsLogProbs = true;
+        }
 
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
         auto const batchSlot = llmReq->mSeqSlot.value();

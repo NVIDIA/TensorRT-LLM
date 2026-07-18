@@ -23,6 +23,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::runtime::decoder
@@ -39,6 +40,10 @@ public:
     using SizeType32 = runtime::SizeType32;
     using TensorPtr = runtime::ITensor::SharedPtr;
     using TensorConstPtr = runtime::ITensor::SharedConstPtr;
+    /// @brief Per-beam token histories: BeamTokens[beam] is the token sequence
+    ///        (prompt + generated) for that beam. Mirrors LlmRequest::BeamTokens
+    ///        but redeclared here to avoid pulling in llmRequest.h.
+    using BeamTokens = std::vector<std::vector<runtime::TokenIdType>>;
 
     explicit DecoderInputBuffers(
         SizeType32 maxBatchSize, SizeType32 maxDecoderSteps, runtime::BufferManager const& manager);
@@ -79,6 +84,16 @@ public:
     //! The vector is sparse, only slots in forwardBatchSlots are used.
     //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
     std::vector<std::vector<runtime::ITensor::SharedPtr>> predictedDraftLogits;
+
+    //! Coherent per-beam token histories for the LogitsPostProcessor callback.
+    //! Index parallel with `decoderRequests` / `decoderLogits`. Built per step by
+    //! TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback() by tracing
+    //! parentIds backward, so beam `b`'s entry is the *ancestral* path the model's
+    //! KV cache actually conditioned on (not the slot-accumulated `mTokens`).
+    //! `nullopt` means the callback should fall back to `llmReq->getTokens()` —
+    //! used when beamWidth==1, no callback is registered, or no reorder happened
+    //! yet (cheap path, no allocation).
+    std::vector<std::optional<BeamTokens>> gatheredBeamTokensForCallback;
 };
 
 class DecoderOutputBuffers

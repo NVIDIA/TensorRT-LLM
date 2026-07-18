@@ -87,6 +87,7 @@ void GptDecoder<T>::disableLookahead(
     penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
+    penaltyParams->logitsPostProcessorReturnsLogProbs = mSamplingConfig.logitsPostProcessorReturnsLogProbs;
 
     // banwords parameters
     auto banWordsParams = std::make_shared<tl::BanWordsSetupParams>();
@@ -140,6 +141,7 @@ void GptDecoder<T>::setup(SamplingConfig const& samplingConfig, size_t batchSize
     penaltyParams->promptIgnoreLength = mSamplingConfig.promptIgnoreLength;
     penaltyParams->temperature = mSamplingConfig.temperature;
     penaltyParams->minLength = mSamplingConfig.minLength;
+    penaltyParams->logitsPostProcessorReturnsLogProbs = mSamplingConfig.logitsPostProcessorReturnsLogProbs;
 
     setupParams->penaltyParams = std::move(penaltyParams);
 
