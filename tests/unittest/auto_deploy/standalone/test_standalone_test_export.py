@@ -39,6 +39,7 @@ GENERATED_TEST_RENAMES = {
     "test_ad_guided_decoding.py": "test_paragraf_trtllm_guided_decoding.py",
     "test_ad_speculative_decoding.py": "test_paragraf_trtllm_speculative_decoding.py",
     "test_ad_dist_strategies.py": "test_paragraf_trtllm_dist_strategies.py",
+    "test_ad_allreduce_strategies.py": "test_paragraf_trtllm_allreduce_strategies.py",
     "test_ad_build_small_multi.py": "test_paragraf_trtllm_build_small_multi.py",
     "test_ad_moe_op.py": "test_paragraf_trtllm_moe_op.py",
     "test_ad_executor_swa_eviction.py": "test_paragraf_trtllm_executor_swa_eviction.py",
