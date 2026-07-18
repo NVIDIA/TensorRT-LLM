@@ -978,16 +978,22 @@ class BasePipeline(nn.Module):
         timestep,
         scheduler,
         extra_stream_schedulers,
+        scheduler_step_kwargs=None,
     ):
         """Execute scheduler step for all streams."""
+        step_kwargs = scheduler_step_kwargs or {}
         t_start = time.time()
-        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+        latents = scheduler.step(noise_pred, timestep, latents, return_dict=False, **step_kwargs)[0]
 
         # Step schedulers for extra streams
         for name, noise_extra in extra_noise_preds.items():
             if name in extra_stream_schedulers:
                 extra_stream_latents[name] = extra_stream_schedulers[name].step(
-                    noise_extra, timestep, extra_stream_latents[name], return_dict=False
+                    noise_extra,
+                    timestep,
+                    extra_stream_latents[name],
+                    return_dict=False,
+                    **step_kwargs,
                 )[0]
 
         t_sched = time.time() - t_start
@@ -1010,6 +1016,7 @@ class BasePipeline(nn.Module):
         boundary_timestep: Optional[float] = None,
         guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
+        scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -1045,6 +1052,8 @@ class BasePipeline(nn.Module):
             post_step_fn: Optional callable applied to latents after each scheduler step.
                          Signature: post_step_fn(latents) -> latents
                          Use for constraints that must hold throughout denoising.
+            scheduler_step_kwargs: Extra keyword arguments forwarded to every
+                         scheduler's ``step()`` call.
 
         Returns:
             Single latents if no extra_streams
@@ -1171,6 +1180,7 @@ class BasePipeline(nn.Module):
                 t,
                 scheduler,
                 extra_stream_schedulers,
+                scheduler_step_kwargs=scheduler_step_kwargs,
             )
 
             if post_step_fn is not None:
