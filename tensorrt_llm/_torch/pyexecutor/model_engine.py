@@ -4570,7 +4570,13 @@ class PyTorchModelEngine(ModelEngine):
                     and not _has_any_multimodal_request
                     and not multimodal_params_list and not lora_params
                     and attn_metadata.padded_num_tokens is None
-                    and self._get_position_id_offset() == 0):
+                    and self._get_position_id_offset() == 0
+                    # A KV-cache compression manager shrinks the physical
+                    # cache mid-generation, so positions and cached-token
+                    # counts stop advancing in lockstep; keep the full
+                    # prepare path, which rebuilds both every step.
+                    and not getattr(kv_cache_manager,
+                                    "kv_compression_manages_history", False)):
                 self._steady_gen_positions_pinned[:_n_gen].copy_(
                     torch.as_tensor(num_cached_tokens_snapshot,
                                     dtype=torch.int))
