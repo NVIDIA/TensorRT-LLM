@@ -136,16 +136,6 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     def warmup_cache_key(self, height: Optional[int], width: Optional[int], **kwargs) -> tuple:
         return (height, width)
 
-    def torch_compile(self) -> None:
-        vgm = self.pipeline_config.visual_gen_mapping
-        if vgm and vgm.cfg_size > 1:
-            logger.warning(
-                "Qwen-Image-Edit disables torch.compile when CFG parallelism is enabled; "
-                "compiled per-rank conditional/unconditional transformer execution does not "
-                "currently preserve CFG=1 parity."
-            )
-            return
-        super().torch_compile()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         from PIL import Image
