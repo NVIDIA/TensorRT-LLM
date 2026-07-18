@@ -111,6 +111,10 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
         return False
+    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
+    # model does not read the paged draft KV cache managed by attention metadata.
+    if spec_config.spec_dec_mode.is_dspark():
+        return False
     return spec_config._allow_separate_draft_kv_cache
 
 
@@ -276,6 +280,7 @@ class SpeculativeDecodingMode(IntEnum):
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
     DFLASH = auto()
+    DSPARK = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -310,8 +315,11 @@ class SpeculativeDecodingMode(IntEnum):
     def is_dflash(self):
         return self == SpeculativeDecodingMode.DFLASH
 
+    def is_dspark(self):
+        return self == SpeculativeDecodingMode.DSPARK
+
     def is_parallel_draft(self):
-        return self.is_pard() or self.is_dflash()
+        return self.is_pard() or self.is_dflash() or self.is_dspark()
 
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
@@ -476,6 +484,11 @@ class SpecMetadata:
 
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
+    # The number of generation requests for the speculative model/layer of each
+    # rank (num_seqs - num_contexts). Used by external drafters (e.g. DSpark)
+    # whose draft forward processes only generation requests and must size a
+    # FUSED_COMM MoE (DeepGEMM MegaMoE) chunk loop identically across EP ranks.
+    all_rank_num_gens: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the

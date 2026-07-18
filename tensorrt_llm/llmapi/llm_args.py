@@ -2629,6 +2629,91 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.DFLASH
 
 
+class DSparkDecodingConfig(DecodingBaseConfig):
+    """Configuration for DSpark speculative decoding.
+
+    DSpark (DeepSeek) is a target-dependent, "semi-parallel" speculative
+    decoding method. Like DFlash it captures hidden states from several target
+    layers as cross-attention context and drafts a whole block in a single
+    backbone forward, but it additionally refines the per-position draft logits
+    with a lightweight sequential head (a low-rank Markov head, optionally an RNN
+    head) and predicts an acceptance-confidence per position to truncate the
+    proposed prefix.
+
+    Key features:
+    - Target-dependent: captures hidden states from ``target_layer_ids``.
+    - Semi-parallel: one block backbone forward + cheap sequential head refine.
+    - Confidence head: truncates the proposed draft length (NOT the accept rule;
+      acceptance stays standard target verification, preserving greedy parity).
+
+    Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
+    """
+    mask_token_id: Optional[int] = Field(
+        default=None,
+        description=
+        "Token ID used as the mask/noise token for parallel draft prediction. "
+        "If None, read from the draft model config (dspark_noise_token_id).")
+
+    target_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Target model layer indices whose hidden states are captured for "
+        "cross-attention in the draft model. If None, read from the draft model "
+        "config (dspark_target_layer_ids).")
+
+    block_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Number of draft positions produced per block. If None, read from the "
+        "draft model config (dspark_block_size). Should equal max_draft_len.")
+
+    markov_rank: Optional[int] = Field(
+        default=None,
+        description=
+        "Low-rank dimension of the Markov head logit-bias. If None, read from "
+        "the draft model config (dspark_markov_rank). 0 disables the head.")
+
+    markov_head_type: Optional[Literal["vanilla", "gated", "rnn"]] = Field(
+        default=None,
+        description=
+        "Type of the sequential refinement head used within a block. If None, "
+        "read from the draft model config (dspark_markov_head_type), "
+        "defaulting to \"vanilla\".")
+
+    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
+    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
+    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
+    # omitted and will be added when the feature is actually wired into the
+    # speculative scheduling/verification path. The confidence head module and its
+    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
+    # dspark_propose).
+
+    decoding_type: Literal["DSpark"] = Field(default="DSpark")
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """DSpark needs K+1 tokens per gen request (K drafts + 1 bonus).
+
+        The draft produces its own mask queries internally; passing mask
+        fillers through the target is pure wasted work at large batch size.
+        """
+        return self.max_draft_len + 1
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.DSPARK
+
+
 class AutoDecodingConfig(DecodingBaseConfig):
     """Configuration for auto speculative decoding.
 
@@ -3295,6 +3380,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
         DFlashDecodingConfig,
+        DSparkDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
@@ -5105,6 +5191,7 @@ class TorchLlmArgs(BaseLlmArgs):
                                 or spec_mode == TorchSpeculativeDecodingMode.MTP
                                 or spec_mode.is_mtp_eagle_one_model()
                                 or spec_mode.is_pard() or spec_mode.is_dflash()
+                                or spec_mode.is_dspark()
                                 or spec_mode.is_draft_target_one_model())
 
                 # Combinations that break the proposal-distribution invariant.
@@ -5114,6 +5201,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 is_new_rejection_method = (
                     spec_mode == TorchSpeculativeDecodingMode.MTP
                     or spec_mode.is_pard() or spec_mode.is_dflash()
+                    or spec_mode.is_dspark()
                     or spec_mode.is_draft_target_one_model())
                 # Plain tensor parallelism is supported (the draft path
                 # all-gathers vocab-sharded draft logits before rejection, see
@@ -5230,6 +5318,92 @@ class TorchLlmArgs(BaseLlmArgs):
                             mask_id = dflash_cfg.get("mask_token_id")
                             if mask_id is not None:
                                 self.speculative_config.mask_token_id = mask_id
+
+            if isinstance(self.speculative_config, DSparkDecodingConfig):
+                spec_cfg = self.speculative_config
+                if not spec_cfg.max_draft_len:
+                    raise ValueError("DSpark max_draft_len must be > 0; got "
+                                     f"{spec_cfg.max_draft_len}")
+                # The DSpark draft weights live in the ``mtp.*`` namespace of a
+                # local checkpoint directory; without ``speculative_model``
+                # neither the draft weights nor the ``dspark_*`` config
+                # defaults can be located, and engine construction would fail
+                # much later with an opaque error.
+                if spec_cfg.speculative_model is None:
+                    raise ValueError(
+                        "DSpark requires speculative_config.speculative_model "
+                        "to point at the checkpoint directory containing the "
+                        "mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this "
+                        "is the target checkpoint directory itself).")
+                # Resolve target_layer_ids / mask_token_id / block_size /
+                # markov_rank from the draft (or main) model config if not set.
+                # DSpark ships these as top-level ``dspark_*`` keys in the
+                # DeepSeek-V4-Pro config.json; also accept a nested
+                # ``dspark_config`` dict for forward compatibility.
+                draft_config_path = os.path.join(spec_cfg.speculative_model,
+                                                 "config.json")
+                if os.path.exists(draft_config_path):
+                    with open(draft_config_path) as f:
+                        draft_cfg = json.load(f)
+                    dspark_cfg = draft_cfg.get("dspark_config", {})
+
+                    def _dspark_get(key, top_level_key):
+                        value = dspark_cfg.get(key)
+                        if value is None:
+                            value = draft_cfg.get(top_level_key)
+                        return value
+
+                    # The checkpoint's ``dspark_target_layer_ids`` is
+                    # authoritative: it fixes both which target hidden states
+                    # were captured during draft training and the input width of
+                    # ``main_proj`` (hidden_size * num_capture_layers). If the
+                    # user leaves ``target_layer_ids`` unset we copy it verbatim
+                    # (order preserved, since the projection columns are
+                    # order-dependent). An explicit override that does not match
+                    # the checkpoint list exactly would either mismatch the
+                    # projection shape at runtime (different count) or feed the
+                    # draft hidden states it was not trained on (same count,
+                    # different layers), so reject it during validation.
+                    ckpt_layer_ids = _dspark_get("target_layer_ids",
+                                                 "dspark_target_layer_ids")
+                    if spec_cfg.target_layer_ids is None:
+                        if ckpt_layer_ids is not None:
+                            spec_cfg.target_layer_ids = list(ckpt_layer_ids)
+                    elif ckpt_layer_ids is not None and list(
+                            spec_cfg.target_layer_ids) != list(ckpt_layer_ids):
+                        raise ValueError(
+                            "DSpark target_layer_ids must match the checkpoint's "
+                            "dspark_target_layer_ids exactly (the draft "
+                            "projection weights are trained for that specific "
+                            f"layer set); got override {spec_cfg.target_layer_ids} "
+                            f"but the checkpoint specifies {list(ckpt_layer_ids)}. "
+                            "Leave target_layer_ids unset to use the checkpoint "
+                            "value.")
+                    if spec_cfg.mask_token_id is None:
+                        mask_id = _dspark_get("mask_token_id",
+                                              "dspark_noise_token_id")
+                        if mask_id is not None:
+                            spec_cfg.mask_token_id = mask_id
+                    if spec_cfg.block_size is None:
+                        block_size = _dspark_get("block_size",
+                                                 "dspark_block_size")
+                        if block_size is not None:
+                            spec_cfg.block_size = int(block_size)
+                    if spec_cfg.markov_rank is None:
+                        markov_rank = _dspark_get("markov_rank",
+                                                  "dspark_markov_rank")
+                        if markov_rank is not None:
+                            spec_cfg.markov_rank = markov_rank
+                if spec_cfg.block_size is None:
+                    spec_cfg.block_size = spec_cfg.max_draft_len
+                if spec_cfg.block_size <= 0:
+                    raise ValueError(
+                        "DSpark block_size must be greater than zero")
+                if spec_cfg.block_size != spec_cfg.max_draft_len:
+                    raise ValueError(
+                        "DSpark block_size must equal max_draft_len; got "
+                        f"block_size={spec_cfg.block_size} and "
+                        f"max_draft_len={spec_cfg.max_draft_len}")
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
