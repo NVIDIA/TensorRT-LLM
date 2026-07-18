@@ -1899,6 +1899,8 @@ def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
     )
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "cosmos3_t2i_4step_output.png")
+    if os.path.exists(output_path):
+        os.remove(output_path)
 
     script_path = os.path.join(
         llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
@@ -1927,3 +1929,4 @@ def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
         env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    assert os.path.getsize(output_path) > 0, f"Example produced an empty image at {output_path}"
