@@ -3,6 +3,7 @@
 """Shared pytest configuration for the VisualGen unit tests."""
 
 import os
+from collections.abc import Iterator
 
 import pytest
 
@@ -16,7 +17,7 @@ os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 
 @pytest.fixture(scope="module")
-def disable_cosmos3_guardrails():
+def disable_cosmos3_guardrails() -> Iterator[None]:
     """Disable Cosmos3 guardrails for the requesting module, leak-free.
 
     Patches both the environment variable (re-read by

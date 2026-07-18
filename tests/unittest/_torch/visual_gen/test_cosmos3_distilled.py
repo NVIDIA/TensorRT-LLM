@@ -6,6 +6,7 @@ and its pipeline wiring: scheduler loading, recipe validation, generation
 defaults, mode resolution, and the guidance-1.0 denoise-loop contract."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -54,7 +55,7 @@ UNIPC_SCHEDULER_CONFIG = {
 SKIP_NON_SCHEDULER = ["text_tokenizer", "tokenizer", "vae", "sound_tokenizer"]
 
 
-def _write_scheduler_config(checkpoint_dir, config: dict) -> None:
+def _write_scheduler_config(checkpoint_dir: Path, config: dict) -> None:
     scheduler_dir = checkpoint_dir / "scheduler"
     scheduler_dir.mkdir(parents=True, exist_ok=True)
     with open(scheduler_dir / "scheduler_config.json", "w") as f:
@@ -89,7 +90,7 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
     return pipeline
 
 
-def _fake_request(output_type="video", **param_overrides):
+def _fake_request(output_type: str = "video", **param_overrides) -> SimpleNamespace:
     """A DiffusionRequest look-alike with executor-merged (None = unset) params."""
     params = SimpleNamespace(
         height=None,
