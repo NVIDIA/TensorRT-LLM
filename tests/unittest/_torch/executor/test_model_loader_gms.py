@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch import memory as memory_mod
+from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -221,7 +222,7 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
     backend = _build_gms_backend(is_rw=is_rw, events=events)
     _install_gms_backend(monkeypatch, backend)
 
-    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader = MagicMock(spec=HfCheckpointLoader, name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
     if is_rw:
         # RW path: the checkpoint loader's returned weights flow into the
@@ -245,6 +246,7 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
             mapping=loader.mapping,
             model=model,
             source_identity=loader._source_identity,
+            _load_format=LoadFormat.GMS,
         )
         loader._call_load_weights.assert_called_once()
         backend.move_untracked_params.assert_called_once_with(model)
@@ -432,6 +434,7 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     assert "post_load_weights" not in events
     assert model._weights_transformed is True
     _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert "_load_format" not in kwargs
     assert kwargs["allow_post_transform_weights"] is True
     assert callable(kwargs["prepare_post_transform_receiver"])
     loader._call_load_weights.assert_not_called()

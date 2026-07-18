@@ -35,6 +35,7 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
                                      DecoderModelForCausalLM, MetaInitMode,
                                      timing)
@@ -710,6 +711,12 @@ class ModelLoader:
                                 "model": model,
                                 "source_identity": self._source_identity,
                             }
+                            if (isinstance(checkpoint_loader,
+                                           HfCheckpointLoader)
+                                    and checkpoint_loader.checkpoint_format
+                                    == "HF"):
+                                load_weights_kwargs[
+                                    "_load_format"] = load_format
                             if checkpoint_loader.checkpoint_format == "MX":
                                 qualification = self._qualify_post_transform_profile(
                                     model,
