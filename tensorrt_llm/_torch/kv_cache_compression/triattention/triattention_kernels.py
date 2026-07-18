@@ -148,6 +148,9 @@ def _tri_score_perhead_kernel(
     USE_MAX: tl.constexpr,
     T_BLOCK: tl.constexpr,
     F_BLOCK: tl.constexpr,
+    F_EXACT: tl.constexpr,  # F_BLOCK == num_freqs: every f-lane is real, so the
+    #   f-axis masks/wheres below are no-ops and are compiled out (fewer
+    #   predicates and selects on the hot path; bit-identical results).
 ):
     # Token tiles ride the fastest grid axis: adjacent programs then walk
     # consecutive K pages of one (request, layer, head) and reuse its
@@ -209,9 +212,14 @@ def _tri_score_perhead_kernel(
     tok_base = phys_page * s_page + slot * s_slot  # [T_BLOCK] int64
 
     # per-request 'mean'-path phase + shared freq scale.
-    mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
-    msin = tl.load(mean_sin_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
-    fss = tl.load(freq_scale_sq_ptr + f, mask=f_mask, other=0.0)
+    if F_EXACT:
+        mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f)
+        msin = tl.load(mean_sin_ptr + req_id * num_freqs + f)
+        fss = tl.load(freq_scale_sq_ptr + f)
+    else:
+        mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
+        msin = tl.load(mean_sin_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
+        fss = tl.load(freq_scale_sq_ptr + f, mask=f_mask, other=0.0)
 
     # ---- PER-HEAD (position + mlr), GQA-deduped, NO head reduction ----
     # This program scores ONE KV head's token tile for the group_size q-heads
@@ -219,7 +227,10 @@ def _tri_score_perhead_kernel(
     # h = kv_head*group_size + qg keeps query-head order 0..num_q_heads-1, so
     # every head's math is bit-for-bit identical to the looped variant.
     group_size = num_q_heads // num_kv_heads
-    load_mask = t_mask[:, None] & f_mask[None, :]
+    if F_EXACT:
+        load_mask = tl.broadcast_to(t_mask[:, None], (T_BLOCK, F_BLOCK))
+    else:
+        load_mask = t_mask[:, None] & f_mask[None, :]
     off_re = f64[None, :] * s_dim
     off_im = (num_freqs + f64[None, :]) * s_dim
 
@@ -233,9 +244,14 @@ def _tri_score_perhead_kernel(
     while qg < group_size:
         h = kv_head * group_size + qg
         calib_off = (layer_id.to(tl.int64) * num_q_heads + h) * num_freqs
-        qre = tl.load(q_real_ptr + calib_off + f, mask=f_mask, other=0.0)
-        qim = tl.load(q_imag_ptr + calib_off + f, mask=f_mask, other=0.0)
-        mlrc = tl.load(mlr_coef_ptr + calib_off + f, mask=f_mask, other=0.0)
+        if F_EXACT:
+            qre = tl.load(q_real_ptr + calib_off + f)
+            qim = tl.load(q_imag_ptr + calib_off + f)
+            mlrc = tl.load(mlr_coef_ptr + calib_off + f)
+        else:
+            qre = tl.load(q_real_ptr + calib_off + f, mask=f_mask, other=0.0)
+            qim = tl.load(q_imag_ptr + calib_off + f, mask=f_mask, other=0.0)
+            mlrc = tl.load(mlr_coef_ptr + calib_off + f, mask=f_mask, other=0.0)
 
         # complex product Q . conj(K) -- the trig importance score.
         prod_real = qre[None, :] * k_re + qim[None, :] * k_im
@@ -248,22 +264,34 @@ def _tri_score_perhead_kernel(
             o = 0
             while o < num_offsets:
                 off = tl.load(offsets_ptr + o)
-                om = tl.load(omega_ptr + f, mask=f_mask, other=0.0)
+                if F_EXACT:
+                    om = tl.load(omega_ptr + f)
+                else:
+                    om = tl.load(omega_ptr + f, mask=f_mask, other=0.0)
                 phase = (rstart + off) * om
                 cphase = tl.cos(phase)
                 sphase = tl.sin(phase)
                 per_f = fss[None, :] * (prod_real * cphase[None, :] - prod_imag * sphase[None, :])
-                offset_score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
+                if F_EXACT:
+                    offset_score = tl.sum(per_f, axis=1)
+                else:
+                    offset_score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
                 score = tl.maximum(score, offset_score)
                 o += 1
         else:
             # 'mean': offset loop collapsed into mean_cos/mean_sin.
             per_f = fss[None, :] * (prod_real * mcos[None, :] - prod_imag * msin[None, :])
-            score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
+            if F_EXACT:
+                score = tl.sum(per_f, axis=1)
+            else:
+                score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
 
         # position-INDEPENDENT MLR term (reuses the per-KV-head |K|).
         mlr_f = kmag * mlrc[None, :] * fss[None, :]
-        mlr = tl.sum(tl.where(f_mask[None, :], mlr_f, 0.0), axis=1)
+        if F_EXACT:
+            mlr = tl.sum(mlr_f, axis=1)
+        else:
+            mlr = tl.sum(tl.where(f_mask[None, :], mlr_f, 0.0), axis=1)
 
         # Segments are request-major then layer-major. Write the decode-only
         # score directly in the selector's [request, layer, head, token] layout.
@@ -284,12 +312,17 @@ def _launch_tri_score_perhead(
     """Launch the shared score ABI for eager and fixed metadata owners."""
     if score_aggregation not in ("mean", "max"):
         raise ValueError(f"unsupported score aggregation: {score_aggregation}")
+    f_block = triton.next_power_of_2(num_freqs)
     _tri_score_perhead_kernel[grid](
         *pointer_args,
         *geometry_args,
         USE_MAX=(score_aggregation == "max"),
         T_BLOCK=token_block,
-        F_BLOCK=triton.next_power_of_2(num_freqs),
+        F_BLOCK=f_block,
+        F_EXACT=(f_block == num_freqs),
+        # 4 warps measured fastest across token blocks; the default was never
+        # tuned for this kernel (sibling kernels pin their warp counts too).
+        num_warps=4,
     )
 
 
@@ -407,7 +440,10 @@ class _FixedScoreGroup:
         )
         slot_idx = slots_t.repeat(max_requests)
         seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
-        self.token_block = 64
+        # 16-token tiles keep the per-program fp32 working set small enough to
+        # avoid the register-pressure occupancy collapse measured at 64-token
+        # tiles (255 regs/thread + spills -> 63 regs, ~1.5x faster end to end).
+        self.token_block = 16
         self.max_ntblk = (self.output_width + self.token_block - 1) // self.token_block
         self.output = torch.empty(
             max_requests,
