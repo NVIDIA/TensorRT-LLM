@@ -346,7 +346,7 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp4ep4_gentp4ep4_glm5_nvfp4_dp_tllm.yaml",
         "qwen3_32b_fp8_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
-        "req60-conc64-qwen3_32b_fp8_mixed_stress":
+        "req120-conc64-qwen3_32b_fp8_mixed_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
         "req10k-conc512-qwen3_32b_fp8_mixed_stress":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp4_qwen3_32b_fp8.yaml",
@@ -3436,6 +3436,37 @@ async def _run_mixed_stress_async(
     }
 
 
+async def _warmup_requests(server_url: str, profiles: list, count: int,
+                           concurrency: int, model_name: str) -> None:
+    """Send `count` requests and discard their results to warm the cluster.
+
+    The first request of each shape pays a one-time autotuner/compile cost
+    (~20s host-steps observed on B200). Running those here, before the measured
+    run, keeps them out of the accuracy/incomplete accounting and out of the
+    heartbeat-eviction path (a worker stuck in a 20s step misses the 2s cluster
+    heartbeat and gets evicted under a high-concurrency flood). Failures are
+    ignored — the only goal is to trigger the autotuner across the profile mix.
+    """
+    import random
+
+    weights = [p.weight for p in profiles]
+    sem = asyncio.Semaphore(concurrency)
+    sink: list = []  # discarded; _send_mixed_request swallows its own errors
+
+    async def bounded(coro):
+        async with sem:
+            await coro
+
+    async with aiohttp.ClientSession() as session:
+        chosen = random.choices(profiles, weights=weights, k=count)
+        tasks = [
+            bounded(
+                _send_mixed_request(session, server_url, p, sink, model_name))
+            for p in chosen
+        ]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def run_disaggregated_mixed_stress(example_dir: str,
                                    config_file: str,
                                    model_path: str,
@@ -3444,6 +3475,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                    accuracy_threshold: float = 0.42,
                                    incomplete_threshold: float = 0.05,
                                    per_profile_min_sample: int = 10,
+                                   warmup_request_count: int = None,
                                    profiles: list = None,
                                    server_start_timeout: int = 600,
                                    env=None,
@@ -3501,6 +3533,22 @@ def run_disaggregated_mixed_stress(example_dir: str,
             raise RuntimeError(
                 f"Disaggregated server did not become ready within "
                 f"{server_start_timeout}s")
+
+        # Pay the one-time autotuner cost before the measured run. The first
+        # request of each shape triggers a ~20s autotuner host-step; left in
+        # the measured run at high concurrency, a worker stuck in that step
+        # misses the 2s cluster heartbeat and is evicted mid-run, causing
+        # "Cluster is not ready" 500s. Default count = ~20s at the ~6 req/s
+        # observed in the 5k B200 run; results are discarded.
+        if warmup_request_count is None:
+            warmup_request_count = 120
+        print(
+            f"[mixed-stress] warmup: {warmup_request_count} requests "
+            f"(results discarded)",
+            flush=True)
+        asyncio.run(
+            _warmup_requests(server_url, profiles, warmup_request_count,
+                             concurrency, model_path))
 
         summary = asyncio.run(
             _run_mixed_stress_async(
@@ -3957,14 +4005,15 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
 @pytest.mark.parametrize(
     "test_config",
     [
-        # Smoke run: 60 requests at 64 concurrency, ~2 min request phase on
-        # B200. Used as L0 post-merge gate. A healthy cluster scores ~1.0
-        # accuracy (every profile validates real content), so 0.9 leaves
-        # margin for a rare flaky request while still catching a regression.
+        # Smoke run: 120 requests at 64 concurrency (matching the warmup
+        # count), ~3 min request phase on B200. Used as L0 post-merge gate. A
+        # healthy cluster scores ~1.0 accuracy (every profile validates real
+        # content), so 0.9 leaves margin for a rare flaky request while still
+        # catching a regression.
         pytest.param(TestConfig(
             model_path='Qwen3/Qwen3-32B-FP8',
-            test_desc='req60-conc64-qwen3_32b_fp8_mixed_stress',
-            request_count=60,
+            test_desc='req120-conc64-qwen3_32b_fp8_mixed_stress',
+            request_count=120,
             concurrency=64,
             accuracy_threshold=0.9,
             speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3'),
