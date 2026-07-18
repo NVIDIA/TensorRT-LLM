@@ -15,7 +15,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -43,7 +43,12 @@ PRETRAINED_CONFIG_COMPAT_DEFAULTS = {
 }
 
 
-def apply_pretrained_config_compat_defaults(pretrained_config):
+_PretrainedConfigT = TypeVar("_PretrainedConfigT")
+
+
+def apply_pretrained_config_compat_defaults(
+    pretrained_config: _PretrainedConfigT,
+) -> _PretrainedConfigT:
     """Fill missing schema fields in place (idempotent); returns the config."""
     for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
         if getattr(pretrained_config, key, None) is None:
