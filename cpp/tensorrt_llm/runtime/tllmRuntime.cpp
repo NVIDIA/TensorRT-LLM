@@ -383,7 +383,6 @@ void TllmRuntime::printEngineInfo()
                 else
                 {
                     TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
-                    TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
                     if (tensorInfo[i]["location"] == std::string("GPU"))
                     {
                         profileInfo[i][k].push_back(context.getTensorShape(nameC));
@@ -619,7 +618,6 @@ void TllmRuntime::setInputTensors(SizeType32 contextIndex, TensorMap const& tens
     {
         NVTX3_SCOPED_RANGE(final_checks);
         TLLM_CHECK_WITH_INFO(context.allInputDimensionsSpecified(), "Input dimensions not specified");
-        TLLM_CHECK_WITH_INFO(context.allInputShapesSpecified(), "Input shapes not specified");
     }
 
     // Print shape of input / output tensors for the TRT engine
