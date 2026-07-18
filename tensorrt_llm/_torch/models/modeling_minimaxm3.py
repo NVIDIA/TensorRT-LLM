@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import os
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Mapping as TMapping
 
@@ -46,7 +47,7 @@ from ..attention_backend.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..distributed import AllReduce, AllReduceParams, MiniMaxAllReduceRMS
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -931,6 +932,7 @@ class MiniMaxM3Attention(Attention):
         position_ids: Optional[torch.IntTensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
         attn_metadata: Optional[AttentionMetadata] = None,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ):
         """Dispatch sparse layers to the MiniMax-M3 sparse algorithm.
@@ -950,14 +952,27 @@ class MiniMaxM3Attention(Attention):
         side index-K buffer.
         """
         if not self.is_sparse_attention_layer:
-            return self._dense_forward(position_ids, hidden_states, attn_metadata, **kwargs)
-        return self._sparse_forward(position_ids, hidden_states, attn_metadata, **kwargs)
+            return self._dense_forward(
+                position_ids,
+                hidden_states,
+                attn_metadata,
+                all_reduce_params=all_reduce_params,
+                **kwargs,
+            )
+        return self._sparse_forward(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            all_reduce_params=all_reduce_params,
+            **kwargs,
+        )
 
     def _dense_forward(
         self,
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Dense MiniMax-M3 attention for layers 0-2.
@@ -1037,7 +1052,11 @@ class MiniMaxM3Attention(Attention):
         # torch.compile. Only the metadata/cache-dependent attention core is
         # hidden behind the inplace custom op.
         o = self._forward_attention_core(q, k, v, None, None, attn_metadata)
-        return self.o_proj(o)
+        # all_reduce_params lets the decoder defer the o_proj output AllReduce so
+        # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
+        # Passing None preserves the standalone o_proj reduction used by the
+        # single-GPU, attention-DP, and fusion-disabled paths.
+        return self.o_proj(o, all_reduce_params=all_reduce_params)
 
     def _sdpa_dense_attention_core(
         self,
@@ -1324,6 +1343,7 @@ class MiniMaxM3Attention(Attention):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run a MiniMax-M3 sparse attention forward end-to-end.
@@ -1439,7 +1459,11 @@ class MiniMaxM3Attention(Attention):
         )
 
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
-        return self.o_proj(o)
+        # all_reduce_params lets the decoder defer the o_proj output AllReduce so
+        # it can be fused with post_attention_layernorm (RESIDUAL_RMS_NORM).
+        # Passing None preserves the standalone o_proj reduction used by the
+        # single-GPU, attention-DP, and fusion-disabled paths.
+        return self.o_proj(o, all_reduce_params=all_reduce_params)
 
     def _triton_sparse_attention_core(
         self,
@@ -1568,6 +1592,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         _, sparse_layer_ids = get_sparse_layer_ids(config)
         disable_index_value_ids = set(get_sparse_disable_index_value_layer_ids(config))
@@ -1599,18 +1624,54 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             )
             self.block_sparse_moe = None
 
+        # Layer-boundary RMSNorms are plain (non-Gemma) norms so they can drive
+        # the fused AllReduce+residual+RMSNorm epilogue
+        # (AllReduceFusionOp.RESIDUAL_RMS_NORM), whose kernel applies a plain
+        # weight * x scaling with no Gemma (1 + weight) offset. When the
+        # checkpoint stores Gemma norms (use_gemma_norm=True), the loader folds
+        # (1 + weight) into the stored weight at load time (see
+        # _fold_gemma_boundary_norm_weights), so the runtime norm is numerically
+        # identical to the original Gemma norm on every path. The per-head
+        # q/k/index norms keep use_gemma because they are consumed by the
+        # separate fused_qk_norm_rope kernel, which handles Gemma directly.
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
-            use_gemma=bool(getattr(config, "use_gemma_norm", False)),
+            use_gemma=False,
         )
         self.post_attention_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
-            use_gemma=bool(getattr(config, "use_gemma_norm", False)),
+            use_gemma=False,
         )
+
+        # DeepSeek-V3-style layer-boundary AllReduce fusion. Each layer folds
+        # the attention o_proj output AllReduce into post_attention_layernorm
+        # (PRE fusion) and the MoE/MLP output AllReduce into the next layer's
+        # input_layernorm (POST fusion, wired via next_layer_layernorm in
+        # setup_aliases). Fusion is only meaningful when there is a real
+        # cross-rank reduction to fold, i.e. TP>1 and not attention-DP (each DP
+        # rank owns independent tokens, so no attention/MoE AllReduce happens
+        # there). An env override matches the DeepSeek-V3 escape hatch.
+        self.enable_fusion = os.environ.get("TRTLLM_MINIMAX_M3_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion &= (not self.enable_attention_dp) and self.mapping.tp_size > 1
+        self.pre_feed_forward_fusion = self.enable_fusion
+        self.post_feed_forward_fusion = self.enable_fusion
+
+        self.allreduce = None
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            self.allreduce = AllReduce(
+                mapping=model_config.mapping,
+                strategy=model_config.allreduce_strategy,
+                dtype=config.torch_dtype,
+            )
+
+        # Wired by MiniMaxM3ForCausalLM.setup_aliases after weight load to the
+        # next layer's input_layernorm (or the final model norm for the last
+        # layer). None disables POST fusion and boundary-norm folding.
+        self.next_layer_layernorm: Optional[RMSNorm] = None
 
     def forward(
         self,
@@ -1624,35 +1685,145 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         # NVTX markers below are emitted only when TLLM_NVTX_DEBUG=1 (or
         # TLLM_LLMAPI_ENABLE_NVTX=1) is set; otherwise they are no-ops.
         attn_kind = "sparse_attn" if self.self_attn.is_sparse_attention_layer else "dense_attn"
-        ffn_kind = "moe" if self.block_sparse_moe is not None else "mlp"
 
-        with nvtx_range_debug(f"layer{self.layer_idx}.input_layernorm"):
-            if residual is None:
+        # Layer-0 prologue only. For every subsequent layer the input_layernorm
+        # (an add+RMSNorm at the layer boundary) was already applied by the
+        # previous layer as its next_layer_layernorm, so residual is not None
+        # here and this block is skipped (matches DeepSeek-V3).
+        if residual is None:
+            with nvtx_range_debug(f"layer{self.layer_idx}.input_layernorm"):
                 residual = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
+        # When PRE fusion is active the attention defers its o_proj AllReduce so
+        # it can be fused into post_attention_layernorm below; otherwise the
+        # o_proj reduces as usual (all_reduce_params=None preserves the
+        # single-GPU, attention-DP, and fusion-disabled behavior exactly).
+        attn_all_reduce_params = (
+            AllReduceParams(enable_allreduce=False) if self.pre_feed_forward_fusion else None
+        )
         with nvtx_range_debug(f"layer{self.layer_idx}.{attn_kind}"):
             hidden_states = self.self_attn(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
+                all_reduce_params=attn_all_reduce_params,
                 **kwargs,
             )
 
-        with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
-            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.block_sparse_moe is not None:
+            hidden_states, residual = self.forward_MoE(hidden_states, attn_metadata, residual)
+        else:
+            hidden_states, residual = self.forward_mlp(hidden_states, residual)
 
-        with nvtx_range_debug(f"layer{self.layer_idx}.{ffn_kind}"):
-            if self.block_sparse_moe is not None:
-                hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
-            else:
-                hidden_states = self.mlp(hidden_states)
         # hidden_states is fully TP-reduced at layer exit (no cross-layer
         # allreduce+norm fusion).
         if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, residual)
+
+        return hidden_states, residual
+
+    def _apply_pre_feed_forward_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """AllReduce(+residual+RMSNorm) between attention and the feed-forward.
+
+        On the PRE-fusion path the deferred attention o_proj AllReduce is fused
+        with post_attention_layernorm into one kernel; otherwise it is the plain
+        add+RMSNorm and the attention already reduced its own output.
+        """
+        if self.pre_feed_forward_fusion:
+            return self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+        return self.post_attention_layernorm(hidden_states, residual)
+
+    def _apply_next_layer_layernorm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply the next layer's input_layernorm at the layer boundary.
+
+        On the POST-fusion path the deferred feed-forward output AllReduce is
+        fused with next_layer_layernorm (the next layer's input_layernorm, or
+        the final model norm for the last layer). Off the fusion path it is the
+        plain add+RMSNorm. When next_layer_layernorm has not been wired (e.g. a
+        standalone unit test that never ran setup_aliases) the
+        (hidden_states, residual) pair is returned unchanged so the model can
+        apply the final norm itself.
+        """
+        if self.next_layer_layernorm is None:
+            return hidden_states, residual
+        if self.post_feed_forward_fusion:
+            return self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    trigger_completion_at_end=False,
+                ),
+            )
+        return self.next_layer_layernorm(hidden_states, residual)
+
+    def _feed_forward_all_reduce_params(self) -> Optional[AllReduceParams]:
+        """AllReduce params handed to the MoE or dense-MLP output projection.
+
+        Disables the module's internal output AllReduce when POST fusion will
+        fold it into next_layer_layernorm; otherwise None preserves the module's
+        own reduction (single-GPU, attention-DP, fusion-disabled).
+        """
+        if self.post_feed_forward_fusion:
+            return AllReduceParams(enable_allreduce=False)
+        return None
+
+    def forward_MoE(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
+            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+
+        with nvtx_range_debug(f"layer{self.layer_idx}.moe"):
+            hidden_states = self.block_sparse_moe(
+                hidden_states,
+                attn_metadata,
+                final_all_reduce_params=self._feed_forward_all_reduce_params(),
+            )
+
+        with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):
+            hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    def forward_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
+            hidden_states, residual = self._apply_pre_feed_forward_norm(hidden_states, residual)
+
+        with nvtx_range_debug(f"layer{self.layer_idx}.mlp"):
+            hidden_states = self.mlp(
+                hidden_states,
+                final_all_reduce_params=self._feed_forward_all_reduce_params(),
+            )
+
+        with nvtx_range_debug(f"layer{self.layer_idx}.next_layer_layernorm"):
+            hidden_states, residual = self._apply_next_layer_layernorm(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1692,11 +1863,17 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # Final norm is a plain (non-Gemma) RMSNorm for the same reason as the
+        # layer-boundary norms (see MiniMaxM3DecoderLayer.__init__): it doubles
+        # as the last layer's next_layer_layernorm, so the last MoE/MLP output
+        # AllReduce folds into it via RESIDUAL_RMS_NORM. The Gemma (1 + weight)
+        # offset is folded into the stored weight at load time (see
+        # _fold_gemma_boundary_norm_weights).
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
             eps=config.rms_norm_eps,
             dtype=config.torch_dtype,
-            use_gemma=bool(getattr(config, "use_gemma_norm", False)),
+            use_gemma=False,
         )
 
     def forward(
@@ -1728,7 +1905,15 @@ class MiniMaxM3Model(DecoderModel):
                     spec_metadata=spec_metadata,
                 )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # When setup_aliases has chained the final norm into the last decoder
+        # layer (next_layer_layernorm = self.norm), the last layer's boundary
+        # step already applied it (fused or plain), so hidden_states is normed
+        # and this is skipped. The fallback covers paths that never ran
+        # setup_aliases (e.g. standalone unit tests): there the last layer
+        # returns the unnormed (hidden_states, residual) pair and the final
+        # add+RMSNorm is applied here.
+        if self.layers[-1].next_layer_layernorm is None:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -1774,6 +1959,43 @@ def _load_index_qk_proj_weights(model: nn.Module, weights) -> None:
                     del weights[key]
 
 
+# Layer-boundary RMSNorms whose Gemma (1 + weight) scaling is folded into the
+# stored weight at load time so the runtime norm is a plain RMSNorm (see
+# MiniMaxM3DecoderLayer.__init__ / MiniMaxM3Model.__init__). These are exactly
+# the norms that drive the DeepSeek-V3-style fused AllReduce+residual+RMSNorm
+# epilogue, whose kernel has no Gemma offset. The per-head q/k/index norms are
+# intentionally excluded: they feed the separate fused_qk_norm_rope kernel,
+# which handles Gemma directly and stays use_gemma=True.
+_M3_BOUNDARY_NORM_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+)
+_M3_FINAL_NORM_KEY = "model.norm.weight"
+
+
+def _fold_gemma_boundary_norm_weights(weights):
+    """Fold Gemma (1 + weight) into the layer-boundary RMSNorm weights.
+
+    MiniMax-M3 stores every RMSNorm as a Gemma norm (use_gemma_norm=True), which
+    computes (1 + weight) * x. The layer-boundary norms are constructed as plain
+    norms (use_gemma=False, weight * x) so they can drive the fused
+    AllReduce+RMSNorm kernels, so their stored weights must be pre-incremented by
+    1.0. This is a numerically exact, load-time-only rewrite; the resulting norm
+    is identical to the original Gemma norm on every path.
+
+    Only the decoder input_layernorm / post_attention_layernorm and the final
+    model.norm are touched. A no-op for keys that are absent (partial load) so it
+    is safe to call unconditionally, but it must only run when the checkpoint
+    actually uses Gemma norms (guarded by the caller).
+    """
+    for key in list(weights.keys()):
+        if key.endswith(_M3_BOUNDARY_NORM_SUFFIXES) or key == _M3_FINAL_NORM_KEY:
+            w = weights[key]
+            w = w[:] if hasattr(w, "__getitem__") else w
+            weights[key] = w + 1.0
+    return weights
+
+
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
@@ -1788,12 +2010,34 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         # Fuse index_q/index_k into each index_qk_proj module (also covers
         # the VL path, which routes text weights through here).
         _load_index_qk_proj_weights(self, weights)
+        # Fold Gemma (1 + weight) into the layer-boundary RMSNorm weights so the
+        # runtime norms can be plain (non-Gemma) and drive the fused
+        # AllReduce+residual+RMSNorm epilogue. Only when the checkpoint actually
+        # stores Gemma norms; otherwise the boundary norms are already plain.
+        if bool(getattr(self.config, "use_gemma_norm", False)):
+            weights = _fold_gemma_boundary_norm_weights(weights)
         # Merge the M3-specific gate-bias rename into any caller-
         # supplied ``params_map`` so the VL wrapper and any downstream
         # tooling that already passes one keep working.
         params_map = kwargs.pop("params_map", None) or {}
         merged = {**_M3_GATE_BIAS_RENAME_MAP, **params_map}
         return super().load_weights(weights, *args, params_map=merged, **kwargs)
+
+    def setup_aliases(self) -> None:
+        """Chain each decoder layer's next_layer_layernorm for POST fusion.
+
+        Wired after weight load (the generic loader skips next_layer_layernorm
+        aliases). Each layer's MoE/MLP output AllReduce is fused into the next
+        layer's input_layernorm; the last layer chains the final model norm so
+        its output AllReduce folds the final normalization too.
+        """
+        layers = self.model.layers
+        num_layers = len(layers)
+        for idx, layer in enumerate(layers):
+            if idx == num_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = layers[idx + 1].input_layernorm
 
 
 def _strip_language_model_prefix(
