@@ -1881,3 +1881,49 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
         env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the distilled T2I checkpoint through the recommended invocation.
+
+    Validates the documented deployment for ``Cosmos3-Super-Text2Image-4Step``:
+    the example script with ``configs/cosmos3-t2i-1gpu.yaml`` (T2I warmup
+    shapes) and ``--output_type image``. Steps/guidance come from the
+    checkpoint's fixed distilled schedule; the run must produce an image.
+    """
+    model_path = _lpips_model_path("Cosmos3-Super-Text2Image-4Step")
+    _skip_if_missing(model_path, "Cosmos3-Super-Text2Image-4Step checkpoint", is_dir=True)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_t2i_4step_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "cosmos3_t2i_4step_output.png")
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "cosmos3-t2i-1gpu.yaml"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--prompt",
+            "A ceramic teapot pouring steaming tea into a cup, morning window light",
+            "--output_type",
+            "image",
+            "--output_path",
+            output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
