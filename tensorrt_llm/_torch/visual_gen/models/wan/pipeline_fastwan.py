@@ -93,9 +93,7 @@ class WanDMDPipeline(WanPipeline):
                 f"ignoring num_inference_steps={num_inference_steps}."
             )
         if guidance_scale not in (None, 1.0):
-            logger.warning(
-                f"FastWan is CFG-free; ignoring guidance_scale={guidance_scale}."
-            )
+            logger.warning(f"FastWan is CFG-free; ignoring guidance_scale={guidance_scale}.")
         if guidance_scale_2 is not None:
             logger.warning(
                 f"FastWan does not support guidance_scale_2; ignoring guidance_scale_2={guidance_scale_2}."
@@ -140,7 +138,9 @@ class WanDMDPipeline(WanPipeline):
         return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
 
     @nvtx_range("WanDMDPipeline._denoise", color="blue")
-    def _denoise(self, latents: torch.Tensor, prompt_embeds: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    def _denoise(
+        self, latents: torch.Tensor, prompt_embeds: torch.Tensor, generator: torch.Generator
+    ) -> torch.Tensor:
         """3-step DMD loop: predict x0, then re-noise with fresh noise.
 
         The per-step sigma reduces to ``sigma = t / NUM_TRAIN_TIMESTEPS`` because
