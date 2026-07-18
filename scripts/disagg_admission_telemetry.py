@@ -44,6 +44,7 @@ class DiagnosticEvent:
     time_s: float
     rank: str
     fields: dict[str, str]
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,7 +159,15 @@ def read_diagnostic_events(paths: Iterable[str | Path]) -> list[DiagnosticEvent]
                 for line in log_file:
                     event = parse_diagnostic_line(line)
                     if event is not None:
-                        events.append(event)
+                        events.append(
+                            DiagnosticEvent(
+                                event.category,
+                                event.time_s,
+                                event.rank,
+                                event.fields,
+                                str(path_like),
+                            )
+                        )
         except OSError:
             continue
     return events
@@ -178,11 +187,17 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
     Returns:
         A JSON-serializable analysis dictionary.
     """
-    sorted_events = sorted(events, key=lambda event: (event.rank, event.time_s))
+    sorted_events = sorted(
+        events,
+        key=lambda event: (event.source or "", event.rank, event.time_s),
+    )
+    sources = {event.source for event in sorted_events if event.source is not None}
+    namespace_by_source = len(sources) > 1
     category_counts = Counter(event.category for event in sorted_events)
     events_by_rank: dict[str, list[DiagnosticEvent]] = defaultdict(list)
     for event in sorted_events:
-        events_by_rank[event.rank].append(event)
+        rank_key = f"{event.source}::rank={event.rank}" if namespace_by_source else event.rank
+        events_by_rank[rank_key].append(event)
 
     global_blocks = _collect_global_request_blocks(sorted_events)
     ranks: dict[str, object] = {}
@@ -195,6 +210,9 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
     aggregate_poll_durations_ms: list[float] = []
     aggregate_progress_poll_durations_ms: list[float] = []
     aggregate_no_progress_poll_durations_ms: list[float] = []
+    aggregate_reported_ready_to_reap_ms: list[float] = []
+    aggregate_physical_release_to_reap_s: list[float] = []
+    aggregate_invalid_ready_to_reap_samples = 0
     aggregate_busy_s = 0.0
     aggregate_completed_blocks = 0.0
 
@@ -234,6 +252,17 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
             aggregate_progress_poll_durations_ms.extend(status_poll["progress_duration_samples_ms"])
             aggregate_no_progress_poll_durations_ms.extend(
                 status_poll["no_progress_duration_samples_ms"]
+            )
+        scheduler_visibility = rank_analysis["scheduler_visibility"]
+        if isinstance(scheduler_visibility, dict):
+            aggregate_reported_ready_to_reap_ms.extend(
+                scheduler_visibility["reported_ready_to_reap_samples_ms"]
+            )
+            aggregate_physical_release_to_reap_s.extend(
+                scheduler_visibility["physical_release_to_reap_samples_s"]
+            )
+            aggregate_invalid_ready_to_reap_samples += int(
+                scheduler_visibility["invalid_reported_ready_to_reap_samples"]
             )
 
     aggregate_throughput = _safe_ratio(aggregate_completed_blocks, aggregate_busy_s)
@@ -287,6 +316,7 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
 
     return {
         "schema_version": 1,
+        "rank_namespace": "source-path::rank" if namespace_by_source else "rank",
         "parsed_event_count": len(sorted_events),
         "event_counts": dict(sorted(category_counts.items())),
         "ranks": ranks,
@@ -313,6 +343,11 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
                 "progress_duration_ms": _summary(aggregate_progress_poll_durations_ms),
                 "no_progress_duration_ms": _summary(aggregate_no_progress_poll_durations_ms),
             },
+            "scheduler_visibility": {
+                "reported_ready_to_reap_ms": _summary(aggregate_reported_ready_to_reap_ms),
+                "physical_release_to_reap_s": _summary(aggregate_physical_release_to_reap_s),
+                "invalid_reported_ready_to_reap_samples": (aggregate_invalid_ready_to_reap_samples),
+            },
         },
         "model": {
             "shadow_multiplier": "1 + throughput_blocks_per_s * refill_gap_s / budget_blocks",
@@ -333,8 +368,22 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
 
 
 def analyze_log_paths(paths: Iterable[str | Path]) -> dict[str, object]:
-    """Read and analyze diagnostic log paths."""
-    return analyze_events(read_diagnostic_events(paths))
+    """Analyze logs without merging overlapping rank IDs across inputs."""
+    path_list = list(paths)
+    events = read_diagnostic_events(path_list)
+    result = analyze_events(events)
+    if len(path_list) > 1:
+        source_aggregates: dict[str, object] = {}
+        for path_like in path_list:
+            source = str(path_like)
+            source_result = analyze_events(event for event in events if event.source == source)
+            source_aggregates[source] = {
+                "parsed_event_count": source_result["parsed_event_count"],
+                "event_counts": source_result["event_counts"],
+                "aggregate": source_result["aggregate"],
+            }
+        result["source_aggregates"] = source_aggregates
+    return result
 
 
 def _analyze_rank(
@@ -411,6 +460,11 @@ def _analyze_rank(
     progress_samples = _linear_progress_credit(admissions, service_intervals)
     fixed_multiplier_samples = _fixed_multiplier_counterfactual(admissions)
     ready_to_reap_samples = _point_pair_gaps(local_ready, reaps)
+    physical_release_to_reap_samples = _point_pair_gaps(
+        [PointEvent(interval.end_s, interval.request) for interval in physical_service_intervals],
+        reaps,
+    )
+    reported_ready_to_reap_samples = _reported_ready_to_reap_samples(events, unsuccessful_requests)
     submit_to_service_start_samples = _submit_to_service_start_gaps(submits, local_ready)
     status_poll_samples = _status_poll_samples(events)
     progress_poll_durations = [
@@ -474,6 +528,25 @@ def _analyze_rank(
             ),
             "progress_duration_ms": _summary(progress_poll_durations),
             "no_progress_duration_ms": _summary(no_progress_poll_durations),
+        },
+        "scheduler_visibility": {
+            "reported_ready_to_reap_samples_ms": [
+                float(sample["duration_ms"]) for sample in reported_ready_to_reap_samples
+            ],
+            "reported_ready_to_reap_ms": _summary(
+                [float(sample["duration_ms"]) for sample in reported_ready_to_reap_samples]
+            ),
+            "reported_ready_to_reap_samples": reported_ready_to_reap_samples,
+            "invalid_reported_ready_to_reap_samples": (
+                _invalid_reported_ready_to_reap_sample_count(events, unsuccessful_requests)
+            ),
+            "physical_release_to_reap_samples_s": [
+                float(sample["gap_s"]) for sample in physical_release_to_reap_samples
+            ],
+            "physical_release_to_reap_s": _summary(
+                [float(sample["gap_s"]) for sample in physical_release_to_reap_samples]
+            ),
+            "physical_release_to_reap_pairs": physical_release_to_reap_samples,
         },
         "receiver_slots": {
             "submit_to_service_start_samples_s": [
@@ -827,6 +900,48 @@ def _status_poll_samples(events: list[DiagnosticEvent]) -> list[dict[str, object
             }
         )
     return samples
+
+
+def _reported_ready_to_reap_samples(
+    events: list[DiagnosticEvent], excluded_requests: set[str]
+) -> list[dict[str, object]]:
+    """Collect scheduler-visible delay reported by completed reap events."""
+    samples: list[dict[str, object]] = []
+    for event in events:
+        if event.category != "reap" or _event_outcome(event) is False:
+            continue
+        request = event.fields.get("request")
+        duration_ms = _as_float(event.fields.get("ready_to_reap_ms"))
+        if (
+            request is None
+            or request in excluded_requests
+            or duration_ms is None
+            or duration_ms < 0.0
+        ):
+            continue
+        samples.append(
+            {
+                "t": event.time_s,
+                "request": request,
+                "duration_ms": duration_ms,
+            }
+        )
+    return samples
+
+
+def _invalid_reported_ready_to_reap_sample_count(
+    events: list[DiagnosticEvent], excluded_requests: set[str]
+) -> int:
+    """Count negative or unavailable delays excluded from the summary."""
+    return sum(
+        1
+        for event in events
+        if event.category == "reap"
+        and _event_outcome(event) is not False
+        and event.fields.get("request") not in excluded_requests
+        and (duration_ms := _as_float(event.fields.get("ready_to_reap_ms"))) is not None
+        and duration_ms < 0.0
+    )
 
 
 def _match_slot_intervals(

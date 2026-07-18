@@ -71,7 +71,8 @@ def test_python_transfer_analysis_derives_refill_multiplier_and_progress_credit(
             "deferred_requests=2:10 budget=10 sequence=2",
             "[DISAGG_DIAG][python-transfer] t=1.1 rank=0 action=local-ready request=1 "
             "bytes=4096 service_start_t=0.3 outcome=completed",
-            "[DISAGG_DIAG][reap] t=1.2 rank=0 request=1 blocks=10 ready_t=1.1 outcome=completed",
+            "[DISAGG_DIAG][reap] t=1.2 rank=0 request=1 blocks=10 ready_t=1.1 "
+            "ready_to_reap_ms=100 outcome=completed",
             "[DISAGG_DIAG][decision] t=1.25 rank=0 sequence=3 runtime=Python "
             "active_blocks=10 candidates=1 candidate_blocks=10 admitted=0 "
             "admitted_blocks=0 deferred=1 deferred_blocks=10 budget=10",
@@ -85,7 +86,8 @@ def test_python_transfer_analysis_derives_refill_multiplier_and_progress_credit(
             "submit_start_t=1.35 submit_call_ms=50",
             "[DISAGG_DIAG][python-transfer] t=2.4 rank=0 action=local-ready request=2 "
             "bytes=4096 service_start_t=1.6 outcome=completed",
-            "[DISAGG_DIAG][reap] t=2.5 rank=0 request=2 blocks=10 ready_t=2.4 outcome=completed",
+            "[DISAGG_DIAG][reap] t=2.5 rank=0 request=2 blocks=10 ready_t=2.4 "
+            "ready_to_reap_ms=-1 outcome=completed",
             "[DISAGG_DIAG][status-poll] t=2.6 rank=0 poll_start_t=2.598 "
             "poll_call_ms=2.0 at_least_num=1 tracked=1 completed=0 failed=0 "
             "cancelled=0",
@@ -101,6 +103,7 @@ def test_python_transfer_analysis_derives_refill_multiplier_and_progress_credit(
     service = rank["service"]
     python_transfer = rank["python_transfer"]
     status_poll = rank["status_poll"]
+    visibility = rank["scheduler_visibility"]
     release = rank["release_to_admission"]
     progress = rank["linear_progress_credit"]
     counterfactual = rank["fixed_multiplier_counterfactual"]
@@ -114,6 +117,8 @@ def test_python_transfer_analysis_derives_refill_multiplier_and_progress_credit(
     assert python_transfer["ready_to_reap_s"]["p50"] == pytest.approx(0.1)
     assert status_poll["no_progress_duration_ms"]["p50"] == pytest.approx(2.0)
     assert status_poll["progress_duration_ms"]["p50"] == pytest.approx(0.5)
+    assert visibility["reported_ready_to_reap_ms"]["p50"] == pytest.approx(100.0)
+    assert visibility["invalid_reported_ready_to_reap_samples"] == 1
     assert result["aggregate"]["status_poll"]["no_progress_duration_ms"]["p50"] == pytest.approx(
         2.0
     )
@@ -151,6 +156,8 @@ def test_receiver_slot_analysis_matches_reuse_and_backlog_refill_gap():
             "manager=0xabc buffer=7",
             "[DISAGG_DIAG][receiver-slot] t=0.6 rank=2 action=released request=11 "
             "manager=0xdef buffer=9",
+            "[DISAGG_DIAG][reap] t=0.65 rank=2 request=11 blocks=4 "
+            "ready_to_reap_ms=25 outcome=completed",
             "[DISAGG_DIAG][admission] t=0.7 rank=2 active_blocks=0 "
             "candidate_requests=12:4 admitted=1 admitted_requests=12:4 deferred=0 "
             "deferred_requests=- budget=4",
@@ -164,6 +171,8 @@ def test_receiver_slot_analysis_matches_reuse_and_backlog_refill_gap():
             "manager=0xabc buffer=7",
             "[DISAGG_DIAG][receiver-slot] t=1.3 rank=2 action=released request=12 "
             "manager=0xdef buffer=9",
+            "[DISAGG_DIAG][reap] t=1.35 rank=2 request=12 blocks=4 "
+            "ready_to_reap_ms=35 outcome=completed",
             "[DISAGG_DIAG][python-transfer] t=1.5 rank=2 action=local-ready request=12 bytes=4096",
             "[DISAGG_DIAG][receiver-slot] t=1.4 rank=2 action=released request=999 "
             "manager=0xmissing buffer=3",
@@ -175,6 +184,7 @@ def test_receiver_slot_analysis_matches_reuse_and_backlog_refill_gap():
     slots = rank["receiver_slots"]
     service = rank["service"]
     release = rank["release_to_admission"]
+    visibility = rank["scheduler_visibility"]
 
     assert release["selected_release_source"] == "receiver-slot"
     assert slots["service_latency_s"]["count"] == 4
@@ -191,6 +201,11 @@ def test_receiver_slot_analysis_matches_reuse_and_backlog_refill_gap():
     assert release["selected_decision_gap_s"]["p50"] == pytest.approx(0.1)
     assert release["selected_refill_gap_s"]["p50"] == pytest.approx(0.15)
     assert release["selected_samples"][0]["release_t"] == pytest.approx(0.6)
+    assert visibility["reported_ready_to_reap_ms"]["p50"] == pytest.approx(30.0)
+    assert visibility["physical_release_to_reap_s"]["p50"] == pytest.approx(0.05)
+    assert result["aggregate"]["scheduler_visibility"]["reported_ready_to_reap_ms"][
+        "p50"
+    ] == pytest.approx(30.0)
 
 
 def test_reap_release_uses_first_decision_then_matching_deferred_refill():
@@ -296,3 +311,27 @@ def test_cli_reads_log_paths_and_prints_json(tmp_path, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["parsed_event_count"] == 1
     assert output["event_counts"] == {"submit": 1}
+
+
+def test_cli_namespaces_overlapping_ranks_from_distinct_logs(tmp_path, capsys):
+    ctx_log = tmp_path / "ctx.log"
+    gen_log = tmp_path / "gen.log"
+    ctx_log.write_text(
+        "[DISAGG_DIAG][status-poll] t=1.0 rank=0 poll_call_ms=5 completed=0 failed=0 cancelled=0\n",
+        encoding="utf-8",
+    )
+    gen_log.write_text(
+        "[DISAGG_DIAG][submit] t=2.0 rank=0 request=5 blocks=2\n",
+        encoding="utf-8",
+    )
+
+    assert main([str(ctx_log), str(gen_log), "--indent", "0"]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["rank_namespace"] == "source-path::rank"
+    assert sorted(output["ranks"]) == [
+        f"{ctx_log}::rank=0",
+        f"{gen_log}::rank=0",
+    ]
+    assert output["source_aggregates"][str(ctx_log)]["event_counts"] == {"status-poll": 1}
+    assert output["source_aggregates"][str(gen_log)]["event_counts"] == {"submit": 1}

@@ -6380,9 +6380,6 @@ class PyExecutor:
         if tracked_requests:
             reap_time = poll_end
             controller = self._get_disagg_transfer_admission_controller()
-            offset = LlmRequest.global_steady_clock_offset
-            offset_seconds = (offset.total_seconds()
-                              if offset is not None else 0.0)
             for request in tracked_requests:
                 if request.is_disagg_generation_transmission_in_progress:
                     continue
@@ -6397,13 +6394,19 @@ class PyExecutor:
                     outcome = "cancelled"
                 ready_time = getattr(request, "py_kv_transfer_ready_time_s",
                                      0.0)
+                ready_time_source = "python-local"
                 if not ready_time:
                     transfer_end = getattr(request, "kv_cache_transfer_end",
                                            None)
                     if transfer_end is not None:
-                        ready_time = max(
-                            0.0,
-                            transfer_end.total_seconds() - offset_seconds)
+                        # This delay is measured entirely inside the local
+                        # executor process. Applying the cross-rank clock
+                        # offset would move the C++ timestamp into rank 0's
+                        # domain and make it incomparable with reap_time.
+                        ready_time = max(0.0, transfer_end.total_seconds())
+                        ready_time_source = "cpp-local"
+                    else:
+                        ready_time_source = "unavailable"
                 ready_to_reap_ms = (-1.0 if not ready_time else
                                     (reap_time - ready_time) * 1000)
                 self._log_disagg_transfer_diagnostic(
@@ -6415,6 +6418,7 @@ class PyExecutor:
                     bytes=getattr(request, "py_kv_cache_xfer_bytes",
                                   getattr(request, "kv_cache_size", 0)),
                     ready_t=f"{ready_time:.9f}",
+                    ready_time_source=ready_time_source,
                     ready_to_reap_ms=f"{ready_to_reap_ms:.6f}",
                     poll_call_ms=f"{(poll_end - poll_start) * 1000:.6f}",
                     outcome=outcome,

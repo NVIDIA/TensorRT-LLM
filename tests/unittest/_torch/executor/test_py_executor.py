@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -693,7 +692,20 @@ class TestDisaggTransferIdleProgress:
         assert "bytes=4096" in message
         assert "submit_call_ms=2.000000" in message
 
-    def test_transfer_status_emits_ready_to_reap_delay(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("python_ready_time", "cpp_ready_time", "ready_time_source"),
+        [
+            (9.5, None, "python-local"),
+            (0.0, 9.5, "cpp-local"),
+        ],
+    )
+    def test_transfer_status_emits_ready_to_reap_delay(
+        self,
+        monkeypatch,
+        python_ready_time,
+        cpp_ready_time,
+        ready_time_source,
+    ):
         monkeypatch.setenv("TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS", "1")
         monkeypatch.setattr(py_executor_module, "_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED", True)
         log_info = Mock()
@@ -712,7 +724,12 @@ class TestDisaggTransferIdleProgress:
         executor.canceled_req_ids = []
         request = _make_disagg_transfer_request(8, 32, in_progress=True)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        request.py_kv_transfer_ready_time_s = 9.5
+        request.py_kv_transfer_ready_time_s = python_ready_time
+        request.kv_cache_transfer_end = (
+            None
+            if cpp_ready_time is None
+            else Mock(total_seconds=Mock(return_value=cpp_ready_time))
+        )
         request.py_kv_cache_xfer_bytes = 2048
         executor.active_requests = [request]
         executor.kv_cache_transceiver = Mock()
@@ -730,6 +747,7 @@ class TestDisaggTransferIdleProgress:
         assert "[DISAGG_DIAG][reap]" in message
         assert "request=8" in message
         assert "ready_t=9.500000000" in message
+        assert f"ready_time_source={ready_time_source}" in message
         assert "ready_to_reap_ms=600.000000" in message
         assert "poll_call_ms=100.000000" in message
         assert "outcome=completed" in message
