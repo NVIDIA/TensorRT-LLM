@@ -14,6 +14,9 @@
 # limitations under the License.
 import os
 import platform
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -70,6 +73,23 @@ def get_version():
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
 
+    # For develop / editable installs (`pip install -e .` or
+    # `python setup.py develop`), append the git commit hash as a PEP 440
+    # local version segment so the installed package is identifiable,
+    # e.g. "1.3.0rc21+58d8964d13".
+    is_develop = any(arg in sys.argv for arg in ("develop", "editable_wheel"))
+    if is_develop:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=10", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            commit = ""
+        commit = re.sub(r"[^A-Za-z0-9.]", "", commit)
+        if commit:
+            version = f"{version}+{commit}"
+
     return version
 
 
@@ -109,6 +129,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+mx_deps = ["modelexpress==0.4.1"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -446,10 +467,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        # MX remains prototype-only and is intentionally not declared as an
-        # optional package extra until its external dependency completes OSS
-        # allowlist onboarding. Keep install instructions in docs/PR text
-        # rather than packaging metadata.
+        "mx": mx_deps,
     },
     zip_safe=True,
     install_requires=required_deps,

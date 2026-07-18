@@ -111,6 +111,10 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
         return False
+    # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
+    # model does not read the paged draft KV cache managed by attention metadata.
+    if spec_config.spec_dec_mode.is_dspark():
+        return False
     return spec_config._allow_separate_draft_kv_cache
 
 
@@ -276,6 +280,7 @@ class SpeculativeDecodingMode(IntEnum):
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
     DFLASH = auto()
+    DSPARK = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -310,8 +315,11 @@ class SpeculativeDecodingMode(IntEnum):
     def is_dflash(self):
         return self == SpeculativeDecodingMode.DFLASH
 
+    def is_dspark(self):
+        return self == SpeculativeDecodingMode.DSPARK
+
     def is_parallel_draft(self):
-        return self.is_pard() or self.is_dflash()
+        return self.is_pard() or self.is_dflash() or self.is_dspark()
 
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
@@ -476,6 +484,11 @@ class SpecMetadata:
 
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
+    # The number of generation requests for the speculative model/layer of each
+    # rank (num_seqs - num_contexts). Used by external drafters (e.g. DSpark)
+    # whose draft forward processes only generation requests and must size a
+    # FUSED_COMM MoE (DeepGEMM MegaMoE) chunk loop identically across EP ranks.
+    all_rank_num_gens: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
@@ -1378,12 +1391,15 @@ class SpecWorkerBase(nn.Module, ABC):
         (see ``_draft_logits_are_sharded``); replicated full-vocab logits are
         returned unchanged.
 
-        Plain TP gathers vocab shards over ``self.mapping``. Under ADP + LM-head
-        TP the worker has already trimmed the LM-head-TP padding rows so each rank
-        holds ``[token_count, vocab_shard]`` for its own tokens; a vocab-dim
-        all-gather over ``mapping_lm_head_tp`` restores full vocab (no token
-        re-slice is needed after the trim).
+        Plain TP gathers vocab shards over ``self.mapping``. ADP + LM-head TP
+        never reaches this path: rejection sampling (the only consumer of
+        advanced draft sampling) is config-gated off under attention DP, and
+        the group-stacked sharded logits it produces are handled by the greedy
+        path in ``greedy_sample_draft_with_tp_gather``.
         """
+        assert mapping_lm_head_tp is None, (
+            "Advanced draft sampling is not supported under ADP + LM-head TP "
+            "(rejection sampling is config-gated off with attention DP)")
         if (spec_metadata is None or spec_metadata.is_all_greedy_sample
                 or not self._draft_logits_are_sharded(logits, spec_metadata)):
             return logits
@@ -1750,7 +1766,26 @@ class SpecWorkerBase(nn.Module, ABC):
         vocab-sharded (see ``_draft_logits_are_sharded``) -- e.g. a borrowed or
         gathered full-vocab draft head. Returns tokens in draft-vocab space (the
         caller applies d2t). Expects 2D ``[num_tokens, vocab_shard]`` logits.
+
+        Under ADP + LM-head TP (``mapping_lm_head_tp`` given) the logits are the
+        LM-head-TP group's row-stacked batch (``tp_size`` segments of
+        ``max_num_requests`` padded rows, all-gathered along dim 0 by the MTP
+        shared head) with the vocab sharded across the group. The global argmax
+        must combine the group's vocab shards, and each rank must read its own
+        row segment at offset ``tp_rank * max_num_requests`` -- NOT rows
+        ``[:batch]``, which belong to group rank 0.
         """
+        if (mapping_lm_head_tp is not None
+                and getattr(mapping_lm_head_tp, "tp_size", 1) > 1):
+            from ..distributed.ops import allgather
+            combined = self._get_local_max_and_combined(logits,
+                                                        mapping_lm_head_tp)
+            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+            group_size = mapping_lm_head_tp.tp_size
+            local_rows = logits.shape[0] // group_size
+            own_segment = gathered.view(group_size, local_rows,
+                                        -1)[mapping_lm_head_tp.tp_rank]
+            return self._get_draft_tokens_from_gathered(own_segment)
         mapping = self.mapping
         sharded = self._draft_logits_are_sharded(logits, spec_metadata)
         if (sharded and mapping is not None
@@ -1760,9 +1795,9 @@ class SpecWorkerBase(nn.Module, ABC):
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
             return self._get_draft_tokens_from_gathered(gathered)
-        # No TP gather for attention-DP (incl. ADP + LM-head TP): each rank owns
-        # its own requests, so a per-rank argmax is the correct proposal and a
-        # cross-rank gather here would desync the ranks (see
+        # No cross-rank gather for plain attention-DP: each rank owns its own
+        # requests with replicated full-vocab logits, so a per-rank argmax is
+        # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
         return torch.argmax(logits, dim=-1).type(torch.int32)
 
@@ -1908,7 +1943,12 @@ class SpecWorkerBase(nn.Module, ABC):
             tokens = self.greedy_sample_draft_with_tp_gather(
                 logits.reshape(-1, logits.shape[-1]), spec_metadata,
                 mapping_lm_head_tp)
-            tokens = tokens.reshape(batch_shape)
+            if mapping_lm_head_tp is None:
+                tokens = tokens.reshape(batch_shape)
+            # else: ADP+LM-head-TP (2D step form only) -- the sampler returned
+            # this rank's own row segment, 1/tp_size of the stacked input rows,
+            # so the input batch shape no longer applies. Keep as-is; the
+            # caller trims the max_num_requests padding to token_count.
         else:
             # Advanced sampling gathers the vocab-sharded draft logits to full
             # vocab, then samples (scattering this step's proposal distribution
