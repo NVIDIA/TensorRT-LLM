@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 from typing import Mapping as TMapping
 
@@ -245,11 +244,18 @@ def _build_swiglu_oai_dense_mlp(
     # MoE composition) carries its own reduction unless ADP collapses
     # TP to 1.
     reduce_output = False if is_shared_expert else (not enable_adp)
+    # SwiGLU-OAI is plain SwiGLU with an alpha gain and (up + 1) offset, so it
+    # routes through the fused silu_and_mul kernel (one launch, optional fp8
+    # epilogue) instead of the eager elementwise fallback. Mirrors the
+    # routed-expert SwigluBias path. See _minimax_m3_swiglu_oai for the math.
     return GatedMLP(
         hidden_size=config.hidden_size,
         intermediate_size=intermediate_size,
         bias=False,
-        activation=partial(_minimax_m3_swiglu_oai, alpha=swiglu_alpha, limit=swiglu_limit),
+        activation=torch.nn.functional.silu,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=1.0,
+        swiglu_limit=swiglu_limit,
         dtype=config.torch_dtype,
         config=model_config,
         overridden_tp_size=1 if enable_adp else None,
@@ -628,7 +634,7 @@ def minimax_m3_attn_custom_op_inplace(
     """Run MiniMax-M3 cache and attention work behind a compile boundary."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     num_tokens = attn_metadata.num_tokens
-    attn_layer._attention_core(
+    attn_layer._dispatch_attention_backend(
         q[:num_tokens],
         k[:num_tokens],
         v[:num_tokens],
@@ -913,7 +919,7 @@ class MiniMaxM3Attention(Attention):
         o = self._forward_attention_core(q, k, v, None, None, attn_metadata)
         return self.o_proj(o)
 
-    def _dense_attention_core(
+    def _sdpa_dense_attention_core(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -921,7 +927,14 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run dense cache updates and attention into ``output``."""
+        """Run dense cache updates and attention into ``output`` (SDPA path).
+
+        This is the non-MSA dense reference path: it runs standard GQA via
+        ``torch.nn.functional.scaled_dot_product_attention`` (memory-efficient
+        / math backends). It is selected only when ``self.attn`` is **not** a
+        :class:`MiniMaxM3MsaSparseAttention`; the MSA backend handles dense
+        layers itself inside :meth:`_msa_attention_core`.
+        """
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
@@ -1110,10 +1123,10 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
         return output
 
-    def _attention_core(
+    def _dispatch_attention_backend(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1123,27 +1136,52 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        # The MSA backend runs the sparse GQA or dense paged GQA through its
-        # inherited forward; this layer selects the top-k blocks (sparse only)
-        # and builds the forward_args the FMHA reads.
+        """Route the attention core to the configured backend.
+
+        ``self.attn`` is either a :class:`MiniMaxM3MsaSparseAttention` (MSA
+        backend, which handles both dense and sparse layers) or a
+        :class:`MiniMaxM3SparseRuntimeBackend` (Triton backend). This method
+        only selects the backend-specific core:
+
+        * MSA → :meth:`_msa_attention_core`
+        * Triton sparse → :meth:`_triton_sparse_attention_core`
+        * SDPA dense → :meth:`_sdpa_dense_attention_core`
+        """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
-            if self.is_sparse_attention_layer:
-                assert idx_q is not None and idx_k is not None
-                # Publish the selected blocks so the FMHA runs the sparse path.
-                kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
-                forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
-            else:
-                assert idx_q is None and idx_k is None
-                # No top-k selection means the FMHA attends the full page table.
-                forward_args = AttentionForwardArgs(output=output)
-            self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
-            return output
+            return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        if self.is_sparse_attention_layer:
+            assert idx_q is not None and idx_k is not None
+            return self._triton_sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        assert idx_q is None and idx_k is None
+        return self._sdpa_dense_attention_core(q, k, v, attn_metadata, output)
+
+    def _msa_attention_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the MSA backend (:class:`MiniMaxM3MsaSparseAttention`).
+
+        The MSA backend runs the sparse GQA or dense paged GQA through its
+        inherited FMHA forward; this layer selects the top-k blocks (sparse
+        only) and builds the ``forward_args`` the FMHA reads.
+        """
+        if self.is_sparse_attention_layer:
+            assert idx_q is not None and idx_k is not None
+            # Publish the selected blocks so the FMHA runs the sparse path.
+            kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+            forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
         else:
-            if self.is_sparse_attention_layer:
-                assert idx_q is not None and idx_k is not None
-                return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
             assert idx_q is None and idx_k is None
-            return self._dense_attention_core(q, k, v, attn_metadata, output)
+            # No top-k selection means the FMHA attends the full page table.
+            forward_args = AttentionForwardArgs(output=output)
+        self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
+        return output
 
     def _sparse_forward(
         self,
@@ -1210,7 +1248,7 @@ class MiniMaxM3Attention(Attention):
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
         return self.o_proj(o)
 
-    def _sparse_attention_core(
+    def _triton_sparse_attention_core(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -1220,7 +1258,13 @@ class MiniMaxM3Attention(Attention):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run sparse cache updates and attention into ``output`` (Triton path)."""
+        """Run sparse cache updates and attention into ``output`` (Triton path).
+
+        This is the non-MSA sparse path: it dispatches to
+        :class:`MiniMaxM3SparseRuntimeBackend` (the Triton sparse runtime). It
+        is selected only when ``self.attn`` is that backend; the MSA backend
+        handles sparse layers itself inside :meth:`_msa_attention_core`.
+        """
         kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
         if kv_cache_manager is None:
             raise RuntimeError(
