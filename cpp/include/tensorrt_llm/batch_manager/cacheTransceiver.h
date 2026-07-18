@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -277,6 +278,16 @@ private:
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
+
+    // Default-off, transition-only lifecycle tracing for NVBUG#6448152.
+    int mWorldRank;
+    bool mNvbug6448152TraceEnabled;
+    std::uint64_t mNvbug6448152ContextCheckSequence{0};
+    std::uint64_t mNvbug6448152ContextTpConsensusSequence{0};
+    std::uint64_t mNvbug6448152ContextPpConsensusSequence{0};
+    std::uint64_t mNvbug6448152GenerationCheckSequence{0};
+    std::uint64_t mNvbug6448152ContextEnqueuedTransitionCount{0};
+    std::unordered_set<LlmRequest::RequestIdType> mNvbug6448152SenderWaitTimeoutIds;
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;

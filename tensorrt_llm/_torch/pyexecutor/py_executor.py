@@ -2,6 +2,7 @@ import dataclasses
 import datetime
 import functools
 import os
+import sys
 import threading
 import time
 import traceback
@@ -94,6 +95,33 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+# Diagnostic-only lifecycle tracing for NVBUG 6448152. The targeted CI
+# configuration enables this explicitly; normal execution remains unchanged.
+NVBUG_6448152_TRACE_ENV_VAR_NAME = "TRTLLM_NVBUG_6448152_TRACE"
+NVBUG_6448152_CTX_STATUS_CALL_SOURCES = frozenset({
+    "_pp_retry_until_can_schedule",
+    "_executor_loop",
+    "_executor_loop_pp",
+    "_handle_executed_batch",
+    "_prepare_and_schedule_batch",
+    "_send_kv_async",
+})
+
+
+def _nvbug_6448152_trace_enabled() -> bool:
+    return os.environ.get(NVBUG_6448152_TRACE_ENV_VAR_NAME, "0") == "1"
+
+
+def _nvbug_6448152_ctx_status_call_source() -> str:
+    """Find the executor call site above the NVTX decorator wrapper."""
+    frame = sys._getframe(2)
+    while frame is not None:
+        name = frame.f_code.co_name
+        if name in NVBUG_6448152_CTX_STATUS_CALL_SOURCES:
+            return name
+        frame = frame.f_back
+    return "unknown"
 
 
 class PPCommTag(IntEnum):
@@ -645,6 +673,9 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        self._nvbug_6448152_trace_enabled = _nvbug_6448152_trace_enabled()
+        self._nvbug_6448152_ctx_status_call_sequence = 0
+        self._nvbug_6448152_ctx_status_signatures = set()
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -799,10 +830,29 @@ class PyExecutor:
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
+                if self._nvbug_6448152_trace_enabled:
+                    logger.warning(
+                        "NVBUG6448152_DIAG event=python_global_commit_observed "
+                        "phase=ctx source=_end_transfer_and_maybe_terminate "
+                        f"rank={self.global_rank} pp_rank={self.dist.pp_rank} "
+                        f"iter={self.iter_counter} req={request.py_request_id} "
+                        "inflight="
+                        f"{len(self.async_transfer_manager.requests_in_transfer())}"
+                    )
                 self.active_requests.remove(request)
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
+            if (self._nvbug_6448152_trace_enabled
+                    and request.is_context_only_request):
+                logger.warning(
+                    "NVBUG6448152_DIAG event=python_global_commit_observed "
+                    "phase=ctx source=_end_transfer_and_maybe_terminate "
+                    f"rank={self.global_rank} pp_rank={self.dist.pp_rank} "
+                    f"iter={self.iter_counter} req={request.py_request_id} "
+                    "inflight="
+                    f"{len(self.async_transfer_manager.requests_in_transfer())}"
+                )
             # When should_store_blocks is True, _handle_responses already
             # terminated this request via the early-termination path
             # (enable_partial_reuse_for_disagg branch). Skip the redundant
@@ -4064,6 +4114,16 @@ class PyExecutor:
                     f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
                 )
                 req.py_kv_transfer_timed_out = True
+                if self._nvbug_6448152_trace_enabled:
+                    logger.warning(
+                        "NVBUG6448152_DIAG event=python_timeout_flag "
+                        f"phase={type} source=_check_kv_transfer_timeout "
+                        f"rank={self.global_rank} pp_rank={self.dist.pp_rank} "
+                        f"iter={self.iter_counter} req={req.py_request_id} "
+                        f"active={len(self.active_requests)} "
+                        "inflight="
+                        f"{len(self.async_transfer_manager.requests_in_transfer())}"
+                    )
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
             flag_if_kv_transfer_timed_out(req, "context")
@@ -4419,6 +4479,15 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    if self._nvbug_6448152_trace_enabled:
+                        logger.warning(
+                            "NVBUG6448152_DIAG event=python_transfer_start "
+                            "phase=ctx source=_send_kv_async "
+                            f"rank={self.global_rank} pp_rank={self.dist.pp_rank} "
+                            f"iter={self.iter_counter} req={req.py_request_id} "
+                            "inflight="
+                            f"{len(self.async_transfer_manager.requests_in_transfer())}"
+                        )
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -4454,10 +4523,46 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
+        trace_call = self._nvbug_6448152_trace_enabled
+        call_started_ns = 0
+        call_source = "disabled"
+        call_sequence = 0
+        if trace_call:
+            self._nvbug_6448152_ctx_status_call_sequence += 1
+            call_sequence = self._nvbug_6448152_ctx_status_call_sequence
+            call_source = _nvbug_6448152_ctx_status_call_source()
+            inflight = len(self.async_transfer_manager.requests_in_transfer())
+            call_signature = (call_source, atLeastNum, inflight)
+            periodic_checkpoint = (inflight > 0 and call_sequence % 512 == 0)
+            if (call_signature not in self._nvbug_6448152_ctx_status_signatures
+                    or periodic_checkpoint):
+                logger.warning(
+                    "NVBUG6448152_DIAG event=python_ctx_status_enter "
+                    "phase=ctx "
+                    f"source={call_source} rank={self.global_rank} "
+                    f"pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"call_seq={call_sequence} at_least={atLeastNum} "
+                    f"inflight={inflight} "
+                    f"periodic_checkpoint={int(periodic_checkpoint)}")
+                self._nvbug_6448152_ctx_status_signatures.add(call_signature)
+            call_started_ns = time.monotonic_ns()
+
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
         completed_req_ids = set(finished_requests + error_requests)
+
+        if trace_call:
+            duration_us = (time.monotonic_ns() - call_started_ns) // 1000
+            if completed_req_ids or duration_us >= 1_000_000:
+                logger.warning(
+                    "NVBUG6448152_DIAG event=python_ctx_status_exit "
+                    "phase=ctx "
+                    f"source={call_source} rank={self.global_rank} "
+                    f"pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                    f"call_seq={call_sequence} duration_us={duration_us} "
+                    f"completed={len(finished_requests)} "
+                    f"failed={len(error_requests)}")
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -4808,6 +4913,16 @@ class PyExecutor:
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
         # but the dummy ID is reused every iteration).
+        if self._nvbug_6448152_trace_enabled and request.is_context_only_request:
+            termination_path = (
+                "pp_ring" if self._disagg_pp_termination_handler is not None
+                and not request.is_dummy_request else "immediate")
+            logger.warning(
+                "NVBUG6448152_DIAG event=python_terminate_dispatch "
+                f"phase=ctx source=_terminate_request rank={self.global_rank} "
+                f"pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                f"req={request.py_request_id} path={termination_path}")
+
         if (self._disagg_pp_termination_handler is not None
                 and not request.is_dummy_request):
             self._disagg_pp_termination_handler.terminate(request)
@@ -4815,7 +4930,30 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        trace_context_free = (self._nvbug_6448152_trace_enabled
+                              and request.is_context_only_request)
+        if trace_context_free:
+            logger.warning(
+                "NVBUG6448152_DIAG event=python_resource_free_enter phase=ctx "
+                f"source=_do_terminate_request rank={self.global_rank} "
+                f"pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                f"req={request.py_request_id} "
+                f"timed_out={int(request.py_kv_transfer_timed_out)} "
+                "kv_release_path=resource_manager "
+                "should_store_blocks="
+                f"{int(self.async_transfer_manager.should_store_blocks)}")
         self.resource_manager.free_resources(request)
+        if trace_context_free:
+            logger.warning(
+                "NVBUG6448152_DIAG event=python_resource_free_exit phase=ctx "
+                f"source=_do_terminate_request rank={self.global_rank} "
+                f"pp_rank={self.dist.pp_rank} iter={self.iter_counter} "
+                f"req={request.py_request_id} "
+                "inflight="
+                f"{len(self.async_transfer_manager.requests_in_transfer())} "
+                "kv_release_path=resource_manager "
+                "should_store_blocks="
+                f"{int(self.async_transfer_manager.should_store_blocks)}")
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)

@@ -53,6 +53,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <numeric>
 #include <unordered_map>
@@ -67,6 +68,13 @@ namespace
 {
 
 using RequestIdType = LlmRequest::RequestIdType;
+
+constexpr long long kNvbug6448152SlowConsensusThresholdUs = 1'000'000;
+
+bool isNvbug6448152TraceEnabled()
+{
+    return common::getBoolEnv("TRTLLM_NVBUG_6448152_TRACE");
+}
 
 enum class TransferConsensusState : std::uint64_t
 {
@@ -276,7 +284,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
     rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
-    : mCacheTransceiverConfig{cacheTransceiverConfig}
+    : mWorldRank{worldConfig.getRank()}
+    , mNvbug6448152TraceEnabled{isNvbug6448152TraceEnabled()}
+    , mCacheTransceiverConfig{cacheTransceiverConfig}
     , mRnnStateManager{rnnStateManager}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
@@ -555,6 +565,17 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
+    if (mNvbug6448152TraceEnabled)
+    {
+        mNvbug6448152ContextEnqueuedTransitionCount++;
+        auto const requestId = mSenderFutures.back().first->mRequestId;
+        TLLM_LOG_INFO(
+            "NVBUG6448152_DIAG event=transfer_start side=ctx rank=%d request_id=%llu check_seq=%llu "
+            "future_count=%zu awaiting_count=%zu timeout_count=%zu",
+            mWorldRank, static_cast<unsigned long long>(requestId),
+            static_cast<unsigned long long>(mNvbug6448152ContextCheckSequence), mSenderFutures.size(),
+            mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+    }
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -571,6 +592,16 @@ void CacheTransceiver::respondAndSendLayerWise(
         setContextState(llmRequest.get());
         auto future = mCacheSender->sendAsync(llmRequest);
         mSenderFutures.emplace_back(llmRequest, std::move(future));
+        if (mNvbug6448152TraceEnabled)
+        {
+            mNvbug6448152ContextEnqueuedTransitionCount++;
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=transfer_start side=ctx_layerwise rank=%d request_id=%llu "
+                "check_seq=%llu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, static_cast<unsigned long long>(llmRequest->mRequestId),
+                static_cast<unsigned long long>(mNvbug6448152ContextCheckSequence), mSenderFutures.size(),
+                mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+        }
     }
 }
 
@@ -601,6 +632,15 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     auto* requestPtr = llmRequest.get();
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
     requestPtr->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    if (mNvbug6448152TraceEnabled)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_DIAG event=transfer_start side=gen rank=%d request_id=%llu check_seq=%llu "
+            "future_count=%zu awaiting_count=%zu timeout_count=%zu",
+            mWorldRank, static_cast<unsigned long long>(requestPtr->mRequestId),
+            static_cast<unsigned long long>(mNvbug6448152GenerationCheckSequence), mRequesterFutures.size(),
+            mRequesterRequestsAwaitingConsensus.size(), mTimedOutRequesterIds.size());
+    }
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -700,6 +740,22 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
+    std::uint64_t contextCheckSequence = 0;
+    bool traceConsensusTransition = false;
+    bool periodicConsensusCheckpoint = false;
+    std::uint64_t enqueuedTransitionCount = 0;
+    size_t localTerminalTransitionCount = 0;
+    size_t firstWaitTimeoutTransitionCount = 0;
+    if (mNvbug6448152TraceEnabled)
+    {
+        contextCheckSequence = ++mNvbug6448152ContextCheckSequence;
+        enqueuedTransitionCount = mNvbug6448152ContextEnqueuedTransitionCount;
+        mNvbug6448152ContextEnqueuedTransitionCount = 0;
+        periodicConsensusCheckpoint
+            = contextCheckSequence % 512 == 0 && (!mSenderFutures.empty() || !mSenderRequestsAwaitingConsensus.empty());
+        traceConsensusTransition = enqueuedTransitionCount > 0 || periodicConsensusCheckpoint;
+    }
+
     bool blockAll = !atLeastRequestNum.has_value();
     std::optional<int> senderFutureTimeoutMs = std::nullopt;
     // If blockAll is true, we want to block and not use a timeout
@@ -794,14 +850,47 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 {
                     future.get();
                     bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    long elapsedMs = 0;
+                    if (mNvbug6448152TraceEnabled)
+                    {
+                        auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
+                        elapsedMs = static_cast<long>(elapsed.count());
+                    }
                     recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
                         mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
                     it = mSenderFutures.erase(it);
+                    if (mNvbug6448152TraceEnabled)
+                    {
+                        traceConsensusTransition = true;
+                        localTerminalTransitionCount++;
+                        TLLM_LOG_INFO(
+                            "NVBUG6448152_DIAG event=local_future_terminal side=ctx rank=%d request_id=%llu "
+                            "outcome=%s elapsed_ms=%ld check_seq=%llu future_count=%zu awaiting_count=%zu "
+                            "timeout_count=%zu",
+                            mWorldRank, static_cast<unsigned long long>(requestId), failed ? "failed" : "completed",
+                            elapsedMs, static_cast<unsigned long long>(contextCheckSequence), mSenderFutures.size(),
+                            mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+                    }
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
+                    if (!mNvbug6448152TraceEnabled)
+                    {
+                        TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
+                            senderFutureTimeoutMs.value());
+                    }
+                    else if (mNvbug6448152SenderWaitTimeoutIds.insert(requestId).second)
+                    {
+                        traceConsensusTransition = true;
+                        firstWaitTimeoutTransitionCount++;
+                        TLLM_LOG_WARNING(
+                            "NVBUG6448152_DIAG event=first_future_wait_timeout side=ctx rank=%d request_id=%llu "
+                            "wait_ms=%d check_seq=%llu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                            mWorldRank, static_cast<unsigned long long>(requestId), senderFutureTimeoutMs.value(),
+                            static_cast<unsigned long long>(contextCheckSequence), mSenderFutures.size(),
+                            mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+                    }
                     ++it;
                 }
                 else
@@ -812,6 +901,18 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
                         mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
                     it = mSenderFutures.erase(it);
+                    if (mNvbug6448152TraceEnabled)
+                    {
+                        traceConsensusTransition = true;
+                        localTerminalTransitionCount++;
+                        TLLM_LOG_INFO(
+                            "NVBUG6448152_DIAG event=local_future_terminal side=ctx rank=%d request_id=%llu "
+                            "outcome=unexpected_future_status check_seq=%llu future_count=%zu awaiting_count=%zu "
+                            "timeout_count=%zu",
+                            mWorldRank, static_cast<unsigned long long>(requestId),
+                            static_cast<unsigned long long>(contextCheckSequence), mSenderFutures.size(),
+                            mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+                    }
                 }
             }
             catch (std::exception const& e)
@@ -820,6 +921,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
                     mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
                 it = mSenderFutures.erase(it);
+                if (mNvbug6448152TraceEnabled)
+                {
+                    traceConsensusTransition = true;
+                    localTerminalTransitionCount++;
+                    TLLM_LOG_INFO(
+                        "NVBUG6448152_DIAG event=local_future_terminal side=ctx rank=%d request_id=%llu "
+                        "outcome=exception check_seq=%llu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                        mWorldRank, static_cast<unsigned long long>(requestId),
+                        static_cast<unsigned long long>(contextCheckSequence), mSenderFutures.size(),
+                        mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+                }
             }
         }
         else
@@ -829,8 +941,117 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     }
 
     RequestStatuses requestsStatus{};
-    auto const consensusOutcome
-        = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    TransferConsensusOutcome consensusOutcome;
+    std::uint64_t tpConsensusSequence = 0;
+    std::uint64_t ppConsensusSequence = 0;
+    long long tpConsensusDurationUs = 0;
+    long long ppConsensusDurationUs = 0;
+    if (mNvbug6448152TraceEnabled)
+    {
+        tpConsensusSequence = ++mNvbug6448152ContextTpConsensusSequence;
+        ppConsensusSequence = ++mNvbug6448152ContextPpConsensusSequence;
+
+        int const tpRank = syncComm != nullptr ? syncComm->getRank() : 0;
+        int const tpSize = syncComm != nullptr ? syncComm->getSize() : 1;
+        if (traceConsensusTransition)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=consensus_enter side=ctx stage=tp rank=%d comm_rank=%d comm_size=%d "
+                "check_seq=%llu consensus_seq=%llu local_terminal_transitions=%zu "
+                "first_wait_timeout_transitions=%zu enqueued_transitions=%llu periodic_checkpoint=%d "
+                "completed_count=%zu failed_count=%zu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, tpRank, tpSize, static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(tpConsensusSequence), localTerminalTransitionCount,
+                firstWaitTimeoutTransitionCount, static_cast<unsigned long long>(enqueuedTransitionCount),
+                static_cast<int>(periodicConsensusCheckpoint), mCompletedSenderRequestIds.size(),
+                mFailedSenderRequestIds.size(), mSenderFutures.size(), mSenderRequestsAwaitingConsensus.size(),
+                mNvbug6448152SenderWaitTimeoutIds.size());
+        }
+        auto const tpConsensusStart = std::chrono::steady_clock::now();
+        auto const tpOutcome = reduceTransferStates(syncComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+        tpConsensusDurationUs
+            = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tpConsensusStart)
+                  .count();
+        if (traceConsensusTransition)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=consensus_exit side=ctx stage=tp rank=%d comm_rank=%d comm_size=%d "
+                "check_seq=%llu consensus_seq=%llu duration_us=%lld local_terminal_transitions=%zu "
+                "first_wait_timeout_transitions=%zu enqueued_transitions=%llu completed_count=%zu failed_count=%zu "
+                "future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, tpRank, tpSize, static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(tpConsensusSequence), tpConsensusDurationUs,
+                localTerminalTransitionCount, firstWaitTimeoutTransitionCount,
+                static_cast<unsigned long long>(enqueuedTransitionCount), tpOutcome.completedRequestIds.size(),
+                tpOutcome.failedRequestIds.size(), mSenderFutures.size(), mSenderRequestsAwaitingConsensus.size(),
+                mNvbug6448152SenderWaitTimeoutIds.size());
+        }
+        else if (tpConsensusDurationUs >= kNvbug6448152SlowConsensusThresholdUs)
+        {
+            TLLM_LOG_WARNING(
+                "NVBUG6448152_DIAG event=consensus_slow side=ctx stage=tp rank=%d comm_rank=%d comm_size=%d "
+                "check_seq=%llu consensus_seq=%llu duration_us=%lld completed_count=%zu failed_count=%zu "
+                "future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, tpRank, tpSize, static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(tpConsensusSequence), tpConsensusDurationUs,
+                tpOutcome.completedRequestIds.size(), tpOutcome.failedRequestIds.size(), mSenderFutures.size(),
+                mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+        }
+
+        int const ppRank = mGroupPipeParaComm != nullptr ? mGroupPipeParaComm->getRank() : 0;
+        int const ppSize = mGroupPipeParaComm != nullptr ? mGroupPipeParaComm->getSize() : 1;
+        if (traceConsensusTransition)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=consensus_enter side=ctx stage=pp rank=%d comm_rank=%d comm_size=%d "
+                "check_seq=%llu consensus_seq=%llu local_terminal_transitions=%zu "
+                "first_wait_timeout_transitions=%zu enqueued_transitions=%llu periodic_checkpoint=%d "
+                "completed_count=%zu failed_count=%zu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, ppRank, ppSize, static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(ppConsensusSequence), localTerminalTransitionCount,
+                firstWaitTimeoutTransitionCount, static_cast<unsigned long long>(enqueuedTransitionCount),
+                static_cast<int>(periodicConsensusCheckpoint), tpOutcome.completedRequestIds.size(),
+                tpOutcome.failedRequestIds.size(), mSenderFutures.size(), mSenderRequestsAwaitingConsensus.size(),
+                mNvbug6448152SenderWaitTimeoutIds.size());
+        }
+        auto const ppConsensusStart = std::chrono::steady_clock::now();
+        consensusOutcome
+            = reduceTransferStates(mGroupPipeParaComm, tpOutcome.completedRequestIds, tpOutcome.failedRequestIds);
+        ppConsensusDurationUs
+            = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - ppConsensusStart)
+                  .count();
+        if (traceConsensusTransition)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=consensus_exit side=ctx stage=pp rank=%d comm_rank=%d comm_size=%d "
+                "check_seq=%llu consensus_seq=%llu duration_us=%lld local_terminal_transitions=%zu "
+                "first_wait_timeout_transitions=%zu enqueued_transitions=%llu completed_count=%zu failed_count=%zu "
+                "future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, ppRank, ppSize, static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(ppConsensusSequence), ppConsensusDurationUs,
+                localTerminalTransitionCount, firstWaitTimeoutTransitionCount,
+                static_cast<unsigned long long>(enqueuedTransitionCount), consensusOutcome.completedRequestIds.size(),
+                consensusOutcome.failedRequestIds.size(), mSenderFutures.size(),
+                mSenderRequestsAwaitingConsensus.size(), mNvbug6448152SenderWaitTimeoutIds.size());
+        }
+        else if (ppConsensusDurationUs >= kNvbug6448152SlowConsensusThresholdUs)
+        {
+            TLLM_LOG_WARNING(
+                "NVBUG6448152_DIAG event=consensus_slow side=ctx stage=pp rank=%d comm_rank=%d comm_size=%d "
+                "check_seq=%llu consensus_seq=%llu duration_us=%lld completed_count=%zu failed_count=%zu "
+                "future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, ppRank, ppSize, static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(ppConsensusSequence), ppConsensusDurationUs,
+                consensusOutcome.completedRequestIds.size(), consensusOutcome.failedRequestIds.size(),
+                mSenderFutures.size(), mSenderRequestsAwaitingConsensus.size(),
+                mNvbug6448152SenderWaitTimeoutIds.size());
+        }
+    }
+    else
+    {
+        consensusOutcome
+            = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    }
     for (auto const requestId : consensusOutcome.failedRequestIds)
     {
         auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
@@ -843,6 +1064,20 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         mTimedOutSenderIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+        if (mNvbug6448152TraceEnabled)
+        {
+            bool const hadWaitTimeout = mNvbug6448152SenderWaitTimeoutIds.erase(requestId) > 0;
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=global_commit side=ctx rank=%d request_id=%llu outcome=failed "
+                "check_seq=%llu tp_consensus_seq=%llu pp_consensus_seq=%llu tp_duration_us=%lld "
+                "pp_duration_us=%lld had_wait_timeout=%d future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, static_cast<unsigned long long>(requestId),
+                static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(tpConsensusSequence),
+                static_cast<unsigned long long>(ppConsensusSequence), tpConsensusDurationUs, ppConsensusDurationUs,
+                static_cast<int>(hadWaitTimeout), mSenderFutures.size(), mSenderRequestsAwaitingConsensus.size(),
+                mNvbug6448152SenderWaitTimeoutIds.size());
+        }
     }
     for (auto const requestId : consensusOutcome.completedRequestIds)
     {
@@ -859,6 +1094,20 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         mTimedOutSenderIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+        if (mNvbug6448152TraceEnabled)
+        {
+            bool const hadWaitTimeout = mNvbug6448152SenderWaitTimeoutIds.erase(requestId) > 0;
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=global_commit side=ctx rank=%d request_id=%llu outcome=completed "
+                "mark_complete=%d check_seq=%llu tp_consensus_seq=%llu pp_consensus_seq=%llu tp_duration_us=%lld "
+                "pp_duration_us=%lld had_wait_timeout=%d future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, static_cast<unsigned long long>(requestId), static_cast<int>(markComplete),
+                static_cast<unsigned long long>(contextCheckSequence),
+                static_cast<unsigned long long>(tpConsensusSequence),
+                static_cast<unsigned long long>(ppConsensusSequence), tpConsensusDurationUs, ppConsensusDurationUs,
+                static_cast<int>(hadWaitTimeout), mSenderFutures.size(), mSenderRequestsAwaitingConsensus.size(),
+                mNvbug6448152SenderWaitTimeoutIds.size());
+        }
     }
 
     return requestsStatus;
@@ -866,6 +1115,12 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
 void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastRequestNum)
 {
+    std::uint64_t generationCheckSequence = 0;
+    if (mNvbug6448152TraceEnabled)
+    {
+        generationCheckSequence = ++mNvbug6448152GenerationCheckSequence;
+    }
+
     bool blockAll = !atLeastRequestNum.has_value();
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
     for (auto&& [request, future] : mRequesterFutures)
@@ -1002,10 +1257,12 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         }
         if (blockAll || toCompleteIdSet.find(requestId) != toCompleteIdSet.end())
         {
+            bool localFailed = true;
             try
             {
                 it->second.get();
                 bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                localFailed = failed;
                 if (failed)
                 {
                     // The receiver uses the error state as a local transfer-failed signal.
@@ -1034,6 +1291,15 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     request->getContextPhaseParams().value().getReqId());
             }
             it = mRequesterFutures.erase(it);
+            if (mNvbug6448152TraceEnabled)
+            {
+                TLLM_LOG_INFO(
+                    "NVBUG6448152_DIAG event=local_future_terminal side=gen rank=%d request_id=%llu outcome=%s "
+                    "check_seq=%llu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                    mWorldRank, static_cast<unsigned long long>(requestId), localFailed ? "failed" : "completed",
+                    static_cast<unsigned long long>(generationCheckSequence), mRequesterFutures.size(),
+                    mRequesterRequestsAwaitingConsensus.size(), mTimedOutRequesterIds.size());
+            }
         }
         else
         {
@@ -1054,6 +1320,15 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         mTimedOutRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+        if (mNvbug6448152TraceEnabled)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=global_commit side=gen rank=%d request_id=%llu outcome=failed "
+                "check_seq=%llu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, static_cast<unsigned long long>(requestId),
+                static_cast<unsigned long long>(generationCheckSequence), mRequesterFutures.size(),
+                mRequesterRequestsAwaitingConsensus.size(), mTimedOutRequesterIds.size());
+        }
     }
     for (auto const requestId : consensusOutcome.completedRequestIds)
     {
@@ -1072,6 +1347,15 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         mTimedOutRequesterIds.erase(requestId);
         eraseLocalTransferOutcome(
             requestId, mCompletedRequesterRequestIds, mFailedRequesterRequestIds, mRequesterRequestsAwaitingConsensus);
+        if (mNvbug6448152TraceEnabled)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_DIAG event=global_commit side=gen rank=%d request_id=%llu outcome=completed "
+                "check_seq=%llu future_count=%zu awaiting_count=%zu timeout_count=%zu",
+                mWorldRank, static_cast<unsigned long long>(requestId),
+                static_cast<unsigned long long>(generationCheckSequence), mRequesterFutures.size(),
+                mRequesterRequestsAwaitingConsensus.size(), mTimedOutRequesterIds.size());
+        }
     }
 }
 
