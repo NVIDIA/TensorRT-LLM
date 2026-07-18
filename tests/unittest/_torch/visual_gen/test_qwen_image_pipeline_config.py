@@ -226,3 +226,42 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
 
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
     assert attention.attn.__class__.__name__ != not_wrapped_as
+
+
+def _qwen_image_edit_pipeline_for_cfg_compile_test(cfg_size: int):
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImageEditPlusPipeline
+
+    pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
+    pipeline.pipeline_config = SimpleNamespace(
+        visual_gen_mapping=SimpleNamespace(cfg_size=cfg_size),
+    )
+    return pipeline
+
+
+def test_qwen_image_edit_cfg_parallel_skips_torch_compile(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+    def fail_if_called(self):
+        raise AssertionError("CFG-parallel Qwen-Image-Edit should skip torch.compile")
+
+    monkeypatch.setattr(BasePipeline, "torch_compile", fail_if_called)
+    pipeline = _qwen_image_edit_pipeline_for_cfg_compile_test(cfg_size=2)
+
+    pipeline.torch_compile()
+
+
+def test_qwen_image_edit_cfg1_keeps_torch_compile(monkeypatch):
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+
+    called = False
+
+    def record_call(self):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(BasePipeline, "torch_compile", record_call)
+    pipeline = _qwen_image_edit_pipeline_for_cfg_compile_test(cfg_size=1)
+
+    pipeline.torch_compile()
+
+    assert called

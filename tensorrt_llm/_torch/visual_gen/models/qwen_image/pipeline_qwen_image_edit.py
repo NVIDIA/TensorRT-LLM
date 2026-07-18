@@ -15,6 +15,7 @@ from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -134,6 +135,17 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     def warmup_cache_key(self, height: Optional[int], width: Optional[int], **kwargs) -> tuple:
         return (height, width)
+
+    def torch_compile(self) -> None:
+        vgm = self.pipeline_config.visual_gen_mapping
+        if vgm and vgm.cfg_size > 1:
+            logger.warning(
+                "Qwen-Image-Edit disables torch.compile when CFG parallelism is enabled; "
+                "compiled per-rank conditional/unconditional transformer execution does not "
+                "currently preserve CFG=1 parity."
+            )
+            return
+        super().torch_compile()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         from PIL import Image
@@ -408,6 +420,22 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
         has_neg = negative_prompt is not None
         do_true_cfg = true_cfg_scale > 1.0 and has_neg
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        cfg_rank = vgm.cfg_rank if vgm else 0
+        cfg_pg = vgm.cfg_group if vgm else None
+        do_cfg_parallel = do_true_cfg and cfg_size > 1
+        if do_cfg_parallel:
+            if cfg_size != 2:
+                raise ValueError(
+                    f"Qwen-Image-Edit CFG parallel requires cfg_size=2, got {cfg_size}"
+                )
+            if not dist.is_available() or not dist.is_initialized():
+                raise RuntimeError(
+                    "Qwen-Image-Edit CFG parallel requires initialized torch.distributed"
+                )
+            if getattr(self, "rank", 0) == 0:
+                logger.info("Qwen-Image-Edit CFG parallel enabled: cfg_size=2")
 
         logger.info("Encoding edit prompt...")
         prompt_embeds, prompt_embeds_mask = self._encode_edit_prompt(
@@ -476,30 +504,60 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         for t in timesteps:
             latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                return_dict=False,
-            )[0]
-            noise_pred = noise_pred[:, : latents.size(1)]
 
-            if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    encoder_hidden_states_mask=neg_prompt_embeds_mask,
-                    encoder_hidden_states=neg_prompt_embeds,
-                    img_shapes=img_shapes,
-                    return_dict=False,
-                )[0]
-                neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
+            if do_cfg_parallel:
+                if cfg_rank == 0:
+                    local_noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep / 1000,
+                        encoder_hidden_states_mask=prompt_embeds_mask,
+                        encoder_hidden_states=prompt_embeds,
+                        img_shapes=img_shapes,
+                        return_dict=False,
+                    )[0]
+                else:
+                    local_noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep / 1000,
+                        encoder_hidden_states_mask=neg_prompt_embeds_mask,
+                        encoder_hidden_states=neg_prompt_embeds,
+                        img_shapes=img_shapes,
+                        return_dict=False,
+                    )[0]
+                local_noise_pred = local_noise_pred[:, : latents.size(1)].contiguous()
+                gathered_noise_pred = [torch.empty_like(local_noise_pred) for _ in range(cfg_size)]
+                dist.all_gather(gathered_noise_pred, local_noise_pred, group=cfg_pg)
+                noise_pred = gathered_noise_pred[0]
+                neg_noise_pred = gathered_noise_pred[1]
                 comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb, dim=-1, keepdim=True)
                 noise_pred = comb * (cond_norm / noise_norm)
+            else:
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep / 1000,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    encoder_hidden_states=prompt_embeds,
+                    img_shapes=img_shapes,
+                    return_dict=False,
+                )[0]
+                noise_pred = noise_pred[:, : latents.size(1)]
+
+                if do_true_cfg:
+                    neg_noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep / 1000,
+                        encoder_hidden_states_mask=neg_prompt_embeds_mask,
+                        encoder_hidden_states=neg_prompt_embeds,
+                        img_shapes=img_shapes,
+                        return_dict=False,
+                    )[0]
+                    neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
+                    comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+                    noise_norm = torch.norm(comb, dim=-1, keepdim=True)
+                    noise_pred = comb * (cond_norm / noise_norm)
 
             latents_dtype = latents.dtype
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
