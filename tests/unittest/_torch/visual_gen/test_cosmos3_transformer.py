@@ -479,13 +479,17 @@ class TestConfigCompatDefaults:
             assert getattr(config, key) == value
 
     def test_old_schema_untouched(self):
+        # Every field deliberately differs from its compat default, so an
+        # overwrite of any one of them fails its assertion.
         config = SimpleNamespace(
-            position_embedding_type="unified_3d_mrope",
-            max_position_embeddings=12345,  # deliberately non-default
-            temporal_compression_factor_sound=1,
+            position_embedding_type="rope_3d",
+            max_position_embeddings=12345,
+            temporal_compression_factor_sound=7,
         )
         apply_pretrained_config_compat_defaults(config)
+        assert config.position_embedding_type == "rope_3d"
         assert config.max_position_embeddings == 12345
+        assert config.temporal_compression_factor_sound == 7
 
     def test_idempotent(self):
         config = SimpleNamespace(hidden_size=64)
