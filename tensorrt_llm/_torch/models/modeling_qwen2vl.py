@@ -84,8 +84,8 @@ PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/b
 
 
 def _prepare_qwen_vl_vision_attn_metadata(
-        seq_lens: List[int],
-        attn_metadata: AttentionMetadata) -> AttentionMetadata:
+        seq_lens: List[int], attn_metadata: AttentionMetadata, *,
+        max_seq_len: int) -> AttentionMetadata:
     seq_lens = [int(seq_len) for seq_len in seq_lens]
     if not seq_lens:
         raise ValueError(
@@ -96,6 +96,17 @@ def _prepare_qwen_vl_vision_attn_metadata(
         raise ValueError(
             f"Qwen VL vision attention segment length must be nonnegative, got {min_seq_len}"
         )
+
+    if max_seq_len <= 0:
+        raise ValueError(
+            f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
+        )
+    actual_max_seq_len = max(seq_lens)
+    if actual_max_seq_len > max_seq_len:
+        raise ValueError(
+            "Qwen VL vision attention segment length exceeds the configured "
+            f"maximum: actual={actual_max_seq_len}, maximum={max_seq_len}. "
+            "Increase encoder_max_num_tokens or reduce the input max_pixels.")
 
     num_segments = len(seq_lens)
     seq_lens_torch = torch.tensor(seq_lens,
@@ -114,7 +125,9 @@ def _prepare_qwen_vl_vision_attn_metadata(
                                non_blocking=True)
     attn_metadata.cu_q_seqlens = cu_seqlens
     attn_metadata.cu_kv_seqlens = cu_seqlens
-    attn_metadata.max_seq_len = max(seq_lens)
+    # Keep the native attention-op cache key stable across image resolutions.
+    # Actual segment lengths remain available through seq_lens / cu_seqlens.
+    attn_metadata.max_seq_len = max_seq_len
     # The vision tower runs no-cache, context-only attention and supplies its
     # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
     # prompt_lens / host_request_types setup) is unnecessary host work.
@@ -1400,6 +1413,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             self.model_config.attn_backend).Metadata
         self.full_attn_metadata: Optional[AttentionMetadata] = None
         self.window_attn_metadata: Optional[AttentionMetadata] = None
+        self.set_attn_max_seq_len(self.model_config.max_num_tokens)
         # Pre-allocated `arange` for the vision block's `rope_position_ids`;
         # per-call code slices `[:seq_len]` instead of a fresh `(seq_len,) int32`
         # + H->D copy. Sized by `setup_attn_metadata` (engine-driven); `forward`
@@ -1427,11 +1441,24 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                       kv_cache_manager=None)
         self.full_attn_metadata = self.metadata_cls(**kwargs)
         self.window_attn_metadata = self.metadata_cls(**kwargs)
+        self.set_attn_max_seq_len(max_num_tokens)
         # Size the vision-block ``rope_position_ids`` scratch to the encoder
         # token budget; ``forward`` grows it on the rare miss above the budget.
         self._rope_position_ids_buffer = torch.arange(max_num_tokens,
                                                       dtype=torch.int32,
                                                       device=self.device)
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
+            )
+        self._full_attn_max_seq_len = max_seq_len
+        vit_merger_window_size = (self.window_size // self.spatial_merge_size //
+                                  self.patch_size)
+        self._window_attn_max_seq_len = min(
+            self._full_attn_max_seq_len,
+            vit_merger_window_size**2 * self.spatial_merge_unit)
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]
@@ -1593,15 +1620,18 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
         return cos_thw, sin_thw, window_index_thw, tuple(seq_lens_thw)
 
-    def prepare_attn_metadata(
-            self,
-            seq_lens: List[int],
-            attn_metadata: Optional[AttentionMetadata] = None):
+    def prepare_attn_metadata(self,
+                              seq_lens: List[int],
+                              attn_metadata: Optional[AttentionMetadata] = None,
+                              *,
+                              max_seq_len: int) -> AttentionMetadata:
         if attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
                 "It must be set up before the encoder forward runs.")
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(seq_lens,
+                                                     attn_metadata,
+                                                     max_seq_len=max_seq_len)
 
     @property
     def device(self) -> torch.device:
@@ -1656,9 +1686,13 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         hidden_states = hidden_states[window_index, :, :].reshape(seq_len, -1)
 
         self.full_attn_metadata = self.prepare_attn_metadata(
-            seq_lens, self.full_attn_metadata)
+            seq_lens,
+            self.full_attn_metadata,
+            max_seq_len=self._full_attn_max_seq_len)
         self.window_attn_metadata = self.prepare_attn_metadata(
-            window_seq_lens, self.window_attn_metadata)
+            window_seq_lens,
+            self.window_attn_metadata,
+            max_seq_len=self._window_attn_max_seq_len)
 
         for layer_num, block in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:

@@ -792,6 +792,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self.metadata_cls = get_attention_backend(self.model_config.attn_backend).Metadata
 
         self.attn_metadata: Optional[AttentionMetadata] = None
+        self._fixed_max_seq_len = self.model_config.max_num_tokens
 
         # Vision block's `rope_position_ids` scratch. Registered empty here;
         # `setup_attn_metadata` allocates it as an `arange` (see there).
@@ -817,6 +818,7 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+        self.set_attn_max_seq_len(max_num_tokens)
         # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
         # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
         # code just slices ``[:seq_len]`` instead of allocating a fresh
@@ -825,6 +827,13 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(
+                f"Qwen VL vision attention max_seq_len must be positive, got {max_seq_len}"
+            )
+        self._fixed_max_seq_len = max_seq_len
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -944,13 +953,15 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self,
         seq_lens: List[int],
         attn_metadata: Optional[AttentionMetadata] = None,
-    ):
+    ) -> AttentionMetadata:
         if attn_metadata is None:
             raise RuntimeError(
                 "Vision encoder AttentionMetadata is not initialized. "
                 "It must be set up before the encoder forward runs."
             )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=self._fixed_max_seq_len
+        )
 
     @torch.inference_mode()
     def forward(

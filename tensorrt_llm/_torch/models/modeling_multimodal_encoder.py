@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -63,6 +63,14 @@ class MultimodalEncoderMixin:
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        """Set an optional stable per-segment attention capacity.
+
+        Specialized encoders may override this hook. Keeping it separate from
+        ``setup_attn_metadata`` preserves that method's existing override
+        contract for external encoders.
+        """
 
 
 class VisionTower(nn.Module):
