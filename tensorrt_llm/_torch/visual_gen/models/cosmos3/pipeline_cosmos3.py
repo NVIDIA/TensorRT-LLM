@@ -21,7 +21,7 @@ from typing import List, Optional, Union
 
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, UniPCMultistepScheduler
+from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import Qwen2Tokenizer
@@ -34,8 +34,14 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
-from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS, COSMOS3_T2I_PARAMS
+from .defaults import (
+    COSMOS3_720P_PARAMS,
+    COSMOS3_EXTRA_SPECS,
+    COSMOS3_PIPELINE_DEFAULTS,
+    COSMOS3_T2I_PARAMS,
+)
 from .guardrails import check_video_safety, download_guardrail_checkpoint
+from .sampling import Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
@@ -60,6 +66,7 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
         "nvidia/Cosmos3-Super",
         "nvidia/Cosmos3-Super-Image2Video",
         "nvidia/Cosmos3-Super-Text2Image",
+        "nvidia/Cosmos3-Super-Text2Image-4Step",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
@@ -68,6 +75,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         primary_pretrained_config = pipeline_config.primary_pretrained_config
         self.audio_gen = False
         self.action_gen = False
+        self.sampling = Cosmos3SamplingPolicy()
         if getattr(
             primary_pretrained_config,
             "audio_gen",
@@ -139,22 +147,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
-            self.scheduler = UniPCMultistepScheduler.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.SCHEDULER,
-            )
-            # Snapshot the checkpoint scheduler config so the scheduler can be
-            # rebuilt at request time when a mode-specific ``flow_shift`` is
-            # needed (T2I uses shift=3.0; T2V/I2V keep the checkpoint default).
-            self._base_scheduler_config = self.scheduler.config
-            self._engine_init_flow_shift = float(
-                getattr(self.scheduler.config, "flow_shift", 1.0) or 1.0
-            )
-            self._current_flow_shift = self._engine_init_flow_shift
+            # The scheduler class comes from the checkpoint: UniPC for base
+            # checkpoints, FlowMatchEuler (fixed stochastic schedule) for
+            # distilled ones. The policy holds the derived immutable facts.
+            self.scheduler = load_scheduler(checkpoint_dir)
+            self.sampling = Cosmos3SamplingPolicy.from_scheduler(self.scheduler)
             if self.audio_gen:
-                # Separate instance so video and audio scheduler states don't collide
-                # (UniPC mutates internal correction buffers on every .step() call).
-                self.audio_scheduler = UniPCMultistepScheduler.from_config(self.scheduler.config)
+                # Separate instance so video and audio scheduler states don't
+                # collide (schedulers mutate internal state on every .step()).
+                self.audio_scheduler = type(self.scheduler).from_config(self.scheduler.config)
 
         # Re-check the env var in case it was changed after initialization like in unit tests.
         guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
@@ -185,23 +186,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
-    def _set_flow_shift(self, target_shift: float) -> None:
-        """Rebuild the UniPC scheduler with ``flow_shift=target_shift`` if needed.
-
-        T2I uses ``flow_shift=3.0`` while T2V/I2V use the checkpoint default.
-        ``self._current_flow_shift`` is tracked explicitly so a prior T2I rebuild
-        does not leak into a subsequent video request.
-        """
-        if not hasattr(self, "_base_scheduler_config"):
-            return
-        target = float(target_shift)
-        if target == float(self._current_flow_shift):
-            return
-        self.scheduler = UniPCMultistepScheduler.from_config(
-            self._base_scheduler_config, flow_shift=target
-        )
-        self._current_flow_shift = target
-
     @property
     def default_warmup_resolutions(self):
         return [(720, 1280)]
@@ -211,14 +195,25 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return [189]
 
     @property
+    def default_warmup_steps(self):
+        # Distilled checkpoints only run their fixed schedule length.
+        return self.sampling.num_steps(super().default_warmup_steps)
+
+    @property
     def default_generation_params(self):
-        return dict(COSMOS3_720P_PARAMS)
+        return {**COSMOS3_PIPELINE_DEFAULTS, **self.sampling.generation_default_overrides()}
 
     @property
     def extra_param_specs(self):
         return dict(COSMOS3_EXTRA_SPECS)
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
+        # base defaults leave it None ("by mode") — warmup runs the video mode.
+        defaults = self.default_generation_params
+        guidance_scale = defaults["guidance_scale"]
+        if guidance_scale is None:
+            guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
@@ -227,51 +222,29 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 width=width,
                 num_frames=num_frames,
                 num_inference_steps=steps,
-                guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
+                guidance_scale=guidance_scale,
                 seed=42,
-                max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
+                max_sequence_length=defaults["max_sequence_length"],
                 use_guardrails=False,
                 image=None,
                 enable_audio=False,
             )
-
-    @staticmethod
-    def _resolve_t2i_default(merged_value, video_default, t2i_default):
-        """Pick the T2I default when the field still carries the merged video default.
-
-        The executor merges a single ``default_generation_params`` dict (the
-        video params) into the request before ``infer()``, so an unspecified
-        field arrives equal to its video default.  For T2I we substitute the
-        T2I default in that case while honoring any explicit user override.
-        """
-        return t2i_default if merged_value == video_default else merged_value
 
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
         is_t2i = str(output_type).lower() == "image"
 
-        height = req.params.height
-        width = req.params.width
-        num_inference_steps = req.params.num_inference_steps
-        guidance_scale = req.params.guidance_scale
-        if is_t2i:
-            height = self._resolve_t2i_default(
-                height, COSMOS3_720P_PARAMS["height"], COSMOS3_T2I_PARAMS["height"]
-            )
-            width = self._resolve_t2i_default(
-                width, COSMOS3_720P_PARAMS["width"], COSMOS3_T2I_PARAMS["width"]
-            )
-            num_inference_steps = self._resolve_t2i_default(
-                num_inference_steps,
-                COSMOS3_720P_PARAMS["num_inference_steps"],
-                COSMOS3_T2I_PARAMS["num_inference_steps"],
-            )
-            guidance_scale = self._resolve_t2i_default(
-                guidance_scale,
-                COSMOS3_720P_PARAMS["guidance_scale"],
-                COSMOS3_T2I_PARAMS["guidance_scale"],
-            )
+        # None = unset; resolve by mode exactly once. Non-None values pass through.
+        mode_params = COSMOS3_T2I_PARAMS if is_t2i else COSMOS3_720P_PARAMS
+
+        def resolved(value, field_name):
+            return value if value is not None else mode_params[field_name]
+
+        height = resolved(req.params.height, "height")
+        width = resolved(req.params.width, "width")
+        num_inference_steps = resolved(req.params.num_inference_steps, "num_inference_steps")
+        guidance_scale = resolved(req.params.guidance_scale, "guidance_scale")
 
         return self.forward(
             prompt=req.prompt,
@@ -634,6 +607,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
     ):
+        """Run one generation. ``infer()`` is the resolved entry point.
+
+        Production requests arrive through ``infer()`` with fully resolved
+        values; the signature defaults are the base-checkpoint *video* table
+        values for direct internal callers. ``forward()`` cannot tell a
+        signature default from an explicit argument, so on distilled
+        checkpoints (which fix steps/guidance and reject anything else) direct
+        callers must pass checkpoint-valid sampling values.
+        """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
@@ -643,7 +625,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Text-to-image mode: same checkpoint/forward path as T2V, but a single
         # latent frame, image-flavored prompt templates, flow_shift=3.0, a CFG
         # guidance interval, and an image (rather than video) output.
-        is_t2i = str(output_type).lower() == "image"
+        output_type = str(output_type).lower()
+        if output_type not in ("video", "image"):
+            raise ValueError(f"output_type must be 'video' or 'image', got {output_type!r}.")
+        is_t2i = output_type == "image"
+
+        self.sampling.validate_request(num_inference_steps, guidance_scale)
+
         guidance_interval = None
         if is_t2i:
             if image is not None:
@@ -653,11 +641,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             num_frames = 1
             enable_audio = False
             guidance_interval = COSMOS3_T2I_PARAMS["guidance_interval"]
-            self._set_flow_shift(COSMOS3_T2I_PARAMS["flow_shift"])
+            self.scheduler = self.sampling.set_flow_shift(
+                self.scheduler, COSMOS3_T2I_PARAMS["flow_shift"]
+            )
         else:
             # Restore the checkpoint flow_shift in case a prior T2I request
             # rebuilt the scheduler with shift=3.0.
-            self._set_flow_shift(getattr(self, "_engine_init_flow_shift", 1.0))
+            self.scheduler = self.sampling.set_flow_shift(
+                self.scheduler, self.sampling.checkpoint_flow_shift
+            )
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -781,7 +773,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         video_shape = (T_latent, H_latent, W_latent)
 
         # 3. Set up scheduler
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self.sampling.set_timesteps(self.scheduler, num_inference_steps, device=self.device)
 
         # 3b. Audio noise init — latent length matches diffusers Cosmos3OmniPipeline.prepare_latents.
         do_audio = enable_audio and self.audio_gen and hasattr(self, "audio_tokenizer")
@@ -798,7 +790,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 dtype=latents.dtype,
             )
             # Audio uses the same scheduler type/config as video.
-            self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+            self.sampling.set_timesteps(
+                self.audio_scheduler, num_inference_steps, device=self.device
+            )
 
         # 4. Build forward_fn for the denoise loop
         def forward_fn(
@@ -861,6 +855,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             extra_cfg_tensors=extra_cfg_tensors,
             extra_streams=extra_streams,
             guidance_interval=guidance_interval,
+            scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
         )
 
         if extra_streams is not None:
