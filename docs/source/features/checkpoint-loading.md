@@ -6,7 +6,7 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 1. [Overview](#overview)
 2. [Core Components](#core-components)
 3. [Built-in Checkpoint Formats](#built-in-checkpoint-formats)
-4. [Experimental Cooperative SafeTensors Prefetch](#experimental-cooperative-safetensors-prefetch)
+4. [Experimental Weight-Load Plans](#experimental-weight-load-plans)
 5. [Using Checkpoint Loaders](#using-checkpoint-loaders)
 6. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
 
@@ -93,68 +93,119 @@ checkpoint or conversion of the Hugging Face checkpoint. For installation, MX
 service deployment, and configuration details, see
 [ModelExpress (MX) Checkpoint Loading](./model-express.md).
 
-## Experimental Cooperative SafeTensors Prefetch
+## Experimental Weight-Load Plans
 
-The HF weight loader includes an opt-in `hybrid` mode for evaluating faster
-cold-cache reads of large SafeTensors checkpoints. Enable it with:
+The HF SafeTensors loader resolves an ordered `WeightLoadPlan` before starting
+storage-specific collectives. The default plan is:
+
+```text
+direct_rank_read
+shared_host_producer
+gpu_broadcast
+legacy_fallback
+```
+
+The first eligible and implemented policy is selected. Qualification and
+fallback happen before policy-specific I/O begins; the loader does not switch
+policies after a collective read or transfer has started. In this first
+version, the two host policies share the same qualification rules and
+`gpu_broadcast` is unavailable. The implicit plan therefore selects
+`direct_rank_read` for a qualified model and otherwise reaches
+`legacy_fallback`; select `shared_host_producer` explicitly to compare it.
+An explicitly selected single policy is strict.
+
+Set a single policy for controlled benchmarking, or a comma-separated ordered
+plan when fallback is desired:
 
 ```bash
-export TRTLLM_HF_SAFETENSORS_LOAD_MODE=hybrid
+# Strict: fail if this policy is not eligible.
+export TRTLLM_HF_WEIGHT_LOAD_PLAN=shared_host_producer
+
+# Ordered fallback.
+export TRTLLM_HF_WEIGHT_LOAD_PLAN=direct_rank_read,legacy_fallback
 trtllm-serve <model>
 ```
 
-You can also select the path when constructing a checkpoint loader:
+The same selection is available when constructing a checkpoint loader:
 
 ```python
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import HfWeightLoader
 
 checkpoint_loader = HfCheckpointLoader(
-    weight_loader=HfWeightLoader(safetensors_load_mode="hybrid")
+    weight_loader=HfWeightLoader(
+        weight_load_plan=("shared_host_producer", "legacy_fallback")
+    )
 )
 ```
 
-The default loader already uses mmap-backed SafeTensors tensors, distributes
-whole-file prefetch across local ranks, and lets the existing model loader apply
-TP/PP ownership while copying weights. Hybrid mode changes the full-prefetch
-scheduler when file-level parallelism is insufficient:
+| Policy | Status | Current behavior |
+| --- | --- | --- |
+| `direct_rank_read` | Implemented; default primary policy | Node-local ranks own disjoint file extents and issue parallel direct reads into the shared OS page cache. |
+| `shared_host_producer` | Implemented page-cache staging v0 | Node-local rank 0 reads all extents with a bounded thread pool; peer ranks wait and then mmap the shared cached pages. |
+| `gpu_broadcast` | Recognized future policy | Preflight reports it unavailable until rank-aware final tensor placement and a topology-aware GPU transport exist. |
+| `legacy_fallback` | Implemented compatibility policy | Uses the pre-existing whole-file prefetch and SafeTensors loading path. |
 
-1. When the existing 90%-of-available-host-memory heuristic permits full
-   prefetch, MPI ranks on each node divide every selected file into bounded
-   extents. A bounded per-rank CPU thread pool reads disjoint extents through
-   8 MiB temporary buffers into the OS page cache. This can parallelize one
-   large consolidated file as well as a sharded checkpoint without allocating
-   a Python bytes object as large as each file.
-2. After a node-local barrier, the existing mmap-backed SafeTensors and model
-   loading paths run unchanged. When the heuristic skips full prefetch, the
-   existing module loader demand-pages the tensor ranges it requests.
+The policy is orthogonal to the weight source. This first implementation
+applies only to HF disk loading with `LoadFormat.AUTO`; MX artifacts, GMS
+transfers, and format-specific Mistral loaders keep their existing paths under
+the default plan. A later source-neutral planner can pair the same placement
+policies with local files, object-store streams, snapshots, MX, or GMS without
+encoding those sources as more policy modes.
 
-Each node independently prefetches one complete logical checkpoint. Full
-prefetch is not PP-aware across nodes and does not globally partition storage
-traffic. Page-cache reuse is best-effort and depends on the filesystem, mount,
-memory pressure, and cache state. Cooperating ranks on a node must resolve the
-checkpoint paths to the same backing files for this page-cache warming to be
-shared. Each rank still performs its own
-host-to-device copies; the mode does not provide object-store streaming,
-pinned-memory pipelining, or MPI/NCCL/NVLink tensor fan-out. The optional HF
-raw-weight cache is currently ignored in hybrid mode.
+`.bin` and `.pth` checkpoints support only `legacy_fallback`. A strict plan
+that omits that policy fails instead of silently measuring the legacy path.
 
-The initial implementation is deliberately restricted to unquantized dense
+Both implemented cooperative policies retain the existing 90%-of-available-
+host-memory guard. When full prefetch is safe, they divide selected files into
+256 MiB extents and read each extent through bounded 8 MiB temporary buffers.
+After a node-local barrier, every rank uses the unchanged mmap-backed
+SafeTensors and model-loading paths. If the memory guard rejects full prefetch,
+the mmap path demand-pages the required ranges instead.
+
+`direct_rank_read` is a storage-byte assignment, not yet a TP/PP-aware tensor
+loader. It aims for one logical checkpoint read per node by striping extents
+across ranks, but each rank subsequently maps the checkpoint, selects its model
+weights, performs its TP/PP transforms, and copies its own parameters to its
+GPU. Each node independently reads a complete checkpoint; PP ownership does
+not partition storage traffic across nodes. "Direct" means that ranks own
+regular buffered `pread` responsibilities; it does not mean Linux `O_DIRECT`,
+GPUDirect Storage, or direct placement into final GPU tensors.
+
+`shared_host_producer` currently uses the Linux page cache as shared host
+storage. It is a useful single-producer comparison policy, but it is not the
+complete pinned shared-memory producer/consumer design. That later design
+requires partial model loading, a bounded pinned buffer, per-rank consumption
+tracking, NUMA placement, cancellation, and crash-safe reclamation.
+
+`gpu_broadcast` is shorthand for topology-aware GPU fan-out rather than a
+literal full-model broadcast. Replicated weights could use NCCL broadcast, but
+TP/EP-sharded weights require scatter or grouped point-to-point transfers and
+PP ranks must receive only their owned layers. A future implementation would
+pipeline storage to bounded pinned host buffers, copy once to a producer GPU,
+and fan out rank-ready chunks over NVLink, NVSwitch, or PCIe into destination
+parameter buffers. The current HF loader returns raw CPU tensors before
+model-specific slicing and placement, so implementing this policy efficiently
+requires a new rank-aware materialization interface.
+
+The cooperative policies are initially restricted to unquantized dense
 `LlamaForCausalLM`, `Qwen2ForCausalLM`, and `Qwen3ForCausalLM` checkpoints with
-standard HF mapping, `LoadFormat.AUTO`, TP, and PP. Distributed hybrid loading
-currently requires MPI-launched ranks; Ray/TorchDist distributed launches fall
-back. Every participating rank must select the same HF disk-load mode and the
-active MPI communicator size must match `Mapping.world_size`; mismatches are
-rejected before hybrid collectives. Context parallelism, expert parallelism,
+standard HF mapping, `LoadFormat.AUTO`, TP, and PP. Distributed cooperative
+loading requires MPI-launched ranks. Context parallelism, expert parallelism,
 attention data parallelism, DWDP, speculative decoding, VLMs, custom models or
 mappers, quantized checkpoints, LoRA-enabled models, dynamic quantization, and
-`.bin`/`.pth` weights use the existing loader.
+`.bin`/`.pth` weights resolve to `legacy_fallback` under the default plan.
+Every participating rank must use the same plan, load format, and world size.
 
-Hybrid mode may improve cold starts when checkpoint sharding does not expose
-enough concurrent I/O and the storage system benefits from parallel requests.
-It can also regress on storage that is already saturated or penalizes
-concurrency. The feature is disabled by default while cold-cache NVMe and
-network-filesystem results are validated.
+Page-cache reuse is best-effort and depends on the filesystem, mount, memory
+pressure, and cache state. Cooperating ranks must resolve paths to the same
+backing files. When the optional HF raw-weight cache is enabled and no plan is
+explicitly configured, the loader preserves that request by selecting
+`legacy_fallback`. An explicitly configured cooperative policy overrides the
+cache with a warning because the cache does not yet mirror its collective
+sequence. More I/O issuers often help Lustre or high-bandwidth NVMe, while one
+producer can help a filesystem that penalizes concurrent clients. Measure both
+against a verified cold cache on the target deployment.
 
 ## Using Checkpoint Loaders
 

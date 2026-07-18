@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from unittest import mock
 
 import pytest
@@ -252,11 +255,17 @@ def test_cache_hit_and_miss_issue_identical_collectives(tmp_path, monkeypatch):
     current: list = []
 
     monkeypatch.setattr(
-        "tensorrt_llm._torch.models.checkpoints.hf.weight_loader.local_mpi_barrier",
-        lambda: current.append("barrier"),
+        HfWeightLoader,
+        "_get_active_node_communicator",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr(
+        HfWeightLoader,
+        "_node_barrier",
+        staticmethod(lambda _node_communicator=None: current.append("barrier")),
     )
 
-    def record_allreduce():
+    def record_allreduce(_node_communicator=None):
         current.append("allreduce")
         return 1 << 60  # plenty of host memory
 
