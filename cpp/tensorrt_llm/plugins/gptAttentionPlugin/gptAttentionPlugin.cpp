@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <numeric>
 
 using namespace nvinfer1;
@@ -1052,7 +1053,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             enqueue_params.num_encoder_tokens = num_encoder_tokens;
         }
 
-        enqueueContext<T, KVCacheBuffer>(enqueue_params, stream);
+        enqueueContext<T, KVCacheBuffer>(enqueue_params, stream, std::numeric_limits<uint64_t>::max());
 
         {
             std::string const afterContexStr = "ctx attention at layer " + std::to_string(mLayerIdx);

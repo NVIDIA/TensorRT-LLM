@@ -30,6 +30,7 @@
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
 #include <cassert>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -224,7 +225,8 @@ public:
     };
 
     template <typename T, typename KVCacheBuffer>
-    int enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream);
+    int enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream,
+        uint64_t workspaceSize = std::numeric_limits<uint64_t>::max());
 
     template <typename T>
     class EnqueueGenerationParams : public EnqueueParams<T>
