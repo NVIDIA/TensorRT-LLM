@@ -2329,6 +2329,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.max_seq_len = args.max_seq_len
         self.max_tokens = args.max_total_draft_tokens + 1
         self.max_beam_width = args.max_beam_width
+        # Snapshot of `not self._use_beam_search` so the update_requests
+        # fast-path avoids a property call per iteration.
+        self._batch_fastpath_eligible: bool = self.max_beam_width == 1
         # The current maximum number of topk logprobs which can be stored in the sampler's store
         self.max_topk_logprobs = MAX_TOP_LOGPROBS
         # The maximum number of topk logprobs for the current batch of requests
@@ -3650,6 +3653,46 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 return beam_history_builder()
             else:
                 return None
+
+        # Fast-path (batched pybind): when the batch is greedy with no beam
+        # search, no logprobs, no draft tokens, no stop-words, and no
+        # speculative tree, collapse per-request pybind chatter into one
+        # batched add_new_tokens_to_requests call. Single-pass eligibility
+        # check with early-break; falls through when any invariant breaks.
+        if (
+            self._batch_fastpath_eligible
+            and logprobs_state_list is None
+            and self.get_spec_tree_manager(resource_manager) is None
+        ):
+            alive_reqs: list[LlmRequest] = []
+            tokens_flat: list[int] = []
+            fastpath_ok = True
+            new_tokens_step0 = new_tokens_list[0]
+            for req in state.requests:
+                if req.state == LlmRequestState.GENERATION_COMPLETE:
+                    continue
+                if get_draft_token_length(req) != 0 or req.py_stop_words_list:
+                    fastpath_ok = False
+                    break
+                alive_reqs.append(req)
+                tokens_flat.append(new_tokens_step0[req.py_seq_slot][DEFAULT_BEAM_IDX])
+            if fastpath_ok and alive_reqs:
+                add_new_tokens_to_requests(alive_reqs, tokens_flat, DEFAULT_BEAM_IDX)
+                _valid_finish_reasons = {
+                    FinishReason.END_ID,
+                    FinishReason.LENGTH,
+                    FinishReason.STOP_WORDS,
+                }
+                for req in alive_reqs:
+                    reason_val = finish_reasons[req.py_seq_slot][0][DEFAULT_BEAM_IDX]
+                    if reason_val != 0:
+                        reason = FinishReason(reason_val)
+                        if reason in _valid_finish_reasons:
+                            req.finish_by(reason, DEFAULT_BEAM_IDX)
+                    req.py_num_accepted_draft_tokens = 0
+                    req.py_rewind_len = 0
+                    req.py_decoding_iter += 1
+                return
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
