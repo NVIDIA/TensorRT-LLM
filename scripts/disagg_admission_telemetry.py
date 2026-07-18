@@ -200,6 +200,12 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
         events_by_rank[rank_key].append(event)
 
     global_blocks = _collect_global_request_blocks(sorted_events)
+    blocks_by_source = {
+        source: _collect_global_request_blocks(
+            [event for event in sorted_events if event.source == source]
+        )
+        for source in sources
+    }
     ranks: dict[str, object] = {}
     aggregate_service_intervals: list[ServiceInterval] = []
     aggregate_selected_gaps: list[dict[str, object]] = []
@@ -217,9 +223,11 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
     aggregate_completed_blocks = 0.0
 
     for rank in sorted(events_by_rank, key=_rank_sort_key):
-        rank_analysis, rank_intervals, selected_gaps = _analyze_rank(
-            events_by_rank[rank], global_blocks
-        )
+        rank_events = events_by_rank[rank]
+        request_blocks = global_blocks
+        if namespace_by_source and rank_events:
+            request_blocks = blocks_by_source.get(rank_events[0].source, {})
+        rank_analysis, rank_intervals, selected_gaps = _analyze_rank(rank_events, request_blocks)
         ranks[rank] = rank_analysis
         aggregate_service_intervals.extend(rank_intervals)
         aggregate_selected_gaps.extend(selected_gaps)
@@ -317,6 +325,7 @@ def analyze_events(events: Iterable[DiagnosticEvent]) -> dict[str, object]:
     return {
         "schema_version": 1,
         "rank_namespace": "source-path::rank" if namespace_by_source else "rank",
+        "aggregate_scope": "all-input-sources" if namespace_by_source else "single-source",
         "parsed_event_count": len(sorted_events),
         "event_counts": dict(sorted(category_counts.items())),
         "ranks": ranks,
@@ -932,7 +941,7 @@ def _reported_ready_to_reap_samples(
 def _invalid_reported_ready_to_reap_sample_count(
     events: list[DiagnosticEvent], excluded_requests: set[str]
 ) -> int:
-    """Count negative or unavailable delays excluded from the summary."""
+    """Count negative reported delays excluded from the summary."""
     return sum(
         1
         for event in events

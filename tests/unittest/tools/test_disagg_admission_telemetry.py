@@ -329,9 +329,41 @@ def test_cli_namespaces_overlapping_ranks_from_distinct_logs(tmp_path, capsys):
     output = json.loads(capsys.readouterr().out)
 
     assert output["rank_namespace"] == "source-path::rank"
+    assert output["aggregate_scope"] == "all-input-sources"
     assert sorted(output["ranks"]) == [
         f"{ctx_log}::rank=0",
         f"{gen_log}::rank=0",
     ]
     assert output["source_aggregates"][str(ctx_log)]["event_counts"] == {"status-poll": 1}
     assert output["source_aggregates"][str(gen_log)]["event_counts"] == {"submit": 1}
+
+
+def test_multi_log_block_lookup_is_scoped_by_source(tmp_path, capsys):
+    ctx_log = tmp_path / "ctx.log"
+    gen_log = tmp_path / "gen.log"
+    ctx_log.write_text(
+        "[DISAGG_DIAG][admission] t=0 rank=0 active_blocks=0 "
+        "candidate_requests=shared:4 admitted=1 admitted_requests=shared:4 "
+        "deferred=0 deferred_requests=- budget=4\n"
+        "[DISAGG_DIAG][receiver-slot] t=0.1 rank=1 action=acquired "
+        "request=shared manager=ctx buffer=0\n"
+        "[DISAGG_DIAG][receiver-slot] t=0.2 rank=1 action=released "
+        "request=shared manager=ctx buffer=0\n",
+        encoding="utf-8",
+    )
+    gen_log.write_text(
+        "[DISAGG_DIAG][admission] t=0 rank=0 active_blocks=0 "
+        "candidate_requests=shared:2 admitted=1 admitted_requests=shared:2 "
+        "deferred=0 deferred_requests=- budget=2\n"
+        "[DISAGG_DIAG][receiver-slot] t=0.1 rank=1 action=acquired "
+        "request=shared manager=gen buffer=0\n"
+        "[DISAGG_DIAG][receiver-slot] t=0.2 rank=1 action=released "
+        "request=shared manager=gen buffer=0\n",
+        encoding="utf-8",
+    )
+
+    assert main([str(ctx_log), str(gen_log), "--indent", "0"]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["ranks"][f"{ctx_log}::rank=1"]["service"]["completed_blocks"] == 4
+    assert output["ranks"][f"{gen_log}::rank=1"]["service"]["completed_blocks"] == 2
