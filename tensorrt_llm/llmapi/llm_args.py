@@ -4918,7 +4918,9 @@ class TorchLlmArgs(BaseLlmArgs):
     checkpoint_format: Optional[str] = Field(
         default=None,
         description=
-        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P "
+        "loading path and falls back to loading the provided Hugging Face checkpoint; it does not require "
+        "converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
         "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
         "and the default HfCheckpointLoader will be used.\n"
