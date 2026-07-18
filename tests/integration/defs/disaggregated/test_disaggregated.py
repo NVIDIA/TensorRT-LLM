@@ -822,7 +822,7 @@ def setup_disagg_cluster(
                         remaining = int(server_start_timeout - elapsed)
                         print(
                             f"[startup] {elapsed}s elapsed, "
-                            f"{max(remaining, 0)}s remaining "
+                            f"{max(remaining, 0)}s left until timeout "
                             f"(timeout={server_start_timeout}s, "
                             f"workers registered: {last_worker_count}/"
                             f"{num_ctx_instances + num_gen_instances})",
