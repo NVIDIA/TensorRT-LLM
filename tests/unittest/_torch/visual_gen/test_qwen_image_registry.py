@@ -85,9 +85,7 @@ def test_qwen_image_edit_plus_pipeline_is_registered():
     """Qwen-Image-Edit checkpoints should route to the edit-plus pipeline."""
     assert "QwenImageEditPlusPipeline" in PIPELINE_REGISTRY
     assert PIPELINE_REGISTRY["QwenImageEditPlusPipeline"].pipeline_cls is QwenImageEditPlusPipeline
-    assert "Qwen/Qwen-Image-Edit-2511" in PIPELINE_REGISTRY[
-        "QwenImageEditPlusPipeline"
-    ].hf_ids
+    assert "Qwen/Qwen-Image-Edit-2511" in PIPELINE_REGISTRY["QwenImageEditPlusPipeline"].hf_ids
 
 
 def test_auto_pipeline_detects_qwen_image_edit_plus_class_name(tmp_path):
