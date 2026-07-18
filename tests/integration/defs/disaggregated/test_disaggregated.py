@@ -90,10 +90,13 @@ def cleanup_output_files():
 
 # Fatal patterns whose presence in worker/server logs after a stress run
 # indicates the cluster did not stay healthy and the test should be failed.
+# Only genuinely fatal conditions belong here — transient request-level errors
+# like "Cluster is not ready" / "Internal server error" are (a) expected during
+# the autotuner warmup phase (whose results are discarded) and (b) already
+# gated for the measured phase by incomplete_rate/server_rejected, so scanning
+# the whole log for them would false-positive on warmup churn.
 _FATAL_LOG_PATTERNS = (
     "Hang detected on rank",
-    "RuntimeError: Cluster is not ready",
-    "Internal server error",
     "out of memory",
 )
 
