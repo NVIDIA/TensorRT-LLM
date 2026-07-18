@@ -820,7 +820,7 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
-    conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+    conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
         messages, model_config)
     tools_dict = [
         tool.model_dump()

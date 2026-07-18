@@ -49,6 +49,7 @@ l0_h100:
   # function's leaves on Hopper, keep the rest of the sampler dir.
   - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_rejection_buffers_guard.py
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/thop/parallel
   - unittest/_torch/thop/parallel_hw_agnostic
