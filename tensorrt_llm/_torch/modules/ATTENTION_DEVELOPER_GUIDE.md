@@ -165,6 +165,8 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+- `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
+  contract (default `0`); see below
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -172,6 +174,18 @@ an explicit `forward_args`.
 
 Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
+
+**Workspace memory-accounting contract.** The KV-cache estimator profiles peak
+memory against an empty cache and hands the rest to the KV pool, so a workspace
+sized by a runtime quantity the profiling forward never drives to its serving
+maximum is under-reserved and can OOM mid-forward. If a backend stages such a
+buffer, declare its per-token cost via
+`runtime_workspace_bytes_per_token(model_config, mapping)` (default `0`): the
+estimator reserves it from the KV budget and the scheduler caps the driving sum.
+Keep the declared cost identical to the runtime allocation's (single source of
+truth). The one instance today is the fp8 context-MLA K/V dequant workspace,
+sized by summed attended KV length (`total_kv_len`) — which KV-cache reuse
+decouples from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
 
 ### 2.4 Capability reference
 
@@ -282,6 +296,9 @@ agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
 context behavior. Read `mla.py` and the relevant
 backend code for the current implementation details.
 
+fp8 context-MLA also stages a K/V dequant workspace sized by summed attended KV
+length; it is declared through the workspace memory-accounting contract (§2.3).
+
 #### 3.2.4 Sparse side-cache semantics
 
 Sparse backends may add side caches beyond the main KV cache. Some sparse
@@ -334,6 +351,11 @@ as the current blocker.
   How K/V are appended, what layout is assumed, how cached state is indexed and
   reused, whether chunked prefill or speculative decoding matters, and whether
   sparse side caches are required.
+
+- **Workspace memory accounting**
+  Whether the backend stages a workspace sized by a runtime quantity the KV-cache
+  profiler does not max out (e.g. `total_kv_len` under reuse) — if so, declare it
+  via `runtime_workspace_bytes_per_token` (§2.3).
 
 ### 4.3 Default bring-up order
 

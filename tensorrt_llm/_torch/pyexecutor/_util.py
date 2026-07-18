@@ -219,6 +219,21 @@ class CacheCost:
         return self.slope * tokens + self.intercept
 
 
+def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
+    """Per-token workspace headroom the model's selected attention backend declares.
+
+    The KV-cache profiling forward under-measures any attention workspace sized by a runtime quantity it
+    does not drive to its serving maximum (e.g. ``total_kv_len``, inflated by KV reuse). Backends declare
+    such a buffer via ``AttentionBackend.runtime_workspace_bytes_per_token``; this resolves the model's
+    backend and returns its rate. The result is both the estimator's reserve rate and the scheduler's
+    admission-cap signal (0 == no reservation, no cap). See ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
+    """
+    from ..attention_backend.utils import get_attention_backend
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_bytes_per_token(
+            model_config, mapping)
+
+
 def is_vswa_enabled(kv_cache_config):
     max_attention_window = kv_cache_config.max_attention_window
     return max_attention_window is not None and len(
@@ -912,6 +927,31 @@ class KvCacheCreator:
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+
+        # Reserve headroom for the fp8 context-MLA attention workspace, which scales with the summed
+        # attended KV length (total_kv_len) and is under-measured by the profiling forward (fresh-prefill
+        # dummies never exercise KV reuse). Split the KV budget between the pool (k bytes/token, all layers)
+        # and the workspace (w bytes/token, one shared layer buffer) at a common token count, so the
+        # resulting max_tokens equals the admission cap the scheduler enforces on summed attended KV.
+        #   pool = cap * k, workspace = cap * w, pool + workspace = budget  =>  cap = budget / (k + w)
+        # This over-reserves slightly (the profiled peak already contains the workspace floor); over-
+        # reserving is the safe direction. w == 0 for non-MLA / non-fp8-KV / sparse models -> no-op.
+        w_bytes_per_token = get_attention_workspace_bytes_per_token(
+            self._model_engine.model.model_config, self._mapping)
+        if w_bytes_per_token > 0:
+            k_bytes_per_token = self._get_kv_size_per_token().slope
+            if k_bytes_per_token > 0:
+                budget_before = kv_cache_max_memory
+                kv_cache_max_memory = int(
+                    kv_cache_max_memory * k_bytes_per_token /
+                    (k_bytes_per_token + w_bytes_per_token))
+                logger.info(
+                    f"Reserving {(budget_before - kv_cache_max_memory) / (GB):.2f} GiB for the fp8 "
+                    f"context-MLA attention workspace (w={w_bytes_per_token} B/token vs KV "
+                    f"k={k_bytes_per_token} B/token): KV cache budget "
+                    f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB. The scheduler "
+                    f"caps summed context total_kv_len at the resulting max_tokens."
+                )
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
