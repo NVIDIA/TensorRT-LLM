@@ -14,6 +14,9 @@
 # limitations under the License.
 import os
 import platform
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
@@ -69,6 +72,23 @@ def get_version():
 
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
+
+    # For develop / editable installs (`pip install -e .` or
+    # `python setup.py develop`), append the git commit hash as a PEP 440
+    # local version segment so the installed package is identifiable,
+    # e.g. "1.3.0rc21+58d8964d13".
+    is_develop = any(arg in sys.argv for arg in ("develop", "editable_wheel"))
+    if is_develop:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=10", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            commit = ""
+        commit = re.sub(r"[^A-Za-z0-9.]", "", commit)
+        if commit:
+            version = f"{version}+{commit}"
 
     return version
 
