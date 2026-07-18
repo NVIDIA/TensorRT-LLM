@@ -136,7 +136,6 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     def warmup_cache_key(self, height: Optional[int], width: Optional[int], **kwargs) -> tuple:
         return (height, width)
 
-
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         from PIL import Image
 
@@ -400,9 +399,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
             prompt = [prompt]
         batch_size = len(prompt)
         if batch_size > 1:
-            raise ValueError(
-                "QwenImageEditPlusPipeline currently supports one prompt at a time."
-            )
+            raise ValueError("QwenImageEditPlusPipeline currently supports one prompt at a time.")
 
         condition_images, vae_images, vae_image_sizes = self._preprocess_edit_images(pil_images)
         device = self.device

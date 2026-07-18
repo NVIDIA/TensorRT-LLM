@@ -1850,7 +1850,7 @@ def test_qwen_image_edit_example(_visual_gen_deps, llm_root, llm_venv):
     ``configs/qwen-image-edit-2511-bf16-1gpu.yaml`` work together as documented.
     """
     model_path = os.environ.get("QWEN_IMAGE_EDIT_MODEL_PATH") or os.path.join(
-        conftest.llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
+        _llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
     )
     _skip_if_missing(model_path, "Qwen-Image-Edit-2511 checkpoint", is_dir=True)
     model_index_path = os.path.join(model_path, "model_index.json")
@@ -1875,7 +1875,7 @@ def test_qwen_image_edit_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
     assert os.path.isfile(image_path), f"Input image not found: {image_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
