@@ -149,6 +149,7 @@ def build_worker_config(base_config: dict[str, Any],
     EXCLUDE_FROM_WORKER = {
         'hostname',
         'port',
+        'num_workers',
         'num_instances',
         'urls',
         'router',
@@ -206,6 +207,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_load_balancing.yaml",
         "conversation":
         f"{test_configs_root}/disagg_config_conversation.yaml",
+        "multi_orchestrator":
+        f"{test_configs_root}/disagg_config_multi_orchestrator.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "cuda_graph":
@@ -653,7 +656,16 @@ def setup_disagg_cluster(
     else:
         work_dir = tempfile.mkdtemp()
     logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
-    disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
+    server_env = env
+    coordinator_url = f"http://{server_host}:{server_port}"
+    if config.get("num_workers", 1) > 1:
+        coordinator_port = get_free_port()
+        while coordinator_port == server_port:
+            coordinator_port = get_free_port()
+        coordinator_url = f"http://{server_host}:{coordinator_port}"
+        server_env = (env or os.environ).copy()
+        server_env["TRTLLM_DISAGG_COORDINATOR_PORT"] = str(coordinator_port)
+    disagg_cluster["cluster_uri"] = coordinator_url
 
     # Auto-deduce minimal_instances from num_instances
     ctx_servers = config.get("context_servers", {})
@@ -734,6 +746,8 @@ def setup_disagg_cluster(
             server_host,
             "port":
             server_port,
+            "num_workers":
+            config.get("num_workers", 1),
             "disagg_cluster":
             disagg_cluster,
             "context_servers": {
@@ -753,7 +767,7 @@ def setup_disagg_cluster(
                                           work_dir,
                                           server_port,
                                           save_log=save_log,
-                                          env=env,
+                                          env=server_env,
                                           cwd=cwd)
 
         all_workers = ctx_workers + gen_workers
@@ -970,6 +984,24 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
     env["CUDA_VISIBLE_DEVICES"] = "0"
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
+                                                    disaggregated_example_root,
+                                                    llm_venv, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    run_disaggregated_test(disaggregated_example_root,
+                           "multi_orchestrator",
+                           num_iters=1,
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
