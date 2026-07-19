@@ -282,6 +282,8 @@ private:
     // Default-off, transition-only lifecycle tracing for NVBUG#6448152.
     int mWorldRank;
     bool mNvbug6448152TraceEnabled;
+    // Diagnostic-only CTX status behavior for NVBUG#6448152.
+    bool mNvbug6448152CtxLegacyStatusEnabled;
     std::uint64_t mNvbug6448152ContextCheckSequence{0};
     std::uint64_t mNvbug6448152ContextTpConsensusSequence{0};
     std::uint64_t mNvbug6448152ContextPpConsensusSequence{0};

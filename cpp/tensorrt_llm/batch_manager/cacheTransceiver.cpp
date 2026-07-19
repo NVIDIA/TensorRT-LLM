@@ -76,6 +76,11 @@ bool isNvbug6448152TraceEnabled()
     return common::getBoolEnv("TRTLLM_NVBUG_6448152_TRACE");
 }
 
+bool isNvbug6448152CtxLegacyStatusEnabled()
+{
+    return common::getBoolEnv("TRTLLM_NVBUG_6448152_CTX_LEGACY_STATUS");
+}
+
 enum class TransferConsensusState : std::uint64_t
 {
     kCompleted = 1,
@@ -286,6 +291,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     rnn_state_manager::RnnStateManager* rnnStateManager, std::vector<SizeType32> const& rnnLayerNumPerPP)
     : mWorldRank{worldConfig.getRank()}
     , mNvbug6448152TraceEnabled{isNvbug6448152TraceEnabled()}
+    , mNvbug6448152CtxLegacyStatusEnabled{isNvbug6448152CtxLegacyStatusEnabled()}
     , mCacheTransceiverConfig{cacheTransceiverConfig}
     , mRnnStateManager{rnnStateManager}
 {
@@ -749,6 +755,13 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     if (mNvbug6448152TraceEnabled)
     {
         contextCheckSequence = ++mNvbug6448152ContextCheckSequence;
+        if (mNvbug6448152CtxLegacyStatusEnabled && contextCheckSequence == 1)
+        {
+            TLLM_LOG_WARNING(
+                "NVBUG6448152_DIAG event=ctx_legacy_status_active side=ctx rank=%d "
+                "outcome_consensus=disabled gen_status=unchanged",
+                mWorldRank);
+        }
         enqueuedTransitionCount = mNvbug6448152ContextEnqueuedTransitionCount;
         mNvbug6448152ContextEnqueuedTransitionCount = 0;
         periodicConsensusCheckpoint
@@ -820,9 +833,11 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    RequestStatuses requestsStatus{};
+
     // Record local terminal outcomes for requests selected this round. The
     // request is reported only after all ranks in the sync group agree that the
-    // request reached a terminal state.
+    // request reached a terminal state, unless the diagnostic legacy mode is enabled.
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
@@ -849,7 +864,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
                     long elapsedMs = 0;
                     if (mNvbug6448152TraceEnabled)
                     {
@@ -857,8 +871,23 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                             LlmRequest::getSteadyClockNow() - request->getKvCacheTransferStart());
                         elapsedMs = static_cast<long>(elapsed.count());
                     }
-                    recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    bool const failed = !mNvbug6448152CtxLegacyStatusEnabled
+                        && request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    if (mNvbug6448152CtxLegacyStatusEnabled)
+                    {
+                        requestsStatus.completedRequestIds.insert(requestId);
+                        if (markComplete)
+                        {
+                            request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                        }
+                        mTimedOutSenderIds.erase(requestId);
+                        mNvbug6448152SenderWaitTimeoutIds.erase(requestId);
+                    }
+                    else
+                    {
+                        recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
+                            mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    }
                     it = mSenderFutures.erase(it);
                     if (mNvbug6448152TraceEnabled)
                     {
@@ -895,11 +924,22 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else
                 {
-                    TLLM_LOG_ERROR(
-                        "Future returned unexpected status for request %ld. Recording as failed.", requestId);
-
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    if (mNvbug6448152CtxLegacyStatusEnabled)
+                    {
+                        TLLM_LOG_ERROR(
+                            "Future returned unexpected status for request %ld. Marking as error.", requestId);
+                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                        requestsStatus.errorRequestIds.insert(requestId);
+                        mTimedOutSenderIds.erase(requestId);
+                        mNvbug6448152SenderWaitTimeoutIds.erase(requestId);
+                    }
+                    else
+                    {
+                        TLLM_LOG_ERROR(
+                            "Future returned unexpected status for request %ld. Recording as failed.", requestId);
+                        recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
+                            mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                    }
                     it = mSenderFutures.erase(it);
                     if (mNvbug6448152TraceEnabled)
                     {
@@ -918,8 +958,18 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                if (mNvbug6448152CtxLegacyStatusEnabled)
+                {
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    requestsStatus.errorRequestIds.insert(requestId);
+                    mTimedOutSenderIds.erase(requestId);
+                    mNvbug6448152SenderWaitTimeoutIds.erase(requestId);
+                }
+                else
+                {
+                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
+                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                }
                 it = mSenderFutures.erase(it);
                 if (mNvbug6448152TraceEnabled)
                 {
@@ -940,7 +990,11 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         }
     }
 
-    RequestStatuses requestsStatus{};
+    if (mNvbug6448152CtxLegacyStatusEnabled)
+    {
+        return requestsStatus;
+    }
+
     TransferConsensusOutcome consensusOutcome;
     std::uint64_t tpConsensusSequence = 0;
     std::uint64_t ppConsensusSequence = 0;
