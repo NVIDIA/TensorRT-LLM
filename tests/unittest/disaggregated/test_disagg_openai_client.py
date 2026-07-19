@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
-from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+from tensorrt_llm.serve.openai_client import OpenAIHttpClient, UpstreamRequestTimeoutError
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -231,6 +232,135 @@ class TestOpenAIHttpClient:
         )
 
     @pytest.mark.asyncio
+    async def test_timeout_is_not_retried(
+        self, openai_client, completion_request, mock_session, mock_router
+    ):
+        """A completed timeout budget must not replay upstream work."""
+        mock_session.post.side_effect = asyncio.TimeoutError()
+
+        with pytest.raises(UpstreamRequestTimeoutError, match="180-second timeout"):
+            await openai_client.send_request(completion_request)
+
+        mock_session.post.assert_called_once()
+        mock_router.finish_request.assert_called_once_with(
+            completion_request, mock_session, success=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_upstream_504_is_not_retried(
+        self, openai_client, completion_request, mock_session, mock_router
+    ):
+        """A worker timeout response must retain timeout semantics."""
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 504
+        mock_http_response.reason = "Gateway Timeout"
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.text = AsyncMock(return_value="worker deadline expired")
+        mock_http_response.request_info = MagicMock()
+        mock_http_response.history = ()
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post.return_value = mock_http_response
+
+        with pytest.raises(UpstreamRequestTimeoutError, match="worker deadline expired"):
+            await openai_client.send_request(completion_request)
+
+        mock_session.post.assert_called_once()
+        mock_router.finish_request.assert_called_once_with(
+            completion_request, mock_session, success=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncated_upstream_504_body_is_not_retried(
+        self, openai_client, completion_request, mock_session, mock_router
+    ):
+        """A broken timeout body must not make a known 504 retryable."""
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 504
+        mock_http_response.reason = "Gateway Timeout"
+        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.text = AsyncMock(
+            side_effect=aiohttp.ClientPayloadError("truncated body")
+        )
+        mock_http_response.request_info = MagicMock()
+        mock_http_response.history = ()
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post.return_value = mock_http_response
+
+        with pytest.raises(UpstreamRequestTimeoutError, match="180-second timeout"):
+            await openai_client.send_request(completion_request)
+
+        mock_session.post.assert_called_once()
+        mock_router.finish_request.assert_called_once_with(
+            completion_request, mock_session, success=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_request_releases_router_once(
+        self, openai_client, completion_request, mock_session, mock_router
+    ):
+        """Task cancellation must not bypass router cleanup."""
+        mock_session.post.side_effect = asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await openai_client.send_request(completion_request)
+
+        mock_session.post.assert_called_once()
+        mock_router.finish_request.assert_called_once_with(
+            completion_request, mock_session, success=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_closed_stream_is_not_recorded_as_success(
+        self,
+        openai_client,
+        streaming_completion_request,
+        mock_session,
+        mock_router,
+    ):
+        """Closing a partially consumed stream records failed cleanup once."""
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+
+        async def mock_iter_any():
+            yield b'data: "first"\n\n'
+            await asyncio.Event().wait()
+
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+
+        response_generator = await openai_client.send_request(streaming_completion_request)
+        assert await response_generator.__anext__() == b'data: "first"\n\n'
+        await response_generator.aclose()
+
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_unstarted_stream_releases_router_once(
+        self,
+        openai_client,
+        streaming_completion_request,
+        mock_session,
+        mock_router,
+    ):
+        """Closing before the first chunk must still release the reservation."""
+        response_generator = await openai_client.send_request(streaming_completion_request)
+        await response_generator.aclose()
+        assert await response_generator.athrow(RuntimeError("closed")) is None
+
+        mock_session.post.assert_not_called()
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=False
+        )
+
+    @pytest.mark.asyncio
     async def test_request_with_retry(
         self, openai_client, completion_request, mock_session, mock_router
     ):
@@ -270,6 +400,19 @@ class TestOpenAIHttpClient:
         # Should try max_retries + 1 times
         assert mock_session.post.call_count == openai_client._max_retries + 1
         mock_router.finish_request.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_max_retries_zero_does_not_retry_disconnect(
+        self, openai_client, completion_request, mock_session
+    ):
+        """Configured zero retries must not replay ambiguous upstream work."""
+        openai_client._max_retries = 0
+        mock_session.post.side_effect = aiohttp.ServerDisconnectedError()
+
+        with pytest.raises(aiohttp.ServerDisconnectedError):
+            await openai_client.send_request(completion_request)
+
+        mock_session.post.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_invalid_request_type(self, openai_client):
@@ -423,146 +566,3 @@ class TestDisaggIdRegenOnRetry:
             await client.send_request(req)
 
         assert req.disaggregated_params.disagg_request_id == 42
-
-
-class TestSelectiveTransientTcpRetry:
-    """Selective retry budget for transient TCP race symptoms.
-
-    ServerDisconnectedError and ConnectionResetError (which include
-    aiohttp.ClientConnectionResetError via MRO) get an extended retry budget
-    of up to 5 attempts; all other client errors keep the original
-    max_retries fail-fast behaviour.
-    """
-
-    def _ok_response(self):
-        return CompletionResponse(
-            id="cmpl-1",
-            object="text_completion",
-            created=0,
-            model="m",
-            choices=[CompletionResponseChoice(index=0, text="ok", finish_reason="stop")],
-            usage=UsageInfo(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-        )
-
-    def _mock_http_ok(self, body):
-        r = AsyncMock()
-        r.status = 200
-        r.headers = {"Content-Type": "application/json"}
-        r.json = AsyncMock(return_value=body.model_dump())
-        r.__aenter__ = AsyncMock(return_value=r)
-        r.__aexit__ = AsyncMock()
-        return r
-
-    def _make_client(self, session, max_retries=1):
-        from prometheus_client.registry import REGISTRY
-
-        REGISTRY._names_to_collectors = {}
-        REGISTRY._collector_to_names = {}
-        router = AsyncMock(spec=Router)
-        router.servers = ["localhost:8000"]
-        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
-        router.finish_request = AsyncMock()
-        return OpenAIHttpClient(
-            router=router,
-            role=ServerRole.CONTEXT,
-            timeout_secs=10,
-            max_retries=max_retries,
-            retry_interval_sec=0,
-            session=session,
-        )
-
-    def _make_request(self):
-        return CompletionRequest(
-            model="m",
-            prompt="hi",
-            stream=False,
-            disaggregated_params=DisaggregatedParams(
-                request_type="context_only", disagg_request_id=1
-            ),
-        )
-
-    @pytest.mark.asyncio
-    async def test_server_disconnected_gets_extra_retries(self):
-        """ServerDisconnectedError: even with max_retries=1, retry up to 5."""
-        session = AsyncMock(spec=aiohttp.ClientSession)
-        client = self._make_client(session, max_retries=1)
-
-        # 4 disconnect failures then success on the 5th attempt
-        session.post.side_effect = [
-            aiohttp.ServerDisconnectedError(),
-            aiohttp.ServerDisconnectedError(),
-            aiohttp.ServerDisconnectedError(),
-            aiohttp.ServerDisconnectedError(),
-            self._mock_http_ok(self._ok_response()),
-        ]
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            await client.send_request(self._make_request())
-
-        # 1 original + 4 retries = 5 total attempts (extra budget kicked in)
-        assert session.post.call_count == 5
-
-    @pytest.mark.asyncio
-    async def test_connection_reset_gets_extra_retries(self):
-        """ConnectionResetError: same extra budget as ServerDisconnectedError."""
-        session = AsyncMock(spec=aiohttp.ClientSession)
-        client = self._make_client(session, max_retries=1)
-
-        session.post.side_effect = [
-            ConnectionResetError(),
-            ConnectionResetError(),
-            self._mock_http_ok(self._ok_response()),
-        ]
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            await client.send_request(self._make_request())
-
-        # 1 original + 2 retries = 3 total attempts (within extra budget)
-        assert session.post.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_other_client_error_keeps_fail_fast(self):
-        """Generic aiohttp.ClientError still respects max_retries (=1)."""
-        session = AsyncMock(spec=aiohttp.ClientSession)
-        client = self._make_client(session, max_retries=1)
-
-        session.post.side_effect = aiohttp.ClientError("transient non-tcp")
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            with pytest.raises(aiohttp.ClientError):
-                await client.send_request(self._make_request())
-
-        # Original + 1 retry = 2 attempts, NOT promoted to 5
-        assert session.post.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_max_retries_zero_still_gets_transient_tcp_budget(self):
-        """Even when max_retries=0, transient TCP races still retry up to 5."""
-        session = AsyncMock(spec=aiohttp.ClientSession)
-        client = self._make_client(session, max_retries=0)
-
-        session.post.side_effect = [
-            aiohttp.ServerDisconnectedError(),
-            self._mock_http_ok(self._ok_response()),
-        ]
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            await client.send_request(self._make_request())
-
-        assert session.post.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_transient_tcp_capped_at_5_when_max_retries_smaller(self):
-        """If transient TCP keeps failing, give up after the extended budget."""
-        session = AsyncMock(spec=aiohttp.ClientSession)
-        client = self._make_client(session, max_retries=1)
-
-        # Always raise — must give up after extended (1 + 5) = 6 attempts
-        session.post.side_effect = aiohttp.ServerDisconnectedError()
-
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            with pytest.raises(aiohttp.ServerDisconnectedError):
-                await client.send_request(self._make_request())
-
-        # 1 original + 5 retries
-        assert session.post.call_count == 6

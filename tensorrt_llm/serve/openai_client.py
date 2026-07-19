@@ -17,7 +17,7 @@ import asyncio
 import os
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, cast
 
 import aiohttp
 
@@ -56,6 +56,88 @@ if _MSGSPEC_ENABLED:
             "(listed in requirements.txt)."
         ) from exc
     _msgpack_encoder = msgspec.msgpack.Encoder()
+
+
+class UpstreamRequestTimeoutError(TimeoutError):
+    """An orchestrator request to a disaggregated worker timed out."""
+
+    def __init__(self, role: ServerRole, timeout_secs: int, detail: Optional[str] = None):
+        self.role = role
+        self.timeout_secs = timeout_secs
+        message = (
+            f"{role.name.lower()} worker request exceeded the configured "
+            f"{timeout_secs}-second timeout"
+        )
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
+
+
+class _ManagedResponseStream:
+    """Own router cleanup even when a response stream is never started."""
+
+    def __init__(self, client, request, resp_generator, req_id: Optional[int] = None):
+        self._client = client
+        self._request = request
+        self._resp_generator = resp_generator
+        self._req_id = req_id
+        self._cleanup_lock = asyncio.Lock()
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.asend(None)
+
+    async def asend(self, value):
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            return await self._resp_generator.asend(value)
+        except StopAsyncIteration:
+            await self._finish(success=True)
+            raise
+        except asyncio.CancelledError:
+            await self._finish(success=False)
+            raise
+        except Exception:
+            await self._finish(success=False)
+            raise
+
+    async def athrow(self, *args):
+        if self._closed:
+            return None
+        try:
+            return await self._resp_generator.athrow(*args)
+        except (StopAsyncIteration, GeneratorExit):
+            await self._finish(success=False)
+            raise
+        except asyncio.CancelledError:
+            await self._finish(success=False)
+            raise
+        except Exception:
+            await self._finish(success=False)
+            raise
+
+    async def aclose(self):
+        await self._finish(success=False)
+
+    async def _finish(self, success: bool) -> None:
+        async with self._cleanup_lock:
+            if self._closed:
+                return
+            if not success:
+                self._client._metrics_collector.error_requests.inc()
+            try:
+                await self._client._cleanup_request_safely(
+                    self._request,
+                    self._resp_generator,
+                    success=success,
+                    req_id=self._req_id,
+                )
+            finally:
+                self._closed = True
 
 
 class OpenAIClient(ABC):
@@ -150,6 +232,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
         self._disagg_id_generator = disagg_id_generator
+        self._timeout_secs = timeout_secs
 
     async def _send_request(
         self,
@@ -160,38 +243,78 @@ class OpenAIHttpClient(OpenAIClient):
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
-        if server is None:
-            if req_id is None:
-                server, _ = await self._router.get_next_server(request)
-            else:
-                server, _ = await self._router.get_next_server(request, req_id=req_id)
-        url = f"http://{server}/{endpoint}"
-        # disaggregated_params is None when conditional_disagg bypasses ctx.
-        _dp = request.disaggregated_params
-        _ctx_rid = _dp.ctx_request_id if _dp is not None else None
-        logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
+        self._metrics_collector.total_requests.inc()
+        resp_generator = None
+        cleanup_deferred = False
+        success = False
         try:
-            self._metrics_collector.total_requests.inc()
+            if server is None:
+                if req_id is None:
+                    server, _ = await self._router.get_next_server(request)
+                else:
+                    server, _ = await self._router.get_next_server(request, req_id=req_id)
+            url = f"http://{server}/{endpoint}"
+            # disaggregated_params is None when conditional_disagg bypasses ctx.
+            _dp = request.disaggregated_params
+            _ctx_rid = _dp.ctx_request_id if _dp is not None else None
+            logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
             resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
             if request.stream:
-                # return the response generator, the request is not done yet
-                return resp_generator
-            else:
-                # consume the generator to get the response and return it directly when it's not streaming
-                response = None
-                async for resp_json in resp_generator:
-                    response = response_type(**resp_json)
-                    if hooks:
-                        if self._role == ServerRole.CONTEXT:
-                            hooks.on_ctx_resp(server, response)
-                        else:
-                            hooks.on_first_token(server, request)
-                            hooks.on_resp_done(server, request, response)
-                return response
+                # The POST is lazy for streaming requests. Keep cleanup around
+                # the generator so cancellation releases the router reservation.
+                response_stream = cast(
+                    UCompletionResponseOrGenerator,
+                    _ManagedResponseStream(self, request, resp_generator, req_id),
+                )
+                cleanup_deferred = True
+                return response_stream
+
+            response = None
+            async for resp_json in resp_generator:
+                response = response_type(**resp_json)
+                if hooks:
+                    if self._role == ServerRole.CONTEXT:
+                        hooks.on_ctx_resp(server, response)
+                    else:
+                        hooks.on_first_token(server, request)
+                        hooks.on_resp_done(server, request, response)
+            success = True
+            return response
+        except asyncio.CancelledError:
+            self._metrics_collector.error_requests.inc()
+            raise
         except Exception:
             self._metrics_collector.error_requests.inc()
-            # finish the request upon error
-            await self._finish_request(request, success=False, req_id=req_id)
+            raise
+        finally:
+            if not cleanup_deferred:
+                await self._cleanup_request_safely(
+                    request, resp_generator, success=success, req_id=req_id
+                )
+
+    async def _cleanup_request_safely(
+        self,
+        request: UCompletionRequest,
+        resp_generator: Optional[AsyncGenerator[Any, None]],
+        success: bool,
+        req_id: Optional[int] = None,
+    ) -> None:
+        """Complete response and router cleanup before propagating cancellation."""
+
+        async def cleanup() -> None:
+            try:
+                if resp_generator is not None:
+                    await resp_generator.aclose()
+            finally:
+                await self._finish_request(request, success=success, req_id=req_id)
+
+        cleanup_task = asyncio.create_task(cleanup())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            # The parent deadline may race the aiohttp timeout. Preserve the
+            # router lease until cleanup finishes, then propagate cancellation.
+            await cleanup_task
             raise
 
     async def _post_with_retry(
@@ -203,13 +326,7 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
-        # Loop range must cover the transient-TCP extended budget (up to 5)
-        # so the conditional raise inside the except block can actually decide
-        # to keep retrying.  Non-transient errors still raise on the first
-        # attempt that reaches self._max_retries.
-        _TRANSIENT_TCP_BUDGET = 5
-        loop_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET) + 1
-        for attempt in range(loop_max):
+        for attempt in range(self._max_retries + 1):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -236,6 +353,36 @@ class OpenAIHttpClient(OpenAIClient):
                     headers=req_headers,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
+                    if http_response.status >= 400:
+                        if http_response.status == 504:
+                            try:
+                                error_body = await http_response.text()
+                            except (
+                                aiohttp.ClientError,
+                                asyncio.TimeoutError,
+                                OSError,
+                                UnicodeError,
+                            ) as e:
+                                # The HTTP status is authoritative. A truncated
+                                # timeout body must not turn a known 504 into a
+                                # retryable transport error and replay work.
+                                logger.warning(
+                                    f"Failed to read {self._role} timeout body from {url}: {e}"
+                                )
+                                error_body = ""
+                            raise UpstreamRequestTimeoutError(
+                                self._role,
+                                self._timeout_secs,
+                                detail=error_body[:2048],
+                            )
+                        error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -250,24 +397,20 @@ class OpenAIHttpClient(OpenAIClient):
                             yield line
                         # don't finish the request here since the response generator is not done yet
                     else:
-                        if http_response.status >= 400:
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
-                        # finish the request after the successful response
-                        await self._finish_request(request, req_id=req_id)
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
                         )
                 break  # break and skip retries if the whole response is processed without exception
+            except UpstreamRequestTimeoutError:
+                raise
+            except asyncio.TimeoutError as e:
+                logger.error(
+                    f"{self._role} request to {url} timed out after {self._timeout_secs} seconds"
+                )
+                raise UpstreamRequestTimeoutError(self._role, self._timeout_secs) from e
             except (aiohttp.ClientError, OSError) as e:
                 if lines_yielded > 0:
                     logger.error(
@@ -275,27 +418,16 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
-                # Selective retry budget: ServerDisconnectedError and
-                # ConnectionResetError are transient TCP races (typically at
-                # burst start when client keepalive vs server keepalive race).
-                # Give them an extended retry budget while preserving the
-                # original fail-fast for genuine upstream errors.
-                is_transient_tcp = isinstance(
-                    e,
-                    (aiohttp.ServerDisconnectedError, ConnectionResetError),
-                )
-                effective_max = self._max_retries
-                if is_transient_tcp:
-                    effective_max = max(self._max_retries, _TRANSIENT_TCP_BUDGET)
-                if attempt >= effective_max:
+                if attempt >= self._max_retries:
                     logger.error(
-                        f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
-                        "failed",
+                        f"Client error to {url}: {e} - last retry {attempt} of "
+                        f"{self._max_retries} failed",
                         traceback.format_exc(),
                     )
                     raise
                 logger.error(
-                    f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
+                    f"{self._role} client error to {url}: {e} - retry {attempt} "
+                    f"of {self._max_retries}",
                     traceback.format_exc(),
                 )
                 await asyncio.sleep(self._retry_interval_sec)
@@ -319,7 +451,6 @@ class OpenAIHttpClient(OpenAIClient):
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
-        success = True
         try:
             last_token_time = start_time
             i = 0
@@ -349,16 +480,7 @@ class OpenAIHttpClient(OpenAIClient):
         except aiohttp.ClientError as e:
             # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
-            self._metrics_collector.error_requests.inc()
-            success = False
             raise
-        except Exception:
-            self._metrics_collector.error_requests.inc()
-            success = False
-            raise
-        finally:
-            # finish the request after streaming response is done or error is raised
-            await self._finish_request(request, success=success, req_id=req_id)
 
     async def _finish_request(
         self,

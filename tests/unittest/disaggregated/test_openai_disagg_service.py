@@ -102,6 +102,16 @@ async def test_conditional_disagg_uses_selected_server_match_length():
     assert need_context is False
 
 
+def _make_conditional_context_first_service() -> OpenAIDisaggregatedService:
+    service = _make_service("context_first")
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=0)
+    gen_router = AsyncMock(spec=KvCacheAwareRouter)
+    service._gen_router = gen_router
+    service._coordinator._gen_router = gen_router
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    return service
+
+
 def _make_completion_response(
     text: str,
     finish_reason: str,
@@ -461,6 +471,403 @@ async def test_context_retry_preserves_generation_reservation_id():
     gen_call = service._gen_client.send_request.call_args
     assert gen_call.kwargs["req_id"] == 101
     assert gen_call.args[0].disaggregated_params.ctx_request_id == 202
+
+
+@pytest.mark.asyncio
+async def test_gen_first_streaming_cancellation_closes_gen_consumer():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+
+    ctx_started = asyncio.Event()
+    gen_started = asyncio.Event()
+    gen_release = asyncio.Event()
+    gen_closed = asyncio.Event()
+
+    async def _ctx_response(*_args, **_kwargs):
+        ctx_started.set()
+        await asyncio.Event().wait()
+
+    async def _gen_response(*_args, **_kwargs):
+        async def _stream():
+            try:
+                gen_started.set()
+                await gen_release.wait()
+                yield b"data: chunk\n\n"
+            finally:
+                gen_closed.set()
+
+        return _stream()
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    request_task = asyncio.create_task(service._send_disagg_request(request))
+    await asyncio.wait_for(ctx_started.wait(), timeout=1)
+    await asyncio.wait_for(gen_started.wait(), timeout=1)
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    closed_by_service = gen_closed.is_set()
+    if not closed_by_service:
+        gen_release.set()
+        await asyncio.wait_for(gen_closed.wait(), timeout=1)
+    assert closed_by_service
+
+
+@pytest.mark.asyncio
+async def test_gen_first_streaming_cancellation_closes_unstarted_gen_consumer():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+
+    class LazyStream:
+        def __init__(self):
+            self.started = False
+            self.close_count = 0
+
+        def __aiter__(self):
+            self.started = True
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            self.close_count += 1
+
+    gen_response = LazyStream()
+    service._gen_client.send_request = AsyncMock(return_value=gen_response)
+    service._ctx_client.send_request = AsyncMock(side_effect=asyncio.CancelledError)
+
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    with pytest.raises(asyncio.CancelledError):
+        await service._send_disagg_request(request)
+
+    assert not gen_response.started
+    assert gen_response.close_count == 1
+
+
+@pytest.mark.asyncio
+async def test_gen_first_releases_ctx_reservation_before_ctx_dispatch():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    gen_started = asyncio.Event()
+
+    async def _gen_response(*_args, **_kwargs):
+        gen_started.set()
+        await asyncio.Event().wait()
+
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+    request = CompletionRequest(model="test-model", prompt="hello", stream=True)
+    request_task = asyncio.create_task(service._send_disagg_request(request))
+    await asyncio.wait_for(gen_started.wait(), timeout=1)
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    service._ctx_client.send_request.assert_not_awaited()
+    route_call = service._ctx_router.get_next_server.await_args
+    routed_ctx_request = route_call.args[0]
+    service._ctx_router.finish_request.assert_awaited_once_with(
+        routed_ctx_request,
+        success=False,
+        req_id=route_call.kwargs["req_id"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_ctx_first_releases_ctx_reservation_during_placement():
+    service = _make_service("context_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._check_conditional_disagg = AsyncMock(return_value=(None, True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    placement_started = asyncio.Event()
+
+    async def _place_ctx(*_args, **_kwargs):
+        placement_started.set()
+        await asyncio.Event().wait()
+
+    service._ctx_router.get_next_server = AsyncMock(side_effect=_place_ctx)
+    request = CompletionRequest(model="test-model", prompt="hello")
+    request_task = asyncio.create_task(service._send_disagg_request(request))
+    await asyncio.wait_for(placement_started.wait(), timeout=1)
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    route_call = service._ctx_router.get_next_server.await_args
+    service._ctx_router.finish_request.assert_awaited_once_with(
+        route_call.args[0],
+        success=False,
+        req_id=route_call.kwargs["req_id"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_ctx_first_releases_gen_reservation_during_placement():
+    service = _make_service("context_first")
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._check_conditional_disagg = AsyncMock(return_value=(None, True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(
+        return_value=_make_completion_response("", finish_reason="length")
+    )
+    placement_started = asyncio.Event()
+
+    async def _place_gen(*_args, **_kwargs):
+        placement_started.set()
+        await asyncio.Event().wait()
+
+    service._gen_router.get_next_server = AsyncMock(side_effect=_place_gen)
+    request = CompletionRequest(model="test-model", prompt="hello")
+    request_task = asyncio.create_task(service._send_disagg_request(request))
+    await asyncio.wait_for(placement_started.wait(), timeout=1)
+
+    request_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request_task
+
+    route_call = service._gen_router.get_next_server.await_args
+    service._gen_router.finish_request.assert_awaited_once_with(
+        route_call.args[0],
+        success=False,
+        req_id=route_call.kwargs["req_id"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_ctx_first_attempts_all_reservation_cleanup_on_cancellation():
+    service = _make_service("context_first")
+    request = CompletionRequest(model="test-model", prompt="hello")
+
+    async def canceled_impl(_request, _hooks, ctx_reservation, gen_reservation):
+        ctx_reservation.mark_pending(request, req_id=101)
+        gen_reservation.mark_pending(request, req_id=101)
+        raise asyncio.CancelledError
+
+    service._send_disagg_request_ctx_first_impl = AsyncMock(side_effect=canceled_impl)
+    service._ctx_router.finish_request.side_effect = RuntimeError("ctx cleanup failed")
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._send_disagg_request_ctx_first(request)
+
+    service._ctx_router.finish_request.assert_awaited_once_with(request, success=False, req_id=101)
+    service._gen_router.finish_request.assert_awaited_once_with(request, success=False, req_id=101)
+
+
+@pytest.mark.asyncio
+async def test_teardown_attempts_all_components_after_client_failure():
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.shutdown.side_effect = RuntimeError("ctx shutdown failed")
+    service._coordinator.stop = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="ctx shutdown failed"):
+        await service.teardown()
+
+    service._ctx_client.shutdown.assert_awaited_once()
+    service._gen_client.shutdown.assert_awaited_once()
+    service._coordinator.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_gen_first_nonstream_error_cancels_and_awaits_sibling():
+    service = _make_service("generation_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+
+    gen_started = asyncio.Event()
+    gen_release = asyncio.Event()
+    gen_cancelled = asyncio.Event()
+    gen_finished = asyncio.Event()
+
+    async def _ctx_response(*_args, **_kwargs):
+        await gen_started.wait()
+        raise RuntimeError("context failed")
+
+    async def _gen_response(*_args, **_kwargs):
+        gen_started.set()
+        try:
+            await gen_release.wait()
+        except asyncio.CancelledError:
+            gen_cancelled.set()
+            raise
+        finally:
+            gen_finished.set()
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+
+    request = CompletionRequest(model="test-model", prompt="hello", stream=False)
+    with pytest.raises(RuntimeError, match="context failed"):
+        await service._send_disagg_request(request)
+
+    cancelled_by_service = gen_cancelled.is_set()
+    if not gen_finished.is_set():
+        gen_release.set()
+        await asyncio.wait_for(gen_finished.wait(), timeout=1)
+    assert cancelled_by_service
+    route_call = service._ctx_router.get_next_server.await_args
+    ctx_call = service._ctx_client.send_request.await_args
+    assert route_call.args[0] is ctx_call.args[0]
+    assert route_call.args[0] is not request
+    assert route_call.kwargs["req_id"] == ctx_call.kwargs["req_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["error", "cancellation"])
+async def test_conditional_ctx_first_releases_gen_reservation_before_dispatch(
+    termination,
+):
+    service = _make_conditional_context_first_service()
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:9001",
+            {"match_length": 0, "num_tokens": 3},
+        )
+    )
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+
+    ctx_started = asyncio.Event()
+
+    async def _ctx_response(*_args, **_kwargs):
+        ctx_started.set()
+        if termination == "error":
+            raise RuntimeError("context failed")
+        await asyncio.Event().wait()
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+    request = CompletionRequest(model="test-model", prompt="hello", stream=False)
+
+    if termination == "error":
+        with pytest.raises(RuntimeError, match="context failed"):
+            await service._send_disagg_request(request)
+    else:
+        request_task = asyncio.create_task(service._send_disagg_request(request))
+        await asyncio.wait_for(ctx_started.wait(), timeout=1)
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    service._gen_client.send_request.assert_not_awaited()
+    service._gen_router.finish_request.assert_awaited_once_with(
+        request,
+        success=False,
+        req_id=101,
+    )
+
+
+@pytest.mark.asyncio
+async def test_conditional_ctx_first_does_not_release_after_gen_dispatch():
+    service = _make_conditional_context_first_service()
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:9001",
+            {"match_length": 0, "num_tokens": 3},
+        )
+    )
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._ctx_client.send_request = AsyncMock(
+        return_value=_make_completion_response("", finish_reason="length")
+    )
+    gen_response = _make_completion_response("done", finish_reason="stop", context_only=False)
+    service._gen_client.send_request = AsyncMock(return_value=gen_response)
+
+    request = CompletionRequest(model="test-model", prompt="hello", stream=False)
+    result = await service._send_disagg_request(request)
+
+    assert result is gen_response
+    service._gen_client.send_request.assert_awaited_once()
+    service._gen_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["error", "cancellation"])
+async def test_conditional_ctx_first_transfers_failed_gen_dispatch_cleanup(
+    termination,
+):
+    service = _make_conditional_context_first_service()
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:9001",
+            {"match_length": 0, "num_tokens": 3},
+        )
+    )
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    service._ctx_client.send_request = AsyncMock(
+        return_value=_make_completion_response("", finish_reason="length")
+    )
+
+    gen_started = asyncio.Event()
+
+    async def _gen_response(*_args, **_kwargs):
+        gen_started.set()
+        if termination == "error":
+            raise RuntimeError("generation failed")
+        await asyncio.Event().wait()
+
+    service._gen_client.send_request = AsyncMock(side_effect=_gen_response)
+    request = CompletionRequest(model="test-model", prompt="hello", stream=False)
+
+    if termination == "error":
+        with pytest.raises(RuntimeError, match="generation failed"):
+            await service._send_disagg_request(request)
+    else:
+        request_task = asyncio.create_task(service._send_disagg_request(request))
+        await asyncio.wait_for(gen_started.wait(), timeout=1)
+        request_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    service._gen_client.send_request.assert_awaited_once()
+    service._gen_router.finish_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_conditional_ctx_first_releases_gen_reservation_on_ctx_early_stop():
+    service = _make_conditional_context_first_service()
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:9001",
+            {"match_length": 0, "num_tokens": 3},
+        )
+    )
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    ctx_response = _make_completion_response("done", finish_reason="stop")
+    service._ctx_client.send_request = AsyncMock(return_value=ctx_response)
+
+    request = CompletionRequest(model="test-model", prompt="hello", stream=False)
+    result = await service._send_disagg_request(request)
+
+    assert result is ctx_response
+    service._gen_client.send_request.assert_not_awaited()
+    service._gen_router.finish_request.assert_awaited_once_with(
+        request,
+        success=False,
+        req_id=101,
+    )
 
 
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():

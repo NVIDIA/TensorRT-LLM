@@ -4897,12 +4897,11 @@ class PyExecutor:
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
-        # Block new requests while control requests are pending
-        if len(self.control_requests) != 0:
-            return
+        control_pending = len(self.control_requests) != 0
 
         # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        idle = (not control_pending and total_num_active_requests == 0
+                and len(waiting_queue) == 0)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -4915,7 +4914,7 @@ class PyExecutor:
         new_requests = []
         if self.dist.rank == 0:
             # Process accumulated requests that were queued during control request handling.
-            if len(self.request_accumulated) != 0:
+            if not control_pending and len(self.request_accumulated) != 0:
                 new_requests.extend(self.request_accumulated)
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
@@ -4930,6 +4929,37 @@ class PyExecutor:
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
             new_requests)
 
+        if control_pending:
+            # A draining control action must not admit ordinary work, but cancel
+            # sentinels still have to pass through. Otherwise a cancel queued
+            # behind the control cannot release the very request that the
+            # control is waiting to drain. Preserve all other items, including
+            # shutdown, in queue order until the control action completes.
+            deferred_requests = []
+            for request_item in new_requests:
+                if request_item.is_canceled_request:
+                    self.canceled_req_ids.append(request_item.id)
+                elif self.dist.rank == 0:
+                    deferred_requests.append(request_item)
+            if self.dist.rank == 0:
+                self.request_accumulated.extend(deferred_requests)
+
+            if self.canceled_req_ids:
+                canceled_waiting_items = waiting_queue.remove_by_ids(
+                    set(self.canceled_req_ids))
+                self._terminalize_canceled_waiting_requests(
+                    canceled_waiting_items)
+                if canceled_waiting_items:
+                    terminalized_ids = {
+                        request_item.id
+                        for request_item in canceled_waiting_items
+                    }
+                    self.canceled_req_ids[:] = [
+                        request_id for request_id in self.canceled_req_ids
+                        if request_id not in terminalized_ids
+                    ]
+            return
+
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
 
@@ -4940,6 +4970,23 @@ class PyExecutor:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
         waiting_queue.add_requests(new_requests)
+
+        # Terminalize queued cancellations before admission. This fetch path
+        # runs even when no model batch can make progress, so a waiting request
+        # cannot remain unresolved behind transfer or capacity pressure.
+        if self.canceled_req_ids:
+            canceled_waiting_items = waiting_queue.remove_by_ids(
+                set(self.canceled_req_ids))
+            self._terminalize_canceled_waiting_requests(canceled_waiting_items)
+            if canceled_waiting_items:
+                terminalized_ids = {
+                    request_item.id
+                    for request_item in canceled_waiting_items
+                }
+                self.canceled_req_ids[:] = [
+                    request_id for request_id in self.canceled_req_ids
+                    if request_id not in terminalized_ids
+                ]
 
     def _pop_from_waiting_queue(
         self,
@@ -5073,8 +5120,17 @@ class PyExecutor:
                 self.canceled_req_ids.append(req_item.id)
             elif req_item.is_control_request:
                 self.control_requests.append(req_item)
+                deferred_requests = []
+                for deferred_item in new_requests[idx + 1:]:
+                    # Cancellation must bypass the pending control action. A
+                    # control action may itself be waiting for this request to
+                    # drain, so parking the marker would deadlock both.
+                    if deferred_item.is_canceled_request:
+                        self.canceled_req_ids.append(deferred_item.id)
+                    elif self.dist.rank == 0:
+                        deferred_requests.append(deferred_item)
                 if self.dist.rank == 0:
-                    self.request_accumulated.extend(new_requests[idx + 1:])
+                    self.request_accumulated.extend(deferred_requests)
                 break
             else:
                 accepted_new_requests.append(req_item)
@@ -6604,6 +6660,61 @@ class PyExecutor:
 
         return self._request_kv_transfer_cancellation(request)
 
+    def _terminalize_canceled_waiting_requests(
+            self, request_items: List[RequestQueueItem]) -> None:
+        """Emit final cancellation responses for requests never activated."""
+        if not request_items:
+            return
+
+        # A terminalized queued request still counts as consumed from the
+        # executor input. Benchmark fill must not wait forever for a canceled
+        # request that can no longer be admitted.
+        self.num_fetch_requests += len(request_items)
+
+        if self.enable_iter_perf_stats and self.dist.rank == 0:
+            # Remove queue-timing entries without charging canceled requests
+            # to the latency metric for requests that became active.
+            self.executor_request_queue.calculate_queue_latency(
+                request_items, time.time())
+
+        adp_collective_required = (self.enable_attention_dp
+                                   and self.dist.world_size != 1)
+        # Waiting items are replicated before attention-DP routing. Let only
+        # rank 0 create their response so allgather does not duplicate it.
+        create_response_locally = (self.dist.rank == 0
+                                   or (self.gather_all_responses
+                                       and not adp_collective_required))
+
+        canceled_requests = []
+        if create_response_locally:
+            canceled_requests = merge_requests(
+                request_items,
+                cp_config=self.dist.cp_config,
+                cp_rank=self.dist.cp_rank,
+                cp_size=self.dist.cp_size,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits())
+
+        canceled_responses = []
+        for request in canceled_requests:
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            response = request.create_response(False, self.dist.rank)
+            if response is not None:
+                canceled_responses.append(
+                    (request.py_request_id if not request.is_child else
+                     request.parent_request_id, response))
+
+        if canceled_responses or adp_collective_required:
+            self._enqueue_responses(canceled_responses)
+
+        # These requests never reached resource preparation, so resource
+        # managers must not be asked to free them. Drop the response routing
+        # entries only after publishing the terminal responses.
+        if self.gather_all_responses or self.dist.rank == 0:
+            for request_item in request_items:
+                self.result_wait_queues.pop(request_item.id, None)
+
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
         if len(self.canceled_req_ids) == 0:
@@ -6612,8 +6723,15 @@ class PyExecutor:
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
 
-        # Remove canceled requests from the waiting queue
-        self.waiting_queue.remove_by_ids(canceled_req_ids_set)
+        # Requests canceled before activation still need a terminal response;
+        # otherwise their result waiters and request mappings remain live.
+        canceled_waiting_items = self.waiting_queue.remove_by_ids(
+            canceled_req_ids_set)
+        self._terminalize_canceled_waiting_requests(canceled_waiting_items)
+        handled_canceled_ids = {
+            request_item.id
+            for request_item in canceled_waiting_items
+        }
 
         still_pending_canceled_ids = []
         for request in self.active_requests:
@@ -6621,6 +6739,7 @@ class PyExecutor:
             if req_id not in canceled_req_ids_set:
                 continue
 
+            handled_canceled_ids.add(req_id)
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
                 # Mark requests as finished, then, we reuse all existing code
@@ -6630,6 +6749,17 @@ class PyExecutor:
                 request.decoding_iter = request.py_decoding_iter
             else:
                 still_pending_canceled_ids.append(req_id)
+
+        # A draining control request parks ordinary input items on rank 0. Keep
+        # cancellation markers whose target has not appeared yet so they can
+        # terminalize the parked request when the control action completes.
+        if getattr(self, "control_requests", None):
+            still_pending_set = set(still_pending_canceled_ids)
+            for req_id in self.canceled_req_ids:
+                if (req_id not in handled_canceled_ids
+                        and req_id not in still_pending_set):
+                    still_pending_canceled_ids.append(req_id)
+                    still_pending_set.add(req_id)
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()

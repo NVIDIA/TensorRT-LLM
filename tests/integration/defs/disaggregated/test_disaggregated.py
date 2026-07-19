@@ -58,6 +58,9 @@ class TestConfig:
     cancellation_rate: Optional[int] = None
     cancellation_delay: Optional[float] = None
     concurrency: int = 512
+    request_timeout: int = 180
+    heartbeat_interval_sec: Optional[int] = None
+    inactive_timeout_sec: Optional[int] = None
 
     def __str__(self):
         return self.test_desc
@@ -99,6 +102,9 @@ _FATAL_LOG_PATTERNS = (
     "Hang detected on rank",
     "out of memory",
 )
+
+_ACCURACY_CLIENT_TIMEOUT_GRACE_SECS = 60
+_ACCURACY_PROCESS_TIMEOUT_SECS = 1_200
 
 
 def scan_logs_for_fatal_errors(processes):
@@ -654,6 +660,9 @@ def setup_disagg_cluster(
     save_log: bool = False,
     startup_callback=None,
     startup_tick: int = 30,
+    request_timeout: int = 180,
+    heartbeat_interval_sec: int | None = None,
+    inactive_timeout_sec: int | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -664,6 +673,12 @@ def setup_disagg_cluster(
         env: Environment variables to pass to subprocess (workers and disagg server)
         server_start_timeout: Timeout in seconds for server to become ready
         schedule_style: Disagg schedule style ('context_first' or 'generation_first')
+        save_log: Whether to save worker and server logs
+        startup_callback: Optional callback invoked while startup is in progress
+        startup_tick: Interval in seconds between startup callback invocations
+        request_timeout: End-to-end disaggregated request timeout in seconds
+        heartbeat_interval_sec: Optional worker heartbeat interval override
+        inactive_timeout_sec: Optional worker inactivity timeout override
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -679,6 +694,20 @@ def setup_disagg_cluster(
                 speculative_model)
 
     disagg_cluster = get_default_disagg_cluster_config()
+    if ((heartbeat_interval_sec is None) != (inactive_timeout_sec is None)):
+        raise ValueError("heartbeat_interval_sec and inactive_timeout_sec "
+                         "must be overridden together")
+    if heartbeat_interval_sec is not None and inactive_timeout_sec is not None:
+        if not 0 < heartbeat_interval_sec < inactive_timeout_sec:
+            raise ValueError("Expected 0 < heartbeat_interval_sec < "
+                             "inactive_timeout_sec")
+        disagg_cluster["heartbeat_interval_sec"] = heartbeat_interval_sec
+        disagg_cluster["inactive_timeout_sec"] = inactive_timeout_sec
+    logger.info("Disagg cluster liveness config: "
+                f"heartbeat_interval_sec="
+                f"{disagg_cluster['heartbeat_interval_sec']}, "
+                f"inactive_timeout_sec="
+                f"{disagg_cluster['inactive_timeout_sec']}")
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
     if save_log:
@@ -800,7 +829,8 @@ def setup_disagg_cluster(
                                           server_port,
                                           save_log=save_log,
                                           env=server_env,
-                                          cwd=cwd)
+                                          cwd=cwd,
+                                          request_timeout=request_timeout)
 
         all_workers = ctx_workers + gen_workers
 
@@ -1115,7 +1145,9 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
 
     try:
         client = openai.OpenAI(api_key="tensorrt_llm",
-                               base_url=f"http://localhost:{server_port}/v1")
+                               base_url=f"http://localhost:{server_port}/v1",
+                               timeout=60.0,
+                               max_retries=0)
 
         # Send 64 concurrent requests to trigger the benchmark fill loop
         # and the insufficient KV cache error.
@@ -1137,13 +1169,29 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
             except Exception as e:
                 return e
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=64)
+        try:
             futures = [pool.submit(send_request) for _ in range(64)]
-            results = [f.result(timeout=120) for f in futures]
+            _, not_done = concurrent.futures.wait(futures, timeout=120)
+            if not_done:
+                pool.shutdown(wait=False, cancel_futures=True)
+                pool = None
+                pytest.fail(
+                    f"{len(not_done)} requests did not reach a terminal result")
+            results = [future.result() for future in futures]
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
 
         errors = [r for r in results if isinstance(r, Exception)]
-        assert len(errors) > 0, \
+        assert errors, \
             "Expected at least one error due to insufficient KV cache"
+        expected_error = "Insufficient KV cache for gen-only benchmark mode"
+        unrelated_errors = [
+            error for error in errors if expected_error not in str(error)
+        ]
+        assert not unrelated_errors, \
+            f"Received unrelated errors: {unrelated_errors!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -2325,7 +2373,10 @@ def run_disaggregated_aiperf(config_file,
                              cancellation_rate=None,
                              cancellation_delay=None,
                              env=None,
-                             cwd=None):
+                             cwd=None,
+                             request_timeout=180,
+                             heartbeat_interval_sec: int | None = None,
+                             inactive_timeout_sec: int | None = None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2342,8 +2393,13 @@ def run_disaggregated_aiperf(config_file,
         random_seed: Random seed for reproducibility
         accuracy_test: Whether to run accuracy test
         threshold: Threshold for accuracy test
+        cancellation_rate: Percentage of requests to cancel
+        cancellation_delay: Delay before cancellation in seconds
         env: Environment variables dict
         cwd: Working directory
+        request_timeout: End-to-end disaggregated request timeout in seconds
+        heartbeat_interval_sec: Optional worker heartbeat interval override
+        inactive_timeout_sec: Optional worker inactivity timeout override
     """
     cleanup_output_files()
     run_env = env.copy()
@@ -2353,7 +2409,10 @@ def run_disaggregated_aiperf(config_file,
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
-                             save_log=True)
+                             save_log=True,
+                             request_timeout=request_timeout,
+                             heartbeat_interval_sec=heartbeat_interval_sec,
+                             inactive_timeout_sec=inactive_timeout_sec)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
@@ -2453,12 +2512,19 @@ def run_disaggregated_aiperf(config_file,
                 f"logs:\n{summary}")
 
         if accuracy_test:
+            accuracy_server_url = f"http://{server_host}:{server_port}"
+            # Give the proxy time to return its bounded timeout and finish
+            # cleanup before lm-eval abandons an individual HTTP attempt. The
+            # complete evaluation retains a separate, longer global safety
+            # cutoff; it is not a worst-case bound for every possible retry.
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
-                server_url=f"http://{server_host}:{server_port}",
+                server_url=accuracy_server_url,
                 concurrency=concurrency,
                 max_retries=3,
-                timeout=1200,
+                request_timeout=(request_timeout +
+                                 _ACCURACY_CLIENT_TIMEOUT_GRACE_SECS),
+                process_timeout=_ACCURACY_PROCESS_TIMEOUT_SECS,
                 max_gen_toks=256,
                 max_length=4096)
 
@@ -2509,17 +2575,19 @@ def run_disaggregated_aiperf(config_file,
 
 
 def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
-                      max_retries: int, timeout: int, max_gen_toks: int,
+                      max_retries: int, request_timeout: int,
+                      process_timeout: int, max_gen_toks: int,
                       max_length: int) -> tuple[bool, float]:
     """
     Run accuracy test using lm_eval with GSM8K dataset
 
     Args:
         model_path: Path of the model being tested
-        server_config: Server configuration containing URL and port
+        server_url: Base URL of the disaggregated server
         concurrency: Concurrency for accuracy tests
         max_retries: Max retries for accuracy tests
-        timeout: Timeout for accuracy tests
+        request_timeout: Timeout for one lm-eval HTTP request
+        process_timeout: Timeout for the complete lm-eval subprocess
         max_gen_toks: Max generation tokens for accuracy tests
         max_length: Max length for accuracy tests
 
@@ -2559,7 +2627,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         f"num_concurrent={concurrency},"
         f"max_retries={max_retries},"
         f"tokenized_requests=False,"
-        f"timeout={timeout},"
+        f"timeout={request_timeout},"
         f"max_gen_toks={max_gen_toks},"
         f"max_length={max_length}",
     ]
@@ -2575,7 +2643,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         result = subprocess.run(lm_eval_cmd,
                                 capture_output=True,
                                 text=True,
-                                timeout=timeout)
+                                timeout=process_timeout)
 
         print_info(f"Accuracy test result is: {result}")
 
@@ -2613,7 +2681,10 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
             return False, accuracy_value
 
     except subprocess.TimeoutExpired:
-        logger.warning(f"Accuracy test timed out after {timeout} seconds")
+        duration = int(time.time() - test_start_time)
+        logger.warning("Accuracy test subprocess timed out after "
+                       f"{duration} seconds (watchdog={process_timeout}, "
+                       f"per_request={request_timeout})")
         return False, accuracy_value
     except Exception as e:
         logger.warning(f"Error during accuracy test: {str(e)}")
@@ -2817,7 +2888,9 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
         accuracy_threshold=0.42,
         speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3',
         cancellation_rate=10,
-        cancellation_delay=0.5),
+        cancellation_delay=0.5,
+        heartbeat_interval_sec=5,
+        inactive_timeout_sec=10),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
@@ -2839,13 +2912,15 @@ def test_disaggregated_stress_test(disaggregated_test_root,
     config_file = get_test_config(test_desc, disaggregated_example_root,
                                   os.path.dirname(__file__))
 
-    # Resolve speculative_model to an absolute path for worker processes.
+    # Apply per-test worker overrides without changing other tests that share
+    # the same checked-in server configuration.
     if test_config.speculative_model_path is not None:
+        with open(config_file, 'r') as f:
+            patched_config = yaml.safe_load(f)
+
         spec_model_dir = f"{llm_models_root()}/{test_config.speculative_model_path}"
         setup_model_symlink(llm_venv, spec_model_dir,
                             test_config.speculative_model_path)
-        with open(config_file, 'r') as f:
-            patched_config = yaml.safe_load(f)
         patched_sections = []
         # Check top-level speculative_config first (current YAML layout), then
         # fall back to per-server blocks for older config shapes.
@@ -2863,30 +2938,35 @@ def test_disaggregated_stress_test(disaggregated_test_root,
             raise AssertionError(
                 f"{test_desc} sets speculative_model_path, but no "
                 "speculative_config.speculative_model field was patched")
+
         patched_path = os.path.join(llm_venv.get_working_directory(),
                                     f"{test_desc}_patched.yaml")
         with open(patched_path, 'w') as f:
             yaml.safe_dump(patched_config, f)
         config_file = patched_path
 
-    run_disaggregated_aiperf(config_file=config_file,
-                             model_path=model_dir,
-                             server_start_timeout=7200,
-                             input_tokens=input_tokens,
-                             output_tokens=output_tokens,
-                             input_tokens_stddev=0,
-                             output_tokens_stddev=output_tokens // 10,
-                             concurrency=concurrency,
-                             endpoint_type='completions',
-                             request_count=test_config.request_count,
-                             warmup_request_count=10,
-                             streaming=False,
-                             accuracy_test=True,
-                             threshold=test_config.accuracy_threshold,
-                             cancellation_rate=test_config.cancellation_rate,
-                             cancellation_delay=test_config.cancellation_delay,
-                             env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+    run_disaggregated_aiperf(
+        config_file=config_file,
+        model_path=model_dir,
+        server_start_timeout=7200,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        input_tokens_stddev=0,
+        output_tokens_stddev=output_tokens // 10,
+        concurrency=concurrency,
+        endpoint_type='completions',
+        request_count=test_config.request_count,
+        warmup_request_count=10,
+        streaming=False,
+        accuracy_test=True,
+        threshold=test_config.accuracy_threshold,
+        cancellation_rate=test_config.cancellation_rate,
+        cancellation_delay=test_config.cancellation_delay,
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        request_timeout=test_config.request_timeout,
+        heartbeat_interval_sec=(test_config.heartbeat_interval_sec),
+        inactive_timeout_sec=(test_config.inactive_timeout_sec))
 
 
 def run_cancel_stress_test(server_url: str,
