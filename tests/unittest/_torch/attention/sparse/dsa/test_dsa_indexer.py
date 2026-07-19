@@ -3166,6 +3166,91 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_blackwell
+def test_cutedsl_mqa_logits_output_buffer_persistent():
+    """Regression: the CuteDSL paged-MQA-logits output must have a STABLE address
+    across calls, not be a per-forward ``torch.empty``.
+
+    At long context the ``[B*next_n, kv_len]`` output is large; as a churning
+    transient it goes stale under CUDA-graph replay when another subsystem
+    co-captured in the same graph (e.g. the MTP / one-model spec sampler)
+    perturbs the shared pool. It must instead be drawn from the reserved
+    ``get_memory_buffers`` arena (like the CuteDSL topk runner), so its address is
+    identical across calls.
+
+    Fails before the fix (two distinct ``torch.empty`` addresses while the first
+    output is kept alive); passes after (same reserved-arena address).
+    """
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+    batch_size, next_n = 4, 1
+    head_dim, block_size, index_topk = 128, 64, 2048
+    heads = 32
+    kv_len = 4096
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=kv_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    create_indexer(sparse_attn_config, layer_idx=0)
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False, prepare_resource=True
+    )
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.full((batch_size,), next_n, dtype=torch.int32),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[kv_len - next_n] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size * next_n,
+        max_draft_tokens=next_n - 1,
+        index_topk=index_topk,
+        use_cute_dsl_paged_mqa_logits=True,
+    )
+    Indexer.prepare(metadata)
+
+    kv_cache = cache_manager.get_indexer_k_cache_buffers(0)
+    q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn((batch_size * next_n, heads), device="cuda", dtype=torch.float32)
+    context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+    block_table = metadata.indexer_k_cache_block_offsets[0:batch_size]
+    sched = metadata.scheduler_metadata_buffer
+
+    def _mqa():
+        return torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+            q, kv_cache, weights, context_lens, block_table, sched, kv_len
+        )
+
+    out1 = _mqa()
+    ptr1 = out1.data_ptr()
+    out2 = _mqa()  # out1 kept alive: a fresh torch.empty would land elsewhere
+    ptr2 = out2.data_ptr()
+
+    assert ptr1 == ptr2, (
+        f"CuteDSL mqa-logits output address changed across calls "
+        f"({ptr1:#x} -> {ptr2:#x}); it must be a persistent reserved-arena buffer "
+        f"to avoid stale-pointer IMA under CUDA-graph replay"
+    )
+    assert "cute_dsl_mqa_logits" in get_memory_buffers().buffers, (
+        "CuteDSL mqa-logits output must be drawn from the get_memory_buffers arena"
+    )
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 def test_topk_indices_buffer_cuda_graph():
     from tensorrt_llm._torch.memory_buffer_utils import Buffers

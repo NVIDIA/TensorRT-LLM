@@ -21,7 +21,7 @@
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/workspace.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -62,14 +62,14 @@ void read(char const*& buffer, T& val)
     buffer += sizeof(T);
 }
 
-inline cudaDataType_t trtToCublasDtype(nvinfer1::DataType type)
+inline cudaDataType_t trtToCublasDtype(tensorrt_llm::DataType type)
 {
     switch (type)
     {
-    case nvinfer1::DataType::kFLOAT: return CUDA_R_32F;
-    case nvinfer1::DataType::kHALF: return CUDA_R_16F;
+    case tensorrt_llm::DataType::kFLOAT: return CUDA_R_32F;
+    case tensorrt_llm::DataType::kHALF: return CUDA_R_16F;
 #if defined(NV_TENSORRT_MAJOR) && NV_TENSORRT_MAJOR >= 9
-    case nvinfer1::DataType::kBF16: return CUDA_R_16BF;
+    case tensorrt_llm::DataType::kBF16: return CUDA_R_16BF;
 #endif
     default: TLLM_THROW("Not supported data type for cuBLAS");
     }
@@ -185,13 +185,6 @@ struct hash
 void const* getCommSessionHandle();
 } // namespace common::op
 
-inline bool isBuilding()
-{
-    auto constexpr key = "IS_BUILDING";
-    auto const val = getenv(key);
-    return val != nullptr && std::string(val) == "1";
-}
-
 #if ENABLE_MULTI_DEVICE
 #define NCCLCHECK(cmd)                                                                                                 \
     do                                                                                                                 \
@@ -214,7 +207,7 @@ inline bool isBuilding()
         }                                                                                                              \
     } while (0)
 
-std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap();
+std::unordered_map<tensorrt_llm::DataType, ncclDataType_t>* getDtypeMap();
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 

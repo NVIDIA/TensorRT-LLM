@@ -573,7 +573,18 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
-        if isinstance(self.mpi_session, MpiPoolSession) and len(status) == 3:
+        self._register_worker_processes(status)
+
+    def _register_worker_processes(self, status: tuple) -> None:
+        """Register identities returned by locally spawned MPI workers.
+
+        Test session reuse replaces this module's ``MpiPoolSession`` class
+        reference with a factory, so identify pool-backed sessions by excluding
+        the external communication session types.
+        """
+        if not isinstance(
+                self.mpi_session,
+            (MpiCommSession, RemoteMpiCommSessionClient)) and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
 

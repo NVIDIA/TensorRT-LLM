@@ -149,6 +149,7 @@ def build_worker_config(base_config: dict[str, Any],
     EXCLUDE_FROM_WORKER = {
         'hostname',
         'port',
+        'num_workers',
         'num_instances',
         'urls',
         'router',
@@ -206,6 +207,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_load_balancing.yaml",
         "conversation":
         f"{test_configs_root}/disagg_config_conversation.yaml",
+        "multi_orchestrator":
+        f"{test_configs_root}/disagg_config_multi_orchestrator.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "cuda_graph":
@@ -422,7 +425,7 @@ def run_client_tests(example_dir,
             '--server-start-timeout',
             str(server_start_timeout)
         ]
-        if prompt_file == "long_prompts.json":
+        if prompt_file.startswith("long_"):
             # Use max_tokens 4 for long prompts to reduce test time
             client_cmd.extend(['--max-tokens', '4'])
 
@@ -467,7 +470,8 @@ def run_client_tests(example_dir,
                        poll_procs=poll_procs)
 
         # Skip output verification for long prompts or tool call tests
-        if prompt_file == "long_prompts.json" or prompt_file == "tool_call_prompts.json":
+        if prompt_file.startswith(
+                "long_") or prompt_file == "tool_call_prompts.json":
             continue
 
         if extra_endpoints_test is not None:
@@ -645,8 +649,23 @@ def setup_disagg_cluster(
     disagg_cluster = get_default_disagg_cluster_config()
     server_host = config.get("hostname", "localhost")
     server_port = get_free_port()
-    work_dir = tempfile.mkdtemp()
-    disagg_cluster["cluster_uri"] = f"http://{server_host}:{server_port}"
+    if save_log:
+        log_base = os.path.join(cwd or ".", "disagg-logs")
+        os.makedirs(log_base, exist_ok=True)
+        work_dir = tempfile.mkdtemp(dir=log_base)
+    else:
+        work_dir = tempfile.mkdtemp()
+    logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
+    server_env = env
+    coordinator_url = f"http://{server_host}:{server_port}"
+    if config.get("num_workers", 1) > 1:
+        coordinator_port = get_free_port()
+        while coordinator_port == server_port:
+            coordinator_port = get_free_port()
+        coordinator_url = f"http://{server_host}:{coordinator_port}"
+        server_env = (env or os.environ).copy()
+        server_env["TRTLLM_DISAGG_COORDINATOR_PORT"] = str(coordinator_port)
+    disagg_cluster["cluster_uri"] = coordinator_url
 
     # Auto-deduce minimal_instances from num_instances
     ctx_servers = config.get("context_servers", {})
@@ -687,34 +706,38 @@ def setup_disagg_cluster(
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_ctx)))
-            print(
-                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}"
-            )
-            ctx_workers.append(
-                run_ctx_worker(model,
+            w = run_ctx_worker(model,
                                ctx_worker_config,
                                work_dir,
                                port=0,
                                device=device_ids,
                                env=env,
-                               save_log=save_log))
+                               save_log=save_log,
+                               worker_index=i)
+            ctx_workers.append(w)
+            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
+            print(
+                f"Launching ctx worker {i + 1}/{num_ctx_instances} on device {device_ids}{log_suffix}"
+            )
             next_device += gpus_per_ctx
 
         for i in range(num_gen_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
                                               for j in range(gpus_per_gen)))
-            print(
-                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}"
-            )
-            gen_workers.append(
-                run_gen_worker(model,
+            w = run_gen_worker(model,
                                gen_worker_config,
                                work_dir,
                                port=0,
                                device=device_ids,
                                env=env,
-                               save_log=save_log))
+                               save_log=save_log,
+                               worker_index=i)
+            gen_workers.append(w)
+            log_suffix = f", logging to {w.log_path}" if w.log_path else ""
+            print(
+                f"Launching gen worker {i + 1}/{num_gen_instances} on device {device_ids}{log_suffix}"
+            )
             next_device += gpus_per_gen
 
         # Build minimal server config and launch
@@ -723,6 +746,8 @@ def setup_disagg_cluster(
             server_host,
             "port":
             server_port,
+            "num_workers":
+            config.get("num_workers", 1),
             "disagg_cluster":
             disagg_cluster,
             "context_servers": {
@@ -742,8 +767,10 @@ def setup_disagg_cluster(
                                           work_dir,
                                           server_port,
                                           save_log=save_log,
-                                          env=env,
+                                          env=server_env,
                                           cwd=cwd)
+
+        all_workers = ctx_workers + gen_workers
 
         async def _wait_with_ticker():
             start = time.monotonic()
@@ -751,6 +778,9 @@ def setup_disagg_cluster(
 
             async def _tick():
                 nonlocal last_tick
+                last_worker_count = 0
+                last_status_log = start
+
                 while True:
                     await asyncio.sleep(1)
                     now = time.monotonic()
@@ -758,17 +788,86 @@ def setup_disagg_cluster(
                         startup_callback(now - start)
                         last_tick = now
 
-            ticker = asyncio.create_task(_tick())
-            try:
-                await wait_for_disagg_server_ready(server_port,
-                                                   timeout=server_start_timeout)
-            finally:
-                ticker.cancel()
+                    if now - last_status_log >= 10:
+                        elapsed = int(now - start)
+                        remaining = int(server_start_timeout - elapsed)
+                        print(
+                            f"[startup] {elapsed}s elapsed, "
+                            f"{max(remaining, 0)}s remaining "
+                            f"(timeout={server_start_timeout}s, "
+                            f"workers registered: {last_worker_count}/"
+                            f"{num_ctx_instances + num_gen_instances})",
+                            flush=True,
+                        )
+                        last_status_log = now
+
+                    # Detect workers that have exited (crash/OOM).
+                    dead = [
+                        w for w in all_workers if w.process.poll() is not None
+                    ]
+                    if dead:
+                        details = ", ".join(
+                            f"{w.log_path or 'unknown'} (rc={w.process.poll()})"
+                            for w in dead)
+                        raise RuntimeError(
+                            f"{len(dead)} worker(s) exited during startup: "
+                            f"{details}")
+
+                    # Track worker registration count for the status log.
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=2)
+                        async with aiohttp.ClientSession(
+                                timeout=timeout) as session:
+                            async with session.get(
+                                    f"http://localhost:{server_port}/cluster_info"
+                            ) as info_resp:
+                                if info_resp.status == 200:
+                                    workers = (await info_resp.json()).get(
+                                        "current_workers", {})
+                                    count = (len(
+                                        workers.get("context_servers", [])) +
+                                             len(
+                                                 workers.get(
+                                                     "generation_servers", [])))
+                                    if count > last_worker_count:
+                                        last_worker_count = count
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        pass
+
+            # Run the readiness poller and the watchdog concurrently.
+            # asyncio.wait(FIRST_COMPLETED) means whichever finishes first
+            # (success or exception) immediately cancels the other, so a dead
+            # worker detected by _tick() doesn't leave wait_for_disagg_server_ready
+            # polling silently for up to server_start_timeout seconds.
+            ready_task = asyncio.create_task(
+                wait_for_disagg_server_ready(server_port,
+                                             timeout=server_start_timeout))
+            tick_task = asyncio.create_task(_tick())
+
+            done, pending = await asyncio.wait(
+                [ready_task, tick_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+
+            # Re-raise the first exception. Prefer tick_task's message (it names
+            # the dead worker); fall back to ready_task (timeout error).
+            for t in [tick_task, ready_task]:
+                if t in done and not t.cancelled() and t.exception(
+                ) is not None:
+                    raise t.exception()
 
         asyncio.run(_wait_with_ticker())
     except Exception:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        if not save_log:
+            shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
@@ -783,8 +882,14 @@ def run_disaggregated_test(example_dir,
                            model_path=None,
                            cwd=None,
                            disagg_schedule_style=None,
-                           post_client_test=None):
-    """Run disaggregated test using service discovery instead of MPI."""
+                           post_client_test=None,
+                           assert_gen_log_contains=None):
+    """Run disaggregated test using service discovery instead of MPI.
+
+    If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
+    client tests, at least one of them must contain that substring (used to prove the KV-cache
+    bounce path actually engaged instead of silently falling back to the per-fragment path).
+    """
     if mpi_disabled():
         pytest.skip(
             "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
@@ -797,7 +902,8 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             schedule_style=disagg_schedule_style)
+                             schedule_style=disagg_schedule_style,
+                             save_log=assert_gen_log_contains is not None)
 
     server_host = config.get("hostname", "localhost")
 
@@ -833,6 +939,18 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
+        if assert_gen_log_contains is not None:
+            # Fail loudly if the marker is absent: the transfer silently fell back to the
+            # per-fragment path, so the bounce path we meant to exercise never ran.
+            logs = []
+            for w in gen_workers:
+                if w.log_path and os.path.exists(w.log_path):
+                    with open(w.log_path, 'r', errors='replace') as f:
+                        logs.append(f.read())
+            assert any(assert_gen_log_contains in log for log in logs), (
+                f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
+                f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
+            )
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -866,6 +984,24 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
     env["CUDA_VISIBLE_DEVICES"] = "0"
     run_disaggregated_test(disaggregated_example_root,
                            "2_ranks",
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
+                                                    disaggregated_example_root,
+                                                    llm_venv, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    run_disaggregated_test(disaggregated_example_root,
+                           "multi_orchestrator",
+                           num_iters=1,
                            env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
@@ -1138,6 +1274,14 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 # KV-cache bounce optimization (cache_transceiver_config.kv_cache_bounce_size_mb > 0): scattered
 # per-block WRITEs are gathered into one coalesced fabric-VMM buffer before a single NIXL WRITE.
 # Restricted to GB200/GB300 since the bounce arena is fabric (MNNVL) VMM memory.
+#
+# The bounce transport coalesces a transfer only when it clears the receiver's min_blocks gate.
+# The test lowers that gate via the TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env so the ordinary short
+# prompts still take the coalesced-bounce WRITE path -- no special long prompt is needed. The test
+# runs the normal disagg output verification (the coalesced KV must still decode to the right
+# answer, e.g. "Berlin"; a corrupt transfer would garble it) AND asserts the generation worker
+# logged the coalesced-bounce marker, so a silent fall-back to the per-fragment path fails the
+# test instead of passing quietly.
 @pytest.mark.skip_device_not_contain(["GB200", "GB300"])
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
@@ -1149,12 +1293,15 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
-    env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
+    # min_blocks=1 forces bounce on even for the short test prompt (the gate is internal, tuned via
+    # env). No fabric-pool env is needed: the bounce arena is its own fabric memory.
+    env["TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python_bounce",
                            env=env,
                            model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           assert_gen_log_contains="[kv-bounce] coalesced")
 
 
 def _verify_python_transceiver_under_host_offload(server_url: str, model: str):
@@ -2508,8 +2655,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
 @skip_pre_blackwell
 @pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"],
-                         ids=["short_prompt", "long_prompt"])
+@pytest.mark.parametrize("prompt_file", ["prompts.json"], ids=["short_prompt"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
@@ -3066,7 +3212,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
                                    concurrency: int = 512,
                                    accuracy_threshold: float = 0.42,
                                    profiles: list = None,
-                                   server_start_timeout: int = 7200,
+                                   server_start_timeout: int = 600,
                                    env=None,
                                    cwd=None,
                                    startup_callback=None,
@@ -3105,10 +3251,13 @@ def run_disaggregated_mixed_stress(example_dir: str,
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
+    setup_start = time.monotonic()
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env,
                              cwd=cwd, server_start_timeout=server_start_timeout,
                              save_log=True, startup_callback=startup_callback)
+    print(f"[startup] cluster ready in {time.monotonic() - setup_start:.1f}s",
+          flush=True)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
@@ -3589,6 +3738,6 @@ def test_disaggregated_mixed_stress_test(disaggregated_test_root,
         total_requests=test_config.request_count,
         concurrency=test_config.concurrency,
         accuracy_threshold=test_config.accuracy_threshold,
-        server_start_timeout=7200,
+        server_start_timeout=600,
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory())

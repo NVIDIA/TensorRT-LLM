@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
@@ -60,34 +61,35 @@ public:
         std::uniform_int_distribution<SizeType32> tokensPerStepDistr(1, mMaxTokensPerStep);
 
         mSequenceLengths
-            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT32);
-        mSequenceLengthLimits = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), tensorrt_llm::DataType::kINT32);
+        mSequenceLengthLimits
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
         mFinished = BufferManager::pinned(
             ITensor::makeShape({maxBatchSize, beamWidth}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
-        mFinishedSum = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mFinishedSum = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
 
         mOutputIds = BufferManager::pinned(
-            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
         mOutputIdsPtr
-            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), tensorrt_llm::DataType::kINT64);
 
         mParentIds = BufferManager::pinned(
-            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
         mParentIdsPtr
-            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), nvinfer1::DataType::kINT64);
+            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, beamWidth}), tensorrt_llm::DataType::kINT64);
 
         mRefOutputIds = BufferManager::pinned(
-            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({maxBatchSize, beamWidth, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
 
-        mStopWords
-            = BufferManager::pinned(ITensor::makeShape({maxBatchSize, 2, maxStopWordsLen}), nvinfer1::DataType::kINT32);
-        mStopWordsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT64);
-        mStopWordsLen = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mStopWords = BufferManager::pinned(
+            ITensor::makeShape({maxBatchSize, 2, maxStopWordsLen}), tensorrt_llm::DataType::kINT32);
+        mStopWordsPtr = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT64);
+        mStopWordsLen = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({batchSize}), tensorrt_llm::DataType::kINT32);
 
-        mEndIds = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
-        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        mEndIds = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<SizeType32>(*mBatchSlots);
         for (SizeType32 bi = 0; bi < batchSize; ++bi)

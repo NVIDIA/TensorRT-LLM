@@ -529,6 +529,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.host_indexer_k_cache_block_offsets[: self.num_seqs],
             non_blocking=True,
         )
+        # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
+        # CUDA-graph padded token slots may still compute scatter addresses from those columns
+        # before being ignored, so map them to block 0, matching the base DSA metadata path.
+        self.indexer_k_cache_block_offsets.clamp_(min=0)
 
     def prepare_for_block_tables(self):
         """Prepare block tables for sliding-window and compressed attention."""
