@@ -36,6 +36,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/contextProgress.h"
+#include "tensorrt_llm/batch_manager/contextTransferCoordinator.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
@@ -55,6 +56,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <numeric>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -67,6 +69,11 @@ namespace
 {
 
 using RequestIdType = LlmRequest::RequestIdType;
+
+bool isNvbug6448152ContextCoordinatorEnabled()
+{
+    return common::getBoolEnv("TRTLLM_NVBUG_6448152_CTX_COORDINATOR_CONSENSUS");
+}
 
 enum class TransferConsensusState : std::uint64_t
 {
@@ -503,11 +510,52 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
     mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
 
+    // The perf-sanity worker environment is shared by CTX and GEN. Negotiate only on the eligible PP CTX service;
+    // the PP1 GEN service remains byte-for-byte on its existing status path.
+    bool const coordinatorRequested = isNvbug6448152ContextCoordinatorEnabled();
+    bool const isPipelineService = worldConfig.getPipelineParallelism() > 1;
+    if (coordinatorRequested && isPipelineService)
+    {
+        TLLM_CHECK_WITH_INFO(useMPI(), "NVBUG6448152 context coordinator requires an MPI control plane.");
+        TLLM_CHECK_WITH_INFO(backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL,
+            "NVBUG6448152 context coordinator is qualified only for the NIXL backend.");
+        TLLM_CHECK_WITH_INFO(worldConfig.getTensorParallelism() == 1 && worldConfig.getContextParallelism() == 1,
+            "NVBUG6448152 context coordinator requires TP1/CP1/PP>1.");
+        TLLM_CHECK_WITH_INFO(!mCacheState->getParallelConfig().mEnableAttentionDP,
+            "NVBUG6448152 context coordinator does not support attention DP.");
+    }
+
+    bool const coordinatorTopologyEligible = isPipelineService && useMPI()
+        && backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
+        && worldConfig.getTensorParallelism() == 1 && worldConfig.getContextParallelism() == 1
+        && !mCacheState->getParallelConfig().mEnableAttentionDP;
+    if (coordinatorTopologyEligible)
+    {
+        TLLM_CHECK(mGroupPipeParaComm != nullptr);
+        constexpr std::uint64_t kCoordinatorProtocolVersion = 1;
+        std::uint64_t const localVersion = coordinatorRequested ? kCoordinatorProtocolVersion : 0;
+        std::vector<std::uint64_t> protocolVersions(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
+        mGroupPipeParaComm->allgather(&localVersion, protocolVersions.data(), 1, mpi::MpiType::kUINT64);
+        TLLM_CHECK_WITH_INFO(std::all_of(protocolVersions.begin(), protocolVersions.end(),
+                                 [&](std::uint64_t const version) { return version == localVersion; }),
+            "NVBUG6448152 context coordinator mode/version differs across PP ranks.");
+        if (localVersion != 0)
+        {
+            mContextTransferCoordinator = std::make_unique<ContextTransferCoordinator>(mGroupPipeParaComm);
+            TLLM_LOG_WARNING(
+                "NVBUG6448152_COORD event=mode_active world_rank=%d pp_rank=%d pp_size=%d coordinator_rank=%d "
+                "version=%lu decision=global resource_retention=global",
+                worldConfig.getRank(), mGroupPipeParaComm->getRank(), mGroupPipeParaComm->getSize(),
+                mGroupPipeParaComm->getSize() - 1, kCoordinatorProtocolVersion);
+        }
+    }
+
     initializeCommState();
 }
 
 CacheTransceiver::~CacheTransceiver()
 {
+    mContextTransferCoordinator.reset();
     if (mWrapperLibHandle)
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
@@ -764,6 +812,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    auto recordOutcome
+        = [&](RequestIdType const requestId, std::shared_ptr<LlmRequest> const& request, bool const failed)
+    {
+        recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds, mFailedSenderRequestIds,
+            mSenderRequestsAwaitingConsensus);
+        if (mContextTransferCoordinator)
+        {
+            mContextTransferCoordinator->publishLocalOutcome(requestId, failed);
+        }
+    };
+
     // Record local terminal outcomes for requests selected this round. The
     // request is reported only after all ranks in the sync group agree that the
     // request reached a terminal state.
@@ -786,6 +845,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
         {
             auto const requestId = request->mRequestId;
+            bool terminal = false;
+            bool failed = false;
             try
             {
                 // Wait for up to a specified timeout
@@ -793,10 +854,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    bool const failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
-                    recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                    it = mSenderFutures.erase(it);
+                    failed = request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR;
+                    terminal = true;
                 }
                 else if (status == std::future_status::timeout)
                 {
@@ -808,18 +867,23 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 {
                     TLLM_LOG_ERROR(
                         "Future returned unexpected status for request %ld. Recording as failed.", requestId);
-
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                    it = mSenderFutures.erase(it);
+                    failed = true;
+                    terminal = true;
                 }
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+                failed = true;
+                terminal = true;
+            }
+            if (terminal)
+            {
+                auto terminalRequest = request;
                 it = mSenderFutures.erase(it);
+                // Keep control-plane publication outside the transfer-future try/catch. A publication failure is a
+                // protocol error, not a different transfer outcome, and must never rewrite an immutable local vote.
+                recordOutcome(requestId, terminalRequest, failed);
             }
         }
         else
@@ -829,8 +893,35 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     }
 
     RequestStatuses requestsStatus{};
-    auto const consensusOutcome
-        = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    TransferConsensusOutcome consensusOutcome;
+    if (mContextTransferCoordinator)
+    {
+        auto mergeCoordinatorOutcome = [&]()
+        {
+            auto coordinatorOutcome = mContextTransferCoordinator->poll();
+            consensusOutcome.completedRequestIds.insert(
+                coordinatorOutcome.completedRequestIds.begin(), coordinatorOutcome.completedRequestIds.end());
+            consensusOutcome.failedRequestIds.insert(
+                coordinatorOutcome.failedRequestIds.begin(), coordinatorOutcome.failedRequestIds.end());
+        };
+        do
+        {
+            mergeCoordinatorOutcome();
+            if (blockAll
+                && consensusOutcome.completedRequestIds.size() + consensusOutcome.failedRequestIds.size()
+                    < mSenderRequestsAwaitingConsensus.size())
+            {
+                std::this_thread::yield();
+            }
+        } while (blockAll
+            && consensusOutcome.completedRequestIds.size() + consensusOutcome.failedRequestIds.size()
+                < mSenderRequestsAwaitingConsensus.size());
+    }
+    else
+    {
+        consensusOutcome
+            = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds, mFailedSenderRequestIds);
+    }
     for (auto const requestId : consensusOutcome.failedRequestIds)
     {
         auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
