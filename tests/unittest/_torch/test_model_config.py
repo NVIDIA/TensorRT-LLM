@@ -170,6 +170,34 @@ def test_deepseek_v4_base_checkpoint_detection(
     assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
 
 
+def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
+    """DeepSeek-V4 load must fail fast with a clear error when neither the
+    checkpoint config nor a user ``sparse_attention_config`` provides
+    ``compress_ratios``.
+
+    Regression test: previously ``compress_ratios`` could stay ``None`` and the
+    internal normalization comprehension raised an opaque
+    ``TypeError: 'NoneType' object is not iterable`` mid-load.
+    """
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
+
+    pretrained_config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        compress_ratios=None,
+        num_hidden_layers=4,
+    )
+
+    # Avoid touching the filesystem for the HF config load; the empty tmp_path
+    # makes the real ``_is_deepseek_v4_base_checkpoint`` probe return False.
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+
+    with pytest.raises(ValueError, match="compress_ratios"):
+        ModelConfig.from_pretrained(str(tmp_path))
+
+
 def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
