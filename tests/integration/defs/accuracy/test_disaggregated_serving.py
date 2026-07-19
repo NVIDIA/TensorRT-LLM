@@ -1692,7 +1692,8 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("overlap_scheduler", [False])
     def test_auto_dtype(self, overlap_scheduler):
         cache_transceiver_config = {
-            "backend": "DEFAULT",
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
             "max_tokens_in_buffer": 4096
         }
         max_num_tokens = 8192
