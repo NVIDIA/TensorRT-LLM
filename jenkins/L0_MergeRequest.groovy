@@ -644,6 +644,38 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
     return result
 }
 
+// Returns true if the GitHub PR has the given label, false if absent.
+// Fails open (returns true) on network/auth errors so CI is not blocked.
+// Only meaningful for GitHub PRs; callers must guard with globalVars[GITHUB_PR_API_URL].
+def hasGithubPRLabel(pipeline, githubPrApiUrl, labelName) {
+    try {
+        def rawDataJson = null
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'
+            ),
+        ]) {
+            rawDataJson = pipeline.sh(
+                script: """
+                    curl --silent --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
+                         --url "${githubPrApiUrl}"
+                """,
+                returnStdout: true
+            )
+        }
+        def prData = readJSON text: rawDataJson, returnPojo: true
+        def labels = prData.get("labels", []) ?: []
+        def found = labels.any { label -> label?.get("name", "") == labelName }
+        echo "[hasGithubPRLabel] label '${labelName}' present: ${found}"
+        return found
+    } catch (Exception e) {
+        echo "[hasGithubPRLabel] Warning: failed to check GitHub PR labels: ${e.toString()}. Failing open."
+        return true  // fail-open: do not block CI if the label check itself fails
+    }
+}
+
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
@@ -1573,6 +1605,22 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
+                    // Gate: require 'ci: full pre-merge approved' label for GitHub PRs.
+                    // PostMerge pipelines and GitLab MR builds are exempt.
+                    if (globalVars[GITHUB_PR_API_URL] && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+                        if (!hasGithubPRLabel(pipeline, globalVars[GITHUB_PR_API_URL],
+                                              "ci: full pre-merge approved")) {
+                            def existingDesc = currentBuild.description ?: ""
+                            currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+                                "<span data-multi-gpu-label-required='true'>" +
+                                "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+                                "</span>"
+                            error "x86_64 Multi-GPU tests require the GitHub label " +
+                                  "'ci: full pre-merge approved' on this PR. " +
+                                  "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
+                                  "then re-trigger CI."
+                        }
+                    }
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
@@ -1688,6 +1736,22 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "SBSA test job is skipped due to Jenkins configuration"
                         return
+                    }
+                    // Gate: require 'ci: full pre-merge approved' label for GitHub PRs.
+                    // PostMerge pipelines and GitLab MR builds are exempt.
+                    if (globalVars[GITHUB_PR_API_URL] && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+                        if (!hasGithubPRLabel(pipeline, globalVars[GITHUB_PR_API_URL],
+                                              "ci: full pre-merge approved")) {
+                            def existingDesc = currentBuild.description ?: ""
+                            currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+                                "<span data-multi-gpu-label-required='true'>" +
+                                "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+                                "</span>"
+                            error "SBSA Multi-GPU tests require the GitHub label " +
+                                  "'ci: full pre-merge approved' on this PR. " +
+                                  "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
+                                  "then re-trigger CI."
+                        }
                     }
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter

@@ -105,6 +105,25 @@ full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 Changes to `waives.txt` should include a bug link or brief explanation so other
 developers understand why the test is disabled.
 
+## Multi-GPU Tests
+
+Running multi-GPU tests (`--add-multi-gpu-test`, `--only-multi-gpu-test`) requires the
+`ci: full pre-merge approved` label on the PR. Without this label the
+`[Test-x86_64-Multi-GPU] Remote Run` and `[Test-SBSA-Multi-GPU] Remote Run` stages will
+fail with an explanatory error.
+
+To obtain the label, ask a member of `NVIDIA/trt-llm-ci-approvers` to apply it. Only
+members of that team can add the label; unauthorized additions are automatically removed
+by the `Guard Full Pre-Merge Approval Label` GitHub Actions workflow.
+
+Once the label is present, re-trigger CI:
+
+```bash
+/bot run --add-multi-gpu-test
+```
+
+Post-merge pipelines and GitLab MR builds are exempt from this label check.
+
 ## Triggering CI Best Practices
 
 ### Triggering Post-merge tests
