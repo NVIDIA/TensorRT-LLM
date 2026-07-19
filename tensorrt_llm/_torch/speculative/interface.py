@@ -526,26 +526,15 @@ class SpecMetadata:
     # Defaults to True so non-one-engine paths (where populate is a no-op)
     # never accidentally select the advanced graph variant.
     is_all_greedy_sample: bool = True
-    # Group-synchronized override for ``is_all_greedy_sample``. ANCHOR: this
-    # comment is the single authoritative description of the group-sync
-    # semantics; other sites (model engine sync, scan application, worker
-    # branch) keep only their local contract and point here.
-    #
-    # Under ADP + LM-head TP with rejection sampling, the greedy-vs-advanced
-    # sampling-path choice gates group collectives (the LM-head-TP stacked
-    # draft forward and its distributed argmax) and the CUDA graph variant
-    # recording them. Under attention DP each rank owns a different batch, so
-    # the local flags can diverge -- a diverged choice would leave part of the
-    # group waiting in a collective the rest never enters. The model engine
-    # (``_sync_group_all_greedy_sample``) therefore all-gathers the per-rank
-    # local flags each iteration BEFORE the CUDA graph key is built and stores
-    # the group AND here; ``_scan_one_model_sampling`` re-applies it on every
-    # rescan so all later consumers (graph key, populate, worker branches)
-    # observe the same value. AND semantics are conservative-safe: a locally
-    # all-greedy rank may be pulled onto the advanced path, where its sentinel
-    # sampling params still sample greedily -- never the reverse. ``None``
-    # (default) means "no group sync configured": the local per-rank value is
-    # used as-is.
+    # Group-synchronized override for ``is_all_greedy_sample`` (AND over the
+    # TP group's local flags; None = no group sync configured, use the local
+    # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
+    # advanced choice gates group collectives, so all ranks must take the same
+    # path even though their batches (and thus local flags) differ. Set by
+    # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
+    # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
+    # a greedy rank pulled onto the advanced path still samples greedily via
+    # its sentinel params.
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
