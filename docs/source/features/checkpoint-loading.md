@@ -108,11 +108,14 @@ legacy_fallback
 The first eligible and implemented policy is selected. Qualification and
 fallback happen before policy-specific I/O begins; the loader does not switch
 policies after a collective read or transfer has started. In this first
-version, the two host policies share the same qualification rules and
-`gpu_broadcast` is unavailable. The implicit plan therefore selects
-`direct_rank_read` for a qualified model and otherwise reaches
+version, the two host policies share source and communicator qualification
+rules and `gpu_broadcast` is unavailable. The implicit plan therefore selects
+`direct_rank_read` for HF/AUTO SafeTensors and otherwise reaches
 `legacy_fallback`; select `shared_host_producer` explicitly to compare it.
 An explicitly selected single policy is strict.
+The ordered plan is an eligibility/fallback mechanism, not a runtime
+performance-adaptive selector: one policy handles the whole checkpoint, and
+policies are not mixed per tensor.
 
 Set a single policy for controlled benchmarking, or a comma-separated ordered
 plan when fallback is desired:
@@ -141,7 +144,7 @@ checkpoint_loader = HfCheckpointLoader(
 
 | Policy | Status | Current behavior |
 | --- | --- | --- |
-| `direct_rank_read` | Implemented; default primary policy | Node-local ranks own disjoint file extents and issue parallel direct reads into the shared OS page cache. |
+| `direct_rank_read` | Implemented; default primary policy | Node-local ranks own disjoint file extents and issue parallel background reads into the shared OS page cache while ModelLoader materializes tensors. |
 | `shared_host_producer` | Implemented page-cache staging v0 | Node-local rank 0 reads all extents with a bounded thread pool; peer ranks wait and then mmap the shared cached pages. |
 | `gpu_broadcast` | Recognized future policy | Preflight reports it unavailable until rank-aware final tensor placement and a topology-aware GPU transport exist. |
 | `legacy_fallback` | Implemented compatibility policy | Uses the pre-existing whole-file prefetch and SafeTensors loading path. |
@@ -159,9 +162,17 @@ that omits that policy fails instead of silently measuring the legacy path.
 Both implemented cooperative policies retain the existing 90%-of-available-
 host-memory guard. When full prefetch is safe, they divide selected files into
 256 MiB extents and read each extent through bounded 8 MiB temporary buffers.
-After a node-local barrier, every rank uses the unchanged mmap-backed
-SafeTensors and model-loading paths. If the memory guard rejects full prefetch,
-the mmap path demand-pages the required ranges instead.
+`shared_host_producer` completes those reads and a node-local barrier before
+every rank uses the unchanged mmap-backed SafeTensors and model-loading paths.
+For `direct_rank_read`, ModelLoader starts a background read-ahead session,
+maps the full raw weight dictionary immediately, and keeps the session open
+through mapper initialization and model weight materialization. Session exit
+joins the reads, coordinates errors, and performs the node barrier. This is
+system-level overlap between filesystem I/O and existing materialization/H2D
+work; it is not pinned-memory asynchronous DMA. Direct callers of
+`HfWeightLoader.load_weights()` retain synchronous behavior. If the memory
+guard rejects full prefetch, the mmap path demand-pages the required ranges
+instead.
 
 `direct_rank_read` is a storage-byte assignment, not yet a TP/PP-aware tensor
 loader. It aims for one logical checkpoint read per node by striping extents
@@ -188,14 +199,37 @@ parameter buffers. The current HF loader returns raw CPU tensors before
 model-specific slicing and placement, so implementing this policy efficiently
 requires a new rank-aware materialization interface.
 
-The cooperative policies are initially restricted to unquantized dense
-`LlamaForCausalLM`, `Qwen2ForCausalLM`, and `Qwen3ForCausalLM` checkpoints with
-standard HF mapping, `LoadFormat.AUTO`, TP, and PP. Distributed cooperative
-loading requires MPI-launched ranks. Context parallelism, expert parallelism,
-attention data parallelism, DWDP, speculative decoding, VLMs, custom models or
-mappers, quantized checkpoints, LoRA-enabled models, dynamic quantization, and
-`.bin`/`.pth` weights resolve to `legacy_fallback` under the default plan.
-Every participating rank must use the same plan, load format, and world size.
+Because the cooperative policies stage immutable raw file extents and return
+the same complete tensor dictionary as the legacy mmap path, eligibility is
+not tied to a model class, mapper, quantization mode, or TP/PP/CP/EP layout.
+That includes Qwen 3.5, DeepSeek V4, and Llama 4 checkpoint paths, including
+MTP/speculative configurations, provided the underlying checkpoint is HF
+SafeTensors with `LoadFormat.AUTO`. This removes a loader-specific model
+onboarding step; model-specific mapping and quantization correctness remains
+the responsibility of the unchanged downstream model loader. Eligibility is
+not end-to-end qualification: each flagship model, quantization, and
+parallelism configuration still requires correctness and cold-start benchmark
+coverage before it is claimed as production-qualified. Distributed
+cooperative loading requires MPI-launched ranks. `.bin`/`.pth`, MX, GMS, and
+format-specific loaders retain their existing paths. Every participating rank
+must use the same plan, load format, and world size.
+
+Flagship qualification should exercise the real downstream loaders rather
+than add model-name checks to the byte reader:
+
+| Family | Minimum coverage |
+| --- | --- |
+| Qwen 3.5 | Dense and MoE HF checkpoints; BF16, FP8, and NVFP4 where supported; TP/EP and attention-DP on and off; the Qwen 3.5 custom mapper. |
+| DeepSeek V4 | Native HF SafeTensors; supported quantization; TP/EP with attention-DP; MTP target and draft loading. |
+| Llama 4 | Scout and Maverick; text and multimodal construction; FP8; TP/EP and a PP configuration that verifies layer ownership. |
+
+For each configuration, run strict `direct_rank_read`, strict
+`shared_host_producer`, the default ordered plan, and `legacy_fallback`. A
+strict optimized run fails qualification if it falls back. Validate
+deterministic inference parity, clean worker and communicator teardown, and
+peak host memory, then measure cold-cache model initialization and first-
+inference latency. Performance claims require a system trace showing storage
+reads overlapping model materialization or H2D activity.
 
 Page-cache reuse is best-effort and depends on the filesystem, mount, memory
 pressure, and cache state. Cooperating ranks must resolve paths to the same

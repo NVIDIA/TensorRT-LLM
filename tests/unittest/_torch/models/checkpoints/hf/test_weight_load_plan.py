@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Tests for selectable HF SafeTensors weight-load policies."""
 
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -43,6 +44,8 @@ def _model(
     *,
     module_name: str | None = None,
     quant_algo=None,
+    quant_config_dict=None,
+    spec_config=None,
     lora_config=None,
     force_dynamic_quantization=False,
 ):
@@ -52,8 +55,8 @@ def _model(
     model = model_cls()
     model.model_config = SimpleNamespace(
         quant_config=SimpleNamespace(quant_algo=quant_algo),
-        quant_config_dict=None,
-        spec_config=None,
+        quant_config_dict=quant_config_dict,
+        spec_config=spec_config,
         lora_config=lora_config,
         force_dynamic_quantization=force_dynamic_quantization,
     )
@@ -94,46 +97,68 @@ def test_direct_rank_read_rejects_duplicate_keys_before_consumption(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "model,mapping,reason",
+    "model,mapping",
     [
-        (None, Mapping(), "initialized model was not provided"),
-        (_model("UnsupportedForCausalLM"), Mapping(), "model type"),
-        (_model(quant_algo="FP8"), Mapping(), "quantized checkpoints"),
-        (_model(lora_config=object()), Mapping(), "LoRA-enabled models"),
-        (_model(force_dynamic_quantization=True), Mapping(), "dynamic quantization"),
-        (_model(), Mapping(world_size=2, cp_size=2), "context parallelism"),
+        (
+            _model(
+                "Qwen3_5MoeForCausalLM",
+                module_name="tensorrt_llm._torch.models.modeling_qwen3_5",
+                quant_algo="FP8",
+                quant_config_dict={"experts": "NVFP4"},
+            ),
+            Mapping(),
+        ),
+        (
+            _model(
+                "DeepseekV4ForCausalLM",
+                module_name="tensorrt_llm._torch.models.modeling_deepseekv4",
+                spec_config=object(),
+            ),
+            Mapping(
+                world_size=8,
+                tp_size=4,
+                pp_size=2,
+                moe_tp_size=1,
+                moe_ep_size=4,
+                enable_attention_dp=True,
+            ),
+        ),
+        (
+            _model(
+                "Llama4ForConditionalGeneration",
+                module_name="tensorrt_llm._torch.models.modeling_llama",
+                lora_config=object(),
+                force_dynamic_quantization=True,
+            ),
+            Mapping(world_size=4, tp_size=2, cp_size=2),
+        ),
     ],
 )
-def test_direct_rank_read_falls_back_before_loading(tmp_path, model, mapping, reason):
-    (tmp_path / "model.safetensors").touch()
-    eager_weights = {"weight": object()}
-    loader = HfWeightLoader(weight_load_plan=("direct_rank_read", "legacy_fallback"))
-
-    with (
-        mock.patch.object(loader, "_prefetch_and_load", return_value=eager_weights) as eager_load,
-        mock.patch.object(loader, "_load_cooperative_policy") as cooperative_load,
-        mock.patch.object(logger, "info") as info,
-    ):
-        weights = loader.load_weights(
-            str(tmp_path), mapping=mapping, model=model, _load_format="AUTO"
-        )
-
-    assert weights is eager_weights
-    eager_load.assert_called_once()
-    cooperative_load.assert_not_called()
-    info.assert_called_once()
-    assert reason in info.call_args.args[0]
-
-
-def test_same_name_custom_model_is_not_eligible():
-    model = _model("LlamaForCausalLM", module_name=__name__)
+def test_cooperative_read_ahead_accepts_flagship_quant_parallel_and_mtp_configs(
+    model, mapping, monkeypatch
+):
+    monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
 
     reason = HfWeightLoader._cooperative_ineligibility_reason(
-        model, Mapping(), checkpoint_format="HF", uses_custom_weight_mapper=False
+        model,
+        mapping,
+        checkpoint_format="HF",
+        uses_custom_weight_mapper=True,
+        load_format="AUTO",
     )
 
-    assert reason is not None
-    assert "model type" in reason
+    assert reason is None
+
+
+def test_cooperative_read_ahead_is_not_gated_by_model_class():
+    reason = HfWeightLoader._cooperative_ineligibility_reason(
+        _model("FutureForCausalLM"),
+        Mapping(),
+        checkpoint_format="HF",
+        uses_custom_weight_mapper=False,
+    )
+
+    assert reason is None
 
 
 def test_distributed_non_mpi_loader_is_not_eligible(monkeypatch):
@@ -242,6 +267,265 @@ def test_shared_host_producer_uses_page_cache_then_mmap(tmp_path):
 
     prefetch.assert_called_once_with([str(checkpoint)], WeightLoadPolicy.SHARED_HOST_PRODUCER, None)
     torch.testing.assert_close(weights["model.norm.weight"], reference["model.norm.weight"])
+
+
+def test_direct_session_yields_before_read_ahead_finishes_and_exit_joins(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read", prefetch_chunk_size=1)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    expected_weights = {"weight": object()}
+
+    def blocked_read(*_args):
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+
+    with (
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(loader, "_prefetch_one_chunk", side_effect=blocked_read),
+        mock.patch.object(loader, "_load_weights_in_parallel", return_value=expected_weights),
+    ):
+        with loader.open_weight_session(str(tmp_path), Mapping(), model=_model()) as weights:
+            assert weights is expected_weights
+            assert started.wait(timeout=5)
+            assert not finished.is_set()
+            release.set()
+
+    assert finished.is_set()
+
+
+def test_public_direct_load_remains_synchronous(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read", prefetch_chunk_size=1)
+    started = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    errors = []
+
+    def blocked_read(*_args):
+        started.set()
+        assert release.wait(timeout=5)
+
+    def load():
+        try:
+            loader.load_weights(str(tmp_path), Mapping(), model=_model())
+        except Exception as error:
+            errors.append(error)
+        finally:
+            returned.set()
+
+    with (
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(loader, "_prefetch_one_chunk", side_effect=blocked_read),
+        mock.patch.object(loader, "_load_weights_in_parallel", return_value={}),
+    ):
+        load_thread = threading.Thread(target=load)
+        load_thread.start()
+        assert started.wait(timeout=5)
+        assert not returned.is_set()
+        release.set()
+        load_thread.join(timeout=5)
+
+    assert not load_thread.is_alive()
+    assert not errors
+
+
+def test_direct_session_has_no_pre_consumption_node_barrier(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read", prefetch_chunk_size=1)
+    node_communicator = mock.Mock()
+    node_communicator.Get_rank.return_value = 0
+    node_communicator.Get_size.return_value = 1
+    node_communicator.allreduce.side_effect = lambda value, op: value
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked_read(*_args):
+        started.set()
+        assert release.wait(timeout=5)
+
+    with (
+        mock.patch.object(
+            loader,
+            "_get_active_node_communicator",
+            return_value=node_communicator,
+        ),
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(loader, "_prefetch_one_chunk", side_effect=blocked_read),
+        mock.patch.object(loader, "_load_weights_in_parallel", return_value={}),
+    ):
+        with loader.open_weight_session(str(tmp_path), Mapping(), model=_model()):
+            assert started.wait(timeout=5)
+            node_communicator.Barrier.assert_not_called()
+            release.set()
+
+    node_communicator.Barrier.assert_called_once_with()
+    node_communicator.Free.assert_called_once_with()
+
+
+def test_shared_host_producer_session_stays_synchronous(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    prefetch_started = threading.Event()
+    release = threading.Event()
+    body_entered = threading.Event()
+    errors = []
+
+    def blocked_prefetch(*_args):
+        prefetch_started.set()
+        assert release.wait(timeout=5)
+
+    def load():
+        try:
+            with loader.open_weight_session(str(tmp_path), Mapping(), model=_model()):
+                body_entered.set()
+        except Exception as error:
+            errors.append(error)
+
+    with (
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(loader, "prefetch_file_chunks", side_effect=blocked_prefetch),
+        mock.patch.object(loader, "_load_weights_in_parallel", return_value={}),
+    ):
+        load_thread = threading.Thread(target=load)
+        load_thread.start()
+        assert prefetch_started.wait(timeout=5)
+        assert not body_entered.is_set()
+        release.set()
+        load_thread.join(timeout=5)
+
+    assert not load_thread.is_alive()
+    assert body_entered.is_set()
+    assert not errors
+
+
+def test_direct_session_preserves_model_body_exception_during_cleanup(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read", prefetch_chunk_size=1)
+
+    with (
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(loader, "_prefetch_one_chunk", side_effect=OSError("read failed")),
+        mock.patch.object(loader, "_load_weights_in_parallel", return_value={}),
+        pytest.raises(ValueError, match="materialization failed"),
+    ):
+        with loader.open_weight_session(str(tmp_path), Mapping(), model=_model()):
+            raise ValueError("materialization failed")
+
+
+def test_direct_session_cancels_read_ahead_on_model_body_failure(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read", prefetch_chunk_size=1)
+    started = threading.Event()
+    cancellation_observed = threading.Event()
+
+    def cancellable_read(_file, _offset, _length, cancel_event):
+        started.set()
+        assert cancel_event.wait(timeout=5)
+        cancellation_observed.set()
+
+    with (
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(loader, "_prefetch_one_chunk", side_effect=cancellable_read),
+        mock.patch.object(loader, "_load_weights_in_parallel", return_value={}),
+        pytest.raises(ValueError, match="materialization failed"),
+    ):
+        with loader.open_weight_session(str(tmp_path), Mapping(), model=_model()):
+            assert started.wait(timeout=5)
+            raise ValueError("materialization failed")
+
+    assert cancellation_observed.is_set()
+
+
+def test_healthy_rank_raises_coordinated_peer_materialization_error(monkeypatch):
+    class FakeWorldCommunicator:
+        calls = 0
+
+        @classmethod
+        def allgather(cls, error_message):
+            cls.calls += 1
+            if cls.calls == 1:
+                assert error_message is None
+                return [None, "ValueError: peer materialization failed"]
+            assert error_message is None
+            return [None, None]
+
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(weight_loader_module, "mpi_comm", lambda: FakeWorldCommunicator())
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read")
+    session = weight_loader_module._DirectReadAheadSession(
+        loader,
+        node_communicator=None,
+        local_chunks=[],
+        max_workers=0,
+        local_rank=0,
+        enabled=False,
+    )
+    session.start()
+
+    class JoinProbe:
+        joined = False
+
+        def join(self):
+            assert session._cancel_event.is_set()
+            self.joined = True
+
+    join_probe = JoinProbe()
+    session._thread = join_probe
+
+    with pytest.raises(
+        RuntimeError,
+        match="Rank 1 failed during direct_rank_read model materialization",
+    ):
+        session.finish()
+
+    assert FakeWorldCommunicator.calls == 2
+    assert join_probe.joined
+
+
+def test_direct_start_failure_is_coordinated_before_mmap(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"x")
+    loader = HfWeightLoader(weight_load_plan="direct_rank_read", prefetch_chunk_size=1)
+    node_communicator = mock.Mock()
+    node_communicator.Get_rank.return_value = 0
+    node_communicator.Get_size.return_value = 1
+    node_communicator.allreduce.side_effect = lambda value, op: value
+
+    with (
+        mock.patch.object(
+            loader,
+            "_get_active_node_communicator",
+            return_value=node_communicator,
+        ),
+        mock.patch.object(loader, "_get_cooperative_prefetch_policy", return_value=(1, True)),
+        mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("cannot start")),
+        mock.patch.object(loader, "_load_weights_in_parallel") as mmap_weights,
+        mock.patch.object(
+            loader, "_raise_on_rank_error", wraps=loader._raise_on_rank_error
+        ) as rank_consensus,
+        pytest.raises(RuntimeError, match="read-ahead start"),
+    ):
+        with loader.open_weight_session(str(tmp_path), Mapping(), model=_model()):
+            pytest.fail("the session body must not run")
+
+    phases = [call.args[0] for call in rank_consensus.call_args_list]
+    assert phases[:2] == [
+        "direct_rank_read read-ahead planning",
+        "direct_rank_read read-ahead start",
+    ]
+    assert "direct_rank_read SafeTensors mmap setup" not in phases
+    mmap_weights.assert_not_called()
+    node_communicator.Free.assert_called_once_with()
 
 
 def test_default_weight_load_plan_matches_policy_order(monkeypatch):
@@ -606,25 +890,24 @@ def test_different_node_local_backing_files_are_rejected(tmp_path, monkeypatch):
     local_communicator.allreduce.assert_not_called()
 
 
-def test_mapper_assigned_after_construction_forces_legacy_fallback(tmp_path):
+def test_mapper_assigned_after_construction_keeps_direct_read_ahead_eligible(tmp_path):
     (tmp_path / "model.safetensors").touch()
-    eager_weights = {"weight": object()}
+    expected_weights = {"weight": object()}
     weight_loader = HfWeightLoader(weight_load_plan=("direct_rank_read", "legacy_fallback"))
     checkpoint_loader = HfCheckpointLoader(weight_loader=weight_loader)
     checkpoint_loader.weight_mapper = mock.Mock()
 
     with (
         mock.patch.object(
-            weight_loader, "_prefetch_and_load", return_value=eager_weights
-        ) as eager_load,
-        mock.patch.object(weight_loader, "_load_cooperative_policy") as cooperative_load,
-        mock.patch.object(logger, "info"),
+            weight_loader, "_load_cooperative_policy", return_value=expected_weights
+        ) as cooperative_load,
     ):
         weights = checkpoint_loader.load_weights(str(tmp_path), Mapping(), model=_model())
 
-    assert weights is eager_weights
-    eager_load.assert_called_once()
-    cooperative_load.assert_not_called()
+    assert weights is expected_weights
+    cooperative_load.assert_called_once_with(
+        [str(tmp_path / "model.safetensors")], WeightLoadPolicy.DIRECT_RANK_READ
+    )
 
 
 @pytest.mark.parametrize(
@@ -669,6 +952,51 @@ def test_mistral_disk_fallback_forwards_checkpoint_format(loader_type, checkpoin
     assert "_load_format" not in kwargs
 
 
+def test_format_specific_session_calls_polymorphic_checkpoint_loader():
+    checkpoint_loader = MistralCheckpointLoader()
+    expected_weights = {"weight": object()}
+
+    with mock.patch.object(
+        checkpoint_loader, "load_weights", return_value=expected_weights
+    ) as load_weights:
+        with checkpoint_loader.open_weight_session("checkpoint", mapping=Mapping()) as weights:
+            assert weights is expected_weights
+
+    load_weights.assert_called_once_with("checkpoint", mapping=mock.ANY)
+
+
+def test_model_loader_helper_uses_class_session_and_duck_fallback():
+    from tensorrt_llm._torch.pyexecutor.model_loader import _open_checkpoint_weight_session
+
+    events = []
+
+    class SessionCheckpointLoader:
+        @contextmanager
+        def open_weight_session(self, checkpoint_dir, **kwargs):
+            events.append("enter")
+            try:
+                yield {"weight": object()}
+            finally:
+                events.append("exit")
+
+        def load_weights(self, *_args, **_kwargs):
+            pytest.fail("class-defined session should be used")
+
+    with _open_checkpoint_weight_session(
+        SessionCheckpointLoader(), "checkpoint", mapping=Mapping()
+    ) as weights:
+        assert weights
+        events.append("materialize")
+
+    assert events == ["enter", "materialize", "exit"]
+
+    duck_loader = mock.MagicMock()
+    duck_loader.load_weights.return_value = {"duck": object()}
+    with _open_checkpoint_weight_session(duck_loader, "checkpoint", mapping=Mapping()) as weights:
+        assert weights == duck_loader.load_weights.return_value
+    duck_loader.load_weights.assert_called_once_with("checkpoint", mapping=mock.ANY)
+
+
 def test_hf_checkpoint_loader_preserves_strict_custom_loader_signature():
     expected_weights = {"weight": object()}
 
@@ -681,6 +1009,21 @@ def test_hf_checkpoint_loader_preserves_strict_custom_loader_signature():
     loader = HfCheckpointLoader(weight_loader=StrictCustomWeightLoader())
 
     assert loader.load_weights("checkpoint", Mapping(), _load_format="AUTO") is expected_weights
+
+
+def test_hf_session_preserves_hf_weight_loader_subclass_override():
+    expected_weights = {"weight": object()}
+
+    class OverriddenHfWeightLoader(HfWeightLoader):
+        def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs):
+            assert checkpoint_dir == "checkpoint"
+            assert kwargs["_checkpoint_format"] == "HF"
+            return expected_weights
+
+    checkpoint_loader = HfCheckpointLoader(weight_loader=OverriddenHfWeightLoader())
+
+    with checkpoint_loader.open_weight_session("checkpoint", Mapping()) as weights:
+        assert weights is expected_weights
 
 
 @pytest.mark.parametrize(

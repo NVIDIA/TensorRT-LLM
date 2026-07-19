@@ -18,7 +18,9 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Any, List, Sequence
 
 import psutil
@@ -42,11 +44,6 @@ from tensorrt_llm.mapping import Mapping
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _WEIGHT_LOAD_PLAN_ENV = "TRTLLM_HF_WEIGHT_LOAD_PLAN"
-_COOPERATIVE_PREFETCH_MODEL_CLASSES = frozenset((
-    ("tensorrt_llm._torch.models.modeling_llama", "LlamaForCausalLM"),
-    ("tensorrt_llm._torch.models.modeling_qwen", "Qwen2ForCausalLM"),
-    ("tensorrt_llm._torch.models.modeling_qwen3", "Qwen3ForCausalLM"),
-))
 _DEFAULT_PREFETCH_CHUNK_SIZE = 256 * 1024 * 1024
 _PREFETCH_READ_SIZE = 8 * 1024 * 1024
 _DEFAULT_PREFETCH_WORKERS_PER_RANK = 16
@@ -60,6 +57,136 @@ _GPU_BROADCAST_UNAVAILABLE_REASON = (
 _DEFAULT_WEIGHT_CACHE_MAX_ENTRIES = 1
 _WEIGHT_CACHE_LOCK = threading.Lock()
 _WEIGHT_CACHE: OrderedDict[tuple, dict[str, Any]] = OrderedDict()
+
+
+class _DirectReadAheadSession:
+    """Own one direct-rank background read-ahead operation.
+
+    Chunk planning and every MPI operation happen on the caller thread. The
+    coordinator thread below only executes precomputed host reads.
+    """
+
+    def __init__(
+        self,
+        loader,
+        *,
+        node_communicator,
+        local_chunks: list[tuple[str, int, int]],
+        max_workers: int,
+        local_rank: int,
+        enabled: bool,
+    ) -> None:
+        self._loader = loader
+        self._node_communicator = node_communicator
+        self._local_chunks = local_chunks
+        self._max_workers = max_workers
+        self._local_rank = local_rank
+        self._enabled = enabled
+        self._started_at = time.perf_counter()
+        self._completed_at: float | None = None
+        self._error: Exception | None = None
+        self._thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
+        self._finished = False
+
+    def start(self) -> None:
+        if not self._enabled or not self._local_chunks:
+            self._completed_at = time.perf_counter()
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="trtllm-direct-rank-read-ahead",
+            daemon=True,
+        )
+        try:
+            self._thread.start()
+        except Exception:
+            self._thread = None
+            self._completed_at = time.perf_counter()
+            raise
+
+    def _run(self) -> None:
+        try:
+            self._loader._prefetch_chunks(self._local_chunks,
+                                          self._max_workers,
+                                          cancel_event=self._cancel_event)
+        except Exception as error:
+            self._error = error
+        finally:
+            self._completed_at = time.perf_counter()
+
+    def finish(self, body_error: BaseException | None = None) -> None:
+        """Join and coordinate the operation on the caller thread."""
+        if self._finished:
+            return
+        self._finished = True
+        if body_error is not None:
+            self._cancel_event.set()
+        tail_started = time.perf_counter()
+        coordinated_body_error = None
+        coordinated_read_error = None
+        finish_error = None
+        communicator_error = None
+        try:
+            try:
+                self._loader._raise_on_rank_error(
+                    "direct_rank_read model materialization", body_error)
+            except Exception as error:
+                coordinated_body_error = error
+                # A peer failed materialization. Stop this rank's remaining
+                # host reads before waiting for the coordinator to exit.
+                self._cancel_event.set()
+
+            if self._thread is not None:
+                self._thread.join()
+            assert self._completed_at is not None
+
+            try:
+                self._loader._raise_on_rank_error(
+                    "direct_rank_read background read-ahead", self._error)
+            except Exception as error:
+                coordinated_read_error = error
+
+            read_ahead_elapsed = self._completed_at - self._started_at
+            successful = (coordinated_body_error is None
+                          and coordinated_read_error is None
+                          and not self._cancel_event.is_set())
+            if successful and self._node_communicator is not None:
+                self._node_communicator.Barrier()
+
+            if self._enabled and successful:
+                exposed_read_tail = max(0.0, self._completed_at - tail_started)
+                local_prefetch_size = sum(
+                    length for _, _, length in self._local_chunks)
+                local_throughput = (local_prefetch_size /
+                                    max(read_ahead_elapsed, 1e-9) / (1024**3))
+                logger.info(
+                    "direct_rank_read local rank "
+                    f"{self._local_rank} background read-ahead assigned "
+                    f"{local_prefetch_size / (1024**3):.2f}GB and completed "
+                    f"in {read_ahead_elapsed:.2f}s "
+                    f"({local_throughput:.2f}GB/s rank-local read rate); "
+                    "exposed read-ahead tail after model materialization was "
+                    f"{exposed_read_tail:.2f}s. This is system-level "
+                    "filesystem I/O and model-materialization/H2D overlap; "
+                    "it does not use pinned asynchronous DMA.")
+        except Exception as error:
+            finish_error = error
+        finally:
+            if self._node_communicator is not None:
+                try:
+                    self._node_communicator.Free()
+                except Exception as error:
+                    communicator_error = error
+
+        if coordinated_body_error is not None:
+            raise coordinated_body_error
+        if coordinated_read_error is not None:
+            raise coordinated_read_error
+        if finish_error is not None:
+            raise finish_error
+        if communicator_error is not None:
+            raise communicator_error
 
 
 @register_checkpoint_weight_loader("MX")
@@ -155,44 +282,18 @@ class HfWeightLoader(BaseWeightLoader):
             checkpoint_format: str | None,
             uses_custom_weight_mapper: bool,
             load_format: Any = None) -> str | None:
+        # These policies only read immutable file extents into the OS page
+        # cache and then return the same complete raw tensor dictionary as the
+        # legacy mmap path. Model architecture, mapper, quantization and
+        # parallelism therefore do not affect byte-read correctness.
+        del model, uses_custom_weight_mapper
         if checkpoint_format != "HF":
             return f"checkpoint format {checkpoint_format or 'unknown'} is not supported"
-        if uses_custom_weight_mapper:
-            return "custom weight mappers are not supported"
         if load_format is not None and getattr(load_format, "name",
                                                load_format) != "AUTO":
             return f"load format {getattr(load_format, 'name', load_format)} is not supported"
-        if model is None:
-            return "the initialized model was not provided"
-        model_class = (type(model).__module__, type(model).__name__)
-        if model_class not in _COOPERATIVE_PREFETCH_MODEL_CLASSES:
-            return f"model type {type(model).__name__} is not supported"
         if mapping.world_size > 1 and mpi_disabled():
             return "distributed cooperative loading requires MPI-launched ranks"
-        if mapping.cp_size != 1:
-            return "context parallelism is not supported"
-        if mapping.moe_ep_size != 1 or mapping.moe_tp_size != mapping.tp_size:
-            return "expert parallelism is not supported"
-        if mapping.enable_attention_dp:
-            return "attention data parallelism is not supported"
-        if mapping.dwdp_enabled:
-            return "distributed weight data parallelism is not supported"
-
-        model_config = getattr(model, "model_config", None)
-        if model_config is None:
-            return "the model has no ModelConfig"
-        quant_config = getattr(model_config, "quant_config", None)
-        if (quant_config is not None
-                and getattr(quant_config, "quant_algo", None) is not None):
-            return "quantized checkpoints are not supported"
-        if getattr(model_config, "quant_config_dict", None) is not None:
-            return "per-layer quantization is not supported"
-        if getattr(model_config, "spec_config", None) is not None:
-            return "speculative decoding models are not supported"
-        if getattr(model_config, "lora_config", None) is not None:
-            return "LoRA-enabled models are not supported"
-        if getattr(model_config, "force_dynamic_quantization", False):
-            return "dynamic quantization is not supported"
         return None
 
     @staticmethod
@@ -464,6 +565,55 @@ class HfWeightLoader(BaseWeightLoader):
                      mapping: Mapping,
                      use_consolidated: bool = False,
                      **kwargs) -> dict[str, Any]:
+        """Load weights synchronously for public/direct callers."""
+        weights, pending_session = self._load_weights_impl(
+            checkpoint_dir,
+            mapping,
+            use_consolidated,
+            defer_direct_read_ahead=False,
+            **kwargs)
+        assert pending_session is None
+        return weights
+
+    @contextmanager
+    def open_weight_session(self,
+                            checkpoint_dir: str,
+                            mapping: Mapping,
+                            use_consolidated: bool = False,
+                            **kwargs) -> Iterator[dict[str, Any]]:
+        """Load weights while allowing direct-rank read-ahead to overlap use."""
+        weights, pending_session = self._load_weights_impl(
+            checkpoint_dir,
+            mapping,
+            use_consolidated,
+            defer_direct_read_ahead=True,
+            **kwargs)
+        body_error = None
+        try:
+            yield weights
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            if pending_session is not None:
+                try:
+                    pending_session.finish(body_error)
+                except Exception:
+                    if body_error is None:
+                        raise
+                    logger.exception(
+                        "Suppressing a direct_rank_read cleanup failure to "
+                        "preserve the model-load exception.")
+
+    def _load_weights_impl(
+        self,
+        checkpoint_dir: str,
+        mapping: Mapping,
+        use_consolidated: bool,
+        *,
+        defer_direct_read_ahead: bool,
+        **kwargs,
+    ) -> tuple[dict[str, Any], _DirectReadAheadSession | None]:
         load_format = kwargs.get("_load_format")
         checkpoint_format = kwargs.get("_checkpoint_format", "HF")
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
@@ -517,20 +667,24 @@ class HfWeightLoader(BaseWeightLoader):
                         "The HF raw-weight cache is ignored by cooperative "
                         "SafeTensors policies because it does not yet mirror "
                         "their collective sequence.")
-                model_type = type(kwargs["model"]).__name__
+                model_type = type(kwargs.get("model")).__name__
                 logger.info(f"Using {policy.value} SafeTensors loading for "
                             f"{model_type} (TP={mapping.tp_size}, "
                             f"PP={mapping.pp_size}).")
-                return self._load_cooperative_policy(weight_files, policy)
+                if (defer_direct_read_ahead
+                        and policy == WeightLoadPolicy.DIRECT_RANK_READ):
+                    return self._load_direct_rank_read_with_background_readahead(
+                        weight_files)
+                return self._load_cooperative_policy(weight_files, policy), None
             if policy != WeightLoadPolicy.LEGACY_FALLBACK:
                 raise RuntimeError(
                     f"Weight-load policy {policy.value} has no executor")
             use_active_communicator = (checkpoint_format == "HF" and getattr(
                 load_format, "name", load_format) in (None, "AUTO"))
-            return self._load_legacy_safetensors(
+            return (self._load_legacy_safetensors(
                 weight_files,
                 use_consolidated,
-                use_active_communicator=use_active_communicator)
+                use_active_communicator=use_active_communicator), None)
 
         if file_kind in ("bin", "pth"):
             weight_load_plan, coordination_error = (
@@ -552,7 +706,7 @@ class HfWeightLoader(BaseWeightLoader):
                 mirror_load_collectives=False,
                 load_fn=lambda: self._load_weights_in_parallel(
                     weight_files, self._load_bin_or_path_file,
-                    "Loading bin weights in parallel"))
+                    "Loading bin weights in parallel")), None
 
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
@@ -620,6 +774,100 @@ class HfWeightLoader(BaseWeightLoader):
             if node_communicator is not None:
                 node_communicator.Free()
 
+    def _load_direct_rank_read_with_background_readahead(
+        self, weight_files: List[str]
+    ) -> tuple[ConsumableWeightsDict, _DirectReadAheadSession]:
+        """Map weights now and defer direct-rank read-ahead completion.
+
+        The caller must finish the returned session after it consumes the
+        weights. That lets page-cache reads overlap tensor materialization and
+        the model's existing H2D copies without changing tensor placement.
+        """
+        node_communicator = self._get_active_node_communicator()
+        session = None
+        start_attempted = False
+        try:
+            prefetch_size, enable_prefetch = (
+                self._get_cooperative_prefetch_policy(weight_files,
+                                                      node_communicator))
+            local_rank = None
+            planning_error = None
+            try:
+                local_rank, local_size = self._get_local_rank_and_size(
+                    node_communicator)
+                local_chunks = self._local_prefetch_chunks(
+                    weight_files, WeightLoadPolicy.DIRECT_RANK_READ,
+                    node_communicator)
+                max_workers = self._get_prefetch_worker_count(
+                    WeightLoadPolicy.DIRECT_RANK_READ, local_size,
+                    len(local_chunks))
+                session = _DirectReadAheadSession(
+                    self,
+                    node_communicator=node_communicator,
+                    local_chunks=local_chunks,
+                    max_workers=max_workers,
+                    local_rank=local_rank,
+                    enabled=enable_prefetch,
+                )
+            except Exception as error:
+                planning_error = error
+            self._raise_on_rank_error("direct_rank_read read-ahead planning",
+                                      planning_error)
+            assert session is not None
+            assert local_rank is not None
+            if enable_prefetch:
+                logger.info(
+                    "direct_rank_read is starting background read-ahead for "
+                    f"{prefetch_size / (1024**3):.2f}GB of checkpoint data "
+                    "in bounded chunks.")
+            else:
+                logger.info(
+                    "Skipping direct_rank_read full-checkpoint background "
+                    "read-ahead; weights will use the existing mmap-backed "
+                    "path.")
+            start_attempted = True
+            start_error = None
+            try:
+                session.start()
+            except Exception as error:
+                start_error = error
+            self._raise_on_rank_error("direct_rank_read read-ahead start",
+                                      start_error)
+
+            mmap_started = time.perf_counter()
+            weights = None
+            mmap_error = None
+            try:
+                weights = self._load_weights_in_parallel(
+                    weight_files,
+                    self._load_safetensors_file,
+                    "Mapping safetensors weights in parallel",
+                    reject_duplicate_keys=True)
+            except Exception as error:
+                mmap_error = error
+            self._raise_on_rank_error("direct_rank_read SafeTensors mmap setup",
+                                      mmap_error)
+            assert weights is not None
+            if local_rank == 0:
+                logger.info(
+                    "direct_rank_read SafeTensors mmap setup completed in "
+                    f"{time.perf_counter() - mmap_started:.2f}s; background "
+                    "read-ahead remains active during model materialization.")
+            return weights, session
+        except BaseException as setup_error:
+            # A mmap/planning failure remains the primary exception even if
+            # joining or communicator cleanup also encounters an error.
+            if session is not None and start_attempted:
+                try:
+                    session.finish(setup_error)
+                except Exception:
+                    logger.exception(
+                        "Suppressing direct_rank_read cleanup failure while "
+                        "propagating weight-session setup failure.")
+            elif node_communicator is not None:
+                node_communicator.Free()
+            raise
+
     def _load_cooperative_policy_with_communicator(
             self, weight_files: List[str], policy: WeightLoadPolicy,
             node_communicator) -> ConsumableWeightsDict:
@@ -685,7 +933,7 @@ class HfWeightLoader(BaseWeightLoader):
         return weights
 
     @staticmethod
-    def _raise_on_rank_error(phase: str, error: Exception | None) -> None:
+    def _raise_on_rank_error(phase: str, error: BaseException | None) -> None:
         error_message = (None if error is None else
                          f"{type(error).__name__}: {error}")
         if ENABLE_MULTI_DEVICE and not mpi_disabled():
@@ -854,13 +1102,19 @@ class HfWeightLoader(BaseWeightLoader):
             logger.info(f"Finished prefetching {file_name}.")
 
     @staticmethod
-    def _prefetch_one_chunk(file_name: str, offset: int, length: int) -> None:
+    def _prefetch_one_chunk(
+            file_name: str,
+            offset: int,
+            length: int,
+            cancel_event: threading.Event | None = None) -> None:
         """Read a bounded file extent into the OS page cache."""
         with open(file_name, "rb", buffering=0) as f:
             file_descriptor = f.fileno()
             read_offset = offset
             remaining = length
             while remaining > 0:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
                 read_size = min(remaining, _PREFETCH_READ_SIZE)
                 data = os.pread(file_descriptor, read_size, read_offset)
                 if not data:
@@ -909,26 +1163,61 @@ class HfWeightLoader(BaseWeightLoader):
 
         local_rank, local_size = self._get_local_rank_and_size(
             node_communicator)
+        max_workers = self._get_prefetch_worker_count(policy, local_size,
+                                                      len(local_chunks))
+        logger.debug(f"{policy.value} local rank {local_rank} prefetching "
+                     f"{len(local_chunks)} chunks with {max_workers} workers.")
+        self._prefetch_chunks(local_chunks, max_workers)
+
+    def _get_prefetch_worker_count(self, policy: WeightLoadPolicy,
+                                   local_size: int, num_chunks: int) -> int:
+        """Choose a bounded worker count before background work starts."""
+        if num_chunks == 0:
+            return 0
         if self._prefetch_workers_per_rank is None:
             worker_budget = _DEFAULT_PREFETCH_WORKERS_PER_RANK
             if policy == WeightLoadPolicy.DIRECT_RANK_READ:
                 worker_budget = min(
                     worker_budget,
                     max(1, _DEFAULT_PREFETCH_WORKERS_PER_NODE // local_size))
-            max_workers = min(worker_budget, len(local_chunks))
+            return min(worker_budget, num_chunks)
         else:
-            max_workers = min(self._prefetch_workers_per_rank,
-                              len(local_chunks))
+            return min(self._prefetch_workers_per_rank, num_chunks)
 
-        logger.debug(f"{policy.value} local rank {local_rank} prefetching "
-                     f"{len(local_chunks)} chunks with {max_workers} workers.")
+    def _prefetch_chunks(self,
+                         local_chunks: list[tuple[str, int, int]],
+                         max_workers: int,
+                         cancel_event: threading.Event | None = None) -> None:
+        """Execute a precomputed read plan without MPI or rank discovery."""
+        if not local_chunks:
+            return
+
+        def prefetch_chunk(chunk: tuple[str, int, int]) -> None:
+            try:
+                if cancel_event is None:
+                    self._prefetch_one_chunk(*chunk)
+                else:
+                    self._prefetch_one_chunk(*chunk, cancel_event)
+            except Exception:
+                if cancel_event is not None:
+                    cancel_event.set()
+                raise
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
-                executor.submit(self._prefetch_one_chunk, *chunk)
-                for chunk in local_chunks
+                executor.submit(prefetch_chunk, chunk) for chunk in local_chunks
             ]
-            for future in futures:
-                future.result()
+            try:
+                for index, future in enumerate(futures):
+                    if cancel_event is not None and cancel_event.is_set():
+                        for pending_future in futures[index:]:
+                            pending_future.cancel()
+                    if not future.cancelled():
+                        future.result()
+            except Exception:
+                for pending_future in futures:
+                    pending_future.cancel()
+                raise
 
     def prefetch_files(self, file_names: List[str], node_communicator=None):
         """
