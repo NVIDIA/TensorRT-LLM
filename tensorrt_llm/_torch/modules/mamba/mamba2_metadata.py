@@ -369,9 +369,14 @@ class Mamba2Metadata:
                     self.state_indices_cpu[:batch_size], non_blocking=True)
             else:
                 # indices is a Python sequence (e.g. List[int]); data
-                # already lives on host, CPU staging is fine.
-                for i, idx in enumerate(indices):
-                    self.state_indices_cpu[i] = idx
+                # already lives on host, CPU staging is fine. One bulk
+                # conversion instead of a per-element tensor write.
+                assert len(indices) == batch_size, (
+                    f"get_state_indices() returned {len(indices)} entries for "
+                    f"a batch of {batch_size} requests.")
+                self.state_indices_cpu[:batch_size].copy_(
+                    torch.as_tensor(indices,
+                                    dtype=self.state_indices_cpu.dtype))
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
 

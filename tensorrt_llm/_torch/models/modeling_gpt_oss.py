@@ -60,7 +60,10 @@ class AttentionBlock(Attention):
                 beta_fast=pretrained_config.rope_scaling['beta_fast'],
                 beta_slow=pretrained_config.rope_scaling['beta_slow'],
                 duplicate_data=False),
-            is_neox=False,
+            # GPT-OSS applies NeoX-style (rotate-half) RoPE, matching the HF
+            # reference. The fused kernel ignores this flag for yarn (which
+            # masked the wrong value); the unfused path honors it.
+            is_neox=True,
         )
 
         super().__init__(

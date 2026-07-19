@@ -153,11 +153,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def block_subordinates(self):
         if self.rank != 0:
-            if isinstance(self.engine, tllm.Executor):
-                self.shutdown()
-                raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
-                )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()

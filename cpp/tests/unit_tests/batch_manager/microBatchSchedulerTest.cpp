@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <numeric>
@@ -59,7 +60,7 @@ protected:
         {
             draftTokens = std::make_shared<std::vector<int32_t>>(draftTokensLen, 2);
             draftLogits = BufferManager::cpu(
-                ITensor::makeShape({draftTokensLen, /* vocabSizePadded*/ 42}), nvinfer1::DataType::kFLOAT);
+                ITensor::makeShape({draftTokensLen, /* vocabSizePadded*/ 42}), tensorrt_llm::DataType::kFLOAT);
         }
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig,
             /*isStreaming=*/false,
@@ -1246,7 +1247,7 @@ protected:
 
         return std::make_shared<kv_cache_manager::KVCacheManager>(
             /*numLayers=*/10, /*nbKvHeads=*/10, /*sizePerHead=*/1, tokensPerBlock, blocksPerWindow, maxNumRequests,
-            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, nvinfer1::DataType::kHALF,
+            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, tensorrt_llm::DataType::kHALF,
             /*sinkTokenLength=*/0, stream, maxNumTokensPerSeq, /*chunkSize=*/maxNumTokensPerSeq, enableReuse);
     }
 
