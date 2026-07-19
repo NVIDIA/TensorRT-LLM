@@ -1120,6 +1120,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # MTP cross-step indexer Top-K reuse control flags.
         self.indexer_skip_topk = False
         self.in_mtp_draft_loop = False
+        # Per-request accepted-token counts for the draft-step-0 top-k stash
+        # (set by the MTP-Eagle worker before the draft loop). None => fall back
+        # to the last padded row.
+        self.mtp_num_accepted = None
 
         # Persistent scratch for the Radix-split-work indexer path. Re-created
         # in update_spec_dec_param when max_draft_tokens changes so it stays
@@ -1267,6 +1271,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def set_in_mtp_draft_loop(self, active: bool):
         self.in_mtp_draft_loop = active
+
+    def set_mtp_num_accepted(self, num_accepted):
+        # Per-request accepted-token counts (device tensor, len == batch_size)
+        # used by the draft-step-0 top-k stash to pick each gen request's
+        # last-accepted row instead of the last padded row.
+        self.mtp_num_accepted = num_accepted
 
     def _invalidate_pool_view_cache(self):
         """Invalidate the cached pool view and related step-invariant values.
@@ -2860,8 +2870,25 @@ class Indexer(nn.Module):
             rows = None
             if num_generations > 0:
                 next_n = num_gen_tokens // num_generations
-                rows = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
-                                           num_gen_tokens][next_n - 1::next_n]
+                gen_block = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
+                                                num_gen_tokens]
+                # [GLM52-KVSHARE-FIX] Stash each gen request's LAST-ACCEPTED-token
+                # top-k, not the last padded/rejected row. TRT pads every gen
+                # request to next_n=(draft_len+1) rows for cuda-graph; rows beyond
+                # num_accepted lie on the target's rejected-branch continuation.
+                # vLLM/SGLang compact the reuse buffer at the last accepted token;
+                # mirror the eagle3 draft-step-0 gather at start + (num_accepted-1).
+                mtp_num_accepted = getattr(metadata, "mtp_num_accepted", None)
+                if mtp_num_accepted is not None:
+                    base = torch.arange(num_generations,
+                                        device=gen_block.device,
+                                        dtype=torch.long) * next_n
+                    acc_gen = mtp_num_accepted[num_contexts:num_contexts +
+                                               num_generations].to(torch.long)
+                    sel = base + (acc_gen - 1).clamp_(min=0, max=next_n - 1)
+                    rows = gen_block[sel]
+                else:
+                    rows = gen_block[next_n - 1::next_n]
             if num_contexts > 0:
                 ctx_last = torch.cumsum(
                     metadata.seq_lens_cuda[:num_contexts].to(

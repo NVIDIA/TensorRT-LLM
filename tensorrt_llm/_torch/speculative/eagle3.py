@@ -821,6 +821,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                           and hasattr(attn_metadata, "set_skip_topk"))
         if reuse_mtp_topk:
             attn_metadata.set_in_mtp_draft_loop(True)
+            # [GLM52-KVSHARE-FIX] Give the step-0 top-k stash each gen request's
+            # accepted-token count so it freezes the last-ACCEPTED row (matching
+            # vLLM/SGLang), not the last padded/rejected row.
+            if hasattr(attn_metadata, "set_mtp_num_accepted"):
+                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
@@ -1023,6 +1028,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if reuse_mtp_topk:
             attn_metadata.set_skip_topk(False)
             attn_metadata.set_in_mtp_draft_loop(False)
+            if hasattr(attn_metadata, "set_mtp_num_accepted"):
+                attn_metadata.set_mtp_num_accepted(None)
 
         # Override with SA draft tokens after all draft layers have run,
         # so that draft layers never see SA tokens in their inputs.
