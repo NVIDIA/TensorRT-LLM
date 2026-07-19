@@ -438,7 +438,20 @@ class GvrTopKKernel:
             # column tax); K2048 keeps q.35 (kC/K = 2.5 makes a fat admit
             # costlier than a slim 2-pass miss). Without vseed, q.35 must
             # stay for all K (it is the only slim rung).
-            r0_qfracs = (0.85, 0.35) if (top_k == 2048 or not r0_vseed) else (0.85,)
+            # K2048 low rung 0.85 -> 0.6 (2026-07-19 real-content rung
+            # recalibration + paired nsys cold-L2 A/B, B200): the shipped
+            # 0.85 rung's admission straddles [K, kC] on real V3.2 decode
+            # captures (bracket on 86% of steps -> one extra falsi pass);
+            # 0.6 lands the first pass. Measured: real V3.2 geomean
+            # +2.2-2.8% across fp32/bf16/fp16 and the full BS grid (8K
+            # rung +10-13% at every BS, no loser cell), favorable
+            # synthetic +9-11%, adverse synthetic wash, exact everywhere.
+            # K512/K1024 unchanged: moving or widening their ladder
+            # measured wash-to-loss (the extra count column costs 3-7%).
+            if top_k == 2048:
+                r0_qfracs = (0.6, 0.35) if r0_vseed else (0.85, 0.35)
+            else:
+                r0_qfracs = (0.85,) if r0_vseed else (0.85, 0.35)
         if enable_r0 and p1b_cache is None:
             if cluster_size > 1:
                 p1b_cache = True
