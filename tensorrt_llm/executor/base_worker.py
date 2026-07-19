@@ -554,6 +554,8 @@ class BaseWorker(GenerationExecutor):
                     # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
+                if request.multimodal_params.mm_item_order:
+                    executor_request.py_mm_item_order = request.multimodal_params.mm_item_order
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
