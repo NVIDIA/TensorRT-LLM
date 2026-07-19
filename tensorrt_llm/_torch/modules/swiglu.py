@@ -27,7 +27,8 @@ def scale_and_clamp(x, scale, dtype):
 
 @triton.jit
 def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
-                        swiglu_limit: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+                        swiglu_limit: tl.constexpr, swiglu_alpha: tl.constexpr,
+                        swiglu_beta: tl.constexpr, BLOCK_SIZE: tl.constexpr,
                         HAS_O_SCALE: tl.constexpr,
                         HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
     i = tl.program_id(axis=0).to(tl.int64)
@@ -43,10 +44,16 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
     b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
 
     if HAS_SWIGLU_LIMIT:
+        # Gate clamp is upper-side only; up clamp is symmetric. This is the
+        # shape both plain SwiGLU-with-limit and the MiniMax-M3 / SGLang
+        # swigluoai activation require.
         a = tl.minimum(a, swiglu_limit)
         b = tl.clamp(b, -swiglu_limit, swiglu_limit)
 
-    result = tl.sigmoid(a) * a * b
+    # swiglu_alpha=1.0, swiglu_beta=0.0 recovers plain silu_and_mul;
+    # swiglu_alpha=1.702, swiglu_beta=1.0 is the swigluoai shape (alpha gain
+    # inside the sigmoid, (up + 1) offset).
+    result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
 
     if HAS_O_SCALE:
         o_scale = tl.load(o_scale_ptr)
@@ -58,7 +65,9 @@ def silu_and_mul_kernel(o_ptr, o_stride, o_scale_ptr, x_ptr, x_stride, d,
 def swiglu(x,
            quant_scale: Optional[torch.Tensor] = None,
            quant_type=None,
-           swiglu_limit: Optional[float] = None):
+           swiglu_limit: Optional[float] = None,
+           swiglu_alpha: Optional[float] = None,
+           swiglu_beta: Optional[float] = None):
     if quant_scale is not None:
         assert quant_type is not None
         return torch.ops.trtllm.silu_and_mul(
@@ -66,6 +75,11 @@ def swiglu(x,
             scale=quant_scale,
             dtype=quant_type,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
         )
 
-    return torch.ops.trtllm.silu_and_mul(x, swiglu_limit=swiglu_limit)
+    return torch.ops.trtllm.silu_and_mul(x,
+                                         swiglu_limit=swiglu_limit,
+                                         swiglu_alpha=swiglu_alpha,
+                                         swiglu_beta=swiglu_beta)
