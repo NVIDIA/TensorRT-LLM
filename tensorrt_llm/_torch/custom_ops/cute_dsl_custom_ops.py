@@ -4023,7 +4023,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha_cache = dict()
         active_clusters_cache = dict()
         _TILE_M = 256
-        _CLUSTER_M = 2
         _SCALE_BLOCK_K = 128
         _SCALES_PER_WORD = 4
         _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
@@ -4050,13 +4049,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _SPLIT_K1_TACTICS = (
             ((128, 128), (1, 1), True, None, False),
             ((128, 128), (1, 1), True, None, True),
+            ((256, 112), (2, 1), False, None, True),
             ((256, 128), (2, 1), True, None, False),
             ((256, 128), (2, 1), True, None, True),
             ((256, 144), (2, 1), True, None, False),
             ((256, 144), (2, 1), True, None, True),
+            ((256, 160), (2, 1), False, None, True),
             ((256, 160), (2, 1), True, None, True),
             ((256, 192), (2, 1), True, None, True),
             ((256, 208), (2, 1), False, None, True),
+            ((256, 208), (2, 1), True, None, True),
+            ((256, 224), (2, 1), False, None, True),
+            ((256, 224), (2, 1), True, None, True),
+            ((256, 240), (2, 1), False, None, True),
+            ((256, 240), (2, 1), True, None, True),
             ((256, 256), (2, 1), True, None, True),
         )
 
@@ -4193,17 +4199,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             c_tmp = partials.permute(1, 2, 0)
 
             device_key = a_tensor.device
-            max_active_clusters = self.__class__.active_clusters_cache.get(
-                device_key)
-            if max_active_clusters is None:
-                max_active_clusters = cutlass.utils.HardwareInfo(
-                ).get_max_active_clusters(self._CLUSTER_M)
-                self.__class__.active_clusters_cache[
-                    device_key] = max_active_clusters
             if tactic == -1:
                 tactic = self._get_fallback_tactic(num_splits)
             (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
              l2_swizzle) = tactic
+            # The persistent grid is capped at max_active_clusters *clusters
+            # of this tactic's size*; querying it for the wrong cluster size
+            # halves the grid for (1, 1)-cluster tactics.
+            cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+            clusters_key = (device_key, cluster_size)
+            max_active_clusters = self.__class__.active_clusters_cache.get(
+                clusters_key)
+            if max_active_clusters is None:
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(cluster_size)
+                self.__class__.active_clusters_cache[
+                    clusters_key] = max_active_clusters
             if swap_ab:
                 # Swap M/N to expose more output tiles.
                 kernel_m, kernel_n = n, m
