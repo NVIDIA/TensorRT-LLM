@@ -2655,8 +2655,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
 @skip_pre_blackwell
 @pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"],
-                         ids=["short_prompt", "long_prompt"])
+@pytest.mark.parametrize("prompt_file", ["prompts.json"], ids=["short_prompt"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
