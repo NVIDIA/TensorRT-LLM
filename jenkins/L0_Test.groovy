@@ -1825,7 +1825,7 @@ if [ -n "\$EXISTING" ]; then
     echo "Fat sqsh builder already running as job \$EXISTING, will wait for it"
     BUILDER_ID="\$EXISTING"
     # Locate the log file of the existing job (submitted by a different Jenkins run with a different jobUID)
-    actualFatBuildLogPath=\$(scontrol show job "\$BUILDER_ID" 2>/dev/null | grep -oP '(?<=StdOut=)\S+' || true)
+    actualFatBuildLogPath=\$(scontrol show job "\$BUILDER_ID" 2>/dev/null | grep -oP '(?<=StdOut=)\\S+' || true)
 else
     # Submit the CPU builder. Best-effort: any submission failure is non-fatal;
     # the GPU job will fall back to base sqsh + full install.
