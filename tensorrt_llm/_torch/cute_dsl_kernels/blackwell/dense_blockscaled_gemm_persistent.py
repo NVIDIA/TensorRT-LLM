@@ -1684,6 +1684,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = (
                 self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB))
 
+            # The scale pipeline is pair-local: its empty-buffer release must
+            # multicast to the MMA pair only. ab_pipeline.consumer_mask spans
+            # the whole A/B TMA multicast group, which crosses MMA pairs for
+            # clusters larger than the pair and corrupts the other pair's
+            # barrier phases (deadlock). For a (2, 1) cluster both masks are
+            # identical.
+            scale_release_mask = None
+            if cutlass.const_expr(self.packed_k128_scales and use_2cta_instrs):
+                scale_release_mask = cute.make_layout_image_mask(
+                    cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=0)
+
             #
             # Persistent tile scheduling loop
             #
@@ -1906,7 +1917,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                     if cutlass.const_expr(use_2cta_instrs):
                                         tcgen05.commit(
                                             scale_empty_mbar,
-                                            ab_pipeline.consumer_mask,
+                                            scale_release_mask,
                                             self.cta_group,
                                         )
                                     else:
