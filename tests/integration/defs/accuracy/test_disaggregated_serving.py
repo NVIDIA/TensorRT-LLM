@@ -1750,6 +1750,7 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                               test_sets=["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
@@ -2663,7 +2664,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-R1"
-    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1-0528-FP4-v2"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2"
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
