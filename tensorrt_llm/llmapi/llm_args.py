@@ -3176,11 +3176,7 @@ class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
 
 @PybindMirror.mirror_pybind_enum(_ContextChunkingPolicy)
 class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
-    """Context chunking policy.
-
-    ``FORCE_CHUNK`` honors per-request snapshot boundaries. When no boundary
-    remains, context is chunked only as required by the scheduling budget.
-    """
+    """Context chunking policy."""
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
     FORCE_CHUNK = "FORCE_CHUNK"
