@@ -1545,13 +1545,33 @@ class PyTorchModelEngine(ModelEngine):
         if curr_max_num_tokens < 4:
             return
 
+        # Cap the multi-seq warmup token count so we don't fill the KV cache
+        # to the brim. The autotuner warmup that ran just before this uses
+        # ``least_requests=True`` (few long sequences) which fits comfortably
+        # even when ``curr_max_num_tokens`` is close to the block ceiling.
+        # ``least_requests=False`` instead spreads the token budget across
+        # ``batch_size`` short sequences; when each sequence's length lands
+        # exactly on a block boundary AND the KV cache has ``num_extra_kv_tokens``
+        # or ``num_extra_decoding_steps`` > 0 (e.g. spec decoding cases),
+        # ``add_token`` needs to allocate one extra block per sequence, which
+        # ``_create_warmup_request``'s ``blocks_to_use`` estimate doesn't
+        # account for. On a small KV pool (e.g. Qwen3.5 hybrid with DFlash spec
+        # decoding on a single H100: 259 blocks total, ``max_num_tokens=8192``
+        # nearly saturates it), that extra per-sequence block overflows the
+        # pool and crashes with "Can't allocate new blocks for window size N".
+        # The point of this warmup is only to trigger ``num_seqs > 1`` +
+        # ``HAS_INITSTATES=True`` kernel variants — a modest token budget
+        # achieves that with plenty of block headroom.
+        WARMUP_TOKEN_CAP = 4096
+        capped_num_tokens = min(curr_max_num_tokens, WARMUP_TOKEN_CAP)
+
         logger.info(
             "Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates)
         mamba_warmup_shapes = [
-            (curr_max_num_tokens, 0, False, False),
-            (curr_max_num_tokens, 0, False, True),
+            (capped_num_tokens, 0, False, False),
+            (capped_num_tokens, 0, False, True),
         ]
 
         autotuner_enabled = self.llm_args.enable_autotuner
@@ -1596,12 +1616,20 @@ class PyTorchModelEngine(ModelEngine):
                                 AutoTuner.get().clean_pp_flag()
 
                             torch.cuda.synchronize()
-                except torch.OutOfMemoryError:
+                except (torch.OutOfMemoryError, RuntimeError) as e:
+                    # Catch both OOM and RuntimeError. C++ KV cache block
+                    # allocation ("Can't allocate new blocks for window size
+                    # N") surfaces as RuntimeError, not torch.OutOfMemoryError.
+                    # This warmup is a pure perf optimization: if a shape
+                    # doesn't fit for any reason, log and skip; the model then
+                    # JIT-compiles the missing kernel variants lazily on the
+                    # first real request (i.e. the pre-fix behavior).
                     logger.warning(
-                        f"OOM during Mamba hybrid warmup with "
-                        f"{num_tokens_i} tokens, {num_gen_requests_i} "
-                        f"generation requests, "
-                        f"force_initstates={force_init_i}. Skipping.")
+                        f"Mamba hybrid warmup skipped for shape "
+                        f"num_tokens={num_tokens_i}, "
+                        f"num_gen_requests={num_gen_requests_i}, "
+                        f"force_initstates={force_init_i}: "
+                        f"{type(e).__name__}: {e}")
                     # Mirror _general_warmup_impl: an OOM between dispatch()
                     # and combine() leaves MoE A2A state in ``dispatched``,
                     # tripping ``dispatch called twice`` on the next forward.
