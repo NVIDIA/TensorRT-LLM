@@ -107,6 +107,25 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
                 return nb::make_tuple(completedRequestIds, errorRequestIds);
             },
             nb::arg("at_least_request_num") = std::nullopt, nb::arg("mark_complete") = false)
+        .def(
+            "check_context_transfer_status_with_local_completion",
+            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
+            {
+                RequestStatuses result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.checkContextTransferStatus(atLeastRequestNum, markComplete);
+                }
+
+                auto completedRequestIds
+                    = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
+                auto errorRequestIds
+                    = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
+                auto locallyCompletedRequestIds = std::vector<int64_t>(
+                    result.locallyCompletedRequestIds.begin(), result.locallyCompletedRequestIds.end());
+                return nb::make_tuple(completedRequestIds, errorRequestIds, locallyCompletedRequestIds);
+            },
+            nb::arg("at_least_request_num") = std::nullopt, nb::arg("mark_complete") = false)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)

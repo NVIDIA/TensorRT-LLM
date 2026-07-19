@@ -61,7 +61,7 @@ from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
 from .kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import BindKvCacheTransceiver, KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
@@ -73,8 +73,8 @@ from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               request_context)
+from .resource_manager import (KVCacheManager, ResourceManager,
+                               ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -221,6 +221,10 @@ class AsyncTransferManager:
         self._request_transfer_metadata: Dict[
             int, self.RequestTransferMetadata] = dict()
 
+        # Diagnostic-only: remember which successful transfers already released
+        # their locally quiesced KV allocation while awaiting the global PP commit.
+        self._locally_released_kv_request_ids = set()
+
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
 
@@ -278,6 +282,7 @@ class AsyncTransferManager:
         if transfer_metadata.end_transfer():
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
+            self._locally_released_kv_request_ids.discard(request.py_request_id)
 
             if self.should_store_blocks:
                 self.kv_cache_manager.unpin_blocks_by_id(
@@ -290,6 +295,42 @@ class AsyncTransferManager:
             return True
 
         return False
+
+    def release_locally_quiesced_kv(self, request: LlmRequest) -> bool:
+        """Release successful sender KV while retaining global transfer state.
+
+        The caller must have observed completion of the local C++ transfer
+        future.  This method deliberately leaves the request tracked and does
+        not change its state; the globally committed outcome remains the only
+        authority for finalization and response publication.
+
+        Returns:
+            bool: True when this call released KV, False for a duplicate signal.
+        """
+        request_id = request.py_request_id
+        if self.should_store_blocks:
+            raise RuntimeError(
+                "Local-quiescence KV reclamation is incompatible with pinned "
+                "blocks for disaggregated reuse")
+        if request_id not in self._requests_in_transfer:
+            raise RuntimeError(
+                f"Request {request_id} is not awaiting a global transfer commit"
+            )
+        transfer_metadata = self._request_transfer_metadata[request_id]
+        if (request.state != LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                or transfer_metadata.counter != 1):
+            raise RuntimeError(
+                f"Request {request_id} is not a single locally quiesced context transfer"
+            )
+        if request_id in self._locally_released_kv_request_ids:
+            return False
+        if self.kv_cache_manager is None:
+            raise RuntimeError(
+                "Local-quiescence KV reclamation requires a KV cache manager")
+
+        self.kv_cache_manager.free_resources(request)
+        self._locally_released_kv_request_ids.add(request_id)
+        return True
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0
@@ -487,6 +528,60 @@ class PyExecutor:
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+
+        local_reclaim_requested = os.environ.get(
+            "TRTLLM_NVBUG_6448152_CTX_LOCAL_KV_RECLAIM", "0") == "1"
+        # The perf-sanity worker environment is shared by CTX and GEN.  Apply
+        # this CTX diagnostic only to the eligible PP service; GEN is PP1.
+        self._nvbug_6448152_local_kv_reclaim = (local_reclaim_requested
+                                                and self.dist.pp_size > 1)
+        self._nvbug_6448152_local_kv_reclaim_count = 0
+        if self._nvbug_6448152_local_kv_reclaim:
+            if os.environ.get("TRTLLM_NVBUG_6448152_CTX_COORDINATOR_CONSENSUS",
+                              "0") != "1":
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation requires the asynchronous PP coordinator"
+                )
+            if not isinstance(kv_cache_transceiver, BindKvCacheTransceiver):
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation requires the C++ transceiver"
+                )
+            if self.dist.tp_size != 1 or self.dist.cp_size != 1:
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation requires TP1/CP1/PP>1")
+            if self.enable_attention_dp:
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation does not support attention DP"
+                )
+            if (not isinstance(self.kv_cache_manager, KVCacheManager)
+                    or isinstance(self.kv_cache_manager, BaseMambaCacheManager)
+                    or self.kv_cache_manager.is_vswa):
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation is qualified only for the primary V1 KV manager"
+                )
+            if self.max_num_active_requests != 1:
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation is qualified only for CTX max_batch_size=1"
+                )
+            if (self.enable_kv_cache_reuse
+                    or self.async_transfer_manager.should_store_blocks):
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation requires block reuse to be disabled"
+                )
+            if kv_connector_manager is not None:
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation does not support a KV connector"
+                )
+            draft_kv_cache_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+            if draft_kv_cache_manager is not None:
+                raise RuntimeError(
+                    "NVBUG6448152 local KV reclamation does not support a separate draft KV cache"
+                )
+            logger.warning(
+                "NVBUG6448152_RECLAIM event=mode_active world_rank=%d "
+                "pp_size=%d decision=global reclaim=local_success_kv",
+                self.global_rank, self.dist.pp_size)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -4454,13 +4549,42 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
-        finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
-            atLeastNum)
+        if self._nvbug_6448152_local_kv_reclaim:
+            finished_requests, error_requests, locally_completed_requests = self.kv_cache_transceiver.check_context_transfer_status_with_local_completion(
+                atLeastNum)
+        else:
+            finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
+                atLeastNum)
+            locally_completed_requests = []
 
         completed_req_ids = set(finished_requests + error_requests)
+        locally_completed_before_commit = set(
+            locally_completed_requests) - completed_req_ids
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
+
+        if self._nvbug_6448152_local_kv_reclaim:
+            for request_id in locally_completed_before_commit:
+                if request_id not in requests_in_transfer:
+                    logger.warning(
+                        f"Locally completed request {request_id} not found in transfer manager"
+                    )
+                    continue
+                request = requests_in_transfer[request_id]
+                if self.async_transfer_manager.release_locally_quiesced_kv(
+                        request):
+                    self._nvbug_6448152_local_kv_reclaim_count += 1
+                    if self._nvbug_6448152_local_kv_reclaim_count in (1, 128,
+                                                                      256, 384,
+                                                                      512):
+                        logger.warning(
+                            "NVBUG6448152_RECLAIM "
+                            "event=local_success_kv_release "
+                            "world_rank=%d request_id=%d count=%d state=%s",
+                            self.global_rank, request_id,
+                            self._nvbug_6448152_local_kv_reclaim_count,
+                            request.state)
 
         for request_id in completed_req_ids:
 

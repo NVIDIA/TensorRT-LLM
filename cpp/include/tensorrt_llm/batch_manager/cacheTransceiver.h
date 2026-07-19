@@ -221,6 +221,8 @@ struct RequestStatuses
     std::unordered_set<LlmRequest::RequestIdType> completedRequestIds;
     /// Requests that have encountered an error during their transfer.
     std::unordered_set<LlmRequest::RequestIdType> errorRequestIds;
+    /// Requests whose local transfer completed successfully, before the global PP decision is available.
+    std::unordered_set<LlmRequest::RequestIdType> locallyCompletedRequestIds;
 };
 
 class BaseCacheTransceiver

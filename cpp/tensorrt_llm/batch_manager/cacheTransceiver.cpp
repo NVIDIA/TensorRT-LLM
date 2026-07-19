@@ -812,6 +812,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         toCompleteIdSet.insert(request->mRequestId);
     }
 
+    RequestStatuses requestsStatus{};
     auto recordOutcome
         = [&](RequestIdType const requestId, std::shared_ptr<LlmRequest> const& request, bool const failed)
     {
@@ -820,6 +821,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         if (mContextTransferCoordinator)
         {
             mContextTransferCoordinator->publishLocalOutcome(requestId, failed);
+            if (!failed)
+            {
+                requestsStatus.locallyCompletedRequestIds.insert(requestId);
+            }
         }
     };
 
@@ -892,7 +897,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         }
     }
 
-    RequestStatuses requestsStatus{};
     TransferConsensusOutcome consensusOutcome;
     if (mContextTransferCoordinator)
     {

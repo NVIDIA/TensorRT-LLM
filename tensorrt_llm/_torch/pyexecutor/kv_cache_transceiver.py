@@ -218,6 +218,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def check_context_transfer_status(self, at_least_request_num: int):
         return self.impl.check_context_transfer_status(at_least_request_num)
 
+    def check_context_transfer_status_with_local_completion(
+            self, at_least_request_num: int):
+        return self.impl.check_context_transfer_status_with_local_completion(
+            at_least_request_num)
+
     def check_gen_transfer_status(self, at_least_request_num: int):
         return self.impl.check_gen_transfer_status(at_least_request_num)
 
