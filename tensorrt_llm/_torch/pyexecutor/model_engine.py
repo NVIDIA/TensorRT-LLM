@@ -1624,12 +1624,11 @@ class PyTorchModelEngine(ModelEngine):
                     # doesn't fit for any reason, log and skip; the model then
                     # JIT-compiles the missing kernel variants lazily on the
                     # first real request (i.e. the pre-fix behavior).
-                    logger.warning(
-                        f"Mamba hybrid warmup skipped for shape "
-                        f"num_tokens={num_tokens_i}, "
-                        f"num_gen_requests={num_gen_requests_i}, "
-                        f"force_initstates={force_init_i}: "
-                        f"{type(e).__name__}: {e}")
+                    logger.warning(f"Mamba hybrid warmup skipped for shape "
+                                   f"num_tokens={num_tokens_i}, "
+                                   f"num_gen_requests={num_gen_requests_i}, "
+                                   f"force_initstates={force_init_i}: "
+                                   f"{type(e).__name__}: {e}")
                     # Mirror _general_warmup_impl: an OOM between dispatch()
                     # and combine() leaves MoE A2A state in ``dispatched``,
                     # tripping ``dispatch called twice`` on the next forward.
