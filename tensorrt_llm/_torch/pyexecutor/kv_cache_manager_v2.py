@@ -3194,7 +3194,10 @@ class KVCacheManagerV2(BaseResourceManager):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ):
+        # max_blocks is accepted for signature parity with KVCacheManager; the
+        # device-side copy op here already scales with allocated blocks only.
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
 
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)

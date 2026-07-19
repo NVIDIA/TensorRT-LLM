@@ -32,6 +32,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -212,7 +213,7 @@ public:
     {
     }
 
-    void set_params(AllReduceParams& params, nvinfer1::DataType dataType, int token_num, int hidden_size,
+    void set_params(AllReduceParams& params, tensorrt_llm::DataType dataType, int token_num, int hidden_size,
         AllReduceFusionOp op) const
     {
         int world_size = world_config.getSize();
@@ -316,7 +317,7 @@ bool test(Workspace const& workspace, int token_num, int hidden_size, bool has_b
     in.copy_from(input_buffer.data());
 
     AllReduceParams params;
-    workspace.set_params(params, nvinfer1::DataType::kHALF, token_num, hidden_size, fusion_op);
+    workspace.set_params(params, tensorrt_llm::DataType::kHALF, token_num, hidden_size, fusion_op);
     params.ranks_per_node = world_size;
     params.local_rank = rank;
     params.local_output_buffer_ptr = out.data();
@@ -334,21 +335,21 @@ bool test(Workspace const& workspace, int token_num, int hidden_size, bool has_b
     cudaEventCreate(&begin);
     cudaEventCreate(&end);
     lamportInitialize(
-        params.fusion_params.lamport_peer_comm_buffer_ptrs[rank], message_size, nvinfer1::DataType::kHALF, s);
+        params.fusion_params.lamport_peer_comm_buffer_ptrs[rank], message_size, tensorrt_llm::DataType::kHALF, s);
     lamportInitialize(params.fusion_params.lamport_peer_comm_buffer_ptrs[rank + MAX_RANKS_PER_NODE], message_size,
-        nvinfer1::DataType::kHALF, s);
+        tensorrt_llm::DataType::kHALF, s);
     lamportInitialize(params.fusion_params.lamport_peer_comm_buffer_ptrs[rank + MAX_RANKS_PER_NODE * 2], message_size,
-        nvinfer1::DataType::kHALF, s);
+        tensorrt_llm::DataType::kHALF, s);
     cudaDeviceSynchronize();
     comm.barrier();
     for (int i = 0; i < warmup; ++i)
     {
-        customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
+        customAllReduce(params, tensorrt_llm::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(begin, s);
     for (int i = 0; i < iter; ++i)
     {
-        customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
+        customAllReduce(params, tensorrt_llm::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(end, s);
     cudaEventSynchronize(end);
@@ -462,7 +463,7 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     in.copy_from(input_buffer.data());
 
     AllReduceParams params;
-    workspace.set_params(params, nvinfer1::DataType::kHALF, token_num, hidden_size, fusion_op);
+    workspace.set_params(params, tensorrt_llm::DataType::kHALF, token_num, hidden_size, fusion_op);
     params.ranks_per_node = world_size;
     params.local_rank = rank;
     params.local_output_buffer_ptr = out.data();
@@ -484,12 +485,12 @@ bool test_prepostnorm(Workspace const& workspace, int token_num, int hidden_size
     comm.barrier();
     for (int i = 0; i < warmup; ++i)
     {
-        customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
+        customAllReduce(params, tensorrt_llm::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(begin, s);
     for (int i = 0; i < iter; ++i)
     {
-        customAllReduce(params, nvinfer1::DataType::kHALF, runtime_strategy, config, fusion_op, s);
+        customAllReduce(params, tensorrt_llm::DataType::kHALF, runtime_strategy, config, fusion_op, s);
     }
     cudaEventRecord(end, s);
     cudaEventSynchronize(end);
