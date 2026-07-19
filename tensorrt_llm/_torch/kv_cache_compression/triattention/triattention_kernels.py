@@ -4,8 +4,11 @@
 
 The production path uses one fixed-shape trig-score launch across all dense
 layers, CuTE-DSL TopK selection, and grouped C++ compaction. This module owns
-the score kernel and its persistent launcher; selection and compaction live in
-their respective runtime modules.
+the score launcher and its persistent metadata; scoring itself runs through
+the compiled ``trtllm`` CUDA ops (coefficient fold + folded paged score) for
+every supported geometry. The original Triton score kernel has been deleted;
+the unit tests validate the CUDA ops against an independent PyTorch oracle.
+Selection and compaction live in their respective runtime modules.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
@@ -98,231 +101,118 @@ def prepare_mean_phase(
     )
 
 
-@triton.jit
-def _tri_score_perhead_kernel(
-    pool_anchor_ptr,  # typed pool pointer; used ONLY to infer the element type
-    #   for the int->pointer cast below (its data is never read through it).
-    layer_base_addrs,  # [num_layers] int64: ABSOLUTE device address of each
-    #   scored layer's HND base. Layers do NOT need to share one storage:
-    #   each segment casts its own layer's address back to a typed pointer, so
-    #   all address arithmetic stays inside that layer's own allocation.
-    block_offsets_ptr,  # Native V2 [pool, request, K/V, block] int32 offsets.
-    seg_page_off,  # [nseg] int64: offset of this segment's page table into
-    #   block_offsets_ptr.
-    # per-SEGMENT metadata (seg = req_slot*L_scored + layer_slot), idx by pid(0):
-    seg_req_id,  # [nseg] int32: request slot (round_start / mean phase lookup)
-    seg_layer_id,  # [nseg] int32: ABSOLUTE layer id (indexes layer_base_addrs + calib)
-    req_seq_len,  # [num_requests] int32
-    req_valid_width_out,  # [num_requests] int32: decode-only length for selection
-    req_round_start,  # [num_requests] int32 logical token position
-    req_token_start,  # [num_requests] int32: pinned prompt length; scoring
-    #   starts at this decode-region origin, so prompt lengths may differ
-    #   across the cohort.
-    # per-LAYER calibration, [L,H,F] flattened layer-major:
-    q_real_ptr,  # [L*H*F] fp32
-    q_imag_ptr,  # [L*H*F] fp32
-    mlr_coef_ptr,  # [L*H*F] fp32
-    # per-REQUEST offset-collapsed phase ('mean' path), [num_requests,F] flattened:
-    mean_cos_ptr,  # [num_requests*F] fp32
-    mean_sin_ptr,  # [num_requests*F] fp32
-    # shared freq vectors:
-    freq_scale_sq_ptr,  # [F] fp32
-    omega_ptr,  # [F] fp32 ('max' path only)
-    offsets_ptr,  # [O] fp32 ('max' path only)
-    out_ptr,  # [request, layer, query_head, decode_token] fp32
-    output_width,
-    # scalars uniform across the batch:
-    num_layers,
-    num_q_heads,
-    num_kv_heads,
-    num_freqs,  # F = head_dim // 2
-    head_dim,
-    tokens_per_block,
-    kv_factor,
-    num_offsets,  # O ('max' path only)
-    # per-layer HND element strides (uniform across scored layers):
-    s_page,
-    s_kv_head,
-    s_slot,
-    s_dim,
-    USE_MAX: tl.constexpr,
-    T_BLOCK: tl.constexpr,
-    F_BLOCK: tl.constexpr,
-    F_EXACT: tl.constexpr,  # F_BLOCK == num_freqs: every f-lane is real, so the
-    #   f-axis masks/wheres below are no-ops and are compiled out (fewer
-    #   predicates and selects on the hot path; bit-identical results).
-):
-    # Token tiles ride the fastest grid axis: adjacent programs then walk
-    # consecutive K pages of one (request, layer, head) and reuse its
-    # calibration/phase rows in L2 (~2% faster than segment-major order).
-    seg = tl.program_id(1)
-    t_blk = tl.program_id(0)
-    # KV heads are grid-parallel (axis 2): iterations of the former kv_head
-    # loop shared NO data (each KV head reads its own K and writes its own
-    # output rows), so hoisting it onto the grid multiplies parallelism with
-    # zero extra HBM traffic. The q-in-group loop below stays inside the
-    # program because it REUSES this head's K from registers (GQA dedup).
-    kv_head = tl.program_id(2)
-
-    req_id = tl.load(seg_req_id + seg)
-    seq_len = tl.load(req_seq_len + req_id)
-    token_start = tl.load(req_token_start + req_id)
-    if (seg % num_layers == 0) & (t_blk == 0) & (kv_head == 0):
-        tl.store(req_valid_width_out + req_id, seq_len - token_start)
-    # Derive the ragged launch bound in the score program instead of staging
-    # one replicated length and block count for every request/layer segment.
-    n_tblk = (seq_len - token_start + T_BLOCK - 1) // T_BLOCK
-    if t_blk >= n_tblk:
-        return
-
-    layer_id = tl.load(seg_layer_id + seg)
-    rstart = tl.load(req_round_start + req_id)
-    # This segment's layer base: an absolute address cast back to a pool-typed
-    # pointer. TRT-LLM V2 exposes every layer as its own TensorWrapper storage,
-    # so "element offset relative to one shared storage" does not exist; the
-    # per-layer absolute address is the same device-pointer-array pattern the
-    # C++ backends use (KVBlockArray / grouped-GEMM pointer arrays).
-    layer_ptr = tl.load(layer_base_addrs + layer_id).to(
-        tl.pointer_type(pool_anchor_ptr.dtype.element_ty)
-    )
-    page_off = tl.load(seg_page_off + seg)
-
-    f = tl.arange(0, F_BLOCK)
-    f_mask = f < num_freqs
-    f64 = f.to(tl.int64)
-
-    # ---- token tile of THIS segment ----
-    t = t_blk * T_BLOCK + tl.arange(0, T_BLOCK)
-    absolute_t = t + token_start
-    t_mask = absolute_t < seq_len
-    blk_in_seq = absolute_t // tokens_per_block
-    slot = (absolute_t % tokens_per_block).to(tl.int64)
-    # The native attention page-table copy encodes K offsets in units of the
-    # underlying K/V role pages. Convert that value to the HND pool page inline
-    # instead of materializing a second page table before scoring.
-    encoded_page = tl.load(
-        block_offsets_ptr + page_off + blk_in_seq,
-        mask=t_mask,
-        other=0,
-    )
-    phys_page = (encoded_page // kv_factor).to(tl.int64)
-
-    # element offset into THIS layer's pool for (page, KEY=0, *, slot).
-    # KEY half is kv_factor index 0 -> its stride term is 0 (matches reference).
-    tok_base = phys_page * s_page + slot * s_slot  # [T_BLOCK] int64
-
-    # per-request 'mean'-path phase + shared freq scale.
-    if F_EXACT:
-        mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f)
-        msin = tl.load(mean_sin_ptr + req_id * num_freqs + f)
-        fss = tl.load(freq_scale_sq_ptr + f)
-    else:
-        mcos = tl.load(mean_cos_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
-        msin = tl.load(mean_sin_ptr + req_id * num_freqs + f, mask=f_mask, other=0.0)
-        fss = tl.load(freq_scale_sq_ptr + f, mask=f_mask, other=0.0)
-
-    # ---- PER-HEAD (position + mlr), GQA-deduped, NO head reduction ----
-    # This program scores ONE KV head's token tile for the group_size q-heads
-    # that share it. K (and |K|) is loaded ONCE and reused across the group;
-    # h = kv_head*group_size + qg keeps query-head order 0..num_q_heads-1, so
-    # every head's math is bit-for-bit identical to the looped variant.
-    group_size = num_q_heads // num_kv_heads
-    if F_EXACT:
-        load_mask = tl.broadcast_to(t_mask[:, None], (T_BLOCK, F_BLOCK))
-    else:
-        load_mask = t_mask[:, None] & f_mask[None, :]
-    off_re = f64[None, :] * s_dim
-    off_im = (num_freqs + f64[None, :]) * s_dim
-
-    base = tok_base + kv_head.to(tl.int64) * s_kv_head  # [T_BLOCK]
-    # paged K loaded ONCE for this KV head (shared by group_size q-heads).
-    k_re = tl.load(layer_ptr + base[:, None] + off_re, mask=load_mask, other=0.0).to(tl.float32)
-    k_im = tl.load(layer_ptr + base[:, None] + off_im, mask=load_mask, other=0.0).to(tl.float32)
-    kmag = tl.sqrt(k_re * k_re + k_im * k_im)  # once per KV head
-
-    qg = 0
-    while qg < group_size:
-        h = kv_head * group_size + qg
-        calib_off = (layer_id.to(tl.int64) * num_q_heads + h) * num_freqs
-        if F_EXACT:
-            qre = tl.load(q_real_ptr + calib_off + f)
-            qim = tl.load(q_imag_ptr + calib_off + f)
-            mlrc = tl.load(mlr_coef_ptr + calib_off + f)
-        else:
-            qre = tl.load(q_real_ptr + calib_off + f, mask=f_mask, other=0.0)
-            qim = tl.load(q_imag_ptr + calib_off + f, mask=f_mask, other=0.0)
-            mlrc = tl.load(mlr_coef_ptr + calib_off + f, mask=f_mask, other=0.0)
-
-        # complex product Q . conj(K) -- the trig importance score.
-        prod_real = qre[None, :] * k_re + qim[None, :] * k_im
-        prod_imag = qim[None, :] * k_re - qre[None, :] * k_im
-
-        if USE_MAX:
-            # max over O offsets does NOT commute through the freq-sum;
-            # explicit O loop reducing max over the per-offset F-sum.
-            score = tl.full((T_BLOCK,), -float("inf"), tl.float32)
-            o = 0
-            while o < num_offsets:
-                off = tl.load(offsets_ptr + o)
-                if F_EXACT:
-                    om = tl.load(omega_ptr + f)
-                else:
-                    om = tl.load(omega_ptr + f, mask=f_mask, other=0.0)
-                phase = (rstart + off) * om
-                cphase = tl.cos(phase)
-                sphase = tl.sin(phase)
-                per_f = fss[None, :] * (prod_real * cphase[None, :] - prod_imag * sphase[None, :])
-                if F_EXACT:
-                    offset_score = tl.sum(per_f, axis=1)
-                else:
-                    offset_score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
-                score = tl.maximum(score, offset_score)
-                o += 1
-        else:
-            # 'mean': offset loop collapsed into mean_cos/mean_sin.
-            per_f = fss[None, :] * (prod_real * mcos[None, :] - prod_imag * msin[None, :])
-            if F_EXACT:
-                score = tl.sum(per_f, axis=1)
-            else:
-                score = tl.sum(tl.where(f_mask[None, :], per_f, 0.0), axis=1)
-
-        # position-INDEPENDENT MLR term (reuses the per-KV-head |K|).
-        mlr_f = kmag * mlrc[None, :] * fss[None, :]
-        if F_EXACT:
-            mlr = tl.sum(mlr_f, axis=1)
-        else:
-            mlr = tl.sum(tl.where(f_mask[None, :], mlr_f, 0.0), axis=1)
-
-        # Segments are request-major then layer-major. Write the decode-only
-        # score directly in the selector's [request, layer, head, token] layout.
-        out_offset = (seg.to(tl.int64) * num_q_heads + h) * output_width + t
-        tl.store(out_ptr + out_offset, score + mlr, mask=t_mask)
-        qg += 1
-
-
 def _launch_tri_score_perhead(
-    grid: tuple,
-    pointer_args: tuple,
-    geometry_args: tuple,
+    group: "_FixedScoreGroup",
+    request_count: int,
+    num_segments: int,
+    valid_seq_lens: torch.Tensor,
+    valid_widths: torch.Tensor,
+    round_starts_device: torch.Tensor,
+    token_starts_device: torch.Tensor,
+    mean_cos: torch.Tensor,
+    mean_sin: torch.Tensor,
     *,
     score_aggregation: str,
-    token_block: int,
-    num_freqs: int,
 ) -> None:
-    """Launch the shared score ABI for eager and fixed metadata owners."""
+    """Fold the per-round coefficients, then score paged KV via the C++ ops.
+
+    The compiled ``trtllm`` score ops are THE implementation for every
+    geometry this launcher accepts; unsupported inputs fail loudly inside the
+    ops (TORCH_CHECK) instead of routing to another kernel. The unit tests
+    validate them against an independent PyTorch oracle.
+    """
     if score_aggregation not in ("mean", "max"):
         raise ValueError(f"unsupported score aggregation: {score_aggregation}")
-    f_block = triton.next_power_of_2(num_freqs)
-    _tri_score_perhead_kernel[grid](
-        *pointer_args,
-        *geometry_args,
-        USE_MAX=(score_aggregation == "max"),
-        T_BLOCK=token_block,
-        F_BLOCK=f_block,
-        F_EXACT=(f_block == num_freqs),
-        # 4 warps measured fastest across token blocks; the default was never
-        # tuned for this kernel (sibling kernels pin their warp counts too).
-        num_warps=4,
+    if not (
+        hasattr(torch.ops.trtllm, "tri_attention_fold_score_coefficients")
+        and hasattr(torch.ops.trtllm, "tri_attention_paged_score")
+    ):
+        raise RuntimeError(
+            "this TensorRT-LLM build is missing the TriAttention score ops; rebuild the C++ "
+            "th_common extension (there is deliberately no Triton fallback: a loud failure "
+            "here beats silently scoring through a slower path)"
+        )
+    use_max = score_aggregation == "max"
+    (
+        num_q_heads,
+        num_kv_heads,
+        num_freqs,
+        tokens_per_block,
+        kv_factor,
+        num_offsets,
+        s_page,
+        s_kv_head,
+        s_slot,
+        s_dim,
+    ) = group.geometry_args
+    # Mean aggregation collapses all offsets into mean_cos/mean_sin (one
+    # coefficient plane); max keeps one c_re/c_im plane per offset because
+    # max does not commute through the frequency sum.
+    offset_planes = num_offsets if use_max else 1
+    c_re, c_im, c_mlr = group._fold_coefficient_buffers(offset_planes)
+    q_real, q_imag, mlr_coef = group.pointer_middle
+    freq_scale_sq, omega, offsets = group.pointer_tail
+    torch.ops.trtllm.tri_attention_fold_score_coefficients(
+        c_re,
+        c_im,
+        c_mlr,
+        q_real,
+        q_imag,
+        mlr_coef,
+        freq_scale_sq,
+        None if use_max else mean_cos.view(-1),
+        None if use_max else mean_sin.view(-1),
+        omega if use_max else None,
+        offsets if use_max else None,
+        round_starts_device if use_max else None,
+        request_count,
+        group._num_calibrated_layers,
+        num_q_heads,
+        num_freqs,
+        offset_planes,
+        use_max,
+        # Per-layer dequant scales (quantized pools only, else None): the fold
+        # multiplies them into the coefficient tables so the score op below
+        # reads raw quantized elements at zero hot-loop cost.
+        group._kv_scales,
+    )
+    pool_anchor, layer_base_addrs, block_offsets, seg_page_off, seg_req, seg_layer = (
+        group.pointer_prefix
+    )
+    torch.ops.trtllm.tri_attention_paged_score(
+        pool_anchor,
+        layer_base_addrs,
+        block_offsets,
+        seg_page_off,
+        seg_req,
+        seg_layer,
+        valid_seq_lens,
+        valid_widths,
+        token_starts_device,
+        c_re,
+        c_im,
+        c_mlr,
+        group.output,
+        group.output_width,
+        group.num_layers,
+        request_count,
+        group._num_calibrated_layers,
+        num_q_heads,
+        num_kv_heads,
+        num_freqs,
+        tokens_per_block,
+        kv_factor,
+        offset_planes,
+        s_page,
+        s_kv_head,
+        s_slot,
+        s_dim,
+        num_segments,
+        use_max,
+        group._use_vectorized,
+        # Validation-only here (presence must match the pool dtype; the fold
+        # op above already consumed the values).
+        group._kv_scales,
     )
 
 
@@ -333,6 +223,13 @@ class _FixedScoreGroup:
     living in DISTINCT storages with DISTINCT block tables. ``block_offsets``
     uses the native TRT-LLM attention layout and ``page_table_slots`` maps each
     scored layer to its V2 pool slot.
+
+    LIFETIME CONTRACT: the group captures the scored layer pools as raw device
+    addresses (``layer_base_addrs``) and keeps a reference only to the anchor
+    pool (the score op's dtype witness). The caller owns ``layer_pools`` and must
+    keep every scored pool alive for as long as it launches through this group
+    (in production the V2 KV-cache manager does); a dropped pool leaves its
+    address dangling and scores read allocator-recycled memory.
     """
 
     def __init__(
@@ -352,6 +249,7 @@ class _FixedScoreGroup:
         omega: torch.Tensor,
         offsets: torch.Tensor,
         output_width: int | None = None,
+        kv_scales: torch.Tensor | None = None,
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
@@ -380,14 +278,12 @@ class _FixedScoreGroup:
         _, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
         if num_q_heads % num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
-        self.num_kv_heads = int(num_kv_heads)
         self.num_freqs = head_dim // 2
         strides = tuple(int(value) for value in p0.stride())
         self.geometry_args = (
             num_q_heads,
             num_kv_heads,
             self.num_freqs,
-            head_dim,
             tokens_per_block,
             kv_factor,
             int(offsets.numel()),
@@ -399,6 +295,7 @@ class _FixedScoreGroup:
         # Per-layer ABSOLUTE base addresses. Layers may live in distinct
         # storages (V2 TensorWrapper-per-layer); only geometry must be uniform.
         element_size = p0.element_size()
+        bases_16b_aligned = True
         layer_base_addrs = torch.zeros(len(layer_pools), dtype=torch.int64, device=device)
         for layer in layer_indices:
             pool = layer_pools[layer]
@@ -411,9 +308,51 @@ class _FixedScoreGroup:
             address = int(pool.data_ptr())
             if address % element_size:
                 raise ValueError("fixed score layer base is not element-aligned")
+            bases_16b_aligned &= address % 16 == 0
             layer_base_addrs[layer] = address
-        # The anchor pool is passed as a typed kernel argument ONLY so the
-        # kernel can recover the element type for the int->pointer cast.
+        # The score op runs 16-byte 8-frequency K loads when the fixed layout
+        # guarantees aligned rows, and its strided scalar path otherwise.
+        # Audited ONCE here: bases and strides never change for this group.
+        strides_16b_aligned = all(
+            (element_size * stride) % 16 == 0 for stride in (strides[0], strides[2], strides[3])
+        )
+        self._use_vectorized = (
+            p0.dtype in (torch.bfloat16, torch.float16)
+            and self.num_freqs % 8 == 0
+            and strides[4] == 1
+            and bases_16b_aligned
+            and strides_16b_aligned
+        )
+        # Quantized (fp8/int8) pools are FUNCTIONAL-ONLY and scalar-path-only
+        # (the dtype gate above already excludes them from the vectorized
+        # path). Their per-layer dequantization scale is folded into the
+        # score coefficients at launch time, so it must be present up front;
+        # conversely, scales alongside a float pool would double-scale the
+        # coefficients, so that pairing is rejected just as loudly.
+        quantized_pool = p0.dtype in (torch.float8_e4m3fn, torch.int8)
+        if quantized_pool and kv_scales is None:
+            raise ValueError("quantized (fp8/int8) KV pools require per-layer kv_scales")
+        if not quantized_pool and kv_scales is not None:
+            raise ValueError("kv_scales are only valid for quantized (fp8/int8) KV pools")
+        self._kv_scales = (
+            None
+            if kv_scales is None
+            else kv_scales.to(device=device, dtype=torch.float32).contiguous().view(-1)
+        )
+        # Calibration tables span every model layer; segments index them by
+        # ABSOLUTE layer id, so the fold covers the full calibrated extent.
+        self._num_calibrated_layers = q_real_LHF.numel() // (int(num_q_heads) * self.num_freqs)
+        # Segment layer ids index the fold tables ON DEVICE where they cannot
+        # be range-checked; validate the extent once here, loudly.
+        if min(layer_indices) < 0 or max(layer_indices) >= self._num_calibrated_layers:
+            raise ValueError("scored layer index exceeds the calibrated layer extent")
+        # Folded per-round coefficient tables, allocated on first launch and
+        # keyed by plane count so switching aggregation (mean: one plane;
+        # max: one plane per offset) re-shapes without churn.
+        self._fold_buffers: dict = {}
+        # The anchor pool is passed to the CUDA score op ONLY as its dtype
+        # witness: the op recovers the pool element type from it and never
+        # reads data through it.
         seg_req = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
             self.num_layers
         )
@@ -440,11 +379,6 @@ class _FixedScoreGroup:
         )
         slot_idx = slots_t.repeat(max_requests)
         seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
-        # 16-token tiles keep the per-program fp32 working set small enough to
-        # avoid the register-pressure occupancy collapse measured at 64-token
-        # tiles (255 regs/thread + spills -> 63 regs, ~1.5x faster end to end).
-        self.token_block = 16
-        self.max_ntblk = (self.output_width + self.token_block - 1) // self.token_block
         self.output = torch.empty(
             max_requests,
             self.num_layers,
@@ -467,6 +401,31 @@ class _FixedScoreGroup:
             mlr_coef_LHF.view(-1),
         )
         self.pointer_tail = (freq_scale_sq, omega, offsets)
+
+    def _fold_coefficient_buffers(
+        self, offset_planes: int
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+        """Return (c_re, c_im, c_mlr) fold tables for one plane count.
+
+        Sized on ``max_requests`` so any launch's active ``request_count``
+        fits without reallocation (each launch folds only its active rows);
+        c_mlr is offset independent so it never grows planes.
+        """
+        buffers = self._fold_buffers.get(offset_planes)
+        if buffers is None:
+            elements = (
+                self.max_requests
+                * self._num_calibrated_layers
+                * int(self.geometry_args[0])
+                * self.num_freqs
+            )
+            device = self.output.device
+            c_re = torch.empty(offset_planes * elements, dtype=torch.float32, device=device)
+            c_im = torch.empty_like(c_re)
+            c_mlr = torch.empty(elements, dtype=torch.float32, device=device)
+            buffers = (c_re, c_im, c_mlr)
+            self._fold_buffers[offset_planes] = buffers
+        return buffers
 
     def launch(
         self,
@@ -496,23 +455,16 @@ class _FixedScoreGroup:
             raise ValueError("request*layer segment count exceeds the CUDA grid limit")
         output = self.output[:request_count]
         _launch_tri_score_perhead(
-            (self.max_ntblk, num_segments, self.num_kv_heads),
-            (
-                *self.pointer_prefix,
-                valid_seq_lens,
-                valid_widths,
-                round_starts_device,
-                token_starts_device,
-                *self.pointer_middle,
-                mean_cos.view(-1),
-                mean_sin.view(-1),
-                *self.pointer_tail,
-                output,
-            ),
-            (self.output_width, self.num_layers, *self.geometry_args),
+            self,
+            request_count,
+            num_segments,
+            valid_seq_lens,
+            valid_widths,
+            round_starts_device,
+            token_starts_device,
+            mean_cos,
+            mean_sin,
             score_aggregation=score_aggregation,
-            token_block=self.token_block,
-            num_freqs=self.num_freqs,
         )
         return output
 

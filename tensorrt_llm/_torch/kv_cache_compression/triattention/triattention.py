@@ -1168,7 +1168,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         self._F = int(self.calibration["E_q"].shape[2])
         # Squared per-frequency RoPE scaling factor (required calibration key).
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
-        # Pre-split query stats + MLR coefficient for the Triton score kernel so
+        # Pre-split query stats + MLR coefficient for the score kernel so
         # it doesn't recompute (E_q_norm - |E_q|) per call. Shapes [L, H, F].
         _Eq = self.calibration["E_q"]
         self._triattn_q_real = _Eq.real.to(torch.float32).contiguous()
