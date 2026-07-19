@@ -110,11 +110,13 @@ developers understand why the test is disabled.
 ### Triggering Post-merge tests
 
 Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
-label because they can consume substantial shared GPU resources. The label must
-be applied by an active member of the `NVIDIA/trt-llm-ci-approvers` GitHub team.
-A GitHub workflow removes invalid approvals. The label remains in place when new
-commits are pushed and can be removed manually when the approval no longer
-applies.
+label because they can consume substantial shared GPU resources. The label is
+intended to be applied by an active member of the
+`NVIDIA/trt-llm-ci-approvers` GitHub team. A GitHub workflow validates the label
+actor and normally removes invalid approvals. This is a best-effort resource
+governance guard, not a strict authorization boundary. The label remains in
+place when new commits are pushed and can be removed manually when the approval
+no longer applies.
 
 When you only need to verify a handful of post-merge tests, specify exactly
 which stages to run:

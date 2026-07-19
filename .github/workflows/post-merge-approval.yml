@@ -31,11 +31,14 @@ jobs:
     concurrency:
       group: post-merge-approval-${{ github.event.pull_request.number }}
       cancel-in-progress: false
+    # Keep a started job eligible to reach fail-closed cleanup after cancellation.
     if: >-
+      always() &&
       github.repository == 'NVIDIA/TensorRT-LLM' &&
       github.event.action == 'labeled' &&
       github.event.label.name == 'ci: post-merge approved'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Validate post-merge approver
         id: validate
@@ -62,7 +65,7 @@ jobs:
                 .filter(
                   (event) =>
                     event.event === 'labeled' &&
-                    event.label?.name === approvalLabel
+                    event.label?.name?.toLowerCase() === approvalLabel.toLowerCase()
                 )
                 .at(-1);
               if (latestApprovalEvent) {
@@ -111,7 +114,8 @@ jobs:
             }
 
       - name: Clear unauthorized post-merge approval
-        if: always() && !cancelled() && steps.validate.outputs.result != 'true'
+        # Let a started job attempt fail-closed cleanup after normal cancellation.
+        if: always() && steps.validate.outputs.result != 'true'
         uses: actions/github-script@v8
         env:
           VALIDATED_ACTOR: ${{ steps.validate.outputs.validated_actor }}
@@ -136,7 +140,8 @@ jobs:
                 pull_number: issueNumber,
               });
               const labelIsPresent = pullRequest.data.labels.some(
-                (label) => label.name === approvalLabel
+                (label) =>
+                  label.name?.toLowerCase() === approvalLabel.toLowerCase()
               );
               if (!labelIsPresent) {
                 console.log('Post-merge approval label is already absent; no cleanup needed.');
@@ -158,7 +163,7 @@ jobs:
                 .filter(
                   (event) =>
                     event.event === 'labeled' &&
-                    event.label?.name === approvalLabel
+                    event.label?.name?.toLowerCase() === approvalLabel.toLowerCase()
                 )
                 .at(-1);
               const latestEventId = latestApprovalEvent
