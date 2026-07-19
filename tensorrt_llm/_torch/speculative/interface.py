@@ -28,6 +28,7 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, prefer_pinned
+from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -997,6 +998,54 @@ class SpecWorkerBase(nn.Module, ABC):
         # seed/offset pattern in `_sample_tokens_for_batch`).
         self._force_accept_rng_pool: Optional[torch.Tensor] = None
         self._force_accept_rng_counter: Optional[torch.Tensor] = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "forward" in cls.__dict__:
+            raise TypeError(
+                f"{cls.__name__} must not override SpecWorkerBase.forward; "
+                f"implement _forward_impl instead. SpecWorkerBase.forward "
+                f"guarantees spec-dec attn-metadata cleanup when a forward "
+                f"fails (https://nvbugs/6442074).")
+
+    def forward(self, *args, **kwargs):
+        """Run _forward_impl with guaranteed spec-dec metadata cleanup.
+
+        Tolerated forward failures (e.g. an OOM during the max-shape general
+        warmup, or an error-budget-tolerated serving exception) must not leak
+        the attn-metadata state saved by prepare_for_spec_dec: a stale save
+        fails every subsequent forward at the pairing assert.
+        https://nvbugs/6442074
+        """
+        attn_metadata = kwargs.get("attn_metadata")
+        spec_metadata = kwargs.get("spec_metadata")
+        if attn_metadata is None or spec_metadata is None:
+            for a in args:
+                if attn_metadata is None and isinstance(a, AttentionMetadata):
+                    attn_metadata = a
+                elif spec_metadata is None and isinstance(a, SpecMetadata):
+                    spec_metadata = a
+        try:
+            return self._forward_impl(*args, **kwargs)
+        finally:
+            self._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
+
+    @abstractmethod
+    def _forward_impl(self, *args, **kwargs):
+        """Worker-specific forward logic, called by SpecWorkerBase.forward."""
+
+    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
+        """Restore attn-metadata spec-dec state if a failure skipped it.
+
+        No-op on the success path: workers restore at their preferred point
+        and this sees no saved state. Subclasses with extra transient state
+        (e.g. the deferred kv_lens rewind in PARD/DFlash) extend this.
+        """
+        if attn_metadata is not None and attn_metadata.has_spec_dec_saved_state:
+            logger.warning(
+                "Spec-dec worker forward failed between prepare_for_spec_dec "
+                "and restore_from_spec_dec; restoring attn metadata state.")
+            self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
     @property
     @abstractmethod
