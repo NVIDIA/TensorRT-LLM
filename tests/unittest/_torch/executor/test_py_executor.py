@@ -946,6 +946,37 @@ def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
     ]
 
 
+def test_schedule_prepares_snapshot_points_before_scheduling():
+    class StopSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    request = Mock()
+    executor.active_requests = [request]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    calls = []
+    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
+        lambda requests: calls.append(("prepare", requests))
+    )
+
+    def stop_after_schedule(requests, inflight_req_ids):
+        calls.append(("schedule", requests, inflight_req_ids))
+        raise StopSchedule
+
+    executor.scheduler.schedule_request.side_effect = stop_after_schedule
+
+    with pytest.raises(StopSchedule):
+        PyExecutor._schedule(executor)
+
+    assert calls == [
+        ("prepare", executor.active_requests),
+        ("schedule", executor.active_requests, executor.inflight_req_ids),
+    ]
+
+
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 

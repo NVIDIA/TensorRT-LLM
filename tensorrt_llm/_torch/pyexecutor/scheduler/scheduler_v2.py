@@ -597,8 +597,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         if force_chunk:
             # Snapshot boundaries can be shorter than chunk_unit_size.
             assert isinstance(req.expect_snapshot_points, list)
-            # With no state to snapshot, V2 avoids adding artificial chunk boundaries.
-            chunk_size = _get_forced_context_chunk_size(req, context_remaining)
+            # With no remaining state to snapshot, avoid artificial boundaries.
+            chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
         else:
             budget_context_remaining = (

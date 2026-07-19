@@ -231,7 +231,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 // Assigns chunk sizes to context requests under the kFORCE_CHUNK policy.
 //
 // Requests with expected snapshot points advance to their next absolute snapshot position.
-// Otherwise, every request is assigned min(contextRemainingLength, chunkUnitSize) tokens.
+// Otherwise, every request consumes its full remaining context.
 // Capacity and context-length truncation are rounded down to a chunk-unit boundary.
 //
 // This policy is designed for linear attention state caching, so reusable KV-cache tokens are NOT
@@ -249,7 +249,7 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
     SizeType32 totalTokens{0};
     for (auto& llmReq : contextsToBeChunked)
     {
-        SizeType32 chunkSize = std::min(llmReq->getContextRemainingLength(), chunkUnitSize);
+        SizeType32 chunkSize = llmReq->getContextRemainingLength();
         auto const& expectedSnapshotPoints = llmReq->getExpectedSnapshotPoints();
         if (!expectedSnapshotPoints.empty())
         {
@@ -288,9 +288,9 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
 //   kEQUAL_PROGRESS        — all requests advance together one chunkUnitSize at a time.
 //   kFIRST_COME_FIRST_SERVED — requests are served greedily in order until the budget
 //                              is exhausted.
-//   kFORCE_CHUNK           — requests advance to the next expected snapshot point, or by
-//                              min(remaining, chunkUnitSize) when none are configured; budget
-//                              is charged at face value (no reuse discount).
+//   kFORCE_CHUNK           — requests advance to the next expected snapshot point, or consume
+//                              the remaining context when none are configured; budget is charged
+//                              at face value (no reuse discount).
 //
 // EQUAL_PROGRESS and FIRST_COME_FIRST_SERVED are compute-aware: tokens covered by the
 // reusable KV-cache prefix are not charged against ctxTokensCapacity.
@@ -458,7 +458,7 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         allContextRequestsFit = false;
     }
 
-    // For FORCE_CHUNK policy, always re-chunk regardless of whether all contexts fit.
+    // FORCE_CHUNK must always run boundary selection even when all contexts fit.
     if (mCtxChunkConfig && mCtxChunkConfig.value().chunkingPolicy == ContextChunkingPolicy::kFORCE_CHUNK)
     {
         allContextRequestsFit = false;

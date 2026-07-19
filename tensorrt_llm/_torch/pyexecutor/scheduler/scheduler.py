@@ -116,17 +116,11 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
-def _next_expected_snapshot_point(req: LlmRequest) -> int | None:
-    return min(
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    next_point = min(
         (point for point in req.expect_snapshot_points if point > req.context_current_position),
         default=None,
     )
-
-
-def _get_forced_context_chunk_size(req: LlmRequest, default_chunk_size: int) -> int:
-    if not req.expect_snapshot_points:
-        return min(req.context_remaining_length, default_chunk_size)
-    next_point = _next_expected_snapshot_point(req)
     if next_point is None:
         return req.context_remaining_length
     next_position = min(next_point, req.prompt_len)
@@ -686,6 +680,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             all_context_requests_fit = False
 
         if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
+            # Run snapshot-boundary selection even when the full contexts fit.
             all_context_requests_fit = False
 
         # 3. Apply Chunking Strategy if needed
@@ -905,18 +900,12 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if capacity is not None:
                 current_compute_capacity -= actual_model_cost
 
-    @staticmethod
-    def _force_chunk_size(req: LlmRequest, unit_size: int) -> int:
-        assert isinstance(req.expect_snapshot_points, list)
-        return _get_forced_context_chunk_size(req, unit_size)
-
     def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
 
-        Requests use expect_snapshot_points when present; otherwise each request
-        gets min(context_remaining_length, unit_size). Requests that
-        would exceed the capacity budget are rounded down to the nearest lower
-        unit_size multiple.
+        Requests advance to their next expected snapshot point. With no
+        remaining snapshot point, they consume the full remaining context.
+        Capacity-limited chunks are rounded down to a unit_size multiple.
 
         This policy is designed for linear attention / Mamba2 state caching, which doesn't support
         estimating reusable tokens, so we don't subtract them from the budget.
@@ -928,7 +917,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             )
         total_tokens = 0
         for req in requests:
-            chunk_size = self._force_chunk_size(req, unit_size)
+            assert isinstance(req.expect_snapshot_points, list)
+            chunk_size = _get_forced_context_chunk_size(req)
             if self.max_context_length is not None and chunk_size > self.max_context_length:
                 chunk_size = (self.max_context_length // unit_size) * unit_size
             if capacity is not None and total_tokens + chunk_size > capacity:
