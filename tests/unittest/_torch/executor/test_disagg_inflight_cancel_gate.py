@@ -14,8 +14,9 @@
 # limitations under the License.
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import MagicMock, Mock, call
 
 import pytest
 
@@ -293,6 +294,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     executor.active_requests = [request]
     executor.canceled_req_ids = [request.py_request_id]
     executor.waiting_queue = Mock()
+    executor.waiting_queue.remove_by_ids.return_value = []
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
@@ -315,6 +317,274 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     assert executor.canceled_req_ids == []
     assert request.py_kv_transfer_timed_out is False
     request.finish_by_reason.assert_called_once()
+
+
+def test_waiting_cancellation_emits_terminal_response_before_cleanup(monkeypatch):
+    request_item = SimpleNamespace(id=7)
+    response = object()
+    request = SimpleNamespace(
+        py_request_id=7,
+        is_child=False,
+        py_decoding_iter=0,
+        finish_by_reason=Mock(),
+        create_response=Mock(return_value=response),
+    )
+    merge = Mock(return_value=[request])
+    monkeypatch.setattr(executor_module, "merge_requests", merge)
+
+    executor = object.__new__(PyExecutor)
+    executor.enable_iter_perf_stats = True
+    executor.num_fetch_requests = 0
+    executor.enable_attention_dp = False
+    executor.gather_all_responses = False
+    executor.dist = SimpleNamespace(rank=0, world_size=1, cp_config={}, cp_rank=0, cp_size=1)
+    executor.executor_request_queue = Mock()
+    executor._should_exclude_last_generation_logits = Mock(return_value=False)
+    executor._enqueue_responses = Mock()
+    executor.result_wait_queues = Mock()
+    order = Mock()
+    order.attach_mock(executor._enqueue_responses, "respond")
+    order.attach_mock(executor.result_wait_queues.pop, "cleanup")
+
+    PyExecutor._terminalize_canceled_waiting_requests(executor, [request_item])
+
+    request.finish_by_reason.assert_called_once_with(executor_module.FinishReason.CANCELLED)
+    request.create_response.assert_called_once_with(False, 0)
+    executor.executor_request_queue.calculate_queue_latency.assert_called_once()
+    executor._enqueue_responses.assert_called_once_with([(7, response)])
+    assert executor.num_fetch_requests == 1
+    assert order.mock_calls == [call.respond([(7, response)]), call.cleanup(7, None)]
+
+
+@pytest.mark.parametrize("gather_all_responses", [False, True])
+def test_waiting_cancellation_enters_adp_response_collective_on_nonleader(
+    monkeypatch, gather_all_responses
+):
+    merge = Mock()
+    monkeypatch.setattr(executor_module, "merge_requests", merge)
+
+    executor = object.__new__(PyExecutor)
+    executor.enable_iter_perf_stats = False
+    executor.num_fetch_requests = 0
+    executor.enable_attention_dp = True
+    executor.gather_all_responses = gather_all_responses
+    executor.dist = SimpleNamespace(rank=1, world_size=2, cp_config={}, cp_rank=0, cp_size=1)
+    executor._enqueue_responses = Mock()
+    waiter = object()
+    executor.result_wait_queues = {7: waiter}
+
+    PyExecutor._terminalize_canceled_waiting_requests(executor, [SimpleNamespace(id=7)])
+
+    merge.assert_not_called()
+    executor._enqueue_responses.assert_called_once_with([])
+    if gather_all_responses:
+        assert 7 not in executor.result_wait_queues
+    else:
+        assert executor.result_wait_queues[7] is waiter
+
+
+def test_handle_canceled_requests_terminalizes_removed_waiting_items():
+    request_item = SimpleNamespace(id=7)
+    executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = [7]
+    executor.active_requests = []
+    executor.waiting_queue = Mock()
+    executor.waiting_queue.remove_by_ids.return_value = [request_item]
+    executor._terminalize_canceled_waiting_requests = Mock()
+
+    PyExecutor._handle_canceled_requests(executor)
+
+    executor._terminalize_canceled_waiting_requests.assert_called_once_with([request_item])
+    assert executor.canceled_req_ids == []
+
+
+def test_handle_canceled_requests_retains_marker_for_control_deferred_item():
+    executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = [7]
+    executor.control_requests = [object()]
+    executor.active_requests = []
+    executor.waiting_queue = Mock()
+    executor.waiting_queue.remove_by_ids.return_value = []
+    executor._terminalize_canceled_waiting_requests = Mock()
+
+    PyExecutor._handle_canceled_requests(executor)
+
+    assert executor.canceled_req_ids == [7]
+
+
+def test_fetch_terminalizes_waiting_cancellation_before_admission():
+    cancel_marker = object()
+    canceled_item = SimpleNamespace(id=7)
+    executor = object.__new__(PyExecutor)
+    executor.control_requests = []
+    executor.canceled_req_ids = []
+    executor.num_fetch_requests = 0
+    executor._disable_mpi = False
+    executor.dist = SimpleNamespace(rank=0, tp_size=1, has_pp=False, cp_size=1)
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=lambda: nullcontext())
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.return_value = [cancel_marker]
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.return_value = ([cancel_marker], [])
+
+    def handle_special_items(_items):
+        executor.canceled_req_ids.append(7)
+        return []
+
+    executor._handle_special_queue_items = Mock(side_effect=handle_special_items)
+    executor._terminalize_canceled_waiting_requests = Mock()
+    waiting_queue = MagicMock()
+    waiting_queue.__len__.return_value = 1
+    waiting_queue.remove_by_ids.return_value = [canceled_item]
+
+    order = Mock()
+    order.attach_mock(waiting_queue.add_requests, "enqueue")
+    order.attach_mock(waiting_queue.remove_by_ids, "remove")
+    order.attach_mock(executor._terminalize_canceled_waiting_requests, "terminalize")
+
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 0)
+
+    assert order.mock_calls == [
+        call.enqueue([]),
+        call.remove({7}),
+        call.terminalize([canceled_item]),
+    ]
+    assert executor.canceled_req_ids == []
+
+
+def test_fetch_processes_cancellation_while_control_waits_for_drain():
+    cancel_marker = SimpleNamespace(
+        id=7,
+        is_shutdown_request=False,
+        is_canceled_request=True,
+    )
+    deferred_request = SimpleNamespace(
+        id=8,
+        is_shutdown_request=False,
+        is_canceled_request=False,
+    )
+    canceled_item = SimpleNamespace(id=7)
+    executor = object.__new__(PyExecutor)
+    executor.control_requests = [object()]
+    executor.canceled_req_ids = []
+    executor._disable_mpi = False
+    executor.dist = SimpleNamespace(rank=0)
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=lambda: nullcontext())
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.return_value = [
+        deferred_request,
+        cancel_marker,
+    ]
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.return_value = (
+        [deferred_request, cancel_marker],
+        [],
+    )
+    executor._terminalize_canceled_waiting_requests = Mock()
+    executor.is_shutdown = False
+    waiting_queue = MagicMock()
+    waiting_queue.remove_by_ids.return_value = [canceled_item]
+
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 1)
+
+    assert executor.request_accumulated == [deferred_request]
+    assert executor.canceled_req_ids == []
+    waiting_queue.add_requests.assert_not_called()
+    waiting_queue.remove_by_ids.assert_called_once_with({7})
+    executor._terminalize_canceled_waiting_requests.assert_called_once_with([canceled_item])
+
+
+def test_fetch_processes_same_batch_cancellation_behind_control():
+    target_item = SimpleNamespace(
+        id=7,
+        is_shutdown_request=False,
+        is_canceled_request=False,
+        is_control_request=False,
+    )
+    control_marker = SimpleNamespace(
+        id=8,
+        is_shutdown_request=False,
+        is_canceled_request=False,
+        is_control_request=True,
+    )
+    cancel_marker = SimpleNamespace(
+        id=7,
+        is_shutdown_request=False,
+        is_canceled_request=True,
+        is_control_request=False,
+    )
+    executor = object.__new__(PyExecutor)
+    executor.control_requests = []
+    executor.canceled_req_ids = []
+    executor._disable_mpi = False
+    executor.dist = SimpleNamespace(rank=0, tp_size=1, has_pp=False, cp_size=1)
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=lambda: nullcontext())
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.return_value = [
+        target_item,
+        control_marker,
+        cancel_marker,
+    ]
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.return_value = (
+        [target_item, control_marker, cancel_marker],
+        [],
+    )
+    executor._terminalize_canceled_waiting_requests = Mock()
+    executor.is_shutdown = False
+    waiting_queue = MagicMock()
+    waiting_queue.__len__.return_value = 0
+    waiting_queue.remove_by_ids.return_value = [target_item]
+
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 0)
+
+    assert executor.control_requests == [control_marker]
+    assert executor.request_accumulated == []
+    assert executor.canceled_req_ids == []
+    waiting_queue.add_requests.assert_called_once_with([target_item])
+    waiting_queue.remove_by_ids.assert_called_once_with({7})
+    executor._terminalize_canceled_waiting_requests.assert_called_once_with([target_item])
+
+
+def test_fetch_defers_shutdown_until_pending_control_completes():
+    shutdown_marker = SimpleNamespace(
+        id=9,
+        is_shutdown_request=True,
+        is_canceled_request=False,
+        is_control_request=False,
+    )
+    executor = object.__new__(PyExecutor)
+    executor.control_requests = [object()]
+    executor.canceled_req_ids = []
+    executor._disable_mpi = False
+    executor.dist = SimpleNamespace(rank=0, tp_size=1, has_pp=False, cp_size=1)
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=lambda: nullcontext())
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.side_effect = [
+        [shutdown_marker],
+        [],
+    ]
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.side_effect = lambda requests: (requests, [])
+    executor._terminalize_canceled_waiting_requests = Mock()
+    executor.is_shutdown = False
+    waiting_queue = MagicMock()
+    waiting_queue.__len__.return_value = 0
+
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 0)
+
+    assert not executor.is_shutdown
+    assert executor.request_accumulated == [shutdown_marker]
+
+    executor.control_requests.clear()
+    PyExecutor._fetch_and_enqueue_requests(executor, waiting_queue, 0)
+
+    assert executor.is_shutdown
+    assert executor.request_accumulated == []
 
 
 def test_flag_unset_generation_driver_skips_cancel_pipeline():
