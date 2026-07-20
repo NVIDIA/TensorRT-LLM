@@ -47,6 +47,27 @@ l0_l40s:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
+      backend: pytorch
+  tests:
+  # Whisper (encoder-decoder) — customer-side deployment targets L40S/H200
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v2-graphs-off-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-requested-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-graphs-off-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v1-graphs-off-greedy]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*l40s*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------

@@ -4633,6 +4633,7 @@ def launchTestJobs(pipeline, testFilter)
         // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
         // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
         // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
+        "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
         // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
         // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],

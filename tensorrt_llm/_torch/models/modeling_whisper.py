@@ -212,11 +212,9 @@ class WhisperEncoderLayer(nn.Module):
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.FULL,
         )
-        hidden_states = residual + hidden_states
 
-        # MLP (pre-norm)
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
+        # MLP (pre-norm); self-attn residual add fused into the LayerNorm
+        hidden_states, residual = self.final_layer_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -301,11 +299,9 @@ class WhisperDecoderLayer(nn.Module):
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.CAUSAL,
         )
-        hidden_states = residual + hidden_states
 
-        # Cross-attention (pre-norm)
-        residual = hidden_states
-        hidden_states = self.cross_attn_layer_norm(hidden_states)
+        # Cross-attention (pre-norm); self-attn residual add fused into the LayerNorm
+        hidden_states, residual = self.cross_attn_layer_norm(hidden_states, residual)
         hidden_states = self.cross_attn(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
@@ -313,11 +309,9 @@ class WhisperDecoderLayer(nn.Module):
             cross_attn_metadata=cross_attn_metadata,
             skip_cross_kv_projection=skip_cross_kv_projection,
         )
-        hidden_states = residual + hidden_states
 
-        # MLP (pre-norm)
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
+        # MLP (pre-norm); cross-attn residual add fused into the LayerNorm
+        hidden_states, residual = self.final_layer_norm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
