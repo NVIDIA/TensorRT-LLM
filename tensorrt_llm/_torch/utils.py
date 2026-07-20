@@ -4,7 +4,7 @@ import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch.nn import functional as F
@@ -36,6 +36,11 @@ EventType = Enum(
     ['Main', *aux_stream_name_list],
     start=0,
 )
+
+
+def is_gdn_replay_enabled() -> bool:
+    """Return whether GDN replay was explicitly enabled."""
+    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") == "1"
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -160,6 +165,13 @@ class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
     is_sf_swizzled: bool = True
+    # Optional un-quantized (BF16/FP16) hidden-state view of the same logical
+    # activation. When the FP4 tensor is produced by a fused
+    # (add+)RMSNorm+NVFP4-quant that also returns the un-quantized
+    # (post-RMSNorm) value, this carries that tensor so downstream consumers
+    # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
+    # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
+    unquantized_hidden_states: Optional[torch.Tensor] = None
 
     @property
     def shape(self):
