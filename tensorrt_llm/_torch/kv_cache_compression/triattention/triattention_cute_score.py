@@ -31,22 +31,28 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
 
-def _cute_sqrt_supports_approx_ftz() -> bool:
-    """Probe whether this CuTe DSL's ``cute.math.sqrt`` takes ``approx``/``ftz``.
+def _cute_sqrt_keyword_mode() -> str:
+    """Probe which fast-sqrt spelling this CuTe DSL's ``cute.math.sqrt`` takes.
 
-    Older DSL releases expose a plain one-argument ``sqrt``; passing the
-    keywords there raises TypeError at trace time (inside ``cute.compile``,
+    The approximate-sqrt control was renamed across DSL releases: some expose
+    ``approx``/``ftz`` keywords, cutlass 4.5 exposes a single ``fastmath``
+    flag, and older releases expose a plain one-argument ``sqrt``. Passing an
+    unknown keyword raises TypeError at trace time (inside ``cute.compile``,
     where it cannot be caught), so the capability is probed once at import
     time via signature inspection and folded into a trace-time constant.
     """
     try:
         parameters = inspect.signature(cute.math.sqrt).parameters
     except (TypeError, ValueError):
-        return False
-    return "approx" in parameters and "ftz" in parameters
+        return "plain"
+    if "approx" in parameters and "ftz" in parameters:
+        return "approx_ftz"
+    if "fastmath" in parameters:
+        return "fastmath"
+    return "plain"
 
 
-_CUTE_SQRT_HAS_APPROX_FTZ = _cute_sqrt_supports_approx_ftz()
+_CUTE_SQRT_KWARG_MODE = _cute_sqrt_keyword_mode()
 
 CTA_M = 64
 K = 96
@@ -906,18 +912,22 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         real = staged_real[prefetch_index]
                         imag = staged_imag[prefetch_index]
                         norm2 = real * real + imag * imag
-                        if cutlass.const_expr(_CUTE_SQRT_HAS_APPROX_FTZ):
+                        if cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "approx_ftz"):
                             magnitude = cute.math.sqrt(
                                 norm2,
                                 approx=self.sqrt_mode == "approx",
                                 ftz=self.magnitude_sqrt_ftz,
                             )
+                        elif cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "fastmath"):
+                            # cutlass 4.5 renamed the approximate-sqrt control
+                            # to ``fastmath``; map the measured approx choice
+                            # onto it to preserve the authored behavior.
+                            magnitude = cute.math.sqrt(norm2, fastmath=self.sqrt_mode == "approx")
                         else:
-                            # DSLs without the keywords get the plain (IEEE)
+                            # DSLs with neither spelling get the plain (IEEE)
                             # sqrt, which is strictly MORE accurate than the
-                            # measured approx+ftz choice above; the unit
-                            # test's 5e-3 oracle tolerance absorbs the
-                            # difference.
+                            # measured approx choice above; the unit test's
+                            # 5e-3 oracle tolerance absorbs the difference.
                             magnitude = cute.math.sqrt(norm2)
                         magnitude_fp16_0 = cutlass.Float16(magnitude)
                         magnitude_fp16_1 = cutlass.Float16(
