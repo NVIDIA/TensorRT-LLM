@@ -105,7 +105,7 @@ The sweep used the following controlled setup:
 | Prompts | Seven prompts, one fixed seed each |
 | Runtime | TensorRT-LLM release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19` |
 | Checkpoint | ModelOpt 0.45.0.dev89 calibrated export with Skip Softmax metadata |
-| Compilation | `torch.compile` enabled, CUDA graphs disabled; timed after compilation warmup |
+| Compilation | `torch.compile` enabled; autotuning and CUDA graphs disabled; one exact-shape warmup before timing |
 
 The grid was
 
@@ -241,6 +241,13 @@ parallel_config:
   cfg_size: 1
   ulysses_size: 1
 ```
+
+These compilation settings are historical benchmark controls, not recommended production
+defaults. The sweep runner used `skip_warmup=True` to bypass the pipeline's generic multi-shape
+warmup, then ran one complete 50-step forward at the benchmark shape and synchronized the GPU
+before timing. In that release, autotuning was invoked by the skipped built-in warmup, so
+`enable_autotune` did not affect this protocol. CUDA graphs were disabled because the rc19 release
+image treated their combination with the `torch.compile` path used by the sweep as unsupported.
 
 Run it offline or pass it to `trtllm-serve`:
 
