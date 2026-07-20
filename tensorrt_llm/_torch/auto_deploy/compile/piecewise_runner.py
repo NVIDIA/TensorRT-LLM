@@ -400,12 +400,30 @@ class ADPiecewiseRunner(nn.Module):
             graph = torch.cuda.CUDAGraph()
 
             dynamic_out_bufs: Dict[int, torch.Tensor] = {}
-            with torch.cuda.graph(graph, pool=self._graph_pool):
-                output = self.submodule(*args, **kwargs)
-                for submod_id, info in self._next_dynamic_out_infos.items():
-                    dynamic_out_bufs[submod_id] = torch.empty(
-                        info.shape, dtype=info.dtype, device=info.device
+            try:
+                with torch.cuda.graph(graph, pool=self._graph_pool):
+                    output = self.submodule(*args, **kwargs)
+                    for submod_id, info in self._next_dynamic_out_infos.items():
+                        dynamic_out_bufs[submod_id] = torch.empty(
+                            info.shape, dtype=info.dtype, device=info.device
+                        )
+            except Exception:
+                # Reset the partially-captured graph while the CUDA generator
+                # state is still valid. Otherwise this orphaned graph (never
+                # stored in entry.cuda_graph) is destroyed later during GC,
+                # when the generator state may be gone, and ~CUDAGraph()'s
+                # unregister_graph aborts the process ("The graph should be
+                # registered to the state"), masking the real capture-time
+                # error.
+                try:
+                    graph.reset()
+                except Exception:
+                    ad_logger.warning(
+                        "Failed to reset CUDA graph after "
+                        "ADPiecewiseRunner capture failure (num_tokens=%s).",
+                        num_tokens,
                     )
+                raise
 
             torch.cuda.synchronize()
 

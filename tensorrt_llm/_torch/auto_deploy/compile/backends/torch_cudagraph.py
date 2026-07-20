@@ -60,6 +60,20 @@ from ..piecewise_utils import (
 )
 
 
+def _safe_reset_cuda_graph(graph: torch.cuda.CUDAGraph, context: str) -> None:
+    """Best-effort reset of a partially-captured CUDA graph.
+
+    graph.reset() can itself raise (e.g. because the CUDA generator state has
+    already been torn down or is inconsistent after a failed capture). Swallow
+    those failures so one failing reset cannot terminate the process from
+    ~CUDAGraph() and cannot mask an earlier, more relevant error.
+    """
+    try:
+        graph.reset()
+    except Exception:
+        ad_logger.warning("Failed to reset CUDA graph %s.", context)
+
+
 def _args_kwargs_flatten_spec(in_spec: TreeSpec, *args, **kwargs) -> List[Any]:
     """Flatten inputs according to provided in_spec."""
     all_args: PyTree = (args, kwargs)
@@ -256,19 +270,29 @@ class CapturedGraph(nn.Module):
         graph = torch.cuda.CUDAGraph()
         od = self._output_dynamic_dim
         output_extents = []
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
-            # compute output
-            out = self.model(*args, **kwargs)
-            # write out into output buffer up to out batch size
-            out_flat = tree_flatten_spec(out, self._out_spec)
-            for o_buffer, o in zip(self._out_buffer_flat, out_flat):
-                output_extent = o.shape[od]
-                assert o_buffer.shape[od] >= output_extent, (
-                    "CUDA graph output extent exceeds backing buffer during capture: "
-                    f"output_extent={output_extent}, buffer_extent={o_buffer.shape[od]}"
-                )
-                o_buffer.narrow(od, 0, output_extent).copy_(o)
-                output_extents.append(output_extent)
+        try:
+            with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
+                # compute output
+                out = self.model(*args, **kwargs)
+                # write out into output buffer up to out batch size
+                out_flat = tree_flatten_spec(out, self._out_spec)
+                for o_buffer, o in zip(self._out_buffer_flat, out_flat):
+                    output_extent = o.shape[od]
+                    assert o_buffer.shape[od] >= output_extent, (
+                        "CUDA graph output extent exceeds backing buffer during capture: "
+                        f"output_extent={output_extent}, buffer_extent={o_buffer.shape[od]}"
+                    )
+                    o_buffer.narrow(od, 0, output_extent).copy_(o)
+                    output_extents.append(output_extent)
+        except Exception:
+            # Reset the partially-captured graph now, while the CUDA generator
+            # state is still valid. Otherwise this orphaned graph (never stored
+            # in self.cudagraphs) is destroyed later during GC, when the
+            # generator state may already be gone, and ~CUDAGraph()'s
+            # unregister_graph aborts the process ("The graph should be
+            # registered to the state"), masking the real capture-time error.
+            _safe_reset_cuda_graph(graph, "after CapturedGraph capture failure")
+            raise
         torch.cuda.synchronize()
         self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph, tuple(output_extents)
