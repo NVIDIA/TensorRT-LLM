@@ -511,6 +511,39 @@ def test_peer_registrar_get_kv_map_non_contiguous_overlap_splits_fragments():
     assert [p.src.memory.bytes_per_region for p in pairs] == [512, 512]
 
 
+def test_peer_registrar_get_kv_map_merges_non_monotonic_contiguous_layout():
+    """Physically contiguous layers merge into one fragment despite global-id order.
+
+    Both peers lay out global layers in physical order ``[5, 3]``: byte-contiguous
+    on both sides, just not monotonic in global id. Iterating the overlap in
+    self's physical order keeps the offset arrays adjacent, so the mapper merges
+    the two layers into a single 1024B fragment; a sorted-by-global-id iteration
+    would visit offsets ``[512, 0]`` and split the copy into two fragments.
+    """
+    self_pt = make_page_table(global_layer_ids=[5, 3])
+    peer_pt = make_page_table(global_layer_ids=[5, 3])
+
+    self_rankinfo = make_rankinfo(instance_name="local", page_table=self_pt)
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=2,
+        layer_num_per_pp=[2],
+        page_table=peer_pt,
+    )
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    assert isinstance(mapper, IntactMapper)
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=1024)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=1024)),
+    )
+    assert not isinstance(pair, list)
+    assert pair.src.memory.ptrs.tolist() == [1000]
+    assert pair.dst.memory.ptrs.tolist() == [2000]
+    assert pair.src.memory.bytes_per_region == 1024
+
+
 def test_nhd_head_mismatch_mapper_slices_each_token():
     self_ri = make_rankinfo(
         instance_name="local",

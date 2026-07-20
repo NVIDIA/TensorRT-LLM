@@ -309,7 +309,15 @@ class PeerRegistrar:
         # convention about global-id/byte-offset ordering is needed.
         self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
         peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
-        overlapping_layers = sorted(set(self_global_ids) & set(peer_global_ids))
+        # Iterate the overlap in self's physical slot order (not sorted by
+        # global id) so that layers whose regions are contiguous on both
+        # sides stay adjacent in the offset arrays and the mappers can merge
+        # them into one fragment even when global-id order diverges from the
+        # physical layout. Order only affects run merging (a perf property):
+        # each layer's byte offset is looked up explicitly below, so any
+        # iteration order transfers correct bytes.
+        overlap = set(self_global_ids) & set(peer_global_ids)
+        overlapping_layers = [gid for gid in self_global_ids if gid in overlap]
 
         self_starts, self_bytes_per_layer = get_layer_byte_ranges(self_pv)
         peer_starts, peer_bytes_per_layer = get_layer_byte_ranges(peer_pv)
