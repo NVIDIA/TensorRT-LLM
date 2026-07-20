@@ -55,10 +55,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
         *,
         mapping: Optional[Mapping] = None,
     ):
-        super().__init__(spec_config,
-                         model_config,
-                         use_separate_draft_kv_cache,
-                         mapping=mapping)
+        super().__init__(spec_config, model_config, use_separate_draft_kv_cache, mapping=mapping)
         assert getattr(spec_config, "use_dynamic_tree", False), (
             "MTPEagleDynamicTreeWorker requires use_dynamic_tree=True"
         )
