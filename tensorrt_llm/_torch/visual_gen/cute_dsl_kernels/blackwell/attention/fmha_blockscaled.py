@@ -26,12 +26,13 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# ruff: noqa: I001, E501, F841
+# ruff: noqa: I001, E501, F841, E712, E741
 
 import math
 from typing import Callable, Type, Tuple, Union, Optional
 from functools import partial
 
+import torch
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -41,7 +42,9 @@ from cutlass.cute.nvgpu.common import OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import Int8, Int32, Int64, Float32
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
@@ -49,7 +52,8 @@ from cutlass.cutlass_dsl import BaseDSL
 from ...helpers import fmha_helpers as fmha_utils
 
 """
-A fused multi-head attention (FMHA) example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
+A fused multi-head attention (FMHA) example where Bmm1(Q@K) is block-scaled with MXFP8 or NVFP4 for
+NVIDIA Blackwell SM100 architecture using CUTE DSL
 
 This example demonstrates an implementation of fused multi-head attention using a TMA + Blackwell SM100
 TensorCore warp-specialized persistent kernel. The implementation integrates the Q*K^T matrix multiplication,
@@ -66,21 +70,23 @@ To run this example:
 
 .. code-block:: bash
 
-    python examples/cute/blackwell/kernel/attention/fmha/fmha.py                                     \
+    python nvidia-internal/fmha_blockscaled.py                            \
+      --qk_mode MXFP8                                                     \
       --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
       --mma_tiler_mn 128,128                                              \
       --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
       --is_persistent
 
 The above example runs FMHA with batch size 4, sequence length 1024, 8 attention heads, and head
-dimension 64. The Blackwell tcgen05 MMA tile shape is (128, 128), and the kernel uses fp16 for input/output
-with fp32 for accumulation.
+dimension 64. The Blackwell tcgen05 MMA tile shape is (128, 128), and the default runner uses BF16
+for V/output with FP32 for accumulation.
 
 To collect performance with NCU profiler:
 
 .. code-block:: bash
 
-    ncu python examples/cute/blackwell/kernel/attention/fmha/fmha.py                                 \
+    ncu python nvidia-internal/fmha_blockscaled.py                        \
+      --qk_mode NVFP4                                                     \
       --qk_acc_dtype Float32 --pv_acc_dtype Float32                       \
       --mma_tiler_mn 128,128                                              \
       --q_shape 4,1024,8,64 --k_shape 4,1024,8,64                         \
@@ -88,7 +94,11 @@ To collect performance with NCU profiler:
       --iterations 10 --skip_ref_check
 
 Constraints for this example:
-* Supported head dimensions: 32, 64, and 128
+* Q and K use supports two microscaling schema:
+  MXFP8 (qk_dtype in {Float8E4M3FN, Float8E5M2}, qk_sf_dtype=Float8E8M0FNU, qk_sf_vec_size=32)
+  and NVFP4 (qk_dtype=Float4E2M1FN, qk_sf_dtype=Float8E4M3FN, qk_sf_vec_size=16)
+* Bmm2 (P@V) remains dense FP8 or BF16 through pv_dtype
+* Supported QK head dimensions: 128 (due to current limitations in blockscaled_utils)
 * Number of heads in Q must be divisible by number of heads in K
 * mma_tiler_mn must be 128,128
 * Batch size must be the same for Q, K, and V tensors
@@ -103,7 +113,92 @@ def make_thread_cooperative_group(size: int):
     return pipeline.CooperativeGroup(pipeline.Agent.Thread, size)
 
 
-class BlackwellFusedMultiHeadAttentionForward:
+def create_scale_factor_tensor(
+    mn: int,
+    k: int,
+    l: int,
+    sf_vec_size: int,
+    sf_dtype: Type[cutlass.Numeric],
+):
+    """
+    Create dense reference SFs and blocked device SF storage for QK block-scaled MMA.
+
+    Generates per-position SFs sampled from {0.5, 1.0, 2.0} (which are exactly representable in both
+    E8M0 and E4M3) and arranges them into the blocked storage that tile_atom_to_shape_SF,
+    BlockScaledBasicChunk consume on the kernel side. The SF atom layout is:
+        ((32,4),(sf_vec,4)) : ((16,4),(0,1))
+    so for a logical mn in [0,128) inside an atom, the SF byte lives at offset:
+        (mn % 32) * 16 + (mn // 32) * 4 + k_inner
+    """
+
+    def ceil_div(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    atom_m = 32 * 4
+    atom_k = 4
+    m_atoms = ceil_div(mn, atom_m)
+    sf_k = ceil_div(k, sf_vec_size)
+    sf_k_atoms = ceil_div(sf_k, atom_k)
+
+    # Generate SFs in the LOGICAL (mn, sf_k, l) layout first, then re-arrange into the blocked
+    # storage layout explained in docstring above.
+    # CuTe decomposes mn in [0,128) column-major as (mn % 32, mn // 32), so the size-32 axis
+    # gets the LOW 5 bits of mn (stride 16) and the size-4 axis gets the HIGH 2 bits (stride 4).
+    mn_padded = m_atoms * atom_m
+    sf_k_padded = sf_k_atoms * atom_k
+    sf_choices = torch.tensor([0.5, 1.0, 2.0], dtype=torch.float32)
+    sf_logical_padded = sf_choices[torch.randint(0, len(sf_choices), (mn_padded, sf_k_padded, l))]
+    sf_storage_f32 = (
+        # K-mode: k_padded -> (sf_k_atoms, atom_k=4)
+        # MN-mode: mn_padded -> (sf_m_atoms, proton_m=4, neutron_m=32)
+        sf_logical_padded.reshape(m_atoms, 4, 32, sf_k_atoms, atom_k, l)
+        # Arrangement (last-idx-major): (l, sf_m_atoms, sf_k_atoms, neutron_m, proton_m, atom_k)
+        # (l, sf_m_atoms, sf_k_atoms) follows a traditional K-major interblock layout
+        # (atom_k) is the last index -> reproduces (sf_vec,atom_k):(0,1)
+        # (neutron_m, proton_m) -> reproduces
+        #   prod((neutron_m,proton_m):(proton_m:1), 1:atom_k) = (32,4):(16,4)
+        .permute(5, 0, 3, 2, 1, 4)
+        .contiguous()
+    )
+
+    sf_tensor, _ = cutlass_torch.cute_tensor_like(
+        sf_storage_f32,
+        sf_dtype,
+        is_dynamic_layout=True,
+        assumed_align=16,
+    )
+
+    sf_logical = sf_logical_padded[:mn, :sf_k, :]
+    # Broadcast each SF across its sf_vec_size K elements to build a elementwise (mn, k, l)
+    # reference whose (m, j, b) entry is the SF the kernel multiplies into the same logical position
+    ref_elementwise = (
+        sf_logical.unsqueeze(2)
+        .expand(-1, -1, sf_vec_size, -1)
+        .reshape(mn, sf_k * sf_vec_size, l)[:, :k, :]
+        .contiguous()
+    )
+
+    return ref_elementwise, sf_tensor
+
+
+def compact_fp4_data(torch_underlying: torch.Tensor, dtype: Type[cutlass.Numeric]) -> None:
+    """Compact packed FP4 rows to match CuTe's sub-byte stride interpretation."""
+    if dtype is not cutlass.Float4E2M1FN:
+        return
+
+    # torch lacks fill_/copy_ kernels for Float4_e2m1fn_x2 on CUDA, but the
+    # storage is byte-packed (two FP4 per byte), so a uint8 view is a free
+    # reinterpret and supports the in-place primitives we need.
+    d = torch_underlying.shape[-1]
+    packed_size = d // (8 // dtype.width)
+    underlying_u8 = torch_underlying.view(torch.uint8)
+    rows = underlying_u8.reshape(-1, d)
+    packed = rows[:, :packed_size].contiguous()
+    underlying_u8.fill_(0)
+    underlying_u8.flatten()[: packed.numel()].copy_(packed.flatten())
+
+
+class BlackwellFusedMultiHeadBlockScaledAttentionForward:
     arch_str: str = "sm_100"
     arch_name: str = "Blackwell SM100"
 
@@ -117,6 +212,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mask_type: fmha_utils.MaskEnum,
         enable_ex2_emulation: bool,
         enable_skip_correction: bool,
+        qk_sf_vec_size: int,
         use_tma_store: bool = True,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
@@ -163,6 +259,10 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
+        if mma_tiler != (128, 128):
+            raise ValueError(
+                "This standalone kernel uses a static TMEM map and currently supports only mma_tiler=(128, 128)"
+            )
         if isinstance(head_dim, tuple):
             self.head_dim = head_dim[0]
             self.head_dim_v = head_dim[1]
@@ -191,6 +291,16 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mask_type = mask_type
         self.enable_skip_correction = enable_skip_correction
         self.enable_ex2_emulation = enable_ex2_emulation
+        self.qk_sf_vec_size = qk_sf_vec_size
+        self.qk_mma_inst_bits_k = 256
+        if qk_sf_vec_size == 16:
+            # NVFP4: a 256-bit MMA operand tile covers 64 logical K values.
+            self.qk_mma_inst_tile_k = self.head_dim // (self.qk_mma_inst_bits_k // 4)
+        elif qk_sf_vec_size == 32:
+            # MXFP8: a 256-bit MMA operand tile covers 32 logical K values.
+            self.qk_mma_inst_tile_k = self.head_dim // (self.qk_mma_inst_bits_k // 8)
+        else:
+            self.qk_mma_inst_tile_k = 0
         self.use_tma_store = use_tma_store
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
@@ -257,6 +367,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_p0_offset = 160
         # inplaced with s0
         self.tmem_p1_offset = 32
+        # Block-scaled QK scale factors are live only while issuing QK MMA.
+        # Keep each stage's scale buffers in the opposite S/P tile's tail columns.
+        self.tmem_qk0_sf_offset = 224
+        self.tmem_qk1_sf_offset = 96
         # vec buffer for row_max & row_sum
         # inplaced with s0
         self.tmem_vec0_offset = 0
@@ -275,7 +389,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.arch = BaseDSL._get_dsl().get_arch_enum()
 
         if self.arch >= Arch.sm_103:
-            assert self.enable_ex2_emulation == False, (  # noqa
+            assert self.enable_ex2_emulation == False, (
                 f"Don't enable exp2 emulation for {self.arch}, it doesn't help performance"
             )
 
@@ -286,12 +400,13 @@ class BlackwellFusedMultiHeadAttentionForward:
 
     def _make_qk_tiled_mma(self, cta_group):
         """Build the QK tiled MMA. Override in subclasses to target a different arch."""
-        return sm100_utils.make_trivial_tiled_mma(
+        return sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.q_dtype,
-            self.q_dtype,
+            self.k_dtype,
             self.q_major_mode,
             self.k_major_mode,
-            self.qk_acc_dtype,
+            self.qk_sf_dtype,
+            self.qk_sf_vec_size,
             cta_group,
             self.qk_mma_tiler[:2],
         )
@@ -358,6 +473,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self,
         q_tensor: cute.Tensor,
         k_tensor: cute.Tensor,
+        q_sf_tensor: cute.Tensor,
+        k_sf_tensor: cute.Tensor,
         v_tensor: cute.Tensor,
         o_tensor: cute.Tensor,
         problem_size: Tuple[Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32],
@@ -368,6 +485,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -418,11 +536,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         :raises TypeError: If tensor data types don't match or aren't supported
         :raises RuntimeError: If tensor layouts aren't in supported formats
         """
-        b, s_q_max, s_lse_max, s_k_max, h_q, h_k, d, dv = problem_size
+        b, s_q_max, s_lse_max, s_k_max, h_q, h_k, d_, dv_ = problem_size
         h_r = h_q // h_k
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = q_tensor.element_type
         self.k_dtype = k_tensor.element_type
+        self.qk_sf_dtype = q_sf_tensor.element_type
         self.v_dtype = v_tensor.element_type
         self.o_dtype = o_tensor.element_type
 
@@ -431,10 +550,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_k = k_tensor.shape[1]
         s_v = v_tensor.shape[1]
         s_lse = s_lse_max
+        d = self.head_dim
+        dv = self.head_dim_v
         # Important for performance
         align = 256 // self.o_dtype.width
-        d = cute.assume(Int32(d), align)
-        dv = cute.assume(Int32(dv), align)
+        assert d % align == 0, f"head_dim must be multiple of {align} for the given datatypes."
+        assert dv % align == 0, f"head_dim_v must be multiple of {align} for the given datatypes."
 
         stride_b_q = h_r * h_k * s_q * d if cum_seqlen_q is None else 0
         stride_b_o = h_r * h_k * s_q * dv if cum_seqlen_q is None else 0
@@ -454,6 +575,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(d * h_k, 1, ((0, d), stride_b_k)),
         )
         k = cute.make_tensor(k_tensor.iterator, k_layout)
+        q_sf_layout = blockscaled_utils.tile_atom_to_shape_SF(q.shape, self.qk_sf_vec_size)
+        q_sf = cute.make_tensor(q_sf_tensor.iterator, q_sf_layout)
+        k_sf_layout = blockscaled_utils.tile_atom_to_shape_SF(
+            (s_k, d, (h_k, b)), self.qk_sf_vec_size
+        )
+        k_sf = cute.make_tensor(k_sf_tensor.iterator, k_sf_layout)
         # (b, s_v, h_k, 1, dv) -> (dv, s_v, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (dv, s_v, ((h_r, h_k), b)),
@@ -487,6 +614,19 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             sink = None
 
+        if cutlass.const_expr(scale_v_channels is not None):
+            # scale_v_channels is per (h_k, dv): shape (h_k * dv,) row-major.
+            # Expose as (dv, ((h_r, h_k), b)) where h_r and b are 0-stride broadcasts.
+            scale_v_channels_layout = cute.make_layout(
+                (dv, ((h_r, h_k), b)),
+                stride=(1, ((0, dv), 0)),
+            )
+            m_scale_v_channels = cute.make_tensor(
+                scale_v_channels.iterator, scale_v_channels_layout
+            )
+        else:
+            m_scale_v_channels = None
+
         self.tile_sched_params, grid = fmha_utils.compute_grid(
             cute.shape((s_q_max, d, ((h_r, h_k), b))),
             self.cta_tiler,
@@ -508,6 +648,27 @@ class BlackwellFusedMultiHeadAttentionForward:
         # V may use a different dtype (pv_dtype) to allow qk_dtype != pv_dtype.
         if cutlass.const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
+        if cutlass.const_expr(self.qk_sf_dtype != k_sf_tensor.element_type):
+            raise TypeError(
+                f"Q/K scale type mismatch: {self.qk_sf_dtype} != {k_sf_tensor.element_type}"
+            )
+        if cutlass.const_expr(self.qk_mma_inst_tile_k <= 0):
+            raise RuntimeError(
+                f"Invalid QK scale-factor tiling for head_dim={self.head_dim}, qk_sf_vec_size={self.qk_sf_vec_size}"
+            )
+        # SFQ + SFK share one 32-column TMEM slot per stage (see kernel TMEM layout
+        # below). Validate the static footprint on the host so we don't smuggle a
+        # `raise` into @cute.kernel.
+        _sf_atom_mn = 32
+        _qk_sf_tmem_cols = (self.qk_mma_tiler[0] // _sf_atom_mn) * self.qk_mma_inst_tile_k
+        _kqk_sf_tmem_cols = (
+            ((self.qk_mma_tiler[1] + 127) // 128 * 128) // _sf_atom_mn
+        ) * self.qk_mma_inst_tile_k
+        if cutlass.const_expr(_qk_sf_tmem_cols + _kqk_sf_tmem_cols > 32):
+            raise RuntimeError(
+                "QK scale-factor TMEM footprint exceeds the static 32-column slot "
+                f"(qk_sf_tmem_cols={_qk_sf_tmem_cols}, k_sf_tmem_cols={_kqk_sf_tmem_cols})"
+            )
         self._setup_attributes(skip_softmax_threshold_log2 is not None)
 
         cta_group = tcgen05.CtaGroup.ONE
@@ -534,6 +695,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.k_dtype,
+            self.kv_stage,
+        )
+        q_sf_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
+            qk_tiled_mma,
+            self.qk_mma_tiler,
+            self.qk_sf_vec_size,
+            self.q_stage,
+        )
+        k_sf_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(
+            qk_tiled_mma,
+            self.qk_mma_tiler,
+            self.qk_sf_vec_size,
             self.kv_stage,
         )
         p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -593,6 +766,16 @@ class BlackwellFusedMultiHeadAttentionForward:
             qk_tiled_mma,
             self.cluster_layout_vmnk.shape,
         )
+        q_sf_smem_layout = cute.slice_(q_sf_smem_layout_staged, (None, None, None, 0))
+        tma_atom_q_sf, tma_tensor_q_sf = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            q_sf,
+            q_sf_smem_layout,
+            self.qk_mma_tiler,
+            qk_tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=cutlass.Int16,
+        )
 
         # TMA load for K
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
@@ -603,6 +786,16 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.qk_mma_tiler,
             qk_tiled_mma,
             self.cluster_layout_vmnk.shape,
+        )
+        k_sf_smem_layout = cute.slice_(k_sf_smem_layout_staged, (None, None, None, 0))
+        tma_atom_k_sf, tma_tensor_k_sf = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op,
+            k_sf,
+            k_sf_smem_layout,
+            self.qk_mma_tiler,
+            qk_tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=cutlass.Int16,
         )
         # TMA load for V
         v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
@@ -625,9 +818,11 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
+        q_sf_copy_size = cute.size_in_bytes(self.qk_sf_dtype, q_sf_smem_layout)
+        k_sf_copy_size = cute.size_in_bytes(self.qk_sf_dtype, k_sf_smem_layout)
         v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
-        self.tma_copy_q_bytes = q_copy_size
-        self.tma_copy_k_bytes = k_copy_size
+        self.tma_copy_q_bytes = q_copy_size + q_sf_copy_size
+        self.tma_copy_k_bytes = k_copy_size + k_sf_copy_size
         self.tma_copy_v_bytes = v_copy_size
 
         @cute.struct
@@ -645,6 +840,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_corr_mbar_ptr: cute.struct.MemRange[Int64, self.mma_corr_stage * 2]
             s0_p1_inplace_barrier_ptr: cute.struct.MemRange[Int64, self.p_mma_stage * 2]
             s1_p0_inplace_barrier_ptr: cute.struct.MemRange[Int64, self.p_mma_stage * 2]
+            # Softmax_{1-j} signals MMA that S_{1-j}'s TMEM region (whose tail
+            # columns hold SFQ_j / SFK_j) is no longer being read, so mma_qk's
+            # SFQ/SFK S2T copy is safe to issue. One pipeline per QK stage.
+            qk_sf_inplace_0_barrier_ptr: cute.struct.MemRange[Int64, 1 * 2]
+            qk_sf_inplace_1_barrier_ptr: cute.struct.MemRange[Int64, 1 * 2]
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -656,8 +856,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.struct.MemRange[self.q_dtype, cute.cosize(q_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            sQSF: cute.struct.Align[
+                cute.struct.MemRange[self.qk_sf_dtype, cute.cosize(q_sf_smem_layout_staged)],
+                self.buffer_align_bytes,
+            ]
             sK: cute.struct.Align[
                 cute.struct.MemRange[self.k_dtype, sK_cosize],
+                self.buffer_align_bytes,
+            ]
+            sKSF: cute.struct.Align[
+                cute.struct.MemRange[self.qk_sf_dtype, cute.cosize(k_sf_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             # Skip softmax and PV warpgroup votes
@@ -672,8 +880,12 @@ class BlackwellFusedMultiHeadAttentionForward:
             pv_tiled_mma,
             tma_atom_q,
             tma_tensor_q,
+            tma_atom_q_sf,
+            tma_tensor_q_sf,
             tma_atom_k,
             tma_tensor_k,
+            tma_atom_k_sf,
+            tma_tensor_k_sf,
             tma_atom_v,
             tma_tensor_v,
             tma_atom_o,
@@ -686,11 +898,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             scale_softmax_log2,
             scale_softmax,
             scale_output,
+            m_scale_v_channels,
             skip_softmax_threshold_log2,
             window_size_left,
             window_size_right,
             q_smem_layout_staged,
             k_smem_layout_staged,
+            q_sf_smem_layout_staged,
+            k_sf_smem_layout_staged,
             p_tmem_layout_staged,
             v_smem_layout_staged,
             o_smem_layout_staged,
@@ -714,8 +929,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         pv_tiled_mma: cute.TiledMma,
         tma_atom_q: cute.CopyAtom,
         mQ_qdl: cute.Tensor,
+        tma_atom_q_sf: cute.CopyAtom,
+        mQSF_qdl: cute.Tensor,
         tma_atom_k: cute.CopyAtom,
         mK_kdl: cute.Tensor,
+        tma_atom_k_sf: cute.CopyAtom,
+        mKSF_kdl: cute.Tensor,
         tma_atom_v: cute.CopyAtom,
         mV_dkl: cute.Tensor,
         tma_atom_o: cute.CopyAtom,
@@ -728,11 +947,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        m_scale_v_channels: Optional[cute.Tensor],
         skip_softmax_threshold_log2: Optional[Float32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
+        q_sf_smem_layout_staged: cute.Layout,
+        k_sf_smem_layout_staged: cute.Layout,
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
@@ -805,7 +1027,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         #
         if warp_idx == self.load_warp_id:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q_sf)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k_sf)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             if cutlass.const_expr(self.use_tma_store):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
@@ -932,6 +1156,27 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=storage.s1_p0_inplace_barrier_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
+        # QK SF TMEM-slot release pipelines: softmax_{1-j} (producer) signals
+        # MMA (consumer) once its T2R-load of S_{1-j} is done, so mma_qk(j)'s
+        # SFQ/SFK S2T copy is safe to overwrite the tail of TMEM[S_{1-j}].
+        qk_sf_inplace_0_producer, qk_sf_inplace_0_consumer = pipeline.PipelineAsync.create(
+            num_stages=1,
+            producer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.softmax1_warp_ids)
+            ),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            barrier_storage=storage.qk_sf_inplace_0_barrier_ptr.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
+        qk_sf_inplace_1_producer, qk_sf_inplace_1_consumer = pipeline.PipelineAsync.create(
+            num_stages=1,
+            producer_group=make_thread_cooperative_group(
+                self.threads_per_warp * len(self.softmax0_warp_ids)
+            ),
+            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
+            barrier_storage=storage.qk_sf_inplace_1_barrier_ptr.data_ptr(),
+            defer_sync=True,
+        ).make_participants()
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -944,8 +1189,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner)
+        # (MMA, MMA_Q, MMA_D, PIPE)
+        sQSF = storage.sQSF.get_tensor(q_sf_smem_layout_staged)
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner)
+        # (MMA, MMA_K, MMA_D, PIPE)
+        sKSF = storage.sKSF.get_tensor(k_sf_smem_layout_staged)
         # (MMA, MMA_K, MMA_D, PIPE)
         # Reuse k's smem buffer for v. Recast element type so MMA descriptor matches v_dtype.
         sV_ptr = cute.recast_ptr(
@@ -1021,6 +1270,13 @@ class BlackwellFusedMultiHeadAttentionForward:
             ),
             mask_args=(window_size_left, window_size_right),
             sched_args=(tile_sched, work_tile),
+            # Each softmax warpgroup picks its producer by stage: softmax0
+            # (stage=0) produces on qk_sf_inplace_1, softmax1 (stage=1) on
+            # qk_sf_inplace_0.
+            qk_sf_inplace_producers=(
+                qk_sf_inplace_1_producer,
+                qk_sf_inplace_0_producer,
+            ),
         )
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
@@ -1058,14 +1314,22 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if not continue_cond:
                     mQ_qdl_ = mQ_qdl
                     mK_kdl_ = mK_kdl
+                    mQSF_qdl_ = mQSF_qdl
+                    mKSF_kdl_ = mKSF_kdl
                     mV_dkl_ = mV_dkl
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         mQ_qdl_ = cute.domain_offset(
                             (cum_seqlen_q[batch_coord], 0, ((0, 0), 0)), mQ_qdl
                         )
+                        mQSF_qdl_ = cute.domain_offset(
+                            (cum_seqlen_q[batch_coord], 0, (0, 0)), mQSF_qdl
+                        )
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         mK_kdl_ = cute.domain_offset(
                             (cum_seqlen_k[batch_coord], 0, ((0, 0), 0)), mK_kdl
+                        )
+                        mKSF_kdl_ = cute.domain_offset(
+                            (cum_seqlen_k[batch_coord], 0, (0, 0)), mKSF_kdl
                         )
                         mV_dkl_ = cute.domain_offset(
                             (0, cum_seqlen_k[batch_coord], ((0, 0), 0)), mV_dkl
@@ -1081,6 +1345,32 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(tSgQ_qdl, 0, 3),
                     )
                     tQgQ = tQgQ_qdl[None, None, 0, curr_block_coord[2]]
+                    gQSF_qdl = cute.local_tile(
+                        mQSF_qdl_,
+                        cute.select(self.qk_mma_tiler, mode=[0, 2]),
+                        (None, None, None),
+                    )
+                    tSgQSF_qdl = qk_thr_mma.partition_A(gQSF_qdl)
+                    tQsQSF, tQgQSF_qdl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_q_sf,
+                        0,  # no multicast
+                        cute.make_layout(1),
+                        cute.group_modes(sQSF, 0, 3),
+                        cute.group_modes(tSgQSF_qdl, 0, 3),
+                    )
+                    tQsQSF = cute.filter_zeros(tQsQSF)
+                    tQgQSF_qdl = cute.filter_zeros(tQgQSF_qdl)
+                    # tile_atom_to_shape_SF coalesces Q's ((h_r, h_k), b) mode into (1, h_r*h_k*b),
+                    # One needs to reconstruct the correct layout here to correctly map block_coord
+                    # onto this linearlized L-like mode.
+                    sf_l_q = cute.make_layout(
+                        mQ_qdl.shape[2],
+                        stride=(
+                            (1, mQ_qdl.shape[2][0][0]),
+                            cute.size(mQ_qdl.shape[2][0]),
+                        ),
+                    )(curr_block_coord[2])
+                    tQgQSF = tQgQSF_qdl[None, None, 0, sf_l_q]
                     gK_kdl = cute.flat_divide(mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2]))
                     tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
                     tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
@@ -1091,6 +1381,28 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(tSgK_kdl, 0, 3),
                     )
                     tKgK = tKgK_kdl[None, None, 0, curr_block_coord[2]]
+                    gKSF_kdl = cute.local_tile(
+                        mKSF_kdl_,
+                        cute.select(self.qk_mma_tiler, mode=[1, 2]),
+                        (None, None, None),
+                    )
+                    tSgKSF_kdl = qk_thr_mma.partition_B(gKSF_kdl)
+                    tKsKSF, tKgKSF_kdl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_k_sf,
+                        0,  # no multicast
+                        cute.make_layout(1),
+                        cute.group_modes(sKSF, 0, 3),
+                        cute.group_modes(tSgKSF_kdl, 0, 3),
+                    )
+                    tKsKSF = cute.filter_zeros(tKsKSF)
+                    tKgKSF_kdl = cute.filter_zeros(tKgKSF_kdl)
+                    # Same L-mode trick as Q's SF (see comment above). K's SF is shared across h_r heads
+                    # (it indexes h_k, not h_q), which we express by a 0-stride for the h_r sub-mode.
+                    sf_l_k = cute.make_layout(
+                        mK_kdl.shape[2],
+                        stride=((0, 1), mK_kdl.shape[2][0][1]),
+                    )(curr_block_coord[2])
+                    tKgKSF = tKgKSF_kdl[None, None, 0, sf_l_k]
                     gV_dkl = cute.flat_divide(mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2]))
                     tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
                     tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
@@ -1118,6 +1430,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tQsQ[None, q0_handle.index],
                         tma_bar_ptr=q0_handle.barrier,
                     )
+                    cute.copy(
+                        tma_atom_q_sf,
+                        tQgQSF[None, q0_coord],
+                        tQsQSF[None, q0_handle.index],
+                        tma_bar_ptr=q0_handle.barrier,
+                    )
                     seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
                         self.mask_type,
                         curr_block_coord,
@@ -1136,6 +1454,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tKsK[None, k_handle.index],
                         tma_bar_ptr=k_handle.barrier,
                     )
+                    cute.copy(
+                        tma_atom_k_sf,
+                        tKgKSF[None, kv_coord],
+                        tKsKSF[None, k_handle.index],
+                        tma_bar_ptr=k_handle.barrier,
+                    )
                     # Q1
                     q1_coord = q0_coord + 1
                     q1_handle = load_q_producer.acquire_and_advance()
@@ -1143,6 +1467,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tma_atom_q,
                         tQgQ[None, q1_coord],
                         tQsQ[None, q1_handle.index],
+                        tma_bar_ptr=q1_handle.barrier,
+                    )
+                    cute.copy(
+                        tma_atom_q_sf,
+                        tQgQSF[None, q1_coord],
+                        tQsQSF[None, q1_handle.index],
                         tma_bar_ptr=q1_handle.barrier,
                     )
                     kv_coord += 1
@@ -1154,6 +1484,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tma_atom_k,
                             tKgK[None, kv_coord],
                             tKsK[None, k_handle.index],
+                            tma_bar_ptr=k_handle.barrier,
+                        )
+                        cute.copy(
+                            tma_atom_k_sf,
+                            tKgKSF[None, kv_coord],
+                            tKsKSF[None, k_handle.index],
                             tma_bar_ptr=k_handle.barrier,
                         )
                         # Vi-1
@@ -1197,6 +1533,60 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, tStS0, tStS1, tOtO0, tOtO1, tOrP0, tOrP1 = make_tmem_tensors(
                 self, qk_thr_mma, pv_thr_mma, p_tmem_layout_staged, tmem_ptr
+            )
+            q_sf_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+                qk_tiled_mma,
+                self.qk_mma_tiler,
+                self.qk_sf_vec_size,
+                cute.slice_(q_sf_smem_layout_staged, (None, None, None, 0)),
+            )
+            k_sf_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+                qk_tiled_mma,
+                self.qk_mma_tiler,
+                self.qk_sf_vec_size,
+                cute.slice_(k_sf_smem_layout_staged, (None, None, None, 0)),
+            )
+            # TMEM offsets are in u32 columns. Follow FA4's explicit SFQ footprint
+            # calculation instead of deriving the offset from the recast FP8 tensor
+            # view, which can under-count for block-scaled layouts.
+            sf_atom_mn = 32
+            q_sf_tmem_cols = (self.qk_mma_tiler[0] // sf_atom_mn) * self.qk_mma_inst_tile_k
+            k_sf_tmem_cols = (
+                ((self.qk_mma_tiler[1] + 127) // 128 * 128) // sf_atom_mn
+            ) * self.qk_mma_inst_tile_k
+            tCtQSF0 = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.tmem_qk0_sf_offset, dtype=self.qk_sf_dtype),
+                q_sf_tmem_layout,
+            )
+            tCtKSF0 = cute.make_tensor(
+                cute.recast_ptr(
+                    tmem_ptr + self.tmem_qk0_sf_offset + q_sf_tmem_cols,
+                    dtype=self.qk_sf_dtype,
+                ),
+                k_sf_tmem_layout,
+            )
+            tCtQSF1 = cute.make_tensor(
+                cute.recast_ptr(tmem_ptr + self.tmem_qk1_sf_offset, dtype=self.qk_sf_dtype),
+                q_sf_tmem_layout,
+            )
+            tCtKSF1 = cute.make_tensor(
+                cute.recast_ptr(
+                    tmem_ptr + self.tmem_qk1_sf_offset + q_sf_tmem_cols,
+                    dtype=self.qk_sf_dtype,
+                ),
+                k_sf_tmem_layout,
+            )
+            tiled_copy_s2t_qsf0, tCsQSF_s2t, tCtQSF0_s2t = self.mainloop_s2t_copy_and_partition(
+                sQSF, tCtQSF0
+            )
+            tiled_copy_s2t_ksf0, tCsKSF_s2t, tCtKSF0_s2t = self.mainloop_s2t_copy_and_partition(
+                sKSF, tCtKSF0
+            )
+            tiled_copy_s2t_qsf1, tCsQSF1_s2t, tCtQSF1_s2t = self.mainloop_s2t_copy_and_partition(
+                sQSF, tCtQSF1
+            )
+            tiled_copy_s2t_ksf1, tCsKSF1_s2t, tCtKSF1_s2t = self.mainloop_s2t_copy_and_partition(
+                sKSF, tCtKSF1
             )
             enable_skip_softmax = skip_softmax_threshold_log2 is not None
             tiled_tmem_load_v = None
@@ -1256,20 +1646,45 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # Wait for K0
                     k_handle = load_kv_consumer.wait_and_advance()
                     tSrK0 = tSrK[None, None, None, k_handle.index]
+                    q0_sf_stage = (None, None, None, None, q0_handle.index)
+                    k_sf_stage = (None, None, None, None, k_handle.index)
                     # GEMM_QK00 (Q0 * K0 -> S0)
-                    mma_s0_producer, s0_corr_producer = self.mma_qk(
+                    mma_s0_producer, s0_corr_producer, qk_sf_inplace_0_consumer = self.mma_qk(
                         qk_tiled_mma,
                         (tSrQ0, tSrK0, tStS0),
+                        (
+                            tiled_copy_s2t_qsf0,
+                            tCsQSF_s2t[q0_sf_stage],
+                            tCtQSF0_s2t,
+                            tCtQSF0,
+                            tiled_copy_s2t_ksf0,
+                            tCsKSF_s2t[k_sf_stage],
+                            tCtKSF0_s2t,
+                            tCtKSF0,
+                        ),
                         (mma_s0_producer, s0_corr_producer),
+                        qk_sf_inplace_0_consumer,
                     )
                     # Wait for Q1
                     q1_handle = load_q_consumer.wait_and_advance()
                     tSrQ1 = tSrQ[None, None, None, q1_handle.index]
+                    q1_sf_stage = (None, None, None, None, q1_handle.index)
                     # GEMM_QK10 (Q1 * K0 -> S1), K0 is ready in GEMM_QK00
-                    mma_s1_producer, s1_corr_producer = self.mma_qk(
+                    mma_s1_producer, s1_corr_producer, qk_sf_inplace_1_consumer = self.mma_qk(
                         qk_tiled_mma,
                         (tSrQ1, tSrK0, tStS1),
+                        (
+                            tiled_copy_s2t_qsf1,
+                            tCsQSF1_s2t[q1_sf_stage],
+                            tCtQSF1_s2t,
+                            tCtQSF1,
+                            tiled_copy_s2t_ksf1,
+                            tCsKSF1_s2t[k_sf_stage],
+                            tCtKSF1_s2t,
+                            tCtKSF1,
+                        ),
                         (mma_s1_producer, s1_corr_producer),
+                        qk_sf_inplace_1_consumer,
                     )
                     # Release K0
                     k_handle.release()
@@ -1290,11 +1705,23 @@ class BlackwellFusedMultiHeadAttentionForward:
                         # Wait for Ki
                         k_handle = load_kv_consumer.wait_and_advance()
                         tSrKi = tSrK[None, None, None, k_handle.index]
+                        k_sf_stage = (None, None, None, None, k_handle.index)
                         # GEMM_QK0i (Q0 * Ki -> S0)
-                        mma_s0_producer, s0_corr_producer = self.mma_qk(
+                        mma_s0_producer, s0_corr_producer, qk_sf_inplace_0_consumer = self.mma_qk(
                             qk_tiled_mma,
                             (tSrQ0, tSrKi, tStS0),
+                            (
+                                tiled_copy_s2t_qsf0,
+                                tCsQSF_s2t[q0_sf_stage],
+                                tCtQSF0_s2t,
+                                tCtQSF0,
+                                tiled_copy_s2t_ksf0,
+                                tCsKSF_s2t[k_sf_stage],
+                                tCtKSF0_s2t,
+                                tCtKSF0,
+                            ),
                             (mma_s0_producer, s0_corr_producer),
+                            qk_sf_inplace_0_consumer,
                         )
                         # Wait for Vi-1
                         v_handle = load_kv_consumer.wait_and_advance()
@@ -1313,10 +1740,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                             ),
                         )
                         # GEMM_QK1i (Q1 * Ki -> S1)
-                        mma_s1_producer, s1_corr_producer = self.mma_qk(
+                        mma_s1_producer, s1_corr_producer, qk_sf_inplace_1_consumer = self.mma_qk(
                             qk_tiled_mma,
                             (tSrQ1, tSrKi, tStS1),
+                            (
+                                tiled_copy_s2t_qsf1,
+                                tCsQSF1_s2t[q1_sf_stage],
+                                tCtQSF1_s2t,
+                                tCtQSF1,
+                                tiled_copy_s2t_ksf1,
+                                tCsKSF1_s2t[k_sf_stage],
+                                tCtKSF1_s2t,
+                                tCtKSF1,
+                            ),
                             (mma_s1_producer, s1_corr_producer),
+                            qk_sf_inplace_1_consumer,
                         )
                         # Release Ki
                         k_handle.release()
@@ -1625,6 +2063,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     sO[None, None, 0],
                                     mLSE,
                                     mSink,
+                                    m_scale_v_channels,
                                 ),
                                 (
                                     s0_corr_consumer,
@@ -1647,6 +2086,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     sO[None, None, 1],
                                     mLSE,
                                     mSink,
+                                    m_scale_v_channels,
                                 ),
                                 (
                                     s1_corr_consumer,
@@ -1688,6 +2128,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 gO0,
                                 mLSE,
                                 mSink,
+                                m_scale_v_channels,
                             ),
                             (s0_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
@@ -1704,6 +2145,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 gO1,
                                 mLSE,
                                 mSink,
+                                m_scale_v_channels,
                             ),
                             (s1_corr_consumer, mma_corr_consumer),
                             (row_idx, *value_args),
@@ -1720,6 +2162,26 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.tmem_dealloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
         return
+
+    def mainloop_s2t_copy_and_partition(
+        self,
+        sSF: cute.Tensor,
+        tSF: cute.Tensor,
+    ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        """Partition one block-scaled QK scale-factor tensor for SMEM to TMEM copy."""
+        tCsSF_compact = cute.filter_zeros(sSF)
+        tCtSF_compact = cute.filter_zeros(tSF)
+
+        copy_atom_s2t = cute.make_copy_atom(
+            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
+            self.qk_sf_dtype,
+        )
+        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
+        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
+        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
+        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
+        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
+        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
 
     @cute.jit
     def kv_producer_update_tx_acquire_and_advance(
@@ -1750,9 +2212,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         self,
         tiled_mma: cute.TiledMma,
         tensor_args: Tuple,
+        scale_args: Tuple,
         pipeline_args: Tuple,
+        qk_sf_inplace_consumer: pipeline.PipelineConsumer,
         pipeline_tokens: Tuple = (None, None),
-    ) -> Tuple[pipeline.PipelineProducer, pipeline.PipelineProducer]:
+    ) -> Tuple[
+        pipeline.PipelineProducer,
+        pipeline.PipelineProducer,
+        pipeline.PipelineConsumer,
+    ]:
         """Perform a single step of the QK GEMM computation on a block of attention scores.
 
         :param tiled_mma: Tiled MMA for QK GEMM
@@ -1761,37 +2229,56 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type tensor_args: Tuple
         :param pipeline_args: Tuple containing mma_si_producer and si_corr_producer
         :type pipeline_args: Tuple
+        :param qk_sf_inplace_consumer: PipelineAsync consumer guarding the SFQ/SFK TMEM slot
+            (the tail of the OPPOSITE-stage S region).
+        :type qk_sf_inplace_consumer: pipeline.PipelineConsumer
         :param pipeline_tokens: Optional non-blocking peek tokens for the Si and
             vec_i producers, in the form ``(si_peek_status, veci_peek_status)``.
             ``None`` for either token falls back to a blocking acquire.
         :type pipeline_tokens: Tuple
-        :return: Tuple containing mma_si_producer and si_corr_producer
-        :rtype: Tuple[pipeline.PipelineProducer, pipeline.PipelineProducer]
+        :return: Tuple containing mma_si_producer, si_corr_producer, and the
+            (advanced) qk_sf_inplace_consumer.
+        :rtype: Tuple[pipeline.PipelineProducer, pipeline.PipelineProducer,
+            pipeline.PipelineConsumer]
         """
         tSrQi, tSrK, tStSi = tensor_args
+        (
+            tiled_copy_s2t_qsf,
+            tCsQSF_stage,
+            tCtQSF_s2t,
+            tCtQSF,
+            tiled_copy_s2t_ksf,
+            tCsKSF_stage,
+            tCtKSF_s2t,
+            tCtKSF,
+        ) = scale_args
         mma_si_producer, si_corr_producer = pipeline_args
         si_peek_status, veci_peek_status = pipeline_tokens
+        qk_tiled_mma = cutlass.new_from_mlir_values(
+            tiled_mma, cutlass.extract_mlir_values(tiled_mma)
+        )
         # 0. Make sure Qi & K are ready when calling mma_qk
         # 1. acquire S0
         si_handle = mma_si_producer.acquire_and_advance(si_peek_status)
         # 2. make sure vec is already released in corr
         veci_handle = si_corr_producer.acquire_and_advance(veci_peek_status)
         veci_handle.commit()
-        # 3. gemm
-        num_kphases = cute.size(tSrQi, mode=[2])
-        for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-            kphase_coord = (None, None, kphase_idx)
-            tiled_mma.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-            cute.gemm(
-                tiled_mma,
-                tStSi,
-                tSrQi[kphase_coord],
-                tSrK[kphase_coord],
-                tStSi,
-            )
+        # 3. Wait until softmax_{1-j} has finished T2R-loading S_{1-j} to avoid SFQK_j race cond
+        qk_sf_inplace_consumer.wait_and_advance()
+        # 4. Copy MXFP8 scale factors and issue block-scaled gemm
+        cute.copy(tiled_copy_s2t_qsf, tCsQSF_stage, tCtQSF_s2t)
+        cute.copy(tiled_copy_s2t_ksf, tCsKSF_stage, tCtKSF_s2t)
+        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        cute.gemm(
+            qk_tiled_mma,
+            tStSi,
+            [tSrQi, tCtQSF],
+            [tSrK, tCtKSF],
+            tStSi,
+        )
         # 4. release S0
         si_handle.commit()
-        return mma_si_producer, si_corr_producer
+        return mma_si_producer, si_corr_producer, qk_sf_inplace_consumer
 
     @cute.jit
     def mma_pv(
@@ -2144,6 +2631,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             skip_softmax_threshold_log2,
             thread_idx,
             logical_offset,
+            qk_sf_inplace_producer,
         ) = value_args
         (
             si_peek_status,
@@ -2226,6 +2714,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     skip_softmax_count,
                     total_softmax_count,
                 )
+            # Fence the T2R load above, then signal MMA that the opposite-stage S is loaded.
+            cute.arch.fence_view_async_tmem_load()
+            qk_sf_inplace_producer.commit()
+            qk_sf_inplace_producer.advance()
             si_handle.release()
             # S0 -> P1 / S1 -> P0
             inplace_producer.commit()
@@ -2270,6 +2762,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 2, 2, 0, 0])
                     tile_row_max_ = cute.arch.fmax(tile_row_max_, tTMEM_LOADrS[i + 3, 2, 0, 0])
                 cute.arch.fence_view_async_tmem_store()
+                # Fence T2R loads then release the QK SF TMEM slot before we release S to MMA
+                cute.arch.fence_view_async_tmem_load()
+                qk_sf_inplace_producer.commit()
+                qk_sf_inplace_producer.advance()
                 si_handle.release()
                 # S0 -> P1 / S1 -> P0
                 inplace_producer.commit()
@@ -2327,6 +2823,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                         skip_softmax_count,
                         total_softmax_count,
                     )
+                # Fence the T2R loads then release the QK SF TMEM slot.
+                cute.arch.fence_view_async_tmem_load()
+                qk_sf_inplace_producer.commit()
+                qk_sf_inplace_producer.advance()
                 si_handle.release()
                 # S0 -> P1 / S1 -> P0
                 inplace_producer.commit()
@@ -2510,6 +3010,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         value_args: Tuple,
         mask_args: Tuple,
         sched_args: Tuple,
+        qk_sf_inplace_producers: Tuple[pipeline.PipelineProducer, pipeline.PipelineProducer],
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2627,6 +3128,20 @@ class BlackwellFusedMultiHeadAttentionForward:
         tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStS_P)
         thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
         tTMEM_STOREtS_x4 = thr_tmem_store.partition_D(tStS_P)
+        # Each softmax warpgroup releases the OPPOSITE-stage S region (where
+        # SFQ_{1-stage}/SFK_{1-stage} live in the tail) by committing to its qk_sf_inplace producer
+        # once per kv block:
+        # softmax0 (stage=0) drives qk_sf_inplace_1
+        # softmax1 (stage=1) drives qk_sf_inplace_0
+        qk_sf_inplace_producer = qk_sf_inplace_producers[stage]
+        # Bootstrap: MMA's first mma_qk(stage=0) waits on qk_sf_inplace_0 before
+        # softmax1 has produced any in-loop commit. Each thread of softmax1
+        # pre-commits once so the first wait succeeds. qk_sf_inplace_1 needs no
+        # pre-commit because mma_qk(stage=1) runs after mma_qk(stage=0),
+        # giving softmax0 enough time to consume S0 and commit naturally.
+        if cutlass.const_expr(stage == 1):
+            qk_sf_inplace_producer.commit()
+            qk_sf_inplace_producer.advance()
         if cutlass.const_expr(self.enable_sequence_barrier):
             if cutlass.const_expr(stage == 1):
                 self.sequence_s0_s1_barrier.arrive()
@@ -2668,6 +3183,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     skip_softmax_threshold_log2,
                     thread_idx,
                     logical_offset,
+                    qk_sf_inplace_producer,
                 )
                 atom_args = (
                     qk_thr_mma,
@@ -3010,7 +3526,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         :param value_args: Tuple containing (row_idx, cuseqlen_q, seqlen_q, blk_coord, scale_softmax, scale_output)
         :type value_args: Tuple
         """
-        tOtO, tTMEM_LOAD_VECtSi, tTMEM_LOAD_VECcS, dest_O, mLSE, mSink = tensor_args
+        (
+            tOtO,
+            tTMEM_LOAD_VECtSi,
+            tTMEM_LOAD_VECcS,
+            dest_O,
+            mLSE,
+            mSink,
+            m_scale_v_channels,
+        ) = tensor_args
         row_idx, cuseqlen_q, seqlen_q, blk_coord, scale_softmax, scale_output = value_args
 
         pv_tiled_mma_shape = (
@@ -3076,16 +3600,27 @@ class BlackwellFusedMultiHeadAttentionForward:
             row_sum = row_sum + sink_exp
         scale = scale_output / row_sum
 
+        if cutlass.const_expr(m_scale_v_channels is not None):
+            scale_v_ch_h = m_scale_v_channels[None, blk_coord[2]]
         for i in range(self.cta_tiler[2] // corr_tile_size):
             tTMEM_LOADtO_i = tTMEM_LOADtO[None, 0, 0, i]
             tTMEM_LOADdO_i = tTMEM_LOADdO[None, 0, 0, i]
-            tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tTMEM_LOADoO_i = tTMEM_LOADoO[None, 0, 0, i]
+            tTMrO = cute.make_rmem_tensor(tTMEM_LOADoO_i.shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
             for j in range(0, cute.size(tTMrO), 2):
                 tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                     (tTMrO[j], tTMrO[j + 1]),
                     (scale, scale),
                 )
+            if cutlass.const_expr(m_scale_v_channels is not None):
+                for j in range(0, cute.size(tTMrO), 2):
+                    _, n0 = tTMEM_LOADoO_i[j]
+                    _, n1 = tTMEM_LOADoO_i[j + 1]
+                    tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tTMrO[j], tTMrO[j + 1]),
+                        (scale_v_ch_h[n0], scale_v_ch_h[n1]),
+                    )
             tDMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
             o_vec = tTMrO.load()
             tDMrO.store(o_vec.to(self.o_dtype))
@@ -3122,14 +3657,28 @@ class BlackwellFusedMultiHeadAttentionForward:
         qk_dtype: Type[cutlass.Numeric],
         pv_dtype: Type[cutlass.Numeric],
         out_dtype: Type[cutlass.Numeric],
+        qk_sf_dtype: Type[cutlass.Numeric],
+        qk_sf_vec_size: int,
         qk_acc_dtype: Type[cutlass.Numeric],
         pv_acc_dtype: Type[cutlass.Numeric],
     ):
-        supported = {cutlass.Float8E4M3FN, cutlass.Float16, cutlass.BFloat16}
-        if qk_dtype not in supported:
-            raise NotImplementedError("Unsupported qk_dtype")
-        if pv_dtype not in supported:
-            raise NotImplementedError("Unsupported pv_dtype")
+        if qk_dtype in {cutlass.Float8E4M3FN, cutlass.Float8E5M2}:
+            if qk_sf_dtype is not cutlass.Float8E8M0FNU:
+                raise NotImplementedError("MXFP8 QK requires qk_sf_dtype Float8E8M0FNU")
+            if qk_sf_vec_size != 32:
+                raise NotImplementedError("MXFP8 QK requires qk_sf_vec_size 32")
+        elif qk_dtype is cutlass.Float4E2M1FN:
+            if qk_sf_dtype is not cutlass.Float8E4M3FN:
+                raise NotImplementedError("NVFP4 QK requires qk_sf_dtype Float8E4M3FN")
+            if qk_sf_vec_size != 16:
+                raise NotImplementedError("NVFP4 QK requires qk_sf_vec_size 16")
+        else:
+            raise NotImplementedError(
+                "qk_dtype must be Float8E4M3FN/Float8E5M2 for MXFP8 or Float4E2M1FN for NVFP4"
+            )
+
+        if pv_dtype not in {cutlass.Float8E4M3FN, cutlass.BFloat16}:
+            raise NotImplementedError("pv_dtype must be Float8E4M3FN or BFloat16")
         if out_dtype not in {cutlass.Float8E4M3FN, cutlass.Float16, cutlass.BFloat16}:
             raise NotImplementedError("Unsupported out_dtype")
         if qk_acc_dtype not in {cutlass.Float32}:
@@ -3140,6 +3689,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     def check_invalid_shape(
         self,
         qk_dtype: Type[cutlass.Numeric],
+        qk_sf_vec_size: int,
         q_shape: Tuple[int, int, int, int],
         k_shape: Tuple[int, int, int, int],
     ):
@@ -3151,16 +3701,19 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise NotImplementedError("q & k must have the same batch size")
         if d != d_:
             raise NotImplementedError("q & k must have the same head dimension")
-        if d not in {32, 64, 128, 192}:
-            raise NotImplementedError("Unsupported head dimension")
+        if qk_dtype is cutlass.Float4E2M1FN:
+            if d not in {64, 128}:
+                raise NotImplementedError("NVFP4 QK supports headdim 64 or 128")
+        elif d not in {32, 64, 128}:
+            raise NotImplementedError("MXFP8 QK supports headdim 32, 64, or 128")
+        if d % qk_sf_vec_size != 0:
+            raise NotImplementedError("head dimension must be divisible by qk_sf_vec_size")
         if h_q % h_k != 0:
             raise NotImplementedError("h_q must be divisible by h_k")
         if isinstance(s_q, tuple) and len(s_q) != b:
             raise NotImplementedError("variable_seqlen s_q must have the length of batch size")
         if isinstance(s_k, tuple) and len(s_k) != b:
             raise NotImplementedError("variable_seqlen s_k must have the length of batch size")
-        if d == 192 and qk_dtype not in {cutlass.Float8E4M3FN}:
-            raise NotImplementedError("unimplemented dtypes for headdim 192")
 
     def can_implement(
         self,
@@ -3169,6 +3722,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         qk_dtype: Type[cutlass.Numeric],
         pv_dtype: Type[cutlass.Numeric],
         out_dtype: Type[cutlass.Numeric],
+        qk_sf_dtype: Type[cutlass.Numeric],
+        qk_sf_vec_size: int,
         qk_acc_dtype: Type[cutlass.Numeric],
         pv_acc_dtype: Type[cutlass.Numeric],
     ) -> bool:
@@ -3196,12 +3751,15 @@ class BlackwellFusedMultiHeadAttentionForward:
                 qk_dtype,
                 pv_dtype,
                 out_dtype,
+                qk_sf_dtype,
+                qk_sf_vec_size,
                 qk_acc_dtype,
                 pv_acc_dtype,
             )
             # Skip invalid shape
             self.check_invalid_shape(
                 qk_dtype,
+                qk_sf_vec_size,
                 q_shape,
                 k_shape,
             )
