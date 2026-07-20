@@ -4806,18 +4806,38 @@ class GvrTopKKernel:
                 # the rung counts (phase1b rungs are per-CTA identical since
                 # preIdx stats are full-row).
                 if cutlass.const_expr(self.use_ext_counts):
-                    # ---- Waterfall L1 admission (ext counts) ----
-                    # Rung thresholds AND exact counts arrive from the
-                    # indexer epilogue: skip P1b + the M-ary count pass.
-                    # Route through the seeded refine (s_r0col = -1): an
-                    # in-band rung is re-measured once (builds the
-                    # per-thread hand-off Phase 3 requires) and accepted;
-                    # a full miss seeds log-falsi from the ext brackets.
+                    # ---- Waterfall L1 admission (ext rungs, v2a) ----
+                    # Rung thresholds arrive from the indexer epilogue:
+                    # ONLY P1b is skipped. The stock M-ary count pass runs
+                    # on the ext rungs so the block-skip list build, rung
+                    # tightening, per-thread hand-off and classify all
+                    # compose unchanged (v1 routed through the dense
+                    # refine and forfeited the compact-walk win: flash 1M
+                    # ext 34.7us vs skipR0 15.6us cold).
+                    # v2b: when an ext count is already in [K, kC], park
+                    # THE ADMITTED THRESHOLD IN ALL RUNG SLOTS — the M-ary
+                    # pass degenerates to one compact single-threshold
+                    # count (+ list build at that threshold) and classify
+                    # admits it; a full miss keeps the 3 distinct rungs as
+                    # measured brackets for the seeded refine.
                     if tidx == cutlass.Int32(0):
+                        bx_m = cutlass.Int32(-1)
+                        bx_c = cutlass.Int32(2147483647)
                         for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                            s_mt_thr[m] = seed_thr_row[m]
-                            s_mt_cnt[m] = cutlass.Int32(seed_counts_row[m])
-                        s_r0col[0] = cutlass.Int32(-1)
+                            cx = cutlass.Int32(seed_counts_row[m])
+                            if (
+                                cx >= cutlass.Int32(self.top_k)
+                                and cx <= cutlass.Int32(self.kC)
+                                and cx < bx_c
+                            ):
+                                bx_m = cutlass.Int32(m)
+                                bx_c = cx
+                        for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                            if bx_m >= cutlass.Int32(0):
+                                s_mt_thr[m] = seed_thr_row[bx_m]
+                            else:
+                                s_mt_thr[m] = seed_thr_row[m]
+                    cute.arch.barrier()
                 if cutlass.const_expr(not self.use_ext_counts):
                     if cutlass.const_expr(self.p1b_cache):
                         # rungs from the SMEM gather-cache P1 stashed (no 2nd
@@ -4846,65 +4866,65 @@ class GvrTopKKernel:
                             warp_id,
                             lane,
                         )
-                    self.block_count_ge_multi(
-                        input_row,
-                        slice_start,
-                        slice_end,
-                        s_mt_thr,
-                        smem_ptcnt_multi,
-                        smem_wcnt_multi,
-                        s_mt_cnt,
-                        s_cluster_partial_m,
-                        do_cluster_sync,
-                        tidx,
-                        warp_id,
-                        lane,
-                        smem_ptcnt=smem_ptcnt,
-                        block_max_row=block_max_row,
-                        smem_active=smem_active,
-                        s_active_cnt=s_active_cnt,
-                    )
-                    cute.arch.barrier()
-                    if tidx == 0:
-                        # tightest admissible rung = SMALLEST count in [K, kC].
-                        # (Explicit argmin: with r0_vseed the pmean column is not
-                        # sorted into the rung order; for sorted rungs this is
-                        # equivalent to the old "last m in window" rule.)
-                        # Dropped rungs (block-skip rung tightening) hold PARTIAL
-                        # counts — never admissible.
-                        dmask_c = cutlass.Int32(0)
-                        if cutlass.const_expr(self.enable_block_skip):
-                            dmask_c = s_active_cnt[2]
-                        best_m = cutlass.Int32(-1)
-                        best_c = cutlass.Int32(2147483647)
-                        for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                            cm = s_mt_cnt[m]
-                            if (
-                                cm >= cutlass.Int32(self.top_k)
-                                and cm <= cutlass.Int32(self.kC)
-                                and cm < best_c
-                                and (dmask_c & (cutlass.Int32(1) << cutlass.Int32(m)))
-                                == cutlass.Int32(0)
-                            ):
-                                best_m = cutlass.Int32(m)
-                                best_c = cm
-                        s_r0col[0] = best_m
-                        if best_m >= cutlass.Int32(0):
-                            s_thr[0] = s_mt_thr[best_m]
-                            s_iscalars[0] = s_mt_cnt[best_m]
-                            # done=1: the threshold is admitted, so Phase 3 must
-                            # SKIP its retry-shrink and honor s_thr[0]. (block_count
-                            # _ge / secant leave done via their own path; the R0
-                            # admission must set it explicitly or Phase 3 re-searches
-                            # and the cluster collect diverges -> wrong output.)
-                            s_iscalars[1] = cutlass.Int32(1)
-                            # Snapshot this CTA's LOCAL slice count for the chosen
-                            # rung into s_iscalars[5] — the per-CTA cand_count that
-                            # Phase 3/4's cluster gather consumes (block_count_ge
-                            # sets it too; the R0 admission must match). Without it
-                            # the cluster collect under-counts -> wrong output.
-                            if cutlass.const_expr(cluster_size > 1):
-                                s_iscalars[5] = s_cluster_partial_m[best_m]
+                self.block_count_ge_multi(
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    s_mt_thr,
+                    smem_ptcnt_multi,
+                    smem_wcnt_multi,
+                    s_mt_cnt,
+                    s_cluster_partial_m,
+                    do_cluster_sync,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_ptcnt=smem_ptcnt,
+                    block_max_row=block_max_row,
+                    smem_active=smem_active,
+                    s_active_cnt=s_active_cnt,
+                )
+                cute.arch.barrier()
+                if tidx == 0:
+                    # tightest admissible rung = SMALLEST count in [K, kC].
+                    # (Explicit argmin: with r0_vseed the pmean column is not
+                    # sorted into the rung order; for sorted rungs this is
+                    # equivalent to the old "last m in window" rule.)
+                    # Dropped rungs (block-skip rung tightening) hold PARTIAL
+                    # counts — never admissible.
+                    dmask_c = cutlass.Int32(0)
+                    if cutlass.const_expr(self.enable_block_skip):
+                        dmask_c = s_active_cnt[2]
+                    best_m = cutlass.Int32(-1)
+                    best_c = cutlass.Int32(2147483647)
+                    for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                        cm = s_mt_cnt[m]
+                        if (
+                            cm >= cutlass.Int32(self.top_k)
+                            and cm <= cutlass.Int32(self.kC)
+                            and cm < best_c
+                            and (dmask_c & (cutlass.Int32(1) << cutlass.Int32(m)))
+                            == cutlass.Int32(0)
+                        ):
+                            best_m = cutlass.Int32(m)
+                            best_c = cm
+                    s_r0col[0] = best_m
+                    if best_m >= cutlass.Int32(0):
+                        s_thr[0] = s_mt_thr[best_m]
+                        s_iscalars[0] = s_mt_cnt[best_m]
+                        # done=1: the threshold is admitted, so Phase 3 must
+                        # SKIP its retry-shrink and honor s_thr[0]. (block_count
+                        # _ge / secant leave done via their own path; the R0
+                        # admission must set it explicitly or Phase 3 re-searches
+                        # and the cluster collect diverges -> wrong output.)
+                        s_iscalars[1] = cutlass.Int32(1)
+                        # Snapshot this CTA's LOCAL slice count for the chosen
+                        # rung into s_iscalars[5] — the per-CTA cand_count that
+                        # Phase 3/4's cluster gather consumes (block_count_ge
+                        # sets it too; the R0 admission must match). Without it
+                        # the cluster collect under-counts -> wrong output.
+                        if cutlass.const_expr(cluster_size > 1):
+                            s_iscalars[5] = s_cluster_partial_m[best_m]
 
                 cute.arch.barrier()
                 bc = s_r0col[0]
@@ -4978,19 +4998,6 @@ class GvrTopKKernel:
                                 cand = bhi
                             elif clo < cutlass.Int32(0):
                                 cand = blo
-                            if cutlass.const_expr(self.use_ext_counts):
-                                # tightest ext rung already in [K, kC]:
-                                # measure exactly it (accepts in one pass).
-                                cbe = cutlass.Int32(2147483647)
-                                for m in cutlass.range_constexpr(M):
-                                    cm4 = s_mt_cnt[m]
-                                    if (
-                                        cm4 >= cutlass.Int32(self.top_k)
-                                        and cm4 <= cutlass.Int32(self.kC)
-                                        and cm4 < cbe
-                                    ):
-                                        cbe = cm4
-                                        cand = s_mt_thr[m]
                             s_thr[0] = cand
                         cute.arch.barrier()
                         rs = cutlass.Int32(0)
