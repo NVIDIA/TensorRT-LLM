@@ -1032,7 +1032,11 @@ class Qwen3VisionModelBase(nn.Module):
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
 
-    def load_weights(self, weights: Dict[str, torch.Tensor]):
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        allow_partial_loading: bool = False,
+    ):
         visual_weights = filter_weights("model.visual", weights)
         converted_weights = {}
 
@@ -1057,7 +1061,12 @@ class Qwen3VisionModelBase(nn.Module):
             r"(.*?)mlp.linear_fc2.(.*)": r"\1mlp.down_proj.\2",
         }
         self.visual.config.num_attention_heads = self.visual.config.num_heads
-        _load_weights_impl(self.visual, converted_weights, params_map=pattern_mapping)
+        _load_weights_impl(
+            self.visual,
+            converted_weights,
+            params_map=pattern_mapping,
+            allow_partial_loading=allow_partial_loading,
+        )
 
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]

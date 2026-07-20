@@ -1239,6 +1239,25 @@ class ModelLoader:
                                 allow_partial_loading=allow_partial_loading)
         torch.cuda.current_stream().synchronize()
 
+    def begin_update_weights(self) -> None:
+        """Start an incremental update session on the persistent mapper."""
+        if self.weight_mapper is None:
+            raise RuntimeError(
+                "Cannot update weights: weight_mapper was not initialized")
+        self.weight_mapper.begin_update_weights()
+
+    def finalize_update_weights(self) -> None:
+        """Validate and close the persistent mapper update session."""
+        if self.weight_mapper is None:
+            raise RuntimeError(
+                "Cannot update weights: weight_mapper was not initialized")
+        self.weight_mapper.finalize_update_weights()
+
+    def abort_update_weights(self) -> None:
+        """Discard persistent mapper state after a failed update session."""
+        if self.weight_mapper is not None:
+            self.weight_mapper.abort_update_weights()
+
     def cleanup(self) -> None:
         """Release backend resources acquired during :meth:`load`.
 

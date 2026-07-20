@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import math
 import re
 from collections import defaultdict
@@ -60,6 +63,88 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     _DENSE_MLP_PATTERN = re.compile(
         r"^((?:model|mtp)\.layers\.\d+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\..+)$"
     )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._partial_split_weights: dict[str, object] = {}
+        self._update_weights_active = False
+
+    def begin_update_weights(self) -> None:
+        """Start a new incremental update and discard stale staging state."""
+        self._partial_split_weights.clear()
+        self._update_weights_active = True
+
+    def finalize_update_weights(self) -> None:
+        """Reject incomplete BF16 projection groups before transforms run."""
+        if self._partial_split_weights:
+            pending = sorted(self._partial_split_weights)
+            self.abort_update_weights()
+            preview = ", ".join(pending[:8])
+            if len(pending) > 8:
+                preview += f", ... ({len(pending)} tensors total)"
+            raise RuntimeError(
+                "Cannot finalize Qwen3.5 weight update with incomplete "
+                f"linear-attention projection groups: {preview}")
+        self._update_weights_active = False
+
+    def abort_update_weights(self) -> None:
+        """Discard tensors retained for an incomplete incremental update."""
+        self._partial_split_weights.clear()
+        self._update_weights_active = False
+
+    def cleanup(self) -> None:
+        """Release staged tensors and references held by the base mapper."""
+        self.abort_update_weights()
+        super().cleanup()
+
+    def _stage_partial_bf16_split_projections(self,
+                                              weights: dict) -> dict:
+        """Emit only complete QKVZ and BA groups from incremental BF16 input.
+
+        Packed broadcast boundaries are byte based and may split projections
+        that must be fused before the normal Qwen3Next mapping runs. Retain
+        those tensors on each inference rank until their complete fusion group
+        is available. Non-projection tensors pass through immediately.
+        """
+        if not self._update_weights_active:
+            self.begin_update_weights()
+
+        ready_weights = {}
+        for name, tensor in weights.items():
+            if self._SPLIT_PROJ_PATTERN.match(name) is None:
+                ready_weights[name] = tensor
+                continue
+            if name in self._partial_split_weights:
+                raise RuntimeError(
+                    f"Duplicate Qwen3.5 partial weight received: {name}")
+            self._partial_split_weights[name] = tensor
+
+        grouped_names = defaultdict(dict)
+        for name in self._partial_split_weights:
+            match = self._SPLIT_PROJ_PATTERN.match(name)
+            assert match is not None
+            prefix, projection_name, suffix = match.groups()
+            grouped_names[(prefix, suffix)][projection_name] = name
+
+        consumed_names = set()
+        for names in grouped_names.values():
+            qkvz_names = {"qkv", "q", "k", "v", "z"} & names.keys()
+            if "qkv" in qkvz_names:
+                required = {"qkv", "z"}
+            elif qkvz_names:
+                required = {"q", "k", "v", "z"}
+            else:
+                required = set()
+            if required and required.issubset(names):
+                consumed_names.update(names[key] for key in required)
+
+            required_ba = {"b", "a"}
+            if required_ba.issubset(names):
+                consumed_names.update(names[key] for key in required_ba)
+
+        for name in consumed_names:
+            ready_weights[name] = self._partial_split_weights.pop(name)
+        return ready_weights
 
     def _normalize_weight_names(self, weights: dict) -> dict:
         normalized_weights = {}
@@ -127,10 +212,14 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             # stacked weights get misrouted into the fused path and crash the
             # quantized loader.
             per_expert_pattern = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_proj)\.")
-            has_per_expert_tensors = any(per_expert_pattern.match(name) for name in module_weights)
+            has_per_expert_tensors = any(
+                per_expert_pattern.match(name) for name in module_weights)
+            has_stacked_expert_tensors = any(
+                name in ("gate_up_proj", "down_proj")
+                and getattr(value, "ndim", None) == 3
+                for name, value in module_weights.items())
             uses_fused_expert_tensors = (
-                "gate_up_proj" in module_weights and not has_per_expert_tensors
-            )
+                has_stacked_expert_tensors and not has_per_expert_tensors)
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
                 if has_per_expert_tensors and weight_name in ("gate_up_proj", "down_proj"):
@@ -555,10 +644,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 remapped_weights[name] = tensor
         return remapped_weights
 
-    def preprocess_weights(self, weights: dict) -> dict:
+    def preprocess_weights(self,
+                           weights: dict,
+                           allow_partial_loading: bool = False) -> dict:
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
+        if allow_partial_loading and quant_algo is None:
+            normalized_weights = self._stage_partial_bf16_split_projections(
+                normalized_weights)
         normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
             normalized_weights, quant_algo
         )
@@ -584,4 +678,5 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         if not getattr(self.config.pretrained_config, "num_experts", 0):
             packed_weights = self._remap_dense_mlp_weights(packed_weights)
 
-        return super().preprocess_weights(packed_weights)
+        return super().preprocess_weights(
+            packed_weights, allow_partial_loading=allow_partial_loading)
