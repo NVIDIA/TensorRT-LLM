@@ -29,7 +29,6 @@ dependencies = [
     "h5py (==3.12.1)",
     "strenum (>=0.4.15,<0.5.0)",
     "sentencepiece (>=0.1.99)",
-    "tensorrt (>=10.16.1,<10.17.0)",
     "torch (>=2.11.0,<=2.13.0a0)",
     "nvidia-modelopt[torch] (>=0.37.0,<0.38.0)",
     "nvidia-nccl-cu13 (>=2.28.9,<=2.30.4)",

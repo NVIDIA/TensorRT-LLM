@@ -1,0 +1,533 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Pure-logic tests for the session prefetcher — no MPI, no GPU."""
+
+import re
+import sys
+import threading
+import time
+import types
+from pathlib import Path
+
+import pytest
+from test_common import session_prefetcher
+from test_common.session_prefetcher import SessionPrefetcher, warm_page_cache
+
+
+class _FakeMarker:
+    def __init__(self, *args):
+        self.args = args
+
+
+class _FakeItem:
+    def __init__(self, model_dir=None, cls=None, params=None):
+        self._marker = _FakeMarker(model_dir) if model_dir else None
+        self.cls = cls
+        if params is not None:
+            self.callspec = types.SimpleNamespace(params=params)
+
+    def get_closest_marker(self, name):
+        return self._marker if name == "prefetch_model_dir" else None
+
+
+def _as_session(*items):
+    """Link fake items into a fake pytest session (final run order)."""
+    session = types.SimpleNamespace(items=list(items))
+    for item in items:
+        item.session = session
+    return list(items)
+
+
+def _wait_for(cond, timeout=5.0):
+    """Poll ``cond`` (fire-and-forget background work) until true or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return cond()
+
+
+@pytest.fixture
+def prefetcher(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    # These pure-logic tests may themselves run under xdist; pin the worker
+    # marker off so the prefetcher's xdist guard does not disable it here.
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    p = SessionPrefetcher()
+    # Record build/warm triggers instead of spawning MPI pools/reading weights.
+    built, warmed, overlays = [], [], []
+
+    def _fake_build(self, spec, gen, env_overlay=None):
+        built.append(spec)
+        overlays.append(env_overlay)
+
+    monkeypatch.setattr(SessionPrefetcher, "_build", _fake_build)
+    monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
+    p.built, p.warmed, p.overlays = built, warmed, overlays
+    return p
+
+
+class _FakePool:
+    def __init__(self, n_workers, wait_shutdown=False):
+        self.n_workers = n_workers
+        self.wait_shutdown = wait_shutdown
+        self.shut = False
+
+    def shutdown(self):
+        self.shut = True
+
+
+def _arm(prefetcher, pool, spec=4):
+    """Publish ``pool`` into the shadow slot through the real API."""
+    prefetcher._publish(spec, pool, session_prefetcher._spawn_snapshot(), prefetcher._build_gen)
+
+
+def test_canary_enabled_on_canary_stage_groups(monkeypatch):
+    # Canary phase: with no explicit setting, active only on the canary
+    # stage groups; prefix match covers dynamically numbered shards.
+    monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("stageName", "A10-PyTorch-2")
+    assert SessionPrefetcher().enabled
+    monkeypatch.setenv("stageName", "DGX_H100-4_GPUs-PyTorch-DeepSeek-1")
+    assert SessionPrefetcher().enabled
+
+
+def test_canary_disabled_elsewhere(monkeypatch):
+    monkeypatch.delenv("TRTLLM_TEST_PREFETCH_SESSION", raising=False)
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("stageName", "DGX_B200-PyTorch-4")
+    assert not SessionPrefetcher().enabled
+    monkeypatch.delenv("stageName", raising=False)  # local run, no stage
+    assert not SessionPrefetcher().enabled
+
+
+def test_explicit_env_overrides_canary_gate(monkeypatch):
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("stageName", "DGX_B200-PyTorch-4")  # not a canary stage
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    assert SessionPrefetcher().enabled  # manual opt-in anywhere
+    monkeypatch.setenv("stageName", "A10-PyTorch-1")  # canary stage
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
+    assert not SessionPrefetcher().enabled  # kill switch beats the canary
+
+
+def test_disabled_is_noop(monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
+    p = SessionPrefetcher()
+    p.schedule_shadow(2)
+    assert p._thread is None
+    assert p.take(2) is None
+
+
+def test_disabled_in_xdist_worker(monkeypatch):
+    # Under xdist each worker runs a scheduler-assigned subset; N workers
+    # would each hold a live pool plus a spare.
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    assert not SessionPrefetcher().enabled
+
+
+def test_factory_miss_builds_sync_and_arms_shadow(prefetcher):
+    # _build is stubbed by the fixture to record specs instead of spawning.
+    factory = prefetcher._make_factory(_FakePool)
+    session = factory(4)  # nothing prefetched yet -> sync build
+    assert isinstance(session, _FakePool) and session.n_workers == 4
+    # Every pool this layer hands out must block its shutdown on worker
+    # exit: the NEXT pool is handed over instantly, without the ~50s sync
+    # spawn that used to hide the GPU-memory release window.
+    assert session.wait_shutdown
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [4]  # shadow armed for the next test
+
+
+def test_factory_single_worker_also_prefetches(prefetcher):
+    # The default single-GPU path spawns a 1-worker pool too (executor.py ->
+    # proxy.py), paying the same ~50s spawn+import: it must benefit as well.
+    factory = prefetcher._make_factory(_FakePool)
+    session = factory(1)
+    assert isinstance(session, _FakePool)
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
+
+
+def test_schedule_shadow_passes_env_overlay_to_build(prefetcher):
+    # session_reuse restocks shadows with its worker-side weight-cache env;
+    # the overlay must reach the build (frozen into workers via the library's
+    # env_overrides channel — the parent env is never touched).
+    prefetcher.schedule_shadow(2, env_overlay={"TRTLLM_HF_WEIGHT_CACHE": "1"})
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [2]
+    assert prefetcher.overlays == [{"TRTLLM_HF_WEIGHT_CACHE": "1"}]
+
+
+def test_take_wrong_size_in_flight_does_not_wait(prefetcher, monkeypatch):
+    # A miss must not stall behind an in-flight build of ANOTHER size only to
+    # discard the result — that is slower than no prefetch at all (wait ~one
+    # spawn, then spawn again). It falls back to sync immediately, and the
+    # build still lands for a later take of its own size.
+    release = threading.Event()
+
+    def _slow_build(self, spec, gen, env_overlay=None):
+        release.wait(5)
+        self._publish(spec, _FakePool(spec), session_prefetcher._spawn_snapshot(), gen)
+
+    monkeypatch.setattr(SessionPrefetcher, "_build", _slow_build)
+    prefetcher.schedule_shadow(2)
+    t0 = time.monotonic()
+    assert prefetcher.take(4) is None  # wrong size in flight: no join
+    assert time.monotonic() - t0 < 1.0
+    assert prefetcher.stats["pools_skipped_size_in_flight"] == 1
+    release.set()
+    prefetcher._thread.join(timeout=10)
+    taken = prefetcher.take(2)  # the undisturbed build landed for its size
+    assert isinstance(taken, _FakePool) and taken.n_workers == 2
+
+
+def test_factory_degrades_loudly_when_wait_shutdown_spawn_fails(prefetcher):
+    # The library fails closed when identity collection cannot complete; the
+    # prefetch layer must not turn that into a test failure: retry once,
+    # then degrade LOUDLY to a plain pool (pre-prefetch semantics).
+    calls = []
+
+    class _FailingWaitPool(_FakePool):
+        def __init__(self, n_workers, wait_shutdown=False):
+            calls.append(wait_shutdown)
+            if wait_shutdown:
+                raise RuntimeError("identity collection incomplete")
+            super().__init__(n_workers, wait_shutdown)
+
+    factory = prefetcher._make_factory(_FailingWaitPool)
+    session = factory(2)
+    assert isinstance(session, _FailingWaitPool) and not session.wait_shutdown
+    assert calls == [True, True, False]  # two contract attempts, then plain
+    assert prefetcher.stats["pools_spawned_degraded"] == 1
+
+
+def test_factory_hit_hands_over_shadow(prefetcher):
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    factory = prefetcher._make_factory(_FakePool)
+    assert factory(4) is pool  # prefetched pool handed over
+
+
+def test_take_spec_mismatch_returns_none(prefetcher):
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    assert prefetcher.take(2) is None  # wrong size: sync fallback
+
+
+def test_take_discards_on_env_mismatch(prefetcher, monkeypatch):
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    monkeypatch.setenv("TLLM_TEST_ONLY_FLAG", "changed-after-spawn")
+    assert prefetcher.take(4) is None  # frozen workers would miss the new env
+    assert _wait_for(lambda: pool.shut)  # stale shadow torn down in background
+
+
+def test_take_discards_on_nonprefixed_env_mismatch(prefetcher, monkeypatch):
+    # Workers inherit the WHOLE parent env at spawn; test knobs outside any
+    # TRTLLM*/TLLM* prefix (e.g. OVERRIDE_QUANT_ALGO, read inside workers by
+    # model_config.py) must also invalidate a prefetched pool, else workers
+    # silently run with stale env (review finding on the prefix allowlist).
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
+    assert prefetcher.take(4) is None
+
+
+def test_pytest_current_test_drift_does_not_discard(prefetcher, monkeypatch):
+    # PYTEST_CURRENT_TEST changes every test phase by design; it must not
+    # invalidate the snapshot or no prefetched pool would ever be handed over.
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_a (call)")
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_b (setup)")
+    assert prefetcher.take(4) is pool
+
+
+def test_take_discards_on_syspath_mismatch(prefetcher, monkeypatch):
+    # test_modeling_out_of_tree monkeypatches sys.path before
+    # LLM(); pool workers freeze sys.path at spawn (MPIPoolExecutor(path=...)),
+    # so a pool spawned earlier can't import the out-of-tree module and dies
+    # during initialization. sys.path must be part of the handover guard.
+    pool = _FakePool(4)
+    _arm(prefetcher, pool, spec=4)
+    monkeypatch.syspath_prepend("/oot/example/path")
+    assert prefetcher.take(4) is None  # frozen workers would miss the new path
+
+
+def test_take_does_not_join_unstarted_shadow_thread(prefetcher, monkeypatch):
+    # A test creating LLMs concurrently (ThreadPoolExecutor)
+    # raced take()'s unlocked read of _thread against schedule_shadow()'s
+    # assign-then-start critical section, joining a thread that had not been
+    # started yet ("cannot join thread before it is started"). A slow start()
+    # widens the assign->start window deterministically.
+    class _SlowStartThread(threading.Thread):
+        def start(self):
+            time.sleep(0.3)  # hold the assigned-but-unstarted state visible
+            super().start()
+
+    monkeypatch.setattr(session_prefetcher.threading, "Thread", _SlowStartThread)
+    errors = []
+
+    def _taker():
+        time.sleep(0.1)  # let schedule_shadow enter its critical section first
+        try:
+            prefetcher.take(1)
+        except RuntimeError as e:  # pre-fix: "cannot join thread before it is started"
+            errors.append(e)
+
+    taker = threading.Thread(target=_taker)
+    taker.start()
+    prefetcher.schedule_shadow(1)
+    taker.join(timeout=10)
+    assert errors == []
+
+
+def test_abandoned_build_publish_discards_pool(prefetcher):
+    # A build that outlives _drain()'s join timeout is abandoned (generation
+    # bump); its late _publish() must shut the pool down, not land it —
+    # landing would overwrite (and leak) a newer pool or hand stale state
+    # to a future test.
+    pool = _FakePool(4)
+    gen = prefetcher._build_gen
+    prefetcher._build_gen += 1  # what _drain() does on abandonment
+    prefetcher._publish(4, pool, session_prefetcher._spawn_snapshot(), gen)
+    assert pool.shut
+    assert prefetcher._built is None
+
+
+def test_publish_never_overwrites_unconsumed_pool(prefetcher):
+    first, second = _FakePool(4), _FakePool(4)
+    _arm(prefetcher, first, spec=4)
+    _arm(prefetcher, second, spec=4)
+    assert prefetcher._built.session is first  # slot kept
+    assert second.shut and not first.shut  # newcomer discarded, not the slot
+
+
+def test_session_summary_counters_and_emission(prefetcher, capfd):
+    # Handover / stale-discard / superseded each count once;
+    # dispose() emits ONE summary line (outside pytest capture in real runs,
+    # the only guaranteed console-visible record of prefetch activity).
+    hit = _FakePool(4)
+    _arm(prefetcher, hit, spec=4)
+    assert prefetcher.take(4) is hit
+    stale = _FakePool(4)
+    _arm(prefetcher, stale, spec=4)
+    assert prefetcher.take(2) is None  # spec mismatch -> stale discard
+    late = _FakePool(4)
+    prefetcher._publish(4, late, session_prefetcher._spawn_snapshot(), prefetcher._build_gen - 1)
+    assert prefetcher.stats["pools_handed_over"] == 1
+    assert prefetcher.stats["pools_discarded_stale"] == 1
+    assert prefetcher.stats["pools_discarded_superseded"] == 1
+    prefetcher.dispose()
+    out = capfd.readouterr().out
+    assert "[session-prefetch] session summary:" in out
+    assert "pools_handed_over=1" in out
+
+
+def test_no_summary_when_prefetch_never_fired(prefetcher, capfd):
+    prefetcher.dispose()
+    assert "session summary" not in capfd.readouterr().out
+
+
+def test_warm_counters_track_gib(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    p = SessionPrefetcher()  # real _warm (fixture would stub it)
+    (tmp_path / "model-00001.safetensors").write_bytes(b"x" * (1 << 20))
+    p._warm(str(tmp_path))
+    assert p.stats["warms"] == 1 and p._warmed_gib > 0
+    p._warm("not/a/real/dir")
+    assert p.stats["warm_noops"] == 1
+
+
+def test_model_switch_triggers_warm_and_dedups(prefetcher):
+    items = _as_session(_FakeItem("/models/a"), _FakeItem("/models/b"))
+    prefetcher.on_test_setup(items[0])
+    # Warm threads are fire-and-forget; poll briefly for the recorded call.
+    assert _wait_for(lambda: prefetcher.warmed)
+    assert prefetcher.warmed == ["/models/b"]
+    # Same next-model again: deduplicated.
+    prefetcher.on_test_setup(items[0])
+    time.sleep(0.2)
+    assert prefetcher.warmed == ["/models/b"]
+
+
+def test_same_next_model_does_not_warm(prefetcher):
+    # Consecutive tests on the same model: its weights are already hot.
+    items = _as_session(_FakeItem("/models/a"), _FakeItem("/models/a"))
+    prefetcher.on_test_setup(items[0])
+    time.sleep(0.2)
+    assert prefetcher.warmed == []
+
+
+def test_no_marker_suite_never_warms(prefetcher):
+    items = _as_session(_FakeItem(), _FakeItem(), _FakeItem())
+    prefetcher.on_test_setup(items[0])
+    time.sleep(0.2)
+    assert prefetcher.warmed == []
+
+
+def test_auto_model_dir_from_accuracy_class_attr(prefetcher):
+    # Accuracy-harness classes declare MODEL_PATH; warming must pick it up
+    # automatically, with no marker on the test.
+    class _TestLlama:
+        MODEL_PATH = "/models/llama"
+
+    class _TestQwen:
+        MODEL_PATH = "/models/qwen"
+
+    items = _as_session(_FakeItem(cls=_TestLlama), _FakeItem(cls=_TestQwen))
+    prefetcher.on_test_setup(items[0])
+    assert _wait_for(lambda: prefetcher.warmed)
+    assert prefetcher.warmed == ["/models/qwen"]
+
+
+def test_model_param_discovery(monkeypatch):
+    # Modeling unit tests carry the model as a `model_folder`-style parameter
+    # (a name under LLM_MODELS_ROOT, or an absolute path) — discovered
+    # without any test-file changes.
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models-root")
+    item = _FakeItem(params={"model_folder": "Nemotron-H-8B-Base-8K"})
+    assert session_prefetcher._model_dir_of(item) == "/models-root/Nemotron-H-8B-Base-8K"
+    item = _FakeItem(params={"model_dir": "/abs/path/model"})
+    assert session_prefetcher._model_dir_of(item) == "/abs/path/model"
+    # Non-model params never produce a guess.
+    assert session_prefetcher._model_dir_of(_FakeItem(params={"dtype": "fp8"})) is None
+
+
+def test_marker_overrides_class_model_path():
+    class _TestCls:
+        MODEL_PATH = "/models/from-class"
+
+    item = _FakeItem(model_dir="/models/from-marker", cls=_TestCls)
+    assert session_prefetcher._model_dir_of(item) == "/models/from-marker"
+
+
+def test_accuracy_harness_still_declares_model_path():
+    # _model_dir_of auto-discovers models via the MODEL_PATH class attribute of
+    # the accuracy harnesses (accuracy_core.py); renaming that attribute would
+    # silently kill warming repo-wide. Textual check — importing accuracy_core
+    # would drag integration-only dependencies into this unit test.
+    core = Path(__file__).parents[2] / "integration" / "defs" / "accuracy" / "accuracy_core.py"
+    assert re.search(r"^\s+MODEL_PATH\s*=", core.read_text(), re.MULTILINE), (
+        "accuracy_core.py no longer declares MODEL_PATH — update "
+        "session_prefetcher._model_dir_of to the harness's new convention"
+    )
+
+
+def test_warm_selects_files_like_the_weight_loader(tmp_path):
+    # Selection must mirror HfWeightLoader.load_weights: safetensors first
+    # (minus huge "consolidated" copies the loader skips), so the .bin copy
+    # and the consolidated file must NOT be read here.
+    payload = b"x" * (1 << 20)
+    (tmp_path / "model-00001.safetensors").write_bytes(payload)
+    (tmp_path / "consolidated.safetensors").write_bytes(payload * 4)
+    (tmp_path / "pytorch_model.bin").write_bytes(payload)
+    (tmp_path / "config.json").write_bytes(b"{}")  # not a weight file
+    assert warm_page_cache(str(tmp_path)) == pytest.approx(1 / 1024, rel=1e-3)
+
+
+def test_warm_falls_back_to_bin_then_pth(tmp_path):
+    payload = b"x" * (1 << 20)
+    bin_dir, pth_dir = tmp_path / "bin", tmp_path / "pth"
+    bin_dir.mkdir(), pth_dir.mkdir()
+    (bin_dir / "pytorch_model.bin").write_bytes(payload)
+    (pth_dir / "model.pth").write_bytes(payload)
+    assert warm_page_cache(str(bin_dir)) == pytest.approx(1 / 1024, rel=1e-3)
+    assert warm_page_cache(str(pth_dir)) == pytest.approx(1 / 1024, rel=1e-3)
+
+
+def test_warm_page_cache_ignores_non_weight_dirs(tmp_path):
+    # MODEL_PATH may be an HF model id or a dir without local weights: no-op.
+    assert warm_page_cache(str(tmp_path)) == 0.0
+    assert warm_page_cache("not/a/real/dir") == 0.0
+
+
+def test_warm_skips_models_larger_than_host_memory(tmp_path, monkeypatch):
+    # Warming a model bigger than free RAM is pure filer traffic: the pages
+    # would be evicted before the test loads them (DeepSeek-R1-class dirs).
+    (tmp_path / "model-00001.safetensors").write_bytes(b"x" * (1 << 20))
+    monkeypatch.setattr(session_prefetcher, "_available_host_memory", lambda: 1 << 10)
+    assert warm_page_cache(str(tmp_path)) == 0.0
+
+
+def test_warm_io_thread_names_covered_by_threadleak_exclude():
+    # Both pytest.ini threadleak_exclude lists contain r"session-prefetch-\w+";
+    # the warm executor's thread_name_prefix must keep its IO workers inside
+    # that pattern (a large warm can outlive the test that started it).
+    assert re.fullmatch(r"session-prefetch-\w+", "session-prefetch-io_0")
+
+
+def _fake_reuse_module(enabled):
+    return types.SimpleNamespace(REUSE=types.SimpleNamespace(is_active=lambda: enabled))
+
+
+def test_yields_mpi_seams_to_active_session_reuse(monkeypatch):
+    # session_reuse owns the same seams and saves the whole respawn; when it
+    # is enabled the prefetcher must not install its factory (whoever patched
+    # first would silently disable the other layer).
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setitem(sys.modules, "test_common.session_reuse", _fake_reuse_module(enabled=True))
+    p = SessionPrefetcher()
+    p.install_pool_factory_if_loaded()
+    assert not p._patched
+    assert p.stats["mpi_yielded_to_reuse"] == 1
+
+
+def test_reuse_layer_inactive_or_absent_does_not_block_prefetch(monkeypatch):
+    monkeypatch.setitem(sys.modules, "test_common.session_reuse", _fake_reuse_module(enabled=False))
+    assert not session_prefetcher._reuse_layer_active()
+    monkeypatch.delitem(sys.modules, "test_common.session_reuse")
+    assert not session_prefetcher._reuse_layer_active()
+
+
+def test_unreadable_reuse_module_errs_on_yielding(monkeypatch):
+    # Module present but attribute layout changed: stay out of the way.
+    monkeypatch.setitem(sys.modules, "test_common.session_reuse", types.SimpleNamespace())
+    assert session_prefetcher._reuse_layer_active()
+
+
+def test_install_wraps_seam_in_isinstance_transparent_shim(prefetcher, monkeypatch):
+    # The patched seam must stay a real TYPE: proxy.py's killed-worker
+    # detection runs isinstance(x, MpiPoolSession) against this attribute,
+    # and a bare function there raises TypeError (the #16338 breakage class).
+    mpi_mod = pytest.importorskip("tensorrt_llm.llmapi.mpi_session")
+    fake = types.ModuleType("fake_seam_mod")
+    fake.MpiPoolSession = mpi_mod.MpiPoolSession
+    monkeypatch.setitem(sys.modules, "fake_seam_mod", fake)
+    monkeypatch.setattr(session_prefetcher, "_PATCH_TARGETS", ("fake_seam_mod",))
+    monkeypatch.setattr(session_prefetcher, "_reuse_layer_active", lambda: False)
+    prefetcher.install_pool_factory_if_loaded()
+    assert fake.MpiPoolSession is not mpi_mod.MpiPoolSession  # patched
+    # isinstance must not raise, and must answer for the real class.
+    assert isinstance(object(), fake.MpiPoolSession) is False
+    assert issubclass(mpi_mod.MpiPoolSession, fake.MpiPoolSession)
+
+
+def test_patch_targets_cover_all_library_construction_sites():
+    # The factory only intercepts the modules listed in _PATCH_TARGETS. If the
+    # library grows another MpiPoolSession(...) construction site, prefetch
+    # would silently stop covering it (armed spare pools would idle next to
+    # directly-constructed ones) — turn that drift into a red test.
+    import tensorrt_llm
+
+    root = Path(tensorrt_llm.__file__).parent
+    # mpi_session.py defines the class (and the MGMN server path, which
+    # legitimately builds its own pool outside the bare-LLM() seams).
+    exempt = {"tensorrt_llm.llmapi.mpi_session"}
+    offenders = []
+    for py in root.rglob("*.py"):
+        if re.search(r"(?<![\w.])MpiPoolSession\(", py.read_text(errors="ignore")):
+            module = "tensorrt_llm." + ".".join(py.relative_to(root).with_suffix("").parts)
+            if module not in session_prefetcher._PATCH_TARGETS and module not in exempt:
+                offenders.append(module)
+    assert not offenders, (
+        f"MpiPoolSession constructed outside _PATCH_TARGETS: {offenders} — "
+        "add the module(s) to _PATCH_TARGETS (or the exempt list above) so "
+        "the prefetch factory keeps covering every bare-LLM() pool spawn"
+    )
