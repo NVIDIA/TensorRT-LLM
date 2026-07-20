@@ -36,6 +36,7 @@ compiled dense BF16 baseline. Skip Softmax uses `target_sparsity=0.65` and
 
 - [Three optimization layers](#three-optimization-layers)
 - [Benchmark design](#benchmark-design)
+- [Where the BF16 baseline time goes](#where-the-bf16-baseline-time-goes)
 - [End-to-end results](#end-to-end-results)
 - [Quality and the dense-family anchor](#quality-and-the-dense-family-anchor)
 - [Choosing an operating point](#choosing-an-operating-point)
@@ -128,6 +129,31 @@ and seed.
 The two baselines serve different purposes. Compiled BF16 isolates performance changes among
 compiled candidates. Eager BF16 supplies a fixed image-space reference. Even compiled dense BF16
 has mean LPIPS 0.118 against eager BF16, so the absolute LPIPS values include compilation drift.
+
+## Where the BF16 baseline time goes
+
+An Nsight Systems trace on the current TensorRT-LLM 1.3.0rc21 image provides a representative
+breakdown of the compiled dense BF16 path. It uses the same p07 prompt, seed, resolution, frame
+count, and denoising steps as the sweep. The captured forward on one B200 took 537.2 seconds. A
+configuration-matched unprofiled run on another B200 took 528.2 seconds, a cross-GPU delta of
+1.7%; treat that delta only as an estimate of tracing overhead. The percentages below are
+projected onto the historical 525.0-second baseline for intuition; they are not a trace of the
+original seven-prompt rc19 run.
+
+| Work | Captured share | Projected time at 525.0s |
+| :--- | ---: | ---: |
+| Attention | 71.73% | 376.6s |
+| GEMM | 20.77% | 109.0s |
+| Other GPU work and host/idle | 7.50% | 39.4s |
+
+Attention includes TensorRT-LLM FMHA and cuDNN SDPA kernels. GEMM includes the NVJET
+matrix-multiply launches. The remaining category includes normalization, RoPE, activations,
+scheduler and VAE work, memory operations, and host or GPU-idle time. Device-event overlap was
+less than 0.004% of wall time, so the categories close to 100% without double-counting.
+
+This distribution explains why the optimizations compose asymmetrically. SAGE and Skip Softmax
+target the largest component, while FP8 block-scaled and NVFP4 GEMMs target roughly one fifth of
+the baseline. End-to-end gains also depend on the kernels left in the final category.
 
 ## End-to-end results
 
@@ -251,6 +277,8 @@ for the checkpoint schema and Python API. To test FP8, change `quant_algo` to
   layer or denoising step.
 - Dynamic quantization and compiled BF16 both introduce reference drift. Absolute LPIPS values
   should not be compared across builds; within-build family anchors are the valid comparison.
+- The component breakdown is one current-RC, single-prompt profile. Its percentages are useful
+  for attribution but are not a replacement for profiling every row of the historical sweep.
 
 ## Conclusion
 
