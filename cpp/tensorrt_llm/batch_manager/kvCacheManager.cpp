@@ -1354,6 +1354,17 @@ void WindowBlockManager::reapReadPendingReleases()
     }
 }
 
+void WindowBlockManager::eraseDiskDeadline(BlockPtr const& block)
+{
+    auto const seq = block->getDiskDeadlineSeq();
+    if (seq == 0)
+    {
+        return;
+    }
+    mDiskDeadlines.erase(DiskDeadline{block->getDiskDeadlineExpiry(), seq, nullptr});
+    block->setDiskDeadlineSeq(0);
+}
+
 BlockPtr WindowBlockManager::claimDiskTarget()
 {
     // Reclaim onboarded slots whose read has landed before handing out a disk slot, so a slot with an
@@ -1368,28 +1379,33 @@ BlockPtr WindowBlockManager::claimDiskTarget()
         mEvictionPolicy->claimBlock(candidate);
         return candidate;
     }
-    // Every free disk block is retained: displace the earliest real deadline; among
+    // Every free disk block is retained: displace the earliest live deadline; among
     // equal deadlines the first-spilled block goes first (leaf-first arrival makes this
-    // suffix-first within a chain). Entries are validated against live block state on
-    // pop; failures mean the entry describes the past (block left disk, was re-stamped,
-    // or is mid-transfer and about to leave) and are discarded.
-    while (!mDiskDeadlines.empty())
+    // suffix-first within a chain). Mid-onboard blocks stay for later; stale entries are
+    // erased on sight.
+    for (auto it = mDiskDeadlines.begin(); it != mDiskDeadlines.end();)
     {
-        auto const top = mDiskDeadlines.top();
-        mDiskDeadlines.pop();
-        if (top.block->isOnDisk() && !top.block->hasRefs() && mEvictionPolicy->isEnqueued(top.block)
-            && top.block->getRetentionExpiry() == std::optional{top.expiry})
+        if (!it->block->isOnDisk())
         {
-            // Protect mode: earliest deadline still future => all live => refuse.
-            // (Expired blocks sort first, so any would have been evicted above.)
-            if (mDiskProtectUnexpired && top.block->isRetainedNow())
-            {
-                mDiskDeadlines.push(top);
-                return nullptr;
-            }
-            mEvictionPolicy->claimBlock(top.block);
-            return top.block;
+            it = mDiskDeadlines.erase(it);
+            continue;
         }
+        if (it->block->hasRefs() || !mEvictionPolicy->isEnqueued(it->block))
+        {
+            ++it;
+            continue;
+        }
+        // Protect mode: earliest deadline still future => all live => refuse.
+        // (Expired blocks sort first, so any would have been evicted above.)
+        if (mDiskProtectUnexpired && it->block->isRetainedNow())
+        {
+            return nullptr;
+        }
+        auto block = it->block;
+        block->setDiskDeadlineSeq(0);
+        mDiskDeadlines.erase(it);
+        mEvictionPolicy->claimBlock(block);
+        return block;
     }
     // Heap drained by stale entries; refuse if the remaining candidate is still live.
     if (mDiskProtectUnexpired && candidate->isRetainedNow())
@@ -1506,7 +1522,10 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         // Parked at max priority: displacement order among retained blocks is decided by
         // mDiskDeadlines (exact deadline, suffix-first within a chain), not queue order.
         victim->setPriority(executor::KvCacheRetentionConfig::kMaxRetentionPriority);
-        mDiskDeadlines.push({*victim->getRetentionExpiry(), ++mDiskSpillSeq, victim});
+        auto const seq = ++mDiskSpillSeq;
+        victim->setDiskDeadlineSeq(seq);
+        victim->setDiskDeadlineExpiry(*victim->getRetentionExpiry());
+        mDiskDeadlines.insert(DiskDeadline{victim->getDiskDeadlineExpiry(), seq, victim});
     }
     else
     {
@@ -1704,6 +1723,7 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         auto const trackId = mTransferManager->asyncDiskReadEnabled() ? offloadBlock->getBlockId()
                                                                       : static_cast<KVCacheBlock::IdType>(-1);
         mTransferManager->loadFromFile(block, offloadBlock->getDiskSlot(), mPools, mDiskCachePath, trackId);
+        eraseDiskDeadline(offloadBlock);
         offloadBlock->swapDiskResidency(block); // matched identity now GPU-resident (bytes may still be in flight)
         offloadBlock->setPriority(executor::KvCacheRetentionConfig::kDefaultRetentionPriority);
         block->clearRetention();

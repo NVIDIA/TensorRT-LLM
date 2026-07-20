@@ -11440,3 +11440,23 @@ TEST_F(KVCacheManagerTest, DiskTierWriteQueueBoundedUnstagedTest)
 {
     runWriteQueueBoundedTest(/*unstaged=*/true);
 }
+
+// A retained block's deadline entry must be erased when the block leaves the disk: spill->reuse
+// cycles otherwise accumulate entries forever (disk=64 stays roomy, so displacement never runs).
+TEST_F(KVCacheManagerTest, DiskTierDeadlineEntryLeakTest)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    DiskTierDir dir;
+    auto bm = makeDiskTierBlockManager(stream, dir.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/64);
+    auto& blockManager = *bm;
+    for (SizeType32 i = 0; i < 100; ++i)
+    {
+        auto s = addDiskTierSequence(blockManager, 1000 + i, iotaTokens(0, 16), std::chrono::milliseconds(600000));
+        releaseDiskTierSequence(blockManager, s);
+        churnOnce(blockManager, 2000 + i, static_cast<TokenIdType>(100 + i));
+        auto r = addDiskTierSequence(blockManager, 3000 + i, iotaTokens(0, 16), std::chrono::milliseconds(600000));
+        releaseDiskTierSequence(blockManager, r);
+    }
+    EXPECT_LE(blockManager.getDiskDeadlineCount(),
+        static_cast<std::size_t>(64)); // never more entries than disk slots; leaked entries grow past it
+}

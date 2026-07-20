@@ -456,6 +456,26 @@ public:
         mDiskSlot = diskSlot;
     }
 
+    [[nodiscard]] std::uint64_t getDiskDeadlineSeq() const
+    {
+        return mDiskDeadlineSeq;
+    }
+
+    void setDiskDeadlineSeq(std::uint64_t seq)
+    {
+        mDiskDeadlineSeq = seq;
+    }
+
+    [[nodiscard]] std::chrono::steady_clock::time_point::duration getDiskDeadlineExpiry() const
+    {
+        return mDiskDeadlineExpiry;
+    }
+
+    void setDiskDeadlineExpiry(std::chrono::steady_clock::time_point::duration expiry)
+    {
+        mDiskDeadlineExpiry = expiry;
+    }
+
     //! \brief Exchange tier residency with \p other: pool index and disk slot swap together.
     //! Used by the host->disk spill and the disk->GPU onboard; the tree-resident identity
     //! keeps its node/hash while the physical backing moves.
@@ -673,6 +693,10 @@ private:
 
     // Disk cache tier: slot index in the disk file pool; kNoDiskSlot when not disk-resident.
     SizeType32 mDiskSlot{kNoDiskSlot};
+
+    // (expiry, seq) key of this block's entry in the disk-tier deadline set; seq 0 = no entry.
+    std::chrono::steady_clock::time_point::duration mDiskDeadlineExpiry{};
+    std::uint64_t mDiskDeadlineSeq{0};
 
     // Disk-tier retention deadline (steady clock); nullopt = never marked.
     std::optional<std::chrono::steady_clock::time_point::duration> mRetentionExpiry;
@@ -1498,29 +1522,34 @@ public:
         return mDiskOnboards;
     }
 
+    [[nodiscard]] std::size_t getDiskDeadlineCount() const
+    {
+        return mDiskDeadlines.size();
+    }
+
 private:
     //! Disk-tier displacement order among retained blocks: exact earliest deadline;
     //! among equal deadlines, first-spilled first. Block release and eviction walk chains
     //! leaf-first, so arrival order at the disk is deepest-first and FIFO here equals
-    //! suffix-first within a chain (and LRU-like across requests). Entries are lazy:
-    //! validated against live block state on pop, stale ones discarded.
+    //! suffix-first within a chain (and LRU-like across requests). An entry is erased
+    //! when its block leaves the disk (onboard or displacement).
     struct DiskDeadline
     {
         std::chrono::steady_clock::time_point::duration expiry;
         std::uint64_t seq;
         BlockPtr block;
 
-        bool operator>(DiskDeadline const& other) const
+        bool operator<(DiskDeadline const& other) const
         {
             if (expiry != other.expiry)
             {
-                return expiry > other.expiry;
+                return expiry < other.expiry;
             }
-            return seq > other.seq; // first-arrived pops first among equal deadlines
+            return seq < other.seq; // first-spilled first among equal deadlines
         }
     };
 
-    std::priority_queue<DiskDeadline, std::vector<DiskDeadline>, std::greater<DiskDeadline>> mDiskDeadlines;
+    std::set<DiskDeadline> mDiskDeadlines;
     std::uint64_t mDiskSpillSeq{0};
 
     // ---- Unstaged async store: reserved host-block pool (env TLLM_KV_DISK_RESERVED_BLOCKS, 0 = off) ----
@@ -1539,6 +1568,9 @@ private:
     // destination is never repurposed mid-read. See releaseBlocks / the areBlocksReady park.
     std::vector<BlockPtr> mReleaseReadPending;
     void reapReadPendingReleases();
+
+    //! \brief Remove \p block's mDiskDeadlines entry, if any.
+    void eraseDiskDeadline(BlockPtr const& block);
     std::uint64_t mUnstagedSpillSeq{0};
 
     //! \brief Pick and claim the disk block to overwrite: empty slots first, then
@@ -2173,6 +2205,16 @@ public:
         for (auto const& [windowSize, manager] : mWindowBlockManagers)
         {
             total += manager.getNumDiskOnboards();
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::size_t getDiskDeadlineCount() const
+    {
+        std::size_t total = 0;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            total += manager.getDiskDeadlineCount();
         }
         return total;
     }
