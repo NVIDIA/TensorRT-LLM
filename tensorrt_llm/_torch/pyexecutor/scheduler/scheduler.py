@@ -490,6 +490,11 @@ class MultimodalScheduler(RequestScheduler):
     item *size* is budgeted separately by ``max_num_tokens``, and encoders
     that split one item into multiple attention sequences derive their own
     workspace capacity from the token budget.
+
+    When a ``MultimodalEncoderCacheManager`` is attached, selection also
+    enforces its byte budget (allocate-before-compute): encoder outputs are
+    stored exclusively in the manager, so an item is only selected when its
+    embedding bytes fit alongside everything already held or claimed.
     """
 
     def __init__(

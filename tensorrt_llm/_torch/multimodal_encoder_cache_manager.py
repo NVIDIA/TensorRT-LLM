@@ -86,7 +86,7 @@ class MultimodalEncoderCacheManager(Generic[K]):
         self,
         max_bytes: int,
         *,
-        name: str = "mm_encoder_cache",
+        name: str = "mm_encoder_cache_manager",
     ) -> None:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")

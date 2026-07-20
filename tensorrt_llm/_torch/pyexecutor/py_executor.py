@@ -237,7 +237,7 @@ def _load_iteration_indexes(env_var: str):
 
 
 def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
-    """Drop pinned encoder cache and raw pre-encoder tensors after prefill completes.
+    """Drop encoder outputs and raw pre-encoder tensors after prefill completes.
 
     Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
     in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
@@ -248,9 +248,10 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
-    # Drop the per-item encoder state; the published `multimodal_embedding`
-    # (an alias of its buffer) survives through the dict above as long as
-    # generation still needs it.
+    # Drop the per-item encoder state alongside the dict clear above: both
+    # alias manager-owned entries, so every alias source disappears at the
+    # same moment the caller releases the request's holds — after this,
+    # eviction of the zero-ref entries actually frees the GPU memory.
     request.py_mm_encoder_state = None
 
 

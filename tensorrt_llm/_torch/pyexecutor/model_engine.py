@@ -2663,7 +2663,8 @@ class PyTorchModelEngine(ModelEngine):
                 f"exclusively in this cache, so using {budget} bytes.",
                 key="raise_mm_encoder_cache_budget",
             )
-        return MultimodalEncoderCacheManager(budget, name="mm_encoder_cache")
+        return MultimodalEncoderCacheManager(budget,
+                                             name="mm_encoder_cache_manager")
 
     def _resolve_mm_embedding_row_bytes(self) -> int:
         """Bytes of one MM embedding row (hidden size x element size).

@@ -473,10 +473,18 @@ class MultimodalModelMixin:
         return embeddings[0]
 
     def _get_multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
-        """Return the per-model encoder cache, if enabled.
+        """Return the per-model full-request-path encoder clone cache, if enabled.
 
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
+
+        Scope: this serves only the full-request consumers (side-stream
+        prefetch, `mm_encoder_only`/disagg encoding, cache-enabled models
+        without item scheduling). Item-scheduling models store encoder
+        outputs in the engine-owned `MultimodalEncoderCacheManager` instead;
+        for them this cache stays empty in the executor loop (their requests
+        arrive here with embeddings already attached). The key format is
+        shared (`_encoder_cache_item_key`) so the two stores can unify later.
         """
         multimodal_config = self.model_config.multimodal_config
         if multimodal_config is None:
