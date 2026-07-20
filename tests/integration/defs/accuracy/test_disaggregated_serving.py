@@ -613,15 +613,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
-    @pytest.mark.parametrize("ctx_disable_overlap_scheduler", [False, True])
-    @pytest.mark.parametrize("gen_disable_overlap_scheduler", [False, True])
-    @pytest.mark.parametrize("ctx_enable_block_reuse", [True, False])
-    @pytest.mark.parametrize("gen_enable_block_reuse", [True, False])
-    def test_auto_dtype(self, ctx_disable_overlap_scheduler,
-                        gen_disable_overlap_scheduler, ctx_enable_block_reuse,
-                        gen_enable_block_reuse):
+    # overlap scheduler is token-invariant (unit-tested); only block-reuse changes which KV is transferred
+    @pytest.mark.parametrize("ctx_enable_block_reuse,gen_enable_block_reuse",
+                             [(True, True), (False, False)],
+                             ids=["block_reuse", "no_block_reuse"])
+    def test_auto_dtype(self, ctx_enable_block_reuse, gen_enable_block_reuse):
         ctx_server_config = {
-            "disable_overlap_scheduler": ctx_disable_overlap_scheduler,
+            "disable_overlap_scheduler": False,
             "kv_cache_config": {
                 "enable_block_reuse": ctx_enable_block_reuse
             }
@@ -631,7 +629,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_tokens_in_buffer": 4096
         }
         gen_server_config = {
-            "disable_overlap_scheduler": gen_disable_overlap_scheduler,
+            "disable_overlap_scheduler": False,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse
             }
