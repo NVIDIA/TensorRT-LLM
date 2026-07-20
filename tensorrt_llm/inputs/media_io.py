@@ -376,6 +376,30 @@ def is_video_file(path) -> bool:
         capture.release()
 
 
+def is_image_bytes(data) -> bool:
+    """True when ``data`` holds still-image content (anything PIL opens).
+
+    In-memory counterpart of :func:`is_image_file` — header-only probe, no
+    pixel decode, no filesystem.
+    """
+    try:
+        with Image.open(BytesIO(data)):
+            return True
+    except UnidentifiedImageError:
+        return False
+
+
+def _read_frames_in_order(cv2, capture, max_frames: Optional[int]) -> List["Image.Image"]:
+    """Drain an opened ``VideoCapture`` into PIL frames, in order, no sampling."""
+    frames = []
+    while max_frames is None or len(frames) < max_frames:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    return frames
+
+
 def decode_video_frames(path, max_frames: Optional[int] = None) -> List["Image.Image"]:
     """Decode a video file into its frames as PIL images, in order, no sampling.
 
@@ -390,16 +414,41 @@ def decode_video_frames(path, max_frames: Optional[int] = None) -> List["Image.I
     try:
         if not capture.isOpened():
             raise ValueError(f"Could not open video file: {path}")
-        frames = []
-        while max_frames is None or len(frames) < max_frames:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        frames = _read_frames_in_order(cv2, capture, max_frames)
     finally:
         capture.release()
     if not frames:
         raise ValueError(f"Video file contains no frames: {path}")
+    return frames
+
+
+def decode_video_frames_from_bytes(data, max_frames: Optional[int] = None) -> List["Image.Image"]:
+    """Decode raw video bytes into PIL frames, in order, no sampling.
+
+    Fully in-memory when this OpenCV build has a stream-buffered backend
+    (:func:`_select_cv2_stream_buffered_backend`); otherwise the bytes spill
+    to an auto-deleted tempfile and take the :func:`decode_video_frames` path.
+    Raises ``ValueError`` when the bytes are not a decodable video.
+    """
+    cv2 = _get_cv2()
+    backend = _select_cv2_stream_buffered_backend()
+    if backend is None:
+        with tempfile.NamedTemporaryFile() as spill:
+            spill.write(data)
+            spill.flush()
+            return decode_video_frames(spill.name, max_frames=max_frames)
+
+    # cv2 keeps a non-owning view into the buffer; hold it until release().
+    buffer = BytesIO(bytes(data))
+    capture = cv2.VideoCapture(buffer, backend, [])
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Could not open video from <{len(data)} bytes>.")
+        frames = _read_frames_in_order(cv2, capture, max_frames)
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError(f"Video bytes contain no frames (<{len(data)} bytes>).")
     return frames
 
 

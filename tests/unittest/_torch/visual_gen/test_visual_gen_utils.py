@@ -329,6 +329,19 @@ class TestInputReferenceMaterialization:
         video_data = params.multi_modal_data["video"]
         assert isinstance(video_data, VideoData)
         assert len(video_data.frames) >= 1
+        # Video references are decoded in memory — nothing lands in media storage.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_video_reference_needs_no_media_storage(self):
+        # The decode is in-memory, so V2V works without a storage path at all
+        # (only image references persist a file for the worker to read).
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
+        generator = _StubVisualGen()
+        b64 = base64.b64encode(self._mp4_bytes()).decode()
+        request = VideoGenerationRequest(prompt="x", input_reference=b64)
+        params = parse_visual_gen_params(request, "vid-9", generator, media_storage_path=None)
+        assert isinstance(params.multi_modal_data["video"], VideoData)
 
     def test_base64_video_reference_routes_to_multimodal(self, tmp_path):
         # Classification is content-based, so the JSON/base64 path can
@@ -368,7 +381,7 @@ class TestInputReferenceMaterialization:
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         with pytest.raises(ValueError, match="neither a decodable image"):
             parse_visual_gen_params(request, "vid-6", generator, media_storage_path=str(tmp_path))
-        # The temporary materialization is removed on rejection.
+        # Classification runs on the bytes; rejected content never touches disk.
         assert list(tmp_path.iterdir()) == []
 
     def test_malformed_base64_reference_raises_and_cleans_up(self, tmp_path):
@@ -394,6 +407,56 @@ class TestInputReferenceMaterialization:
             parse_visual_gen_params(request, "vid-8", generator, media_storage_path=str(tmp_path))
         # … but the partial materialization must not leak.
         assert list(tmp_path.iterdir()) == []
+
+
+class TestMediaBytesProbes:
+    """The in-memory probe/decode primitives the serve boundary runs on."""
+
+    def test_is_image_bytes(self):
+        from tensorrt_llm.inputs.media_io import is_image_bytes
+
+        buf = BytesIO()
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(buf, format="PNG")
+        assert is_image_bytes(buf.getvalue())
+        assert not is_image_bytes(b"definitely not an image")
+        # Video bytes are not an image (mp4 has no PIL-openable header).
+        assert not is_image_bytes(TestInputReferenceMaterialization._mp4_bytes())
+
+    def test_decode_video_frames_from_bytes(self):
+        pytest.importorskip("cv2")
+        from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes
+
+        frames = decode_video_frames_from_bytes(TestInputReferenceMaterialization._mp4_bytes())
+        assert len(frames) == 2
+        assert all(isinstance(f, Image.Image) for f in frames)
+
+    def test_decode_video_frames_from_bytes_max_frames(self):
+        pytest.importorskip("cv2")
+        from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes
+
+        frames = decode_video_frames_from_bytes(
+            TestInputReferenceMaterialization._mp4_bytes(), max_frames=1
+        )
+        assert len(frames) == 1
+
+    def test_decode_video_frames_from_bytes_rejects_garbage(self):
+        pytest.importorskip("cv2")
+        from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes
+
+        with pytest.raises(ValueError):
+            decode_video_frames_from_bytes(b"not a video at all")
+
+    def test_tempfile_fallback_without_stream_backend(self, monkeypatch):
+        # Old OpenCV builds have no stream-buffered backend; the bytes spill
+        # to an auto-deleted tempfile and decode through the path route.
+        pytest.importorskip("cv2")
+        from tensorrt_llm.inputs import media_io
+
+        monkeypatch.setattr(media_io, "_select_cv2_stream_buffered_backend", lambda: None)
+        frames = media_io.decode_video_frames_from_bytes(
+            TestInputReferenceMaterialization._mp4_bytes()
+        )
+        assert len(frames) == 2
 
 
 # =============================================================================
