@@ -559,7 +559,7 @@ class PyExecutor:
                 raise RuntimeError(
                     "NVBUG6448152 local KV reclamation is qualified only for the primary V1 KV manager"
                 )
-            if self.max_num_active_requests != 1:
+            if max_batch_size != 1:
                 raise RuntimeError(
                     "NVBUG6448152 local KV reclamation is qualified only for CTX max_batch_size=1"
                 )
