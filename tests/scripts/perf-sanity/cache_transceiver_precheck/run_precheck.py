@@ -37,16 +37,28 @@ tuning harness), reduced to a single go/no-go sweep and extended to
 asymmetric layouts, attention DP, and multi-instance pairing.
 
 Rendezvous is file-based under --work-dir (a shared filesystem): each ctx
-leader binds one ZMQ REP socket per gen peer and publishes host:port in
-rendezvous/ctx{ci}_gen{gj}.addr; gen leaders connect with REQ sockets. Only
-tiny control payloads travel over ZMQ -- KV data goes through the
-transceiver under test.
+leader binds one ZMQ REP socket per gen peer and publishes host:port plus a
+per-session HMAC key in rendezvous/ctx{ci}_gen{gj}.addr; gen leaders connect
+with REQ sockets. Only tiny control payloads travel over ZMQ -- KV data goes
+through the transceiver under test.
+
+Control messages are JSON with an appended HMAC-SHA256 tag -- NEVER pickle:
+the REP port is reachable from the cluster network, and unpickling
+network-supplied bytes is arbitrary code execution. The key travels only via
+the work-dir addr file (filesystem permissions = the job's trust domain), so
+a network-only attacker can neither read it nor forge/tamper messages.
+ContextPhaseParams crosses the wire as its primitive fields (opaque_state
+base64-encoded), mirroring DisaggregatedParams <-> ContextPhaseParams in
+tensorrt_llm/disaggregated_params.py and executor/result.py.
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
 import os
-import pickle
+import secrets
 import signal
 import socket
 import sys
@@ -93,6 +105,55 @@ def seed_for(rid, global_layer):
     # Per (request, GLOBAL layer); rank-independent so any receiving layout
     # can regenerate its local slice.
     return (rid * 1_000_003 + global_layer * 31) & 0x7FFFFFFF
+
+
+# --------------------------------------------------------------------------- #
+# Control-channel wire format: HMAC-SHA256-authenticated JSON (never pickle --
+# the ZMQ port is reachable from the cluster network).
+# --------------------------------------------------------------------------- #
+_HMAC_TAG_LEN = hashlib.sha256().digest_size
+
+
+def pack_msg(obj, key):
+    """JSON-encode `obj` and append an HMAC-SHA256 tag."""
+    data = json.dumps(obj, separators=(",", ":")).encode()
+    return data + hmac.new(key, data, hashlib.sha256).digest()
+
+
+def unpack_msg(raw, key):
+    """Verify the HMAC tag, then JSON-decode. Raises _TransferError on forgery."""
+    if len(raw) <= _HMAC_TAG_LEN:
+        raise _TransferError(f"control frame too short ({len(raw)} bytes)")
+    data, tag = raw[:-_HMAC_TAG_LEN], raw[-_HMAC_TAG_LEN:]
+    if not hmac.compare_digest(hmac.new(key, data, hashlib.sha256).digest(), tag):
+        raise _TransferError("control frame failed HMAC verification (tampered or wrong key)")
+    return json.loads(data)
+
+
+def params_to_wire(p):
+    """ContextPhaseParams -> JSON-safe dict (fields per executor/result.py)."""
+    return {
+        "first_gen_tokens": list(p.first_gen_tokens or []),
+        "req_id": p.req_id,
+        "opaque_state": base64.b64encode(p.opaque_state or b"").decode(),
+        "draft_tokens": list(p.draft_tokens) if p.draft_tokens is not None else None,
+        "ctx_dp_rank": p.ctx_dp_rank,
+        "ctx_info_endpoint": p.disagg_info_endpoint,
+    }
+
+
+def params_from_wire(d):
+    """Inverse of params_to_wire (ctor per disaggregated_params.py)."""
+    import tensorrt_llm.bindings.executor as tllme
+
+    return tllme.ContextPhaseParams(
+        list(d["first_gen_tokens"]),
+        int(d["req_id"]),
+        base64.b64decode(d["opaque_state"]),
+        d["draft_tokens"],
+        d["ctx_dp_rank"],
+        d["ctx_info_endpoint"],
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -271,9 +332,12 @@ def addr_path(work_dir, ctx_idx, gen_idx):
 
 
 def write_addr(path, payload):
+    """Atomically publish an addr file. It carries the session HMAC key, so
+    restrict it to the owning user before it becomes visible."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
+        os.fchmod(f.fileno(), 0o600)
         json.dump(payload, f)
         f.flush()
         os.fsync(f.fileno())
@@ -607,14 +671,14 @@ class PrecheckRunner:
             self.zmq_ctx = zmq.Context.instance()
         return zmq, self.zmq_ctx
 
-    def _leader_send_recv(self, sock, obj):
+    def _leader_send_recv(self, sock, obj, key):
         """REQ round-trip on the gen leader; broadcast the reply to all ranks."""
         reply = None
         err = None
         if self.is_leader:
             try:
-                sock.send(pickle.dumps(obj))
-                reply = pickle.loads(sock.recv())
+                sock.send(pack_msg(obj, key))
+                reply = unpack_msg(sock.recv(), key)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
         err, reply = self.comm.bcast((err, reply), root=0)
@@ -647,7 +711,7 @@ def hello_timeout_s(plan, num_peers):
 # --------------------------------------------------------------------------- #
 # ctx / gen session loops
 # --------------------------------------------------------------------------- #
-def ctx_serve_peer(runner, sock, peer_idx, arm, disarm):
+def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     """Serve one gen peer's full schedule on a dedicated REP socket."""
     plan = runner.plan
     comm = runner.comm
@@ -656,7 +720,7 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm):
         msg, err = None, None
         if runner.is_leader:
             try:
-                msg = pickle.loads(sock.recv())
+                msg = unpack_msg(sock.recv(), key)
             except Exception as e:  # noqa: BLE001
                 err = repr(e)
         err, msg = comm.bcast((err, msg), root=0)
@@ -666,7 +730,7 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm):
 
     def leader_reply(obj):
         if runner.is_leader:
-            sock.send(pickle.dumps(obj))
+            sock.send(pack_msg(obj, key))
 
     arm(f"hello gen_{peer_idx}", seconds=hello_timeout_s(plan, runner.side["num_peers"]))
     msg = leader_recv()
@@ -689,7 +753,8 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm):
         except _TransferError as e:
             leader_reply(("abort", str(e)))
             raise
-        leader_reply(("params", params_by_pair))
+        # JSON object keys are strings; the gen side converts back to int.
+        leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
         runner.ctx_finish_chunk(reqs)
 
     arm(f"bye gen_{peer_idx}")
@@ -708,7 +773,7 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
 
     # Rendezvous with instance-wide consensus: if only the leader raised here,
     # the other ranks would deadlock in the next bcast.
-    sock, err = None, None
+    sock, key, err = None, None, None
     arm(f"rendezvous ctx_{peer_idx}", seconds=hello_s)
     if runner.is_leader:
         try:
@@ -716,6 +781,9 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
                 addr_path(runner.work_dir, peer_idx, runner.server_idx),
                 plan["rendezvous_timeout_s"],
             )
+            # Session HMAC key: shared only through the work-dir addr file,
+            # never over the network.
+            key = bytes.fromhex(addr["key"])
             zmq, zctx = runner._zmq()
             sock = zctx.socket(zmq.REQ)
             sock.setsockopt(zmq.LINGER, 0)
@@ -730,7 +798,9 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
     try:
         arm(f"hello ctx_{peer_idx}", seconds=hello_s)
         reply = runner._leader_send_recv(
-            sock, ("hello", {"gen_idx": runner.server_idx, "fingerprint": plan["fingerprint"]})
+            sock,
+            ("hello", {"gen_idx": runner.server_idx, "fingerprint": plan["fingerprint"]}),
+            key,
         )
         if reply[0] == "abort":
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
@@ -746,17 +816,18 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
         for li, req_len, rep, chunk in _schedule(plan):
             arm(f"ctx_{peer_idx} len={req_len} rep={rep}")
             reply = runner._leader_send_recv(
-                sock, ("go", {"li": li, "rep": rep, "chunk": chunk[0]})
+                sock, ("go", {"li": li, "rep": rep, "chunk": chunk[0]}), key
             )
             if reply[0] == "abort":
                 raise _TransferError(f"ctx_{peer_idx} aborted: {reply[1]}")
-            ok, detail = runner.gen_run_chunk(peer_idx, li, req_len, rep, chunk, reply[1])
+            params_by_pair = {int(p): params_from_wire(v) for p, v in reply[1].items()}
+            ok, detail = runner.gen_run_chunk(peer_idx, li, req_len, rep, chunk, params_by_pair)
             if rep >= plan["warmup_requests"]:
                 prev_ok, prev_detail = case_ok.get(req_len, (True, ""))
                 case_ok[req_len] = (prev_ok and ok, prev_detail or detail)
 
         arm(f"bye ctx_{peer_idx}")
-        runner._leader_send_recv(sock, ("done", {}))
+        runner._leader_send_recv(sock, ("done", {}), key)
         disarm()
 
         for req_len, (ok, detail) in case_ok.items():
@@ -915,7 +986,9 @@ def main(argv=None):
         if args.role == "ctx":
             # One dedicated REP socket per gen peer (avoids REQ interleaving
             # across sessions on a shared socket), published via addr files.
-            socks = {}
+            # Each session gets a fresh HMAC key, shared only through the
+            # work-dir addr file (0600).
+            socks, keys = {}, {}
             if runner.is_leader:
                 zmq, zctx = runner._zmq()
                 host = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
@@ -925,15 +998,21 @@ def main(argv=None):
                     # Generous: gen peers are serialized across ctx servers.
                     s.setsockopt(zmq.RCVTIMEO, hello_timeout_s(plan, num_peers) * 1000)
                     port = s.bind_to_random_port("tcp://*")
+                    keys[gj] = secrets.token_bytes(32)
                     write_addr(
                         addr_path(runner.work_dir, args.server_idx, gj),
-                        {"host": host, "port": port},
+                        {"host": host, "port": port, "key": keys[gj].hex()},
                     )
                     socks[gj] = s
             for gj in range(num_peers):
                 try:
                     ctx_serve_peer(
-                        runner, socks.get(gj) if runner.is_leader else None, gj, arm, disarm
+                        runner,
+                        socks.get(gj) if runner.is_leader else None,
+                        gj,
+                        arm,
+                        disarm,
+                        keys.get(gj),
                     )
                     runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
                 except _Timeout:
