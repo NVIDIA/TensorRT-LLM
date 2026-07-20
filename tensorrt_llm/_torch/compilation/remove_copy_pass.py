@@ -17,15 +17,18 @@ def remove_copy_for_mutates_args(graph: Graph):
 
     nodes_to_remove: list[Node] = []
 
-    def remove_functionalize_inner(node: Node, mutates_args: dict, is_v2=False):
+    def remove_functionalize_inner(node: Node, mutates_args: dict):
         getitem_nodes = [
             user for user in node.users if is_call_function(user, getitem)
         ]
 
         kwargs = {k: v for k, v in node.kwargs.items() if not k.startswith("_")}
-        if is_v2:
-            for k, v in mutates_args.items():
-                kwargs[v] = node.kwargs["_all_bases"][k - 1]
+        if is_call_function(node, auto_functionalized_v2):
+            all_bases = node.kwargs["_all_bases"]
+            for arg_name in mutates_args.values():
+                base_index = node.kwargs.get(f"_{arg_name}_base_index")
+                kwargs[arg_name] = (None if base_index is None else
+                                    all_bases[base_index])
 
         for getitem_node in getitem_nodes:
             idx = getitem_node.args[1]
