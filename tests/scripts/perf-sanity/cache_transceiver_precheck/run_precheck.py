@@ -936,7 +936,13 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
         leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
         runner.ctx_finish_chunk(reqs)
 
-    arm(f"bye gen_{peer_idx}")
+    # The gen defers "done" until it has finished the schedules of ALL its
+    # ctx peers, so every ctx instance stays alive for the whole precheck --
+    # matching real serving, where ctx servers outlive the entire run. (An
+    # early-exiting ctx leaves the gen's C++ transceiver holding connections
+    # to a dead agent, a state the real test never produces.) The wait can
+    # therefore span the gen's remaining sessions: budget like a handshake.
+    arm(f"bye gen_{peer_idx}", seconds=hello_timeout_s(plan, runner.side["num_peers"]))
     msg = leader_recv()
     if msg[0] != "done":
         raise _TransferError(f"expected done from gen_{peer_idx}, got {msg[:1]}")
@@ -945,7 +951,13 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
 
 
 def gen_run_peer(runner, peer_idx, arm, disarm):
-    """Run the full schedule against ctx server `peer_idx`."""
+    """Run the full schedule against ctx server `peer_idx`.
+
+    Returns (sock, key) with the session STILL OPEN on success -- the caller
+    sends the deferred "done" only after every ctx peer's schedule finished,
+    keeping all ctx instances alive for the whole precheck (real-serving
+    lifecycle; see ctx_serve_peer). On failure the socket is closed here.
+    """
     plan = runner.plan
     comm = runner.comm
     hello_s = hello_timeout_s(plan, runner.side["num_peers"])
@@ -1004,9 +1016,6 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
             if rep >= plan["warmup_requests"]:
                 prev_ok, prev_detail = case_ok.get(req_len, (True, ""))
                 case_ok[req_len] = (prev_ok and ok, prev_detail or detail)
-
-        arm(f"bye ctx_{peer_idx}")
-        runner._leader_send_recv(sock, ("done", {}), key)
         disarm()
 
         for req_len, (ok, detail) in case_ok.items():
@@ -1016,6 +1025,19 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
                 "PASS" if ok else "MISMATCH",
                 "" if ok else detail,
             )
+        return sock, key
+    except BaseException:
+        if sock is not None:
+            sock.close(linger=0)
+        raise
+
+
+def gen_release_peer(runner, peer_idx, sock, key, arm, disarm):
+    """Deferred session teardown: send "done" and close (best-effort)."""
+    try:
+        arm(f"bye ctx_{peer_idx}")
+        runner._leader_send_recv(sock, ("done", {}), key)
+        disarm()
     finally:
         if sock is not None:
             sock.close(linger=0)
@@ -1218,9 +1240,11 @@ def main(argv=None):
                     disarm()
                     runner.recorder.record(f"gen_{gj}", 0, "TRANSFER_ERROR", repr(e))
         else:
+            open_sessions = []
             for ci in range(num_peers):
                 try:
-                    gen_run_peer(runner, ci, arm, disarm)
+                    sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
+                    open_sessions.append((ci, sock, sess_key))
                 except _Timeout:
                     disarm()
                     runner.recorder.record(
@@ -1230,6 +1254,21 @@ def main(argv=None):
                         f"exceeded {plan['chunk_timeout_s']}s during {current_cell['what']}",
                     )
                 except Exception as e:  # noqa: BLE001 - per-peer isolation
+                    disarm()
+                    runner.recorder.record(f"ctx_{ci}", 0, "TRANSFER_ERROR", repr(e))
+            # Deferred "done": released only after EVERY ctx peer's schedule
+            # finished, so all ctx instances stay alive for the whole
+            # precheck (real-serving lifecycle -- no dead-agent connections
+            # in anyone's transceiver while transfers are still running).
+            for ci, sock, sess_key in open_sessions:
+                try:
+                    gen_release_peer(runner, ci, sock, sess_key, arm, disarm)
+                except _Timeout:
+                    disarm()
+                    runner.recorder.record(
+                        f"ctx_{ci}", 0, "TIMEOUT", "releasing session (deferred done)"
+                    )
+                except Exception as e:  # noqa: BLE001 - best-effort release
                     disarm()
                     runner.recorder.record(f"ctx_{ci}", 0, "TRANSFER_ERROR", repr(e))
     finally:
