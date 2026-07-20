@@ -338,3 +338,40 @@ class TestRendezvousStaleness:
         rp.write_addr(p, {"host": "new", "port": 2, "key": "bb"})
         got = rp.wait_for_addr(p, timeout_s=2)
         assert got["host"] == "new" and got["job"] == "22222"
+
+
+def test_wireup_timeout_derivation():
+    plan = pcfg.resolve_plan(_disagg_yaml())  # ctx dep4 -> gen dep16
+    assert plan["wireup_timeout_s"] == min(1800, 150 * 16)
+    plan = pcfg.resolve_plan(
+        _disagg_yaml(gen_extra={"tensor_parallel_size": 4})
+    )
+    assert plan["wireup_timeout_s"] == 600
+    plan = pcfg.resolve_plan(_disagg_yaml(cache_transceiver_precheck={"wireup_timeout_s": 42}))
+    assert plan["wireup_timeout_s"] == 42
+
+
+def test_rid_tags_dense_within_session():
+    """The C++ notification tag is rid & 0xFFF: rids must be dense within a
+    (ctx, gen) session so tags cannot alias across reps/lengths."""
+    import run_precheck as rp
+
+    plan = pcfg.resolve_plan(_disagg_yaml())  # n_pairs=16
+    total_reps = plan["warmup_requests"] + plan["num_requests"]
+    n_pairs = plan["n_pairs"]
+
+    def session_rids(ctx_idx, gen_idx):
+        out = []
+        for li in range(2):
+            for rep in range(total_reps):
+                for pair in range(n_pairs):
+                    seq = (li * total_reps + rep) * n_pairs + pair
+                    out.append(rp.make_rid(ctx_idx, gen_idx, 2, seq))
+        return out
+
+    a = session_rids(0, 0)
+    b = session_rids(1, 0)
+    assert len(set(a)) == len(a) and len(set(b)) == len(b)
+    assert not (set(a) & set(b))  # globally unique across sessions
+    tags = [r & 0xFFF for r in a]
+    assert len(set(tags)) == len(tags)  # no tag aliasing within a session

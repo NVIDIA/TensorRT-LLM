@@ -44,6 +44,13 @@ PRECHECK_DEFAULTS = {
     "max_concurrent_pairs": 8,
     # signal.alarm / hang-detector budget for one chunk of transfers.
     "chunk_timeout_s": 180,
+    # Extra budget for the FIRST rep of the schedule, which pays the one-time
+    # NIXL agent metadata wire-up (fetchRemoteMD over the mgmt network): with
+    # MLA + ctx pp>1 every receiving rank must connect to every ctx rank, and
+    # a cold cross-rack fetch was measured at 100-170s per agent pair. Real
+    # serving absorbs this as slow first requests (no hard alarm), so the
+    # precheck must too. None -> derived: min(1800, 150 * max world size).
+    "wireup_timeout_s": None,
     # How long the gen side waits for the ctx rendezvous files (covers ctx
     # KV-pool allocation + NIXL/UCX transceiver bring-up).
     "rendezvous_timeout_s": 600,
@@ -195,6 +202,11 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         "n_pairs": n_pairs,
         "chunk_size": chunk_size,
         "chunk_timeout_s": int(knobs["chunk_timeout_s"]),
+        "wireup_timeout_s": int(
+            knobs["wireup_timeout_s"]
+            if knobs["wireup_timeout_s"] is not None
+            else min(1800, 150 * max(ctx["world_size"], gen["world_size"]))
+        ),
         "rendezvous_timeout_s": int(knobs["rendezvous_timeout_s"]),
         "verify_data": bool(knobs["verify_data"]),
     }

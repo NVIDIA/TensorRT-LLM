@@ -908,10 +908,18 @@ def main():
             "--work-dir $testOutputDir/cache_transceiver_precheck "
             f"--benchmark-mode {precheck_mode} --llm-src $llmSrcNode"
         )
+        # The external step timeout must cover the driver's first-rep NIXL
+        # wire-up allowance (precheck_config: min(1800, 150 * max world)).
+        max_world = max(
+            hardware_config.get("gpus_per_ctx_server", 0) or 0,
+            hardware_config.get("gpus_per_gen_server", 0) or 0,
+        )
+        default_step_timeout = 900 + min(1800, 150 * max_world)
         script_prefix_lines.extend(
             [
                 f"export ctPrecheckEnabled={1 if precheck_enabled else 0}",
-                f"export ctPrecheckTimeout={int(precheck_cfg.get('step_timeout_s', 900))}",
+                f"export ctPrecheckTimeout="
+                f"{int(precheck_cfg.get('step_timeout_s', default_step_timeout))}",
                 "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
                 "disaggregated/slurm_precheck_run.sh",
                 f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS'
