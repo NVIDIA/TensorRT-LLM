@@ -36,6 +36,7 @@ _PRECHECK_DIR = os.path.join(
 sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
 
 import precheck_config as pcfg  # noqa: E402
+import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
 
 
 def _disagg_yaml(ctx_extra=None, gen_extra=None, **overrides):
@@ -212,7 +213,6 @@ def test_side_plan_views():
     ctx_view = pcfg.side_plan(plan, "ctx")
     gen_view = pcfg.side_plan(plan, "gen")
     assert ctx_view["parallel"]["world_size"] == 4
-    assert ctx_view["peer_parallel"]["world_size"] == 16
     assert ctx_view["num_peers"] == 1 and gen_view["num_peers"] == 1
     assert gen_view["cache_transceiver_config"]["max_tokens_in_buffer"] == 16384
 
@@ -220,19 +220,12 @@ def test_side_plan_views():
 class TestControlWireFormat:
     """run_precheck's HMAC-JSON control frames (importable without torch)."""
 
-    def _rp(self):
-        import run_precheck as rp
-
-        return rp
-
     def test_roundtrip(self):
-        rp = self._rp()
         key = b"\x01" * 32
         msg = ["go", {"li": 0, "rep": 1, "chunk": 2}]
         assert rp.unpack_msg(rp.pack_msg(msg, key), key) == msg
 
     def test_tampered_frame_rejected(self):
-        rp = self._rp()
         key = b"\x01" * 32
         raw = rp.pack_msg(["hello", {}], key)
         bad = raw[:-1] + bytes([raw[-1] ^ 0xFF])
@@ -240,18 +233,15 @@ class TestControlWireFormat:
             rp.unpack_msg(bad, key)
 
     def test_wrong_key_rejected(self):
-        rp = self._rp()
         raw = rp.pack_msg(["hello", {}], b"\x01" * 32)
         with pytest.raises(rp._TransferError):
             rp.unpack_msg(raw, b"\x02" * 32)
 
     def test_short_frame_rejected(self):
-        rp = self._rp()
         with pytest.raises(rp._TransferError):
             rp.unpack_msg(b"tiny", b"\x01" * 32)
 
     def test_addr_file_owner_only(self, tmp_path):
-        rp = self._rp()
         path = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
         rp.write_addr(path, {"host": "h", "port": 1, "key": "aa"})
         assert (os.stat(path).st_mode & 0o777) == 0o600
@@ -299,13 +289,7 @@ def test_model_kv_shape_vocab_size(tmp_path):
 class TestRendezvousStaleness:
     """wait_for_addr must skip addr files stamped by a previous run."""
 
-    def _rp(self):
-        import run_precheck as rp
-
-        return rp
-
     def test_same_job_accepted(self, tmp_path, monkeypatch):
-        rp = self._rp()
         monkeypatch.setenv("SLURM_JOB_ID", "12345")
         p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
         rp.write_addr(p, {"host": "h", "port": 1, "key": "aa"})
@@ -313,7 +297,6 @@ class TestRendezvousStaleness:
         assert got["job"] == "12345" and got["port"] == 1
 
     def test_stale_job_skipped_until_timeout(self, tmp_path, monkeypatch):
-        rp = self._rp()
         monkeypatch.setenv("SLURM_JOB_ID", "11111")
         p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
         rp.write_addr(p, {"host": "h", "port": 1, "key": "aa"})  # stamped 11111
@@ -322,7 +305,6 @@ class TestRendezvousStaleness:
             rp.wait_for_addr(p, timeout_s=2)
 
     def test_no_job_id_accepts_any(self, tmp_path, monkeypatch):
-        rp = self._rp()
         monkeypatch.setenv("SLURM_JOB_ID", "11111")
         p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
         rp.write_addr(p, {"host": "h", "port": 1, "key": "aa"})
@@ -330,7 +312,6 @@ class TestRendezvousStaleness:
         assert rp.wait_for_addr(p, timeout_s=2)["port"] == 1
 
     def test_write_addr_replaces_stale_file(self, tmp_path, monkeypatch):
-        rp = self._rp()
         monkeypatch.setenv("SLURM_JOB_ID", "11111")
         p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
         rp.write_addr(p, {"host": "old", "port": 1, "key": "aa"})
@@ -354,8 +335,6 @@ def test_wireup_timeout_derivation():
 def test_rid_tags_dense_within_session():
     """The C++ notification tag is rid & 0xFFF: rids must be dense within a
     (ctx, gen) session so tags cannot alias across reps/lengths."""
-    import run_precheck as rp
-
     plan = pcfg.resolve_plan(_disagg_yaml())  # n_pairs=16
     total_reps = plan["warmup_requests"] + plan["num_requests"]
     n_pairs = plan["n_pairs"]

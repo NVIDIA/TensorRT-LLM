@@ -54,7 +54,6 @@ tensorrt_llm/disaggregated_params.py and executor/result.py.
 
 import argparse
 import base64
-import dataclasses
 import hashlib
 import hmac
 import json
@@ -145,37 +144,39 @@ def params_to_wire(p):
 
 
 def params_from_wire(d):
-    """Inverse of params_to_wire (ctor per disaggregated_params.py)."""
-    import tensorrt_llm.bindings.executor as tllme
+    """Inverse of params_to_wire, via the maintained DisaggregatedParams
+    converter (keeps us off the raw nanobind ctor signature)."""
+    from tensorrt_llm import DisaggregatedParams
 
-    return tllme.ContextPhaseParams(
-        list(d["first_gen_tokens"]),
-        int(d["req_id"]),
-        base64.b64decode(d["opaque_state"]),
-        d["draft_tokens"],
-        d["ctx_dp_rank"],
-        d["ctx_info_endpoint"],
-    )
+    return DisaggregatedParams(
+        ctx_request_id=int(d["req_id"]),
+        first_gen_tokens=list(d["first_gen_tokens"]),
+        opaque_state=base64.b64decode(d["opaque_state"]),
+        draft_tokens=d["draft_tokens"],
+        ctx_dp_rank=d["ctx_dp_rank"],
+        ctx_info_endpoint=d["ctx_info_endpoint"],
+    ).get_context_phase_params()
 
 
 # --------------------------------------------------------------------------- #
 # KV fill / verify (heavy imports stay inside functions: --dry-run and unit
 # tests must work without torch / tensorrt_llm installed)
 # --------------------------------------------------------------------------- #
-def _pattern_like(view, seed):
-    """Deterministic tensor matching `view`, constant along the head axis.
+def _pattern_like(shape, dtype, device, seed):
+    """Deterministic tensor of `shape`, constant along the head axis.
 
-    `view` is an HND block slice: [nblocks, kv_factor, heads, tokens, dim].
+    `shape` is an HND block slice: [nblocks, kv_factor, heads, tokens, dim].
     Generated on CPU (bit-identical across nodes), head axis generated as 1
-    and expanded, so ctx/gen sides with different local head counts (TP
+    and expanded ON DEVICE (transferring heads x the unique data would be
+    pure waste), so ctx/gen sides with different local head counts (TP
     resharding) or different local layer sets (PP re-splitting) still agree.
     """
     import torch
 
-    nb, kv, heads, tok, dim = view.shape
+    nb, kv, heads, tok, dim = shape
     g = torch.Generator(device="cpu").manual_seed(int(seed))
     rnd = torch.rand((nb, kv, 1, tok, dim), dtype=torch.float32, generator=g)
-    return rnd.to(view.dtype).expand(nb, kv, heads, tok, dim)
+    return rnd.to(dtype).to(device).expand(nb, kv, heads, tok, dim)
 
 
 def _request_block_views(kvm, rid):
@@ -191,8 +192,8 @@ def _request_block_views(kvm, rid):
 
 def fill_request(kvm, rid):
     for global_layer, buf, valid in _request_block_views(kvm, rid):
-        view = buf[valid]
-        buf[valid] = _pattern_like(view, seed_for(rid, global_layer)).to(view.device)
+        shape = (len(valid), *buf.shape[1:])
+        buf[valid] = _pattern_like(shape, buf.dtype, buf.device, seed_for(rid, global_layer))
 
 
 def verify_request(kvm, rid):
@@ -201,47 +202,12 @@ def verify_request(kvm, rid):
 
     for global_layer, buf, valid in _request_block_views(kvm, rid):
         recv = buf[valid]
-        exp = _pattern_like(recv, seed_for(rid, global_layer)).to(recv.device)
-        if not torch.equal(recv.float(), exp.float()):
-            bad = (recv.float() != exp.float()).sum().item()
+        exp = _pattern_like(recv.shape, recv.dtype, recv.device, seed_for(rid, global_layer))
+        recv_f, exp_f = recv.float(), exp.float()  # fp8 lacks direct compare ops
+        if not torch.equal(recv_f, exp_f):
+            bad = (recv_f != exp_f).sum().item()
             return False, f"layer={global_layer} mismatched_elements={bad}/{recv.numel()}"
     return True, ""
-
-
-@dataclasses.dataclass
-class _KvCacheConfigV2:
-    """KvCacheConfig stand-in for KVCacheManagerV2.
-
-    Mirrors examples/disaggregated/slurm/cache_transceiver_test (and the
-    reference dataclass in
-    tests/unittest/disaggregated/test_cache_transceiver_single_process.py):
-    KVCacheManagerV2 reads these fields off the config object directly, so
-    every attribute it accesses must exist here.
-    """
-
-    max_tokens: "int | None" = None
-    enable_block_reuse: bool = False
-    max_attention_window: "list | None" = None
-    sink_token_length: "int | None" = None
-    free_gpu_memory_fraction: "float | None" = None
-    host_cache_size: "int | None" = None
-    disk_cache_size: "int | None" = None
-    disk_cache_path: "str | None" = None
-    onboard_blocks: bool = True
-    cross_kv_cache_fraction: "float | None" = None
-    secondary_offload_min_priority: "int | None" = None
-    event_buffer_max_size: int = 0
-    kv_cache_event_hash_algo: str = "auto"
-    max_gpu_total_bytes: "int | None" = None
-    enable_partial_reuse: bool = False
-    copy_on_partial_reuse: bool = False
-    dtype: str = "auto"
-    pool_ratio: "list | None" = None
-    avg_seq_len: "int | None" = None
-    block_reuse_policy: str = "all_reusable"
-    enable_swa_scratch_reuse: bool = False
-    disk_prefetch_num_reqs: int = 4
-    max_util_for_resume: float = 0.95
 
 
 def _lookup_model_cls(model_dir):
@@ -287,8 +253,19 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
             except Exception as e:  # noqa: BLE001 - model hooks may need llm_args
                 print(f"[precheck] WARNING: get_model_defaults failed ({e!r}); "
                       f"assuming V1", flush=True)
-        kv_defaults = defaults.get("kv_cache_config") or {}
-        use_v2 = kv_defaults.get("use_kv_cache_manager_v2", False) is True
+        try:
+            # The REAL serving resolver, via the same shim pattern as the
+            # runtime resolution below -- one owner for the 'auto' semantics.
+            from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
+
+            shim = types.SimpleNamespace(
+                kv_cache_config=types.SimpleNamespace(use_kv_cache_manager_v2="auto")
+            )
+            use_v2 = bool(_resolve_kv_cache_manager_v2_auto(shim, defaults))
+        except Exception as e:  # noqa: BLE001 - fall back like a missing model
+            print(f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); "
+                  f"assuming V1", flush=True)
+            use_v2 = False
     else:
         use_v2 = bool(setting)
 
@@ -353,13 +330,18 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
     )
     if use_v2:
         from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-        # is_disagg=True doubles the IndexMapper capacity so in-flight
-        # transfers (TRANS_IN_PROGRESS) can hold slots, like real serving.
+        # The REAL pydantic KvCacheConfig (what serving passes): partial reuse
+        # is pinned off because its pydantic default is True and block reuse
+        # is off here. is_disagg=True doubles the IndexMapper capacity so
+        # in-flight transfers (TRANS_IN_PROGRESS) can hold slots.
         return KVCacheManagerV2(
-            _KvCacheConfigV2(
+            KvCacheConfig(
                 max_tokens=max_tokens,
                 enable_block_reuse=False,
+                enable_partial_reuse=False,
+                copy_on_partial_reuse=False,
                 max_attention_window=[padded_len],
             ),
             cache_type,
@@ -430,11 +412,9 @@ def add_sequence(kvm, req, prompt_len, use_v2):
 
 def free_sequence(kvm, req, use_v2):
     if use_v2:
-        import torch
-
         # free_resources() closes the kv_cache AND releases the IndexMapper
-        # slot (closing the cache alone leaks slots).
-        torch.cuda.current_stream().synchronize()
+        # slot (closing the cache alone leaks slots). Callers synchronize the
+        # stream once per batch before freeing (see _free_all).
         kvm.free_resources(req)
         return
     kvm.impl.remove_sequence(req.py_request_id, req, True)
@@ -461,8 +441,6 @@ def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
     next_report = t0 + 15.0
     while req.state not in terminal:
         xcvr.check_gen_transfer_status(1)
-        if req.state in terminal:
-            break
         now = time.monotonic()
         if now >= next_report:
             print(
@@ -494,14 +472,10 @@ def run_token():
 
 
 def write_addr(path, payload):
-    """Atomically publish an addr file (clearing any stale one first). It
-    carries the session HMAC key, so restrict it to the owning user before
-    it becomes visible."""
+    """Atomically publish an addr file (os.replace overwrites stale ones;
+    readers reject wrong-job stamps). It carries the session HMAC key, so
+    restrict it to the owning user before it becomes visible."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    try:
-        os.remove(path)  # stale file from a previous run in a reused work dir
-    except FileNotFoundError:
-        pass
     payload = dict(payload, job=run_token())
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
@@ -619,7 +593,9 @@ def parse_bandwidth_gbps(csv_dir, rank, tag="recv"):
         with open(path) as f:
             rows = list(csv_mod.DictReader(f))
         col = next((c for c in (rows[0] or {}) if "Bandwidth" in c), None)
-        vals = [float(r[col]) / 8.0 for r in rows if col and r.get(col)]
+        if col is None:
+            return None
+        vals = [float(r[col]) / 8.0 for r in rows if r.get(col)]
         return statistics.median(vals) if vals else None
     except (OSError, ValueError, IndexError, StopIteration):
         return None
@@ -634,7 +610,6 @@ class PrecheckRunner:
     def __init__(self, args, plan, side, comm):
         from mpi4py import MPI  # noqa: F401 - ensures MPI initialized
 
-        self.args = args
         self.plan = plan
         self.side = side
         self.role = side["role"]
@@ -759,13 +734,15 @@ class PrecheckRunner:
         # Params for pair k come from its owning dp rank at pp stage 0 with
         # attention DP; without DP every rank sends the same request, and the
         # instance leader's params are the ones the real server would return.
-        contrib = {}
-        if local_err is None:
-            if self.side["parallel"]["enable_attention_dp"]:
-                if self.mapping.pp_rank == 0:
-                    contrib = {p: r.context_phase_params for p, r in reqs.items()}
-            elif self.is_leader:
-                contrib = {p: r.context_phase_params for p, r in reqs.items()}
+        if self.side["parallel"]["enable_attention_dp"]:
+            contributes = self.mapping.pp_rank == 0
+        else:
+            contributes = self.is_leader
+        contrib = (
+            {p: r.context_phase_params for p, r in reqs.items()}
+            if local_err is None and contributes
+            else {}
+        )
         gathered = self.comm.gather(contrib, root=0)
         params_by_pair = {}
         if self.is_leader and reason is None:
@@ -807,7 +784,11 @@ class PrecheckRunner:
             raise _TransferError(f"ctx transfer failed: {reason}")
 
     def gen_run_chunk(self, peer_idx, li, req_len, rep, chunk, params_by_pair):
-        """Receive + verify owned pairs. Returns (ok, mismatch_detail)."""
+        """Receive + verify owned pairs. Returns (ok, mismatch_detail).
+
+        Warmup reps skip the (CPU-heavy) byte verification: their result is
+        discarded by the caller either way, transfer errors still raise.
+        """
         import torch
 
         import tensorrt_llm
@@ -849,7 +830,7 @@ class PrecheckRunner:
             ]
             if bad:
                 local_err = _TransferError(f"gen DISAGG_TRANS_ERROR on pairs {bad}")
-            elif self.plan["verify_data"]:
+            elif self.plan["verify_data"] and rep >= self.plan["warmup_requests"]:
                 for pair, req in reqs.items():
                     ok, detail = verify_request(self.kvm, req.py_request_id)
                     if not ok:
@@ -866,6 +847,10 @@ class PrecheckRunner:
         return (not mismatches, "; ".join(mismatches[:4]))
 
     def _free_all(self, reqs):
+        if reqs and self.use_v2:
+            import torch
+
+            torch.cuda.current_stream().synchronize()  # V2 frees need quiesced stream
         for req in reqs.values():
             try:
                 free_sequence(self.kvm, req, self.use_v2)
@@ -1039,10 +1024,9 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
         # ZMQ timeout is only a backstop under the per-chunk alarm, so it
         # includes the first-rep wire-up allowance unconditionally.
         if runner.is_leader:
-            import zmq as zmq_mod
-
+            zmq, _ = runner._zmq()
             sock.setsockopt(
-                zmq_mod.RCVTIMEO,
+                zmq.RCVTIMEO,
                 (plan["chunk_timeout_s"] + plan["wireup_timeout_s"] + 30) * 1000,
             )
 
@@ -1122,7 +1106,7 @@ def main(argv=None):
     plan, side = load_plan(args)
 
     if args.dry_run:
-        print(json.dumps({k: v for k, v in plan.items()}, indent=2, default=str))
+        print(json.dumps(plan, indent=2, default=str))
         return 0
     if plan.get("skip"):
         print(f"[precheck] SKIP: {plan['skip_reason']}", flush=True)
@@ -1240,6 +1224,20 @@ def main(argv=None):
             flush=True,
         )
 
+    def record_peer_failure(peer, exc):
+        """Map a per-peer exception to its verdict (isolation: other peers
+        keep running)."""
+        disarm()
+        if isinstance(exc, _Timeout):
+            runner.recorder.record(
+                peer, 0, "TIMEOUT",
+                f"exceeded the budget during {current_cell['what']}",
+            )
+        elif isinstance(exc, _PeerAbort):
+            runner.recorder.record(peer, 0, "TRANSFER_ERROR", str(exc))
+        else:
+            runner.recorder.record(peer, 0, "TRANSFER_ERROR", repr(exc))
+
     # --- sessions -------------------------------------------------------------
     num_peers = side["num_peers"]
     try:
@@ -1268,44 +1266,23 @@ def main(argv=None):
                 try:
                     ctx_serve_peer(
                         runner,
-                        socks.get(gj) if runner.is_leader else None,
+                        socks.get(gj),
                         gj,
                         arm,
                         disarm,
                         keys.get(gj),
                     )
                     runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
-                except _Timeout:
-                    disarm()
-                    runner.recorder.record(
-                        f"gen_{gj}",
-                        0,
-                        "TIMEOUT",
-                        f"exceeded {plan['chunk_timeout_s']}s during {current_cell['what']}",
-                    )
-                except _PeerAbort as e:
-                    disarm()
-                    runner.recorder.record(f"gen_{gj}", 0, "TRANSFER_ERROR", str(e))
                 except Exception as e:  # noqa: BLE001 - per-peer isolation
-                    disarm()
-                    runner.recorder.record(f"gen_{gj}", 0, "TRANSFER_ERROR", repr(e))
+                    record_peer_failure(f"gen_{gj}", e)
         else:
             open_sessions = []
             for ci in range(num_peers):
                 try:
                     sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
                     open_sessions.append((ci, sock, sess_key))
-                except _Timeout:
-                    disarm()
-                    runner.recorder.record(
-                        f"ctx_{ci}",
-                        0,
-                        "TIMEOUT",
-                        f"exceeded {plan['chunk_timeout_s']}s during {current_cell['what']}",
-                    )
                 except Exception as e:  # noqa: BLE001 - per-peer isolation
-                    disarm()
-                    runner.recorder.record(f"ctx_{ci}", 0, "TRANSFER_ERROR", repr(e))
+                    record_peer_failure(f"ctx_{ci}", e)
             # Deferred "done": released only after EVERY ctx peer's schedule
             # finished, so all ctx instances stay alive for the whole
             # precheck (real-serving lifecycle -- no dead-agent connections
@@ -1313,14 +1290,8 @@ def main(argv=None):
             for ci, sock, sess_key in open_sessions:
                 try:
                     gen_release_peer(runner, ci, sock, sess_key, arm, disarm)
-                except _Timeout:
-                    disarm()
-                    runner.recorder.record(
-                        f"ctx_{ci}", 0, "TIMEOUT", "releasing session (deferred done)"
-                    )
                 except Exception as e:  # noqa: BLE001 - best-effort release
-                    disarm()
-                    runner.recorder.record(f"ctx_{ci}", 0, "TRANSFER_ERROR", repr(e))
+                    record_peer_failure(f"ctx_{ci}", e)
     finally:
         disarm()
         hang_detector.stop()
