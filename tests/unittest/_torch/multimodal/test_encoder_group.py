@@ -152,3 +152,23 @@ class TestReorderEmbedsByManifest:
         out = _reorder_embeds_by_manifest([mp], per_modality_embeds, per_modality_lengths)
         expected = torch.tensor([7.0] * 2 + [9.0] * 3)
         assert torch.equal(out[:, 0], expected)
+
+    def test_empty_bookkeeping_returns_typed_empty(self):
+        # Mirrors the executor KV-cache profiling pass: the dummy batch runs the
+        # encoder but carries no ``multimodal_embedding_lengths``, so per-modality
+        # lengths are empty and the sliced embeds are zero-row. Reorder must
+        # return a correctly-typed empty tensor, not crash on ``torch.cat([])``.
+        mp = _mp(buckets={"image": {}})  # modality present, no manifest, no lengths
+        hidden = 5
+        per_modality_embeds = {"image": torch.empty((0, hidden), dtype=torch.float16)}
+        per_modality_lengths = {"image": []}
+        out = _reorder_embeds_by_manifest([mp], per_modality_embeds, per_modality_lengths)
+        assert out.shape == (0, hidden)
+        assert out.dtype == torch.float16
+
+    def test_no_embeds_returns_empty(self):
+        # Defensive: no group produced embeddings at all — return an empty
+        # tensor rather than crashing.
+        mp = _mp(buckets={})
+        out = _reorder_embeds_by_manifest([mp], {}, {})
+        assert out.numel() == 0
