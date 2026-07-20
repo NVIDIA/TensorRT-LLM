@@ -20,6 +20,7 @@ from io import BytesIO
 from typing import Optional
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from fastapi.testclient import TestClient
@@ -63,10 +64,13 @@ def _assert_llm_envelope(
 def _require_opencv():
     """Skip unless OpenCV is installed (the shared optional video decoder).
 
-    These tests drive ``is_video_file``, which decodes references via
-    OpenCV (the same optional dep the multimodal video path uses). ``cv2`` ships
-    in no CI image, so this ``importorskip``-s it and returns the module for
-    tests that synthesize a clip with ``cv2.VideoWriter``.
+    These tests drive ``is_video_file``, which decodes references via OpenCV
+    (the same optional dep the multimodal video path uses). CI installs
+    ``opencv-python-headless`` in every test stage (``jenkins/L0_Test.groovy``),
+    so these tests always run there; the skip only spares bare local
+    environments, where cv2 stays optional (kept out of requirements by the
+    dependency policy). Returns the module for tests that synthesize a clip
+    with ``cv2.VideoWriter``.
     """
     return pytest.importorskip("cv2")
 
@@ -861,7 +865,6 @@ class TestVideoGenerationSync:
         synthesized in-test with OpenCV — no video asset ships with the repo.
         """
         cv2 = _require_opencv()
-        np = pytest.importorskip("numpy")
         ref_path = tmp_path / "ref.mp4"
         # mp4v is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
         writer = cv2.VideoWriter(str(ref_path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))

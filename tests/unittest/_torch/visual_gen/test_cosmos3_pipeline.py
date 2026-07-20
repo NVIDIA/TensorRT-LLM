@@ -33,6 +33,7 @@ from types import SimpleNamespace
 os.environ["TLLM_DISABLE_MPI"] = "1"
 os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 
+import numpy as np
 import PIL.Image
 import pytest
 import torch
@@ -583,13 +584,13 @@ class TestNormalizeVideoInputContentDispatch:
 
     The serve path stores references with no type-suffix, so decode dispatch
     must key on the container, not the filename. CPU-only; the clip is
-    synthesized with OpenCV (``cv2`` ships in no CI image → importorskip).
+    synthesized with OpenCV (installed by CI test stages via
+    ``jenkins/L0_Test.groovy``; the importorskip only spares bare local envs).
     """
 
     @staticmethod
     def _write_mp4(path, num_frames: int = 3) -> None:
         cv2 = pytest.importorskip("cv2")
-        np = pytest.importorskip("numpy")
         writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
         try:
             for _ in range(num_frames):
