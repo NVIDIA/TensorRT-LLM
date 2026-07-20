@@ -4713,24 +4713,42 @@ class GvrTopKKernel:
                 s_active_cnt[2] = cutlass.Int32(0)  # dropped-rung mask
 
         # ---- Phase 1: preIdx Min/Max/Mean ----
-        self.phase1_preidx_stats(
-            input_row,
-            N,
-            pre_idx_row,
-            pre_idx_count,
-            pre_idx_offset,
-            smem_wmin,
-            smem_wmax,
-            smem_wsum,
-            smem_wcnt_p1,
-            s_thr,
-            s_iscalars,
-            tidx,
-            warp_id,
-            lane,
-            smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
-            s_mt_thr=s_mt_thr,  # r0_vseed: park pmean in the last rung column
-        )
+        # ext counts: P1's only surviving products are the [v_lo, v_hi]
+        # outer bracket and the scalar state init — the ext rungs provide
+        # the bracket directly (host contract: t_0 < t_2, finite, all rows
+        # valid), so the preIdx gather is skipped wholesale. A miss whose
+        # target lies outside [t_0, t_2] recovers via the refine loop's
+        # 8x bracket expansion (same fail-soft as the stock path).
+        if cutlass.const_expr(self.use_ext_counts):
+            if tidx == cutlass.Int32(0):
+                s_thr[0] = seed_thr_row[1]
+                s_thr[1] = seed_thr_row[0]
+                s_thr[2] = seed_thr_row[2]
+                s_iscalars[0] = cutlass.Int32(0)  # cand_count
+                s_iscalars[1] = cutlass.Int32(0)  # done
+                s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb seeding owns)
+                s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
+                s_iscalars[4] = cutlass.Int32(0)  # out_count
+            cute.arch.barrier()
+        if cutlass.const_expr(not self.use_ext_counts):
+            self.phase1_preidx_stats(
+                input_row,
+                N,
+                pre_idx_row,
+                pre_idx_count,
+                pre_idx_offset,
+                smem_wmin,
+                smem_wmax,
+                smem_wsum,
+                smem_wcnt_p1,
+                s_thr,
+                s_iscalars,
+                tidx,
+                warp_id,
+                lane,
+                smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
+                s_mt_thr=s_mt_thr,  # r0_vseed: park pmean in the last rung column
+            )
 
         # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
         # When preIdx values produce an unusable bracket (e.g. all -inf or
