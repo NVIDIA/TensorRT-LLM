@@ -765,10 +765,10 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations. The encoder branch lives in ``_executor_loop`` only;
-        # ``_executor_loop_overlap`` has not been threaded yet. Reject
-        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
-        # is intentionally out of scope for this port).
+        # iterations in both executor loops. PP usage is very rare for these
+        # models, so encoder PP send/recv support is not implemented in the
+        # PyTorch path for now. Reject pp_size > 1.
+        # TODO: Add support for pp + encoder models
         is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
@@ -778,11 +778,6 @@ class PyExecutor:
                     "pp_size > 1 is not supported for encoder-decoder models "
                     "in the PyTorch flow; encoder send/recv hooks are out of "
                     "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models. Set disable_overlap_scheduler=True for "
-                    "encoder-decoder runs.")
             if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
                        False):
                 raise NotImplementedError(
@@ -2584,6 +2579,9 @@ class PyExecutor:
                     f'{scheduled_batch.num_generation_requests} generation requests'
                 )
 
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
+
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
@@ -3207,8 +3205,17 @@ class PyExecutor:
                 scheduled_batch.batch_size, self.model_engine.max_draft_len)
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
+            rejection_on = getattr(self.model_engine.spec_config,
+                                   "use_rejection_sampling", False)
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
+                # One-model rejection: a gen request entering with 0 real draft
+                # tokens produced no draft-prob scatter for its slot last iter,
+                # so next iter's rejection kernel would read a stale draft_probs
+                # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
+                # one-hot placeholder row after spec_metadata.prepare().
+                request.py_needs_onehot_draft_probs = (
+                    rejection_on and current_num_draft_tokens == 0)
                 if spec_dec_mode.is_pard():
                     # special case: PARD carries 2K-1 draft tokens per request
                     runtime_draft_token_buffer_width = (
@@ -4446,6 +4453,9 @@ class PyExecutor:
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
+
+                if scheduled_batch.encoder_requests:
+                    self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(

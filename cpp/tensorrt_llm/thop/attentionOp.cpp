@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -1123,7 +1124,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const is_fp4_out = out_dtype == torch::kUInt8;
 
     RunnerPtr runner;
-    if (dtype == nvinfer1::DataType::kHALF)
+    if (dtype == tensorrt_llm::DataType::kHALF)
     {
         if (is_fp8_out)
         {
@@ -1139,13 +1140,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             runner = std::make_shared<Runner<half>>();
         }
     }
-    else if (dtype == nvinfer1::DataType::kFLOAT)
+    else if (dtype == tensorrt_llm::DataType::kFLOAT)
     {
         TLLM_CHECK(out_dtype == torch::kFloat32);
         runner = std::make_shared<Runner<float>>();
     }
 #ifdef ENABLE_BF16
-    else if (dtype == nvinfer1::DataType::kBF16)
+    else if (dtype == tensorrt_llm::DataType::kBF16)
     {
         if (is_fp8_out)
         {
@@ -1168,7 +1169,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
     auto op = std::make_shared<AttentionOp>();
     op->mType = dtype;
-    op->mFMHAForceFP32Acc = dtype == nvinfer1::DataType::kBF16;
+    op->mFMHAForceFP32Acc = dtype == tensorrt_llm::DataType::kBF16;
     op->mLayerIdx = local_layer_idx;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
@@ -1431,7 +1432,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     }
 
     auto op = std::make_shared<AttentionOp>();
-    op->mType = nvinfer1::DataType::kHALF;
+    op->mType = tensorrt_llm::DataType::kHALF;
     op->mNumHeads = num_heads;
     op->mNumKVHeads = num_kv_heads;
     op->mHeadSize = head_size;

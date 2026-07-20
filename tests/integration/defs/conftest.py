@@ -39,6 +39,14 @@ import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
+# Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
+# non-top-level conftest: a repo-root invocation like `pytest tests` loads
+# this file as a NESTED conftest and would fail collection; and not via "-p"
+# in pytest.ini addopts, which imports at preparse, before the ini pythonpath
+# entries are usable). The wrappers below forward to the plugin; hooks are
+# idempotent, so a repo-root run that also dispatches from tests/conftest.py
+# is harmless.
+from test_common import session_prefetcher_hooks as _prefetch_hooks
 
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
@@ -676,12 +684,13 @@ def custom_user_workspace(request):
 
 
 @pytest.fixture(scope="session")
-def llm_venv(llm_root, custom_user_workspace):
+def llm_venv(request, llm_root, custom_user_workspace):
     workspace_dir = custom_user_workspace
     subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
     if workspace_dir is None:
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
+    keep_workspace = request.config.getoption("--keep-workspace", default=False)
     from defs.local_venv import PythonVenvRunnerImpl
 
     venv = PythonVenvRunnerImpl("", "", "python3",
@@ -689,11 +698,11 @@ def llm_venv(llm_root, custom_user_workspace):
     yield venv
     # Remove the workspace directory
     if os.path.exists(workspace_dir):
-        print(f"Cleaning up workspace: {workspace_dir}")
-        try:
-            shutil.rmtree(workspace_dir)
-        except Exception as e:
-            print(f"Failed to clean up workspace: {e}")
+        if keep_workspace:
+            print(f"Keeping workspace (--keep-workspace): {workspace_dir}")
+        else:
+            print(f"Cleaning up workspace: {workspace_dir}")
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -2075,6 +2084,13 @@ def pytest_addoption(parser):
         "By default, GPU clock locking is disabled.",
     )
     parser.addoption(
+        "--keep-workspace",
+        action="store_true",
+        default=False,
+        help=
+        "Skip workspace cleanup at session end (useful for inspecting logs after a failure).",
+    )
+    parser.addoption(
         "--periodic-save-unfinished-test",
         action="store_true",
         default=False,
@@ -2187,6 +2203,7 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    _prefetch_hooks.pytest_configure(config)
     os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
 
     # avoid thread leak of tqdm's TMonitor
@@ -2580,15 +2597,6 @@ def pytest_runtest_protocol(item, nextitem):
 
 
 @pytest.fixture(scope="function")
-def deterministic_test_root(llm_root, llm_venv):
-    "Get deterministic test root"
-    deterministic_root = os.path.join(llm_root,
-                                      "tests/integration/defs/deterministic")
-
-    return deterministic_root
-
-
-@pytest.fixture(scope="function")
 def disaggregated_test_root(llm_root, llm_venv):
     "Get disaggregated test root"
     disaggregated_root = os.path.join(llm_root,
@@ -2658,3 +2666,11 @@ def torch_empty_cache() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
+
+
+def pytest_runtest_setup(item):
+    _prefetch_hooks.pytest_runtest_setup(item)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

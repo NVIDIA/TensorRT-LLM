@@ -561,9 +561,10 @@
     {
       "allowed_values": [
         "all_reusable",
-        "per_request"
+        "per_request",
+        "per_conversation"
       ],
-      "annotation": "Literal['all_reusable', 'per_request']",
+      "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_policy"
@@ -971,6 +972,13 @@
       "converter": "",
       "kind": "value",
       "path": "moe_tensor_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "multimodal_config.encoder_cache_max_bytes"
     },
     {
       "allowed_values": [],
@@ -1601,9 +1609,17 @@
       "path": "speculative_config.begin_thinking_phase_token"
     },
     {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.block_size"
+    },
+    {
       "allowed_values": [
         "AUTO",
         "DFlash",
+        "DSpark",
         "Draft_Target",
         "Eagle3",
         "Eagle",
@@ -1707,6 +1723,24 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.is_use_oldest"
+    },
+    {
+      "allowed_values": [
+        "vanilla",
+        "gated",
+        "rnn"
+      ],
+      "annotation": "Optional[Literal['vanilla', 'gated', 'rnn']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.markov_head_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.markov_rank"
     },
     {
       "allowed_values": [],

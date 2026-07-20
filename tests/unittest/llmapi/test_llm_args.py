@@ -34,6 +34,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -239,6 +240,145 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
     assert any(
         "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3" in m
         for m in warnings_seen)
+
+
+def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.block_size == 5
+
+
+def test_dspark_block_size_must_match_max_draft_len(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 4}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    with pytest.raises(ValueError, match="block_size must equal max_draft_len"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
+    # When the user leaves target_layer_ids unset, the checkpoint's ordered
+    # dspark_target_layer_ids must be adopted verbatim.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [3, 1, 2]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    # Order is preserved (projection columns are order-dependent).
+    assert args.speculative_config.target_layer_ids == [3, 1, 2]
+
+
+def test_dspark_target_layer_ids_matching_override_accepted(tmp_path):
+    # An explicit override that matches the checkpoint list exactly is fine.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2, 3])
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.target_layer_ids == [1, 2, 3]
+
+
+def test_dspark_target_layer_ids_mismatched_count_rejected(tmp_path):
+    # A different number of layers would mismatch main_proj.in_features.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_same_count_different_layers_rejected(tmp_path):
+    # Same count but different layers: shapes line up, but the draft would see
+    # hidden states it was not trained on, so this must be rejected too.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2, 4])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
+    # Same set but different order: projection columns are order-dependent, so a
+    # reordered override must be rejected rather than silently accepted.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[3, 2, 1])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_requires_speculative_model():
+    # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
+    # unset speculative_model must fail fast at config validation instead of
+    # raising an opaque TypeError deep inside engine construction.
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5)
+
+    with pytest.raises(ValueError,
+                       match="requires speculative_config.speculative_model"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_requires_positive_max_draft_len(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(speculative_model=str(tmp_path))
+
+    with pytest.raises(ValueError, match="max_draft_len must be > 0"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
 
 
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
@@ -461,6 +601,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    assert (KvCacheConfig(block_reuse_policy="per_conversation").
+            block_reuse_policy == "per_conversation")
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
 
@@ -523,6 +665,7 @@ class TestMultimodalConfig:
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
+        assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -530,12 +673,36 @@ class TestMultimodalConfig:
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
+        assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.video_pruning_rate is None
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, 0),
+            ("0", 0),
+            ("4KB", 4 * 1024),
+            ("512MB", 512 * 1024**2),
+            ("1GB", 1024**3),
+            ("1GiB", 1024**3),
+            ("2TB", 2 * 1024**4),
+        ],
+    )
+    def test_encoder_cache_max_bytes_parses_binary_units(self, value, expected):
+        config = MultimodalConfig(encoder_cache_max_bytes=value)
+        assert config.encoder_cache_max_bytes == expected
+
+    @pytest.mark.parametrize("value", ["-1", "1.5GB", "1XB", "GB", object()])
+    def test_encoder_cache_max_bytes_rejects_invalid_values(self, value):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(encoder_cache_max_bytes=value)
+
     def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
-        args = TorchLlmArgs(
-            model=llama_model_path,
-            multimodal_config=MultimodalConfig(encoder_side_stream_max_ahead=2))
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                encoder_side_stream_max_ahead=2,
+                                encoder_cache_max_bytes=0,
+                            ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
@@ -575,6 +742,7 @@ class TestMultimodalConfig:
             model=llama_model_path,
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
+                "encoder_cache_max_bytes": 0,
                 "video_pruning_rate": 0.5,
             },
         )
@@ -592,7 +760,15 @@ class TestMultimodalConfig:
                         }
                     },
                     "encoder_side_stream_max_ahead": 1,
+                    "encoder_cache_max_bytes": 0,
                 },
+            )
+
+    def test_encoder_cache_and_side_stream_max_ahead_are_exclusive(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            MultimodalConfig(
+                encoder_cache_max_bytes="1MiB",
+                encoder_side_stream_max_ahead=1,
             )
 
 
@@ -1005,9 +1181,13 @@ class TestExplicitCliKeysPrecedence:
 
     def test_multimodal_config_yaml_siblings_preserved(self):
         base = {
-            "model": "dummy",
+            "model":
+            "dummy",
             "multimodal_config":
-            MultimodalConfig(encoder_side_stream_max_ahead=2),
+            MultimodalConfig(
+                encoder_side_stream_max_ahead=2,
+                encoder_cache_max_bytes=0,
+            ),
         }
         yaml_dict = {
             "multimodal_config": {
@@ -1021,9 +1201,13 @@ class TestExplicitCliKeysPrecedence:
 
     def test_multimodal_config_null_yaml_preserves_base_config(self):
         base = {
-            "model": "dummy",
+            "model":
+            "dummy",
             "multimodal_config":
-            MultimodalConfig(encoder_side_stream_max_ahead=2),
+            MultimodalConfig(
+                encoder_side_stream_max_ahead=2,
+                encoder_cache_max_bytes=0,
+            ),
         }
         yaml_dict = {"multimodal_config": None}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
@@ -1326,18 +1510,19 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
        is True (and stays `None` otherwise). The fixed list keeps the
        capture set small to bound startup time and CUDA graph memory;
-       the model-engine filter (invariants 2 and 3) ensures the largest
-       reachable size is always captured even when it is not in this
-       default list.
+       the model-engine filter (invariants 2 and 3) clamps out-of-range
+       entries to the reachable ceiling and never invents sizes beyond
+       this list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
-    3. The reachable ceiling itself is always present in the returned
-       capture set (when positive), so runtime ISLs in the gap between
-       the next-largest candidate and the ceiling get a graph rather
-       than falling back to eager.
+    3. Candidates above the reachable ceiling are clamped down to the
+       ceiling (a requested 128 becomes 127), and no size beyond the
+       user's list is ever invented (an appended far ceiling would make
+       runtime padding execute the full ceiling shape for every
+       iteration in the gap).
     """
 
     _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
@@ -1394,14 +1579,50 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         )
         assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
 
-    def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
-        """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
+    def test_piecewise_filter_never_invents_far_ceiling(self):
+        """A ceiling far above the largest candidate is NOT added.
 
-        Without the cap, the warmup loop would silently skip these entries
-        and the outer padding logic would pad to a target with no captured
-        graph. They must be removed from `kept` and surfaced in
-        `unrecordable` so the warning fires. The ceiling itself is then
-        appended so ISLs in the gap still get a graph.
+        Runtime padding rounds each iteration up to the nearest captured
+        size, so an invented far ceiling (e.g. 65536 over a list topping
+        out at 13914) would make every iteration in the gap execute the
+        full ceiling shape. The filter must never invent sizes the user
+        did not request.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = [512, 1024, 2048, 4096, 8192, 13914]
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=65536,
+            max_batch_size=896,
+            max_seq_len=32768,
+        )
+        assert kept == candidates
+        assert unrecordable == []
+
+    def test_piecewise_filter_clamps_multiple_oversized_candidates(self):
+        """All above-ceiling candidates collapse to one ceiling entry."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            [64, 120, 128, 200, 256],
+            max_num_tokens=256,
+            max_batch_size=1,
+            max_seq_len=128,
+        )
+        # Ceiling: 1 * (128 - 1) = 127; 128/200/256 clamp to 127, deduped.
+        assert kept == [64, 120, 127]
+        assert unrecordable == [128, 200, 256]
+
+    def test_piecewise_filter_clamps_entries_above_reachable_ceiling(self):
+        """Clamp candidates above `max_batch_size * (max_seq_len - 1)`.
+
+        Entries above the ceiling cannot be recorded by the warmup loop;
+        they are clamped down to the ceiling and surfaced in
+        `unrecordable` so the warning fires. ISLs in the gap still get a
+        graph at the nearest recordable size.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -1459,9 +1680,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
         Drafting loops consume extra decode steps; the filter must mirror
         the `max_seq_len - 1 - num_extra_decoding_steps` constraint
-        applied when warmup requests are built. The ceiling is appended
-        whenever it is strictly greater than the largest surviving
-        candidate.
+        applied when warmup requests are built. Candidates above the
+        reduced ceiling are clamped down to it; nothing is appended.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -1475,7 +1695,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_seq_len=128,
             num_extra_decoding_steps=5,
         )
-        assert kept[-1] == 122
+        assert kept[-1] == 120  # nothing above the 122 ceiling to clamp
         assert 120 in kept
         assert unrecordable == []
         # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
@@ -1523,9 +1743,12 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert kept == []
         assert unrecordable == [1, 2, 4]
 
-    def test_piecewise_filter_appends_ceiling_when_only_smaller_candidates(
-            self):
-        """No candidate near the ceiling -> ceiling still appended."""
+    def test_piecewise_filter_keeps_small_candidates_unchanged(self):
+        """No candidate above the ceiling -> the list is used as-is.
+
+        The ceiling (1016 here) is not appended; iterations above the
+        largest candidate run eagerly at their true size.
+        """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
 
@@ -1535,8 +1758,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_batch_size=8,
             max_seq_len=128,
         )
-        # Ceiling: 8 * (128 - 1) = 1016.
-        assert kept == [1, 2, 4, 8, 1016]
+        # Ceiling: 8 * (128 - 1) = 1016 -- far above max candidate 8.
+        assert kept == [1, 2, 4, 8]
 
 
 class TestTorchLlmArgs:
