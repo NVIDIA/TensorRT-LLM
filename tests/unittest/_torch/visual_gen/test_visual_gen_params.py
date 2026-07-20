@@ -760,6 +760,48 @@ class TestRequestValidation:
         req = self._make_request(extra_params={"stg_scale": 0.5})
         self._merge_and_validate(executor, req)  # should not raise
 
+    def test_spec_validator_runs_at_preflight(self):
+        """Per-param validators turn deterministic client errors into 400s at
+        the boundary instead of worker-side failures (Cosmos3 conditioning)."""
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def _validate(extras):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params=extras),
+                declared_defaults={},
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
+        # Valid values pass.
+        _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
+        _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _validate({"condition_video_latent_indexes": [0, -1]})
+        with pytest.raises(ValueError, match="must not be empty"):
+            _validate({"condition_video_latent_indexes": []})
+        with pytest.raises(ValueError, match="first or last"):
+            _validate({"condition_video_keep": "middle"})
+        with pytest.raises(ValueError, match=r"\[T, H, W, C\]"):
+            _validate({"video": torch.zeros(4, 4, 3, dtype=torch.uint8)})  # 3-D
+        with pytest.raises(ValueError, match="uint8"):
+            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.float32)})
+
+    def test_spec_validators_survive_pickling(self):
+        """Specs travel worker -> coordinator in the READY handshake (pickled
+        over ZMQ); validators must be module-level functions so they serialize
+        by reference — a lambda/closure here would crash worker startup."""
+        import pickle
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
+        with pytest.raises(ValueError, match="first or last"):
+            specs["condition_video_keep"].validator("middle")
+
     # --- unsupported universal fields ---
 
     def test_num_frames_on_image_pipeline_raises(self):

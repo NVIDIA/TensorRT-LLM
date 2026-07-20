@@ -36,11 +36,11 @@ from tensorrt_llm.logger import logger
 
 from .defaults import (
     COSMOS3_720P_PARAMS,
-    COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
-    COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
     COSMOS3_T2I_PARAMS,
+    _normalize_condition_video_keep,
+    _normalize_condition_video_latent_indexes,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
@@ -62,34 +62,11 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
-def _normalize_condition_video_latent_indexes(
-    indexes: Iterable[int] | None,
-) -> tuple[int, ...]:
-    if indexes is None:
-        return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
-    normalized = tuple(int(index) for index in indexes)
-
-    if not normalized:
-        raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
-    if any(index < 0 for index in normalized):
-        raise ValueError(
-            f"Cosmos3 condition_video_latent_indexes must be non-negative, got {normalized}."
-        )
-    return normalized
-
-
 def _condition_pixel_frame_count(
     condition_video_latent_indexes: Iterable[int],
     temporal_compression: int,
 ) -> int:
     return max(condition_video_latent_indexes) * int(temporal_compression) + 1
-
-
-def _normalize_condition_video_keep(keep: str | None) -> str:
-    normalized = str(keep or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
-    if normalized not in {"first", "last"}:
-        raise ValueError("Cosmos3 condition_video_keep must be either first or last.")
-    return normalized
 
 
 @register_pipeline(
@@ -763,7 +740,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
-        video: torch.Tensor | None = None, # uint8 [T, H, W, C, dtype=uint8]
+        video: torch.Tensor | None = None,  # [T, H, W, C, dtype=uint8]
         condition_video_latent_indexes: Iterable[int] | None = None,
         condition_video_keep: str | None = None,
         flow_shift: Optional[float] = None,

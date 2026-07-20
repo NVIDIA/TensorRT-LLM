@@ -17,7 +17,9 @@
 Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 """
 
-from typing import Dict
+from typing import Dict, Iterable
+
+import torch
 
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
@@ -37,6 +39,47 @@ COSMOS3_720P_PARAMS = {
 
 COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES = (0, 1)
 COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
+
+
+# ---------------------------------------------------------------------------
+# Conditioning-value normalizers / validators. Declared as the ``validator``
+# of the matching extra-param specs below, so invalid values 400 at preflight;
+# the pipeline reuses them at run time to normalize the same inputs.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_condition_video_latent_indexes(
+    indexes: Iterable[int] | None,
+) -> tuple[int, ...]:
+    if indexes is None:
+        return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
+    normalized = tuple(int(index) for index in indexes)
+
+    if not normalized:
+        raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
+    if any(index < 0 for index in normalized):
+        raise ValueError(
+            f"Cosmos3 condition_video_latent_indexes must be non-negative, got {normalized}."
+        )
+    return normalized
+
+
+def _normalize_condition_video_keep(keep: str | None) -> str:
+    normalized = str(keep or COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP).strip().lower()
+    if normalized not in {"first", "last"}:
+        raise ValueError("Cosmos3 condition_video_keep must be either first or last.")
+    return normalized
+
+
+def _validate_video_reference_tensor(video: torch.Tensor) -> None:
+    if video.ndim != 4 or video.shape[-1] != 3:
+        raise ValueError(
+            f"Cosmos3 video reference must be a uint8 [T, H, W, C] RGB tensor, "
+            f"got shape {tuple(video.shape)}."
+        )
+    if video.dtype != torch.uint8:
+        raise ValueError(f"Cosmos3 video reference must have dtype uint8, got {video.dtype}.")
+
 
 # Fields merged by the executor for every request. Modality-specific values
 # (height/width/num_frames/steps/guidance) are declared with ``None`` so the
@@ -104,11 +147,13 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "pixel frames, so the worker consumes the first (or last, per "
             "condition_video_keep) max(indexes)*4+1 reference frames."
         ),
+        validator=_normalize_condition_video_latent_indexes,
     ),
     "condition_video_keep": ExtraParamSchema(
         type="str",
         default=COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
         description="Which side of the input video to use for conditioning: first or last.",
+        validator=_normalize_condition_video_keep,
     ),
     "flow_shift": ExtraParamSchema(
         type="float",
@@ -126,5 +171,6 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "condition_video_latent_indexes / condition_video_keep and "
             "VAE-encodes it; media is always decoded by the producer."
         ),
+        validator=_validate_video_reference_tensor,
     ),
 }
