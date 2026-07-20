@@ -1368,6 +1368,15 @@ class KVCacheManager(BaseResourceManager):
         window_size = self._resolve_window_size(window_size)
         return self.impl.get_priority_by_block_id(block_id, window_size)
 
+    def get_memory_pool_block_indices(self, block_ids: List[int], *,
+                                      window_size: int) -> List[int]:
+        # Translate logical block IDs to primary-pool slot indices. With host offload enabled,
+        # a block's ID and its current pool slot can diverge after an offload/onboard cycle.
+        # Every referenced block must be primary (asserted in C++): callers do primary-pool
+        # pointer arithmetic and the returned index carries no residency information.
+        return self.impl.get_memory_pool_block_indices(list(block_ids),
+                                                       window_size)
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -2164,9 +2173,13 @@ class KVCacheManager(BaseResourceManager):
     def pin_blocks(self, request_id: int):
         self.impl.pin_blocks(request_id)
 
-    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
-                                 request_ids: List[int], beam_width: int,
-                                 num_context: int, num_seqs: int):
+    def copy_batch_block_offsets(self,
+                                 dst_tensor: torch.Tensor,
+                                 request_ids: List[int],
+                                 beam_width: int,
+                                 num_context: int,
+                                 num_seqs: int,
+                                 max_blocks: Optional[int] = None):
         # Fill the persistent host buffer in place, exactly as before. CPU-side
         # consumers read self.host_kv_cache_block_offsets directly and depend on
         # its persistent, max_batch-sized layout: DSA sparse attention, the
@@ -2232,23 +2245,39 @@ class KVCacheManager(BaseResourceManager):
         # matching the already-safe kv_lens / block_ids_per_seq staging. The
         # persistent buffer above is untouched by this and stays valid for the
         # synchronous CPU readers.
-        host_block_offsets = self._stage_block_offsets_for_copy(num_seqs)
+        host_block_offsets = self._stage_block_offsets_for_copy(
+            num_seqs, max_blocks)
+        width = host_block_offsets.shape[-1]
         for pool_idx in range(self.num_pools):
-            dst_tensor[pool_idx, :num_seqs].copy_(host_block_offsets[pool_idx],
-                                                  non_blocking=True)
+            dst_tensor[pool_idx, :num_seqs, :, :width].copy_(
+                host_block_offsets[pool_idx], non_blocking=True)
 
-    def _stage_block_offsets_for_copy(self, num_rows: int) -> torch.Tensor:
+    def _stage_block_offsets_for_copy(
+            self,
+            num_rows: int,
+            max_blocks: Optional[int] = None) -> torch.Tensor:
         """Snapshot the first ``num_rows`` rows of the persistent host block
         offset buffer into a fresh pinned buffer, to serve as the private source
-        of an asynchronous H2D copy (nvbug 6293536)."""
+        of an asynchronous H2D copy (nvbug 6293536).
+
+        ``max_blocks`` bounds the copied block width. The buffer is laid out
+        for max_seq_len (max_blocks_per_seq columns) but consumers only read
+        each sequence's allocated block prefix, so a caller that knows the
+        batch's maximum KV length can skip the unused tail — with a large
+        max_seq_len the tail dominates the copy cost."""
+        if max_blocks is None:
+            width = self.max_blocks_per_seq
+        else:
+            width = min(max(max_blocks, 1), self.max_blocks_per_seq)
         host_block_offsets = torch.empty(self.num_pools,
                                          num_rows,
                                          2,
-                                         self.max_blocks_per_seq,
+                                         width,
                                          dtype=torch.int32,
                                          pin_memory=prefer_pinned(),
                                          device='cpu')
-        host_block_offsets.copy_(self.host_kv_cache_block_offsets[:, :num_rows])
+        host_block_offsets.copy_(
+            self.host_kv_cache_block_offsets[:, :num_rows, :, :width])
         return host_block_offsets
 
     def truncate_blocks(self, target_tokens: List[int],

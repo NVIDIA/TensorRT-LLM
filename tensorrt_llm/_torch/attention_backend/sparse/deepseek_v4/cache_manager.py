@@ -314,14 +314,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)
 
         model_layer_idx, attn_type = layer_semantics
-        attr = self.impl._storage.get_buffer_attr(layer_id, role)
-        pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
-        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
         return (
             f"deepseek_role={attn_type.name}, "
             f"compress_ratio={self._compress_ratios[model_layer_idx]}, "
-            f"pool_group_id={int(pool_group_id)}, "
-            f"lifecycle_id={int(attr.life_cycle_id)}, lifecycle={lifecycle}"
+            f"{super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)}"
         )
 
     def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
@@ -892,7 +888,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # the typical step. An all-generation typical_step over-provisions the
             # compressed-cache pool at the expense of the SWA pool, starving the
             # SWA pool and artificially capping the achievable batch size.
-            ctx_capacity = max_num_tokens if max_num_tokens is not None else typical_seq_len
+            ctx_capacity = (
+                max_num_tokens if max_num_tokens is not None else typical_seq_len
+            ) + self.num_extra_kv_tokens
             generation_history_length = max(0, typical_seq_len - max_draft_len - 1)
             typical_step = BatchDesc(
                 kv_caches=[
@@ -938,7 +936,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             enable_partial_reuse=kv_cache_config.enable_partial_reuse,
@@ -1306,8 +1303,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ) -> None:
-        """For compatibility with AttentionOp, copy only the SWA block offsets."""
+        """For compatibility with AttentionOp, copy only the SWA block offsets.
+
+        max_blocks is accepted for signature parity with KVCacheManager; the
+        copy below is already bounded by the precomputed SWA table width.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
         dst_tensor.fill_(BAD_PAGE_INDEX)

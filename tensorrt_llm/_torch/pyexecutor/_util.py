@@ -46,6 +46,7 @@ from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..utils import is_gdn_replay_enabled
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
                            is_hybrid_linear, is_mla, is_nemotron_hybrid,
                            is_qwen3_hybrid)
@@ -581,6 +582,10 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
+        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
+        # nothing to profile.
+        if getattr(self._model_engine.model, "mm_encoder", object()) is None:
+            return []
         input_processor = self._model_engine.input_processor
         _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
         # Modality-agnostic: the model declares each modality's per-item token
@@ -627,6 +632,21 @@ class KvCacheCreator:
         with torch.inference_mode():
             return self._model_engine.model.encode_multimodal_inputs(
                 self._dummy_encoder_inputs)
+
+    def _reserve_multimodal_encoder_cache_memory(
+        self,
+        peak_memory: int,
+    ) -> int:
+        """Reserve encoder-cache capacity when the model implements that cache."""
+        model = self._model_engine.model
+        if (not isinstance(model, MultimodalModelMixin)
+                or not model.supports_encoder_cache):
+            return peak_memory
+
+        multimodal_config = model.model_config.multimodal_config
+        if multimodal_config is None:
+            return peak_memory
+        return peak_memory + multimodal_config.encoder_cache_max_bytes
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -875,6 +895,14 @@ class KvCacheCreator:
             peak_memory = total_used_bytes
             allocated_bytes = 0
             activation_bytes = 0
+
+        peak_memory_without_encoder_cache = peak_memory
+        peak_memory = self._reserve_multimodal_encoder_cache_memory(peak_memory)
+        if peak_memory != peak_memory_without_encoder_cache:
+            mem_gb = (peak_memory - peak_memory_without_encoder_cache) / GB
+            logger.info(
+                f"Reserving {mem_gb:.2f} GiB for the multimodal encoder cache while estimating KV cache "
+                "capacity.", )
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
@@ -1960,6 +1988,47 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             quant_config=quant_config,
         )
+
+        # Replay state update for GDN MTP: mirrors the nemotron_hybrid gating
+        # above, minus the Mamba2-specific stochastic-rounding/Philox gate.
+        # The GDN replay kernel does a plain cast on checkpoint commit, so
+        # quantized SSM cache dtypes stay on the legacy path.
+        sm = get_sm_version()
+        use_replay = spec_config is not None and sm >= 80
+        if spec_config is None:
+            logger.info(
+                "GDN replay kernel requires speculative decoding; using "
+                "non-replay path")
+        elif spec_config.tokens_per_gen_step > 8:
+            logger.info("GDN cached replay supports at most 8 tokens per "
+                        "generation step; using non-replay path")
+            use_replay = False
+
+        # Tree attention: replay assumes a linear token sequence.
+        if (spec_config is not None
+                and (getattr(spec_config, 'eagle_choices', None) is not None
+                     or getattr(spec_config, 'use_dynamic_tree', False))):
+            logger.info("GDN replay kernel incompatible with tree attention; "
+                        "using legacy MTP path")
+            use_replay = False
+
+        if mamba_params.mamba_ssm_cache_dtype not in (torch.float32,
+                                                      torch.bfloat16,
+                                                      torch.float16):
+            logger.info(
+                "GDN replay kernel does not support quantized SSM cache "
+                f"dtype {mamba_params.mamba_ssm_cache_dtype}; using legacy "
+                "MTP path")
+            use_replay = False
+
+        # Replay is opt-in because its end-to-end benefit is workload-dependent.
+        if not is_gdn_replay_enabled():
+            logger.info("GDN replay kernel is disabled; set "
+                        "TRTLLM_USE_GDN_REPLAY=1 to enable it")
+            use_replay = False
+        logger.info("GDN replay state update: " +
+                    ("ENABLED" if use_replay else "DISABLED"))
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1988,6 +2057,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             model_type="qwen3_next",
+            use_replay_state_update=use_replay,
             **manager_extra_kwargs,
         )
     else:

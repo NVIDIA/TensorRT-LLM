@@ -245,3 +245,83 @@ class TestFromConfigDuplicateData:
         rp = RopeParams.from_config(self._make_config(qk_rope_head_dim=64))
         assert rp.duplicate_data is True
         assert rp.dim == 64
+
+
+class TestUnfusedRopeOwnership:
+    """With rope_fusion=False the Python rotary module owns RoPE; the backend
+    must receive no position-embedding params. yarn is not listed in
+    PositionEmbeddingType.is_rope(), which used to leak the params through and
+    made the attention kernel rotate a second time (double RoPE)."""
+
+    def test_unfused_yarn_rope_is_applied_exactly_once(self):
+        from tensorrt_llm._torch.attention_backend.interface import \
+            PositionalEmbeddingParams
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._torch.modules.attention import Attention
+        from tensorrt_llm.functional import PositionEmbeddingType
+
+        yarn_params = PositionalEmbeddingParams(
+            type=PositionEmbeddingType.yarn,
+            rope=RopeParams(
+                dim=32,
+                theta=150000,
+                scale_type=RotaryScalingType.yarn,
+                scale=32.0,
+                max_positions=1024,
+                original_max_positions=256,
+                beta_fast=32,
+                beta_slow=1,
+                duplicate_data=False,
+            ),
+            is_neox=True,
+        )
+        attn = Attention(
+            hidden_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            max_position_embeddings=1024,
+            bias=False,
+            pos_embd_params=yarn_params,
+            rope_fusion=False,
+            layer_idx=0,
+            dtype=torch.bfloat16,
+            config=ModelConfig(),
+        )
+
+        assert attn.rotary_emb is not None
+        # 0 means the kernel side received no position embedding.
+        assert attn.attn.position_embedding_type == 0
+
+    def test_unfused_yarn_rotation_matches_fused_kernel_convention(self):
+        """The unfused (Python) yarn rotation must match the NeoX rotate-half
+        convention the fused kernel applies with the same cos/sin table."""
+        head_dim = 64
+        num_pos, num_heads = 64, 4
+        rope_params = RopeParams(
+            dim=head_dim,
+            theta=150000,
+            scale_type=RotaryScalingType.yarn,
+            scale=32.0,
+            max_positions=1024,
+            original_max_positions=256,
+            beta_fast=32,
+            beta_slow=1,
+            duplicate_data=False,
+        )
+        emb = RotaryEmbedding(rope_params, head_dim=head_dim, is_neox=True)
+        torch.manual_seed(0)
+        q = torch.randn(num_pos, num_heads * head_dim)
+        positions = torch.arange(num_pos).cuda()
+        # Single-target call takes the pure-torch path.
+        q_unfused = emb(positions, [q.cuda()])[0].cpu()
+
+        # Reference: NeoX rotate-half with the exact table the kernel reads.
+        table = emb.rotary_cos_sin.cpu()  # (max_pos, 2, head_dim/2)
+        cos = table[:num_pos, 0, :].unsqueeze(1)
+        sin = table[:num_pos, 1, :].unsqueeze(1)
+        qh = q.view(num_pos, num_heads, head_dim)
+        q1, q2 = qh[..., :head_dim // 2], qh[..., head_dim // 2:]
+        q_ref = torch.cat((q1 * cos - q2 * sin, q2 * cos + q1 * sin),
+                          dim=-1).reshape(num_pos, -1)
+
+        torch.testing.assert_close(q_unfused, q_ref, rtol=1e-5, atol=1e-5)

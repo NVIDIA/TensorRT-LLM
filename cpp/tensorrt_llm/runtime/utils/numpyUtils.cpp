@@ -20,9 +20,9 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include <NvInferRuntime.h>
 
 #include <sstream>
 #include <stdexcept>
@@ -34,9 +34,9 @@ namespace tc = tensorrt_llm::common;
 namespace tensorrt_llm::runtime::utils
 {
 
-std::string getNumpyTypeDesc(nvinfer1::DataType type)
+std::string getNumpyTypeDesc(tensorrt_llm::DataType type)
 {
-    using dt = nvinfer1::DataType;
+    using dt = tensorrt_llm::DataType;
     static std::unordered_map<dt, std::string> const type_map{{dt::kBOOL, "?"}, {dt::kUINT8, "u1"}, {dt::kINT8, "i1"},
         {dt::kINT32, "i4"}, {dt::kINT64, "i8"}, {dt::kHALF, "f2"}, {dt::kFLOAT, "f4"}};
 
@@ -51,11 +51,11 @@ std::string getNumpyTypeDesc(nvinfer1::DataType type)
     return type_map.count(type) > 0 ? type_map.at(type) : "x";
 }
 
-nvinfer1::DataType typeFromNumpyDesc(std::string const& type)
+tensorrt_llm::DataType typeFromNumpyDesc(std::string const& type)
 {
     TLLM_LOG_DEBUG("numpy type: %s", type.c_str());
 
-    using dt = nvinfer1::DataType;
+    using dt = tensorrt_llm::DataType;
     static std::unordered_map<std::string, dt> const type_map{{"?", dt::kBOOL}, {"u1", dt::kUINT8}, {"i1", dt::kINT8},
         {"i4", dt::kINT32}, {"i8", dt::kINT64}, {"f2", dt::kHALF}, {"f4", dt::kFLOAT}};
     TLLM_CHECK_WITH_INFO(type_map.count(type) > 0, "numpy data type '" + type + "' not supported");
@@ -102,7 +102,7 @@ void parseNpyIntro(FILE*& f_ptr, uint32_t& header_len, uint32_t& start_data)
     start_data = 8 + 2 * npy_major + header_len;
 }
 
-int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, std::vector<size_t>& shapeVec)
+int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, tensorrt_llm::DataType& type, std::vector<size_t>& shapeVec)
 {
     char* header_c = (char*) malloc(header_len * sizeof(char));
     TLLM_CHECK_WITH_INFO(header_c != nullptr, "Failed to allocate memory for npy header");
@@ -168,11 +168,11 @@ int parseNpyHeader(FILE*& f_ptr, uint32_t header_len, nvinfer1::DataType& type, 
     uint32_t header_len, start_data;
     utils::parseNpyIntro(f_ptr, header_len, start_data);
 
-    nvinfer1::DataType type;
+    tensorrt_llm::DataType type;
     std::vector<size_t> shape;
     utils::parseNpyHeader(f_ptr, header_len, type, shape);
 
-    nvinfer1::Dims dims;
+    tensorrt_llm::Dims dims;
     dims.nbDims = shape.size();
     std::copy(shape.begin(), shape.end(), dims.d);
 
@@ -203,10 +203,10 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
     auto const dtype = tensor.getDataType();
 
 #ifdef ENABLE_BF16
-    if (dtype == nvinfer1::DataType::kBF16)
+    if (dtype == tensorrt_llm::DataType::kBF16)
     {
         TLLM_CHECK(where == MemoryType::kGPU);
-        auto tensorFp32 = manager.gpu(shape, nvinfer1::DataType::kFLOAT);
+        auto tensorFp32 = manager.gpu(shape, tensorrt_llm::DataType::kFLOAT);
         auto dataFp32 = bufferCast<float>(*tensorFp32);
         auto dataBf16 = bufferCast<__nv_bfloat16 const>(tensor);
         tc::invokeCudaD2DcpyConvert(dataFp32, dataBf16, tensorSize);
