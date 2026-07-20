@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include <numeric>
@@ -59,7 +60,7 @@ protected:
         {
             draftTokens = std::make_shared<std::vector<int32_t>>(draftTokensLen, 2);
             draftLogits = BufferManager::cpu(
-                ITensor::makeShape({draftTokensLen, /* vocabSizePadded*/ 42}), nvinfer1::DataType::kFLOAT);
+                ITensor::makeShape({draftTokensLen, /* vocabSizePadded*/ 42}), tensorrt_llm::DataType::kFLOAT);
         }
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig,
             /*isStreaming=*/false,
@@ -1246,7 +1247,7 @@ protected:
 
         return std::make_shared<kv_cache_manager::KVCacheManager>(
             /*numLayers=*/10, /*nbKvHeads=*/10, /*sizePerHead=*/1, tokensPerBlock, blocksPerWindow, maxNumRequests,
-            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, nvinfer1::DataType::kHALF,
+            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, tensorrt_llm::DataType::kHALF,
             /*sinkTokenLength=*/0, stream, maxNumTokensPerSeq, /*chunkSize=*/maxNumTokensPerSeq, enableReuse);
     }
 
@@ -1362,6 +1363,80 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerSetsReusableTokensForMicroBatch)
     // Without reuse: gen(1) + ctx(30) = 31 > 15 → req2 doesn't fit
     bool req2InCtx = std::any_of(ctx2.begin(), ctx2.end(), [](auto const& r) { return r->mRequestId == 2; });
     EXPECT_FALSE(req2InCtx) << "Without reuse, 30 context tokens + 1 gen token exceeds 15 budget";
+
+    kvCacheManager->removeSequence(req0->mRequestId, req0);
+}
+
+TEST_F(CombinedSchedulerTest, PrefixAwareSchedulingDisabledKeepsReusableTokensZero)
+{
+    constexpr SizeType32 tokensPerBlock = 10;
+    constexpr SizeType32 kvCacheMaxNumTokens = 100;
+    constexpr SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    constexpr SizeType32 maxNumRequests = 4;
+
+    auto kvCacheManager = createKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, /*enableReuse=*/true);
+
+    auto capacityScheduler = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        /*hasKvCacheManager=*/true, /*twoStepsLookAhead=*/false,
+        /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+        /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE, /*enablePrefixAwareScheduling=*/false);
+
+    auto microBatchScheduler = MicroBatchScheduler();
+
+    constexpr int32_t promptLen = 30;
+    constexpr int32_t maxNewTokens = 5;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    auto req0 = createRequestWithTokens(inputTokens, maxNewTokens, 0);
+    auto req1 = createRequestWithTokens(inputTokens, maxNewTokens, 1);
+
+    RequestList activeList;
+    activeList.push_back(req0);
+    activeList.push_back(req1);
+
+    auto [scheduled0, disaggInit0, paused0]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+    ASSERT_GE(scheduled0.size(), 1u);
+    EXPECT_TRUE(disaggInit0.empty());
+    EXPECT_TRUE(paused0.empty());
+    EXPECT_EQ(req1->getEstimatedReusableTokens(), 0);
+
+    kvCacheManager->addSequenceBatch({{{req0->mRequestId, promptLen, /*beamWidth=*/1}}}, {std::ref(*req0)});
+    req0->moveToNextContextChunk();
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
+    kvCacheManager->storeContextBlocks(*req0);
+    req0->addNewTokens({0});
+    req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    kvCacheManager->addToken(req0->mRequestId);
+
+    auto [scheduled1, disaggInit1, paused1]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+
+    EXPECT_TRUE(disaggInit1.empty());
+    EXPECT_TRUE(paused1.empty());
+    EXPECT_EQ(req1->getEstimatedReusableTokens(), 0);
+    auto const req1Scheduled
+        = std::any_of(scheduled1.begin(), scheduled1.end(), [](auto const& req) { return req->mRequestId == 1; });
+    ASSERT_TRUE(req1Scheduled) << "Capacity scheduler must admit req1 before micro batch budget filtering";
+
+    RequestVector microBatchActive;
+    for (auto& req : scheduled1)
+    {
+        microBatchActive.push_back(req);
+    }
+
+    constexpr SizeType32 maxNumTokensBudget = 15;
+    constexpr SizeType32 maxBatchSize = 4;
+    ReqIdsSet inflightReqIds;
+    auto [ctx, gen] = microBatchScheduler(microBatchActive, inflightReqIds, maxBatchSize, maxNumTokensBudget);
+
+    auto const req1InCtx = std::any_of(ctx.begin(), ctx.end(), [](auto const& req) { return req->mRequestId == 1; });
+    EXPECT_FALSE(req1InCtx) << "Without scheduler-side reusable-token credit, req1 exceeds the tight token budget";
+
+    auto const req0InGen = std::any_of(gen.begin(), gen.end(), [](auto const& req) { return req->mRequestId == 0; });
+    EXPECT_TRUE(req0InGen);
 
     kvCacheManager->removeSequence(req0->mRequestId, req0);
 }

@@ -21,6 +21,10 @@ PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
 T = TypeVar("T")
 
 
+def _zero_prefix_reuse_summary() -> PrefixReuseSummary:
+    return tb_internal.batch_manager.PrefixReuseSummary()
+
+
 def _call_with_optional_summary(
     fn: Callable[..., T],
     *args: Any,
@@ -306,14 +310,15 @@ class BindCapacityScheduler(CapacityScheduler):
     def __init__(
         self,
         max_num_requests: int,
-        kv_cache_manager,
+        kv_cache_manager: object | None,
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         *,
-        cross_kv_cache_manager=None,
+        cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
-    ):
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
         """C++-bound capacity scheduler wrapper.
 
         ``cross_kv_cache_manager`` enables encoder-decoder dual-pool
@@ -336,6 +341,7 @@ class BindCapacityScheduler(CapacityScheduler):
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=no_schedule_until_state,
             no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
     def schedule_request(
@@ -1112,8 +1118,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                     # MaxUtilizationPolicy.schedule and the C++
                     # single-walk-per-request convention.
                     req_id = req.py_request_id
-                    cached_summary = summary_by_req.get(req_id)
-                    cached_cross_summary = cross_summary_by_req.get(req_id)
+                    cached_summary = summary_by_req.get(
+                        req_id
+                    ) or scheduler._disabled_prefix_summary(req)
+                    cached_cross_summary = cross_summary_by_req.get(
+                        req_id
+                    ) or scheduler._disabled_prefix_summary(req)
 
                     if req.is_encoder_init_state:
                         # Encoder admission only admits encoder compute.
@@ -1261,7 +1271,8 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 scheduled_cross_blocks_manager,
                 num_scheduled_peft_pages,
                 seen_task_ids,
-                cached_summary=summary_by_req.get(req.py_request_id),
+                cached_summary=summary_by_req.get(req.py_request_id)
+                or scheduler._disabled_prefix_summary(req),
             )
 
             if was_scheduled:
@@ -1495,14 +1506,15 @@ class PyCapacityScheduler:
     def __init__(
         self,
         max_num_requests: int,
-        kv_cache_manager=None,
-        peft_cache_manager=None,
+        kv_cache_manager: object | None = None,
+        peft_cache_manager: object | None = None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        cross_kv_cache_manager=None,
+        cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
-    ):
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
         """
         Initialize the capacity scheduler.
 
@@ -1515,6 +1527,7 @@ class PyCapacityScheduler:
             two_step_lookahead: Enable two-step lookahead for MAX_UTILIZATION
             no_schedule_until_state: Don't schedule until this state is reached
             no_schedule_after_state: Don't schedule after this state is reached
+            enable_prefix_aware_scheduling: Use KV prefix-reuse estimates for scheduler decisions
         """
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
@@ -1524,6 +1537,7 @@ class PyCapacityScheduler:
         self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
+        self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         # Cache state values to avoid repeated .value access (optimization)
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
@@ -1569,6 +1583,8 @@ class PyCapacityScheduler:
         """
         if self.kv_cache_manager is None:
             return False
+        if not self.enable_prefix_aware_scheduling:
+            return False
         if self.kv_cache_manager.is_variable_window:
             return False
         if (
@@ -1588,7 +1604,7 @@ class PyCapacityScheduler:
         newly_contributed_context_blocks: Set = set()
         newly_contributed_cross_context_blocks: Set = set()
 
-        if self.kv_cache_manager is None:
+        if self.kv_cache_manager is None or not self.enable_prefix_aware_scheduling:
             return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
         enable_block_reuse = self.kv_cache_manager.enable_block_reuse
@@ -1640,6 +1656,8 @@ class PyCapacityScheduler:
 
         C++ reference: capacityScheduler.cpp (beneficialToSkip / oneManagerBeneficialToSkip)
         """
+        if not self.enable_prefix_aware_scheduling:
+            return False
         if not (req.is_context_init_state and req.is_first_context_chunk):
             return False
 
@@ -1689,6 +1707,13 @@ class PyCapacityScheduler:
             newly_contributed_cross_context_blocks.add(cross_new_block)
 
         return False
+
+    def _disabled_prefix_summary(self, req: LlmRequest) -> Optional[PrefixReuseSummary]:
+        if self.enable_prefix_aware_scheduling:
+            return None
+        if req.is_context_init_state and req.is_first_context_chunk:
+            return _zero_prefix_reuse_summary()
+        return None
 
     def _get_max_peft_pages(self) -> int:
         """Get maximum PEFT cache pages."""
@@ -1768,15 +1793,16 @@ class SimpleUnifiedScheduler(RequestScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: int,
-        kv_cache_manager,
-        peft_cache_manager,
+        kv_cache_manager: object | None,
+        peft_cache_manager: object | None,
         scheduler_policy: CapacitySchedulerPolicy,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
-        cross_kv_cache_manager=None,
+        cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
-    ):
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
         # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
         capacity = scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -1791,6 +1817,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
             cross_kv_cache_manager=cross_kv_cache_manager,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
         # 2. Initialize Python MicroBatch Scheduler

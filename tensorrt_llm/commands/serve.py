@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import gc
 import importlib
 import inspect
@@ -9,34 +10,34 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, Optional, Sequence, Set
 
 import click
 import torch
+import uvloop
 import yaml
 from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
-                                         get_is_diffusion_model)
+                                         get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -80,13 +81,6 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
         else:
             raise ValueError(f"Invalid middleware {middleware}. "
                              "Must be a class or an async function.")
-
-
-def help_info_with_stability_tag(
-        help_str: str, tag: Literal["stable", "beta", "prototype",
-                                    "deprecated"]) -> str:
-    """Append stability info to help string."""
-    return f":tag:`{tag}` {help_str}"
 
 
 def _signal_handler_cleanup_child(signum, frame):
@@ -137,7 +131,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     """
     always_include = {
         "model", "backend", "tokenizer", "custom_tokenizer",
-        "postprocess_tokenizer_dir"
+        "post_processor_hook", "postprocess_tokenizer_dir"
     }
 
     if param_name in always_include:
@@ -155,14 +149,13 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
         "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
         "build_config":
         ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
+        "multimodal_config": ("video_pruning_rate", ),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "tensorrt":
-        llm_args_class = TrtLlmArgs
-    elif backend == "_autodeploy":
+    if backend == "_autodeploy":
         from tensorrt_llm._torch.auto_deploy.llm_args import \
             LlmArgs as AutoDeployLlmArgs
         llm_args_class = AutoDeployLlmArgs
@@ -182,18 +175,21 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     return value != default
 
 
+# CLI/API defaults are sourced from the TorchLlmArgs field defaults so they stay
+# in lock-step with the args class and can't drift.
+_LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+
+
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
         custom_tokenizer: Optional[str] = None,
+        post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
-        max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
-    default,
-        max_batch_size: int = BuildConfig.model_fields["max_batch_size"].
-    default,
-        max_num_tokens: int = BuildConfig.model_fields["max_num_tokens"].
-    default,
-        max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
+        max_beam_width: int = _LLM_ARGS_FIELDS["max_beam_width"].default,
+        max_batch_size: int = _LLM_ARGS_FIELDS["max_batch_size"].default,
+        max_num_tokens: int = _LLM_ARGS_FIELDS["max_num_tokens"].default,
+        max_seq_len: int = None,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         context_parallel_size: int = 1,
@@ -243,6 +239,8 @@ def get_llm_args(
         tokenizer,
         "custom_tokenizer":
         custom_tokenizer,
+        "post_processor_hook":
+        post_processor_hook,
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
@@ -250,19 +248,8 @@ def get_llm_args(
                       dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
-        "build_config":
-        BuildConfig(max_batch_size=max_batch_size,
-                    max_num_tokens=max_num_tokens,
-                    max_beam_width=max_beam_width,
-                    max_seq_len=max_seq_len) if backend == "tensorrt" else None,
         "scheduler_config":
-        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
-                        GUARANTEED_NO_EVICT,
-                        dynamic_batch_config=DynamicBatchConfig(
-                            enable_batch_size_tuning=True,
-                            enable_max_num_tokens_tuning=False,
-                            dynamic_batch_moving_average_window=128))
-        if backend == "tensorrt" else None,
+        None,
         "max_batch_size":
         max_batch_size,
         "max_beam_width":
@@ -297,8 +284,9 @@ def get_llm_args(
         otlp_traces_endpoint,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
-        "video_pruning_rate":
-        video_pruning_rate,
+        "multimodal_config":
+        MultimodalConfig(video_pruning_rate=video_pruning_rate)
+        if video_pruning_rate is not None else None,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
             disabled=not telemetry,
@@ -341,6 +329,37 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
+def _diagnose_port_in_use(port: int) -> str:
+    """Describe which process currently holds the given port, best effort."""
+    try:
+        import psutil
+    except ImportError:
+        return "psutil unavailable; cannot identify the process holding the port"
+
+    details = []
+    try:
+        for conn in psutil.net_connections(kind="inet"):
+            if conn.laddr and conn.laddr.port == port:
+                holder = ""
+                if conn.pid is not None:
+                    try:
+                        proc = psutil.Process(conn.pid)
+                        holder = (f" pid={conn.pid} name={proc.name()} "
+                                  f"cmdline={' '.join(proc.cmdline())}")
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        holder = f" pid={conn.pid}"
+                details.append(
+                    f"{conn.laddr.ip}:{conn.laddr.port} status={conn.status}{holder}"
+                )
+    except (psutil.Error, OSError) as e:
+        return f"failed to inspect port holders: {e}"
+
+    if not details:
+        return ("no listening socket found for this port; it may have already "
+                "been released, indicating a transient race")
+    return "; ".join(details)
+
+
 def launch_server(
         host: str,
         port: int,
@@ -353,7 +372,9 @@ def launch_server(
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
-        allow_request_chat_template: bool = False):
+        allow_request_chat_template: bool = False,
+        num_input_processor_workers: int = 8,
+        num_media_load_workers: int = 8):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -369,7 +390,12 @@ def launch_server(
             if port == 0:
                 port = s.getsockname()[1]
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind server socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
@@ -380,9 +406,6 @@ def launch_server(
             # AutoDeploy does not support build_config
             llm_args.pop("build_config", None)
             llm = AutoDeployLLM(**llm_args)
-        elif backend == 'tensorrt' or backend == 'trt':
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -397,14 +420,16 @@ def launch_server(
             disagg_cluster_config=disagg_cluster_config,
             multimodal_server_config=multimodal_server_config,
             chat_template=chat_template,
-            allow_request_chat_template=allow_request_chat_template)
+            allow_request_chat_template=allow_request_chat_template,
+            input_processor_workers=num_input_processor_workers,
+            media_load_workers=num_media_load_workers)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
             gc.disable()
 
-        asyncio.run(server(host, port, sockets=[s]))
+        uvloop.run(server(host, port, sockets=[s]))
 
 
 def launch_grpc_server(host: str,
@@ -448,9 +473,6 @@ def launch_grpc_server(host: str,
             from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
             llm_args.pop("build_config", None)
             llm = AutoDeployLLM(**llm_args)
-        elif backend == "tensorrt" or backend == "trt":
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -530,7 +552,7 @@ def launch_grpc_server(host: str,
 
             logger.info("Shutdown complete")
 
-    asyncio.run(serve_grpc_async())
+    uvloop.run(serve_grpc_async())
 
 
 def launch_mm_encoder_server(
@@ -551,6 +573,107 @@ def launch_mm_encoder_server(
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
         allow_request_chat_template=allow_request_chat_template)
+    uvloop.run(server(host, port))
+
+
+# HF causal-LM architecture -> TRT-LLM text-embedding architecture. The embeddings
+# subcommand declares embedding intent (cf. SGLang --is-embedding); this maps known
+# sentence-transformers decoder backbones onto their pooling+normalize wrapper class.
+# To support another decoder embedder, add its HF architecture here and a matching
+# `*ForTextEmbedding` model class (see Qwen3ForTextEmbedding in modeling_qwen3.py).
+# Architectures absent from this map are left as declared (the model self-routes).
+_EMBEDDING_ARCH_MAP = {
+    "Qwen3ForCausalLM": "Qwen3ForTextEmbedding",
+}
+
+
+def _resolve_embedding_architecture_override(
+        model: str,
+        trust_remote_code: bool,
+        revision: Optional[str] = None) -> Optional[dict]:
+    """Return a `model_kwargs` architecture override for a known embedder.
+
+    Returns `None` to leave the model's declared architecture unchanged.
+    Qwen3-Embedding ships as `Qwen3ForCausalLM` (a causal decoder) plus a
+    sentence-transformers pooling/normalize pipeline. Overriding `architectures`
+    flips both the model-class selection (`get_model_architecture`) and the
+    encoder-vs-generation routing (`is_generation_model`) with one change.
+    """
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision)
+        architectures = getattr(hf_config, "architectures", None) or []
+    except Exception as e:  # noqa: BLE001 - config read is best-effort
+        logger.warning(
+            f"Could not read model config for embedding routing ({model}): {e}")
+        return None
+
+    if not architectures:
+        return None
+    target = _EMBEDDING_ARCH_MAP.get(architectures[0])
+    if target is None:
+        return None
+
+    # Best-effort sanity check on a local checkpoint: warn (don't fail) if the
+    # sentence-transformers pooling layout is absent. The subcommand is explicit
+    # embedding intent, so we still proceed with last-token pooling + L2 norm.
+    if os.path.isdir(model):
+        pooling_cfg = os.path.join(model, "1_Pooling", "config.json")
+        if not os.path.isfile(pooling_cfg):
+            logger.warning(
+                f"{model} maps to {target} but has no 1_Pooling/config.json; "
+                "proceeding with last-token pooling + L2 normalize.")
+
+    logger.info(f"Embedding routing: overriding architecture "
+                f"{architectures[0]} -> {target}")
+    return {"architectures": [target]}
+
+
+def launch_embedding_server(
+    host: str,
+    port: int,
+    llm_args: dict,
+    max_queue_delay: float,
+    max_queue_size: int,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
+    model = llm_args["model"]
+    llm_args.pop("build_config", None)
+    # encode_only is forced on below; drop any value coming from --config to avoid
+    # a duplicate keyword argument.
+    llm_args.pop("encode_only", None)
+
+    # Sentence-transformers decoder embedders (e.g. Qwen3-Embedding) declare a
+    # causal-LM architecture; remap it to the text-embedding model class so the
+    # forward returns pooled+normalized sentence embeddings instead of LM logits.
+    override = _resolve_embedding_architecture_override(
+        model, llm_args.get("trust_remote_code", False),
+        llm_args.get("revision"))
+    if override is not None:
+        model_kwargs = dict(llm_args.get("model_kwargs") or {})
+        if "architectures" in model_kwargs:
+            # A user-supplied model_kwargs.architectures (e.g. via --config) wins;
+            # log so the suppressed auto-remap isn't a silent surprise.
+            logger.info(
+                "Embedding routing: keeping user-supplied model_kwargs "
+                f"architectures={model_kwargs['architectures']} (auto-remap to "
+                f"{override['architectures']} suppressed).")
+        else:
+            model_kwargs["architectures"] = override["architectures"]
+        llm_args["model_kwargs"] = model_kwargs
+
+    # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path
+    # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
+    llm = PyTorchLLM(encode_only=True, **llm_args)
+
+    server = OpenAIServer(generator=llm,
+                          model=model,
+                          server_role=ServerRole.EMBEDDING,
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None,
+                          embedding_max_queue_delay=max_queue_delay,
+                          embedding_max_queue_size=max_queue_size)
     asyncio.run(server(host, port))
 
 
@@ -571,6 +694,16 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
+    # Only global rank 0 serves HTTP; in external multi-rank launch ranks > 0
+    # must become workers before binding, else every rank on a multi-GPU node
+    # races the same port and all but one die EADDRINUSE. VisualGen() on a
+    # worker rank never returns (sys.exit in __init__).
+    from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    ext = _detect_external_launch()
+    if ext is not None and ext[0] != 0:
+        VisualGen(model=model, args=visual_gen_args)
+        return
+
     # Reserve the listening (host, port) by binding the socket *before*
     # constructing the VisualGen pipeline, then hand the bound socket to
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
@@ -584,7 +717,12 @@ def launch_visual_gen_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}")
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind VisualGen server socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
 
         logger.info(f"Initializing VisualGen ({model})")
 
@@ -604,338 +742,344 @@ def launch_visual_gen_server(
                               metadata_server_cfg=metadata_server_cfg,
                               tool_parser=None)
         _apply_fastapi_middlewares(server.app, middleware)
-        asyncio.run(server(host, port, sockets=[s]))
-
-
-class ChoiceWithAlias(click.Choice):
-
-    def __init__(self,
-                 choices: Sequence[str],
-                 aliases: Mapping[str, str],
-                 case_sensitive: bool = True) -> None:
-        super().__init__(choices, case_sensitive)
-        self.aliases = aliases
-
-    def to_info_dict(self) -> Dict[str, Any]:
-        info_dict = super().to_info_dict()
-        info_dict["aliases"] = self.aliases
-        return info_dict
-
-    def convert(self, value: Any, param: Optional["click.Parameter"],
-                ctx: Optional["click.Context"]) -> Any:
-        if value in self.aliases:
-            value = self.aliases[value]
-        return super().convert(value, param, ctx)
+        uvloop.run(server(host, port, sockets=[s]))
 
 
 @click.command("serve")
 @click.argument("model", type=str)
-@click.option(
+@stability_option(
     "--tokenizer",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Path or name of the tokenizer. When using the PyTorch backend, "
-        "this replaces the default HuggingFace tokenizer.", "beta"))
-@click.option(
+    help="Path or name of the tokenizer. When using the PyTorch backend, "
+    "this replaces the default HuggingFace tokenizer.",
+    status="beta")
+@stability_option(
     "--custom_tokenizer",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
-        "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
-        "prototype"))
-@click.option("--host",
-              type=str,
-              default="localhost",
-              help=help_info_with_stability_tag("Hostname of the server.",
-                                                "beta"))
-@click.option("--port",
-              type=int,
-              default=8000,
-              help=help_info_with_stability_tag("Port of the server.", "beta"))
-@click.option(
-    "--backend",
-    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
-                         {"trt": "tensorrt"}),
-    default="pytorch",
-    help=help_info_with_stability_tag(
-        "The backend to use to serve the model. Default is pytorch backend.",
-        "beta"))
-@click.option(
-    "--custom_module_dirs",
-    type=click.Path(exists=True,
-                    readable=True,
-                    path_type=Path,
-                    resolve_path=True),
+    help=
+    "Custom tokenizer type: alias (e.g., 'deepseek_v32') or Python import path "
+    "(e.g., 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer').",
+    status="prototype")
+@stability_option(
+    "--post_processor_hook",
+    type=str,
     default=None,
-    multiple=True,
-    help=help_info_with_stability_tag(
-        "Paths to custom module directories to import.", "prototype"),
-)
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help=help_info_with_stability_tag("The logging level.", "beta"))
-@click.option("--max_beam_width",
-              type=int,
-              default=BuildConfig.model_fields["max_beam_width"].default,
-              help=help_info_with_stability_tag(
-                  "Maximum number of beams for beam search decoding.", "beta"))
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
-              help=help_info_with_stability_tag(
-                  "Maximum number of requests that the engine can schedule.",
-                  "beta"))
-@click.option(
+    help="Python import path of a user post-processing hook applied after "
+    "detokenization and before the per-endpoint response formatter (e.g. "
+    "'my_pkg.guardrail.MyPostProcessorHook'). The class must be importable "
+    "and picklable, take no constructor arguments, and be callable as "
+    "'__call__(chunk) -> verdict' (see tensorrt_llm.executor.postprocessor_hook). "
+    "It runs once per output, per streaming chunk, and may rewrite, "
+    "suppress, or terminate the output; it owns its own per-request state.",
+    status="prototype")
+@stability_option("--host",
+                  type=str,
+                  default="localhost",
+                  help="Hostname of the server.",
+                  status="beta")
+@stability_option("--port",
+                  type=int,
+                  default=8000,
+                  help="Port of the server.",
+                  status="beta")
+@stability_option(
+    "--backend",
+    type=click.Choice(["pytorch", "_autodeploy"]),
+    default="pytorch",
+    help="The backend to use to serve the model. Default is pytorch backend.",
+    status="beta")
+@stability_option("--custom_module_dirs",
+                  type=click.Path(exists=True,
+                                  readable=True,
+                                  path_type=Path,
+                                  resolve_path=True),
+                  default=None,
+                  multiple=True,
+                  help="Paths to custom module directories to import.",
+                  status="prototype")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option("--max_beam_width",
+                  type=int,
+                  default=_LLM_ARGS_FIELDS["max_beam_width"].default,
+                  help="Maximum number of beams for beam search decoding.",
+                  status="beta")
+@stability_option(
+    "--max_batch_size",
+    type=int,
+    default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+    help="Maximum number of requests that the engine can schedule.",
+    status="beta")
+@stability_option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.model_fields["max_num_tokens"].default,
-    help=help_info_with_stability_tag(
-        "Maximum number of batched input tokens after padding is removed in each batch.",
-        "beta"))
-@click.option(
+    default=_LLM_ARGS_FIELDS["max_num_tokens"].default,
+    help=
+    "Maximum number of batched input tokens after padding is removed in each batch.",
+    status="beta")
+@stability_option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.model_fields["max_seq_len"].default,
-    help=help_info_with_stability_tag(
-        "Maximum total length of one request, including prompt and outputs. "
-        "If unspecified, the value is deduced from the model config.", "beta"))
-@click.option("--tensor_parallel_size",
-              "--tp_size",
-              type=int,
-              default=1,
-              help=help_info_with_stability_tag('Tensor parallelism size.',
-                                                'beta'))
-@click.option("--pipeline_parallel_size",
-              "--pp_size",
-              type=int,
-              default=1,
-              help=help_info_with_stability_tag('Pipeline parallelism size.',
-                                                'beta'))
-@click.option("--context_parallel_size",
-              "--cp_size",
-              type=int,
-              default=1,
-              help=help_info_with_stability_tag('Context parallelism size.',
-                                                'beta'))
-@click.option("--moe_expert_parallel_size",
-              "--ep_size",
-              type=int,
-              default=None,
-              help=help_info_with_stability_tag("expert parallelism size",
-                                                "beta"))
-@click.option(
+    default=None,
+    help="Maximum total length of one request, including prompt and outputs. "
+    "If unspecified, the value is deduced from the model config.",
+    status="beta")
+@stability_option("--tensor_parallel_size",
+                  "--tp_size",
+                  type=int,
+                  default=1,
+                  help='Tensor parallelism size.',
+                  status='beta')
+@stability_option("--pipeline_parallel_size",
+                  "--pp_size",
+                  type=int,
+                  default=1,
+                  help='Pipeline parallelism size.',
+                  status='beta')
+@stability_option("--context_parallel_size",
+                  "--cp_size",
+                  type=int,
+                  default=1,
+                  help='Context parallelism size.',
+                  status='beta')
+@stability_option("--moe_expert_parallel_size",
+                  "--ep_size",
+                  type=int,
+                  default=None,
+                  help="expert parallelism size",
+                  status="beta")
+@stability_option(
     "--moe_cluster_parallel_size",
     "--cluster_size",
     type=int,
     default=None,
-    help=help_info_with_stability_tag(
-        "[Deprecated] Expert cluster parallelism size. "
-        "This option is no longer supported and will be removed in a future release.",
-        "deprecated"))
-@click.option(
+    help="[Deprecated] Expert cluster parallelism size. "
+    "This option is no longer supported and will be removed in a future release.",
+    status="deprecated")
+@stability_option(
     "--gpus_per_node",
     type=int,
     default=None,
-    help=help_info_with_stability_tag(
-        "Number of GPUs per node. Default to None, and it will be detected automatically.",
-        "beta"))
-@click.option("--free_gpu_memory_fraction",
-              "--kv_cache_free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help=help_info_with_stability_tag(
-                  "Free GPU memory fraction reserved for KV Cache, "
-                  "after allocating model weights and buffers.", "beta"))
-@click.option(
+    help=
+    "Number of GPUs per node. Default to None, and it will be detected automatically.",
+    status="beta")
+@stability_option("--free_gpu_memory_fraction",
+                  "--kv_cache_free_gpu_memory_fraction",
+                  type=float,
+                  default=0.9,
+                  help="Free GPU memory fraction reserved for KV Cache, "
+                  "after allocating model weights and buffers.",
+                  status="beta")
+@stability_option(
     "--kv_cache_dtype",
     type=click.Choice(("auto", "fp8", "nvfp4")),
     default="auto",
-    help=help_info_with_stability_tag(
-        "KV cache quantization dtype for PyTorch backend. "
-        "'auto' uses checkpoint/model metadata; explicit values force override.",
-        "prototype"))
-@click.option("--num_postprocess_workers",
-              type=int,
-              default=0,
-              help=help_info_with_stability_tag(
-                  "Number of workers to postprocess raw responses "
-                  "to comply with OpenAI protocol.", "prototype"))
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag("Flag for HF transformers.",
-                                                "beta"))
-@click.option("--hf_revision",
-              "--revision",
-              "revision",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "The revision to use for the HuggingFace model "
+    help="KV cache quantization dtype for PyTorch backend. "
+    "'auto' uses checkpoint/model metadata; explicit values force override.",
+    status="prototype")
+@stability_option("--num_postprocess_workers",
+                  type=int,
+                  default=0,
+                  help="Number of workers to postprocess raw responses "
+                  "to comply with OpenAI protocol.",
+                  status="prototype")
+@stability_option("--num_input_processor_workers",
+                  type=click.IntRange(min=1),
+                  default=8,
+                  help="Size of the dedicated thread pool that runs the HF "
+                  "input processor (multimodal preprocess) on the chat "
+                  "and completion endpoints.",
+                  status="prototype")
+@stability_option("--num_media_load_workers",
+                  type=click.IntRange(min=1),
+                  default=8,
+                  help="Size of the dedicated thread pool that decodes media "
+                  "payloads (image / video / audio) for multimodal "
+                  "requests.",
+                  status="prototype")
+@stability_option("--trust_remote_code",
+                  is_flag=True,
+                  default=False,
+                  help="Flag for HF transformers.",
+                  status="beta")
+@stability_option("--hf_revision",
+                  "--revision",
+                  "revision",
+                  type=str,
+                  default=None,
+                  help="The revision to use for the HuggingFace model "
                   "(branch name, tag name, or commit id). "
-                  "Prefer --hf_revision over --revision.", "beta"))
-@click.option(
+                  "Prefer --hf_revision over --revision.",
+                  status="beta")
+@stability_option(
     "--config",
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Path to a YAML configuration file. Explicit CLI flags take precedence "
-        "over values in this file. Can be specified as either --config or "
-        "--extra_llm_api_options.", "prototype"))
-@click.option(
-    "--reasoning_parser",
-    type=click.Choice(["auto"] + list(ReasoningParserFactory.keys())),
-    default=None,
-    help=help_info_with_stability_tag(
-        "Specify the parser for reasoning models. "
-        "Use 'auto' to automatically select based on the model.", "prototype"),
-)
-@click.option(
-    "--tool_parser",
-    type=click.Choice(["auto"] + list(ToolParserFactory.parsers.keys())),
-    default=None,
-    help=help_info_with_stability_tag(
-        "Specify the parser for tool models. "
-        "Use 'auto' to automatically select based on the model.", "prototype"),
-)
-@click.option("--metadata_server_config_file",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Path to metadata server config file", "prototype"))
-@click.option(
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Can be specified as either --config or "
+    "--extra_llm_api_options.",
+    status="prototype")
+@stability_option("--reasoning_parser",
+                  type=click.Choice(["auto"] +
+                                    list(ReasoningParserFactory.keys())),
+                  default=None,
+                  help="Specify the parser for reasoning models. "
+                  "Use 'auto' to automatically select based on the model.",
+                  status="prototype")
+@stability_option("--tool_parser",
+                  type=click.Choice(["auto"] +
+                                    list(ToolParserFactory.parsers.keys())),
+                  default=None,
+                  help="Specify the parser for tool models. "
+                  "Use 'auto' to automatically select based on the model.",
+                  status="prototype")
+@stability_option("--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option(
     "--server_role",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "Server role for disaggregated serving. "
-        "CONTEXT=prefill (prompt processing), GENERATION=decode (token generation), "
-        "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
-        "Required when using service registry.", "prototype"))
-@click.option(
+    help="Server role for disaggregated serving. "
+    "CONTEXT=prefill (prompt processing), GENERATION=decode (token generation), "
+    "MM_ENCODER=multimodal encoder, VISUAL_GEN=visual generation. "
+    "Required when using service registry.",
+    status="prototype")
+@stability_option(
     "--fail_fast_on_attention_window_too_large",
     is_flag=True,
     default=True,
-    help=help_info_with_stability_tag(
-        "[Deprecated] Exit with runtime error when attention window is too large "
-        "to fit even a single sequence in the KV cache. Now defaults to True. "
-        "This flag only affects the TRT backend and will be removed in a future release.",
-        "deprecated"))
-@click.option("--otlp_traces_endpoint",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Target URL to which OpenTelemetry traces will be sent.",
-                  "prototype"))
-@click.option("--telemetry/--no-telemetry",
-              default=True,
-              help="Enable or disable anonymous usage telemetry collection.")
-@click.option("--disagg_cluster_uri",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "URI of the disaggregated cluster.", "prototype"))
-@click.option("--enable_chunked_prefill",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag("Enable chunked prefill",
-                                                "prototype"))
-@click.option("--enable_attention_dp",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag(
-                  "Enable attention data parallel.", "beta"))
-@click.option("--media_io_kwargs",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Keyword arguments for media I/O as a JSON string. "
+    help=
+    "[Deprecated] Exit with runtime error when attention window is too large "
+    "to fit even a single sequence in the KV cache. Now defaults to True. "
+    "This flag only affects the TRT backend and will be removed in a future release.",
+    status="deprecated")
+@stability_option("--otlp_traces_endpoint",
+                  type=str,
+                  default=None,
+                  help="Target URL to which OpenTelemetry traces will be sent.",
+                  status="prototype")
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
+@stability_option("--disagg_cluster_uri",
+                  type=str,
+                  default=None,
+                  help="URI of the disaggregated cluster.",
+                  status="prototype")
+@stability_option("--enable_chunked_prefill",
+                  is_flag=True,
+                  default=False,
+                  help="Enable chunked prefill",
+                  status="prototype")
+@stability_option("--enable_attention_dp",
+                  is_flag=True,
+                  default=False,
+                  help="Enable attention data parallel.",
+                  status="beta")
+@stability_option("--media_io_kwargs",
+                  type=str,
+                  default=None,
+                  help="Keyword arguments for media I/O as a JSON string. "
                   "Keys are modality names (\"video\", \"image\", \"audio\") "
                   "whose values are dicts of keyword arguments forwarded to "
                   "the corresponding loader. "
                   "Example: '{\"video\": {\"extract_audio\": true, "
                   "\"num_frames\": 16}}' to enable audio extraction from "
-                  "video files.", "prototype"))
-@click.option("--video_pruning_rate",
-              type=float,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Pruning rate for video frames in multimodal models. "
+                  "video files.",
+                  status="prototype")
+@stability_option("--video_pruning_rate",
+                  type=float,
+                  default=None,
+                  help="Pruning rate for video frames in multimodal models. "
                   "Applied by Efficient Video Sampling (EVS). "
                   "None disables EVS, values in [0, 1) enable pruning.",
-                  "prototype"))
-@click.option("--chat_template",
-              type=str,
-              default=None,
-              help=help_info_with_stability_tag(
-                  "Specify a custom chat template. "
+                  status="prototype")
+@stability_option("--chat_template",
+                  type=str,
+                  default=None,
+                  help="Specify a custom chat template. "
                   "Can be a file path or one-liner template string",
-                  "prototype"))
-@click.option("--allow_request_chat_template",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag(
-                  "Allow clients to supply per-request chat_template values. "
-                  "Only enable this for trusted clients.", "prototype"))
-@click.option(
+                  status="prototype")
+@stability_option(
+    "--allow_request_chat_template",
+    is_flag=True,
+    default=False,
+    help="Allow clients to supply per-request chat_template values. "
+    "Only enable this for trusted clients.",
+    status="prototype")
+@stability_option(
     "--middleware",
     multiple=True,
     type=str,
-    help=help_info_with_stability_tag(
-        "FastAPI middleware import path to add to the server app. "
-        "Can be specified multiple times. Each value must point to either "
-        "a middleware class or an async HTTP middleware function.",
-        "prototype"))
-@click.option(
+    help="FastAPI middleware import path to add to the server app. "
+    "Can be specified multiple times. Each value must point to either "
+    "a middleware class or an async HTTP middleware function.",
+    status="prototype")
+@stability_option(
     "--grpc",
     is_flag=True,
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
-@click.option(
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    status="prototype")
+@stability_option(
     "--served_model_name",
     type=str,
     default=None,
-    help=help_info_with_stability_tag(
-        "The model name used in the API. If not specified, the model path is "
-        "used as the model name. This is useful when the model path is long or "
-        "when you want to expose a custom name to clients.", "prototype"))
-@click.option(
-    "--visual_gen_args",
-    type=str,
-    default=None,
-    help=help_info_with_stability_tag(
-        "Path to a YAML file with VisualGen engine args.",
-        "prototype",
-    ),
-)
-@click.option(
+    help="The model name used in the API. If not specified, the model path is "
+    "used as the model name. This is useful when the model path is long or "
+    "when you want to expose a custom name to clients.",
+    status="prototype")
+@stability_option(
+    "--enable_visual_gen",
+    is_flag=True,
+    default=False,
+    help="Enable VisualGen runtime for model checkpoints that support both LLM "
+    "and Visual Generation. Not required if --visual_gen_args specified "
+    "or the model supports Visual Generation only.",
+    status="prototype")
+@stability_option("--visual_gen_args",
+                  type=str,
+                  default=None,
+                  help="Path to a YAML file with VisualGen engine args.",
+                  status="prototype")
+@stability_option(
     "--agent_percentage",
     type=float,
     default=0.0,
-    help=
-    "The percentage of agent requests to schedule. Defaults to 0.0. Should be between 0.0 and 1.0."
-)
-@click.option(
+    help="The percentage of agent requests to schedule. Defaults to 0.0. "
+    "Should be between 0.0 and 1.0.",
+    status="prototype")
+@stability_option(
     "--agent_types",
     type=str,
     default=None,
     help=
-    "Types of agents to schedule. Now Only Support Open Deep Research agent.")
+    "Types of agents to schedule. Now Only Support Open Deep Research agent.",
+    status="prototype")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        host: str, port: int, log_level: str, backend: str, max_beam_width: int,
-        max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-        tensor_parallel_size: int, pipeline_parallel_size: int,
-        context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+        post_processor_hook: Optional[str], host: str, port: int,
+        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
+        max_num_tokens: int, max_seq_len: int, tensor_parallel_size: int,
+        pipeline_parallel_size: int, context_parallel_size: int,
+        moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, trust_remote_code: bool,
+        num_postprocess_workers: int, num_input_processor_workers: int,
+        num_media_load_workers: int, trust_remote_code: bool,
         revision: Optional[str], extra_llm_api_options: Optional[str],
         reasoning_parser: Optional[str], tool_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
@@ -946,7 +1090,7 @@ def serve(
         agent_types: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], allow_request_chat_template: bool,
-        middleware: tuple[str, ...], grpc: bool,
+        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
         served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -1014,6 +1158,7 @@ def serve(
             model=model,
             tokenizer=tokenizer,
             custom_tokenizer=custom_tokenizer,
+            post_processor_hook=post_processor_hook,
             backend=backend,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
@@ -1135,7 +1280,9 @@ def serve(
                 disagg_cluster_config,
                 multimodal_server_config,
                 served_model_name=served_model_name,
-                allow_request_chat_template=allow_request_chat_template)
+                allow_request_chat_template=allow_request_chat_template,
+                num_input_processor_workers=num_input_processor_workers,
+                num_media_load_workers=num_media_load_workers)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1147,7 +1294,8 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = visual_gen_args is not None or get_is_diffusion_model(model)
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
     if is_visual_gen:
         _serve_visual_gen()
     else:
@@ -1156,73 +1304,92 @@ def serve(
 
 @click.command("mm_embedding_serve")
 @click.argument("model", type=str)
-@click.option("--host",
-              type=str,
-              default="localhost",
-              help="Hostname of the server.")
-@click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-@click.option("--max_batch_size",
-              type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
-              help="Maximum number of requests that the engine can schedule.")
-@click.option(
+@stability_option("--host",
+                  type=str,
+                  default="localhost",
+                  help="Hostname of the server.",
+                  status="beta")
+@stability_option("--port",
+                  type=int,
+                  default=8000,
+                  help="Port of the server.",
+                  status="beta")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option(
+    "--max_batch_size",
+    type=int,
+    default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+    help="Maximum number of requests that the engine can schedule.",
+    status="beta")
+@stability_option(
     "--max_num_tokens",
     type=int,
     default=16384,  # set higher default max_num_tokens for multimodal encoder
     help=
-    "Maximum number of batched input tokens after padding is removed in each batch."
-)
-@click.option("--gpus_per_node",
-              type=int,
-              default=None,
-              help="Number of GPUs per node. Default to None, and it will be "
-              "detected automatically.")
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help="Flag for HF transformers.")
-@click.option(
+    "Maximum number of batched input tokens after padding is removed in each batch.",
+    status="beta")
+@stability_option(
+    "--gpus_per_node",
+    type=int,
+    default=None,
+    help="Number of GPUs per node. Default to None, and it will be "
+    "detected automatically.",
+    status="beta")
+@stability_option("--trust_remote_code",
+                  is_flag=True,
+                  default=False,
+                  help="Flag for HF transformers.",
+                  status="beta")
+@stability_option(
     "--config",
     "--extra_encoder_options",
     "extra_encoder_options",
     type=str,
     default=None,
     help="Path to a YAML configuration file. Explicit CLI flags take precedence "
-    "over values in this file. Prefer --config over --extra_encoder_options.")
-@click.option("--hf_revision",
-              "--revision",
-              "revision",
-              type=str,
-              default=None,
-              help="The revision to use for the HuggingFace model "
-              "(branch name, tag name, or commit id).")
-@click.option("--free_gpu_memory_fraction",
-              type=float,
-              default=0.9,
-              help="Free GPU memory fraction reserved for KV Cache, "
-              "after allocating model weights and buffers.")
-@click.option("--tensor_parallel_size",
-              "--tp_size",
-              type=int,
-              default=1,
-              help="Tensor parallelism size.")
-@click.option("--metadata_server_config_file",
-              type=str,
-              default=None,
-              help="Path to metadata server config file")
-@click.option("--allow_request_chat_template",
-              is_flag=True,
-              default=False,
-              help=help_info_with_stability_tag(
-                  "Allow clients to supply per-request chat_template values. "
-                  "Only enable this for trusted clients.", "prototype"))
-@click.option("--telemetry/--no-telemetry",
-              default=True,
-              help="Enable or disable anonymous usage telemetry collection.")
+    "over values in this file. Prefer --config over --extra_encoder_options.",
+    status="prototype")
+@stability_option("--hf_revision",
+                  "--revision",
+                  "revision",
+                  type=str,
+                  default=None,
+                  help="The revision to use for the HuggingFace model "
+                  "(branch name, tag name, or commit id).",
+                  status="beta")
+@stability_option("--free_gpu_memory_fraction",
+                  type=float,
+                  default=0.9,
+                  help="Free GPU memory fraction reserved for KV Cache, "
+                  "after allocating model weights and buffers.",
+                  status="beta")
+@stability_option("--tensor_parallel_size",
+                  "--tp_size",
+                  type=int,
+                  default=1,
+                  help="Tensor parallelism size.",
+                  status="beta")
+@stability_option("--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option(
+    "--allow_request_chat_template",
+    is_flag=True,
+    default=False,
+    help="Allow clients to supply per-request chat_template values. "
+    "Only enable this for trusted clients.",
+    status="prototype")
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
 def serve_encoder(model: str, host: str, port: int, log_level: str,
                   max_batch_size: int, max_num_tokens: int,
                   gpus_per_node: Optional[int], trust_remote_code: bool,
@@ -1282,47 +1449,171 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         allow_request_chat_template=allow_request_chat_template)
 
 
-@click.command("disaggregated")
-@click.option("-c",
-              "--config",
-              "--config_file",
-              "config_file",
+@click.command("embeddings")
+@click.argument("model", type=str)
+@click.option("--host",
               type=str,
-              default=None,
-              help="Path to the disaggregated serving configuration YAML file.")
-@click.option("-m",
-              "--metadata_server_config_file",
-              type=str,
-              default=None,
-              help="Path to metadata server config file")
-@click.option("-t",
-              "--server_start_timeout",
-              type=int,
-              default=180,
-              help="Server start timeout")
-@click.option("-r",
-              "--request_timeout",
-              type=int,
-              default=180,
-              help="Request timeout")
-@click.option("-l",
-              '--log_level',
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
               help="The logging level.")
-@click.option("-s",
-              "--schedule_style",
-              type=click.Choice(["context_first", "generation_first"],
-                                case_sensitive=False),
-              default=None,
-              help="The schedule style for the disaggregated server.")
+@click.option("--max_batch_size",
+              type=int,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+              help="Maximum batch size coalesced into a single encode() call.")
 @click.option(
+    "--max_num_tokens",
+    type=int,
+    default=8192,
+    help="Maximum number of batched input tokens in each encode() call.")
+@click.option(
+    "--max_queue_delay",
+    type=click.FloatRange(min=0.0),
+    default=0.005,
+    help="Dynamic-batching hold window in seconds: how long an incoming request "
+    "waits for others to join its batch before being dispatched (mirrors Triton's "
+    "max_queue_delay_microseconds).")
+@click.option(
+    "--max_queue_size",
+    type=click.IntRange(min=1),
+    default=2048,
+    help="Maximum number of in-flight queued requests; further requests are "
+    "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--config",
+    "--extra_llm_api_options",
+    "extra_llm_api_options",
+    type=str,
+    default=None,
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
+def serve_embedding(
+        model: str, host: str, port: int, log_level: str, max_batch_size: int,
+        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
+        trust_remote_code: bool, extra_llm_api_options: Optional[str],
+        revision: Optional[str], metadata_server_config_file: Optional[str],
+        telemetry: bool):
+    """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
+
+    Coalesces concurrent requests with a dynamic batcher and serves them through
+    the synchronous llm.encode() fast path (no KV cache / sampler / scheduler).
+    Single-GPU only: the command does not expose tensor/pipeline parallelism.
+
+    MODEL: model name | HF checkpoint path
+    """
+    logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
+
+    # Single-GPU, encode-only: tensor_parallel_size is fixed to 1 and not exposed as a
+    # flag (the in-process encode path has no multi-GPU worker proxy). gpus_per_node is
+    # auto-detected by get_llm_args; free_gpu_memory_fraction is omitted because the
+    # encode path allocates no KV cache. All remain settable via --config if needed.
+    llm_args, _ = get_llm_args(model=model,
+                               max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
+                               trust_remote_code=trust_remote_code,
+                               revision=revision,
+                               tensor_parallel_size=1,
+                               telemetry=telemetry,
+                               explicit_cli_keys=explicit_cli_keys)
+
+    extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            extra_dict = yaml.safe_load(f)
+    llm_args = update_llm_args_with_extra_dict(
+        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+
+    # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
+    # that explicitly rather than hang: the in-process encode-only path cannot shard.
+    effective_tp = llm_args.get("tensor_parallel_size") or 1
+    effective_pp = llm_args.get("pipeline_parallel_size") or 1
+    effective_cp = llm_args.get("context_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
+        raise click.BadParameter(
+            "The embeddings server is single-GPU only; multi-GPU (TP/PP/CP) is not "
+            f"supported yet. Got tensor_parallel_size={effective_tp}, "
+            f"pipeline_parallel_size={effective_pp}, "
+            f"context_parallel_size={effective_cp} from --config.",
+            param_hint="config")
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    launch_embedding_server(host, port, llm_args, max_queue_delay,
+                            max_queue_size, metadata_server_cfg)
+
+
+@click.command("disaggregated")
+@stability_option(
+    "-c",
+    "--config",
+    "--config_file",
+    "config_file",
+    type=str,
+    default=None,
+    help="Path to the disaggregated serving configuration YAML file.",
+    status="beta")
+@stability_option("-m",
+                  "--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option("-t",
+                  "--server_start_timeout",
+                  type=int,
+                  default=180,
+                  help="Server start timeout",
+                  status="beta")
+@stability_option("-r",
+                  "--request_timeout",
+                  type=int,
+                  default=180,
+                  help="Request timeout",
+                  status="beta")
+@stability_option("-l",
+                  '--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option("-s",
+                  "--schedule_style",
+                  type=click.Choice(["context_first", "generation_first"],
+                                    case_sensitive=False),
+                  default=None,
+                  help="The schedule style for the disaggregated server.",
+                  status="beta")
+@stability_option(
     "--metrics-log-interval",
     type=int,
     default=0,
     help="[Deprecated] The interval of logging metrics in seconds. "
-    "This option is not connected to any functionality and will be removed in a future release."
-)
+    "This option is not connected to any functionality and will be removed in a future release.",
+    status="deprecated")
 def disaggregated(
     config_file: Optional[str],
     metadata_server_config_file: Optional[str],
@@ -1352,16 +1643,49 @@ def disaggregated(
     # Inherited by child processes via env var; used for deduplication at query time.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] = uuid.uuid4().hex
 
+    logger.info(f"Reserving disaggregated server address "
+                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()})")
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    # Topology from explicit config (num_workers + disagg_coordinator_url):
+    # (a) url set -> delegate to that external coordinator; (b) url absent,
+    # num_workers>1 -> implicit in-process coordinator + delegating fleet;
+    # (c) url absent, num_workers==1 -> single self-contained server.
+    num_workers = disagg_cfg.num_workers
+    coordinator_url = disagg_cfg.disagg_coordinator_url
+
+    if coordinator_url:
+        # (a) External coordinator: fork a fleet of delegating servers (or a
+        # single one) pointed at it; never start a coordinator in this process.
+        _serve_disagg_fleet(disagg_cfg, config_file,
+                            metadata_server_config_file, request_timeout,
+                            server_start_timeout, num_workers, coordinator_url)
+        return
+
+    if num_workers > 1:
+        # (b) Implicit coordinator in this process (on port-1) + a delegating
+        # uvicorn fleet (workers=N) on the public port. See below.
+        _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                     metadata_server_config_file,
+                                     metadata_server_cfg, request_timeout,
+                                     server_start_timeout, num_workers)
+        return
+
+    # (c) num_workers==1, no external coordinator: a single disagg server with an
+    # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
         except OSError as e:
+            holder = _diagnose_port_in_use(disagg_cfg.port)
+            logger.error(
+                f"Failed to bind disaggregated server socket to "
+                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
+                f"{e}. Current port holder(s): {holder}")
             raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}"
-            )
-
-        metadata_server_cfg = parse_metadata_server_config_file(
-            metadata_server_config_file)
+                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
+                f"Port holder(s): {holder}")
 
         server = OpenAIDisaggServer(
             config=disagg_cfg,
@@ -1383,7 +1707,303 @@ def disaggregated(
         if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
             gc.disable()
 
-        asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+        uvloop.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+
+
+def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                         request_timeout, server_start_timeout, num_workers,
+                         coordinator_url):
+    """Launch delegating disaggregated-server workers.
+
+    Each worker has its own ``Popen`` running ``_run_fleet_worker`` on the shared
+    public port and pointing at ``coordinator_url``. Separate processes allow an
+    explicit per-worker ``TLLM_DISAGG_WORKER_PROCESS_ID`` and independent
+    ``SO_REUSEPORT`` sockets. MPI/PMIX/SLURM environment variables are stripped.
+
+    Returns the list of ``Popen`` handles.
+    """
+    from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
+    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    base_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
+                             "I_MPI_", "HYDRA_", "MPI_"))
+    }
+    # num_workers is explicit config now; ensure no stale WEB_CONCURRENCY leaks in
+    # and re-forks each plain-HTTP worker into a nested fleet.
+    base_env.pop("WEB_CONCURRENCY", None)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL] = coordinator_url
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE] = os.path.abspath(
+        config_file)
+    if metadata_server_config_file:
+        base_env[DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE] = \
+            os.path.abspath(metadata_server_config_file)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(
+        request_timeout)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
+        server_start_timeout)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE] = \
+        disagg_cfg.schedule_style
+    # Propagate the parent's log level so fleet workers' INFO logs (e.g. the
+    # per-request [ttft_split] / [coord_api] breakdowns) are not dropped.
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL] = logger.level
+
+    cmd = [
+        sys.executable, "-c",
+        "from tensorrt_llm.commands.serve import _run_fleet_worker; "
+        "_run_fleet_worker()"
+    ]
+    logger.info(
+        f"Launching disagg fleet: {num_workers} SO_REUSEPORT workers on "
+        f"{public_host}:{public_port}, coordinator={coordinator_url}")
+
+    procid_space = disagg_process_id_space()
+    if not 1 <= num_workers <= procid_space:
+        raise ValueError(
+            f"num_workers must be between 1 and {procid_space}, got {num_workers}"
+        )
+    fleet = []
+    for i in range(num_workers):
+        worker_env = dict(base_env)
+        # Explicit per-worker process index (no shared counter file).
+        worker_env[DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID] = str(i)
+        p = subprocess.Popen(cmd,
+                             env=worker_env,
+                             stdout=sys.stdout,
+                             stderr=sys.stderr)
+        logger.info(f"Disagg fleet worker {i} launched (pid={p.pid})")
+        fleet.append(p)
+
+    def _cleanup():
+        for p in fleet:
+            if p.poll() is None:
+                p.terminate()
+        deadline = time.monotonic() + 10
+        for p in fleet:
+            try:
+                p.wait(timeout=max(0, deadline - time.monotonic()))
+            except Exception:
+                p.kill()
+                p.wait()
+
+    def _handle_signal(signum, _frame):
+        _cleanup()
+        raise SystemExit(128 + signum)
+
+    atexit.register(_cleanup)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    return fleet
+
+
+def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                        request_timeout, server_start_timeout, num_workers,
+                        coordinator_url):
+    """External coordinator: fork the delegating fleet and block on it.
+
+    No coordinator is started in this process -- the fleet delegates to the
+    already-running coordinator at ``coordinator_url``.
+    """
+    fleet = _launch_disagg_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file, request_timeout,
+                                 server_start_timeout, num_workers,
+                                 coordinator_url)
+    # Block until any worker exits; a nonzero exit from any worker is a failure.
+    try:
+        while True:
+            for i, p in enumerate(fleet):
+                rc = p.poll()
+                if rc is not None:
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Disagg fleet worker {i} (pid={p.pid}) exited with "
+                            f"code {rc}")
+                    # A clean exit of one worker ends the fleet.
+                    return
+            time.sleep(1)
+    finally:
+        for process in fleet:
+            if process.poll() is None:
+                process.terminate()
+
+
+def _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file,
+                                 metadata_server_cfg, request_timeout,
+                                 server_start_timeout, num_workers):
+    """workers>1, no external URL: coordinator server here + a delegating fleet.
+
+    This process runs the coordinator server (owns the ctx/gen routers, cluster
+    state, and centralized ZMQ ingest) on ``port-1``; a uvicorn fleet on the
+    public port delegates to it.
+    """
+    from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+    from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+
+    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    coord_port = int(
+        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
+                       public_port - 1))
+    # The fleet is co-located with the implicit coordinator, so route its hot
+    # /select,/finish over a Unix domain socket (avoids the TCP loopback stack
+    # that dominated per-request latency). Opt-out via the UDS env = "0".
+    use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
+                             "1") == "1"
+    coord_uds = (
+        f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
+        if use_uds else None)
+    # Fleet points at the UDS when enabled; the TCP port stays up for health.
+    coord_url = f"unix:{coord_uds}" if coord_uds else \
+        f"http://{public_host}:{coord_port}"
+
+    # 1. Launch the delegating fleet pointed at the implicit coordinator we start
+    #    below (port-1 for TCP; UDS for the hot path). Workers hold
+    #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
+    fleet = _launch_disagg_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file, request_timeout,
+                                 server_start_timeout, num_workers, coord_url)
+
+    # 2. Build + serve the coordinator in this process. It OWNS routing state and
+    #    builds the owner routers itself (single shared namespace-aware core + ONE
+    #    ZMQ ingest server, started once here).
+    def _client_factory(router, role, max_retries=1):
+        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+
+    coordinator = DisaggCoordinatorService(
+        disagg_cfg,
+        _client_factory,
+        metadata_config=metadata_server_cfg,
+        server_start_timeout_secs=server_start_timeout)
+    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+                f"(uds={coord_uds}) (fleet on public port {public_port})")
+
+    async def _serve_and_monitor():
+        server_task = asyncio.create_task(
+            CoordinatorServer(coordinator)(public_host,
+                                           coord_port,
+                                           uds=coord_uds))
+
+        async def _monitor_fleet():
+            while True:
+                for i, process in enumerate(fleet):
+                    return_code = process.poll()
+                    if return_code is not None:
+                        if return_code != 0:
+                            raise RuntimeError(
+                                f"Disagg fleet worker {i} (pid={process.pid}) "
+                                f"exited with code {return_code}")
+                        return
+                await asyncio.sleep(1)
+
+        monitor_task = asyncio.create_task(_monitor_fleet())
+        done, pending = await asyncio.wait((server_task, monitor_task),
+                                           return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+
+    try:
+        asyncio.run(_serve_and_monitor())
+    finally:
+        for process in fleet:
+            if process.poll() is None:
+                process.terminate()
+
+
+def _init_fleet_worker_process():
+    """Per-process setup shared by every fleet worker (one OS process each).
+
+    Restores logging/GC state for the fresh ``python -c`` interpreter and tags
+    every log line with this worker's PID so the shared-stdout fleet output stays
+    attributable.
+    """
+    # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
+    # it is never itself re-forked into multiple uvicorn workers.
+    os.environ.pop("WEB_CONCURRENCY", None)
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+
+    # This is a fresh Python process, so the TRT-LLM logger defaults to WARNING
+    # and would drop the workers' INFO logs (per-request [ttft_split] /
+    # [coord_api]). Restore the parent's level.
+    _worker_log_level = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL)
+    if _worker_log_level:
+        logger.set_level(_worker_log_level)
+
+    # All N fleet workers share one stdout; tag every trtllm log line from this
+    # worker with its PID so interleaved fleet output is attributable.
+    import logging as _logging
+    for _h in _logging.getLogger("TRT-LLM").handlers:
+        _h.setFormatter(
+            _logging.Formatter(
+                fmt=
+                f"[%(asctime)s] [fleet-worker pid={os.getpid()}] %(message)s",
+                datefmt="%m/%d/%Y-%H:%M:%S"))
+
+
+def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
+    """Build one delegating disagg server from the env the launcher exported.
+
+    Fully stateless -- reads config + coordinator URL from ``DisaggWorkerEnvs``;
+    the server holds a remote ``CoordinatorClient`` so routing/readiness are
+    delegated to the coordinator. The worker's process index (for the snowflake
+    disagg-id) is read from ``TLLM_DISAGG_WORKER_PROCESS_ID``, which the launcher
+    set explicitly per worker (see ``worker_local_process_id``).
+    """
+    config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
+    coordinator_url = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL]
+    metadata_config_file = os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE)
+    request_timeout = int(
+        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT, "180"))
+    server_start_timeout = int(
+        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT,
+                       "180"))
+
+    disagg_cfg = parse_disagg_config_file(config_file)
+    schedule_style = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE)
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_config_file)
+
+    server = OpenAIDisaggServer(config=disagg_cfg,
+                                req_timeout_secs=request_timeout,
+                                server_start_timeout_secs=server_start_timeout,
+                                metadata_server_cfg=metadata_server_cfg,
+                                coordinator_url=coordinator_url)
+    logger.info(f"Disagg server built, coordinator={coordinator_url}")
+    return server
+
+
+def _run_fleet_worker():
+    """Run one fleet worker process.
+
+    Each ``Popen`` receives an explicit ``TLLM_DISAGG_WORKER_PROCESS_ID`` and
+    binds its own ``SO_REUSEPORT`` socket on the shared public port.
+    """
+    _init_fleet_worker_process()
+    server = _build_disagg_server_from_env()
+    host, port = server._config.hostname, server._config.port
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
+    # connections across the workers' accept queues by 4-tuple hash.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    try:
+        s.bind((host, port))
+    except OSError as e:
+        raise RuntimeError(
+            f"Fleet worker failed to SO_REUSEPORT-bind {host}:{port}: {e}")
+    pidx = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID, "0")
+    logger.info(f"Fleet worker process_id={pidx} bound {host}:{port} "
+                f"(SO_REUSEPORT)")
+    asyncio.run(server(host, port, sockets=[s]))
 
 
 def set_cuda_device():
@@ -1401,17 +2021,20 @@ def set_cuda_device():
 
 
 @click.command("disaggregated_mpi_worker")
-@click.option("-c",
-              "--config",
-              "--config_file",
-              "config_file",
-              type=str,
-              default=None,
-              help="Path to the disaggregated serving configuration YAML file.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
+@stability_option(
+    "-c",
+    "--config",
+    "--config_file",
+    "config_file",
+    type=str,
+    default=None,
+    help="Path to the disaggregated serving configuration YAML file.",
+    status="beta")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
 def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
 
@@ -1478,6 +2101,29 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
     TLLM_DISAGG_DEPLOYMENT_ID = "TRTLLM_DISAGG_DEPLOYMENT_ID"
     TLLM_DISAGG_ROLE = "TRTLLM_DISAGG_ROLE"
+
+
+class DisaggWorkerEnvs(StrEnum):
+    # Passed from the `disaggregated` coordinator to the fleet of worker processes
+    # (one Popen per worker) via env, then read by _run_fleet_worker in each worker.
+    TLLM_DISAGG_COORDINATOR_URL = "TRTLLM_DISAGG_COORDINATOR_URL"
+    TLLM_DISAGG_CONFIG_FILE = "TRTLLM_DISAGG_CONFIG_FILE"
+    TLLM_DISAGG_METADATA_CONFIG_FILE = "TRTLLM_DISAGG_METADATA_CONFIG_FILE"
+    TLLM_DISAGG_REQUEST_TIMEOUT = "TRTLLM_DISAGG_REQUEST_TIMEOUT"
+    TLLM_DISAGG_SERVER_START_TIMEOUT = "TRTLLM_DISAGG_SERVER_START_TIMEOUT"
+    TLLM_DISAGG_SCHEDULE_STYLE = "TRTLLM_DISAGG_SCHEDULE_STYLE"
+    # Parent's logger level; the forked uvicorn fleet is a fresh process that
+    # otherwise defaults to WARNING and drops the workers' INFO logs.
+    TLLM_DISAGG_LOG_LEVEL = "TRTLLM_DISAGG_LOG_LEVEL"
+    # Coordinator transport (read in _serve_coordinator_and_fleet): PORT overrides
+    # the coordinator TCP port (default public_port-1); UDS="1" (default) routes the
+    # co-located fleet's hot /select,/finish over a Unix domain socket, "0" for TCP.
+    TLLM_DISAGG_COORDINATOR_PORT = "TRTLLM_DISAGG_COORDINATOR_PORT"
+    TLLM_DISAGG_COORDINATOR_UDS = "TRTLLM_DISAGG_COORDINATOR_UDS"
+    # Per-fleet-worker process index (0..N-1) → the snowflake disagg-id process_id
+    # field so co-located workers never collide; the launcher sets one distinct
+    # value per worker Popen (see worker_local_process_id). Defaults to 0 if unset.
+    TLLM_DISAGG_WORKER_PROCESS_ID = "TRTLLM_DISAGG_WORKER_PROCESS_ID"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
@@ -1636,7 +2282,8 @@ main = DefaultGroup(
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
-        "mm_embedding_serve": serve_encoder
+        "mm_embedding_serve": serve_encoder,
+        "embeddings": serve_embedding
     })
 
 if __name__ == "__main__":

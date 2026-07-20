@@ -24,14 +24,14 @@ Integration tests are listed under `tests/integration/test_lists/test-db/`. Most
 - `stage`: either `pre_merge` or `post_merge`.
 - `backend`: `pytorch`, `tensorrt` or `triton`.
 
-Example from `l0_a100.yml`:
+Example from `l0_a30.yml`:
 
 ```yaml
       terms:
-        stage: post_merge
-        backend: triton
+        stage: pre_merge
+        backend: pytorch
   tests:
-  - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
+  - unittest/_torch/sampler/test_beam_search.py
 ```
 
 ## Unit tests
@@ -61,8 +61,8 @@ Manually searching YAML and Groovy files can be tedious.  The helper script
 `scripts/test_to_stage_mapping.py` automates the lookup:
 
 ```bash
-python scripts/test_to_stage_mapping.py --tests "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
-python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
+python scripts/test_to_stage_mapping.py --tests "unittest/_torch/sampler/test_beam_search.py"
+python scripts/test_to_stage_mapping.py --tests test_beam_search
 python scripts/test_to_stage_mapping.py --stages A100X-Triton-Post-Merge-1
 python scripts/test_to_stage_mapping.py --test-list my_tests.txt
 python scripts/test_to_stage_mapping.py --test-list my_tests.yml
@@ -109,8 +109,17 @@ developers understand why the test is disabled.
 
 ### Triggering Post-merge tests
 
-When you only need to verify a handful of post-merge tests, avoid the heavy
-`/bot run --post-merge` command. Instead, specify exactly which stages to run:
+Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
+label because they can consume substantial shared GPU resources. The label is
+intended to be applied by an active member of the
+`NVIDIA/trt-llm-ci-approvers` GitHub team. A GitHub workflow validates the label
+actor and normally removes invalid approvals. This is a best-effort resource
+governance guard, not a strict authorization boundary. The label remains in
+place when new commits are pushed and can be removed manually when the approval
+no longer applies.
+
+When you only need to verify a handful of post-merge tests, specify exactly
+which stages to run:
 
 ```bash
 /bot run --stage-list "stage-A,stage-B"
@@ -123,8 +132,14 @@ default pre-merge set:
 /bot run --extra-stage "stage-A,stage-B"
 ```
 
-Both options accept any stage name defined in `jenkins/L0_Test.groovy`. Being
-selective keeps CI turnaround fast and conserves hardware resources.
+Both options accept stage names and wildcard patterns defined in
+`jenkins/L0_Test.groovy`. The broad `"*"` and `"*Post-Merge*"` selectors
+require the same approval label, including when they appear in a comma-separated
+list. Equivalent escaped or repeated-star forms are treated the same. Other
+stage selectors, including explicit stage names and limited patterns such as
+`"*PerfSanity*"`, retain their existing behavior.
+
+Being selective keeps CI turnaround fast and conserves hardware resources.
 
 ### Avoiding unnecessary `--disable-fail-fast` usage
 

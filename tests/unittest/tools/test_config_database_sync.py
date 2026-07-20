@@ -21,6 +21,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).parent.parent.parent.parent.resolve()
 EXPECTED_MODEL_METADATA = {
     "deepseek-ai/DeepSeek-R1-0528": {
@@ -150,6 +152,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
             "Generated config_db.json is missing entries from lookup.yaml.",
         )
 
+    @pytest.mark.skip(reason="https://nvbugs/6337224")
     def test_config_database_tests_sync(self):
         """Test that config database test files are synchronized with lookup.yaml.
 

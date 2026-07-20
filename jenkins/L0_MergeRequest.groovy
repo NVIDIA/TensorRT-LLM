@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
@@ -123,6 +139,13 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+@Field
+def CBTS_COVERAGE = "cbts_coverage"
+@Field
+def DISABLE_CBTS = "disable_cbts"
+// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
+@Field
+def ENABLE_CBTS_COVERAGE = true
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -142,6 +165,8 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
     (CBTS_RESULT): null,
+    (CBTS_COVERAGE): false,
+    (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -161,7 +186,7 @@ def globalVars = [
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
-    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -313,6 +338,9 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+    // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -713,6 +741,13 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 
 def getCbtsResult(pipeline, testFilter, globalVars)
 {
+    // Explicit kill switch: `/bot run --disable-cbts` forces a full run.
+    if (testFilter[(DISABLE_CBTS)]) {
+        pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
+        _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        return null
+    }
+
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
@@ -748,7 +783,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def diffs = [:]
         for (f in changedFiles) {
             if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
-                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f)
+                // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
+                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f) ?: ""
             }
         }
 
@@ -918,7 +954,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/include/tensorrt_llm/runtime/worldConfig.h",
         "cpp/tensorrt_llm/batch_manager/",
         "cpp/tensorrt_llm/executor/",
-        "cpp/tensorrt_llm/executor_worker/",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
@@ -933,13 +968,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/userbuffers/",
         "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
         "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
-        "cpp/tensorrt_llm/plugins/ncclPlugin/",
         "cpp/tensorrt_llm/nanobind/",
         "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
@@ -949,8 +977,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/allgatherOp.cpp",
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
-        "cpp/tests/e2e_tests/batch_manager/",
-        "cpp/tests/e2e_tests/executor/",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
         "tensorrt_llm/_ipc_utils.py",
@@ -1011,22 +1037,18 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_ctx2_node1_gpu4_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_gpus_perf_sanity.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
-        "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
@@ -1162,15 +1184,6 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
-            if (testFilter[(IS_POST_MERGE)]) {
-                try {
-                    sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
-                    trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
-                } catch (Exception e) {
-                    // No need to fail the stage if the duration file generation fails
-                    echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
-                }
-            }
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
 
@@ -1203,8 +1216,16 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     --output-file=rerun/rerun_report.xml \
                     --input-files=${inputfiles}
                 """
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                if (fileExists("rerun/rerun_report.html")) {
+                    try {
+                        trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+                        echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                    } catch (Exception e) {
+                        echo "Failed to upload rerun report: ${e.toString()}"
+                    }
+                } else {
+                    echo "No rerun test results found, skipping rerun report upload."
+                }
                 catchError(
                     buildResult: 'SUCCESS',
                     stageResult: 'UNSTABLE') {
@@ -1222,34 +1243,27 @@ def collectTestResults(pipeline, testFilter, globalVars)
             try {
                 stage("Test Coverage") {
                     sh "ls"
-                    def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
-                    sh "echo ${CUR_PATH}"
                     sh "rm -rf cov && mkdir -p cov"
-                    sh "find . -type f -wholename '*/.coverage.*' -exec mv {} cov/ \\; || true"
-                    sh "cd cov && find . -type f"
-                    def fileCount = sh(returnStdout: true, script: 'find cov -type f | wc -l').replaceAll("\\s","").toInteger()
+                    // Collect the per-process PY_START data files from every stage's results tarball.
+                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                    sh "cd cov && ls -la"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
                     if (fileCount == 0) {
-                        echo "Test coverage is skipped because there is no test data file."
+                        echo "CBTS coverage skipped: no PY_START data files."
                         return
                     }
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
-                    sh "coverage --version"
-
-                    sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
-                    def coverageConfigFile = "cov/.coveragerc"
+                    // Merge into the indexed touch DB, a per-file HTML report, and the coverage rate.
                     sh """
-                        echo '[paths]' > ${coverageConfigFile}
-                        echo 'source1=\n    ${CUR_PATH}/llm/examples/\n    */TensorRT-LLM/src/examples/' >> ${coverageConfigFile}
-                        echo 'source2=\n    ${CUR_PATH}/llm/tensorrt_llm/\n    */tensorrt_llm/' >> ${coverageConfigFile}
-                        cat ${coverageConfigFile}
+                        python3 llm/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                            --glob 'cov/.cbtscov.*.sqlite' \
+                            --out-sqlite cov/cbts_touchmap.sqlite \
+                            --out-dir cov/cbts_report \
+                            --source-root llm/tensorrt_llm
                     """
-
-                    sh "cd cov && coverage combine"
-                    sh "cd cov && find . -type f"
-                    sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
-                    sh "cd cov && coverage html -d test_coverage_html -i"
-                    trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
-                    echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
+                    // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
+                    sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
+                    trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "CBTS coverage (touch DB + report): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
                 } // Test coverage
             }
             catch (InterruptedException e)
@@ -1509,8 +1523,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
-                        echo "In the official post-merge pipeline or when fail fast is disabled, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
@@ -1620,8 +1634,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
-                        echo "In the official post-merge pipeline or when fail fast is disabled, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."

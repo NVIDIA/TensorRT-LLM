@@ -5,11 +5,13 @@
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import safetensors.torch
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
@@ -37,6 +39,7 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
+from .parallel_vae import tile_parallel_decode
 from .pipeline_ltx2 import (
     LTX2Pipeline,
     _assert_resolution,
@@ -49,6 +52,7 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # Baseline BF16 peak memory ~75 GiB, saving BF16 weights snapshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
+_QKV_SUFFIXES = (".to_q", ".to_k", ".to_v")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +103,36 @@ def _should_save_bf16_weights(
     return save_state
 
 
+def _map_lora_param_name(base_name: str, strip_prefixes: List[str]) -> str:
+    param_name = base_name
+    for prefix in strip_prefixes:
+        if param_name.startswith(prefix):
+            param_name = param_name[len(prefix) :]
+            break
+
+    # Apply the same key remapping as LTXModel.load_weights() so LoRA delta
+    # keys match TRT-LLM parameter names.
+    for ff_prefix in (".ff.", ".audio_ff."):
+        if ff_prefix + "net.0.proj" in param_name:
+            param_name = param_name.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
+        elif ff_prefix + "net.2" in param_name:
+            param_name = param_name.replace(ff_prefix + "net.2", ff_prefix + "down_proj")
+    param_name = param_name.replace(".q_norm.", ".norm_q.")
+    param_name = param_name.replace(".k_norm.", ".norm_k.")
+    return param_name
+
+
+def _has_lora_target(param_name: str, model_params: set[str]) -> bool:
+    if param_name in model_params or f"{param_name}.weight" in model_params:
+        return True
+
+    for suffix in _QKV_SUFFIXES:
+        if param_name.endswith(suffix):
+            attn_prefix = param_name[: -len(suffix)]
+            return f"{attn_prefix}.qkv_proj.weight" in model_params
+    return False
+
+
 def _load_lora_deltas(
     lora_path: str,
     transformer: torch.nn.Module,
@@ -117,7 +151,9 @@ def _load_lora_deltas(
     sft_paths = _find_safetensors_files(lora_path)
     if not sft_paths:
         raise ValueError(f"No safetensors files found at {lora_path}")
-    _prefetch_ltx2_safetensors_files(sft_paths)
+    # This helper can run in a background thread while base components load.
+    # Avoid distributed prefetch collectives here; every rank must enter those
+    # from the same foreground load sequence to avoid hangs.
 
     raw: Dict[str, torch.Tensor] = {}
     alpha_dict: Dict[str, float] = {}
@@ -163,39 +199,28 @@ def _load_lora_deltas(
             if suffix:
                 strip_prefixes.append(suffix)
 
+    model_params = {n for n, _ in transformer.named_parameters()}
     deltas: Dict[str, torch.Tensor] = {}
+    skipped_non_targets = 0
     for base_name in down_keys:
         if base_name not in up_keys:
             continue
+
+        param_name = _map_lora_param_name(base_name, strip_prefixes)
+        if not _has_lora_target(param_name, model_params):
+            skipped_non_targets += 1
+            continue
+
         A = down_keys[base_name]  # (rank, in_features)
         B = up_keys[base_name]  # (out_features, rank)
         rank = A.shape[0]
         alpha = alpha_dict.get(base_name, float(rank))
         scale = strength * alpha / rank
-
-        param_name = base_name
-        for prefix in strip_prefixes:
-            if param_name.startswith(prefix):
-                param_name = param_name[len(prefix) :]
-                break
-
-        # Apply the same key remapping as LTXModel.load_weights() so
-        # that LoRA delta keys match TRT-LLM parameter names.
-        for ff_prefix in (".ff.", ".audio_ff."):
-            if ff_prefix + "net.0.proj" in param_name:
-                param_name = param_name.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
-            elif ff_prefix + "net.2" in param_name:
-                param_name = param_name.replace(ff_prefix + "net.2", ff_prefix + "down_proj")
-        param_name = param_name.replace(".q_norm.", ".norm_q.")
-        param_name = param_name.replace(".k_norm.", ".norm_k.")
-
         delta = (B.float() @ A.float()) * scale
         deltas[param_name] = delta
 
     # Fuse separate to_q / to_k / to_v deltas into a single qkv_proj
     # delta when the transformer uses QKV fusion (FUSE_QKV mode).
-    model_params = {n for n, _ in transformer.named_parameters()}
-    _QKV_SUFFIXES = (".to_q", ".to_k", ".to_v")
     fused_keys: set = set()
     qkv_groups: Dict[str, List[str]] = {}
     for key in list(deltas.keys()):
@@ -223,7 +248,10 @@ def _load_lora_deltas(
     for key in fused_keys:
         del deltas[key]
 
-    logger.info(f"Loaded {len(deltas)} LoRA deltas from {lora_path} (strength={strength})")
+    logger.info(
+        f"Loaded {len(deltas)} LoRA deltas from {lora_path} "
+        f"(strength={strength}, skipped_non_targets={skipped_non_targets})"
+    )
     return deltas
 
 
@@ -967,17 +995,49 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # The BF16 snapshot threshold is a whole-pipeline capacity gate, so
         # record it before loading model/runtime components that consume HBM.
         self._bf16_snapshot_preload_free_gib = _get_free_gpu_memory_gib(device=device)
-        super().load_standard_components(
-            checkpoint_dir,
-            device,
-            skip_components=skip_components,
-            **kwargs,
-        )
-
         dtype = self.pipeline_config.torch_dtype
         spatial_upsampler_path = self.pipeline_config.extra_attrs.get("spatial_upsampler_path", "")
         distilled_lora_path = self.pipeline_config.extra_attrs.get("distilled_lora_path", "")
 
+        lora_executor = None
+        lora_future = None
+        if distilled_lora_path:
+            logger.info(f"Starting distilled LoRA pre-compute from {distilled_lora_path}...")
+            lora_executor = ThreadPoolExecutor(max_workers=1)
+            lora_future = lora_executor.submit(
+                _load_lora_deltas,
+                distilled_lora_path,
+                self.transformer,
+                self._TRANSFORMER_PREFIX,
+            )
+
+        try:
+            super().load_standard_components(
+                checkpoint_dir,
+                device,
+                skip_components=skip_components,
+                **kwargs,
+            )
+
+            self._load_two_stage_components(
+                device,
+                dtype,
+                spatial_upsampler_path,
+                distilled_lora_path,
+                lora_future,
+            )
+        finally:
+            if lora_executor is not None:
+                lora_executor.shutdown(wait=True)
+
+    def _load_two_stage_components(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        spatial_upsampler_path: str,
+        distilled_lora_path: str,
+        lora_future,
+    ) -> None:
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
             logger.info(f"Loading spatial upsampler from {spatial_upsampler_path}...")
@@ -1018,12 +1078,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         self._distilled_lora_deltas: Dict[str, torch.Tensor] = {}
         self._distilled_lora_weight_cache: Optional[_PersistentLoRAWeightCache] = None
         if distilled_lora_path:
-            logger.info(f"Loading distilled LoRA from {distilled_lora_path}...")
-            self._distilled_lora_deltas = _load_lora_deltas(
-                distilled_lora_path,
-                self.transformer,
-                transformer_prefix=self._TRANSFORMER_PREFIX,
-            )
+            logger.info("Waiting for distilled LoRA pre-compute...")
+            if lora_future is None:
+                raise RuntimeError("Distilled LoRA pre-compute was not started.")
+            self._distilled_lora_deltas = lora_future.result()
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
@@ -1173,8 +1231,123 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
 
         # ================================================================
-        # Spatial upsample: 2x via learned upsampler
+        # Stage 2: spatial upsample + refinement denoise (rank-0 only)
         # ================================================================
+        # Only rank 0 refines; other vae_ranks skip Stage 2 and rejoin at the
+        # collective decode below, receiving the refined latents via broadcast.
+        if self.rank == 0:
+            video_latents, audio_latents = self._upsample_and_refine(
+                video_latents=video_latents,
+                audio_latents=audio_latents,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                seed=seed,
+                max_sequence_length=max_sequence_length,
+                image=image,
+                image_cond_strength=image_cond_strength,
+            )
+        else:
+            video_latents, audio_latents = None, None
+
+        # ================================================================
+        # Decode
+        # ================================================================
+        if output_type == "latent":
+            # No decode: only rank 0 holds the refined latents.
+            video_out, audio_out = (
+                (video_latents, audio_latents) if self.rank == 0 else (None, None)
+            )
+            if self.rank == 0:
+                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+            timer.mark_end()
+            return timer.fill(
+                PipelineOutput(
+                    video=video_out,
+                    audio=audio_out,
+                    frame_rate=float(frame_rate),
+                    audio_sample_rate=(
+                        int(self.audio_sampling_rate)
+                        if getattr(self, "audio_sampling_rate", None) is not None
+                        and audio_out is not None
+                        else None
+                    ),
+                )
+            )
+
+        if self._parallel_vae_enabled:
+            # Broadcast rank-0's refined Stage-2 latents to every vae_rank, then
+            # decode collectively (tile-parallel over vgm.vae_group).
+            vgm = self.pipeline_config.visual_gen_mapping
+            video_latents = self._broadcast_video_latents(video_latents, vgm.vae_group)
+            logger.info("Decoding upsampled video (tile-parallel)...")
+            video = tile_parallel_decode(
+                self.video_decoder,
+                video_latents,
+                TilingConfig.default(),
+                pg=vgm.vae_group,
+            )
+            video = postprocess_video_tensor(video)
+        else:
+            logger.info("Decoding upsampled video (tiled)...")
+            video_latents = video_latents.to(self.dtype)
+            chunks = list(
+                self.video_decoder.tiled_decode(
+                    video_latents,
+                    TilingConfig.default(),
+                    generator=None,
+                )
+            )
+            video = torch.cat(chunks, dim=2)
+            video = postprocess_video_tensor(video)
+
+        # Audio decode is rank-0 only (not tile-parallel).
+        audio_out = None
+        if self.rank == 0 and audio_latents is not None:
+            audio_latents = audio_latents.to(self.dtype)
+            audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
+
+        if self.rank == 0:
+            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio_out,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None
+                    and audio_out is not None
+                    else None
+                ),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _upsample_and_refine(
+        self,
+        video_latents: torch.Tensor,
+        audio_latents: Optional[torch.Tensor],
+        prompt: Union[str, List[str]],
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        seed: int,
+        max_sequence_length: int,
+        image: Optional[Union[str, torch.Tensor]] = None,
+        image_cond_strength: float = 1.0,
+    ) -> tuple:
+        """Stage 2 (rank-0 only): learned 2x spatial upsample + refinement denoise.
+
+        Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
+        """
         per_ch_stats = self._get_per_channel_statistics()
         video_latents = upsample_video(
             video_latents[:1],
@@ -1183,9 +1356,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
         logger.info("Upsampled video latents via learned upsampler")
 
-        # ================================================================
-        # Stage 2: refinement denoising with distilled LoRA
-        # ================================================================
         # The persistent cache owns original and merged tensors when it can be
         # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
         # state, so no per-request clone, merge, or unmerge math is needed.
@@ -1274,65 +1444,34 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             else:
                 self._lora_cuda_graph_state = "original"
 
-        # ================================================================
-        # Decode
-        # ================================================================
-        if output_type == "latent":
-            if self.rank == 0:
-                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-            timer.mark_end()
-            return timer.fill(
-                PipelineOutput(
-                    video=video_latents,
-                    audio=audio_latents,
-                    frame_rate=float(frame_rate),
-                    audio_sample_rate=(
-                        int(self.audio_sampling_rate)
-                        if getattr(self, "audio_sampling_rate", None) is not None
-                        and audio_latents is not None
-                        else None
-                    ),
-                )
+        return video_latents, audio_latents
+
+    def _broadcast_video_latents(
+        self, video_latents: Optional[torch.Tensor], vae_group
+    ) -> torch.Tensor:
+        """Broadcast rank-0's refined Stage-2 latents to every ``vae_rank``.
+
+        ``tile_parallel_decode`` needs the full latent replicated on each rank of
+        ``vae_group``; only rank 0 ran Stage 2, so it is the broadcast source.
+        Video latents are 5-D ``(B, C, F, H, W)``.
+        """
+        if vae_group is None:
+            raise ValueError(
+                "parallel VAE decode requires a valid vae_group, got None "
+                "(a None group would fall back to the world group and hang on non-VAE ranks)."
             )
-
-        logger.info("Decoding upsampled video (tiled)...")
-        video_latents = video_latents.to(self.dtype)
-        tiling_config = TilingConfig.default()
-        chunks = list(
-            self.video_decoder.tiled_decode(
-                video_latents,
-                tiling_config,
-                generator=None,
-            )
-        )
-        video = torch.cat(chunks, dim=2)
-        video = postprocess_video_tensor(video)
-
-        audio_out = None
-        if audio_latents is not None:
-            audio_latents = audio_latents.to(self.dtype)
-            audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
-
         if self.rank == 0:
-            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-        timer.mark_end()
-        return timer.fill(
-            PipelineOutput(
-                video=video,
-                audio=audio_out,
-                frame_rate=float(frame_rate),
-                audio_sample_rate=(
-                    int(self.audio_sampling_rate)
-                    if getattr(self, "audio_sampling_rate", None) is not None
-                    and audio_out is not None
-                    else None
-                ),
+            video_latents = video_latents.to(self.dtype).contiguous()
+            shape = torch.tensor(video_latents.shape, dtype=torch.long, device=self.device)
+        else:
+            shape = torch.empty(5, dtype=torch.long, device=self.device)
+        dist.broadcast(shape, src=0, group=vae_group)
+        if self.rank != 0:
+            video_latents = torch.empty(
+                torch.Size(shape.tolist()), dtype=self.dtype, device=self.device
             )
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        dist.broadcast(video_latents, src=0, group=vae_group)
+        return video_latents
 
     def _get_per_channel_statistics(self) -> torch.nn.Module:
         """Return per-channel statistics for un-normalize/normalize.

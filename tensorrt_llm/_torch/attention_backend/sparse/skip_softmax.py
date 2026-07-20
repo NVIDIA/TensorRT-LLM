@@ -17,11 +17,8 @@
 The kernel consumes a scalar ``threshold_scale_factor`` (combined with
 the sequence length at runtime) to decide which KV blocks to skip.
 This module owns the calibration side that produces that scalar from a
-semantic ``target_sparsity`` via a formula shipped with the checkpoint
-(the formula model and checkpoint-parsing helpers), plus the
-kernel-facing :class:`SkipSoftmaxKernelParams` carrier that the shared
-``TrtllmAttention`` reads. All of it is shared by the LLM and VisualGen
-pipelines.
+semantic ``target_sparsity`` via a formula shipped with the checkpoint.
+The helpers are shared by the LLM and VisualGen pipelines.
 """
 
 from dataclasses import dataclass, field
@@ -34,7 +31,7 @@ from pydantic import Field as PydanticField
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
-from .params import SparseParams
+from .params import SkipSoftmaxKernelParams, SparseParams
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
@@ -270,21 +267,6 @@ def skip_softmax_formula_from_ckpt_sparse_attention_config(
         # Scalar VisualGen configs may also keep coefficients next to formula.
         return SkipSoftmaxFormula.parse_from_dict(threshold_config)
     return None
-
-
-@dataclass
-class SkipSoftmaxKernelParams:
-    """Skip-softmax thresholds passed to attention backend kernels.
-
-    Produced by ``SkipSoftmaxScheduler.get_kernel_params()``.
-    """
-
-    # The kernel divides this by the context length to get the skip threshold;
-    # zero turns skip-softmax off.
-    threshold_scale_factor_prefill: float = 0.0
-    # Only autoregressive (LLM) decoding has a decode phase; diffusion and
-    # visual generation leave this at zero.
-    threshold_scale_factor_decode: float = 0.0
 
 
 class SkipSoftmaxScheduler:

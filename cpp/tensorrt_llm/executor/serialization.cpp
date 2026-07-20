@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/serialization.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/requestImpl.h"
@@ -626,8 +627,8 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto hasRnnConfig = su::deserialize<bool>(is);
     std::optional<CacheState::RnnModelConfig> rnnModelConfig;
     std::vector<SizeType32> rnnLayerNumPerPP;
-    nvinfer1::DataType convStateDataType{nvinfer1::DataType::kFLOAT};
-    nvinfer1::DataType ssmStateDataType{nvinfer1::DataType::kFLOAT};
+    tensorrt_llm::DataType convStateDataType{tensorrt_llm::DataType::kFLOAT};
+    tensorrt_llm::DataType ssmStateDataType{tensorrt_llm::DataType::kFLOAT};
     if (hasRnnConfig)
     {
         CacheState::RnnModelConfig rnnCfg;
@@ -641,8 +642,8 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
         rnnCfg.mNumHeads = su::deserialize<decltype(CacheState::RnnModelConfig::mNumHeads)>(is);
         rnnCfg.mConvSectionLayout
             = static_cast<CacheState::RnnModelConfig::ConvSectionLayout>(su::deserialize<SizeType32>(is));
-        convStateDataType = su::deserialize<nvinfer1::DataType>(is);
-        ssmStateDataType = su::deserialize<nvinfer1::DataType>(is);
+        convStateDataType = su::deserialize<tensorrt_llm::DataType>(is);
+        ssmStateDataType = su::deserialize<tensorrt_llm::DataType>(is);
         rnnLayerNumPerPP = su::deserialize<std::vector<SizeType32>>(is);
         rnnModelConfig = std::move(rnnCfg);
     }
@@ -1427,7 +1428,9 @@ SchedulerConfig Serialization::deserializeSchedulerConfig(std::istream& is)
     auto capacitySchedulerPolicy = su::deserialize<CapacitySchedulerPolicy>(is);
     auto contextChunkingPolicy = su::deserialize<std::optional<ContextChunkingPolicy>>(is);
     auto dynamicBatchConfig = su::deserialize<std::optional<DynamicBatchConfig>>(is);
-    return SchedulerConfig{capacitySchedulerPolicy, contextChunkingPolicy, dynamicBatchConfig};
+    auto enablePrefixAwareScheduling = su::deserialize<bool>(is);
+    return SchedulerConfig{
+        capacitySchedulerPolicy, contextChunkingPolicy, dynamicBatchConfig, enablePrefixAwareScheduling};
 }
 
 void Serialization::serialize(SchedulerConfig const& schedulerConfig, std::ostream& os)
@@ -1435,6 +1438,7 @@ void Serialization::serialize(SchedulerConfig const& schedulerConfig, std::ostre
     su::serialize(schedulerConfig.getCapacitySchedulerPolicy(), os);
     su::serialize(schedulerConfig.getContextChunkingPolicy(), os);
     su::serialize(schedulerConfig.getDynamicBatchConfig(), os);
+    su::serialize(schedulerConfig.getEnablePrefixAwareScheduling(), os);
 }
 
 size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
@@ -1443,6 +1447,7 @@ size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
     totalSize += su::serializedSize(schedulerConfig.getCapacitySchedulerPolicy());
     totalSize += su::serializedSize(schedulerConfig.getContextChunkingPolicy());
     totalSize += su::serializedSize(schedulerConfig.getDynamicBatchConfig());
+    totalSize += su::serializedSize(schedulerConfig.getEnablePrefixAwareScheduling());
     return totalSize;
 }
 

@@ -24,8 +24,6 @@ from torch import nn
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -149,10 +147,8 @@ class Mamba2Mixer(nn.Module):
             allreduce_strategy=config.allreduce_strategy)
 
         # A
-        self.A = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.A = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
+                              requires_grad=False)
 
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
@@ -163,7 +159,9 @@ class Mamba2Mixer(nn.Module):
         # TODO: Update head_dims once flashinfer is updated.
         # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
+        # flashinfer supports some head group ratios:
+        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
+        supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
         supported_d_states = [64, 128, 256]
         head_group_ratio = (self.tp_nheads //
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
@@ -202,16 +200,13 @@ class Mamba2Mixer(nn.Module):
                     key="stochastic_rounding_disabled")
 
         # D
-        self.D = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.D = nn.Parameter(torch.empty(self.tp_nheads, dtype=torch.float32),
+                              requires_grad=False)
 
         # dt_bias
-        self.dt_bias = nn.Parameter(
-            torch.empty(self.tp_nheads,
-                        dtype=torch.float32,
-                        requires_grad=False))
+        self.dt_bias = nn.Parameter(torch.empty(self.tp_nheads,
+                                                dtype=torch.float32),
+                                    requires_grad=False)
 
         # LoRA layers require regular bf16 tensors, not Fp4QuantizedTensor.
         # Disable fused RMSNorm+NVFP4 when LoRA is configured.
@@ -255,22 +250,32 @@ class Mamba2Mixer(nn.Module):
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        """Post-process after loading weights."""
+    def cache_derived_state(self) -> None:
+        """Recompute state derived from loaded weights."""
         if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
             self._try_attach_nvfp4_scale()
 
         # Pre-expand A, D, dt_bias for the decode path.
-        self._A_expanded = repeat(self.A,
-                                  "h -> h p n",
-                                  p=self.head_dim,
-                                  n=self.d_state).to(dtype=torch.float32)
-        self._dt_bias_expanded = repeat(self.dt_bias,
-                                        "h -> h p",
-                                        p=self.head_dim)
-        self._D_expanded = repeat(self.D, "h -> h p", p=self.head_dim)
+        # On first call: register as non-persistent buffers so the addresses are
+        # stable for CUDA-graph capture.  On subsequent calls (e.g. update_weights):
+        # update in-place so the captured addresses remain valid.
+        a_exp = repeat(self.A, "h -> h p n", p=self.head_dim,
+                       n=self.d_state).to(dtype=torch.float32)
+        dt_exp = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+        d_exp = repeat(self.D, "h -> h p", p=self.head_dim)
+        if '_A_expanded' not in self._buffers:
+            self.register_buffer('_A_expanded', a_exp, persistent=False)
+            self.register_buffer('_dt_bias_expanded', dt_exp, persistent=False)
+            self.register_buffer('_D_expanded', d_exp, persistent=False)
+        else:
+            self._A_expanded.copy_(a_exp)
+            self._dt_bias_expanded.copy_(dt_exp)
+            self._D_expanded.copy_(d_exp)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
@@ -301,17 +306,10 @@ class Mamba2Mixer(nn.Module):
 
         state_indices = mamba_metadata.state_indices[:num_prefills +
                                                      num_decodes]
-        if use_cpp_mamba_cache_manager():
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                self.layer_idx)
-            layer_cache = None  # Not used in C++ path
-        else:
-            layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
-                self.layer_idx)
-            conv_states = layer_cache.conv
-            ssm_states = layer_cache.temporal
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
+            self.layer_idx)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

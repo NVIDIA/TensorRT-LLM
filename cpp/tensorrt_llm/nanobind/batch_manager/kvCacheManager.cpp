@@ -18,6 +18,7 @@
 #include "kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -348,8 +349,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 
     nb::class_<tbk::PoolConfiguration>(m, "PoolConfiguration")
         .def(nb::init<>())
-        .def(nb::init<SizeType32, SizeType32, nvinfer1::DataType>(), nb::arg("window_size"), nb::arg("size_per_head"),
-            nb::arg("dtype"))
+        .def(nb::init<SizeType32, SizeType32, tensorrt_llm::DataType>(), nb::arg("window_size"),
+            nb::arg("size_per_head"), nb::arg("dtype"))
         .def_rw("window_size", &tbk::PoolConfiguration::windowSize)
         .def_rw("size_per_head", &tbk::PoolConfiguration::sizePerHead)
         .def_rw("dtype", &tbk::PoolConfiguration::dtype);
@@ -379,9 +380,17 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("primary_max_num_blocks", &tbk::KvCacheIterationStats::primaryMaxNumBlocks)
         .def_rw("primary_free_num_blocks", &tbk::KvCacheIterationStats::primaryFreeNumBlocks)
         .def_rw("primary_used_num_blocks", &tbk::KvCacheIterationStats::primaryUsedNumBlocks)
+        .def_rw("primary_evictable_num_blocks", &tbk::KvCacheIterationStats::primaryEvictableNumBlocks)
+        .def_rw("primary_peak_free_num_blocks", &tbk::KvCacheIterationStats::primaryPeakFreeNumBlocks)
+        .def_rw("primary_peak_used_num_blocks", &tbk::KvCacheIterationStats::primaryPeakUsedNumBlocks)
+        .def_rw("primary_peak_evictable_num_blocks", &tbk::KvCacheIterationStats::primaryPeakEvictableNumBlocks)
         .def_rw("secondary_max_num_blocks", &tbk::KvCacheIterationStats::secondaryMaxNumBlocks)
         .def_rw("secondary_free_num_blocks", &tbk::KvCacheIterationStats::secondaryFreeNumBlocks)
         .def_rw("secondary_used_num_blocks", &tbk::KvCacheIterationStats::secondaryUsedNumBlocks)
+        .def_rw("secondary_evictable_num_blocks", &tbk::KvCacheIterationStats::secondaryEvictableNumBlocks)
+        .def_rw("secondary_peak_free_num_blocks", &tbk::KvCacheIterationStats::secondaryPeakFreeNumBlocks)
+        .def_rw("secondary_peak_used_num_blocks", &tbk::KvCacheIterationStats::secondaryPeakUsedNumBlocks)
+        .def_rw("secondary_peak_evictable_num_blocks", &tbk::KvCacheIterationStats::secondaryPeakEvictableNumBlocks)
         .def_rw("iter_alloc_total_blocks", &tbk::KvCacheIterationStats::iterAllocTotalBlocks)
         .def_rw("iter_alloc_new_blocks", &tbk::KvCacheIterationStats::iterAllocNewBlocks)
         .def_rw("iter_reused_blocks", &tbk::KvCacheIterationStats::iterReusedBlocks)
@@ -395,7 +404,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_offload_blocks", &tbk::KvCacheIterationStats::iterOffloadBlocks)
         .def_rw("iter_offload_bytes", &tbk::KvCacheIterationStats::iterOffloadBytes)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
-        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes);
+        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes)
+        .def_rw("iter_host_dropped_blocks", &tbk::KvCacheIterationStats::iterHostDroppedBlocks)
+        .def_rw("iter_host_dropped_bytes", &tbk::KvCacheIterationStats::iterHostDroppedBytes);
 
     nb::class_<tbk::BlockKey>(m, "BlockKey")
         .def(nb::init<>())
@@ -651,8 +662,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
                  std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
-                 std::vector<SizeType32> const&, nvinfer1::DataType, SizeType32, int64_t, SizeType32, SizeType32, bool,
-                 tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
+                 std::vector<SizeType32> const&, tensorrt_llm::DataType, SizeType32, int64_t, SizeType32, SizeType32,
+                 bool, tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
                  std::shared_ptr<tbk::KVCacheEventManager>, bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>,
                  bool, SizeType32, SizeType32, bool, std::optional<tbk::LinearAttentionMetadata>,
                  std::vector<tbk::PoolConfiguration> const&>(),
@@ -683,7 +694,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("copy_linear_attention_block", &tbk::KVCacheManager::copyLinearAttentionBlock, nb::arg("llm_request"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("copy_linear_attention_block_batch", &tbk::KVCacheManager::copyLinearAttentionBlockBatch,
-            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_memory_pool_block_indices", &tbk::KVCacheManager::getMemoryPoolBlockIndicesByBlockIds,
+            nb::arg("block_ids"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

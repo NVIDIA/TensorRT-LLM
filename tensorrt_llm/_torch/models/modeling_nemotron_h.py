@@ -553,7 +553,7 @@ class NemotronHLayer(DecoderLayer):
 
     def post_load_weights(self):
         """Post-process after loading weights."""
-        if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
+        if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
@@ -602,7 +602,7 @@ class NemotronHLayer(DecoderLayer):
 
         if hasattr(self, 'pre_allreduce'):
             norm = self.norm
-            has_nvfp4_scale = hasattr(norm, 'nvfp4_scale')
+            has_nvfp4_scale = norm.nvfp4_scale is not None
             if norm.is_nvfp4 and has_nvfp4_scale and norm.return_hp_output:
                 fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
             elif norm.is_nvfp4 and has_nvfp4_scale:
@@ -972,9 +972,14 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             if not hasattr(config, attr) or getattr(config, attr) is None:
                 setattr(config, attr, _bc_getattr(fallback, attr))
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self,
+                     weights: dict,
+                     weight_mapper: BaseWeightMapper,
+                     allow_partial_loading: bool = False):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
+        super().load_weights(weights=new_weights,
+                             weight_mapper=weight_mapper,
+                             allow_partial_loading=allow_partial_loading)
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:

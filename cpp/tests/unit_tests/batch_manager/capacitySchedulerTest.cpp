@@ -31,7 +31,7 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
-#include <NvInferPlugin.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdlib>
 #include <functional>
@@ -132,7 +132,7 @@ protected:
         auto const nbKvHeads = 10;
         auto constexpr sizePerHead = 1;
         auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
-        auto const kvDtype = nvinfer1::DataType::kHALF;
+        auto const kvDtype = tensorrt_llm::DataType::kHALF;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -1818,6 +1818,50 @@ TEST_F(CapacitySchedulerTest, DelayDuplicateRequest)
                 EXPECT_EQ(numIterations, maxNewTokens + 1);
             }
             EXPECT_EQ(kvCacheManager->getNumReusedBlocks(), promptLen / kvCacheTokensPerBlock * 2);
+        }
+    }
+}
+
+TEST_F(CapacitySchedulerTest, PrefixAwareSchedulingDisabledDoesNotDelayDuplicateRequest)
+{
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    SizeType32 maxNumRequests = 3;
+    bool enableReuse = true;
+    bool enablePrefixAwareScheduling = false;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kMAX_UTILIZATION, CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens,
+            kvCacheMaxNumTokensPerSeq, /*sinkTokenLength=*/0, /*enableReuse=*/enableReuse);
+        auto peftCacheManager = getPeftCacheManager();
+        auto capacityScheduler = CapacityScheduler(maxNumRequests, capacitySchedulerPolicy, kvCacheManager != nullptr,
+            /*twoStepsLookAhead=*/false, /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+            /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+            /*enablePrefixAwareScheduling=*/enablePrefixAwareScheduling);
+
+        int32_t maxNewTokens = 2;
+        int32_t promptLen = 2 * kvCacheTokensPerBlock + 1;
+
+        auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen, 1);
+        std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+        RequestList activeRequests;
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 0, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 1, 1234));
+        activeRequests.push_back(createRequest(inputTokens, maxNewTokens, 2, 1234));
+
+        auto [scheduled, disaggInit, paused] = capacityScheduler(activeRequests, *kvCacheManager, peftCacheManager);
+
+        EXPECT_EQ(scheduled.size(), 3u);
+        EXPECT_TRUE(disaggInit.empty());
+        EXPECT_TRUE(paused.empty());
+        for (auto const& req : activeRequests)
+        {
+            EXPECT_EQ(req->getEstimatedReusableTokens(), 0);
         }
     }
 }

@@ -14,12 +14,14 @@
 # limitations under the License.
 """Integration tests for VisualGen examples and visual quality checks."""
 
+import base64
 import contextlib
 import gc
 import glob
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -29,8 +31,6 @@ import zipfile
 import pytest
 import torch
 import torch._inductor.config as inductor_config
-from defs import conftest
-from defs.common import venv_check_call
 from defs.trt_test_alternative import check_call
 from torch._inductor.async_compile import shutdown_compile_workers
 
@@ -229,16 +229,6 @@ AESTHETIC_PREDICTOR_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", 
 
 
 @pytest.fixture(scope="session")
-def _visual_gen_deps(llm_venv):
-    """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
-    llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
-
-
-@pytest.fixture(scope="session")
 def vbench_repo_root(llm_venv):
     """Clone VBench repo into workspace and install; return repo root path."""
     workspace = llm_venv.get_working_directory()
@@ -343,8 +333,30 @@ def _precache_aesthetic_predictor():
                 ) from exc
 
 
+def _llm_models_root():
+    # Imported lazily so that re-importing this module in a torch.multiprocessing.spawn
+    # child (a fresh interpreter) does not run a module-level `from defs import conftest`,
+    # which pulls in `tensorrt_llm.bindings` -- a compiled extension absent from the source
+    # tree the spawned child resolves, crashing the worker before the test runs. The parent
+    # process already imports conftest during collection, so this deferral is free.
+    from defs import conftest
+
+    return conftest.llm_models_root()
+
+
+def _venv_check_call(*args, **kwargs):
+    # Deferred like _llm_models_root above: defs.common does `from tensorrt_llm import
+    # LLM`, which pulls in tensorrt_llm.bindings. Importing it at module load would
+    # crash the torch.multiprocessing.spawn child processes used by the multi-GPU LPIPS
+    # tests, which re-import this module before the worker fixes sys.path. Only the
+    # single-GPU example tests call this, and only in the parent process.
+    from defs.common import venv_check_call
+
+    return venv_check_call(*args, **kwargs)
+
+
 def _lpips_model_path(*parts):
-    return os.path.join(conftest.llm_models_root(), *parts)
+    return os.path.join(_llm_models_root(), *parts)
 
 
 def _skip_if_missing(path, label, is_dir=False):
@@ -380,7 +392,7 @@ def _golden_media_path(tmp_path, media_name, label):
 
 
 def _ltx2_lpips_text_encoder_path():
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     candidates = [
         os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH),
         os.path.join(scratch_space, "gemma", LTX2_TEXT_ENCODER_SUBPATH),
@@ -410,14 +422,28 @@ def _cleanup_cuda():
 
 
 @contextlib.contextmanager
-def _lpips_deterministic_algorithms():
-    previous = torch.are_deterministic_algorithms_enabled()
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True)
+def _lpips_deterministic_algorithms(*, fully_eager=False):
+    previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_cublas_workspace_config = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+
     try:
-        yield
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        compiler_context = (
+            torch.compiler.set_stance("force_eager") if fully_eager else contextlib.nullcontext()
+        )
+        with compiler_context:
+            yield
     finally:
-        torch.use_deterministic_algorithms(previous)
+        torch.use_deterministic_algorithms(
+            previous_deterministic,
+            warn_only=previous_warn_only,
+        )
+        if previous_cublas_workspace_config is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = previous_cublas_workspace_config
 
 
 def _save_lpips_video_mp4(video, output_path, frame_rate):
@@ -425,35 +451,18 @@ def _save_lpips_video_mp4(video, output_path, frame_rate):
 
     try:
         save_video(video, output_path, frame_rate=frame_rate)
-        return
     except RuntimeError as err:
         if "MP4 format requires ffmpeg" not in str(err):
             raise
-
-    import cv2
-
-    if video.dim() == 5:
-        video = video[0]
-    output_path = str(output_path)
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    video_np = video.detach().cpu().numpy()
-    num_frames, height, width, channels = video_np.shape
-    assert channels == 3, f"Expected RGB video with 3 channels, got {channels}"
-    writer = cv2.VideoWriter(
-        output_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        float(frame_rate),
-        (width, height),
-    )
-    assert writer.isOpened(), f"Failed to open MP4 writer for {output_path}"
-    try:
-        for frame in video_np:
-            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
+        # Never fall back to another codec here: the goldens are H.264/x264 and
+        # LPIPS compares decoded pixels, so a silent cv2/mp4v fallback compares
+        # codec artifacts, not model output (this produced a spurious 0.059 on
+        # wan22 while the generated frames were identical to the golden).
+        pytest.fail(
+            "ffmpeg is unavailable for LPIPS video encoding; refusing to fall back "
+            "to another codec because the golden comparison would measure codec "
+            f"artifacts instead of model output: {err}"
+        )
     assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
 
 
@@ -517,6 +526,39 @@ def _assert_lpips_below_threshold(score, threshold):
     assert score < threshold, f"LPIPS too high: {score:.6f} (expected < {threshold:.6f})"
 
 
+def _preserve_lpips_candidate_on_failure(request, score, threshold, candidate_path, artifact_name):
+    """Copy the generated candidate into pytest's --output-dir when the LPIPS gate fails.
+
+    CI archives the output dir per stage, so a threshold failure leaves behind the
+    exact CI-generated media needed to refresh the golden without guessing at
+    machine-to-machine kernel-stack drift (measured ~0.04 LPIPS across B200 hosts
+    on the same container for 1-step Wan2.1).
+    """
+    if score < threshold:
+        return
+    output_dir = request.config.getoption("--output-dir", default=None)
+    if not output_dir:
+        return
+    dest_dir = os.path.join(str(output_dir), "lpips_failure_artifacts")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, artifact_name)
+    shutil.copy2(str(candidate_path), dest)
+    print(f"[LPIPS] candidate preserved for golden refresh: {dest}")
+    # CI's per-stage results tarball only collects flat files (results.xml etc.), not
+    # this subdirectory — and junit stdout IS collected. Small candidates therefore
+    # also go into stdout as base64 so a threshold failure is diagnosable from the
+    # archived results.xml alone (this is how wan22's spurious 0.059 was traced to a
+    # silent mpeg4 codec fallback rather than a generation difference).
+    size = os.path.getsize(dest)
+    if size <= 8 * 1024 * 1024:
+        with open(dest, "rb") as fh:
+            encoded = base64.b64encode(fh.read()).decode("ascii")
+        print(f"[LPIPS-B64-BEGIN {artifact_name} {size}]")
+        for i in range(0, len(encoded), 3072):
+            print(encoded[i : i + 3072])
+        print(f"[LPIPS-B64-END {artifact_name}]")
+
+
 def _generate_flux_lpips_image(model_path, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
@@ -561,7 +603,10 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
     _disable_inductor_compile_worker_quiesce()
 
-    with _lpips_deterministic_algorithms():
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    # Wrapped here (not in the fixture) so the golden fixture and both sides of
+    # test_ltx2_cuda_graph_lpips_matches_eager run the same eager numerics.
+    with _lpips_deterministic_algorithms(), torch.compiler.set_stance("force_eager"):
         args = VisualGenArgs(
             model=checkpoint_path,
             pipeline_config={
@@ -593,6 +638,79 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
+def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        CompilationConfig,
+        CudaGraphConfig,
+        ParallelConfig,
+        TorchCompileConfig,
+    )
+
+    scratch_space = _llm_models_root()
+    checkpoint_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
+    text_encoder_path = _ltx2_lpips_text_encoder_path()
+    spatial_upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
+    distilled_lora_path = os.path.join(scratch_space, LTX2_DISTILLED_LORA_SUBPATH)
+    _skip_if_missing(checkpoint_path, "LTX-2 checkpoint")
+    _skip_if_missing(text_encoder_path, "LTX-2 text encoder", is_dir=True)
+    _skip_if_missing(spatial_upsampler_path, "LTX-2 spatial upsampler")
+    _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
+    _disable_inductor_compile_worker_quiesce()
+
+    visual_gen_args = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "NVFP4", "dynamic": True},
+        attention_config=AttentionConfig(backend="TRTLLM"),
+        parallel_config=ParallelConfig(
+            cfg_size=1,
+            ulysses_size=1,
+            parallel_vae_size=1,
+        ),
+        compilation_config=CompilationConfig(
+            resolutions=[
+                (
+                    LTX2_T2V_HEIGHT,
+                    LTX2_T2V_WIDTH,
+                )
+            ],
+            num_frames=[LTX2_LPIPS_NUM_FRAMES],
+        ),
+        cuda_graph_config=CudaGraphConfig(enable=True),
+        torch_compile_config=TorchCompileConfig(
+            enable=True,
+            enable_fullgraph=False,
+            enable_autotune=True,
+        ),
+        pipeline_config={
+            "text_encoder_path": text_encoder_path,
+            "spatial_upsampler_path": spatial_upsampler_path,
+            "distilled_lora_path": distilled_lora_path,
+        },
+    )
+
+    visual_gen = VisualGen(model=checkpoint_path, args=visual_gen_args)
+    try:
+        params = VisualGenParams(
+            height=LTX2_T2V_HEIGHT,
+            width=LTX2_T2V_WIDTH,
+            num_frames=LTX2_LPIPS_NUM_FRAMES,
+            num_inference_steps=LTX2_LPIPS_NUM_INFERENCE_STEPS,
+            guidance_scale=LTX2_T2V_GUIDANCE_SCALE,
+            max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
+            seed=LTX2_T2V_SEED,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+            negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
+        )
+        output = visual_gen.generate(inputs=LTX2_T2V_PROMPT, params=params)
+        _save_lpips_video_mp4(output.video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
+    finally:
+        visual_gen.shutdown()
+
+    assert os.path.isfile(output_path), f"LTX-2 TRTLLM backend did not produce {output_path}"
+
+
 def _run_wan_lpips_pipeline(
     model_path,
     prompt,
@@ -605,6 +723,7 @@ def _run_wan_lpips_pipeline(
     seed,
     attention_backend="VANILLA",
     parallel=None,
+    fully_eager=False,
 ):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
@@ -618,7 +737,7 @@ def _run_wan_lpips_pipeline(
     )
     if parallel is not None:
         args_kwargs["parallel_config"] = parallel
-    with _lpips_deterministic_algorithms():
+    with _lpips_deterministic_algorithms(fully_eager=fully_eager):
         args = VisualGenArgs(**args_kwargs)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
@@ -653,7 +772,9 @@ def _generate_wan_lpips_video(
     guidance_scale,
     seed,
     frame_rate,
+    attention_backend="VANILLA",
     parallel=None,
+    fully_eager=False,
 ):
     generated_video = _run_wan_lpips_pipeline(
         model_path,
@@ -665,7 +786,9 @@ def _generate_wan_lpips_video(
         num_inference_steps,
         guidance_scale,
         seed,
+        attention_backend=attention_backend,
         parallel=parallel,
+        fully_eager=fully_eager,
     )
     assert generated_video is not None, "Single-GPU Wan LPIPS run produced no video"
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=frame_rate)
@@ -676,19 +799,21 @@ def wan21_bf16_video_path(_visual_gen_deps, llm_venv):
     output_path = _visual_gen_output_path(llm_venv, "wan21_bf16")
     if os.path.isfile(output_path):
         return output_path
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
-        output_path,
-        WAN21_LPIPS_PROMPT,
-        WAN21_LPIPS_NEGATIVE_PROMPT,
-        WAN21_LPIPS_HEIGHT,
-        WAN21_LPIPS_WIDTH,
-        WAN21_LPIPS_NUM_FRAMES,
-        WAN21_LPIPS_NUM_INFERENCE_STEPS,
-        WAN21_LPIPS_GUIDANCE_SCALE,
-        WAN21_LPIPS_SEED,
-        WAN_LPIPS_FRAME_RATE,
-    )
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    with torch.compiler.set_stance("force_eager"):
+        _generate_wan_lpips_video(
+            _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
+            output_path,
+            WAN21_LPIPS_PROMPT,
+            WAN21_LPIPS_NEGATIVE_PROMPT,
+            WAN21_LPIPS_HEIGHT,
+            WAN21_LPIPS_WIDTH,
+            WAN21_LPIPS_NUM_FRAMES,
+            WAN21_LPIPS_NUM_INFERENCE_STEPS,
+            WAN21_LPIPS_GUIDANCE_SCALE,
+            WAN21_LPIPS_SEED,
+            WAN_LPIPS_FRAME_RATE,
+        )
     return output_path
 
 
@@ -697,33 +822,36 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     output_path = _visual_gen_output_path(llm_venv, "wan22_bf16")
     if os.path.isfile(output_path):
         return output_path
-    _generate_wan_lpips_video(
-        _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
-        output_path,
-        WAN22_LPIPS_PROMPT,
-        WAN22_LPIPS_NEGATIVE_PROMPT,
-        WAN22_LPIPS_HEIGHT,
-        WAN22_LPIPS_WIDTH,
-        WAN22_LPIPS_NUM_FRAMES,
-        WAN22_LPIPS_NUM_INFERENCE_STEPS,
-        WAN22_LPIPS_GUIDANCE_SCALE,
-        WAN22_LPIPS_SEED,
-        WAN22_LPIPS_FRAME_RATE,
-    )
+    # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
+    with torch.compiler.set_stance("force_eager"):
+        _generate_wan_lpips_video(
+            _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+            output_path,
+            WAN22_LPIPS_PROMPT,
+            WAN22_LPIPS_NEGATIVE_PROMPT,
+            WAN22_LPIPS_HEIGHT,
+            WAN22_LPIPS_WIDTH,
+            WAN22_LPIPS_NUM_FRAMES,
+            WAN22_LPIPS_NUM_INFERENCE_STEPS,
+            WAN22_LPIPS_GUIDANCE_SCALE,
+            WAN22_LPIPS_SEED,
+            WAN22_LPIPS_FRAME_RATE,
+        )
     return output_path
 
 
-def _generate_qwenimage_lpips_image(model_path, output_path):
-    """Generate the QwenImage text-to-image LPIPS sample (default setting, compile-off)."""
+def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_graph=False):
+    """Generate the QwenImage text-to-image LPIPS sample."""
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
-    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "QwenImage checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args = VisualGenArgs(
         model=model_path,
         torch_compile_config=TorchCompileConfig(enable=False),
+        cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
@@ -855,7 +983,7 @@ def test_flux2_lpips_against_golden(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
+def test_ltx2_lpips_against_golden(request, tmp_path, ltx2_two_stage_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
     )
@@ -867,11 +995,18 @@ def test_ltx2_lpips_against_golden(tmp_path, ltx2_two_stage_bf16_video_path):
         golden_path,
         ltx2_two_stage_bf16_video_path,
     )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_LPIPS_THRESHOLD,
+        ltx2_two_stage_bf16_video_path,
+        "ltx2_lpips_golden_video.mp4",
+    )
     _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
+def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
     eager_path = tmp_path / "ltx2_eager_generated.mp4"
     cuda_graph_path = tmp_path / "ltx2_cuda_graph_generated.mp4"
 
@@ -889,7 +1024,32 @@ def test_ltx2_cuda_graph_lpips_matches_eager(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_wan21_t2v_lpips_against_golden(tmp_path, wan21_bf16_video_path):
+def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path):
+    generated_path = tmp_path / "ltx2_cuda_graph_trtllm_backend_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
+    )
+    _generate_ltx2_cuda_graph_trtllm_backend_video(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_cuda_graph_trtllm_backend",
+        "video",
+        LTX2_T2V_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_LPIPS_THRESHOLD,
+        generated_path,
+        "ltx2_cuda_graph_trtllm_backend_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_wan21_t2v_lpips_against_golden(request, tmp_path, wan21_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan21_t2v_lpips_golden_video.mp4", "Wan 2.1 LPIPS golden video"
     )
@@ -901,11 +1061,18 @@ def test_wan21_t2v_lpips_against_golden(tmp_path, wan21_bf16_video_path):
         golden_path,
         wan21_bf16_video_path,
     )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        WAN_LPIPS_THRESHOLD,
+        wan21_bf16_video_path,
+        "wan21_t2v_lpips_golden_video.mp4",
+    )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_wan22_t2v_lpips_against_golden(tmp_path, wan22_bf16_video_path):
+def test_wan22_t2v_lpips_against_golden(request, tmp_path, wan22_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
     )
@@ -916,6 +1083,13 @@ def test_wan22_t2v_lpips_against_golden(tmp_path, wan22_bf16_video_path):
         WAN22_LPIPS_PROMPT,
         golden_path,
         wan22_bf16_video_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        WAN_LPIPS_THRESHOLD,
+        wan22_bf16_video_path,
+        "wan22_t2v_lpips_golden_video.mp4",
     )
     _assert_lpips_below_threshold(score, WAN_LPIPS_THRESHOLD)
 
@@ -939,7 +1113,29 @@ def test_qwenimage_lpips_against_golden(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cosmos3_nano_t2v_lpips_against_golden(tmp_path):
+def test_qwenimage_cuda_graph_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "qwenimage_cuda_graph_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path, "qwenimage_lpips_golden.png", "QwenImage LPIPS golden image"
+    )
+    _generate_qwenimage_lpips_image(
+        _lpips_model_path(QWENIMAGE_MODEL_SUBPATH),
+        generated_path,
+        enable_cuda_graph=True,
+    )
+    score = _run_lpips_eval(
+        tmp_path,
+        "qwenimage_cuda_graph",
+        "image",
+        QWENIMAGE_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_nano_t2v_lpips_against_golden(_visual_gen_deps, tmp_path):
     generated_path = tmp_path / "cosmos3_nano_t2v_generated.mp4"
     golden_path = _golden_media_path(
         tmp_path,
@@ -984,7 +1180,7 @@ def _generate_wan_video(llm_venv, model_subpath, output_subdir):
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, model_subpath)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -1057,7 +1253,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
     """
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
     upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
@@ -1217,7 +1413,7 @@ def _run_vbench_and_report(
         "custom_input",
     ]
     cmd.extend(["--dimension"] + VBENCH_DIMENSIONS)
-    venv_check_call(llm_venv, cmd)
+    _venv_check_call(llm_venv, cmd)
 
     pattern = os.path.join(output_path, "*_eval_results.json")
     result_files = glob.glob(pattern)
@@ -1356,7 +1552,7 @@ def test_vbench_dimension_score_ltx2_two_stage_fp8(
 
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/quickstart_example.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
         pytest.skip(
@@ -1370,7 +1566,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
         os.symlink(model_src, model_dst, target_is_directory=True)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "quickstart_example.py")
-    venv_check_call(llm_venv, [script_path])
+    _venv_check_call(llm_venv, [script_path])
 
     output_path = os.path.join(llm_venv.get_working_directory(), "output.avi")
     assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"
@@ -1378,7 +1574,7 @@ def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
 
 def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
     """Run examples/visual_gen/api_walkthrough.py end-to-end."""
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_src):
         pytest.skip(
@@ -1392,7 +1588,7 @@ def test_visual_gen_api_walkthrough(_visual_gen_deps, llm_root, llm_venv):
         os.symlink(model_src, model_dst, target_is_directory=True)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "api_walkthrough.py")
-    venv_check_call(llm_venv, [script_path])
+    _venv_check_call(llm_venv, [script_path])
 
     output_path = os.path.join(llm_venv.get_working_directory(), "api_walkthrough_output.avi")
     assert os.path.isfile(output_path), f"API walkthrough did not produce {output_path}"
@@ -1415,7 +1611,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     which runs the same script but with a no-quant YAML synthesized at
     runtime and additionally evaluates VBench scores.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_A14B_NVFP4_MODEL_SUBPATH)
     assert os.path.isdir(model_path), (
         f"Model not found: {model_path} "
@@ -1433,7 +1629,7 @@ def test_wan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1469,7 +1665,7 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1505,7 +1701,7 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1544,7 +1740,7 @@ def test_ltx2_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1568,7 +1764,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     work together as documented. Uses the pre-quantized Wan 2.2 I2V A14B NVFP4
     checkpoint and the default input image (cat_piano.png) bundled with the examples.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -1587,7 +1783,7 @@ def test_wan_i2v_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1609,7 +1805,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     ``configs/qwen-image-fp8-1gpu.yaml`` work together as documented. Uses the
     local Qwen-Image checkpoint and the shared FP8 blockwise dynamic-quant config.
     """
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     model_path = os.path.join(scratch_space, QWEN_IMAGE_MODEL_SUBPATH)
     _skip_if_missing(model_path, "Qwen-Image checkpoint", is_dir=True)
     model_index_path = os.path.join(model_path, "model_index.json")
@@ -1631,7 +1827,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
@@ -1647,7 +1843,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
 
 
 def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
-    """Run examples/visual_gen/models/cosmos3_ti2v.py with FP8 config end-to-end.
+    """Run examples/visual_gen/models/cosmos3/cosmos3.py with FP8 config end-to-end.
 
     Validates that the Cosmos3-Nano example script and ``configs/cosmos3-nano-1gpu.yaml``
     work together as documented. Uses the local Cosmos3-Nano checkpoint and
@@ -1660,14 +1856,16 @@ def test_cosmos3_example(_visual_gen_deps, llm_root, llm_venv):
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "cosmos3_output.mp4")
 
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "cosmos3_ti2v.py")
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
     config_path = os.path.join(
         llm_root, "examples", "visual_gen", "configs", "cosmos3-nano-1gpu.yaml"
     )
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
     assert os.path.isfile(config_path), f"Config not found: {config_path}"
 
-    venv_check_call(
+    _venv_check_call(
         llm_venv,
         [
             script_path,
