@@ -157,24 +157,11 @@ __global__ void fusedQKNormRopeKernel(
         // Compute RMS normalization factor
         float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
 
-        // Coalesced load: each thread pulls its numElemsPerThread contiguous bf16
-        // weights with a single vec_T load (uint2 for head_dim=128) instead of
-        // numElemsPerThread scalar strided 2-byte loads. Across the warp this is
-        // one aligned 256-byte request per warp — matches the qkv-load pattern.
-        __nv_bfloat16 const* w_base = isQ ? q_weight : k_weight;
-        vec_T w_vec = *reinterpret_cast<vec_T const*>(&w_base[laneId * numElemsPerThread]);
-        float weights_f[numElemsPerThread];
-        for (int i = 0; i < vecSize; i++)
-        {
-            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&w_vec) + i));
-            weights_f[2 * i] = vals.x;
-            weights_f[2 * i + 1] = vals.y;
-        }
-
         // Normalize elements
         for (int i = 0; i < numElemsPerThread; i++)
         {
-            float weight = weights_f[i];
+            int dim = laneId * numElemsPerThread + i;
+            float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
             // Gemma RMSNorm scales by (1 + weight); standard RMSNorm scales by weight.
             elements[i] *= rms_rcp * (use_gemma ? (1.0f + weight) : weight);
         }
