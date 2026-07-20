@@ -26,7 +26,7 @@ using namespace tensorrt_llm::common;
 TEST(LoggerModuleTest, FormatModuleNoTrailingSpaces)
 {
     for (auto const* raw : {"batch_manager", "common", "cutlass_extensions", "deep_ep", "deep_gemm", "executor",
-             "executor_worker", "flash_mla", "kernels", "layers", "nanobind", "plugins", "runtime", "testing", "thop"})
+             "flash_mla", "kernels", "layers", "nanobind", "runtime", "testing", "thop"})
     {
         auto const fmt = formatModule(raw);
         EXPECT_FALSE(fmt.empty());

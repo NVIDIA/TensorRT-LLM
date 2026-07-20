@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/penaltyTypes.h"
 #include "tests/unit_tests/kernels/sampling/samplingTest.h"
 
@@ -161,14 +162,14 @@ protected:
         mLogitsPtrs = BufferManager::pinned(ITensor::makeShape({mBatchSize}), ptrType);
 
         mPenaltyWorkspaceDevice = mBufferManager->gpu(
-            ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep, mVocabSize * 2}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mMaxBatchSize, mMaxTokensPerStep, mVocabSize * 2}), tensorrt_llm::DataType::kINT32);
 
-        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
         mBiasHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
         mBiasDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mVocabSizePadded}), dataType);
 
-        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), tensorrt_llm::DataType::kINT32);
 
         trk::invokeFill(*mLogitsRefHost, T{0.0f}, *mStream);
         trk::invokeFill(*mOutLogitsDevice, T{0.0f}, *mStream);
@@ -204,7 +205,7 @@ protected:
 
         ASSERT_EQ(param.temperaturesSize, mMaxBatchSize) << "Invalid test configuration.";
         mTemperaturesDevice
-            = mBufferManager->gpu(ITensor::makeShape({param.temperaturesSize}), nvinfer1::DataType::kFLOAT);
+            = mBufferManager->gpu(ITensor::makeShape({param.temperaturesSize}), tensorrt_llm::DataType::kFLOAT);
         mBufferManager->copy(*param.temperatures, *mTemperaturesDevice);
     }
 
@@ -281,7 +282,8 @@ TYPED_TEST(TemperaturePenaltyTest, NoPenalty)
 {
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
-    TensorPtr temperaturesHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr temperaturesHost
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*temperaturesHost)[i] = 1.0f;
@@ -297,7 +299,8 @@ TYPED_TEST(TemperaturePenaltyTest, LessThanOne)
 {
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
-    TensorPtr temperaturesHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr temperaturesHost
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*temperaturesHost)[i] = 0.53f;
@@ -313,7 +316,8 @@ TYPED_TEST(TemperaturePenaltyTest, GreaterThaneOne)
 {
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
-    TensorPtr temperaturesHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr temperaturesHost
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*temperaturesHost)[i] = 2.01f;
@@ -329,7 +333,8 @@ TYPED_TEST(TemperaturePenaltyTest, Mixed)
 {
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
-    TensorPtr temperaturesHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr temperaturesHost
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*temperaturesHost)[i] = 0.53f + 0.2f * i;
@@ -345,7 +350,8 @@ TYPED_TEST(TemperaturePenaltyTest, LargeVocab)
 {
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
-    TensorPtr temperaturesHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr temperaturesHost
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*temperaturesHost)[i] = 0.53f + 0.2f * i;
@@ -361,7 +367,8 @@ TYPED_TEST(TemperaturePenaltyTest, LargeVocabTokensPerStep)
 {
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
-    TensorPtr temperaturesHost = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+    TensorPtr temperaturesHost
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*temperaturesHost)[i] = 1.f; // 0.53f + 0.2f * i;
@@ -541,25 +548,25 @@ protected:
         mLogitsPtrs = BufferManager::pinned(ITensor::makeShape({mBatchSize}), ptrType);
 
         mPenaltyWorkspaceDevice = mBufferManager->gpu(
-            ITensor::makeShape({mBatchSize, mMaxTokensPerStep, mVocabSize * 2}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mBatchSize, mMaxTokensPerStep, mVocabSize * 2}), tensorrt_llm::DataType::kINT32);
 
-        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mOutputIdsHost
-            = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize, mSequenceLength}), nvinfer1::DataType::kINT32);
+        mOutputIdsHost = BufferManager::pinned(
+            ITensor::makeShape({mMaxBatchSize, mSequenceLength}), tensorrt_llm::DataType::kINT32);
         mOutputIdsDevice
-            = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mSequenceLength}), nvinfer1::DataType::kINT32);
+            = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize, mSequenceLength}), tensorrt_llm::DataType::kINT32);
 
-        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
         mIdsPtrHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), ptrType);
         mIdsPtrDevice = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), ptrType);
 
-        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), tensorrt_llm::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
@@ -606,13 +613,13 @@ protected:
         ASSERT_EQ(param.frequencyPenaltiesSize, mMaxBatchSize) << "Invalid test configuration.";
         ASSERT_EQ(param.promptIgnoreLengthsSize, mMaxBatchSize) << "Invalid test configuration.";
         mRepetitionPenaltiesDevice
-            = mBufferManager->gpu(ITensor::makeShape({param.repetitionPenaltiesSize}), nvinfer1::DataType::kFLOAT);
+            = mBufferManager->gpu(ITensor::makeShape({param.repetitionPenaltiesSize}), tensorrt_llm::DataType::kFLOAT);
         mPresencePenaltiesDevice
-            = mBufferManager->gpu(ITensor::makeShape({param.presencePenaltiesSize}), nvinfer1::DataType::kFLOAT);
+            = mBufferManager->gpu(ITensor::makeShape({param.presencePenaltiesSize}), tensorrt_llm::DataType::kFLOAT);
         mFrequencyPenaltiesDevice
-            = mBufferManager->gpu(ITensor::makeShape({param.frequencyPenaltiesSize}), nvinfer1::DataType::kFLOAT);
+            = mBufferManager->gpu(ITensor::makeShape({param.frequencyPenaltiesSize}), tensorrt_llm::DataType::kFLOAT);
         mPromptIgnoreLengthsDevice
-            = mBufferManager->gpu(ITensor::makeShape({param.promptIgnoreLengthsSize}), nvinfer1::DataType::kINT32);
+            = mBufferManager->gpu(ITensor::makeShape({param.promptIgnoreLengthsSize}), tensorrt_llm::DataType::kINT32);
         mBufferManager->copy(*param.repetitionPenalties, *mRepetitionPenaltiesDevice);
         mBufferManager->copy(*param.presencePenalties, *mPresencePenaltiesDevice);
         mBufferManager->copy(*param.frequencyPenalties, *mFrequencyPenaltiesDevice);
@@ -740,13 +747,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchNoPenalty)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
@@ -773,13 +780,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchRepetitionLessThanOne)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53f;
@@ -806,13 +813,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchRepetitionGreaterThaneOne)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 2.01f;
@@ -839,13 +846,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchRepetitionMixed)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -872,13 +879,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchPresenceMixed)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
@@ -905,13 +912,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchPresenceHasDefaultValueZero2)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
@@ -938,13 +945,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchFrequencyMixed)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
@@ -971,13 +978,13 @@ TYPED_TEST(RepetitionPenaltyTest, BatchFrequencyHasDefaultValueZero2)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
@@ -1004,13 +1011,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeRepetitionPresence)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -1037,13 +1044,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeRepetitionFrequency)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -1070,13 +1077,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypePresenceFrequency)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 1.0f;
@@ -1103,13 +1110,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeFull)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -1136,13 +1143,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeFullTokensPerStep)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -1170,13 +1177,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeFullWithPartialPromptIgnore)
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -1203,13 +1210,13 @@ TYPED_TEST(RepetitionPenaltyTest, PenaltyTypeFullTokensPerStepWithFullPromptIgno
     int32_t batchSize = 6;
     int32_t maxBatchSize = 2 * batchSize;
     TensorPtr repetitionPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr presencePenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr frequencyPenaltyHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kFLOAT);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kFLOAT);
     TensorPtr promptIgnoreLengthsHost
-        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinned(ITensor::makeShape({maxBatchSize}), tensorrt_llm::DataType::kINT32);
     for (int32_t i = 0; i < maxBatchSize; ++i)
     {
         bufferCast<float>(*repetitionPenaltyHost)[i] = 0.53 + i * 0.2f;
@@ -1333,23 +1340,23 @@ protected:
         mLogitsPtrs = BufferManager::pinned(ITensor::makeShape({mBatchSize}), ptrType);
 
         mPenaltyWorkspaceDevice = mBufferManager->gpu(
-            ITensor::makeShape({mBatchSize, mMaxTokensPerStep, mVocabSize}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mBatchSize, mMaxTokensPerStep, mVocabSize}), tensorrt_llm::DataType::kINT32);
 
-        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mTokensPerStep = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mMinLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mMinLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mMinLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mMinLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mEndIdsHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mEndIdsHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), tensorrt_llm::DataType::kINT32);
 
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
@@ -1551,30 +1558,30 @@ protected:
         }
 
         // Defines currentStep.
-        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mSeqLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         initConstant<int>(bufferCast<int32_t>(*mSeqLengthHost), mMaxBatchSize, 3);
-        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mSeqLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         mBufferManager->copy(*mSeqLengthHost, *mSeqLengthDevice);
 
         // Defines inputLength.
-        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mContextLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         initConstant<int>(bufferCast<int32_t>(*mContextLengthHost), mMaxBatchSize, 2);
-        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mContextLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         mBufferManager->copy(*mContextLengthHost, *mContextLengthDevice);
 
         // Defines minLength.
-        mMinLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mMinLengthHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         initConstant<int>(bufferCast<int32_t>(*mMinLengthHost), mMaxBatchSize, 10);
-        mMinLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mMinLengthDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         mBufferManager->copy(*mMinLengthHost, *mMinLengthDevice);
 
         // Defines endIds.
-        mEndIdsHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mEndIdsHost = BufferManager::pinned(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         initConstant<int>(bufferCast<int32_t>(*mEndIdsHost), mMaxBatchSize, -1);
-        mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mEndIdsDevice = mBufferManager->gpu(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         mBufferManager->copy(*mEndIdsHost, *mEndIdsDevice);
 
-        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = BufferManager::pinned(ITensor::makeShape({mBatchSize}), tensorrt_llm::DataType::kINT32);
         auto batchSlotsPtr = bufferCast<int32_t>(*mBatchSlots);
         for (SizeType32 bi = 0; bi < mBatchSize; ++bi)
         {

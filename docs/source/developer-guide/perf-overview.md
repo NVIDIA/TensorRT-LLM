@@ -268,7 +268,7 @@ Testing was performed using the PyTorch backend - this workflow does not require
 
 | Stage | Description | Command |
 | :- | - | - |
-| [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file` |
+| [Dataset](#preparing-a-dataset) | Create a synthetic dataset | `python benchmarks/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file` |
 | [Run](#running-the-benchmark) | Run a benchmark with a dataset | `trtllm-bench --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options` |
 
 ### Variables
@@ -288,11 +288,11 @@ Testing was performed using the PyTorch backend - this workflow does not require
 
 ### Preparing a Dataset
 
-In order to prepare a dataset, you can use the provided [script](source:benchmarks/cpp/prepare_dataset.py).
+In order to prepare a dataset, you can use the provided [script](source:benchmarks/prepare_dataset.py).
 To generate a synthetic dataset, run the following command:
 
 ```shell
-python benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file
+python benchmarks/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests --input-mean=$isl --output-mean=$osl --input-stdev=0 --output-stdev=0 > $dataset_file
 ```
 
 The command will generate a text file located at the path specified `$dataset_file` where all requests are of the same

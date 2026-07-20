@@ -317,6 +317,8 @@ class KvCacheCreator:
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
+        self._pool_ratio_in = self._kv_cache_config.pool_ratio
+        self._avg_seq_len_in = self._kv_cache_config.avg_seq_len
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
@@ -579,6 +581,10 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
+        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
+        # nothing to profile.
+        if getattr(self._model_engine.model, "mm_encoder", object()) is None:
+            return []
         input_processor = self._model_engine.input_processor
         _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
         # Modality-agnostic: the model declares each modality's per-item token
@@ -625,6 +631,21 @@ class KvCacheCreator:
         with torch.inference_mode():
             return self._model_engine.model.encode_multimodal_inputs(
                 self._dummy_encoder_inputs)
+
+    def _reserve_multimodal_encoder_cache_memory(
+        self,
+        peak_memory: int,
+    ) -> int:
+        """Reserve encoder-cache capacity when the model implements that cache."""
+        model = self._model_engine.model
+        if (not isinstance(model, MultimodalModelMixin)
+                or not model.supports_encoder_cache):
+            return peak_memory
+
+        multimodal_config = model.model_config.multimodal_config
+        if multimodal_config is None:
+            return peak_memory
+        return peak_memory + multimodal_config.encoder_cache_max_bytes
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -750,6 +771,11 @@ class KvCacheCreator:
             max_tokens = min(
                 estimate_max_tokens, self._kv_cache_config.max_tokens
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
+            # User-provided pool sizing can underprovision the temporary
+            # estimation cache and cause warmup to hang or fail. Override it
+            # for estimation, then restore it in configure_kv_cache_capacity().
+            self._kv_cache_config.pool_ratio = None
+            self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
                 max_gpu_total_bytes = int(
@@ -869,10 +895,23 @@ class KvCacheCreator:
             allocated_bytes = 0
             activation_bytes = 0
 
+        peak_memory_without_encoder_cache = peak_memory
+        peak_memory = self._reserve_multimodal_encoder_cache_memory(peak_memory)
+        if peak_memory != peak_memory_without_encoder_cache:
+            mem_gb = (peak_memory - peak_memory_without_encoder_cache) / GB
+            logger.info(
+                f"Reserving {mem_gb:.2f} GiB for the multimodal encoder cache while estimating KV cache "
+                "capacity.", )
+
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+
+        # Estimation uses inferred pool sizing; the final manager uses the
+        # user-provided configuration.
+        self._kv_cache_config.pool_ratio = self._pool_ratio_in
+        self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -1814,6 +1853,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             vocab_size=config.vocab_size,
+            max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
@@ -2046,6 +2086,43 @@ def create_kv_cache_compression_manager(
     return None
 
 
+def compute_max_num_sequences(mapping: Mapping,
+                              max_batch_size: int,
+                              disable_overlap_scheduler: bool,
+                              enable_overlap_headroom: bool = False) -> int:
+    """Size the sequence-slot pool (and the sampler state it indexes).
+
+    ``enable_overlap_headroom`` is intentionally opt-in. DeepSeek-V4 needs a
+    second non-PP slot set because the V2 scheduler can backfill seats before
+    the overlap scheduler releases the previous iteration's terminal slots.
+    Other models retain their established sizing until that behavior is
+    validated independently. Pipeline parallelism already sizes the pool by
+    ``pp_size``.
+    """
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = (2 if enable_overlap_headroom
+                             and not disable_overlap_scheduler else 1)
+    return max_batch_size * num_micro_batches
+
+
+def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
+                                       mapping: Mapping) -> bool:
+    """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
+    return model_type == "deepseek_v4" and not mapping.has_pp()
+
+
+def should_enable_dsv4_overlap_headroom(
+        model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
+    return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
+            and spec_config is not None
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and not disable_overlap_scheduler)
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -2072,6 +2149,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    max_num_sequences: Optional[int] = None,
 ) -> PyExecutor:
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
@@ -2080,7 +2158,9 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    max_num_sequences = max_batch_size * mapping.pp_size
+    if max_num_sequences is None:
+        max_num_sequences = compute_max_num_sequences(
+            mapping, max_batch_size, llm_args.disable_overlap_scheduler)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
@@ -2277,7 +2357,9 @@ def create_py_executor_instance(
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    scheduler_capacity = max_num_sequences
+    # V1 scheduler handles overlap via two_step_lookahead, so skip the
+    # slot-pool overlap factor here.
+    scheduler_capacity = max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
@@ -2433,8 +2515,13 @@ def create_torch_sampler_args(
     disable_overlap_scheduler: bool,
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
+    max_num_sequences: Optional[int] = None,
 ):
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # The sampler's per-slot state is indexed by sequence slots, so it must
+    # be sized identically to the executor's slot pool.
+    if max_num_sequences is None:
+        max_num_sequences = compute_max_num_sequences(
+            mapping, max_batch_size, disable_overlap_scheduler)
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
@@ -2464,6 +2551,7 @@ def instantiate_sampler(
     speculative_config: SpeculativeConfig,
     decoding_config: trtllm.DecodingConfig,
     kv_cache_config: KvCacheConfig,
+    max_num_sequences: Optional[int] = None,
 ):
     enable_async_worker = (confidential_compute_enabled()
                            or llm_args.sampler_force_async_worker)
@@ -2478,6 +2566,7 @@ def instantiate_sampler(
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
+        max_num_sequences=max_num_sequences,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
@@ -2506,7 +2595,8 @@ def instantiate_sampler(
                              max_beam_width=max_beam_width,
                              decoding_config=decoding_config,
                              kv_cache_config=kv_cache_config,
-                             enable_async_worker=enable_async_worker)
+                             enable_async_worker=enable_async_worker,
+                             max_num_sequences=max_num_sequences)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()

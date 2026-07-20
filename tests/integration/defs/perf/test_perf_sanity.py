@@ -2273,10 +2273,19 @@ class PerfSanityTestConfig:
         else:
             return
 
+        stage_name = os.environ.get("stageName", "")
         extra_fields = {
-            "s_stage_name": os.environ.get("stageName", ""),
+            "s_stage_name": stage_name,
             "s_test_list": self._test_param_labels,
         }
+
+        # Stages tagged "FUNCTIONAL-ONLY" run the full perf harness (numbers are
+        # still uploaded to OpenSearch and dashboards) but do not fail CI on perf
+        # regression -- same behavior as post-merge. Used for pre-merge disagg
+        # coverage where the goal is functional-failure detection, not gating on
+        # perf. Explicit False (not None) so the auto-detect in
+        # process_and_upload_test_results does not flip it back on for pre-merge.
+        fail_on_regression = False if "FUNCTIONAL-ONLY" in stage_name else None
 
         # gen_only tests are gated solely on per-iter prev_device_step_time, not
         # token throughput (token-based numbers are dominated by KV cache transfer
@@ -2304,6 +2313,7 @@ class PerfSanityTestConfig:
             regression_metrics=regression_metrics,
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
+            fail_on_regression=fail_on_regression,
         )
 
 

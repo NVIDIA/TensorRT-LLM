@@ -1,9 +1,7 @@
 import atexit
 import json
 import os
-import shutil
 import socket
-import tempfile
 import time
 import weakref
 from collections.abc import Mapping
@@ -24,9 +22,7 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
 from .._utils import nvtx_range_debug
-from ..bindings import executor as tllm
 from ..bindings import steady_clock_now
-from ..builder import EngineConfig
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
@@ -44,14 +40,12 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
-                       PybindMirror, TorchLlmArgs, TrtLlmArgs)
+from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
-                        LlmBuildStats, ModelLoader, _ModelRuntimeContext)
+                        LlmBuildStats, ModelLoader)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .thinking_budget import add_thinking_budget_logits_processor
-from .tokenizer import TokenizerBase, _xgrammar_tokenizer_info
+from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
@@ -203,15 +197,6 @@ def _contains_bart_forced_tokens_logits_processor(processor: Any) -> bool:
     return False
 
 
-TRT_LLM_DOCSTRING = TRT_LLMARGS_EXPLICIT_DOCSTRING + """
-
-    Attributes:
-        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.
-        workspace (pathlib.Path): The directory to store intermediate files.
-        llm_id (str): The unique ID of the LLM instance.
-        disaggregated_params (dict): The disaggregated parameters of the LLM instance.
-"""
-
 TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
 
     Attributes:
@@ -279,8 +264,9 @@ class BaseLLM:
                     LlmArgs as AutoDeployLlmArgs
                 llm_args_cls = AutoDeployLlmArgs
             else:
-                logger.info("Using LLM with TensorRT backend")
-                llm_args_cls = TrtLlmArgs
+                raise ValueError(
+                    f"Unknown backend: {backend!r}. Supported backends are "
+                    "'pytorch' and '_autodeploy'.")
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
@@ -356,17 +342,12 @@ class BaseLLM:
             self._executor: Optional[GenerationExecutor] = None
             self._encode_only: bool = False
             self._encoder_executor = None
-            if self._on_trt_backend:
-                self._workspace = tempfile.TemporaryDirectory(
-                    suffix="-llm-workspace", dir=self.args.workspace)
-            else:
-                self._workspace = None
+            self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
             self._hf_model_config = None
             self._generation_config = None
 
-            self.runtime_context: Optional[_ModelRuntimeContext] = None
             self.llm_build_stats = LlmBuildStats()
             self._build_model()
 
@@ -652,11 +633,10 @@ class BaseLLM:
 
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
-        # TODO: Also support for trt backend
         is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
         is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
 
-        if is_ctx_only and not self._on_trt_backend:
+        if is_ctx_only:
             sampling_params.max_tokens = 1
 
         if isinstance(inputs, PreprocessedInputs):
@@ -884,7 +864,12 @@ class BaseLLM:
                 # 1. Extend support for more modalities and models
                 # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.
                 input_processor_with_hash = create_input_processor_with_hash(
-                    self.input_processor)
+                    self.input_processor,
+                    encoder_cache_enabled=(
+                        self.args.multimodal_config is not None
+                        and self.args.multimodal_config.encoder_cache_max_bytes
+                        > 0),
+                )
                 with nvtx_range_debug("input_processor_with_hash"):
                     prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                         inputs, sampling_params)
@@ -905,12 +890,13 @@ class BaseLLM:
                 "prompt")  # This is the text prompt, if present.
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
-                # Create unified MultimodalParams
+                # Create unified MultimodalParams.
                 multimodal_params = MultimodalParams(
                     multimodal_input=extra_processed_inputs.get(
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
-                        'multimodal_data'))
+                        'multimodal_data'),
+                    mm_item_order=inputs.get("mm_item_order"))
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
@@ -1434,10 +1420,6 @@ class BaseLLM:
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
 
-    @property
-    def _on_trt_backend(self) -> bool:
-        return isinstance(self.args, TrtLlmArgs)
-
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
             return None
@@ -1445,9 +1427,6 @@ class BaseLLM:
         if self.args.tokenizer is not None:
             assert isinstance(self.args.tokenizer, TokenizerBase)
             return self.args.tokenizer
-
-        if self.runtime_context is not None:
-            return self.runtime_context.tokenizer
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
@@ -1552,199 +1531,6 @@ class BaseLLM:
         self.shutdown()
 
 
-@append_docstring(TRT_LLM_DOCSTRING)
-class _TrtLLM(BaseLLM):
-    """LLM class is the main class for running a LLM model using TensorRT LLM backend.
-
-    Parameters:
-    """
-
-    def __init__(self,
-                 model: Union[str, Path],
-                 tokenizer: Optional[Union[str, Path, TokenizerBase,
-                                           PreTrainedTokenizerBase]] = None,
-                 tokenizer_mode: Literal['auto', 'slow'] = 'auto',
-                 skip_tokenizer_init: bool = False,
-                 trust_remote_code: bool = False,
-                 tensor_parallel_size: int = 1,
-                 dtype: str = "auto",
-                 revision: Optional[str] = None,
-                 tokenizer_revision: Optional[str] = None,
-                 **kwargs: Any) -> None:
-        super().__init__(model, tokenizer, tokenizer_mode, skip_tokenizer_init,
-                         trust_remote_code, tensor_parallel_size, dtype,
-                         revision, tokenizer_revision, **kwargs)
-
-    @property
-    def workspace(self) -> Path:
-        return Path(self._workspace.name) if self._on_trt_backend else None
-
-    def save(self, engine_dir: str) -> None:
-        """Save the built engine to the given path.
-
-        Args:
-            engine_dir (str): The path to save the engine.
-        """
-        logger.info(f"Save model to {engine_dir}")
-        if self._engine_dir is None:
-            raise RuntimeError("The engine is not built yet.")
-
-        if self._engine_dir.absolute() == os.path.abspath(engine_dir):
-            return
-
-        if not self.mpi_session or not self.mpi_session.is_comm_session():
-            shutil.copytree(self._engine_dir, engine_dir, dirs_exist_ok=True)
-        else:
-            # NFS is fragile, so we copy files one by one
-            target_engine_dir = Path(engine_dir)
-            target_engine_dir.mkdir(parents=True, exist_ok=True)
-            # copy files one by one
-            for file in self._engine_dir.iterdir():
-                logger_debug(
-                    f"Copying {file} to {target_engine_dir / file.name}\n")
-                shutil.copy(file, target_engine_dir / file.name)
-
-    def _build_model(self):
-        super()._build_model()
-        # update the model_dir to a local dir for the runtime, such as tokenizer loading.
-        if self._engine_dir is not None:
-            self.args.model = self._engine_dir
-
-        # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
-        # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
-        self._tokenizer = self._try_load_tokenizer()
-        # Load HF config from the original HF model dir when available,
-        # since self.args.model now points to the engine dir (whose
-        # config.json uses TRT-LLM schema, not HF schema).
-        if self._hf_model_dir is not None:
-            self._hf_model_config = ModelLoader.load_hf_model_config(
-                self._hf_model_dir,
-                trust_remote_code=self.args.trust_remote_code)
-        else:
-            self._hf_model_config = self._try_load_hf_model_config()
-        self._generation_config = self._try_load_generation_config()
-
-        # Multimodal special handling:
-        # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
-        # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
-        self.input_processor = create_input_processor(
-            self._hf_model_dir,
-            self.tokenizer,
-            trust_remote_code=self.args.trust_remote_code)
-        self._tokenizer = self.input_processor.tokenizer
-
-        max_batch_size = self.args.max_batch_size
-        max_num_tokens = self.args.max_num_tokens
-        max_seq_len = self.args.max_seq_len
-
-        build_config = self.args.build_config
-
-        max_batch_size = max_batch_size or build_config.max_batch_size
-        max_num_tokens = max_num_tokens or build_config.max_num_tokens
-        max_seq_len = max_seq_len or build_config.max_seq_len
-
-        self._executor_config = tllm.ExecutorConfig(
-            max_beam_width=self.args.max_beam_width,
-            scheduler_config=PybindMirror.maybe_to_pybind(
-                self.args.scheduler_config),
-            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
-            or tllm.BatchingType.INFLIGHT,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits,
-            fail_fast_on_attention_window_too_large=getattr(
-                self.args, 'fail_fast_on_attention_window_too_large', False))
-
-        # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
-        if max_seq_len is not None:
-            self._executor_config.max_seq_len = max_seq_len
-        else:
-            engine_config = EngineConfig.from_json_file(self._engine_dir /
-                                                        "config.json")
-            self._executor_config.max_seq_len = engine_config.build_config.max_seq_len
-
-        if self.args.kv_cache_config is not None:
-            self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
-                self.args.kv_cache_config)
-        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
-            # Disable KV cache reuse for deterministic mode
-            self._executor_config.kv_cache_config.enable_block_reuse = False
-            self._executor_config.kv_cache_config.enable_partial_reuse = False
-        if self.args.peft_cache_config is not None:
-            self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
-                self.args.peft_cache_config)
-
-        lora_config = None
-        if self.args.build_config.plugin_config.lora_plugin:
-            engine_config = EngineConfig.from_json_file(self._engine_dir /
-                                                        "config.json")
-            lora_config = engine_config.build_config.lora_config
-            if self.args.lora_config is not None:
-                logger.info(
-                    "Overriding lora_config from engine with lora_config from LLM args"
-                )
-                lora_config = self.args.lora_config
-
-            max_lora_rank = lora_config.max_lora_rank
-            num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
-                len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
-
-            peft_cache_config_model = PeftCacheConfig.from_pybind(
-                self._executor_config.peft_cache_config
-            ) if self._executor_config.peft_cache_config is not None else PeftCacheConfig(
-            )
-            if lora_config.max_loras is not None:
-                peft_cache_config_model.num_device_module_layer = \
-                    max_lora_rank * num_lora_modules * lora_config.max_loras
-            if lora_config.max_cpu_loras is not None:
-                peft_cache_config_model.num_host_module_layer = \
-                    max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
-            self._executor_config.peft_cache_config = peft_cache_config_model._to_pybind(
-            )
-
-        if self.args.decoding_config is not None:
-            self._executor_config.decoding_config = self.args.decoding_config
-        if self.args.guided_decoding_backend == 'xgrammar':
-            self._executor_config.guided_decoding_config = tllm.GuidedDecodingConfig(
-                backend=tllm.GuidedDecodingConfig.GuidedDecodingBackend.
-                XGRAMMAR,
-                **_xgrammar_tokenizer_info(self.tokenizer))
-        elif self.args.guided_decoding_backend is not None:
-            raise ValueError(
-                f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
-            )
-
-        self._executor_config.normalize_log_probs = self.args.normalize_log_probs
-        self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
-        self._executor_config.max_beam_width = self.args.max_beam_width or self.args.build_config.max_beam_width
-        if self.args.extended_runtime_perf_knob_config is not None:
-            self._executor_config.extended_runtime_perf_knob_config = PybindMirror.maybe_to_pybind(
-                self.args.extended_runtime_perf_knob_config)
-        if self.args.cache_transceiver_config is not None:
-            self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
-                self.args.cache_transceiver_config)
-        self._executor_config.llm_parallel_config = self.args.parallel_config
-        return_logits = (self.args.gather_generation_logits
-                         or (self.args.build_config
-                             and self.args.build_config.gather_context_logits))
-
-        self._executor = self._executor_cls.create(
-            self._engine_dir,
-            executor_config=self._executor_config,
-            batched_logits_processor=self.args.batched_logits_processor,
-            model_world_size=self.args.parallel_config.world_size,
-            mpi_session=self.mpi_session,
-            reuse_mpi_comm=external_mpi_comm_available(
-                self.args.parallel_config.world_size),
-            return_logits=return_logits,
-            postproc_worker_config=PostprocWorkerConfig(
-                num_postprocess_workers=self.args.num_postprocess_workers,
-                postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
-                post_processor_hook=self.args.post_processor_hook,
-            ),
-            is_llm_executor=True)
-
-
 @append_docstring(TORCH_LLM_DOCSTRING)
 class _TorchLLM(BaseLLM):
     """LLM class is the main class for running a LLM model using PyTorch backend.
@@ -1767,7 +1553,7 @@ class _TorchLLM(BaseLLM):
 
         backend = kwargs.pop("backend", "pytorch")
 
-        # Validate that users don't pass TrtLlmArgs-specific arguments
+        # Validate that only arguments supported by the PyTorch backend are passed.
         self._validate_args_for_torch_backend(kwargs)
 
         super().__init__(model,
@@ -1897,23 +1683,20 @@ class _TorchLLM(BaseLLM):
             llm_args=self.args)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
-        """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.
+        """Validate that only arguments supported by the PyTorch backend are passed.
         """
-        trtllm_fields = set(TrtLlmArgs.model_fields.keys())
         torchllm_fields = set(TorchLlmArgs.model_fields.keys())
 
-        trtllm_specific_fields = trtllm_fields - torchllm_fields
+        # Check if any arguments not supported by the PyTorch backend are passed.
+        unsupported_args = [
+            key for key in kwargs
+            if key not in torchllm_fields and key not in ('_mpi_session',
+                                                          'backend')
+        ]
 
-        # Check if any TrtLlmArgs-specific arguments are passed
-        trtllm_specific_args = []
-        for key in kwargs:
-            if key in trtllm_specific_fields:
-                trtllm_specific_args.append(key)
-
-        if trtllm_specific_args:
+        if unsupported_args:
             raise ValueError(
-                f"The following arguments are specific to TensorRT backend and cannot be used with PyTorch backend: {trtllm_specific_args}.\n"
-                f"Please use 'from tensorrt_llm._tensorrt_engine import LLM' instead to use the TensorRT backend."
+                f"The following arguments are not supported by the PyTorch backend: {unsupported_args}."
             )
 
 
