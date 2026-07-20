@@ -908,7 +908,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    # grammar backend is disagg-agnostic (runs on gen worker); backend correctness is covered by aggregated tests
+    @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_guided_decoding(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         ctx_server_config = {
@@ -1296,7 +1297,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    # grammar backend is disagg-agnostic (runs on gen worker); backend correctness is covered by aggregated tests
+    @pytest.mark.parametrize("backend", ["xgrammar"])
     def test_guided_decoding(self, backend: str, mtp_nextn: int, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         ctx_server_config = {
