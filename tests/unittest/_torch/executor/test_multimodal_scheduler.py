@@ -599,8 +599,11 @@ def test_item_cache_keys_pin_the_full_request_path_format():
         hashes, [("image", 0), ("video", 0)], [2, 3], "kw"
     )
 
-    # Must stay identical to `_encoder_cache_item_key` / `_encoder_cache_keys`
-    # so both encode paths hit each other's entries.
+    # Deliberately identical to `_encoder_cache_item_key` /
+    # `_encoder_cache_keys`: the manager and the legacy full-request clone
+    # cache are separate stores today, but keeping one key format lets the
+    # remaining full-request consumers unify onto the manager later without
+    # invalidating entries.
     assert keys == [("image", (1, 2), 2, "kw"), ("video", (3, 4), 3, "kw")]
 
 
