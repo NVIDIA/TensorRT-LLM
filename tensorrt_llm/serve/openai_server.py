@@ -520,11 +520,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
-        disable_harmony = os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1"
-        if disable_harmony or self.model_config is None:
-            self.use_harmony = False
-        else:
-            self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
+        from tensorrt_llm.tokenizer import uses_harmony_tokenization
+        model_type = (None if self.model_config is None else type(
+            self.model_config).model_type)
+        self.use_harmony = uses_harmony_tokenization(model_type)
 
         self._ensure_post_processor_hook_supported(
             self.use_harmony,

@@ -117,6 +117,40 @@ def _load_tokenizer_config_inherits(
     return {k: tcfg[k] for k in _TOKENIZER_CONFIG_INHERIT_KEYS if k in tcfg}
 
 
+def resolve_model_type_from_name_or_config(model: str) -> Optional[str]:
+    """Resolve the model type from a model alias or config.json when available."""
+    normalized_model = model.lower().replace("_", "-")
+    if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
+        return "gpt_oss"
+
+    import json
+    config_path = os.path.join(model, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug(f"Failed to read model config for {model}: {e}")
+        return None
+
+    if not isinstance(config, dict):
+        return None
+    raw_model_type = config.get("model_type")
+    return raw_model_type if isinstance(raw_model_type, str) else None
+
+
+def uses_harmony_tokenization(model_type: Optional[str],
+                              use_harmony: Optional[bool] = None) -> bool:
+    """Return whether chat tokenization should use the GPT-OSS Harmony path."""
+    if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
+        return False
+    if use_harmony is not None:
+        return use_harmony
+    return model_type == "gpt_oss"
+
+
 def _fallback_to_fast_tokenizer(pretrained_model_dir: str,
                                 original_error: BaseException, **kwargs):
     """Bypass AutoTokenizer's HF-config path with PreTrainedTokenizerFast.

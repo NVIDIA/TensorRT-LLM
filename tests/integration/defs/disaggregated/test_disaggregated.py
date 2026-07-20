@@ -2708,10 +2708,20 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])
+@pytest.mark.parametrize(("model_path", "test_desc"), [
+    pytest.param('gpt_oss/gpt-oss-120b',
+                 'gpt_oss_120b_harmony',
+                 marks=pytest.mark.skip_less_device(4),
+                 id='gpt_oss/gpt-oss-120b'),
+    pytest.param('gpt_oss/gpt-oss-120b',
+                 'gpt_oss_120b_eagle_trtllm_2ctx',
+                 marks=pytest.mark.skip_less_device(8),
+                 id='gpt_oss_120b_eagle_trtllm_2ctx'),
+])
 def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                                             disaggregated_example_root,
-                                            llm_venv, model_path):
+                                            llm_venv, model_path: str,
+                                            test_desc: str) -> None:
     model_dir = f"{llm_models_root()}/{model_path}"
     setup_model_symlink(llm_venv, model_dir, model_path)
 
@@ -2721,26 +2731,11 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
     env["TIKTOKEN_RS_CACHE_DIR"] = tiktoken_vocab
     env["TIKTOKEN_ENCODINGS_BASE"] = tiktoken_vocab
 
+    num_iters = 1 if test_desc == "gpt_oss_120b_eagle_trtllm_2ctx" else 5
     run_disaggregated_test(disaggregated_example_root,
-                           "gpt_oss_120b_harmony",
+                           test_desc,
+                           num_iters=num_iters,
                            env=env,
-                           model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
-
-
-@skip_pre_blackwell
-@pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("model_path", ['gpt_oss/gpt-oss-120b'])
-def test_disaggregated_gpt_oss_120b_eagle_2ctx(disaggregated_example_root: str,
-                                               llm_venv,
-                                               model_path: str) -> None:
-    model_dir = f"{llm_models_root()}/{model_path}"
-    setup_model_symlink(llm_venv, model_dir, model_path)
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "gpt_oss_120b_eagle_trtllm_2ctx",
-                           num_iters=1,
-                           env=llm_venv._new_env,
                            model_path=model_dir,
                            cwd=llm_venv.get_working_directory())
 

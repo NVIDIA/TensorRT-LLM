@@ -1941,8 +1941,10 @@ def test_gpt_oss_harmony_empty_tools_matches_chat_harmony_path() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_case", ["nonempty", "empty"])
+@pytest.mark.parametrize("template_case",
+                         ["default", "documents", "custom_chat_template"])
 async def test_gpt_oss_router_and_server_create_same_tokenized_input(
-        tool_case: str) -> None:
+        tool_case: str, template_case: str) -> None:
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     router = KvCacheAwareRouter(server_role=None,
@@ -1951,6 +1953,16 @@ async def test_gpt_oss_router_and_server_create_same_tokenized_input(
                                 max_batch_size=32,
                                 tokens_per_block=32)
     request_tools = [_get_weather_tool()] if tool_case == "nonempty" else []
+    request_kwargs: dict[str, object] = {}
+    if template_case == "documents":
+        request_kwargs["documents"] = [{
+            "title":
+            "Weather policy",
+            "text":
+            "Use Celsius for European weather."
+        }]
+    elif template_case == "custom_chat_template":
+        request_kwargs["chat_template"] = "{{ messages[0]['content'] }}"
 
     def fake_harmony_tokens(messages: list[object],
                             tools: list[dict[str, object]] | None,
@@ -1982,6 +1994,7 @@ async def test_gpt_oss_router_and_server_create_same_tokenized_input(
         reasoning_effort="medium",
         stream=True,
         max_completion_tokens=1,
+        **request_kwargs,
     )
     router_request = copy.deepcopy(request)
     server_request = copy.deepcopy(request)
@@ -1989,7 +2002,7 @@ async def test_gpt_oss_router_and_server_create_same_tokenized_input(
     server = OpenAIServer.__new__(OpenAIServer)
     server.harmony_adapter = harmony
     server.await_disconnected = mock.AsyncMock()
-    server.allow_request_chat_template = False
+    server.allow_request_chat_template = template_case == "custom_chat_template"
     server.model_config = SimpleNamespace(vocab_size=1000)
     server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
         vocab_size=1000))

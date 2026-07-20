@@ -9,7 +9,9 @@ from .tokenizer import (
     load_custom_tokenizer,
     load_hf_tokenizer,
     maybe_fix_byte_level_tokenizer,
+    resolve_model_type_from_name_or_config,
     tokenizer_factory,
+    uses_harmony_tokenization,
 )
 
 __all__ = [
@@ -21,7 +23,9 @@ __all__ = [
     "load_custom_tokenizer",
     "load_hf_tokenizer",
     "maybe_fix_byte_level_tokenizer",
+    "resolve_model_type_from_name_or_config",
     "tokenizer_factory",
+    "uses_harmony_tokenization",
     "_xgrammar_tokenizer_info",
     "_llguidance_tokenizer_info",
 ]

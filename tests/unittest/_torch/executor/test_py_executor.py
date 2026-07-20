@@ -426,8 +426,13 @@ def _make_gen_request(num_draft_tokens: int = 0) -> Mock:
     return req
 
 
-def _make_disagg_trans_complete_request(draft_tokens: list[int] | None) -> Mock:
+def _make_disagg_trans_complete_request(
+    draft_tokens: list[int] | None, request_id: int = 0
+) -> Mock:
     req = Mock()
+    req.py_request_id = request_id
+    req.request_id = request_id
+    req.py_disaggregated_params = None
     req.is_disagg_generation_transmission_complete = True
     req.context_phase_params = Mock(draft_tokens=draft_tokens)
     req.py_draft_tokens = []
@@ -824,6 +829,22 @@ class TestDisaggTransferIdleProgress:
             charge_budget=False,
         )
 
+    def test_gen_transfer_status_tracks_completed_requests_for_deferred_sync(self):
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.kv_cache_transceiver.check_gen_transfer_status.return_value = ([7], [], [])
+        trans_complete = _make_disagg_trans_complete_request([11, 12], request_id=7)
+        executor._disagg_generation_trans_in_progress_requests = {7: trans_complete}
+        executor._pending_disagg_generation_trans_complete_requests = {}
+        executor.canceled_req_ids = []
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        executor._check_cache_transfer_errors = Mock()
+
+        PyExecutor._check_disagg_gen_cache_transfer_status(executor, 0)
+
+        assert executor._disagg_generation_trans_in_progress_requests == {}
+        assert executor._pending_disagg_generation_trans_complete_requests == {7: trans_complete}
+
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
@@ -847,6 +868,33 @@ class TestDisaggTransferIdleProgress:
 
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionPP:
+    def test_pp_schedule_syncs_completed_generation_transfer_before_scheduling(self):
+        executor = object.__new__(PyExecutor)
+        executor.dist = Mock(
+            rank=0, is_first_pp_rank=True, is_last_pp_rank=True, tp_size=1, cp_size=1
+        )
+        executor.enable_attention_dp = False
+        executor.kv_cache_transceiver = Mock()
+        executor.model_engine = Mock(enable_spec_decode=False, max_total_draft_tokens=0)
+        executor.max_total_draft_tokens = 0
+        trans_complete = _make_disagg_trans_complete_request([11, 12], request_id=7)
+        executor._pending_disagg_generation_trans_complete_requests = {7: trans_complete}
+        scheduled_batch = ScheduledRequests()
+
+        def schedule_after_sync():
+            assert trans_complete.py_draft_tokens == [11, 12]
+            assert trans_complete.draft_tokens == [11, 12]
+            return scheduled_batch, [], 0
+
+        executor._schedule = Mock(side_effect=schedule_after_sync)
+        executor._apply_disagg_transfer_admission = Mock(return_value=([], False))
+
+        PyExecutor._pp_schedule_and_propagate(executor, microbatch_id=0)
+
+        executor._schedule.assert_called_once_with()
+        executor._apply_disagg_transfer_admission.assert_called_once_with([])
+        assert executor._pending_disagg_generation_trans_complete_requests == {}
+
     def test_pp_schedule_applies_gate_before_serializing(self):
         executor = object.__new__(PyExecutor)
         executor.dist = Mock(
@@ -1010,6 +1058,17 @@ class TestComputeScheduledTokens:
         assert trans_complete.draft_tokens == []
         assert trans_complete.py_draft_pages_allocated == 0
         assert PyExecutor._compute_scheduled_tokens([], [trans_complete]) == 1
+
+    def test_disagg_trans_complete_missing_draft_tokens_use_spec_decode_budget(self) -> None:
+        trans_complete = _make_disagg_trans_complete_request(None)
+        PyExecutor._sync_disagg_generation_trans_complete_draft_tokens(
+            [trans_complete], enable_spec_decode=True, max_total_draft_tokens=3
+        )
+
+        assert trans_complete.py_draft_tokens == [0, 0, 0]
+        assert trans_complete.draft_tokens == [0, 0, 0]
+        assert trans_complete.py_draft_pages_allocated == 3
+        assert PyExecutor._compute_scheduled_tokens([], [trans_complete]) == 4
 
     def test_sync_disagg_draft_tokens_ignores_regular_generation_requests(self) -> None:
         gen = _make_gen_request(3)

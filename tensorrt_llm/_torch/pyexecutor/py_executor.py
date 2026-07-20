@@ -703,6 +703,10 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        self._disagg_generation_trans_in_progress_requests: Dict[
+            int, LlmRequest] = {}
+        self._pending_disagg_generation_trans_complete_requests: Dict[
+            int, LlmRequest] = {}
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _handle_responses and _append_iter_stats are reached from
         # per-rank-divergent gates, so their tp_allgather collectives are
@@ -2413,6 +2417,8 @@ class PyExecutor:
         serializable_schedule = None
         wait_for_disagg_gen_transfer_progress = False
         is_dp_broadcast = self.dist.tp_size > 1 and self.enable_attention_dp
+        if getattr(self, "kv_cache_transceiver", None):
+            self._sync_pending_disagg_generation_trans_complete_draft_tokens()
         if self.dist.rank == 0 or (self.dist.is_first_pp_rank
                                    and is_dp_broadcast):
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -3356,8 +3362,84 @@ class PyExecutor:
                 scheduled_batch)
 
     @staticmethod
+    def _get_disagg_generation_transfer_id(
+            request: LlmRequest) -> Optional[int]:
+        disagg_params = getattr(request, "py_disaggregated_params", None)
+        transfer_id = getattr(disagg_params, "disagg_request_id", None)
+        if isinstance(transfer_id, int):
+            return transfer_id
+        request_id = getattr(request, "py_request_id", None)
+        if isinstance(request_id, int):
+            return request_id
+        request_id = getattr(request, "request_id", None)
+        if isinstance(request_id, int):
+            return request_id
+        return None
+
+    def _get_disagg_generation_trans_in_progress_requests(
+            self) -> Dict[int, LlmRequest]:
+        requests = getattr(self,
+                           "_disagg_generation_trans_in_progress_requests",
+                           None)
+        if requests is None:
+            requests = {}
+            self._disagg_generation_trans_in_progress_requests = requests
+        return requests
+
+    def _get_pending_disagg_generation_trans_complete_requests(
+            self) -> Dict[int, LlmRequest]:
+        requests = getattr(
+            self, "_pending_disagg_generation_trans_complete_requests", None)
+        if requests is None:
+            requests = {}
+            self._pending_disagg_generation_trans_complete_requests = requests
+        return requests
+
+    def _track_disagg_generation_trans_in_progress(
+            self, requests: Iterable[LlmRequest]) -> None:
+        in_progress = self._get_disagg_generation_trans_in_progress_requests()
+        for request in requests:
+            transfer_id = self._get_disagg_generation_transfer_id(request)
+            if transfer_id is not None:
+                in_progress[transfer_id] = request
+
+    def _queue_disagg_generation_trans_complete_draft_sync(
+            self, requests: Iterable[LlmRequest]) -> None:
+        pending = self._get_pending_disagg_generation_trans_complete_requests()
+        for request in requests:
+            if not getattr(request,
+                           "is_disagg_generation_transmission_complete", False):
+                continue
+            transfer_id = self._get_disagg_generation_transfer_id(request)
+            if transfer_id is not None:
+                pending[transfer_id] = request
+
+    def _queue_disagg_generation_trans_complete_draft_sync_by_ids(
+            self, transfer_ids: Iterable[int]) -> None:
+        in_progress = self._get_disagg_generation_trans_in_progress_requests()
+        completed_requests = []
+        for transfer_id in transfer_ids:
+            request = in_progress.pop(transfer_id, None)
+            if request is not None:
+                completed_requests.append(request)
+        self._queue_disagg_generation_trans_complete_draft_sync(
+            completed_requests)
+
+    @staticmethod
+    def _resolve_disagg_generation_trans_complete_draft_tokens(
+            context_phase_draft_tokens: Optional[Iterable[int]],
+            enable_spec_decode: bool, max_total_draft_tokens: int) -> List[int]:
+        draft_tokens = ([] if context_phase_draft_tokens is None else
+                        list(context_phase_draft_tokens))
+        if not draft_tokens and enable_spec_decode:
+            return [0] * max_total_draft_tokens
+        return draft_tokens
+
+    @staticmethod
     def _sync_disagg_generation_trans_complete_draft_tokens(
-            requests: Iterable[LlmRequest]) -> None:
+            requests: Iterable[LlmRequest],
+            enable_spec_decode: bool = False,
+            max_total_draft_tokens: int = 0) -> None:
         for request in requests:
             if not getattr(request,
                            "is_disagg_generation_transmission_complete", False):
@@ -3367,11 +3449,24 @@ class PyExecutor:
             if context_phase_params is None:
                 continue
 
-            draft_tokens = context_phase_params.draft_tokens
-            request.py_draft_tokens = [] if draft_tokens is None else list(
-                draft_tokens)
+            request.py_draft_tokens = PyExecutor._resolve_disagg_generation_trans_complete_draft_tokens(
+                context_phase_params.draft_tokens, enable_spec_decode,
+                max_total_draft_tokens)
             request.draft_tokens = request.py_draft_tokens
             request.py_draft_pages_allocated = len(request.py_draft_tokens)
+
+    def _sync_pending_disagg_generation_trans_complete_draft_tokens(
+            self) -> None:
+        pending = self._get_pending_disagg_generation_trans_complete_requests()
+        if not pending:
+            return
+        max_total_draft_tokens = getattr(self.model_engine,
+                                         "max_total_draft_tokens",
+                                         self.max_total_draft_tokens)
+        self._sync_disagg_generation_trans_complete_draft_tokens(
+            pending.values(), self.model_engine.enable_spec_decode,
+            max_total_draft_tokens)
+        pending.clear()
 
     @staticmethod
     def _get_generation_num_draft_tokens(request: LlmRequest) -> int:
@@ -3602,8 +3697,6 @@ class PyExecutor:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
-            self._sync_disagg_generation_trans_complete_draft_tokens(
-                self.active_requests)
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -3675,6 +3768,9 @@ class PyExecutor:
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
                 request.draft_tokens = [0] * self.max_total_draft_tokens
+
+        if self.kv_cache_transceiver:
+            self._sync_pending_disagg_generation_trans_complete_draft_tokens()
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
@@ -6012,6 +6108,8 @@ class PyExecutor:
         if self._is_disagg_gen_only_no_context_benchmark():
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            self._queue_disagg_generation_trans_complete_draft_sync(
+                new_gen_reqs)
             return
 
         if not self._uses_async_disagg_gen_transfer():
@@ -6022,10 +6120,13 @@ class PyExecutor:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
                     self._sync_disagg_transfer_made_progress = True
+                    self._queue_disagg_generation_trans_complete_draft_sync(
+                        [req])
             self._check_cache_transfer_errors("generation requests")
             return
 
         for req in new_gen_reqs:
+            self._track_disagg_generation_trans_in_progress([req])
             self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -6178,10 +6279,19 @@ class PyExecutor:
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
         result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         if isinstance(result, tuple):
-            _, _, cancelled_reqs = result
+            completed_request_ids, failed_request_ids, cancelled_reqs = result
+            self._queue_disagg_generation_trans_complete_draft_sync_by_ids(
+                completed_request_ids)
+            in_progress = self._get_disagg_generation_trans_in_progress_requests(
+            )
+            for request_id in failed_request_ids:
+                in_progress.pop(request_id, None)
             user_canceled_set = set(self.canceled_req_ids)
             for req in cancelled_reqs:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
+                transfer_id = self._get_disagg_generation_transfer_id(req)
+                if transfer_id is not None:
+                    in_progress.pop(transfer_id, None)
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
         if not self._is_disagg_inflight_cancel_active():

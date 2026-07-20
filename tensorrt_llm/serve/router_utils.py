@@ -17,7 +17,6 @@ Extracted from ``router.py`` so the surface routers there can share a single
 implementation of block hashing without importing the whole router module.
 """
 
-import json
 import os
 from collections import OrderedDict
 from typing import Iterable, List, Optional, Union
@@ -226,32 +225,16 @@ class BlockHashMixin:
 
     def _get_model_type(self, model: str) -> Optional[str]:
         if model not in self._model_types:
-            model_type = None
             model_path = self._tokenizer_dir or model
-            normalized_model = model_path.lower().replace("_", "-")
-            if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
-                model_type = "gpt_oss"
-            else:
-                config_path = os.path.join(model_path, "config.json")
-                if os.path.isfile(config_path):
-                    try:
-                        with open(config_path, encoding="utf-8") as config_file:
-                            config = json.load(config_file)
-                        if isinstance(config, dict):
-                            raw_model_type = config.get("model_type")
-                            if isinstance(raw_model_type, str):
-                                model_type = raw_model_type
-                    except (OSError, json.JSONDecodeError) as e:
-                        logger.debug(f"BlockHashMixin: failed to read model config for {model_path}: {e}")
-            self._model_types[model] = model_type
+            from tensorrt_llm.tokenizer import resolve_model_type_from_name_or_config
+
+            self._model_types[model] = resolve_model_type_from_name_or_config(model_path)
         return self._model_types[model]
 
     def _uses_harmony_tokenization(self, request: ChatCompletionRequest) -> bool:
-        if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
-            return False
-        if self._use_harmony is not None:
-            return self._use_harmony
-        return self._get_model_type(request.model) == "gpt_oss"
+        from tensorrt_llm.tokenizer import uses_harmony_tokenization
+
+        return uses_harmony_tokenization(self._get_model_type(request.model), self._use_harmony)
 
     @staticmethod
     def _tool_dicts(request: ChatCompletionRequest) -> Optional[list[dict[str, object]]]:
