@@ -490,6 +490,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             ],
             "hmac_key":
             hmac_key.hex(),
+            # Attached frontends must apply the same collective_rpc guard
+            # as the launcher (see _check_collective_rpc_guard).
+            "model_world_size":
+            self.model_world_size,
             # Stats / KV events / disagg params RPC endpoint on the rank0
             # worker (ROUTER socket, natively multi-client).
             "rpc_addr":
@@ -1047,6 +1051,15 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             postprocess_tokenizer_dir,
             is_llm_executor=is_llm_executor)
 
+        # State consumed by methods inherited from GenerationExecutorProxy
+        # (submit / check_health / collective_rpc). The engine lives with
+        # the launcher: there are no local MPI workers, so the monitor
+        # stays empty and worker death reaches this frontend through its
+        # result lane / error queue instead.
+        self._engine_dead = False
+        self.model_world_size = attach_info.get("model_world_size", 1)
+        self._worker_process_monitor = WorkerProcessMonitor()
+
         self._frontend_id = frontend_id
         self._num_frontends = num_lanes
         self._results: Dict[int, GenerationResult] = {}
@@ -1084,6 +1097,23 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         return namespace_client_id(self._frontend_id,
                                    super()._get_next_client_id())
 
+    def check_health(self) -> bool:
+        """Health contract of an attached frontend.
+
+        An attached frontend owns no workers, so there is no process or
+        MPI-future liveness to poll: it is healthy while no fatal error
+        has been recorded and shutdown has not begun. Engine death
+        reaches it through the per-lane result socket / dispatch-thread
+        error path, which records the fatal error checked here.
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
+            return False
+
+        if self._drain_error_queue():
+            return self._fatal_error is None and not self.doing_shutdown
+
+        return True
+
     def pre_shutdown(self):
         if self.doing_shutdown:
             return
@@ -1098,6 +1128,7 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         if self.rpc_client is not None:
             self.rpc_client.close()
             self.rpc_client = None
+        self._worker_process_monitor.close()
         # The dispatch thread blocks on result_queue.get(); it is a daemon
         # ManagedThread that exits with the process or on the worker's
         # per-lane None sentinel at engine teardown. Closing its socket from

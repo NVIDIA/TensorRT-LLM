@@ -218,6 +218,28 @@ class TestClassicFrontendProxyEndToEnd:
                 "an attached frontend must never send the engine-shutdown sentinel"
             )
 
+    def test_check_health_and_submit_reflect_fatal_error(self):
+        import pytest
+
+        from tensorrt_llm.executor.request import GenerationRequest
+        from tensorrt_llm.executor.utils import EngineDeadError
+        from tensorrt_llm.sampling_params import SamplingParams
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
+
+            # Regression: this state lives in GenerationExecutorProxy.__init__,
+            # which an attached frontend deliberately skips, so it must be
+            # initialized explicitly (a missing _engine_dead broke the first
+            # submit(); a missing _worker_process_monitor broke /health).
+            assert proxy.check_health()
+            assert proxy.model_world_size == 1
+
+            proxy._set_fatal_error(RuntimeError("rank0 worker died"))
+            assert not proxy.check_health()
+            with pytest.raises(EngineDeadError):
+                proxy.submit(GenerationRequest([1], SamplingParams()))
+
     def test_dispatch_routes_own_lane_responses(self):
         import zmq
 
