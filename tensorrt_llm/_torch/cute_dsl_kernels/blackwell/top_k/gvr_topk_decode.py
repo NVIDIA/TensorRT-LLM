@@ -443,6 +443,11 @@ class GvrTopKKernel:
         self.skip_order = "grouped"
         if enable_block_skip and num_threads not in (512, 1024):
             raise ValueError("enable_block_skip requires num_threads in {512, 1024}")
+        if enable_block_skip and not enable_r0:
+            # The compact machinery hangs off the R0 count pass and the
+            # phase-3 stream-write; without R0 the 16KB list SMEM would be
+            # allocated but the skip could never engage.
+            raise ValueError("enable_block_skip requires enable_r0")
         # C7 dispatch (op#26 host policy folded into the ctor; all gated on
         # enable_r0 so an OFF kernel is byte-identical to the base):
         #  - qfracs default = M2D (0.85, 0.35): dispatch_r0_op26 ships M2D for
@@ -1553,6 +1558,22 @@ class GvrTopKKernel:
         skip_ok = cutlass.Int32(0)
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             skip_ok = cutlass.Int32(1)
+            # Capacity/id-width guard: the active list holds at most
+            # SKIP_MAX_BLOCKS local ids and _list_st stores ABSOLUTE block
+            # ids as int16. A slice over 8192 full blocks (N_local >
+            # 262144) or reaching absolute id >= 32768 falls back to the
+            # dense walk (lossless; the list-current flag is never set, so
+            # phase3 stays dense too).
+            blk_lo_g = (slice_start + cutlass.Int32(self.SKIP_BLOCK - 1)) >> cutlass.Int32(
+                self.SKIP_BLOCK_LOG2
+            )
+            blk_hi_g = (slice_end + cutlass.Int32(self.SKIP_BLOCK - 1)) >> cutlass.Int32(
+                self.SKIP_BLOCK_LOG2
+            )
+            if blk_hi_g - blk_lo_g > cutlass.Int32(self.SKIP_MAX_BLOCKS):
+                skip_ok = cutlass.Int32(0)
+            if blk_hi_g > cutlass.Int32(32767):
+                skip_ok = cutlass.Int32(0)
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             if skip_ok == cutlass.Int32(1):
                 head_end = (
@@ -1658,17 +1679,22 @@ class GvrTopKKernel:
                             pos0 = blk * cutlass.Int32(self.SKIP_BLOCK) + my_chunk0 * cutlass.Int32(
                                 vec_w
                             )
-                            src_ptr_u = cute.make_ptr(
-                                self.dtype,
-                                row_addr + cutlass.Int64(pos0) * cutlass.Int64(elem_bytes),
-                                cute.AddressSpace.gmem,
-                                assumed_align=vec_align,
-                            )
-                            cute.copy(
-                                copy_atom,
-                                cute.make_tensor(src_ptr_u, cute.make_layout((vec_w,))),
-                                frags[u],
-                            )
+                            # Vector-load only fully in-bounds chunks; the
+                            # slice-end straddle re-reads scalars below (a
+                            # tail block's chunks would otherwise read past
+                            # the row/allocation when N % 32 != 0).
+                            if pos0 + cutlass.Int32(vec_w) <= slice_end:
+                                src_ptr_u = cute.make_ptr(
+                                    self.dtype,
+                                    row_addr + cutlass.Int64(pos0) * cutlass.Int64(elem_bytes),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=vec_align,
+                                )
+                                cute.copy(
+                                    copy_atom,
+                                    cute.make_tensor(src_ptr_u, cute.make_layout((vec_w,))),
+                                    frags[u],
+                                )
                         poss.append(pos0)
                         valids.append(valid)
                     for u in cutlass.range_constexpr(UN):
@@ -2297,18 +2323,18 @@ class GvrTopKKernel:
                     pos0_w = blk_w * cutlass.Int32(self.SKIP_BLOCK) + my_chunk0_w * cutlass.Int32(
                         vec_w
                     )
-                    src_ptr_w = cute.make_ptr(
-                        self.dtype,
-                        row_addr + cutlass.Int64(pos0_w) * cutlass.Int64(elem_bytes),
-                        cute.AddressSpace.gmem,
-                        assumed_align=vec_align,
-                    )
-                    cute.copy(
-                        copy_atom,
-                        cute.make_tensor(src_ptr_w, cute.make_layout((vec_w,))),
-                        wfrag,
-                    )
                     if pos0_w + cutlass.Int32(vec_w) <= slice_end:
+                        src_ptr_w = cute.make_ptr(
+                            self.dtype,
+                            row_addr + cutlass.Int64(pos0_w) * cutlass.Int64(elem_bytes),
+                            cute.AddressSpace.gmem,
+                            assumed_align=vec_align,
+                        )
+                        cute.copy(
+                            copy_atom,
+                            cute.make_tensor(src_ptr_w, cute.make_layout((vec_w,))),
+                            wfrag,
+                        )
                         for j in cutlass.range_constexpr(vec_w):
                             if cutlass.const_expr(self.dtype == cutlass.Float32):
                                 vj = wfrag[j]

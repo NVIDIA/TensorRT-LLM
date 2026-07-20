@@ -192,7 +192,7 @@ def emu_block_max(
     next_n: int = 1,
     compress_ratio: int = 1,
     tail_mode: str = "pad_inf",
-    records: str = "rotate",
+    records: str = "positional",
 ) -> torch.Tensor:
     """``[num_rows, nb_pad*4] fp32`` warp-partial upper-bound records.
 
@@ -421,7 +421,8 @@ def gvr_topk_decode(
             and block_max.dim() == 2
             and block_max.shape[0] == num_rows
             and block_max.shape[1] % 4 == 0
-        ), "block_max must be contiguous CUDA fp32 [num_rows, nb_pad*4]"
+            and block_max.shape[1] >= (logits.shape[1] + 31) // 32
+        ), "block_max must be contiguous CUDA fp32 [num_rows, nb_pad*4] covering the row"
 
     if return_output_values:
         if out_values is None:
