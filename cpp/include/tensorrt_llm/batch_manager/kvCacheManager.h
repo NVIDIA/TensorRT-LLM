@@ -882,6 +882,7 @@ public:
         radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         SizeType32 numPlaceholderBlocks = 0);
 
@@ -911,7 +912,19 @@ public:
 
     void releasePools();
 
-    void createIndexerKCachePools();
+    //! \brief Create the indexer K cache pools mirroring each KV pool.
+    //! \details When an indexer layer mask is set, only masked-in layers get a row in the
+    //! indexer pool (masked layout); rows follow the order of `managedLayers` restricted to
+    //! the KV pool's layers, matching the KV pool's own layer-row order.
+    void createIndexerKCachePools(std::vector<SizeType32> const& managedLayers);
+
+    //! \brief Row of `layerIdx` within the masked indexer K cache pool, or -1 when the layer
+    //! is masked out (owns no indexer K cache).
+    [[nodiscard]] SizeType32 getIndexerKCachePoolLayerIdx(SizeType32 layerIdx) const
+    {
+        auto const it = mLayerToIndexerPoolRow.find(layerIdx);
+        return it != mLayerToIndexerPoolRow.end() ? it->second : -1;
+    }
 
     void startScheduling();
 
@@ -1457,6 +1470,14 @@ private:
     // Whether the indexer K cache stores FP4-packed data (half the byte count
     // per token vs. FP8). Drives the createIndexerKCachePools() formula.
     bool mIndexerKCacheUseFp4{false};
+    // Optional per-layer indexer K cache mask, indexed like numKvHeadsPerLayer.
+    // nullopt = every layer owns an indexer K cache row (dense, legacy behavior).
+    // When set, only masked-in layers get a row in the (masked) indexer pool —
+    // e.g. GLM 5.2 cross-layer indexer sharing where "shared" layers reuse the
+    // previous full layer's top-k and never touch the indexer K cache.
+    std::optional<std::vector<bool>> mIndexerKCacheLayerMask;
+    // layerIdx -> row within the masked indexer K cache pool (only masked-in layers).
+    std::unordered_map<SizeType32, SizeType32> mLayerToIndexerPoolRow;
 
     std::optional<LinearAttentionMetadata> mLinearAttentionMetadata;
 };
@@ -1489,7 +1510,8 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
-        bool indexerKCacheUseFp4 = false, std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        bool indexerKCacheUseFp4 = false, std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
     [[nodiscard]] bool isEnableIndexerKCache() const
@@ -1723,6 +1745,13 @@ public:
     [[nodiscard]] SizeType32 getPoolLayerIdx(SizeType32 layerIdx) const
     {
         return windowManagerByLayer(layerIdx).getPoolLayerIdx(layerIdx);
+    }
+
+    //! \brief Row of `layerIdx` within the masked indexer K cache pool, or -1 when the layer
+    //! owns no indexer K cache (masked out by the per-layer indexer mask).
+    [[nodiscard]] SizeType32 getIndexerKCachePoolLayerIdx(SizeType32 layerIdx) const
+    {
+        return windowManagerByLayer(layerIdx).getIndexerKCachePoolLayerIdx(layerIdx);
     }
 
     [[nodiscard]] bool isPoolLayerFirst(SizeType32 layerIdx) const
@@ -2285,6 +2314,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
@@ -2299,6 +2329,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
@@ -2313,6 +2344,7 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 
@@ -2323,6 +2355,7 @@ public:
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
         std::vector<PoolConfiguration> const& poolConfigurations = {});
 

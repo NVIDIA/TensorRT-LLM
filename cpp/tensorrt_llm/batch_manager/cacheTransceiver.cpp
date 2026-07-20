@@ -432,6 +432,24 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
     if (isMLA && cacheManager->isEnableIndexerKCache())
     {
+        // The indexer K cache split/concat path strides indexer blocks by the per-rank
+        // attention layer count. A masked indexer pool (per-layer indexer mask, e.g.
+        // GLM 5.2 cross-layer indexer sharing) holds fewer rows than that -- possibly
+        // zero, in which case no pool exists at all -- which the transfer kernels do
+        // not understand yet. Fail fast instead of corrupting ctx->gen transfers (or
+        // dereferencing a null pool in CacheTransBufferManager).
+        auto const indexerPool = cacheManager->getIndexerKCachePool();
+        TLLM_CHECK_WITH_INFO(indexerPool != nullptr,
+            "The KV cache transceiver does not support a per-layer masked indexer K cache pool yet: "
+            "this rank owns no indexer K cache rows (every local layer uses cross-layer indexer sharing). Disable "
+            "the cache transceiver for models with cross-layer indexer sharing (e.g. GLM 5.2).");
+        auto const numIndexerLayers = indexerPool->getShape().d[1];
+        auto const numLocalLayers = cacheManager->getBlockManager().getNumLayers();
+        TLLM_CHECK_WITH_INFO(numIndexerLayers == static_cast<int64_t>(numLocalLayers),
+            "The KV cache transceiver does not support a per-layer masked indexer K cache pool yet: "
+            "the indexer pool holds %ld layer rows but this rank manages %d attention layers. Disable the cache "
+            "transceiver for models with cross-layer indexer sharing (e.g. GLM 5.2).",
+            static_cast<long>(numIndexerLayers), numLocalLayers);
         mCacheTransBufferManagers.push_back(
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }
