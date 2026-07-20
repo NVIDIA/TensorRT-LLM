@@ -183,6 +183,7 @@ def test_model_kv_shape_mla_and_gqa(tmp_path):
         "num_kv_heads": 1,
         "head_dim": 576,
         "is_mla": True,
+        "vocab_size": None,
         "source": "config.json (MLA)",
     }
 
@@ -256,3 +257,40 @@ class TestControlWireFormat:
         assert (os.stat(path).st_mode & 0o777) == 0o600
         with open(path) as f:
             assert json.load(f)["key"] == "aa"
+
+
+def test_use_kv_cache_manager_v2_flags():
+    # Absent -> "auto" (the driver resolves it against the model's
+    # get_model_defaults at runtime, like serving).
+    plan = pcfg.resolve_plan(_disagg_yaml())
+    assert plan["ctx_use_kv_cache_manager_v2"] == "auto"
+    assert plan["gen_use_kv_cache_manager_v2"] == "auto"
+    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] == "auto"
+
+    # Explicit yaml values win, per side.
+    plan = pcfg.resolve_plan(
+        _disagg_yaml(
+            ctx_extra={"kv_cache_config": {"dtype": "fp8", "use_kv_cache_manager_v2": False}},
+            gen_extra={"kv_cache_config": {"dtype": "fp8", "use_kv_cache_manager_v2": True}},
+        )
+    )
+    assert plan["ctx_use_kv_cache_manager_v2"] is False
+    assert plan["gen_use_kv_cache_manager_v2"] is True
+    assert pcfg.side_plan(plan, "gen")["use_kv_cache_manager_v2"] is True
+
+
+def test_model_kv_shape_vocab_size(tmp_path):
+    model_dir = tmp_path / "m"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 129280,
+            }
+        )
+    )
+    assert pcfg.model_kv_shape(str(model_dir))["vocab_size"] == 129280

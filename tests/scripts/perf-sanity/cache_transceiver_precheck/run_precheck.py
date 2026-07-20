@@ -54,6 +54,7 @@ tensorrt_llm/disaggregated_params.py and executor/result.py.
 
 import argparse
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -206,7 +207,106 @@ def verify_request(kvm, rid):
     return True, ""
 
 
-def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len):
+@dataclasses.dataclass
+class _KvCacheConfigV2:
+    """KvCacheConfig stand-in for KVCacheManagerV2.
+
+    Mirrors examples/disaggregated/slurm/cache_transceiver_test (and the
+    reference dataclass in
+    tests/unittest/disaggregated/test_cache_transceiver_single_process.py):
+    KVCacheManagerV2 reads these fields off the config object directly, so
+    every attribute it accesses must exist here.
+    """
+
+    max_tokens: "int | None" = None
+    enable_block_reuse: bool = False
+    max_attention_window: "list | None" = None
+    sink_token_length: "int | None" = None
+    free_gpu_memory_fraction: "float | None" = None
+    host_cache_size: "int | None" = None
+    disk_cache_size: "int | None" = None
+    disk_cache_path: "str | None" = None
+    onboard_blocks: bool = True
+    cross_kv_cache_fraction: "float | None" = None
+    secondary_offload_min_priority: "int | None" = None
+    event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
+    max_gpu_total_bytes: "int | None" = None
+    enable_partial_reuse: bool = False
+    copy_on_partial_reuse: bool = False
+    dtype: str = "auto"
+    pool_ratio: "list | None" = None
+    avg_seq_len: "int | None" = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
+    disk_prefetch_num_reqs: int = 4
+    max_util_for_resume: float = 0.95
+
+
+def _lookup_model_cls(model_dir):
+    """Model class from config.json architectures, like serving's automodel path."""
+    try:
+        with open(os.path.join(model_dir, "config.json")) as f:
+            hf_cfg = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None, None
+    archs = hf_cfg.get("architectures") or []
+    hf_view = type("HFConfigView", (), hf_cfg)  # attribute access for the pref hook
+    if not archs:
+        return None, hf_view
+    import tensorrt_llm._torch.models  # noqa: F401 - populates the registry
+
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+
+    return MODEL_CLASS_MAPPING.get(archs[0]), hf_view
+
+
+def resolve_model_prefs(model_dir, side, cache_cfg):
+    """Mirror serving's model-preference resolution (PR #15823 semantics).
+
+    - use_kv_cache_manager_v2 == "auto" (yaml absent): adopt the model
+      class's get_model_defaults() value, default False
+      (llm_utils._resolve_kv_cache_manager_v2_auto).
+    - cache_cfg.transceiver_runtime == "auto": adopt
+      model_cls.get_preferred_transceiver_runtime(), NIXL-gated, via the
+      REAL llm_utils._resolve_transceiver_runtime_auto (mutates cache_cfg).
+
+    Returns the effective use_v2 bool.
+    """
+    import types
+
+    model_cls, hf_view = _lookup_model_cls(model_dir)
+
+    setting = side["use_kv_cache_manager_v2"]
+    if setting == "auto":
+        defaults = {}
+        if model_cls is not None:
+            try:
+                defaults = model_cls.get_model_defaults(None) or {}
+            except Exception as e:  # noqa: BLE001 - model hooks may need llm_args
+                print(f"[precheck] WARNING: get_model_defaults failed ({e!r}); "
+                      f"assuming V1", flush=True)
+        kv_defaults = defaults.get("kv_cache_config") or {}
+        use_v2 = kv_defaults.get("use_kv_cache_manager_v2", False) is True
+    else:
+        use_v2 = bool(setting)
+
+    if getattr(cache_cfg, "transceiver_runtime", None) == "auto":
+        try:
+            from tensorrt_llm.llmapi.llm_utils import _resolve_transceiver_runtime_auto
+
+            shim = types.SimpleNamespace(cache_transceiver_config=cache_cfg)
+            _resolve_transceiver_runtime_auto(shim, model_cls, hf_view)
+        except Exception as e:  # noqa: BLE001 - fall back to the create() default (CPP)
+            print(
+                f"[precheck] WARNING: transceiver_runtime 'auto' resolution failed "
+                f"({e!r}); create_kv_cache_transceiver will fall back to CPP",
+                flush=True,
+            )
+    return use_v2
+
+
+def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
     import tensorrt_llm.bindings
     import tensorrt_llm.bindings.executor as trtllm_executor
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -239,9 +339,7 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len):
     # Real MLA serving uses SELFKONLY (kv_factor=1: one latent plane, no V) —
     # see _torch/pyexecutor/_util.py; SELF would double the per-token bytes.
     cache_type = CacheTypeCpp.SELFKONLY if kv_shape["is_mla"] else CacheTypeCpp.SELF
-    return KVCacheManager(
-        trtllm_executor.KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
-        cache_type,
+    common = dict(
         num_layers=kv_shape["num_layers"],
         num_kv_heads=kv_shape["num_kv_heads"],
         head_dim=kv_shape["head_dim"],
@@ -251,6 +349,27 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len):
         mapping=mapping,
         dtype=dtype,
         spec_config=spec_config,
+    )
+    if use_v2:
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
+        # is_disagg=True doubles the IndexMapper capacity so in-flight
+        # transfers (TRANS_IN_PROGRESS) can hold slots, like real serving.
+        return KVCacheManagerV2(
+            _KvCacheConfigV2(
+                max_tokens=max_tokens,
+                enable_block_reuse=False,
+                max_attention_window=[padded_len],
+            ),
+            cache_type,
+            vocab_size=kv_shape.get("vocab_size") or 32000,
+            is_disagg=True,
+            **common,
+        )
+    return KVCacheManager(
+        trtllm_executor.KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
+        cache_type,
+        **common,
     )
 
 
@@ -295,11 +414,28 @@ def make_request(is_ctx, rid, req_len, runtime, ctx_params=None):
     )
 
 
-def add_sequence(kvm, req, prompt_len):
+def add_sequence(kvm, req, prompt_len, use_v2):
+    """Allocate KV blocks (mirrors the cache_transceiver_test harness)."""
+    if use_v2:
+        if req.is_disagg_generation_init_state:
+            ok = kvm.prepare_disagg_gen_init(req)
+        else:
+            ok = kvm.prepare_context(req) and kvm.resize_context(req, prompt_len)
+        if not ok:
+            raise RuntimeError(f"V2 KV cache allocation failed for request {req.py_request_id}")
+        return
     kvm.impl.add_sequence_batch([(req.py_request_id, prompt_len, 1)], [req])
 
 
-def free_sequence(kvm, req):
+def free_sequence(kvm, req, use_v2):
+    if use_v2:
+        import torch
+
+        # free_resources() closes the kv_cache AND releases the IndexMapper
+        # slot (closing the cache alone leaks slots).
+        torch.cuda.current_stream().synchronize()
+        kvm.free_resources(req)
+        return
     kvm.impl.remove_sequence(req.py_request_id, req, True)
 
 
@@ -473,6 +609,8 @@ class PrecheckRunner:
         self.kvm = None
         self.xcvr = None
         self.runtime = "CPP"
+        # Resolved in setup(): "auto" needs the model class (get_model_defaults).
+        self.use_v2 = False
         self.mapping = None
         self.llm_request_state = None
         self.csv_dir = os.path.join(self.work_dir, "csv", f"{self.role}_{self.server_idx}")
@@ -511,10 +649,25 @@ class PrecheckRunner:
         os.makedirs(self.csv_dir, exist_ok=True)
         os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = self.csv_dir
 
-        self.kvm = build_kv_cache_manager(kv_shape, self.plan, self.side, self.mapping, max_req_len)
         # Built VERBATIM from the disagg yaml's cache_transceiver_config so
         # backend/max_tokens_in_buffer/timeouts match the real test exactly.
         cache_cfg = CacheTransceiverConfig(**self.side["cache_transceiver_config"])
+        # Yaml-absent settings resolve against the model's preferences, like
+        # serving does (kv manager version + transceiver runtime).
+        self.use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), self.side, cache_cfg)
+        # KVCacheManagerV2 only works with the Python transceiver (see
+        # cache_transceiver_test/report.py); reject the pairing up front with
+        # a clear INIT_ERROR instead of a C++ binding type error.
+        if self.use_v2 and cache_cfg.transceiver_runtime != "PYTHON":
+            raise RuntimeError(
+                "KVCacheManagerV2 requires cache_transceiver_config."
+                f"transceiver_runtime: PYTHON, got {cache_cfg.transceiver_runtime!r} "
+                "(the C++ transceiver only supports the V1 manager)"
+            )
+
+        self.kvm = build_kv_cache_manager(
+            kv_shape, self.plan, self.side, self.mapping, max_req_len, self.use_v2
+        )
         AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
         attention_type = AttentionTypeCpp.MLA if kv_shape["is_mla"] else AttentionTypeCpp.DEFAULT
         dist_obj = Distributed.get(self.mapping)
@@ -550,7 +703,7 @@ class PrecheckRunner:
             for pair in owned:
                 rid = self._pair_rid(peer_idx, li, rep, pair)
                 req = make_request(True, rid, req_len, self.runtime)
-                add_sequence(self.kvm, req, req_len)
+                add_sequence(self.kvm, req, req_len, self.use_v2)
                 fill_request(self.kvm, rid)
                 tensorrt_llm.logger.info(
                     f"[ctx{self.server_idx} r{self.rank}] rid={rid} len={req_len}: send START"
@@ -617,7 +770,7 @@ class PrecheckRunner:
                 req = make_request(
                     False, rid, req_len, self.runtime, ctx_params=params_by_pair[pair]
                 )
-                add_sequence(self.kvm, req, req_len)
+                add_sequence(self.kvm, req, req_len, self.use_v2)
                 tensorrt_llm.logger.info(
                     f"[gen{self.server_idx} r{self.rank}] rid={rid} len={req_len}: recv START"
                 )
@@ -659,7 +812,7 @@ class PrecheckRunner:
     def _free_all(self, reqs):
         for req in reqs.values():
             try:
-                free_sequence(self.kvm, req)
+                free_sequence(self.kvm, req, self.use_v2)
             except Exception:  # noqa: BLE001 - teardown best-effort
                 pass
 
@@ -979,6 +1132,15 @@ def main(argv=None):
             flush=True,
         )
         return 1
+    if runner.is_leader:
+        # Effective values after model-preference resolution — what serving
+        # would actually run with (PR #15823 semantics).
+        print(
+            f"[precheck {args.role}_{args.server_idx}] "
+            f"kv_cache_manager={'V2' if runner.use_v2 else 'V1'} "
+            f"transceiver_runtime={runner.runtime}",
+            flush=True,
+        )
 
     # --- sessions -------------------------------------------------------------
     num_peers = side["num_peers"]
@@ -1063,7 +1225,13 @@ def main(argv=None):
 
     failed_local = 1 if runner.recorder.failed_cases() else 0
     failed = comm.allreduce(failed_local, op=MPI.MAX)
-    runner.recorder.finalize(extra={"per_gpu_bw_gbps": bw} if bw else None)
+    extra = {
+        "kv_cache_manager": "V2" if runner.use_v2 else "V1",
+        "transceiver_runtime": runner.runtime,
+    }
+    if bw:
+        extra["per_gpu_bw_gbps"] = bw
+    runner.recorder.finalize(extra=extra)
     comm.Barrier()
     if runner.is_leader:
         verdict = "FAIL" if failed else "PASS"
