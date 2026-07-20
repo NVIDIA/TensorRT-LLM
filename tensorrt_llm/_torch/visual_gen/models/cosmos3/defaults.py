@@ -115,4 +115,16 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default=None,
         description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
     ),
+    "video": ExtraParamSchema(
+        type="tensor",
+        default=None,
+        description=(
+            "V2V reference: decoded video frames as a uint8 [T, H, W, C] RGB "
+            "torch.Tensor (build one from a file with "
+            "tensorrt_llm.inputs.media_io.load_video_frames_tensor). The worker "
+            "keeps the first/last conditioning window per "
+            "condition_video_latent_indexes / condition_video_keep and "
+            "VAE-encodes it; media is always decoded by the producer."
+        ),
+    ),
 }

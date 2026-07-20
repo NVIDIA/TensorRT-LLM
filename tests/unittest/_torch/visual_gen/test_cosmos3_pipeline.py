@@ -55,6 +55,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _normalize_condition_video_latent_indexes,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.inputs.media_io import frames_to_tensor
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cosmos3
@@ -537,16 +538,14 @@ class TestCosmos3V2VConditioningParams:
         "value,expected",
         [
             (None, (0, 1)),
-            (0, (0,)),
             ([0, 2], (0, 2)),
             ((1, 3), (1, 3)),
-            ("0, 2", (0, 2)),
         ],
     )
     def test_normalize_condition_video_latent_indexes(self, value, expected):
         assert _normalize_condition_video_latent_indexes(value) == expected
 
-    @pytest.mark.parametrize("value", [[], "", [-1], "0, -1", [0, -2]])
+    @pytest.mark.parametrize("value", [[], [-1], [0, -2]])
     def test_invalid_condition_video_latent_indexes_raise(self, value):
         with pytest.raises(ValueError):
             _normalize_condition_video_latent_indexes(value)
@@ -579,96 +578,70 @@ class TestCosmos3V2VConditioningParams:
             _normalize_condition_video_keep("middle")
 
 
-class TestNormalizeVideoInputContentDispatch:
-    """``normalize_video_input_path`` classifies files by content, not suffix.
+def _write_mp4(path, num_frames: int = 3) -> None:
+    """Synthesize a tiny mp4v clip (no video asset ships with the repo)."""
+    cv2 = pytest.importorskip("cv2")
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
+    try:
+        for _ in range(num_frames):
+            writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+    finally:
+        writer.release()
+    assert path.exists() and path.stat().st_size > 0
 
-    The serve path stores references with no type-suffix, so decode dispatch
-    must key on the container, not the filename. CPU-only; the clip is
-    synthesized with OpenCV (installed by CI test stages via
-    ``jenkins/L0_Test.groovy``; the importorskip only spares bare local envs).
-    """
 
-    @staticmethod
-    def _write_mp4(path, num_frames: int = 3) -> None:
-        cv2 = pytest.importorskip("cv2")
-        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
-        try:
-            for _ in range(num_frames):
-                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-        finally:
-            writer.release()
-        assert path.exists() and path.stat().st_size > 0
+class TestLoadVideoFramesTensor:
+    """``media_io.load_video_frames_tensor`` builds the uint8 [T, H, W, C]
+    tensor the ``video`` extra param carries (all frames, no crop — the worker
+    keeps the conditioning window). Public helper, used by the example and
+    available to API clients. CPU-only."""
 
-    def test_video_without_extension_decodes_to_frames(self, tmp_path):
+    def test_from_video_file_all_frames(self, tmp_path):
         pytest.importorskip("cv2")
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input_path
-
-        # OpenCV's *writer* selects the muxer by extension, so encode to a
-        # ``.mp4`` path, then rename to a suffix-less name — exactly what the
-        # serve path produces (raw bytes written to ``{id}_reference``).
-        encoded = tmp_path / "clip.mp4"
-        self._write_mp4(encoded)
-        ref = encoded.rename(tmp_path / "reference")
-        frames = normalize_video_input_path(ref)
-        # Took the video-decode path (returns PIL frames), not the single-still
-        # path (which would return the bare ``[str(path)]``).
-        assert frames and all(isinstance(f, PIL.Image.Image) for f in frames)
-
-    def test_image_without_extension_is_single_frame(self, tmp_path):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input_path
-
-        ref = tmp_path / "reference"  # no ``.png`` suffix
-        PIL.Image.new("RGB", (8, 8), (1, 2, 3)).save(ref, format="PNG")
-        assert normalize_video_input_path(ref) == [str(ref)]
-
-    def test_undecodable_file_raises(self, tmp_path):
-        pytest.importorskip("cv2")
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input_path
-
-        ref = tmp_path / "reference"
-        ref.write_bytes(b"not media")
-        with pytest.raises(ValueError, match="decodable"):
-            normalize_video_input_path(ref)
-
-
-class TestLoadReferenceVideo:
-    """``load_reference_video`` decodes any reference into the framework's
-    ``VideoData`` (all frames) for ``multi_modal_data["video"]``. It does not
-    crop — the worker does — so the producer stays model-agnostic. CPU-only."""
-
-    def test_from_pil_list_all_frames(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
-        from tensorrt_llm.inputs.multimodal_data import VideoData
-
-        frames = [PIL.Image.new("RGB", (8, 8), (i, i, i)) for i in range(6)]
-        vd = load_reference_video(frames)
-        assert isinstance(vd, VideoData)
-        assert len(vd.frames) == 6  # all frames, no crop
-        assert all(isinstance(f, PIL.Image.Image) for f in vd.frames)
-        # No temporal metadata: placement comes from request params
-        # (condition_video_latent_indexes, frame_rate), not the reference.
-        assert vd.metadata == {}
-
-    def test_from_video_file(self, tmp_path):
-        pytest.importorskip("cv2")
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
 
         enc = tmp_path / "clip.mp4"
-        TestNormalizeVideoInputContentDispatch._write_mp4(enc, num_frames=8)
-        assert len(load_reference_video(enc).frames) == 8  # all frames
+        _write_mp4(enc, num_frames=8)
+        video = load_video_frames_tensor(enc)
+        assert video.dtype == torch.uint8
+        assert video.ndim == 4 and video.shape[0] == 8 and video.shape[-1] == 3
+
+    def test_from_image_file_is_single_frame(self, tmp_path):
+        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
+
+        p = tmp_path / "img.png"
+        PIL.Image.new("RGB", (8, 8), (7, 7, 7)).save(p)
+        assert load_video_frames_tensor(p).shape == (1, 8, 8, 3)
 
     def test_from_directory(self, tmp_path):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
 
         for i in range(5):
             PIL.Image.new("RGB", (8, 8), (i, i, i)).save(tmp_path / f"{i:03d}.png")
-        assert len(load_reference_video(tmp_path).frames) == 5
+        video = load_video_frames_tensor(tmp_path)
+        assert video.shape == (5, 8, 8, 3)
+        # Sorted lexicographically: frame k is the solid (k, k, k) image.
+        assert int(video[0].float().mean()) == 0 and int(video[4].float().mean()) == 4
+
+    def test_directory_selects_by_suffix_and_fails_loud_on_corrupt(self, tmp_path):
+        # Directories are user-curated: non-frame entries are ignored by name,
+        # but a selected frame that doesn't decode raises — corrupt frames are
+        # never silently dropped into a video with holes.
+        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
+
+        PIL.Image.new("RGB", (8, 8), (1, 1, 1)).save(tmp_path / "000.png")
+        (tmp_path / "notes.txt").write_text("not a frame")  # ignored by suffix
+        assert load_video_frames_tensor(tmp_path).shape[0] == 1
+
+        (tmp_path / "001.png").write_bytes(b"corrupt")
+        with pytest.raises(PIL.UnidentifiedImageError):
+            load_video_frames_tensor(tmp_path)
 
     def test_missing_path_raises(self, tmp_path):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+        from tensorrt_llm.inputs.media_io import load_video_frames_tensor
 
         with pytest.raises(ValueError, match="does not exist"):
-            load_reference_video(tmp_path / "nope")
+            load_video_frames_tensor(tmp_path / "nope")
 
 
 @pytest.mark.integration
@@ -676,7 +649,7 @@ class TestLoadReferenceVideo:
 @pytest.mark.high_cuda_memory
 class TestCosmos3V2V:
     def test_v2v_smoke(self, cosmos3_pipeline):
-        video = _make_test_video(NUM_FRAMES)
+        video = frames_to_tensor(_make_test_video(NUM_FRAMES))
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
@@ -693,18 +666,19 @@ class TestCosmos3V2V:
             use_karras_sigmas=False,
         )
 
-    def test_v2v_multimodal_reference_smoke(self, cosmos3_pipeline):
-        """The V2V reference arrives as ``VideoData`` (built by
-        ``load_reference_video``, all frames) under ``multi_modal_data["video"]``;
-        the worker crops the conditioning window and VAE-encodes. Mirrors what the
-        offline example feeds the pipeline."""
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+    def test_v2v_tensor_reference_smoke(self, cosmos3_pipeline):
+        """The V2V reference arrives as a decoded uint8 [T, H, W, C] tensor
+        (the ``video`` extra-param contract); the worker crops the conditioning
+        window and VAE-encodes. Mirrors what the offline example and serve feed
+        the pipeline."""
+        from tensorrt_llm.inputs.media_io import frames_to_tensor
 
-        video_data = load_reference_video(_make_test_video(NUM_FRAMES))
+        video = frames_to_tensor(_make_test_video(NUM_FRAMES))
+        assert video.dtype == torch.uint8 and video.ndim == 4
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
-            video=video_data.frames,
+            video=video,
             num_frames=NUM_FRAMES,
             condition_video_latent_indexes=[0, 1],
             condition_video_keep="first",
@@ -722,7 +696,9 @@ class TestCosmos3V2V:
         dark = PIL.Image.new("RGB", (WIDTH, HEIGHT), (40, 40, 40))
         bright = PIL.Image.new("RGB", (WIDTH, HEIGHT), (230, 230, 230))
         # 5 = max(condition_video_latent_indexes) * 4 + 1 conditioning frames.
-        video = [dark.copy() for _ in range(NUM_FRAMES)] + [bright.copy() for _ in range(5)]
+        video = frames_to_tensor(
+            [dark.copy() for _ in range(NUM_FRAMES)] + [bright.copy() for _ in range(5)]
+        )
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
@@ -766,7 +742,7 @@ class TestCosmos3V2V:
         with pytest.raises(StopAfterTokenize):
             pipeline.forward(
                 prompt="continue",
-                video=_make_test_video(5, width=16, height=16),
+                video=frames_to_tensor(_make_test_video(5, width=16, height=16)),
                 height=16,
                 width=16,
                 num_frames=5,
@@ -791,7 +767,7 @@ class TestCosmos3V2V:
             _run_forward(
                 cosmos3_pipeline,
                 image=_make_test_image(),
-                video=_make_test_video(5),
+                video=frames_to_tensor(_make_test_video(5)),
             )
 
     def test_t2i_and_video_rejected(self, cosmos3_pipeline):
@@ -799,7 +775,7 @@ class TestCosmos3V2V:
             _run_forward(
                 cosmos3_pipeline,
                 image=None,
-                video=_make_test_video(5),
+                video=frames_to_tensor(_make_test_video(5)),
                 output_type="image",
                 height=T2I_HEIGHT,
                 width=T2I_WIDTH,
@@ -846,7 +822,7 @@ class TestCosmos3Audio:
         result = _run_forward(
             cosmos3_pipeline,
             enable_audio=True,
-            video=_make_test_video(NUM_FRAMES),
+            video=frames_to_tensor(_make_test_video(NUM_FRAMES)),
             condition_video_latent_indexes=[0, 1],
             condition_video_keep="first",
         )

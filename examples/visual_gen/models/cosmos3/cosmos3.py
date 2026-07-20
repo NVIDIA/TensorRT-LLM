@@ -107,7 +107,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+from tensorrt_llm.inputs.media_io import load_video_frames_tensor
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -280,7 +280,9 @@ def main():
     params.extra_params["output_type"] = output_type
 
     if args.video_path is not None:
-        params.multi_modal_data = {"video": load_reference_video(args.video_path)}
+        # Decode client-side into the uint8 [T, H, W, C] tensor contract; the
+        # worker keeps the conditioning window and VAE-encodes.
+        params.extra_params["video"] = load_video_frames_tensor(args.video_path)
 
     if negative_prompt is None:
         params.negative_prompt = None

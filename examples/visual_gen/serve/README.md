@@ -286,7 +286,7 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `input_reference`: Reference image (I2V/TI2V) or video (V2V), classified by decoding the content — filename and content type are ignored; accepted as base64-encoded string in JSON or as a file in multipart form-data. Undecodable content returns HTTP 400. Video decode requires the `av` (PyAV) package on the server (not bundled — `pip install av`).
+- `input_reference`: Reference image (I2V/TI2V) or video (V2V), classified by decoding the content — filename and content type are ignored; accepted as base64-encoded string in JSON or as a file in multipart form-data. Undecodable content returns HTTP 400. Video decode requires OpenCV on the server (not bundled — `pip install opencv-python-headless`).
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"b64_json"` or `"url"`
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).

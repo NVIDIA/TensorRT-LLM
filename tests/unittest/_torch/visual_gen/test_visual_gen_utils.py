@@ -313,8 +313,8 @@ class TestInputReferenceMaterialization:
         finally:
             os.remove(path)
 
-    def test_multipart_video_reference_routes_to_multimodal(self, tmp_path):
-        from tensorrt_llm.inputs.multimodal_data import VideoData
+    def test_multipart_video_reference_routes_to_extra_params_tensor(self, tmp_path):
+        import torch
 
         generator = _StubVisualGen()
         upload = UploadFile(file=BytesIO(self._mp4_bytes()), filename="clip.mp4")
@@ -322,31 +322,32 @@ class TestInputReferenceMaterialization:
         params = parse_visual_gen_params(
             request, "vid-3", generator, media_storage_path=str(tmp_path)
         )
-        # Video content is decoded into VideoData under multi_modal_data["video"]
-        # (framework convention), not params.image. The worker crops + VAE-encodes.
+        # Video content is decoded into a uint8 [T, H, W, C] tensor on the
+        # model-specific ``video`` extra param, not params.image. The worker
+        # crops the conditioning window + VAE-encodes.
         assert params.image is None
-        assert params.multi_modal_data is not None
-        video_data = params.multi_modal_data["video"]
-        assert isinstance(video_data, VideoData)
-        assert len(video_data.frames) >= 1
+        video = params.extra_params["video"]
+        assert isinstance(video, torch.Tensor)
+        assert video.dtype == torch.uint8
+        assert video.ndim == 4 and video.shape[0] == 2 and video.shape[-1] == 3
         # Video references are decoded in memory — nothing lands in media storage.
         assert list(tmp_path.iterdir()) == []
 
     def test_video_reference_needs_no_media_storage(self):
         # The decode is in-memory, so V2V works without a storage path at all
         # (only image references persist a file for the worker to read).
-        from tensorrt_llm.inputs.multimodal_data import VideoData
+        import torch
 
         generator = _StubVisualGen()
         b64 = base64.b64encode(self._mp4_bytes()).decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
         params = parse_visual_gen_params(request, "vid-9", generator, media_storage_path=None)
-        assert isinstance(params.multi_modal_data["video"], VideoData)
+        assert isinstance(params.extra_params["video"], torch.Tensor)
 
-    def test_base64_video_reference_routes_to_multimodal(self, tmp_path):
+    def test_base64_video_reference_routes_to_extra_params_tensor(self, tmp_path):
         # Classification is content-based, so the JSON/base64 path can
         # carry video even though it has no content-type or filename.
-        from tensorrt_llm.inputs.multimodal_data import VideoData
+        import torch
 
         generator = _StubVisualGen()
         b64 = base64.b64encode(self._mp4_bytes()).decode()
@@ -355,7 +356,7 @@ class TestInputReferenceMaterialization:
             request, "vid-4", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is None
-        assert isinstance(params.multi_modal_data["video"], VideoData)
+        assert isinstance(params.extra_params["video"], torch.Tensor)
 
     def test_multipart_image_reference_routes_to_image(self, tmp_path):
         # JPEG upload: content sniffing classifies it as an image and routes
