@@ -64,6 +64,7 @@ def _compile(
     seqlen_sorted: bool = False,
     p4_warp_redundant: bool = True,
     p2_warp_redundant: bool = True,
+    enable_block_skip: bool = False,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -122,6 +123,16 @@ def _compile(
         if seqlen_sorted
         else None
     )
+    block_max_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (n_rows, cute.sym_int()),
+            stride_order=(1, 0),
+            assumed_align=16,
+        )
+        if enable_block_skip
+        else None
+    )
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = GvrTopKKernel(
         dtype=cute_dtype,
@@ -140,6 +151,7 @@ def _compile(
         seqlen_sorted=seqlen_sorted,
         p4_warp_redundant=p4_warp_redundant,
         p2_warp_redundant=p2_warp_redundant,
+        enable_block_skip=enable_block_skip,
     )
     return cute.compile(
         kernel,
@@ -149,9 +161,161 @@ def _compile(
         out_values_fake,
         out_indices_fake,
         order_row_fake,
+        block_max_fake,
         stream=fake_stream,
         options="--enable-tvm-ffi",
     )
+
+
+_FLT_MAX = torch.finfo(torch.float32).max
+_META_BLOCK = 128
+_META_RECS_PER_BLOCK = 4  # warp-partial records per block (indexer layout)
+
+
+def _row_n_eff(
+    seq_lens: torch.Tensor,
+    num_rows: int,
+    next_n: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Per-row effective scan length, mirroring the kernel formula."""
+    dev = seq_lens.device
+    rows = torch.arange(num_rows, device=dev)
+    sl = seq_lens[rows // next_n].to(torch.int64)
+    actual = sl - next_n + (rows % next_n) + 1
+    return actual // compress_ratio
+
+
+def emu_block_max(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    tail_mode: str = "pad_inf",
+    records: str = "rotate",
+) -> torch.Tensor:
+    """``[num_rows, nb_pad*4] fp32`` warp-partial upper-bound records.
+
+    tail_mode:
+      "exact":   tight bound — max over valid positions only.
+      "pad_inf": a partially-valid tail unit is forced to +FLT_MAX, the
+                 worst legal inflation (the indexer masks by request-level
+                 ctx >= N_eff, so tail positions can inflate the bound).
+                 Tests use this to prove inflated bounds only *disable*
+                 skipping, never break correctness.
+    records:
+      "rotate":     fold-correctness fixture — the 128-block max lands in
+                    ONE slot rotated by blk % 4, the other 3 hold
+                    -FLT_MAX. Any 4 values folding to the block max are
+                    legal; the rotation makes a consumer that drops or
+                    mis-reads partial slots fail the tests. Valid ONLY
+                    for grain-128 consumers (slots are NOT positional).
+      "positional": production semantics — record r is the exact max of
+                    positions [r*32, r*32+32) (the indexer's TMEM T2R
+                    partition gives warp w of a tile the contiguous
+                    positions [tile*128 + w*32, +32)). Required for
+                    skip_grain=32; also a legal grain-128 input (its
+                    fold is the block max).
+    """
+    assert tail_mode in ("exact", "pad_inf")
+    assert records in ("rotate", "positional")
+    R, C = logits.shape
+    nb = (C + _META_BLOCK - 1) // _META_BLOCK
+    dev = logits.device
+    n_eff = _row_n_eff(seq_lens, R, next_n, compress_ratio).unsqueeze(1)
+    lf = logits.to(torch.float32)
+    pad = nb * _META_BLOCK - C
+    if pad:
+        lf = torch.nn.functional.pad(lf, (0, pad), value=float("-inf"))
+    pos = torch.arange(nb * _META_BLOCK, device=dev).unsqueeze(0)
+    masked = torch.where(pos < n_eff, lf, torch.full_like(lf, float("-inf")))
+    if records == "positional":
+        sub = _META_BLOCK // _META_RECS_PER_BLOCK  # 32 positions/record
+        nrec = nb * _META_RECS_PER_BLOCK
+        rmax = masked.view(R, nrec, sub).amax(-1)
+        if tail_mode == "pad_inf":
+            rec_start = torch.arange(nrec, device=dev).unsqueeze(0) * sub
+            partial = (rec_start < n_eff) & (rec_start + sub > n_eff)
+            rmax = torch.where(partial, torch.full_like(rmax, _FLT_MAX), rmax)
+        return rmax.contiguous()
+    bmax = masked.view(R, nb, _META_BLOCK).amax(-1)
+    if tail_mode == "pad_inf":
+        blk_start = torch.arange(nb, device=dev).unsqueeze(0) * _META_BLOCK
+        partial = (blk_start < n_eff) & (blk_start + _META_BLOCK > n_eff)
+        bmax = torch.where(partial, torch.full_like(bmax, _FLT_MAX), bmax)
+    out = torch.full((R, nb, _META_RECS_PER_BLOCK), -_FLT_MAX, dtype=torch.float32, device=dev)
+    slot = torch.arange(nb, device=dev) % _META_RECS_PER_BLOCK
+    out[:, torch.arange(nb, device=dev), slot] = bmax
+    return out.reshape(R, nb * _META_RECS_PER_BLOCK).contiguous()
+
+
+# Rung offsets below each 32-position record's max for the meta-seed
+# metadata (L6_geo.25 — offline-validated: 1.00 real scans on synth +
+# real captures for both V4 models with the kernel's S=16 x 2-pass
+# quantized search).
+_META_DELTAS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+
+def emu_block_meta(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    compress_ratio: int = 1,
+    next_n: int = 1,
+) -> torch.Tensor:
+    """Emulate the indexer-side per-32-block rung-count metadata.
+
+    Record r packs, for each rung offset ``delta_j`` in
+    ``_META_DELTAS``, ``count(v >= record_max - delta_j)`` over
+    positions ``[32r, 32r+32)`` as a 5-bit saturating field at bits
+    ``[5j, 5j+5)`` (31 = "31 or 32"; the kernel decodes 31 as the safe
+    upper bound 32). Positions beyond the row's effective length are
+    excluded. Layout matches ``block_max``: ``[num_rows, nrec]`` int32
+    with ``nrec = ceil(N/128)*4`` (one record per 32 positions).
+    On the indexer side this is ~L ballots+popcounts per record in the
+    epilogue, same shape as the +1.3% block_max emission.
+    """
+    assert next_n == 1, "emu_block_meta: next_n == 1 only"
+    x = logits.float()
+    R, N = x.shape
+    nrec = ((N + _META_BLOCK - 1) // _META_BLOCK) * _META_RECS_PER_BLOCK
+    npad = nrec * 32
+    if npad > N:
+        x = torch.nn.functional.pad(x, (0, npad - N), value=float("-inf"))
+    n_eff = seq_lens.long() // compress_ratio
+    ar = torch.arange(npad, device=x.device)[None, :]
+    x = x.masked_fill(ar >= n_eff[:, None], float("-inf"))
+    xb = x.view(R, nrec, 32)
+    m = xb.amax(2, keepdim=True)
+    meta = torch.zeros(R, nrec, dtype=torch.int32, device=x.device)
+    for j, d in enumerate(_META_DELTAS):
+        cj = (xb >= (m - d)).sum(2).clamp(max=31).to(torch.int32)
+        meta |= cj << (5 * j)
+    return meta.contiguous()
+
+
+def enc_ordered_f32(t: torch.Tensor) -> torch.Tensor:
+    """Order-preserving int encoding of fp32 (an involution).
+
+    Stored back in fp32 slots — matches the indexer's encoded-int atomic
+    min/max.
+    """
+    bits = t.float().contiguous().view(torch.int32)
+    enc = torch.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    return enc.view(torch.float32)
+
+
+def hit_agg_identities(num_rows: int, device) -> torch.Tensor:
+    """Identity-initialized per-row hit aggregate.
+
+    {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} — the required initial state of
+    the buffer the indexer atomically merges into.
+    """
+    ident = torch.tensor([_FLT_MAX, -_FLT_MAX], dtype=torch.float32, device=device)
+    enc = enc_ordered_f32(ident)
+    out = torch.zeros((num_rows, 4), dtype=torch.float32, device=device)
+    out[:, 0] = enc[0]
+    out[:, 1] = enc[1]
+    return out.contiguous()
 
 
 def gvr_topk_decode(
@@ -178,6 +342,7 @@ def gvr_topk_decode(
     order_row: Optional[torch.Tensor] = None,
     p4_warp_redundant: bool = True,
     p2_warp_redundant: bool = True,
+    block_max: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -247,6 +412,17 @@ def gvr_topk_decode(
     cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
 
     num_rows = logits.shape[0]
+    enable_block_skip = block_max is not None
+    if enable_block_skip:
+        assert (
+            block_max.dtype == torch.float32
+            and block_max.is_cuda
+            and block_max.is_contiguous()
+            and block_max.dim() == 2
+            and block_max.shape[0] == num_rows
+            and block_max.shape[1] % 4 == 0
+        ), "block_max must be contiguous CUDA fp32 [num_rows, nb_pad*4]"
+
     if return_output_values:
         if out_values is None:
             out_values = torch.empty((num_rows, top_k), dtype=logits.dtype, device=logits.device)
@@ -312,6 +488,7 @@ def gvr_topk_decode(
         seqlen_sorted,
         p4_warp_redundant,
         p2_warp_redundant,
+        enable_block_skip,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -324,6 +501,7 @@ def gvr_topk_decode(
         out_values if return_output_values else None,
         out_indices,
         order_row if seqlen_sorted else None,
+        block_max if enable_block_skip else None,
     )
     if return_output_values:
         return out_values, out_indices

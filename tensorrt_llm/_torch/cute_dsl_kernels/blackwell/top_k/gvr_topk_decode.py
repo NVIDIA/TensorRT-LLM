@@ -270,6 +270,7 @@ class GvrTopKKernel:
         p4_tail_fast: Optional[bool] = None,  # [p4tt]
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
+        enable_block_skip: bool = False,
     ):
         # Redundant-warp sync reduction: every warp replays the block
         # reduce + decision from the same staged SMEM partials in the
@@ -423,6 +424,25 @@ class GvrTopKKernel:
         self.enable_r0 = bool(enable_r0)
         self.mt_unroll = int(mt_unroll)
         self.fb_fix = bool(fb_fix)
+        # enable_block_skip: gate the R0 M-ary count pass and the Phase-3
+        # stream-write on per-32-position upper bounds emitted by the
+        # indexer epilogue (``block_max [num_rows, nb_pad*4]`` fp32, record
+        # r = exact max of positions [r*32, r*32+32) of the POST-CONVERSION
+        # stored logits — contract in workspace/epilogue_topk_interface.md).
+        # Lossless: the active-block list is built at the LOOSEST rung, so a
+        # skipped block cannot contain any element >= any rung and every
+        # rung count (and the collect) equals its dense value. The port
+        # ships the measured-optimal configuration only: grain 32, int16
+        # list entries (16KB SMEM, 3 CTA/SM at T512), strided coalesced
+        # O(1)-barrier build, UN=2 software-pipelined compact scan.
+        self.enable_block_skip = bool(enable_block_skip)
+        self.SKIP_BLOCK = 32
+        self.SKIP_BLOCK_LOG2 = 5
+        self.SKIP_MAX_BLOCKS = 8192  # covers N up to 262144 at grain 32
+        self.SKIP_UNROLL = 2
+        self.skip_order = "grouped"
+        if enable_block_skip and num_threads not in (512, 1024):
+            raise ValueError("enable_block_skip requires num_threads in {512, 1024}")
         # C7 dispatch (op#26 host policy folded into the ctor; all gated on
         # enable_r0 so an OFF kernel is byte-identical to the base):
         #  - qfracs default = M2D (0.85, 0.35): dispatch_r0_op26 ships M2D for
@@ -1377,6 +1397,105 @@ class GvrTopKKernel:
     # totals are the answer. smem_ptcnt_multi holds slice-local per-thread
     # columns (the accepted rung's column seeds Phase 3 per CTA).
     # ------------------------------------------------------------------
+
+    # ---- block-skip machinery (enable_block_skip; ported from the
+    # skip-finegrain development chain, measured-optimal configuration
+    # only: grain 32, int16 list, grouped strided build, UN=2 scan) ----
+
+    @cute.jit
+    def _list_ld(self, smem_active, idx):
+        return cutlass.Int32(smem_active[idx])
+
+    @cute.jit
+    def _list_st(self, smem_active, idx, val):
+        smem_active[idx] = cutlass.Int16(val)
+
+    @cute.jit
+    def _block_bound(self, bm_addr, blk_id):
+        # grain 32: record blk_id IS the exact positional bound of
+        # [blk_id*32, blk_id*32+32) (indexer TMEM partition contract) —
+        # one 4B scalar load, no fold.
+        bm_ptr = cute.make_ptr(
+            cutlass.Float32,
+            bm_addr + cutlass.Int64(blk_id) * cutlass.Int64(4),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        )
+        return cute.make_tensor(bm_ptr, cute.make_layout((1,)))[0]
+
+    @cute.jit
+    def _full_build_active(
+        self,
+        block_max_row,
+        slice_start,
+        slice_end,
+        threshold,
+        smem_wcnt,
+        smem_active,
+        s_active_cnt,
+        tidx,
+        warp_id,
+        lane,
+    ):
+        # Two-phase register-bitmask build. Each thread owns ids_per_thread
+        # block ids STRIDED (t, t+T, t+2T, ...) so each pass's bound loads
+        # coalesce warp-wide. Phase A flags+counts with no sync; phase B is
+        # ONE block-wide exclusive scan over per-thread counts; phase C
+        # scatters from the bitmask — 3 barriers TOTAL, independent of
+        # nb_slice. List order is thread-grouped, not ascending: fine, since
+        # the count scan and the Phase-3 stream-write walk the SAME list by
+        # position (determinism contract).
+        ids_per_thread = cutlass.const_expr(self.SKIP_MAX_BLOCKS // self.num_threads)
+        num_threads = cutlass.const_expr(self.num_threads)
+        blk_lo = slice_start >> cutlass.Int32(self.SKIP_BLOCK_LOG2)
+        blk_hi = (slice_end + cutlass.Int32(self.SKIP_BLOCK - 1)) >> cutlass.Int32(
+            self.SKIP_BLOCK_LOG2
+        )
+        nb_slice = blk_hi - blk_lo
+        bm_addr = block_max_row.iterator.toint()
+
+        # Phase A (no sync): flag my ids into a register bitmask.
+        bmask = cutlass.Int32(0)
+        cnt = cutlass.Int32(0)
+        for m in cutlass.range_constexpr(ids_per_thread):
+            ib = tidx + cutlass.Int32(m * num_threads)
+            if ib < nb_slice:
+                bound = self._block_bound(bm_addr, blk_lo + ib)
+                if bound >= threshold:
+                    bmask = bmask | (cutlass.Int32(1) << cutlass.Int32(m))
+                    cnt = cnt + cutlass.Int32(1)
+
+        # Phase B: one block-wide exclusive scan over per-thread counts.
+        tp = cnt
+        for off_i in cutlass.range_constexpr(5):
+            off_v = cutlass.const_expr(1 << off_i)
+            other = cute.arch.shuffle_sync_up(tp, off_v, mask_and_clamp=0)
+            if lane >= cutlass.Int32(off_v):
+                tp = tp + other
+        excl = tp - cnt
+        warp_total = cute.arch.shuffle_sync(tp, cutlass.Int32(self.WARP_SIZE - 1))
+        if lane == 0:
+            smem_wcnt[warp_id] = warp_total
+        cute.arch.barrier()
+        if tidx == 0:
+            tot = cutlass.Int32(0)
+            for w in cutlass.range_constexpr(self.num_warps):
+                cw = smem_wcnt[w]
+                smem_wcnt[w] = tot
+                tot = tot + cw
+            s_active_cnt[0] = tot
+        cute.arch.barrier()
+
+        # Phase C: scatter from the bitmask at deterministic offsets.
+        pos_out = smem_wcnt[warp_id] + excl
+        if bmask != cutlass.Int32(0):
+            for m in cutlass.range_constexpr(ids_per_thread):
+                if (bmask & (cutlass.Int32(1) << cutlass.Int32(m))) != cutlass.Int32(0):
+                    ib_c = tidx + cutlass.Int32(m * num_threads)
+                    self._list_st(smem_active, pos_out, blk_lo + ib_c)
+                    pos_out = pos_out + cutlass.Int32(1)
+        cute.arch.barrier()
+
     @cute.jit
     def block_count_ge_multi(
         self,
@@ -1393,6 +1512,9 @@ class GvrTopKKernel:
         warp_id,
         lane,
         smem_ptcnt=None,  # vseed: last column's per-thread counts land here
+        block_max_row=None,  # block-skip: per-32-position upper bounds
+        smem_active=None,  # block-skip: int16 active list
+        s_active_cnt=None,  # block-skip: [0]=list length, [1]=list-current flag
     ):
         M = cutlass.const_expr(self.M_thr)
         num_threads = cutlass.const_expr(self.num_threads)
@@ -1416,7 +1538,97 @@ class GvrTopKKernel:
         i = slice_start + tidx * cutlass.Int32(vec_w)
         step = cutlass.Int32(step_elem)
 
-        if self.enable_unroll_4:
+        # ---- block-skip compact iteration (lossless vs the dense path) ----
+        # Build the active list at the LOOSEST threshold over all M columns:
+        # a skipped block bounds every element below min(t_m), so all M
+        # counts equal their dense values. Slice boundaries must be
+        # 32-aligned for the list's block<->position mapping to stay inside
+        # the slice (runtime-uniform guard; misaligned slices fall through
+        # to the dense path below via skip_ok == 0).
+        skip_ok = cutlass.Int32(0)
+        if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
+            if (slice_start & cutlass.Int32(self.SKIP_BLOCK - 1)) == cutlass.Int32(0):
+                skip_ok = cutlass.Int32(1)
+        if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
+            if skip_ok == cutlass.Int32(1):
+                tmin = thr_frag[0]
+                for m in cutlass.range_constexpr(M):
+                    tmin = _fmin_f32_inline(tmin, thr_frag[m])
+                # smem_wcnt_multi's first num_warps slots double as the
+                # build's warp-total scratch: the build's own barriers
+                # complete before any count lands there.
+                self._full_build_active(
+                    block_max_row,
+                    slice_start,
+                    slice_end,
+                    tmin,
+                    smem_wcnt_multi,
+                    smem_active,
+                    s_active_cnt,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
+                if tidx == 0:
+                    s_active_cnt[1] = cutlass.Int32(1)  # list-current flag
+                chunks_per_block = cutlass.const_expr(
+                    self.SKIP_BLOCK // (self.vec_bits // self.dtype.width)
+                )
+                tpb = cutlass.const_expr(chunks_per_block)
+                blocks_per_iter = cutlass.const_expr(self.num_threads // chunks_per_block)
+                UN = cutlass.const_expr(self.SKIP_UNROLL)
+                stride_un = cutlass.const_expr(blocks_per_iter * UN)
+                my_blk_slot = tidx // cutlass.Int32(tpb)
+                my_chunk0 = tidx % cutlass.Int32(tpb)
+                cnt_active = s_active_cnt[0]
+                frags = [cute.make_fragment((vec_w,), self.dtype) for _ in range(UN)]
+                li = my_blk_slot
+                while li < cnt_active:
+                    poss = []
+                    valids = []
+                    for u in cutlass.range_constexpr(UN):
+                        lu = li + cutlass.Int32(u * blocks_per_iter)
+                        valid = lu < cnt_active
+                        pos0 = cutlass.Int32(0)
+                        if valid:
+                            blk = self._list_ld(smem_active, lu)
+                            pos0 = blk * cutlass.Int32(self.SKIP_BLOCK) + my_chunk0 * cutlass.Int32(
+                                vec_w
+                            )
+                            src_ptr_u = cute.make_ptr(
+                                self.dtype,
+                                row_addr + cutlass.Int64(pos0) * cutlass.Int64(elem_bytes),
+                                cute.AddressSpace.gmem,
+                                assumed_align=vec_align,
+                            )
+                            cute.copy(
+                                copy_atom,
+                                cute.make_tensor(src_ptr_u, cute.make_layout((vec_w,))),
+                                frags[u],
+                            )
+                        poss.append(pos0)
+                        valids.append(valid)
+                    for u in cutlass.range_constexpr(UN):
+                        if valids[u]:
+                            pos = poss[u]
+                            if pos + cutlass.Int32(vec_w) <= slice_end:
+                                for j in cutlass.range_constexpr(vec_w):
+                                    if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                        vj = frags[u][j]
+                                    else:
+                                        vj = cutlass.Float32(frags[u][j])
+                                    for m in cutlass.range_constexpr(M):
+                                        cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vj >= thr_frag[m])
+                            else:
+                                jj = pos
+                                while jj < slice_end:
+                                    vs = self._load_fp32(input_row, jj)
+                                    for m in cutlass.range_constexpr(M):
+                                        cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vs >= thr_frag[m])
+                                    jj = jj + cutlass.Int32(1)
+                    li = li + cutlass.Int32(stride_un)
+
+        if self.enable_unroll_4 and skip_ok == cutlass.Int32(0):
             rng_frag = cute.make_fragment((vec_w,), self.dtype)
             big_iters = cutlass.Int32(0)
             if slice_end > i + cutlass.Int32(vec_w - 1):
@@ -1443,30 +1655,31 @@ class GvrTopKKernel:
             i = i + big_iters * cutlass.Int32(step_elem)
 
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
-        while i + cutlass.Int32(vec_w - 1) < slice_end:
-            src_ptr = cute.make_ptr(
-                self.dtype,
-                row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
-                cute.AddressSpace.gmem,
-                assumed_align=vec_align,
-            )
-            src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
-            cute.copy(copy_atom, src, tail_frag)
-            for j in cutlass.range_constexpr(vec_w):
-                if cutlass.const_expr(self.dtype == cutlass.Float32):
-                    vj = tail_frag[j]
-                else:
-                    vj = cutlass.Float32(tail_frag[j])
-                for m in cutlass.range_constexpr(M):
-                    cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vj >= thr_frag[m])
-            i = i + step
+        if skip_ok == cutlass.Int32(0):
+            while i + cutlass.Int32(vec_w - 1) < slice_end:
+                src_ptr = cute.make_ptr(
+                    self.dtype,
+                    row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=vec_align,
+                )
+                src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+                cute.copy(copy_atom, src, tail_frag)
+                for j in cutlass.range_constexpr(vec_w):
+                    if cutlass.const_expr(self.dtype == cutlass.Float32):
+                        vj = tail_frag[j]
+                    else:
+                        vj = cutlass.Float32(tail_frag[j])
+                    for m in cutlass.range_constexpr(M):
+                        cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vj >= thr_frag[m])
+                i = i + step
 
-        it = n_aligned + tidx
-        while it < slice_end:
-            v = self._load_fp32(input_row, it)
-            for m in cutlass.range_constexpr(M):
-                cnt_frag[m] = cnt_frag[m] + cutlass.Int32(v >= thr_frag[m])
-            it = it + cutlass.Int32(num_threads)
+            it = n_aligned + tidx
+            while it < slice_end:
+                v = self._load_fp32(input_row, it)
+                for m in cutlass.range_constexpr(M):
+                    cnt_frag[m] = cnt_frag[m] + cutlass.Int32(v >= thr_frag[m])
+                it = it + cutlass.Int32(num_threads)
 
         for m in cutlass.range_constexpr(M):
             if cutlass.const_expr(self.r0_vseed and m == self.M_qf):
@@ -1813,6 +2026,8 @@ class GvrTopKKernel:
         lane,
         do_cluster_sync,  # bool: False = cs=1 / short-row degrade (skip cluster sync)
         smem_input=None,  # optional SMEM-cached slice
+        smem_active=None,  # block-skip: int16 active list (reused, not rebuilt)
+        s_active_cnt=None,  # block-skip: [0]=list length, [1]=list-current flag
     ):
         """Retry-shrink (when P2 didn't converge) + prefix sum + stream-write.
 
@@ -1976,6 +2191,72 @@ class GvrTopKKernel:
             ic = slice_start + tidx * cutlass.Int32(vec_w)
         wc = my_write_pos
         step = cutlass.Int32(step_elem)
+
+        # ---- block-skip compact stream-write ----
+        # Reuses the active list left by the R0 compact count pass (same
+        # ownership walk: my_blk_slot's list slots in ascending order, so
+        # each thread produces its candidates in the SAME per-thread order
+        # the count pass counted them — the prefix-sum positions match).
+        # Only taken when the list is CURRENT (s_active_cnt[1] == 1, set by
+        # the build; cleared on any dense fallback re-count).
+        skip_wr = cutlass.Int32(0)
+        if cutlass.const_expr(self.enable_block_skip and smem_active is not None):
+            if s_active_cnt[1] == cutlass.Int32(1):
+                skip_wr = cutlass.Int32(1)
+        if cutlass.const_expr(self.enable_block_skip and smem_active is not None):
+            if skip_wr == cutlass.Int32(1):
+                chunks_per_block_w = cutlass.const_expr(
+                    self.SKIP_BLOCK // (self.vec_bits // self.dtype.width)
+                )
+                blocks_per_iter_w = cutlass.const_expr(self.num_threads // chunks_per_block_w)
+                my_blk_slot_w = tidx // cutlass.Int32(chunks_per_block_w)
+                my_chunk0_w = tidx % cutlass.Int32(chunks_per_block_w)
+                cnt_active_w = s_active_cnt[0]
+                wfrag = cute.make_fragment((vec_w,), self.dtype)
+                li_w = my_blk_slot_w
+                while li_w < cnt_active_w:
+                    blk_w = self._list_ld(smem_active, li_w)
+                    pos0_w = blk_w * cutlass.Int32(self.SKIP_BLOCK) + my_chunk0_w * cutlass.Int32(
+                        vec_w
+                    )
+                    src_ptr_w = cute.make_ptr(
+                        self.dtype,
+                        row_addr + cutlass.Int64(pos0_w) * cutlass.Int64(elem_bytes),
+                        cute.AddressSpace.gmem,
+                        assumed_align=vec_align,
+                    )
+                    cute.copy(
+                        copy_atom,
+                        cute.make_tensor(src_ptr_w, cute.make_layout((vec_w,))),
+                        wfrag,
+                    )
+                    if pos0_w + cutlass.Int32(vec_w) <= slice_end:
+                        for j in cutlass.range_constexpr(vec_w):
+                            if cutlass.const_expr(self.dtype == cutlass.Float32):
+                                vj = wfrag[j]
+                            else:
+                                vj = cutlass.Float32(wfrag[j])
+                            if vj >= thr_final and wc < cutlass.Int32(kCC):
+                                smem_keys[wc] = vj
+                                smem_vals[wc] = pos0_w + cutlass.Int32(j)
+                                wc = wc + cutlass.Int32(1)
+                    else:
+                        jj_w = pos0_w
+                        while jj_w < slice_end:
+                            v_w = self._load_fp32(input_row, jj_w)
+                            if v_w >= thr_final and wc < cutlass.Int32(kCC):
+                                smem_keys[wc] = v_w
+                                smem_vals[wc] = jj_w
+                                wc = wc + cutlass.Int32(1)
+                            jj_w = jj_w + cutlass.Int32(1)
+                    li_w = li_w + cutlass.Int32(blocks_per_iter_w)
+
+        # When the compact write ran, park the dense cursors at the end so
+        # all three dense loops below (4-way, vec tail, scalar tail) fall
+        # through without re-indenting them.
+        if skip_wr == cutlass.Int32(1):
+            ic = N_local
+            n_aligned = N_local
 
         # Phase3 unrolling: master gated by self.enable_phase3_unroll.
         # When OFF, only the tail 1-way loop runs (matches the pre-unroll
@@ -3717,6 +3998,7 @@ class GvrTopKKernel:
         output_values: cute.Tensor,  # [numRows, top_k] dtype
         output_indices: cute.Tensor,  # [numRows, top_k] int32
         order_row: cute.Tensor,  # [batch_size] int32 (or None when seqlen_sorted=False)
+        block_max: cute.Tensor,  # [numRows, nb_pad*4] fp32 (or None: no block-skip)
     ):
         """Thin entry: bidx → row_idx → run_one_row.
 
@@ -3768,6 +4050,7 @@ class GvrTopKKernel:
             seq_lens,
             output_values,
             output_indices,
+            block_max=block_max,
         )
 
     @cute.jit
@@ -3779,6 +4062,7 @@ class GvrTopKKernel:
         seq_lens: cute.Tensor,  # [numRows / next_n] int32
         output_values: cute.Tensor,  # [numRows, top_k] dtype, optional
         output_indices: cute.Tensor,  # [numRows, top_k] int32
+        block_max: cute.Tensor = None,  # [numRows, nb_pad*4] fp32
     ):
         """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
@@ -3835,6 +4119,10 @@ class GvrTopKKernel:
         # Slice per-row views.
         input_row = input_data[row_idx, None]
         pre_idx_row = pre_idx[pre_idx_row_idx, None]
+        if cutlass.const_expr(self.enable_block_skip and block_max is not None):
+            block_max_row = block_max[row_idx, None]
+        else:
+            block_max_row = None
         # When return_output_values=False, ``output_values`` is None at
         # launch and the gated writes below are compiled out; slicing into
         # None would crash so we keep the view None as well.
@@ -3874,6 +4162,22 @@ class GvrTopKKernel:
             layout=cute.make_ordered_layout((num_threads,), order=(0,)),
             byte_alignment=128,
         )
+        # block-skip: int16 active list (16KB at 8192 entries) + control
+        # ([0] list length, [1] list-current flag for the Phase-3 reuse).
+        if cutlass.const_expr(self.enable_block_skip):
+            smem_active = smem.allocate_tensor(
+                element_type=cutlass.Int16,
+                layout=cute.make_ordered_layout((self.SKIP_MAX_BLOCKS,), order=(0,)),
+                byte_alignment=128,
+            )
+            s_active_cnt = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((2,), order=(0,)),
+                byte_alignment=16,
+            )
+        else:
+            smem_active = None
+            s_active_cnt = None
         # warp_counts[NUM_WARPS] int32 (P3 prefix-sum scratch)
         # p2_warp_redundant parity-banks the Phase-2 staging (a warp one
         # round ahead writes the other half) — costs num_warps*4 bytes.
@@ -4114,6 +4418,9 @@ class GvrTopKKernel:
                         tidx,
                         warp_id,
                         lane,
+                        block_max_row=block_max_row,
+                        smem_active=smem_active,
+                        s_active_cnt=s_active_cnt,
                     )
                 else:
                     # Short row: only CTA 0 scans the full row; the other
@@ -4155,6 +4462,9 @@ class GvrTopKKernel:
                             tidx,
                             warp_id,
                             lane,
+                            block_max_row=block_max_row,
+                            smem_active=smem_active,
+                            s_active_cnt=s_active_cnt,
                         )
             else:
                 # cs=1: one CTA per row, no cluster sync.
@@ -4193,6 +4503,9 @@ class GvrTopKKernel:
                     tidx,
                     warp_id,
                     lane,
+                    block_max_row=block_max_row,
+                    smem_active=smem_active,
+                    s_active_cnt=s_active_cnt,
                 )
 
         griddepcontrol_launch_dependents()
@@ -4234,6 +4547,9 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        block_max_row=None,  # block-skip: this row's per-32-position bounds
+        smem_active=None,
+        s_active_cnt=None,
     ):
         """Run Phase 1-4 + final cluster barrier on a given row slice.
 
@@ -4247,6 +4563,13 @@ class GvrTopKKernel:
         num_threads = cutlass.const_expr(self.num_threads)
         cluster_size = cutlass.const_expr(self.cluster_size)
         is_leader = cta_in_cluster == cutlass.Int32(0)
+
+        # block-skip: the list-current flag starts INVALID every row; only
+        # the R0 compact pass's build sets it. Ordered ahead of all readers
+        # by Phase 1's internal barriers.
+        if cutlass.const_expr(self.enable_block_skip):
+            if tidx == cutlass.Int32(0):
+                s_active_cnt[1] = cutlass.Int32(0)
 
         # ---- Phase 1: preIdx Min/Max/Mean ----
         self.phase1_preidx_stats(
@@ -4357,6 +4680,9 @@ class GvrTopKKernel:
                     warp_id,
                     lane,
                     smem_ptcnt=smem_ptcnt,
+                    block_max_row=block_max_row,
+                    smem_active=smem_active,
+                    s_active_cnt=s_active_cnt,
                 )
                 cute.arch.barrier()
                 if tidx == 0:
@@ -4409,6 +4735,9 @@ class GvrTopKKernel:
                 # count passes (op#26 efficiency) instead of ~6. done=1 on
                 # accept so Phase 3 skips its retry-shrink.
                 if bc < cutlass.Int32(0):
+                    if cutlass.const_expr(self.enable_block_skip):
+                        if tidx == cutlass.Int32(0):
+                            s_active_cnt[1] = cutlass.Int32(0)
                     if cutlass.const_expr(self.fb_fix):
                         if tidx == cutlass.Int32(0):
                             M = cutlass.const_expr(self.M_thr)
@@ -4604,6 +4933,8 @@ class GvrTopKKernel:
                 lane,
                 do_cluster_sync=do_cluster_sync,
                 smem_input=smem_input,
+                smem_active=smem_active,
+                s_active_cnt=s_active_cnt,
             )
 
             # Cluster handoff #2: leader's DSMEM gather of peer
@@ -4752,6 +5083,7 @@ class GvrTopKKernel:
         output_values: cute.Tensor,  # or None.
         output_indices: cute.Tensor,
         order_row: cute.Tensor,  # or None when seqlen_sorted=False
+        block_max: cute.Tensor,  # or None: block-skip disabled
         stream,
     ):
         num_rows = input_data.shape[0]
@@ -4774,6 +5106,7 @@ class GvrTopKKernel:
             output_values,
             output_indices,
             order_row,
+            block_max,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),
