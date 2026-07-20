@@ -66,7 +66,8 @@ from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import HangDetector, propagate_hard_kill
+from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
+                            propagate_hard_kill)
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
@@ -1179,6 +1180,7 @@ class PyExecutor:
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
     def _event_loop_wrapper(self):
+        crashed = False
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -1188,6 +1190,7 @@ class PyExecutor:
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
+            crashed = True
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -1201,6 +1204,14 @@ class PyExecutor:
             raise e
         finally:
             self._executor_loop_cleanup()
+            if crashed:
+                # Peers cannot make progress without this rank's loop: they
+                # would block in their next collective until their own
+                # HangDetectors fire 300s later. Kill the world now instead;
+                # the grace inside lets the stashed error reach rank-local
+                # waiters and the ready handshake first, so the client sees
+                # the original exception rather than a bare worker death.
+                hard_kill_on_rank_crash(self.dist.world_size)
 
     @property
     def is_warmup(self) -> bool:
