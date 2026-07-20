@@ -71,6 +71,8 @@ from ..utils import (
     get_model_extra_attrs,
     is_torch_compiling,
 )
+from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_auto_model
 
@@ -1917,20 +1919,6 @@ class MiniMaxM3Model(DecoderModel):
         return hidden_states
 
 
-# HF MiniMax-M3 stores the routed score-correction bias one level above
-# the router weight (``block_sparse_moe.e_score_correction_bias``,
-# sibling of ``block_sparse_moe.gate.weight``). The TRT-LLM module tree
-# binds it to :class:`MiniMaxM3Gate`, so the generic loader expects to
-# see it at ``block_sparse_moe.gate.e_score_correction_bias``. The
-# regex below moves the key into the gate's prefix before the loader
-# dispatches; this lets ``mark_consumed("...gate")`` cleanly remove
-# both the weight and the bias together without disturbing the sibling
-# ``block_sparse_moe.experts.*`` backend subtree.
-_M3_GATE_BIAS_RENAME_MAP = {
-    r"^(.*\.block_sparse_moe)\.e_score_correction_bias$": (r"\1.gate.e_score_correction_bias"),
-}
-
-
 def _load_index_qk_proj_weights(model: nn.Module, weights) -> None:
     """Fuse checkpoint index_q_proj and index_k_proj into index_qk_proj.
 
@@ -2006,7 +1994,13 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             model_config = get_text_model_config(model_config)
         super().__init__(MiniMaxM3Model(model_config), model_config)
 
-    def load_weights(self, weights, *args, **kwargs):
+    def load_weights(
+        self,
+        weights: Dict,
+        weight_mapper: Optional[BaseWeightMapper] = None,
+        params_map: Optional[Dict[str, str]] = None,
+        allow_partial_loading: bool = False,
+    ) -> None:
         # Fuse index_q/index_k into each index_qk_proj module (also covers
         # the VL path, which routes text weights through here).
         _load_index_qk_proj_weights(self, weights)
@@ -2016,12 +2010,16 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         # stores Gemma norms; otherwise the boundary norms are already plain.
         if bool(getattr(self.config, "use_gemma_norm", False)):
             weights = _fold_gemma_boundary_norm_weights(weights)
-        # Merge the M3-specific gate-bias rename into any caller-
-        # supplied ``params_map`` so the VL wrapper and any downstream
-        # tooling that already passes one keep working.
-        params_map = kwargs.pop("params_map", None) or {}
-        merged = {**_M3_GATE_BIAS_RENAME_MAP, **params_map}
-        return super().load_weights(weights, *args, params_map=merged, **kwargs)
+        if weight_mapper is None:
+            weight_mapper = MiniMaxM3HfWeightMapper()
+        weight_mapper.init_model_and_config(self, self.model_config)
+        merged_params_map = {**MINIMAX_M3_PARAMS_MAP, **(params_map or {})}
+        super().load_weights(
+            weights=weights,
+            weight_mapper=weight_mapper,
+            params_map=merged_params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
 
     def setup_aliases(self) -> None:
         """Chain each decoder layer's next_layer_layernorm for POST fusion.
@@ -2173,7 +2171,13 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         self.last_loaded_vision_keys = []
         self.last_missing_vision_keys = []
 
-    def load_weights(self, weights, *args, **kwargs):
+    def load_weights(
+        self,
+        weights: Dict,
+        weight_mapper: Optional[BaseWeightMapper] = None,
+        params_map: Optional[Dict[str, str]] = None,
+        allow_partial_loading: bool = False,
+    ) -> None:
         text_cfg = self.config
         if is_minimax_m3_vl_config(text_cfg):
             text_cfg = get_text_config(text_cfg)
@@ -2196,7 +2200,12 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             self.last_loaded_vision_keys = loaded
             self.last_missing_vision_keys = missing
 
-        return super().load_weights(text_weights, *args, **kwargs)
+        super().load_weights(
+            weights=text_weights,
+            weight_mapper=weight_mapper,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
 
     def forward(
         self,
