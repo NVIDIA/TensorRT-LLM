@@ -86,7 +86,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
-                # On/off switch via config (size 0 => None => per-block path).
+                # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
             )
         )
@@ -182,12 +182,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         token_range = None
         if req.prompt_len > 0:
-            # Align with KV cache allocation (prepare_disagg_gen_init /
-            # _get_context_bytes), which reserves prompt_len +
-            # num_extra_kv_tokens slots for speculative decoding methods
-            # (e.g. EAGLE3) that consume extra KV positions per request.
-            num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
-            token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
+            # end must match the trimmed block list below (ceil(prompt_len / tpb)
+            # blocks). num_extra_kv_tokens slots (speculative decoding) are not
+            # transferred. In the previously added support for ctx disabling
+            # speculative decoding while gen enables it, both sides currently
+            # use prompt_len as the transfer range, so the ranges stay
+            # consistent.
+            # TODO: the accuracy impact of not transferring num_extra_kv_tokens
+            # on MTP and other speculative decoding paths is currently unclear;
+            # revisit whether these extra KV slots need to be transferred.
+            token_range = TokenRange(start=0, end=req.prompt_len)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
@@ -196,8 +200,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
-            # Extra blocks from num_extra_kv_tokens (speculative decoding) have
-            # uninitialized KV data and must not be transferred.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
             if block_ids.size > total_blocks:
                 block_ids = block_ids[:total_blocks]
@@ -343,14 +345,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return _find_consensus_request_ids(all_ranks, sync_size)
 
     @staticmethod
-    def _allgather_or_passthrough(
-        local_ids, allgather: Callable, need_sync: bool
-    ) -> List[List[int]]:
-        if not need_sync:
-            return [list(local_ids)]
-        return list(allgather(list(local_ids)))
-
-    @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
         merged: set = set()
         for ids in all_lists:
@@ -371,9 +365,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        all_c = self._allgather_or_passthrough(cancelled, allgather, need_sync)
-        all_f = self._allgather_or_passthrough(failed, allgather, need_sync)
-        all_done = self._allgather_or_passthrough(completed, allgather, need_sync)
+        # Batch the three id lists into one allgather to cut the per-step collective count.
+        if not need_sync:
+            all_c, all_f, all_done = [list(cancelled)], [list(failed)], [list(completed)]
+        else:
+            packed = list(allgather([list(cancelled), list(failed), list(completed)]))
+            all_c = [p[0] for p in packed]
+            all_f = [p[1] for p in packed]
+            all_done = [p[2] for p in packed]
         n = len(all_c)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
@@ -544,9 +543,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
-        if not self._ever_had_send_session and not (
-            self._ctx_need_tp_sync or self._ctx_need_pp_sync
-        ):
+        # A worker that never sends KV has nothing to reconcile here, so skip the consensus. Safe
+        # because the flag flips together on every rank and never resets, so they all skip in step;
+        # gating on the live session dict instead would not be, since a cancel clears it per-rank.
+        # Keep the original sweep (only when tp/pp sync is on) so nothing is leaked.
+        if not self._ever_had_send_session:
+            if self._ctx_need_tp_sync or self._ctx_need_pp_sync:
+                self._transfer_worker.sweep_stale_req_infos()
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -781,6 +784,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if rid not in self._send_sessions:
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+
+        # Nothing waiting on any rank, so skip the consensus. The waiting set is the same on every
+        # rank, so they all skip together.
+        if not self._wait_reqs:
+            return
 
         # Check which waiting requests have peer info locally, then allgather
         # consensus so all TP/PP ranks agree before promoting.
