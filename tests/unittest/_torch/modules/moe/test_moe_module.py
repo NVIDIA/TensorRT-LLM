@@ -78,6 +78,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -411,15 +412,18 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype, model_
             is_fused=False,  # Use PyTorch implementation for testing
         )
 
-    # MiniMaxM2 routing method requires special parameters
-    if routing_method_cls == MiniMaxM2MoeRoutingMethod:
+    # MiniMax routing methods require the correction bias and expert count.
+    if routing_method_cls in (MiniMaxM2MoeRoutingMethod, MiniMaxM3MoeRoutingMethod):
         # Create e_score_correction_bias as a zero tensor (no bias correction in test)
         e_score_correction_bias = torch.zeros(num_experts, dtype=dtype, device="cuda")
-        return routing_method_cls(
+        kwargs = dict(
             top_k=top_k,
             num_experts=num_experts,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
         )
+        if routing_method_cls == MiniMaxM3MoeRoutingMethod:
+            kwargs["routed_scaling_factor"] = 2.0
+        return routing_method_cls(**kwargs)
 
     # SigmoidRenorm routing method requires num_experts
     if routing_method_cls == SigmoidRenormMoeRoutingMethod:
@@ -1660,6 +1664,40 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
         enable_autotune=True,
         routing_method_cls=routing_method_cls,
         dtype_routing_logits=dtype_routing_logits,
+        bias_dtype=torch.float32,
+    )
+
+
+def test_trtllm_gen_minimax_m3_integrated_routing_scale():
+    """TRTLLM-Gen integrated routing must preserve M3's routed scale."""
+    if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
+        pytest.skip("TRTLLM-Gen NVFP4 integrated routing requires Blackwell")
+
+    model_config = MoeModelConfig(128, 4, 512, 512)
+    skip_reason = should_skip_trtllm(
+        MoeBackendType.TRTLLM,
+        QuantAlgo.NVFP4,
+        model_config,
+        routing_method_cls=MiniMaxM3MoeRoutingMethod,
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    # A single-rank, non-attention-DP mapping makes ConfigurableMoE pass
+    # router_logits into TRTLLM-Gen, exercising the integrated MiniMax2/M3
+    # routing kernel rather than the scheduler's separated routing path.
+    _test_moe_worker(
+        moe_backend=MoeBackendType.TRTLLM.value,
+        dtype=torch.bfloat16,
+        quant_algo=QuantAlgo.NVFP4,
+        model_config=model_config,
+        seq_len=8,
+        enable_autotune=True,
+        routing_method_cls=MiniMaxM3MoeRoutingMethod,
+        dtype_routing_logits=torch.float32,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        swiglu_limit=7.0,
         bias_dtype=torch.float32,
     )
 
