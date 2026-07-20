@@ -228,6 +228,66 @@ _SHARED_EXPERT_RENAME = {
 }
 
 
+def _get_deepseek_v4_routed_moe_scale_name(weights: Dict, key_prefix: str) -> str:
+    """Return the model scale suffix for routed-expert checkpoint tensors."""
+    for key, value in weights.items():
+        if (
+            key.startswith(key_prefix)
+            and ".ffn.experts." in key
+            and key.endswith(".weight")
+            and getattr(value, "ndim", 0) == 2
+            and getattr(value, "dtype", None) in (torch.int8, torch.uint8)
+        ):
+            return "weight_scale"
+    return "weight_scale_inv"
+
+
+def _rename_deepseek_v4_attn_subkey(rest: str) -> str:
+    """Rename a DeepSeek-V4 attention checkpoint subkey."""
+    if rest == "attn_sink":
+        return "attn_sink"
+    if rest == "wo_a.weight":
+        return "o_a_proj"
+    if rest == "wo_a.scale":
+        return "o_a_proj.weight_scale_inv"
+    if rest.startswith("compressor.") or rest.startswith("indexer."):
+        return rest.replace(".scale", ".weight_scale_inv")
+    head, sep, tail = rest.partition(".")
+    new_head = _ATTN_PARAM_RENAME.get(head, head)
+    if tail == "scale":
+        tail = "weight_scale_inv"
+    return f"{new_head}.{tail}" if sep else new_head
+
+
+def _rename_deepseek_v4_ffn_subkey(rest: str, routed_moe_scale_name: str) -> str:
+    """Rename a DeepSeek-V4 FFN checkpoint subkey."""
+    if rest == "gate.bias":
+        return "gate.e_score_correction_bias"
+    if rest.startswith("experts.") and rest.endswith(".scale"):
+        return f"{rest[: -len('.scale')]}.{routed_moe_scale_name}"
+    rest = rest.replace(".scale", ".weight_scale_inv")
+    if rest.startswith("shared_experts."):
+        parts = rest.split(".")
+        if len(parts) >= 2 and parts[1] in _SHARED_EXPERT_RENAME:
+            parts[1] = _SHARED_EXPERT_RENAME[parts[1]]
+        rest = ".".join(parts)
+    return rest
+
+
+def _maybe_view_deepseek_v4_routed_moe_tensor(
+    model_key: str, tensor: torch.Tensor, routed_moe_scale_name: str
+) -> torch.Tensor:
+    """Expose packed MXFP4 routed-expert tensors through their uint8 view."""
+    if (
+        routed_moe_scale_name == "weight_scale"
+        and ".mlp.experts." in model_key
+        and (model_key.endswith(".weight") or model_key.endswith(".weight_scale"))
+        and tensor.dtype != torch.uint8
+    ):
+        return tensor.view(torch.uint8)
+    return tensor
+
+
 def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
     """Resolve the DeepSeek-V4 fused HC boundary-fusion knob."""
     env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
@@ -315,66 +375,7 @@ def _remap_deepseek_v4_checkpoint_keys(
         carries it but matches the main head, so we let the main head win.
     """
     mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
-    routed_moe_scale_name = "weight_scale_inv"
-    for key, value in weights.items():
-        if (
-            key.startswith("layers.")
-            and ".ffn.experts." in key
-            and key.endswith(".weight")
-            and getattr(value, "ndim", 0) == 2
-            and value.dtype in (torch.int8, torch.uint8)
-        ):
-            routed_moe_scale_name = "weight_scale"
-            break
-
-    def _rename_attn_subkey(rest: str) -> Optional[str]:
-        # rest examples: "wq_a.weight", "wq_a.scale", "wo_a.weight",
-        # "attn_sink", "compressor.wkv.weight", "indexer.wq_b.scale",
-        # "kv_norm.weight"
-        # ``attn_sink`` is loaded by the ``mqa`` branch in the per-module
-        # loader, which reads it under the parent ``self_attn.attn_sink``
-        # key. Pass through unchanged.
-        if rest == "attn_sink":
-            return "attn_sink"
-        # `wo_a` is an nn.Parameter on the model side (not a Linear), so
-        # `wo_a.weight` carries the value directly into `o_a_proj` without
-        # a trailing ``.weight``. Retain `.scale` so the loader can dequantize
-        # FP8 block-scaled checkpoints before assigning the bf16 parameter.
-        if rest == "wo_a.weight":
-            return "o_a_proj"
-        if rest == "wo_a.scale":
-            return "o_a_proj.weight_scale_inv"
-        # Compressor / indexer paths — pass through with .scale rename, plus
-        # wkv+wgate fusion handled separately below.
-        if rest.startswith("compressor.") or rest.startswith("indexer."):
-            return rest.replace(".scale", ".weight_scale_inv")
-        head, sep, tail = rest.partition(".")
-        new_head = _ATTN_PARAM_RENAME.get(head, head)
-        if tail == "scale":
-            tail = "weight_scale_inv"
-        return f"{new_head}.{tail}" if sep else new_head
-
-    def _rename_ffn_subkey(rest: str) -> str:
-        # Examples:
-        #   gate.weight / gate.tid2eid → gate.weight / gate.tid2eid
-        #   gate.bias → gate.e_score_correction_bias
-        #   experts.<i>.<w1|w2|w3>.<weight|scale> → experts.<i>.<w1|w2|w3>.<weight|weight_scale*>
-        #   shared_experts.<w1|w3|w2>.<weight|scale> → shared_experts.<gate|up|down>_proj.<weight|weight_scale_inv>
-        if rest == "gate.bias":
-            return "gate.e_score_correction_bias"
-        if rest.startswith("experts.") and rest.endswith(".scale"):
-            return f"{rest[: -len('.scale')]}.{routed_moe_scale_name}"
-        rest = rest.replace(".scale", ".weight_scale_inv")
-        # Non-hashed layers carry the routing logit bias as `gate.bias`; the
-        # model wires it through `DeepseekV4Gate.e_score_correction_bias`.
-        if rest == "gate.bias":
-            return "gate.e_score_correction_bias"
-        if rest.startswith("shared_experts."):
-            parts = rest.split(".")
-            if len(parts) >= 2 and parts[1] in _SHARED_EXPERT_RENAME:
-                parts[1] = _SHARED_EXPERT_RENAME[parts[1]]
-            rest = ".".join(parts)
-        return rest
+    routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, "layers.")
 
     def _rename_layer_subkey(rest: str) -> Optional[str]:
         # rest examples: "attn_norm.weight", "ffn_norm.weight",
@@ -390,10 +391,10 @@ def _remap_deepseek_v4_checkpoint_keys(
         if rest.startswith("hc_attn_") or rest.startswith("hc_ffn_"):
             return rest
         if rest.startswith("attn."):
-            new_sub = _rename_attn_subkey(rest[len("attn.") :])
-            return None if new_sub is None else f"self_attn.{new_sub}"
+            return f"self_attn.{_rename_deepseek_v4_attn_subkey(rest[len('attn.') :])}"
         if rest.startswith("ffn."):
-            return f"mlp.{_rename_ffn_subkey(rest[len('ffn.') :])}"
+            new_sub = _rename_deepseek_v4_ffn_subkey(rest[len("ffn.") :], routed_moe_scale_name)
+            return f"mlp.{new_sub}"
         return rest
 
     out: Dict[str, torch.Tensor] = {}
@@ -417,13 +418,7 @@ def _remap_deepseek_v4_checkpoint_keys(
             part = "wkv" if model_key.endswith(".wkv.weight") else "wgate"
             _record_compressor_part(model_key, part, tensor)
             return
-        if (
-            routed_moe_scale_name == "weight_scale"
-            and ".mlp.experts." in model_key
-            and (model_key.endswith(".weight") or model_key.endswith(".weight_scale"))
-            and tensor.dtype != torch.uint8
-        ):
-            tensor = tensor.view(torch.uint8)
+        tensor = _maybe_view_deepseek_v4_routed_moe_tensor(model_key, tensor, routed_moe_scale_name)
         out[model_key] = tensor
 
     for k, v in weights.items():
@@ -1703,7 +1698,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-        is_separate_draft_engine: bool = False,
+        attention_layer_idx: Optional[int] = None,
         mapping_with_cp: Optional[Mapping] = None,
         disable_post_moe_fusion: bool = False,
     ):
@@ -1732,14 +1727,12 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             post_mult_value=2.0,
         )
 
-        layer_idx_for_attention = layer_idx
-        if is_separate_draft_engine:
-            # KVCacheManager only support 1 layer for separate draft engine
-            layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
+        if attention_layer_idx is None:
+            attention_layer_idx = layer_idx
 
         self.self_attn = DeepseekV4Attention(
             model_config,
-            layer_idx=layer_idx_for_attention,
+            layer_idx=attention_layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention],
             reduce_output=not self.enable_attention_dp and self.mapping.tp_size > 1,
         )
@@ -1960,8 +1953,18 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # No engram concern here because engram only fires at layer entry.
         # When enable_fused_hc=False, fall back to the unfused chain.
         # -------------------------------------------------------------------
-        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+        capture_this_layer = spec_metadata is not None and spec_metadata.is_layer_capture(
+            self.layer_idx
+        )
+        is_dspark_capture = capture_this_layer and spec_metadata.spec_dec_mode.is_dspark()
+        if capture_this_layer:
             self.fusion_config.POST_MOE_FUSION = False
+        if is_dspark_capture:
+            # DSpark captures the FULL post-mapped mHC residual stream (reference
+            # `h.mean(dim=2)`), which is only materialized after
+            # hc_ffn.post_mapping -- so post_mapping must resolve in-layer rather
+            # than being deferred into the next layer's fused_hc.
+            self.defer_post_mapping = False
         if self.enable_fused_hc:
             residual, post_mix, comb_mix, layer_input = self.hc_ffn.fused_hc(
                 x_prev=x_attn,
@@ -2003,6 +2006,17 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             post_layer_mix=post_mix,
             comb_res_mix=comb_mix,
         )
+        if is_dspark_capture:
+            # Capture the full mHC residual stream [N, hc_mult*hidden]; the DSpark
+            # metadata means over the hc streams (reference `h.mean(dim=2)`) to
+            # form the draft's captured context (``main_x``). This is the correct
+            # representation -- NOT the pre-post_mapping MoE delta that the generic
+            # capture in forward_MoE records for other spec modes.
+            spec_metadata.maybe_capture_hidden_states(
+                self.layer_idx,
+                resolved_residual.reshape(resolved_residual.shape[0], -1),
+                None,
+            )
         return HCState.resolved(resolved_residual)
 
     def _entry_boundary(self, hc_state, engram_embeddings, has_engram):
@@ -2131,7 +2145,14 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                     fc2_output, all_reduce_params=moe_all_reduce_params
                 )
         else:
-            if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            # DSpark captures the post-mapped mHC residual stream after this layer
+            # (done in the decoder-layer forward), not the pre-post_mapping MoE
+            # output recorded here for other spec modes.
+            if (
+                spec_metadata is not None
+                and spec_metadata.is_layer_capture(self.layer_idx)
+                and not spec_metadata.spec_dec_mode.is_dspark()
+            ):
                 spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
 
         return hidden_states
@@ -2143,13 +2164,13 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-        is_separate_draft_engine: bool = False,
+        attention_layer_idx: Optional[int] = None,
     ):
         super().__init__(
             model_config,
             layer_idx,
             aux_stream_dict,
-            is_separate_draft_engine,
+            attention_layer_idx=attention_layer_idx,
             disable_post_moe_fusion=True,
         )
         config = model_config.pretrained_config

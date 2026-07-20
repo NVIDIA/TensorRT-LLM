@@ -1,4 +1,7 @@
 -r requirements.txt
+# VisualGen LPIPS goldens were recorded with this version. Install it before
+# pytest collection so already-imported Diffusers modules match the package files.
+diffusers==0.38.0
 boto3
 einops
 lpips

@@ -33,8 +33,8 @@ from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from .trt_test_alternative import (check_call, check_output, exists, is_windows,
-                                   print_info, print_warning)
+from .trt_test_alternative import (check_call, check_output, exists, print_info,
+                                   print_warning)
 
 
 def venv_check_call(venv, cmd, env=None, **kwargs):
@@ -573,26 +573,6 @@ def generate_summary_cmd(example_root, *args, **kwargs):
     return summary_cmd
 
 
-def generate_deterministic_cmd(example_root, *args, **kwargs):
-    "generate deterministic command"
-    deterministic_cmd = [
-        f"{example_root}/mixtral_deterministic.py",
-        "--check_deterministic_accuracy"
-    ]
-
-    for key, value in kwargs.items():
-        if isinstance(value, bool):
-            if value:
-                deterministic_cmd.extend(f"--{key}")
-        else:
-            deterministic_cmd.extend([f"--{key}", f"{value}"])
-
-    for arg in args:
-        deterministic_cmd.append(f"--{arg}")
-
-    return deterministic_cmd
-
-
 def quantize_data(llm_venv,
                   example_root,
                   model_dir,
@@ -727,24 +707,6 @@ def run_and_check(llm_venv, run_cmd, valid_outputs, streaming=False):
         assert any([
             similar(output, expect, threshold=0.95) for expect in valid_outputs
         ]), f"output is: {output}"
-
-
-def get_cpp_benchmark(cpp_benchmark_name, llm_root):
-    suffix = ".exe" if is_windows() else ""
-    cpp_benchmark_name += suffix
-    # In CI/CD, we copy the cpp binary into the same folder as cpp to avoid package sanity
-    ci_path = os.path.join(os.path.dirname(os.path.realpath(llm_root)),
-                           "benchmarks", "cpp", cpp_benchmark_name)
-    if os.path.exists(ci_path):
-        return ci_path
-    # In QA, we keep the benchmark build at its original location
-    qa_path = os.path.join(llm_root, "cpp", "build", "benchmarks",
-                           cpp_benchmark_name)
-    if os.path.exists(qa_path):
-        return qa_path
-    raise Exception(
-        f"Cannot find cpp benchmark binary in either {ci_path} or {qa_path}. Did you forget --benchmark in building TRT-LLM?"
-    )
 
 
 def generate_dummy_loras(

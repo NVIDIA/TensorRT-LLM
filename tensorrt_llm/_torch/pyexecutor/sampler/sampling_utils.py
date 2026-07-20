@@ -31,47 +31,49 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
 # These op wrappers are safe to import without flashinfer installed; they are
 # only called on the flashinfer sampler / speculative-worker paths.
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    sampling_from_probs_op as sampling_from_probs_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import softmax_op as softmax_op
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_mask_logits_op as top_k_mask_logits_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_sampling_from_probs_op as top_k_sampling_from_probs_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_top_p_sampling_from_logits_op as top_k_top_p_sampling_from_logits_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_p_renorm_probs_op as top_p_renorm_probs_op,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_p_sampling_from_probs_op as top_p_sampling_from_probs_op,
+    sampling_from_probs_op,
+    softmax_op,
+    top_k_mask_logits_op,
+    top_k_sampling_from_probs_op,
+    top_k_top_p_sampling_from_logits_op,
+    top_p_renorm_probs_op,
+    top_p_sampling_from_probs_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    GREEDY_TEMPERATURE_THRESHOLD as GREEDY_TEMPERATURE_THRESHOLD,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    BeamSearchMetadata as BeamSearchMetadata,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions as Fusions
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import StrategyMetadata as StrategyMetadata
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    beam_search_sampling_batch as beam_search_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    get_rejected_indices as get_rejected_indices,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    greedy_search_sampling_batch as greedy_search_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import sample_rejected as sample_rejected
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    top_k_top_p_sampling_batch as top_k_top_p_sampling_batch,
+    GREEDY_TEMPERATURE_THRESHOLD,
+    BeamSearchMetadata,
+    Fusions,
+    StrategyMetadata,
+    beam_search_sampling_batch,
+    get_rejected_indices,
+    greedy_search_sampling_batch,
+    sample_rejected,
+    top_k_top_p_sampling_batch,
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
+
+# Ops imported above are re-exported for dependent modules (sampler, drafting
+# loops, tests). mypy runs in strict mode (no implicit re-export), so they must
+# be listed here.
+__all__ = [
+    "GREEDY_TEMPERATURE_THRESHOLD",
+    "BeamSearchMetadata",
+    "Fusions",
+    "StrategyMetadata",
+    "beam_search_sampling_batch",
+    "get_rejected_indices",
+    "greedy_search_sampling_batch",
+    "sample_rejected",
+    "sampling_from_probs_op",
+    "softmax_op",
+    "top_k_mask_logits_op",
+    "top_k_sampling_from_probs_op",
+    "top_k_top_p_sampling_batch",
+    "top_k_top_p_sampling_from_logits_op",
+    "top_p_renorm_probs_op",
+    "top_p_sampling_from_probs_op",
+]
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -824,9 +826,6 @@ class FlashInferGroupedStrategySampler:
         return next_tokens, softmax, strategy_impl.get_temperature()
 
 
-# Re-export the torch greedy op (used by drafting_loops and speculative/interface).
-greedy = greedy_search_sampling_batch
-
 # ---------------------------------------------------------------------------
 # Spec-decoding interface: compute_probs_from_logits (per-request tensor params)
 # ---------------------------------------------------------------------------
@@ -842,7 +841,7 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
     ``vocab_size`` (== keep all tokens), leaving genuine top_k values
     untouched.
     """
-    return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
+    return top_k.clamp(max=vocab_size).masked_fill_(top_k <= 0, vocab_size)
 
 
 @torch.compile(options={"max-autotune": True})

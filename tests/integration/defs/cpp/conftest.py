@@ -3,7 +3,6 @@ import os as _os
 import pathlib as _pl
 import shutil
 import sys as _sys
-import time
 
 import defs.cpp.cpp_common as _cpp
 import pytest
@@ -173,52 +172,6 @@ def build_google_tests(request, build_type):
         skip_building_wheel=True,
         extra_make_targets=["google-tests"],
     )
-
-
-@pytest.fixture(scope="session")
-def build_benchmarks(build_google_tests, build_dir, build_type):
-
-    make_benchmarks = [
-        "cmake",
-        "--build",
-        ".",
-        "--config",
-        build_type,
-        "-j",
-        "--target",
-        "benchmarks",
-    ]
-
-    _cpp.run_command(make_benchmarks, cwd=build_dir, timeout=300)
-
-
-@pytest.fixture(scope="session")
-def prepare_model(
-    root_dir,
-    cpp_resources_dir,
-    python_exe,
-    model_cache_arg,
-    install_additional_requirements,
-):
-
-    def _prepare(model_name: str, run_fp8=False):
-        install_additional_requirements(model_name)
-
-        start_time = time.time()
-
-        _cpp.prepare_model_tests(
-            model_name=model_name,
-            python_exe=python_exe,
-            root_dir=root_dir,
-            resources_dir=cpp_resources_dir,
-            model_cache_arg=model_cache_arg,
-        )
-
-        duration = time.time() - start_time
-        print(f"Built model: {model_name}")
-        print(f"Duration: {duration} seconds")
-
-    return _prepare
 
 
 @pytest.fixture(scope="function", autouse=True)

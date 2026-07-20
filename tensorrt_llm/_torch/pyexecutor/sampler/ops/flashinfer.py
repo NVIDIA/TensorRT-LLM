@@ -15,7 +15,12 @@
 """FlashInfer-accelerated sampling kernels.
 
 These ops depend on flashinfer; the import is guarded so the module stays
-importable without it.
+importable without it (sampling_utils imports it unconditionally, and the
+vanilla/TRTLLM sampler paths must keep working without flashinfer). Without
+flashinfer, calling any op raises an ImportError with installation guidance.
+Components that will invoke these ops are expected to fail fast at startup
+instead of relying on that call-time error: TorchSampler enforces flashinfer
+availability in its constructor.
 
 Randomness can be supplied either way (flashinfer accepts both in one
 signature; explicit ``seed``/``offset`` take precedence over ``generator``):
@@ -27,7 +32,7 @@ signature; explicit ``seed``/``offset`` take precedence over ``generator``):
   random values).
 """
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -35,6 +40,19 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_en
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.sampling
+else:
+
+    class _FlashInferUnavailable:
+        """Placeholder that raises on first use instead of a bare NameError."""
+
+        def __getattr__(self, name: str) -> Any:
+            raise ImportError(
+                "flashinfer is required for the FlashInfer sampling ops but is "
+                "not installed; please install the version pinned in "
+                "requirements.txt."
+            )
+
+    flashinfer = _FlashInferUnavailable()  # type: ignore[assignment]
 
 SeedOrTensor = Union[int, torch.Tensor]
 

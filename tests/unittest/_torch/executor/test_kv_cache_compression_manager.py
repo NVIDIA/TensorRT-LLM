@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
@@ -264,21 +265,33 @@ class TestResourceManagerAPI:
 
 
 class TestFactory:
-    def test_raises_when_no_algorithm_registered(self, fake_kv_cache_manager):
-        # A config whose algorithm has no registered manager is a developer
-        # error (config subclass added without a factory branch): fail loudly
-        # instead of silently running without compression. The draft-manager
-        # kwarg does not change the dispatch, so both forms raise identically.
+    def test_returns_none_when_no_algorithm_registered(self, fake_kv_cache_manager):
+        # Framework-only: no concrete algorithm ships, so any config -> None.
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        with pytest.raises(ValueError, match="no registered compression manager"):
+        assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
+
+    def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
+        cfg = MagicMock()
+        cfg.algorithm = "made_up_method"
+        with patch.object(util_mod, "logger") as mock_logger:
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
-        with pytest.raises(ValueError, match="no registered compression manager"):
+            mock_logger.warning.assert_called_once()
+
+    def test_factory_accepts_independent_draft_manager(self):
+        cfg = MagicMock()
+        cfg.algorithm = "made_up_method"
+        target = _v2_manager(is_draft=False)
+        draft = _v2_manager(is_draft=True)
+
+        assert (
             create_kv_cache_compression_manager(
                 cfg,
-                fake_kv_cache_manager,
-                draft_kv_cache_manager=_v2_manager(is_draft=True),
+                target,
+                draft_kv_cache_manager=draft,
             )
+            is None
+        )
 
     def test_eviction_method_predicate_defaults_false(self):
         # Non-evicting methods (e.g. offloading) are never restricted by the

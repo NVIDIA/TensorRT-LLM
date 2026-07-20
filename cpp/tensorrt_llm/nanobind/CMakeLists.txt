@@ -14,7 +14,6 @@ set(SRCS
     batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
-    executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
     process_group/bindings.cpp
@@ -23,7 +22,6 @@ set(SRCS
     runtime/moeBindings.cpp
     suffixAutomaton/bindings.cpp
     testing/kvCacheManagerTestUtilBinding.cpp
-    testing/modelSpecBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu

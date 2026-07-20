@@ -45,7 +45,6 @@ add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
 option(BUILD_TESTS "Build Google tests" ON)
-option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
@@ -124,12 +123,6 @@ if(BUILD_TESTS)
   message(STATUS "Building Google tests")
 else()
   message(STATUS "Not building Google tests")
-endif()
-
-if(BUILD_BENCHMARKS)
-  message(STATUS "Building benchmarks")
-else()
-  message(STATUS "Not building benchmarks")
 endif()
 
 if(BUILD_MICRO_BENCHMARKS)
@@ -249,8 +242,6 @@ if(ENABLE_MULTI_DEVICE)
 endif()
 
 # TRT dependencies
-find_package(TensorRT 10 REQUIRED COMPONENTS OnnxParser)
-set(TRT_LIB TensorRT::NvInfer)
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
@@ -291,7 +282,6 @@ include_directories(
   ${CUDAToolkit_INCLUDE_DIRS}
   ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
-  $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${maybe_nvtx_includedir}
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
@@ -669,11 +659,6 @@ if(BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(BUILD_BENCHMARKS)
-  add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
-                   ${CMAKE_BINARY_DIR}/benchmarks)
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/micro_benchmarks
                    ${CMAKE_BINARY_DIR}/micro_benchmarks)
@@ -688,6 +673,6 @@ if(MEASURE_BUILD_TIME)
 endif()
 
 set(BUILD_WHEEL_TARGETS
-    tensorrt_llm;nvinfer_plugin_tensorrt_llm
+    tensorrt_llm
     CACHE STRING "Targets used to build wheel")
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})

@@ -205,7 +205,6 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 | Flag | Description |
 |------|-------------|
 | `--trt_root /usr/local/tensorrt` | TensorRT installation path (standard in NVIDIA containers) |
-| `--benchmarks` | Build the C++ benchmarks |
 | `-a "100-real"` | Target architecture — `100` for Blackwell, `90` for Hopper, etc. |
 | `--nvtx` | Enable NVTX markers for profiling |
 | `--no-venv` | Skip virtual environment creation |

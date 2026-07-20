@@ -888,7 +888,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # the typical step. An all-generation typical_step over-provisions the
             # compressed-cache pool at the expense of the SWA pool, starving the
             # SWA pool and artificially capping the achievable batch size.
-            ctx_capacity = max_num_tokens if max_num_tokens is not None else typical_seq_len
+            ctx_capacity = (
+                max_num_tokens if max_num_tokens is not None else typical_seq_len
+            ) + self.num_extra_kv_tokens
             generation_history_length = max(0, typical_seq_len - max_draft_len - 1)
             typical_step = BatchDesc(
                 kv_caches=[

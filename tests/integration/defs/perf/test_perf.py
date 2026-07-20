@@ -1066,7 +1066,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
         data_cmd = []
-        prepare_data_script = os.path.join(self._llm_root, "benchmarks", "cpp",
+        prepare_data_script = os.path.join(self._llm_root, "benchmarks",
                                            "prepare_dataset.py")
 
         if self._config.model_name in MODEL_PATH_DICT.keys():

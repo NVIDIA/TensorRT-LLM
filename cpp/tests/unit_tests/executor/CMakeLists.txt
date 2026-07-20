@@ -19,21 +19,11 @@ add_gtest(decodingConfigTest decodingConfigTest.cpp)
 add_gtest(requestTest requestTest.cpp)
 add_gtest(responseTest responseTest.cpp)
 
-add_gtest(executorTestSmall executorTestSmall.cpp)
-target_link_libraries(executorTestSmall PRIVATE testingUtils)
-
-add_gtest(executorTestSmallArbitraryOutputTensors
-          executorTestSmallArbitraryOutputTensors.cpp)
-target_link_libraries(executorTestSmallArbitraryOutputTensors
-                      PRIVATE testingUtils)
-
 add_gtest(executorConfigTest executorConfigTest.cpp)
 add_gtest(executorTensorTest tensorTest.cpp)
 add_gtest(serializeUtilsTest serializeUtilsTest.cpp)
 add_gtest(requestWithIdTest requestWithIdTest.cpp)
 add_gtest(loraConfigTest loraConfigTest.cpp)
-add_gtest(intervalSetTest intervalSetTest.cpp)
-add_gtest(dynamicBatchTunerTest dynamicBatchTunerTest.cpp)
 add_gtest(genUniqueAgentNameTest genUniqueAgentNameTest.cpp)
 target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
 add_gtest(ucxCommTest ucxCommTest.cpp)

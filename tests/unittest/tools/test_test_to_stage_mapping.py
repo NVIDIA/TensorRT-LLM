@@ -182,17 +182,22 @@ def test_search_functionality(stage_query, sample_test_cases):
 
 
 @pytest.mark.parametrize('file_format', ['txt', 'yml'])
-def test_cli_functionality(tmp_path, sample_test_cases, file_format):
+def test_cli_functionality(tmp_path, stage_query, sample_test_cases,
+                           file_format):
     """Test CLI functionality with sample data."""
-    if not sample_test_cases:
-        pytest.skip("No test cases available")
+    # Use the first sample that maps to at least one stage (some test-db
+    # files, e.g. multi-node perf-sanity lists, have no L0 stage).
+    test_case = next(
+        (t for t in sample_test_cases if stage_query.tests_to_stages([t])),
+        None)
+    if test_case is None:
+        pytest.skip("No sampled test maps to any stage")
 
-    # Use only first sample for CLI test
     test_file = tmp_path / f'sample_tests.{file_format}'
     if file_format == 'txt':
-        test_file.write_text(f'{sample_test_cases[0]}\n')
+        test_file.write_text(f'{test_case}\n')
     else:  # yml
-        test_file.write_text(f'- {sample_test_cases[0]}\n')
+        test_file.write_text(f'- {test_case}\n')
 
     script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
     cmd = [sys.executable, script, '--test-list', str(test_file)]
@@ -200,7 +205,7 @@ def test_cli_functionality(tmp_path, sample_test_cases, file_format):
     lines = output.decode().strip().splitlines()
 
     # Should return at least one stage
-    assert lines, f"No stages returned for test '{sample_test_cases[0]}'"
+    assert lines, f"No stages returned for test '{test_case}'"
 
 
 def test_backend_filtering_consistency(stage_query):

@@ -16,7 +16,7 @@ _DEFAULT_OUTPUT_MEAN = 100
 _DEFAULT_OUTPUT_STDEV = 10
 _TEST_TASK_IDS = [0, 1, 2]
 _TOKENIZER_SUBPATH = "llama-models-v2/tinyllama-tarot-v1/"
-_PREPARE_DATASET_SCRIPT_PATH = "benchmarks/cpp/prepare_dataset.py"
+_PREPARE_DATASET_SCRIPT_PATH = "benchmarks/prepare_dataset.py"
 
 
 class TestPrepareDatasetLora:

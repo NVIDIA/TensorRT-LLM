@@ -9,14 +9,14 @@ common-files: &common_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        benchmarks/cpp/__init__.py |
-        benchmarks/cpp/prepare_dataset.py |
-        benchmarks/cpp/utils/__init__.py |
-        benchmarks/cpp/utils/convert_nemo_dataset.py |
-        benchmarks/cpp/utils/generate_rand_loras.py |
-        benchmarks/cpp/utils/prepare_real_data.py |
-        benchmarks/cpp/utils/prepare_synthetic_data.py |
-        benchmarks/cpp/utils/utils.py |
+        benchmarks/__init__.py |
+        benchmarks/prepare_dataset.py |
+        benchmarks/utils/__init__.py |
+        benchmarks/utils/convert_nemo_dataset.py |
+        benchmarks/utils/generate_rand_loras.py |
+        benchmarks/utils/prepare_real_data.py |
+        benchmarks/utils/prepare_synthetic_data.py |
+        benchmarks/utils/utils.py |
         cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
@@ -41,38 +41,11 @@ common-files: &common_files |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
         cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/copy_cu.py |
-        cpp/tests/resources/scripts/build_chatglm_engines.py |
-        cpp/tests/resources/scripts/build_eagle_engines.py |
-        cpp/tests/resources/scripts/build_enc_dec_engines.py |
-        cpp/tests/resources/scripts/build_engines_utils.py |
-        cpp/tests/resources/scripts/build_gpt_engines.py |
-        cpp/tests/resources/scripts/build_gptj_engines.py |
-        cpp/tests/resources/scripts/build_llama_engines.py |
-        cpp/tests/resources/scripts/build_mamba_engines.py |
-        cpp/tests/resources/scripts/build_medusa_engines.py |
-        cpp/tests/resources/scripts/build_recurrentgemma_engines.py |
-        cpp/tests/resources/scripts/build_redrafter_engines.py |
-        cpp/tests/resources/scripts/generate_expected_chatglm_output.py |
-        cpp/tests/resources/scripts/generate_expected_eagle_output.py |
-        cpp/tests/resources/scripts/generate_expected_enc_dec_output.py |
-        cpp/tests/resources/scripts/generate_expected_gpt_output.py |
-        cpp/tests/resources/scripts/generate_expected_gptj_output.py |
-        cpp/tests/resources/scripts/generate_expected_llama_output.py |
-        cpp/tests/resources/scripts/generate_expected_mamba_output.py |
-        cpp/tests/resources/scripts/generate_expected_medusa_output.py |
-        cpp/tests/resources/scripts/generate_expected_recurrentgemma_output.py |
-        cpp/tests/resources/scripts/generate_expected_redrafter_output.py |
-        cpp/tests/resources/scripts/generate_hf_gpt_output.py |
         cpp/tests/resources/scripts/generate_test_lora_weights.py |
-        cpp/tests/resources/scripts/io_converter.py |
         docs/source/conf.py |
         docs/source/helper.py |
         examples/apps/chat.py |
         examples/apps/fastapi_server.py |
-        examples/bindings/executor/example_advanced.py |
-        examples/bindings/executor/example_basic.py |
-        examples/bindings/executor/example_debug.py |
-        examples/bindings/executor/example_logits_processor.py |
         examples/disaggregated/clients/disagg_client.py |
         examples/disaggregated/slurm/benchmark/submit.py |
         examples/dora/normalize_weights.py |
@@ -246,7 +219,6 @@ common-files: &common_files |
         jenkins/scripts/mergeWaiveList.py |
         jenkins/scripts/open_search_db.py |
         jenkins/scripts/test_rerun.py |
-        scripts/build_cpp_examples.py |
         scripts/build_wheel.py |
         scripts/check_test_list.py |
         scripts/dco_check.py |
@@ -851,11 +823,8 @@ common-files: &common_files |
         tests/integration/defs/conftest.py |
         tests/integration/defs/cpp/conftest.py |
         tests/integration/defs/cpp/cpp_common.py |
-        tests/integration/defs/cpp/test_e2e.py |
         tests/integration/defs/cpp/test_multi_gpu.py |
         tests/integration/defs/cpp/test_unit_tests.py |
-        tests/integration/defs/deterministic/mixtral_deterministic.py |
-        tests/integration/defs/deterministic/test_mixtral_deterministic.py |
         tests/integration/defs/disaggregated/test_auto_scaling.py |
         tests/integration/defs/disaggregated/test_disaggregated.py |
         tests/integration/defs/disaggregated/test_disaggregated_etcd.py |
@@ -928,7 +897,6 @@ common-files: &common_files |
         tests/integration/defs/test_fmha.py |
         tests/integration/defs/test_list_parser.py |
         tests/integration/defs/test_list_validation.py |
-        tests/integration/defs/test_mlpf_results.py |
         tests/integration/defs/test_sanity.py |
         tests/integration/defs/test_unittests.py |
         tests/integration/defs/triton_server/__init__.py |
@@ -1081,7 +1049,6 @@ common-files: &common_files |
         tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
-        tests/unittest/bindings/binding_test_utils.py |
         tests/unittest/bindings/test_bindings_moe.py |
         tests/unittest/bindings/test_bindings_ut.py |
         tests/unittest/bindings/test_executor_bindings.py |
@@ -1169,7 +1136,6 @@ common-files: &common_files |
         tests/unittest/others/test_kv_cache_transceiver.py |
         tests/unittest/others/test_kv_cache_update.py |
         tests/unittest/others/test_layer.py |
-        tests/unittest/others/test_leak.py |
         tests/unittest/others/test_mapping.py |
         tests/unittest/others/test_model_dtype.py |
         tests/unittest/others/test_module.py |
@@ -1350,14 +1316,14 @@ legacy-files: &legacy_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        benchmarks/cpp/__init__.py |
-        benchmarks/cpp/prepare_dataset.py |
-        benchmarks/cpp/utils/__init__.py |
-        benchmarks/cpp/utils/convert_nemo_dataset.py |
-        benchmarks/cpp/utils/generate_rand_loras.py |
-        benchmarks/cpp/utils/prepare_real_data.py |
-        benchmarks/cpp/utils/prepare_synthetic_data.py |
-        benchmarks/cpp/utils/utils.py |
+        benchmarks/__init__.py |
+        benchmarks/prepare_dataset.py |
+        benchmarks/utils/__init__.py |
+        benchmarks/utils/convert_nemo_dataset.py |
+        benchmarks/utils/generate_rand_loras.py |
+        benchmarks/utils/prepare_real_data.py |
+        benchmarks/utils/prepare_synthetic_data.py |
+        benchmarks/utils/utils.py |
         cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
@@ -1382,38 +1348,11 @@ legacy-files: &legacy_files |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
         cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/copy_cu.py |
-        cpp/tests/resources/scripts/build_chatglm_engines.py |
-        cpp/tests/resources/scripts/build_eagle_engines.py |
-        cpp/tests/resources/scripts/build_enc_dec_engines.py |
-        cpp/tests/resources/scripts/build_engines_utils.py |
-        cpp/tests/resources/scripts/build_gpt_engines.py |
-        cpp/tests/resources/scripts/build_gptj_engines.py |
-        cpp/tests/resources/scripts/build_llama_engines.py |
-        cpp/tests/resources/scripts/build_mamba_engines.py |
-        cpp/tests/resources/scripts/build_medusa_engines.py |
-        cpp/tests/resources/scripts/build_recurrentgemma_engines.py |
-        cpp/tests/resources/scripts/build_redrafter_engines.py |
-        cpp/tests/resources/scripts/generate_expected_chatglm_output.py |
-        cpp/tests/resources/scripts/generate_expected_eagle_output.py |
-        cpp/tests/resources/scripts/generate_expected_enc_dec_output.py |
-        cpp/tests/resources/scripts/generate_expected_gpt_output.py |
-        cpp/tests/resources/scripts/generate_expected_gptj_output.py |
-        cpp/tests/resources/scripts/generate_expected_llama_output.py |
-        cpp/tests/resources/scripts/generate_expected_mamba_output.py |
-        cpp/tests/resources/scripts/generate_expected_medusa_output.py |
-        cpp/tests/resources/scripts/generate_expected_recurrentgemma_output.py |
-        cpp/tests/resources/scripts/generate_expected_redrafter_output.py |
-        cpp/tests/resources/scripts/generate_hf_gpt_output.py |
         cpp/tests/resources/scripts/generate_test_lora_weights.py |
-        cpp/tests/resources/scripts/io_converter.py |
         docs/source/conf.py |
         docs/source/helper.py |
         examples/apps/chat.py |
         examples/apps/fastapi_server.py |
-        examples/bindings/executor/example_advanced.py |
-        examples/bindings/executor/example_basic.py |
-        examples/bindings/executor/example_debug.py |
-        examples/bindings/executor/example_logits_processor.py |
         examples/disaggregated/clients/disagg_client.py |
         examples/disaggregated/slurm/benchmark/submit.py |
         examples/dora/normalize_weights.py |
@@ -1587,7 +1526,6 @@ legacy-files: &legacy_files |
         jenkins/scripts/mergeWaiveList.py |
         jenkins/scripts/open_search_db.py |
         jenkins/scripts/test_rerun.py |
-        scripts/build_cpp_examples.py |
         scripts/build_wheel.py |
         scripts/check_test_list.py |
         scripts/dco_check.py |
@@ -2192,11 +2130,8 @@ legacy-files: &legacy_files |
         tests/integration/defs/conftest.py |
         tests/integration/defs/cpp/conftest.py |
         tests/integration/defs/cpp/cpp_common.py |
-        tests/integration/defs/cpp/test_e2e.py |
         tests/integration/defs/cpp/test_multi_gpu.py |
         tests/integration/defs/cpp/test_unit_tests.py |
-        tests/integration/defs/deterministic/mixtral_deterministic.py |
-        tests/integration/defs/deterministic/test_mixtral_deterministic.py |
         tests/integration/defs/disaggregated/test_auto_scaling.py |
         tests/integration/defs/disaggregated/test_disaggregated.py |
         tests/integration/defs/disaggregated/test_disaggregated_etcd.py |
@@ -2269,7 +2204,6 @@ legacy-files: &legacy_files |
         tests/integration/defs/test_fmha.py |
         tests/integration/defs/test_list_parser.py |
         tests/integration/defs/test_list_validation.py |
-        tests/integration/defs/test_mlpf_results.py |
         tests/integration/defs/test_sanity.py |
         tests/integration/defs/test_unittests.py |
         tests/integration/defs/triton_server/__init__.py |
@@ -2422,7 +2356,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/thop/serial/test_moe_alltoall.py |
         tests/unittest/api_stability/api_stability_core.py |
         tests/unittest/api_stability/test_llm_api.py |
-        tests/unittest/bindings/binding_test_utils.py |
         tests/unittest/bindings/test_bindings_moe.py |
         tests/unittest/bindings/test_bindings_ut.py |
         tests/unittest/bindings/test_executor_bindings.py |
@@ -2510,7 +2443,6 @@ legacy-files: &legacy_files |
         tests/unittest/others/test_kv_cache_transceiver.py |
         tests/unittest/others/test_kv_cache_update.py |
         tests/unittest/others/test_layer.py |
-        tests/unittest/others/test_leak.py |
         tests/unittest/others/test_mapping.py |
         tests/unittest/others/test_model_dtype.py |
         tests/unittest/others/test_module.py |

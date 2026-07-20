@@ -1863,6 +1863,20 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         if any("Laguna" in arch for arch in draft_arches):
             return DFlashLagunaForCausalLM(draft_config)
         return DFlashForCausalLM(draft_config)
+    elif spec_dec_mode.is_dspark():
+        # Lazy import to avoid a cycle (modeling_dspark -> modeling_deepseekv4 ->
+        # modeling_speculative). The DSpark draft reuses the target's aux streams.
+        # The draft stage count (n_mtp_layers) is not in the HF config, so derive
+        # it from the checkpoint's mtp.* namespace.
+        from .modeling_dspark import DSparkForCausalLM, count_dspark_stages
+        num_stages = count_dspark_stages(
+            model_config.spec_config.speculative_model)
+        return DSparkForCausalLM(
+            draft_config,
+            getattr(model, "aux_stream_dict", None),
+            num_stages=num_stages,
+            block_size=model_config.spec_config.block_size,
+        )
     elif spec_dec_mode.is_draft_target_one_model():
         # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
         # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
@@ -2057,7 +2071,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_config and (
                 not self.spec_config.spec_dec_mode.is_external_drafter()
-                or self.spec_config.spec_dec_mode.is_dflash()):
+                or self.spec_config.spec_dec_mode.is_dflash()
+                or self.spec_config.spec_dec_mode.is_dspark()):
             self.draft_model.load_weights_from_target_model(self)
 
     def set_guided_decoder(self,

@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/types.h"
 
@@ -97,7 +98,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_TRUE(llmReq.getStopWordsList().has_value());
         {
             auto badWordsTensor = llmReq.getBadWordsList().value();
-            EXPECT_EQ(badWordsTensor->getDataType(), nvinfer1::DataType::kINT32);
+            EXPECT_EQ(badWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
             EXPECT_EQ(badWordsTensor->getShape().nbDims, 3);
             EXPECT_EQ(badWordsTensor->getShape().d[0], 1);
             EXPECT_EQ(badWordsTensor->getShape().d[1], 2);
@@ -119,7 +120,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
 
         {
             auto stopWordsTensor = llmReq.getStopWordsList().value();
-            EXPECT_EQ(stopWordsTensor->getDataType(), nvinfer1::DataType::kINT32);
+            EXPECT_EQ(stopWordsTensor->getDataType(), tensorrt_llm::DataType::kINT32);
             EXPECT_EQ(stopWordsTensor->getShape().nbDims, 3);
             EXPECT_EQ(stopWordsTensor->getShape().d[0], 1);
             EXPECT_EQ(stopWordsTensor->getShape().d[1], 2);
@@ -151,7 +152,7 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[0], 1);
         EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[1], vocabSize);
         EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[2], hiddenSize);
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getDataType(), nvinfer1::DataType::kFLOAT);
+        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getDataType(), tensorrt_llm::DataType::kFLOAT);
         EXPECT_EQ(llmReq.getPromptVocabSize().value(), vocabSize);
         VecUniqueTokens uniqueTokens;
         for (size_t i = 0; i < inputTokens.size(); ++i)
@@ -373,7 +374,7 @@ TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
     EXPECT_EQ(llmReq.mPromptLen, 5);
 
     SizeType32 vocabSizePadded = 32000;
-    nvinfer1::DataType logitsDataType = nvinfer1::DataType::kFLOAT;
+    tensorrt_llm::DataType logitsDataType = tensorrt_llm::DataType::kFLOAT;
 
     // Test the allocation of context logits
     EXPECT_EQ(llmReq.getContextLogitsHost(), nullptr);
@@ -462,7 +463,7 @@ TEST_F(LlmRequestTest, testCreateRequests)
     SizeType32 maxNewTokens{60};
     tb::LlmRequest::RequestIdType requestId{77};
     SizeType32 vocabSize{32};
-    nvinfer1::DataType dtype{nvinfer1::DataType::kHALF};
+    tensorrt_llm::DataType dtype{tensorrt_llm::DataType::kHALF};
 
     tr::SamplingConfig samplingConfig(1);
     samplingConfig.randomSeed = std::vector<texec::RandomSeedType>{7};
