@@ -21,7 +21,7 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// Fast approximate tanh.
+// Fast approximate tanh. Delete.
 static inline __device__ float __tanhf(float x)
 {
 #if (__CUDA_ARCH__ >= 750)
