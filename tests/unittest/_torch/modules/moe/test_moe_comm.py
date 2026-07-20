@@ -1198,6 +1198,109 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         raise
 
 
+def _nccl_ep_replay_slots(
+    *,
+    target_rank: int,
+    num_tokens: int,
+    experts_per_rank: int,
+) -> torch.Tensor:
+    """Route every local token to one EP rank, using distinct local experts."""
+    local_experts = torch.arange(num_tokens, device="cuda", dtype=torch.int32)
+    local_experts %= experts_per_rank
+    return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
+
+
+def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
+    """Capture LL dispatch, change routing, and verify the replay sees the change.
+
+    ``NcclEP.dispatch`` converts the stable input routing tensor to the dtype
+    expected by nccl-ep inside the graph. The captured handle therefore must
+    consume the updated device buffer on each replay, rather than reusing the
+    routes present while the graph was captured.
+    """
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    comm = None
+    try:
+        mapping = Mapping(
+            rank=rank,
+            tp_size=config.ep_size,
+            moe_ep_size=config.ep_size,
+            world_size=config.ep_size,
+        )
+        comm = create_comm_object(COMM_NCCL_EP, mapping, config)
+        num_tokens = config.all_num_tokens[rank]
+        experts_per_rank = config.num_experts // config.ep_size
+        all_rank_num_tokens = config.all_num_tokens
+
+        # A rank-tagged payload makes a routing change visible without relying
+        # on private nccl-ep state: local routing receives rank + 1, while the
+        # second replay must receive the peer rank tag.
+        hidden_states = torch.full(
+            (num_tokens, config.hidden_size),
+            float(rank + 1),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        weights = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+        local_routes = _nccl_ep_replay_slots(
+            target_rank=rank,
+            num_tokens=num_tokens,
+            experts_per_rank=experts_per_rank,
+        )
+        peer_rank = (rank + 1) % config.ep_size
+        peer_routes = _nccl_ep_replay_slots(
+            target_rank=peer_rank,
+            num_tokens=num_tokens,
+            experts_per_rank=experts_per_rank,
+        )
+
+        # Initialize the context and handle eagerly. Capture is intentionally
+        # rejected before this point, so this mirrors production graph setup.
+        comm.dispatch(
+            hidden_states,
+            None,
+            local_routes,
+            weights,
+            all_rank_num_tokens,
+        )
+        torch.cuda.synchronize()
+
+        static_routes = local_routes.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            recv_hs, _, recv_slots, _ = comm.dispatch(
+                hidden_states,
+                None,
+                static_routes,
+                weights,
+                all_rank_num_tokens,
+            )
+        torch.cuda.synchronize()
+
+        def replay_and_check(expected_sender: int) -> dict:
+            graph.replay()
+            torch.cuda.synchronize()
+            valid = recv_slots[:, 0] >= 0
+            received = recv_hs[valid, 0].to(torch.float32).round().to(torch.int64)
+            return {
+                "valid_count": int(valid.sum().item()),
+                "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
+            }
+
+        static_routes.copy_(local_routes)
+        local_result = replay_and_check(rank)
+        static_routes.copy_(peer_routes)
+        peer_result = replay_and_check(peer_rank)
+        return {"rank": rank, "local": local_result, "peer": peer_result}
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        if comm is not None:
+            comm.destroy()
+
+
 def _make_rank_mask_config(
     ep_size: int,
     local_num_tokens: int,
@@ -2319,6 +2422,39 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
+def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
+    """Verify graph replay observes routing changed between replays."""
+    ep_size = mpi_pool_executor.num_workers
+    config = CommTestConfig(
+        comm_type=COMM_NCCL_EP,
+        ep_size=ep_size,
+        num_experts=FIXED_NUM_EXPERTS,
+        top_k=1,
+        hidden_size=DEFAULT_HIDDEN_SIZE,
+        all_num_tokens=[16] * ep_size,
+    )
+    skip_reason = _get_skip_reason(config)
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    futures = [
+        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config)
+        for _ in range(config.ep_size)
+    ]
+    results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
+    for result in results:
+        rank = result["rank"]
+        for replay_name in ("local", "peer"):
+            replay = result[replay_name]
+            valid_count = replay["valid_count"]
+            assert valid_count == 16, (
+                f"rank {rank}: {replay_name} replay received {valid_count} valid rows, expected 16"
+            )
+            assert replay["sender_matches"], (
+                f"rank {rank}: {replay_name} replay did not observe the expected routing buffer"
+            )
+
+
 def _skip_if_rank_mask_config_unsupported(config: CommTestConfig) -> None:
     """Skip active-rank-mask tests when NVLinkOneSided cannot run locally."""
     skip_reason = check_platform_support(config.comm_type)
@@ -2475,6 +2611,12 @@ class TestMoEComm:
     def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, group: CommTestGroup):
         """Verify NVLinkOneSided with non-divisible EP (num_experts % ep_size != 0)."""
         _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
+        """Verify LL CUDA graph replay reads routing written after capture."""
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(

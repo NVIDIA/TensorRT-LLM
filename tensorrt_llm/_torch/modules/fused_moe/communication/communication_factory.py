@@ -192,7 +192,15 @@ class CommunicationFactory:
 
         # Try NCCL EP (rank-major LL). Falls through to DeepEP/AllGather if
         # prerequisites are not met or libnccl_ep.so is not available.
-        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(act_dtype)
+        nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
+            act_dtype,
+            quant_config,
+            num_slots,
+            hidden_size,
+            max_num_tokens,
+            moe_max_num_tokens,
+            top_k,
+        )
         if nccl_ep_unavailable_reason is None:
             try:
                 strategy = NcclEP(
@@ -355,7 +363,13 @@ class CommunicationFactory:
             )
         elif method == "NCCL_EP":
             nccl_ep_unavailable_reason = CommunicationFactory._get_nccl_ep_unavailable_reason(
-                act_dtype
+                act_dtype,
+                quant_config,
+                num_slots,
+                hidden_size,
+                max_num_tokens,
+                moe_max_num_tokens,
+                top_k,
             )
             if nccl_ep_unavailable_reason is not None:
                 raise ValueError(nccl_ep_unavailable_reason)
@@ -375,7 +389,28 @@ class CommunicationFactory:
     @staticmethod
     def _get_nccl_ep_unavailable_reason(
         act_dtype: torch.dtype,
+        quant_config,
+        num_slots: int,
+        hidden_size: int,
+        max_num_tokens: int,
+        moe_max_num_tokens: Optional[int],
+        top_k: int,
     ) -> Optional[str]:
         if act_dtype != torch.bfloat16:
             return f"NcclEP requires act_dtype=torch.bfloat16, got {act_dtype}."
+        if quant_config is not None:
+            quant_mode = getattr(quant_config, "layer_quant_mode", None)
+            if quant_mode is not None and quant_mode.has_any_quant(exclude_kv_cache=True):
+                return "NcclEP v0.1 does not support quantized MoE communication."
+        if num_slots <= 0 or hidden_size <= 0 or max_num_tokens <= 0:
+            return (
+                "NcclEP requires positive num_slots, hidden_size, and max_num_tokens, got "
+                f"{num_slots=}, {hidden_size=}, {max_num_tokens=}."
+            )
+        if moe_max_num_tokens is not None and moe_max_num_tokens <= 0:
+            return (
+                f"NcclEP requires moe_max_num_tokens > 0 when provided, got {moe_max_num_tokens}."
+            )
+        if top_k <= 0 or top_k > num_slots:
+            return f"NcclEP requires 0 < top_k <= num_slots, got {top_k=}, {num_slots=}."
         return None

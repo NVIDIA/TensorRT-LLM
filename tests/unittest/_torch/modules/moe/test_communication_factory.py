@@ -201,6 +201,34 @@ def test_auto_selection_skips_nccl_ep_when_preconditions_fail(
     assert isinstance(strategy, AllGatherReduceScatter)
 
 
+def test_auto_selection_skips_nccl_ep_for_quantized_moe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_config = _make_model_config()
+    model_config.quant_config = SimpleNamespace(
+        layer_quant_mode=SimpleNamespace(has_any_quant=lambda **_: True)
+    )
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.setattr(
+        communication_factory,
+        "NcclEP",
+        lambda *args, **kwargs: pytest.fail("NcclEP should not be constructed for quantized MoE"),
+    )
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=32,
+        num_slots=32,
+        top_k=8,
+        expert_size_per_partition=16,
+        hidden_size=4096,
+    )
+
+    assert isinstance(strategy, AllGatherReduceScatter)
+
+
 def test_auto_selection_falls_back_when_nccl_probe_runtime_fails(
     monkeypatch: pytest.MonkeyPatch,
 ):

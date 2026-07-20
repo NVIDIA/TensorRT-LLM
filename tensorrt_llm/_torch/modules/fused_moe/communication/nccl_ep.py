@@ -57,7 +57,6 @@ class NcclEP(Communication):
         max_num_tokens: int = 1024,
         moe_max_num_tokens: Optional[int] = None,
         top_k: int = 8,
-        use_fp8: bool = False,
     ):
         super().__init__(mapping)
 
@@ -66,12 +65,36 @@ class NcclEP(Communication):
         if not is_nccl_ep_installed():
             raise RuntimeError("nccl-ep is not installed.")
 
+        if self.ep_size <= 0:
+            raise ValueError(f"NcclEP requires moe_ep_size > 0, got {self.ep_size}")
+        if not 0 <= self.ep_rank < self.ep_size:
+            raise ValueError(
+                f"NcclEP requires 0 <= moe_ep_rank < moe_ep_size, "
+                f"got {self.ep_rank=}, {self.ep_size=}"
+            )
+        if num_slots <= 0:
+            raise ValueError(f"NcclEP requires num_slots > 0, got {num_slots}")
+        if num_slots % self.ep_size != 0:
+            raise ValueError(
+                f"NcclEP requires num_slots divisible by moe_ep_size, "
+                f"got {num_slots=}, {self.ep_size=}"
+            )
+        if hidden_size <= 0:
+            raise ValueError(f"NcclEP requires hidden_size > 0, got {hidden_size}")
+        if top_k <= 0 or top_k > num_slots:
+            raise ValueError(f"NcclEP requires 0 < top_k <= num_slots, got {top_k=}, {num_slots=}")
+        if max_num_tokens <= 0:
+            raise ValueError(f"NcclEP requires max_num_tokens > 0, got {max_num_tokens}")
+        if moe_max_num_tokens is not None and moe_max_num_tokens <= 0:
+            raise ValueError(
+                f"NcclEP requires moe_max_num_tokens > 0 when provided, got {moe_max_num_tokens}"
+            )
+
         self.num_slots = num_slots
         self.num_experts = num_slots
         self.hidden_size = hidden_size
         self.num_local_experts = num_slots // self.ep_size
         self.max_top_k = top_k
-        self.use_fp8 = use_fp8
 
         self.max_tokens_per_rank = (
             max_num_tokens
@@ -106,10 +129,6 @@ class NcclEP(Communication):
             return False
         return True
 
-    def supports_post_quant_dispatch(self) -> bool:
-        # FP8 path: NCCL EP internally quantizes bf16 -> fp8 during dispatch.
-        return self.use_fp8
-
     def _get_context(self):
         if self._ctx is None:
             if torch.cuda.is_current_stream_capturing():
@@ -127,7 +146,6 @@ class NcclEP(Communication):
                 self.max_tokens_per_rank,
                 self.hidden_size,
                 self.max_top_k,
-                self.use_fp8,
                 Layout.RANK_MAJOR,
             )
         return self._ctx
@@ -222,15 +240,12 @@ class NcclEP(Communication):
             tokens=ctx.output_tokens_nd,
             topk_weights=ctx.recv_topk_weights_nd,
             topk_idx=ctx.recv_topk_idx_nd,
-            scales=ctx.scales_nd if self.use_fp8 else None,
+            scales=None,
         )
         layout_info = LayoutInfo(src_rank_counters=ctx.recv_rank_counter_nd)
-        # If the linked nccl-ep supports it, ask the kernel to emit GLOBAL
-        # expert ids directly. The high-level LayoutInfo dataclass does not
-        # surface the field on older wheels, so set it on the underlying
-        # cybind struct via _lowpp -- on builds without the field, the
-        # ctx-side probe sets _expert_id_kind_global to None and we leave
-        # the descriptor untouched (defaults to AUTO == LOCAL).
+        # The v0.2-gated capability path asks the kernel to emit global
+        # expert ids directly; v0.1 retains the default local-id contract
+        # and uses the translation below.
         if ctx._expert_id_kind_global is not None:
             layout_info._lowpp.recv_topk_idx_kind = ctx._expert_id_kind_global
 
@@ -281,7 +296,7 @@ class NcclEP(Communication):
         # flatten via view.
         return (
             ctx.output_tokens_buf.view(self.max_recv_tokens, self.hidden_size),
-            ctx.scales_buf if self.use_fp8 else None,
+            None,
             recv_slots_global,
             ctx.recv_topk_weights_buf.view(self.max_recv_tokens, self.max_top_k),
         )
@@ -310,21 +325,33 @@ class NcclEP(Communication):
 
         num_tokens = state["num_tokens"]
 
-        # Combine input for LL rank-major must be 3D
-        # [ep_size, max_tokens_per_rank, hidden] -- reshape if caller passed
-        # 2D [max_recv, H] or a per-expert [E, max_recv, H] layout.
-        if final_hidden_states.dim() == 3 and final_hidden_states.shape[0] != self.ep_size:
-            final_hidden_states = final_hidden_states.reshape(-1, self.hidden_size)
+        # NCCL-EP LL combine consumes rank-major tokens with shape
+        # [ep_size, max_tokens_per_rank, hidden]. The scheduler normally
+        # provides the equivalent 2D [max_recv_tokens, hidden] view.
         if final_hidden_states.dim() == 2:
-            if final_hidden_states.shape[0] != self.max_recv_tokens:
+            expected_shape = (self.max_recv_tokens, self.hidden_size)
+            if tuple(final_hidden_states.shape) != expected_shape:
                 raise ValueError(
-                    f"combine input rows={final_hidden_states.shape[0]} "
-                    f"expected={self.max_recv_tokens}"
+                    f"combine input shape={tuple(final_hidden_states.shape)} "
+                    f"expected={expected_shape}"
                 )
             final_hidden_states = final_hidden_states.view(
                 self.ep_size,
                 self.max_tokens_per_rank,
                 self.hidden_size,
+            )
+        elif final_hidden_states.dim() == 3:
+            expected_shape = (self.ep_size, self.max_tokens_per_rank, self.hidden_size)
+            if tuple(final_hidden_states.shape) != expected_shape:
+                raise ValueError(
+                    f"combine input shape={tuple(final_hidden_states.shape)} "
+                    f"expected={expected_shape}"
+                )
+        else:
+            raise ValueError(
+                "NcclEP combine input must be 2D [max_recv_tokens, hidden] or "
+                "3D [ep_size, max_tokens_per_rank, hidden], got "
+                f"shape={tuple(final_hidden_states.shape)}"
             )
 
         combine_input_c = final_hidden_states.contiguous()

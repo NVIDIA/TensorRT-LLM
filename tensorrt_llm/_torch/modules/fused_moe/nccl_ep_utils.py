@@ -16,8 +16,7 @@
 
 Owns the long-lived NCCL EP resources (communicator, group, persistent receive
 NDTensors) for the MoE NcclEP communication strategy. Per-step dispatch handles
-are created in ``communication/nccl_ep.py``. ``use_fp8`` gates allocation of
-the persistent FP8 scales receive buffer.
+are created in ``communication/nccl_ep.py``.
 """
 
 from typing import Optional
@@ -95,7 +94,7 @@ def _nccl_ep_supports_int32_topk_idx() -> bool:
 
 
 # Singleton EP context keyed by (ep_size, ep_rank, max_tokens, num_experts,
-# hidden, max_top_k, use_fp8, layout).
+# hidden, max_top_k, layout).
 _ep_group_cache: dict = {}
 _ep_group_refcounts: dict = {}
 
@@ -105,7 +104,7 @@ class NcclEpContext:
 
     Owns the :class:`nccl.ep.Group`, the source :class:`nccl.core.Communicator`,
     and the rank-major LL persistent receive buffers (tokens, top-k idx / weights,
-    per-source-rank counter, optional FP8 scales) wrapped as
+    per-source-rank counter) wrapped as
     :class:`nccl.ep.Tensor` descriptors.
 
     Per-step routing handles (``Handle``) are created in ``NcclEP``, not here.
@@ -118,7 +117,6 @@ class NcclEpContext:
         max_tokens_per_rank: int,
         hidden_size: int,
         max_top_k: int,
-        use_fp8: bool = False,
         layout: Optional[int] = None,
     ):
         import nccl.core as nccl_core
@@ -134,7 +132,6 @@ class NcclEpContext:
         self.max_tokens_per_rank = max_tokens_per_rank
         self.max_top_k = max_top_k
         self.hidden_size = hidden_size
-        self.use_fp8 = use_fp8
         self.layout = Layout.RANK_MAJOR if layout is None else Layout(layout)
         self.max_recv_tokens = self.ep_size * max_tokens_per_rank
 
@@ -142,38 +139,44 @@ class NcclEpContext:
         # int64 in ncclEpUpdateHandle; 0.2+ supports TRT-LLM's native int32
         # routing ids and avoids the per-iter widening conversion.
         self.topk_idx_dtype = torch.int32 if _nccl_ep_supports_int32_topk_idx() else torch.int64
+        self._v0_2_features_enabled = self.topk_idx_dtype == torch.int32
 
-        # Auto-detect whether the linked libnccl_ep.so supports a
+        # NCCL-EP v0.2+ may expose a configurable receive expert-id kind.
+        # Within that version-gated path, detect whether the linked binding supports a
         # configurable recv_topk_idx kind on LayoutInfo. When the field
         # is present we set it to GLOBAL and skip the post-dispatch
         # local->global rewrite; otherwise the kernel writes LOCAL ids
         # unconditionally (older nccl-ep builds) and the dispatch
         # wrapper applies torch.where to restore the global contract
         # NVLinkOneSided also advertises.
-        try:
-            from nccl.bindings.nccl_ep import ExpertIdKind as _ExpertIdKind
-            from nccl.bindings.nccl_ep import LayoutInfo as _LowLayoutInfo
+        self.kernel_writes_global_ids = False
+        self._expert_id_kind_global = None
+        if self._v0_2_features_enabled:
+            try:
+                from nccl.bindings.nccl_ep import ExpertIdKind as _ExpertIdKind
+                from nccl.bindings.nccl_ep import LayoutInfo as _LowLayoutInfo
 
-            self.kernel_writes_global_ids = hasattr(_LowLayoutInfo(), "recv_topk_idx_kind")
-            self._expert_id_kind_global = (
-                int(_ExpertIdKind.GLOBAL) if self.kernel_writes_global_ids else None
-            )
-        except (ImportError, AttributeError):
-            self.kernel_writes_global_ids = False
-            self._expert_id_kind_global = None
+                self.kernel_writes_global_ids = hasattr(_LowLayoutInfo(), "recv_topk_idx_kind")
+                self._expert_id_kind_global = (
+                    int(_ExpertIdKind.GLOBAL) if self.kernel_writes_global_ids else None
+                )
+            except (ImportError, AttributeError):
+                pass
 
-        # Capability probe for the opportunistic zero-copy dispatch path.
+        # NCCL-EP v0.2+ may support opportunistic zero-copy dispatch.
         # When the Pythonic GroupConfig facade exposes `zero_copy` (i.e.,
         # the wheel was built against a libnccl_ep.so that has the field
         # in ncclEpGroupConfig_t), we allocate a VMM-backed,
         # window-registered dispatch output buffer; the LL dispatch
         # opportunistically picks zero-copy when recv_x->win_hdl is set
-        # (nvlink-only + rank-major + !fp8). The config flag itself stays
+        # (nvlink-only + rank-major). The config flag itself stays
         # AUTO/OFF -- strict zero_copy=ON requires combine inputs to be
         # windowed too, which would force a caller-side interface change
         # (the MLP output is caller-owned). The C-side strict-ON check
         # remains in the library for future use.
-        self.zerocopy_enabled = "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
+        self.zerocopy_enabled = self._v0_2_features_enabled and "zero_copy" in getattr(
+            GroupConfig, "__dataclass_fields__", {}
+        )
 
         # MPI sub-communicator scoped to the EP group. Mirrors the
         # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
@@ -270,21 +273,6 @@ class NcclEpContext:
             dtype=torch.int32,
             device=device,
         )
-        # Optional FP8 scales. Even on rank-major LL the kernel writes a 3D
-        # `[num_local_experts, max_recv, hidden/128]` tensor for scales --
-        # callers that want 2D should view-flatten the first dim.
-        self.scales_buf: Optional[torch.Tensor] = None
-        if use_fp8:
-            if hidden_size % 512 != 0:
-                raise ValueError(f"FP8 dispatch requires hidden % 512 == 0, got {hidden_size}")
-            self.scales_buf = torch.empty(
-                self.num_local_experts,
-                self.max_recv_tokens,
-                hidden_size // 128,
-                dtype=torch.float32,
-                device=device,
-            )
-
         # Wrap each persistent buffer as a Tensor descriptor. Torch owns the
         # storage; the descriptor only carries shape + a pointer (+ window
         # handle on dispatch output when zerocopy is on, so libnccl_ep's
@@ -300,9 +288,6 @@ class NcclEpContext:
         self.recv_topk_idx_nd = Tensor(self.recv_topk_idx_buf)
         self.recv_topk_weights_nd = Tensor(self.recv_topk_weights_buf)
         self.recv_rank_counter_nd = Tensor(self.recv_rank_counter_buf)
-        self.scales_nd: Optional[Tensor] = (
-            Tensor(self.scales_buf) if self.scales_buf is not None else None
-        )
 
     def get_stream(self) -> int:
         """Current CUDA stream as a raw int handle (accepted by ``nccl.ep`` APIs)."""
@@ -374,7 +359,6 @@ def get_nccl_ep_context(
     max_tokens_per_rank: int,
     hidden_size: int,
     max_top_k: int,
-    use_fp8: bool = False,
     layout: Optional[int] = None,
 ) -> NcclEpContext:
     """Get or create a singleton :class:`NcclEpContext` for the given configuration."""
@@ -389,7 +373,6 @@ def get_nccl_ep_context(
         num_experts,
         hidden_size,
         max_top_k,
-        use_fp8,
         int(layout),
     )
     if key not in _ep_group_cache:
@@ -399,7 +382,6 @@ def get_nccl_ep_context(
             max_tokens_per_rank,
             hidden_size,
             max_top_k,
-            use_fp8,
             layout,
         )
     _ep_group_refcounts[key] = _ep_group_refcounts.get(key, 0) + 1
