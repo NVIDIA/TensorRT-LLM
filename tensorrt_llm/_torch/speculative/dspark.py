@@ -404,7 +404,7 @@ class DSparkWorker(SpecWorkerBase):
         )
         return block_logits
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,

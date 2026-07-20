@@ -137,15 +137,13 @@ if constraints_file.exists():
 
 if on_windows:
     package_data = [
-        'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
+        'libs/th_common.dll', 'libs/tensorrt_llm.dll', 'bindings.*.pyd',
+        "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker',
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
-        'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -191,7 +189,6 @@ package_data += [
     # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
     '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
     '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
-    '_torch/visual_gen/cute_dsl_kernels/blackwell/attention/cubins/**/*.so',
     'usage/schemas/*.json',
 ]
 

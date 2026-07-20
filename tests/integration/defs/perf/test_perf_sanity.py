@@ -467,10 +467,18 @@ class ServerConfig:
         self.moe_max_num_tokens = moe_config.get("max_num_tokens", 0)
         self.use_low_precision_moe_combine = moe_config.get("use_low_precision_moe_combine", False)
         load_balancer_config = moe_config.get("load_balancer", {})
-        self.load_balancer_num_slots = load_balancer_config.get("num_slots", 0)
-        self.load_balancer_layer_updates_per_iter = load_balancer_config.get(
-            "layer_updates_per_iter", 0
-        )
+        # load_balancer may be either an inline dict (num_slots + layer_updates_per_iter)
+        # or a path string to an offline-eplb YAML that the TRT-LLM engine loads at
+        # runtime. When it is a string, skip the inline attribute extraction — those
+        # metrics live inside the referenced YAML and aren't scraped by perf-sanity.
+        if isinstance(load_balancer_config, str):
+            self.load_balancer_num_slots = 0
+            self.load_balancer_layer_updates_per_iter = 0
+        else:
+            self.load_balancer_num_slots = load_balancer_config.get("num_slots", 0)
+            self.load_balancer_layer_updates_per_iter = load_balancer_config.get(
+                "layer_updates_per_iter", 0
+            )
 
         # cuda_graph_config
         cuda_graph_config = server_config_data.get("cuda_graph_config", {})
@@ -685,6 +693,15 @@ class ServerConfig:
                 config_data["speculative_config"]["speculative_model"] = os.path.join(
                     llm_models_root(), spec_model
                 )
+
+        # Resolve `moe_config.load_balancer` when it is a repo-relative path
+        # string. The TRT-LLM engine accepts either a dict (inline) or a path
+        # to an offline-eplb YAML. Absolute paths and dicts are left alone.
+        moe_cfg = config_data.get("moe_config")
+        if isinstance(moe_cfg, dict):
+            lb = moe_cfg.get("load_balancer")
+            if isinstance(lb, str) and lb and not os.path.isabs(lb):
+                moe_cfg["load_balancer"] = os.path.join(get_llm_root(), lb)
 
         return yaml.dump(config_data, default_flow_style=False, sort_keys=False)
 
@@ -1726,6 +1743,17 @@ class PerfSanityTestConfig:
                 hardware["num_ctx_servers"] = 0
 
         worker_env_var = environment.get("worker_env_var", "")
+        # Optional per-role env vars appended to the shared worker_env_var so
+        # ctx and gen workers can diverge (e.g. PYTORCH_CUDA_ALLOC_CONF on ctx
+        # only). Absent keys leave the shared value untouched.
+        ctx_worker_env_var_extra = environment.get("ctx_worker_env_var", "") or ""
+        gen_worker_env_var_extra = environment.get("gen_worker_env_var", "") or ""
+        ctx_worker_env_var = " ".join(
+            part for part in (worker_env_var, ctx_worker_env_var_extra) if part
+        )
+        gen_worker_env_var = " ".join(
+            part for part in (worker_env_var, gen_worker_env_var_extra) if part
+        )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
 
@@ -1761,7 +1789,10 @@ class PerfSanityTestConfig:
                 **ctx_config,
             }
 
-            ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
+            # ctx_only runs the ctx worker in aggregated mode; use the merged
+            # ctx-side env var so the aggregated run still gets any ctx-only
+            # extras from the disagg yaml.
+            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
             self.server_configs = [ctx_server_config]
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
@@ -1783,8 +1814,8 @@ class PerfSanityTestConfig:
                 **worker_config.get("gen", {}),
             }
 
-            ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
-            gen_server_config = ServerConfig(gen_server_config_data, worker_env_var)
+            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
+            gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
 
             disagg_config = DisaggConfig(
                 name=f"{benchmark_mode}-{config_file_base_name}",
