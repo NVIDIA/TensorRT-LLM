@@ -2600,6 +2600,8 @@ def create_py_executor_instance(
             scheduler,
             max_num_items=model_engine.encoder_max_num_items,
             max_num_tokens=model_engine.encoder_max_num_tokens,
+            cache_manager=model_engine.mm_encoder_cache_manager,
+            embedding_row_bytes=model_engine.mm_embedding_row_bytes,
         )
 
     config = model_engine.model.model_config.pretrained_config

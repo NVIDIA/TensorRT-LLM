@@ -5331,28 +5331,34 @@ class PyExecutor:
         return context_requests
 
     def _attach_mm_encoder_cache_hits(self) -> None:
-        """Complete pending MM items from the encoder cache before scheduling.
+        """Complete pending MM items from resident cache entries before
+        scheduling.
 
-        Cache hits are stored into the request's item slots ahead of
-        scheduler selection, so they neither consume the encoder budgets nor
-        get re-encoded. A request with remaining misses becomes PARTIAL and
-        keeps following the item path, which re-computes only those misses; a
-        fully attached request graduates to READY without any encoder work.
+        Hits are pinned for the request and recorded into its item slots
+        ahead of scheduler selection, so they neither consume the encoder
+        budgets nor get re-encoded. A request with remaining misses becomes
+        PARTIAL and keeps following the item path, which re-computes only
+        those misses; a fully attached request graduates to READY without
+        any encoder work. Requests without stable content keys can never
+        hit (their outputs live under request-scoped temporary keys), so
+        they are skipped.
         """
+        manager = self.model_engine.mm_encoder_cache_manager
+        if manager is None:
+            return
         for request in self.active_requests:
             state = request.py_mm_encoder_state
             if state is None or is_multimodal_encoder_ready(request):
                 continue
-            cache_and_keys = self.model_engine.get_mm_encoder_cache_and_keys(
-                request)
-            if cache_and_keys is None:
+            item_keys = self.model_engine.get_mm_encoder_item_keys(request)
+            if item_keys is None:
                 continue
-            encoder_cache, item_keys = cache_and_keys
             for item_idx in state.pending_item_indices():
-                cached_output = encoder_cache.get(item_keys[item_idx])
+                cached_output = manager.get_and_pin(item_keys[item_idx],
+                                                    request.request_id)
                 if cached_output is None:
                     continue
-                state.fill(item_idx, cached_output)
+                state.record(item_idx, cached_output)
             state.finalize_into(request.py_multimodal_data)
 
     @nvtx_range("_schedule")
@@ -6455,6 +6461,7 @@ class PyExecutor:
                 # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
                 # at high concurrency.
                 _strip_py_multimodal_data_post_prefill(request)
+                self._unpin_mm_encoder_entries(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -6682,7 +6689,20 @@ class PyExecutor:
         else:
             self._do_terminate_request(request)
 
+    def _unpin_mm_encoder_entries(self, request: LlmRequest) -> None:
+        """Release the request's MM encoder cache pins (idempotent).
+
+        Part of the single teardown funnel: the post-prefill strip releases
+        pins as soon as the embedding is consumed, and `_do_terminate_request`
+        catches every other exit (cancellation, errors, disagg timeouts), so
+        a pin can never outlive its request.
+        """
+        manager = getattr(self.model_engine, "mm_encoder_cache_manager", None)
+        if manager is not None:
+            manager.unpin_request(request.request_id)
+
     def _do_terminate_request(self, request: LlmRequest):
+        self._unpin_mm_encoder_entries(request)
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)

@@ -497,10 +497,25 @@ class MultimodalScheduler(RequestScheduler):
         scheduler: SimpleScheduler,
         max_num_items: int,
         max_num_tokens: int,
+        *,
+        cache_manager=None,
+        embedding_row_bytes: int = 0,
     ) -> None:
         self.scheduler = scheduler
         self.max_num_items = max_num_items
         self.max_num_tokens = max_num_tokens
+        # Optional `MultimodalEncoderCacheManager`: when present, item
+        # selection additionally performs allocate-before-compute against
+        # the manager's byte budget (encoder outputs are stored exclusively
+        # there). `embedding_row_bytes` converts declared embedding rows to
+        # bytes and must be positive alongside a manager.
+        self.cache_manager = cache_manager
+        self.embedding_row_bytes = embedding_row_bytes
+        if cache_manager is not None and embedding_row_bytes <= 0:
+            raise ValueError(
+                "embedding_row_bytes must be positive when a cache manager "
+                "budgets MM encoder output storage"
+            )
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
             scheduler, "micro_batch_scheduler"
         )
@@ -516,12 +531,25 @@ class MultimodalScheduler(RequestScheduler):
         hits gets no boost over older `PENDING` requests — a deliberate
         fairness default.
 
+        When a cache manager is attached, selection also performs
+        allocate-before-compute: an item is only selected if the manager can
+        host its embedding bytes, counting bytes claimed earlier in this
+        pass (selected items are adopted only later this iteration). The
+        first request left incomplete additionally reserves its remaining
+        bytes so requests behind it cannot squat the space it needs across
+        iterations — without this head-of-line reservation, several
+        partially-stored requests could pin fragments of the budget and
+        deadlock waiting on one another.
+
         Returns the selected item indices per request id, plus the requests
         eligible for LLM microbatch scheduling this iteration (encoder
         outputs already ready, or every pending item selected above).
         """
         remaining_items = self.max_num_items
         remaining_tokens = self.max_num_tokens
+        manager = self.cache_manager
+        reserved_bytes = 0
+        head_of_line_reserved = False
         selected: dict[int, list[int]] = {}
         llm_eligible: RequestList = []
 
@@ -553,6 +581,11 @@ class MultimodalScheduler(RequestScheduler):
                 cost = token_lengths[item_idx]
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
+                if manager is not None:
+                    item_bytes = state.embedding_lengths[item_idx] * self.embedding_row_bytes
+                    if not manager.can_allocate(item_bytes, reserved_bytes=reserved_bytes):
+                        break
+                    reserved_bytes += item_bytes
                 request_items.append(item_idx)
                 remaining_items -= 1
                 remaining_tokens -= cost
@@ -562,6 +595,30 @@ class MultimodalScheduler(RequestScheduler):
 
             if pending and len(request_items) == len(pending):
                 llm_eligible.append(request)
+            elif manager is not None and not head_of_line_reserved:
+                # Head-of-line reservation: `request_items` is a prefix of
+                # `pending`, so the unselected suffix is what this request
+                # still needs in future iterations.
+                remaining_request_bytes = (
+                    sum(
+                        state.embedding_lengths[item_idx]
+                        for item_idx in pending[len(request_items) :]
+                    )
+                    * self.embedding_row_bytes
+                )
+                total_request_bytes = sum(state.embedding_lengths) * self.embedding_row_bytes
+                if total_request_bytes > manager.max_bytes:
+                    # Liveness guard: this request's pins can never coexist
+                    # within the budget, so it would starve forever.
+                    raise RuntimeError(
+                        f"Multimodal request {request.py_request_id} needs "
+                        f"{total_request_bytes} bytes of encoder output "
+                        "storage but multimodal_config."
+                        f"encoder_cache_max_bytes only allows "
+                        f"{manager.max_bytes}; raise the cache budget"
+                    )
+                reserved_bytes += remaining_request_bytes
+                head_of_line_reserved = True
 
         return selected, llm_eligible
 
