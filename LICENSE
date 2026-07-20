@@ -20,13 +20,6 @@ Copyright (c) 2024, Tri Dao.
 Licensed under the BSD 3-Clause License
 
 --------------------------------------------------------------------------------
-CUTLASS
---------------------------------------------------------------------------------
-Original Source: https://github.com/NVIDIA/cutlass
-Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-Licensed under the BSD 3-Clause License
-
---------------------------------------------------------------------------------
 flash-attention
 --------------------------------------------------------------------------------
 Original Source: https://github.com/Dao-AILab/flash-attention/
@@ -40,14 +33,6 @@ flash-linear-attention
 Original Source: https://github.com/fla-org/flash-linear-attention
 Copyright (c) 2023-2025 Songlin Yang
 Licensed under the MIT License
-
---------------------------------------------------------------------------------
-FlashInfer
---------------------------------------------------------------------------------
-Original Source: https://github.com/flashinfer-ai/flashinfer
-Copyright 2025-2026 NVIDIA
-Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
-Licensed under the Apache License 2.0
 
 --------------------------------------------------------------------------------
 InstructEval
@@ -73,14 +58,6 @@ Mamba
 Original Source: https://github.com/state-spaces/mamba
 Copyright 2023 Tri Dao, Albert Gu
 Licensed under the Apache License 2.0
-
---------------------------------------------------------------------------------
-MSA (MiniMax Sparse Attention)
---------------------------------------------------------------------------------
-Original Source: https://github.com/MiniMax-AI/MSA
-Copyright (c) 2026 MiniMax
-Licensed under the MIT License
-
 
 --------------------------------------------------------------------------------
 Quack
