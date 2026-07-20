@@ -624,6 +624,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
         self._is_mamba_hybrid_cache = None
 
+        # Worker-side saved spec-dec params; initialized so that a failure
+        # inside _prepare_attn_metadata_for_spec_dec (e.g. an OOM in the
+        # clone calls) cannot turn the cleanup restore into AttributeError.
+        self._saved_packed_mask = None
+        self._saved_position_offsets = None
+        self._saved_position_offsets_cpp = None
+        self._saved_generation_lengths = None
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -679,15 +687,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
 
-    def forward(self,
-                input_ids,
-                position_ids,
-                hidden_states,
-                logits,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                resource_manager=None):
+    def _forward_impl(self,
+                      input_ids,
+                      position_ids,
+                      hidden_states,
+                      logits,
+                      attn_metadata,
+                      spec_metadata,
+                      draft_model,
+                      resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0

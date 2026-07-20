@@ -4732,7 +4732,6 @@ def launchTestJobs(pipeline, testFilter)
         "A10-TensorRT-1": ["a10", "l0_a10", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
-        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
         "A30-CPP-1": ["a30", "l0_a30", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
@@ -4775,7 +4774,6 @@ def launchTestJobs(pipeline, testFilter)
         // "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "H100_PCIe-AutoDeploy-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         // "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
         // "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
         // "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
@@ -5152,6 +5150,46 @@ def launchTestJobs(pipeline, testFilter)
         1,
         36,
         9
+    )
+    // GB300 DeepSeek-V4-Pro disaggregated (4 shapes: single-user latency +
+    // throughput sweep). Each yaml is registered with one active e2e test, so
+    // testCount=1 per shape. gen_only variants remain in the yamls as
+    // commented-out lines and can be re-enabled in a follow-up PR.
+    // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
+        1,
+        36,
+        9
+    )
+    // 10 Nodes: ctx6 (1 node, 4 GPUs each) + gen1 (4 nodes, 16 GPUs) = 40 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX6-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx6_node1_gpu4_gen1_node4_gpu16",
+        1,
+        40,
+        10
+    )
+    // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
+        1,
+        44,
+        11
+    )
+    // 14 Nodes: ctx12 (1 node, 4 GPUs each) + gen1 (2 nodes, 8 GPUs) = 56 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-56_GPUs-14_Nodes-PyTorch-Disagg-PerfSanity-CTX12-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8",
+        1,
+        56,
+        14
     )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()

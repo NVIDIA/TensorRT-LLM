@@ -954,7 +954,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/include/tensorrt_llm/runtime/worldConfig.h",
         "cpp/tensorrt_llm/batch_manager/",
         "cpp/tensorrt_llm/executor/",
-        "cpp/tensorrt_llm/executor_worker/",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
@@ -969,13 +968,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/userbuffers/",
         "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
         "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
-        "cpp/tensorrt_llm/plugins/ncclPlugin/",
         "cpp/tensorrt_llm/nanobind/",
         "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
         "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
@@ -985,8 +977,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/thop/allgatherOp.cpp",
         "cpp/tensorrt_llm/thop/allreduceOp.cpp",
         "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
-        "cpp/tests/e2e_tests/batch_manager/",
-        "cpp/tests/e2e_tests/executor/",
         "cpp/tests/unit_tests/multi_gpu/",
         "jenkins/L0_Test.groovy",
         "tensorrt_llm/_ipc_utils.py",
@@ -1194,15 +1184,6 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
-            if (testFilter[(IS_POST_MERGE)]) {
-                try {
-                    sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
-                    trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
-                } catch (Exception e) {
-                    // No need to fail the stage if the duration file generation fails
-                    echo "An error occurred while generating or uploading the duration file: ${e.toString()}"
-                }
-            }
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
 

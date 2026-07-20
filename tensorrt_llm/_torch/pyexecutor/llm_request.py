@@ -1192,6 +1192,13 @@ def executor_request_to_llm_request(
                                        "py_logprobs_simple_format", False),
     )
 
+    # Bad-words list for the TorchSampler path, kept in its native
+    # list[list[int]] form (single- and multi-token words). This is the
+    # TorchSampler's own input and is independent of any other sampler.
+    llm_request.py_bad_words = [
+        list(word) for word in executor_request.bad_words
+    ] if executor_request.bad_words else None
+
     llm_request.py_original_end_id = getattr(executor_request,
                                              "py_original_end_id",
                                              llm_request.py_end_id)
