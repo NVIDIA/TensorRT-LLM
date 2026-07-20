@@ -71,14 +71,14 @@ if CUR_DIR not in sys.path:
 
 import precheck_config as pcfg  # noqa: E402
 
-# Request-id strides (must keep rids unique across the whole precheck).
-RID_PAIR_STRIDE = 1
-RID_MAX_PAIRS = 4096
-RID_REP_STRIDE = RID_MAX_PAIRS
-RID_MAX_REPS = 64
-RID_LEN_STRIDE = RID_REP_STRIDE * RID_MAX_REPS
-RID_MAX_LENS = 64
-RID_PEER_STRIDE = RID_LEN_STRIDE * RID_MAX_LENS
+# Request-id scheme: rids must be unique across the whole precheck AND
+# dense within a (ctx, gen) session -- the C++ transceiver derives its
+# notification tag from the LOW 12 BITS of the request id (tagFromRequestId,
+# dataTransceiver.cpp), and notifications are matched by (remote agent, tag).
+# A dense per-session sequence keeps tags unique among any 4096 consecutive
+# requests of a session; the peer stride only separates sessions, which talk
+# to distinct agents and therefore cannot alias tags with each other.
+RID_PEER_STRIDE = 1 << 24
 
 
 class _Timeout(Exception):
@@ -97,9 +97,10 @@ def _alarm_handler(signum, frame):
     raise _Timeout()
 
 
-def make_rid(ctx_idx, gen_idx, num_ctx, li, rep, pair):
+def make_rid(ctx_idx, gen_idx, num_ctx, seq):
+    """Unique rid: peer-session base + dense in-session sequence number."""
     peer = gen_idx * num_ctx + ctx_idx
-    return 1 + peer * RID_PEER_STRIDE + li * RID_LEN_STRIDE + rep * RID_REP_STRIDE + pair
+    return 1 + peer * RID_PEER_STRIDE + seq
 
 
 def seed_for(rid, global_layer):
@@ -723,7 +724,9 @@ class PrecheckRunner:
     def _pair_rid(self, peer_idx, li, rep, pair):
         ctx_idx = self.server_idx if self.is_ctx else peer_idx
         gen_idx = peer_idx if self.is_ctx else self.server_idx
-        return make_rid(ctx_idx, gen_idx, self.plan["num_ctx_servers"], li, rep, pair)
+        total_reps = self.plan["warmup_requests"] + self.plan["num_requests"]
+        seq = (li * total_reps + rep) * self.plan["n_pairs"] + pair
+        return make_rid(ctx_idx, gen_idx, self.plan["num_ctx_servers"], seq)
 
     def _owned(self, chunk):
         return pcfg.owned_pairs(self.plan, self.role, self.mapping.tp_rank, chunk)
@@ -909,9 +912,17 @@ def hello_timeout_s(plan, num_peers):
 
     Handshakes are serialized across peers (one gen talks to one ctx at a
     time), so waiting for a peer's hello/welcome can legitimately span other
-    peers' full sessions -- budget rendezvous + per-peer slack.
+    peers' full sessions -- budget rendezvous + per-peer slack (including
+    the peer's first-rep wire-up).
     """
-    return plan["rendezvous_timeout_s"] + num_peers * 300
+    return plan["rendezvous_timeout_s"] + num_peers * (300 + plan["wireup_timeout_s"])
+
+
+def chunk_timeout_s(plan, li, rep):
+    """Per-chunk budget: the first rep additionally pays the one-time NIXL
+    agent wire-up (see PRECHECK_DEFAULTS['wireup_timeout_s'])."""
+    extra = plan["wireup_timeout_s"] if (li == 0 and rep == 0) else 0
+    return plan["chunk_timeout_s"] + extra
 
 
 # --------------------------------------------------------------------------- #
@@ -946,7 +957,7 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     leader_reply(("welcome", {"fingerprint": plan["fingerprint"]}))
 
     for li, req_len, rep, chunk in _schedule(plan):
-        arm(f"gen_{peer_idx} len={req_len} rep={rep}")
+        arm(f"gen_{peer_idx} len={req_len} rep={rep}", seconds=chunk_timeout_s(plan, li, rep))
         msg = leader_recv()
         if msg[0] == "abort":
             raise _PeerAbort(f"gen_{peer_idx} aborted: {msg[1]}")
@@ -1024,15 +1035,20 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
         if reply[0] != "welcome":
             raise _TransferError(f"unexpected handshake reply from ctx_{peer_idx}: {reply[:1]}")
-        # Established sessions are dedicated: chunk replies are prompt.
+        # Established sessions are dedicated: chunk replies are prompt. The
+        # ZMQ timeout is only a backstop under the per-chunk alarm, so it
+        # includes the first-rep wire-up allowance unconditionally.
         if runner.is_leader:
             import zmq as zmq_mod
 
-            sock.setsockopt(zmq_mod.RCVTIMEO, (plan["chunk_timeout_s"] + 30) * 1000)
+            sock.setsockopt(
+                zmq_mod.RCVTIMEO,
+                (plan["chunk_timeout_s"] + plan["wireup_timeout_s"] + 30) * 1000,
+            )
 
         case_ok = {}
         for li, req_len, rep, chunk in _schedule(plan):
-            arm(f"ctx_{peer_idx} len={req_len} rep={rep}")
+            arm(f"ctx_{peer_idx} len={req_len} rep={rep}", seconds=chunk_timeout_s(plan, li, rep))
             reply = runner._leader_send_recv(
                 sock, ("go", {"li": li, "rep": rep, "chunk": chunk[0]}), key
             )
