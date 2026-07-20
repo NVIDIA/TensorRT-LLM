@@ -806,6 +806,12 @@ class PyTorchModelEngine(ModelEngine):
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
 
+        # Cache for enc-dec cross-attention stable generation steps.
+        # Populated on the first CUDA-graph generation step; cleared whenever
+        # the batch composition changes (new encoder request arrives).
+        self._cross_attn_stable_cached_tokens: Optional[List[int]] = None
+        self._cross_attn_stable_request_ids: Optional[List[int]] = None
+
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
@@ -2868,12 +2874,45 @@ class PyTorchModelEngine(ModelEngine):
             skip_cross_kv_projection = True
 
         if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
-            cross_attn_metadata = attn_metadata.update_cross_metadata(
-                encoder_seq_lens=encoder_seq_lens,
-                cross_kv_cache_manager=cross_kv_cache_manager,
-                encoder_num_cached_tokens_per_seq=
-                encoder_num_cached_tokens_per_seq,
+            # Fast path for stable CUDA-graph generation steps: the encoder
+            # KV lengths (kv_lens_cuda) and the frozen prompt lengths
+            # (prompt_lens_cuda) are identical across all generation steps
+            # for a fixed batch. Skip the expensive torch.tensor() allocations
+            # and H2D copies inside prepare() when nothing has changed.
+            is_stable_gen_step = (
+                new_encoder_tokens == 0  # pure generation, no new cross-KV
+                and self._cross_attn_stable_cached_tokens
+                == encoder_num_cached_tokens_per_seq
+                and self._cross_attn_stable_request_ids
+                == attn_metadata.request_ids  # same batch and row order
             )
+            if is_stable_gen_step:
+                cross_attn_metadata = attn_metadata.cross
+                # Only refresh the decoder-side Python references that the
+                # kernel reads; these are pointer-level updates with no alloc.
+                cross_attn_metadata._seq_lens = attn_metadata.seq_lens
+                cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
+                cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
+                cross_attn_metadata.request_ids = attn_metadata.request_ids
+                cross_attn_metadata.num_contexts = attn_metadata.num_contexts
+            else:
+                cross_attn_metadata = attn_metadata.update_cross_metadata(
+                    encoder_seq_lens=encoder_seq_lens,
+                    cross_kv_cache_manager=cross_kv_cache_manager,
+                    encoder_num_cached_tokens_per_seq=
+                    encoder_num_cached_tokens_per_seq,
+                )
+                cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    # Record this stable state for future fast-path use.
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(
+                        attn_metadata.request_ids)
+                else:
+                    # Batch changed (new encoder request); reset cache.
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
                 cross_kv_cache_manager=cross_kv_cache_manager,
@@ -2883,7 +2922,18 @@ class PyTorchModelEngine(ModelEngine):
             )
             if attn_metadata.is_cuda_graph:
                 attn_metadata.cross = cross_attn_metadata
-        cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(
+                        attn_metadata.request_ids)
+                else:
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
+            else:
+                self._cross_attn_stable_cached_tokens = None
+                self._cross_attn_stable_request_ids = None
+            cross_attn_metadata.prepare()
 
         return {
             "encoder_hidden_states": packed_encoder_hidden_states,
@@ -6185,7 +6235,7 @@ class PyTorchModelEngine(ModelEngine):
         encoder_attn_metadata.num_contexts = len(encoder_requests)
         encoder_attn_metadata.max_seq_len = self.max_seq_len
         encoder_attn_metadata.request_ids = request_ids
-        encoder_attn_metadata.prepare()
+        encoder_attn_metadata.prepare_encoder_only()
 
         encoder_input_ids_t = torch.tensor(encoder_input_ids,
                                            dtype=torch.int,
