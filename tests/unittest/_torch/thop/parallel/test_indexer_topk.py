@@ -814,14 +814,16 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8])
-@pytest.mark.parametrize("index_topk", [4096, 8192, 16384])
+@pytest.mark.parametrize("index_topk", [1023, 2047, 4095, 4096, 8192, 16384])
 @pytest.mark.parametrize("num_tokens", [32768, 131072])
-def test_cute_dsl_topk_decode_high_k(batch_size, index_topk, num_tokens):
-    """top_k above 4096 stays bit-exact (wrapper guard raised to 16384).
+def test_cute_dsl_topk_decode_high_and_odd_k(batch_size, index_topk, num_tokens):
+    """Large (>4096) and odd top_k stay bit-exact on the decode entry points.
 
-    Covers the three decode entry points: the single-CTA and multi-CTA
-    Blackwell wrappers (whose top_k guard this test backs) and the indexer
-    variant used by KV-cache eviction with large keep budgets.
+    The indexer entry point is the path KV-cache eviction uses with large or
+    odd keep budgets, so it is checked for every top_k across all three dtypes
+    (the scalar output write at vecsize_out=1 is dtype dependent). The
+    single-CTA and multi-CTA wrappers, whose raised guard this test backs, only
+    support even top_k, so they are checked on the even values in fp32.
     """
 
     def run_single_cta(logits, seq_lens):
@@ -857,55 +859,40 @@ def test_cute_dsl_topk_decode_high_k(batch_size, index_topk, num_tokens):
         )
         return output_indices
 
-    for run_fn in (run_single_cta, run_multi_cta, run_indexer):
-        _run_cute_dsl_topk_test(
-            batch_size,
-            1,
-            index_topk,
-            num_tokens,
-            torch.float32,
-            run_fn,
-        )
+    if index_topk % 2 == 0:
+        # Even top_k: all three entry points are defined; the raised guard this
+        # test backs is exercised on the wrappers in fp32.
+        dtype_runs = [(torch.float32, (run_single_cta, run_multi_cta, run_indexer))]
+    else:
+        # Odd top_k: only the indexer path supports it, checked across dtypes.
+        dtype_runs = [
+            (torch.float32, (run_indexer,)),
+            (torch.float16, (run_indexer,)),
+            (torch.bfloat16, (run_indexer,)),
+        ]
 
-
-@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
-@skip_pre_blackwell
-@pytest.mark.parametrize("batch_size", [1, 8])
-@pytest.mark.parametrize("index_topk", [1023, 2047, 4095])
-def test_cute_dsl_indexer_topk_decode_odd_k(batch_size, index_topk):
-    """Odd top_k stays bit-exact on the indexer decode entry point."""
-    num_tokens = 32768
-
-    def run_indexer(logits, seq_lens):
-        output_indices = torch.empty(batch_size, index_topk, dtype=torch.int32, device="cuda")
-        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-            input_values=logits,
-            seq_lens=seq_lens,
-            output_indices=output_indices,
-            top_k=index_topk,
-            next_n=1,
-            num_copy_bits=256,
-        )
-        return output_indices
-
-    _run_cute_dsl_topk_test(
-        batch_size,
-        1,
-        index_topk,
-        num_tokens,
-        torch.float32,
-        run_indexer,
-    )
+    for dtype, run_fns in dtype_runs:
+        for run_fn in run_fns:
+            _run_cute_dsl_topk_test(
+                batch_size,
+                1,
+                index_topk,
+                num_tokens,
+                dtype,
+                run_fn,
+            )
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("top_k", [1023, 2047, 2048])
-def test_filtered_topk_varlen_odd_k(top_k):
+@pytest.mark.parametrize("dtype_name", ["float32", "float16", "bfloat16"])
+def test_filtered_topk_varlen_odd_k(top_k, dtype_name):
     """The filtered varlen kernel supports odd top_k (scalar output tail).
 
     The reference check inside the runner asserts bitwise agreement with a
-    torch reference; 2048 is the even control.
+    torch reference; 2048 is the even control. The scalar tail write is dtype
+    dependent, so all three supported dtypes are exercised.
     """
     import cutlass
 
@@ -913,8 +900,14 @@ def test_filtered_topk_varlen_odd_k(top_k):
         run_topk_decode,
     )
 
+    dtype = {
+        "float32": cutlass.Float32,
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+    }[dtype_name]
+
     run_topk_decode(
-        cutlass.Float32,
+        dtype,
         batch_size=16,
         max_num_cols=4096,
         top_k=top_k,
@@ -1550,6 +1543,52 @@ def test_cute_dsl_topk_decode_single_pass_multi_cta_cluster(
             return_val=False,
             num_copy_bits=256,
         )
+        if result[0] is None:
+            pytest.skip("Problem size exceeds cluster kernel capacity")
+        return result[0]
+
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        run_fn,
+    )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("index_topk", [2047, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_cluster", [False, True])
+def test_cute_dsl_single_pass_multi_cta_high_and_odd_k(batch_size, index_topk, dtype, use_cluster):
+    """Large (>2048) and odd top_k stay bit-exact on the single-pass multi-CTA
+    and cluster decode paths.
+
+    The raised wrapper guard forwards these values to both dispatch paths, so
+    this covers the odd-K scalar output write on routes the other tests only
+    exercise at top_k=2048.
+    """
+    num_tokens = 131072
+    next_n = 1
+
+    if use_cluster:
+        runner = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner
+    else:
+        runner = cute_dsl_custom_ops.CuteDSLTopKDecodeSinglePassMultiCTARunner
+
+    def run_fn(logits, seq_lens):
+        result = runner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            return_val=False,
+            num_copy_bits=256,
+        )
+        # The cluster runner returns None when the problem exceeds its capacity.
         if result[0] is None:
             pytest.skip("Problem size exceeds cluster kernel capacity")
         return result[0]
