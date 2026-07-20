@@ -367,6 +367,68 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
     }
 }
 
+template <int VEC_SIZE, typename ThreadingPolicy>
+__device__ void vectorized_dispatch_compact_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
+    int max_tokens_per_rank, int payload_idx, DispatchKernelPointers const& ptrs, int const* compact_send_indices,
+    int ep_size)
+{
+    using flashinfer::vec_t;
+
+    size_t const source_rank_base = static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank);
+    int const stride = ThreadingPolicy::stride() * VEC_SIZE;
+    for (int offset = ThreadingPolicy::offset() * VEC_SIZE; offset < bytes_per_token; offset += stride)
+    {
+        vec_t<uint8_t, VEC_SIZE> value;
+        value.load(src_ptr + offset);
+
+#pragma unroll 1
+        for (int target_rank = 0; target_rank < ep_size; ++target_rank)
+        {
+            int const dst_token_idx = compact_send_indices[target_rank];
+            if (dst_token_idx < 0)
+            {
+                continue;
+            }
+            uint8_t* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][payload_idx]);
+            size_t const base_token
+                = (source_rank_base + static_cast<size_t>(dst_token_idx)) * static_cast<size_t>(bytes_per_token);
+            value.store(dst_data + base_token + offset);
+        }
+    }
+}
+
+template <typename ThreadingPolicy>
+__device__ void vectorized_dispatch_compact(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
+    int max_tokens_per_rank, int payload_idx, DispatchKernelPointers const& ptrs, int const* compact_send_indices,
+    int ep_size)
+{
+    if (bytes_per_token % 16 == 0)
+    {
+        vectorized_dispatch_compact_impl<16, ThreadingPolicy>(
+            src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs, compact_send_indices, ep_size);
+    }
+    else if (bytes_per_token % 8 == 0)
+    {
+        vectorized_dispatch_compact_impl<8, ThreadingPolicy>(
+            src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs, compact_send_indices, ep_size);
+    }
+    else if (bytes_per_token % 4 == 0)
+    {
+        vectorized_dispatch_compact_impl<4, ThreadingPolicy>(
+            src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs, compact_send_indices, ep_size);
+    }
+    else if (bytes_per_token % 2 == 0)
+    {
+        vectorized_dispatch_compact_impl<2, ThreadingPolicy>(
+            src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs, compact_send_indices, ep_size);
+    }
+    else
+    {
+        vectorized_dispatch_compact_impl<1, ThreadingPolicy>(
+            src_ptr, bytes_per_token, rank_id, max_tokens_per_rank, payload_idx, ptrs, compact_send_indices, ep_size);
+    }
+}
+
 __global__ void moeA2APrepareDispatchKernel(
     int* send_counters, int* local_token_counter, int ep_size, uint32_t* flag_val_ptr)
 {
@@ -393,14 +455,13 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
+template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool COMPACT_FANOUT>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
 {
-    int thread_idx = ThreadingPolicy::offset();
     int local_token_idx = ThreadingPolicy::token_idx();
 
     if (local_num_tokens == 0)
@@ -420,86 +481,104 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         if (local_token_idx >= local_num_tokens)
             return;
 
-        // One block per token: a single shared-memory tile is reused by the entire CTA.
+        // One block per token. Compact fanout stages one entry per destination rank;
+        // non-compact fanout stages target and send indices per top-k slot.
         extern __shared__ int smem[];
-        int* smem_topk_target_ranks = smem;
-        int* smem_topk_send_indices = smem + TOP_K;
-
-        uint64_t already_copied[kRankMaskWords] = {};
-        // Precompute the ceil/floor partition parameters once per thread, outside the
-        // per-token TOP_K loop. The fast path (remainder == 0) then collapses to a single
-        // integer divide per call, matching the pre-PR uniform-partition cost exactly.
-        int const ep_base = num_experts / ep_size;
-        int const ep_remainder = num_experts - ep_base * ep_size; // == num_experts % ep_size
+        int* compact_send_indices = smem;
+        int* topk_target_ranks_smem = smem;
+        int* topk_send_indices_smem = smem + TOP_K;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
 #endif
-        for (int k = 0; k < TOP_K; k++)
+
+        if (threadIdx.x < warpSize)
         {
-            int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-            // Use contiguous ceil/floor partitioning to determine target rank.
-            // Supports the non-divisible case where num_experts % ep_size != 0.
-            int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
-
-            int const mask_word = target_rank >> 6;
-            uint64_t const mask_bit = 1ULL << (target_rank & 63);
-            bool const target_already_copied = (already_copied[mask_word] & mask_bit) != 0;
-            bool skip_target = target_already_copied;
-            if constexpr (ENABLE_RANK_MASK)
+            int const laneId = threadIdx.x;
+            if constexpr (COMPACT_FANOUT)
             {
-                // This is a fail-closed safety guard until post-commit routing is enforced end to end.
-                // A masked route is not valid model output; the failed execution epoch must be discarded.
-                skip_target = skip_target || !is_rank_active(ptrs.active_rank_mask, target_rank);
-            }
-            if (skip_target)
-            {
-                if (thread_idx == 0)
+                for (int targetRank = laneId; targetRank < ep_size; targetRank += warpSize)
                 {
-                    ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
-                    ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
-                    // Mirror to shared memory immediately
-                    smem_topk_target_ranks[k] = -1;
-                    smem_topk_send_indices[k] = -1;
+                    compact_send_indices[targetRank] = -1;
                 }
-                continue;
+                __syncwarp();
             }
 
-            // Only one thread per warp should increment the counter
-            int dst_token_idx;
-            if (thread_idx == 0)
+            unsigned int const topkMask = __ballot_sync(0xFFFFFFFFU, laneId < TOP_K);
+            if (laneId < TOP_K)
             {
-                dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+                int const epBase = num_experts / ep_size;
+                int const epRemainder = num_experts - epBase * ep_size;
+                int const expertId = token_selected_experts[local_token_idx * TOP_K + laneId];
+                int const targetRank = compute_target_rank_id(expertId, epBase, epRemainder);
+                unsigned int const matchingLanes = __match_any_sync(topkMask, targetRank);
 
-                ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
-                ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-                // Mirror to shared memory immediately
-                smem_topk_target_ranks[k] = target_rank;
-                smem_topk_send_indices[k] = dst_token_idx;
+                bool targetActive = true;
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    targetActive = is_rank_active(ptrs.active_rank_mask, targetRank);
+                }
+
+                int metadataRank = -1;
+                int dstTokenIdx = -1;
+                bool const isFirst = laneId == __ffs(matchingLanes) - 1;
+                if (isFirst && targetActive)
+                {
+                    dstTokenIdx = atomicAdd(&ptrs.send_counters[targetRank], 1);
+                    metadataRank = targetRank;
+                }
+
+                if constexpr (COMPACT_FANOUT)
+                {
+                    if (dstTokenIdx >= 0)
+                    {
+                        compact_send_indices[targetRank] = dstTokenIdx;
+                    }
+                }
+                else
+                {
+                    topk_target_ranks_smem[laneId] = metadataRank;
+                    topk_send_indices_smem[laneId] = dstTokenIdx;
+                }
+
+                ptrs.topk_target_ranks[local_token_idx * TOP_K + laneId] = metadataRank;
+                ptrs.topk_send_indices[local_token_idx * TOP_K + laneId] = dstTokenIdx;
             }
-            already_copied[mask_word] |= mask_bit;
         }
-        // Sync before dispatching data
+
         ThreadingPolicy::sync();
 
-        // Read staged routing once into registers per thread
-        int topk_target_ranks[TOP_K];
-        int topk_send_indices[TOP_K];
-#pragma unroll
-        for (int k = 0; k < TOP_K; ++k)
+        if constexpr (COMPACT_FANOUT)
         {
-            topk_target_ranks[k] = smem_topk_target_ranks[k];
-            topk_send_indices[k] = smem_topk_send_indices[k];
+            for (int payload_idx = 0; payload_idx < num_payloads; ++payload_idx)
+            {
+                uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+                int const bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+                uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+
+                vectorized_dispatch_compact<ThreadingPolicy>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                    payload_idx, ptrs, compact_send_indices, ep_size);
+            }
         }
-
-        // Perform a single source load and TOP_K fanout per payload
-        for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
+        else
         {
-            uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
-            int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-            uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+            int topk_target_ranks[TOP_K];
+            int topk_send_indices[TOP_K];
+#pragma unroll
+            for (int k = 0; k < TOP_K; ++k)
+            {
+                topk_target_ranks[k] = topk_target_ranks_smem[k];
+                topk_send_indices[k] = topk_send_indices_smem[k];
+            }
 
-            vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+            for (int payload_idx = 0; payload_idx < num_payloads; ++payload_idx)
+            {
+                uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+                int const bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+                uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+
+                vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                    payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+            }
         }
 
         ThreadingPolicy::sync();
@@ -708,14 +787,17 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     {
         grid_size = 1;
     }
-    int shared_bytes = 2 * params.top_k * (int) sizeof(int);
+    bool const useCompactFanout = params.ep_size < params.top_k;
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
         SWITCH_TOP_K(params.top_k, TOP_K, {
-            auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
-            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
-                params.eplb_stats_num_experts);
+            SWITCH_BOOL(useCompactFanout, COMPACT_FANOUT, {
+                int const sharedBytes = (COMPACT_FANOUT ? params.ep_size : 2 * TOP_K) * static_cast<int>(sizeof(int));
+                auto kernelFn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS, ENABLE_RANK_MASK, COMPACT_FANOUT>;
+                launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernelFn, grid_size, kBlockSize, sharedBytes,
+                    params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                    params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
+                    params.num_experts, params.eplb_stats_num_experts);
+            });
         });
     })})
 }
