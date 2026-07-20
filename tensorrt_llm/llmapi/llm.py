@@ -44,6 +44,9 @@ from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .reasoning_parser import (
+    adapt_guided_decoding_params_for_reasoning_parser,
+    resolve_raw_guided_decoding_reasoning_parser)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -1289,6 +1292,24 @@ class BaseLLM:
                 sampling_params._setup(self.tokenizer, self._hf_model_config,
                                        self._generation_config)
             self._add_bart_forced_tokens_logits_processor(sampling_params)
+            if sampling_params.guided_decoding is not None:
+                reasoning_format_for_guided_decoding = (
+                    resolve_raw_guided_decoding_reasoning_parser(
+                        self.args.reasoning_parser,
+                        getattr(self._hf_model_config, "model_type", None),
+                        self.args.guided_decoding_backend,
+                    ))
+                if reasoning_format_for_guided_decoding is not None:
+                    # SamplingParams carries a caller-provided content
+                    # constraint, but not how this model frames reasoning and
+                    # final output. Add that model-aware framing here so
+                    # xgrammar applies the guide only to Harmony's final
+                    # channel. Other formats preserve the original guide.
+                    sampling_params.guided_decoding = (
+                        adapt_guided_decoding_params_for_reasoning_parser(
+                            sampling_params.guided_decoding,
+                            reasoning_format_for_guided_decoding,
+                        ))
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.args.reasoning_parser,

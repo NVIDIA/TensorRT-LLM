@@ -19,13 +19,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Type
 
-from tensorrt_llm import logger
+from tensorrt_llm.logger import logger
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
 @dataclass
 class ReasoningParserResult:
     content: str = ""
     reasoning_content: str = ""
+
+
+HARMONY_REASONING_PARSER = "gpt_oss"
+HARMONY_FINAL_CHANNEL_TRIGGER = "<|start|>assistant<|channel|>final<|message|>"
+
+# Unlike normal reasoning parsers, Harmony is selected automatically by the
+# serving stack from the model type. Raw LLM requests need the same default
+# when they arrive with pre-built SamplingParams.
+_DEFAULT_GUIDED_DECODING_REASONING_PARSER_BY_MODEL_TYPE = {
+    "gpt_oss": HARMONY_REASONING_PARSER,
+}
 
 
 def register_reasoning_parser(*keys: str, **default_kwargs):
@@ -106,6 +118,127 @@ class IdentityReasoningParser(BaseReasoningParser):
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         return ReasoningParserResult(content=delta_text)
+
+
+def resolve_guided_decoding_reasoning_parser(
+    reasoning_parser: Optional[str],
+    model_type: Optional[str],
+) -> Optional[str]:
+    """Resolve the reasoning format used to scope a request's guide.
+
+    An explicitly configured parser always wins. The model-type dispatch only
+    supplies formats that serving already selects implicitly, currently the
+    GPT-OSS Harmony protocol. Other raw LLM models therefore retain their
+    pre-existing guided-decoding behavior unless a parser was configured.
+    """
+    if reasoning_parser is not None:
+        return reasoning_parser
+    return _DEFAULT_GUIDED_DECODING_REASONING_PARSER_BY_MODEL_TYPE.get(
+        model_type)
+
+
+def resolve_raw_guided_decoding_reasoning_parser(
+    reasoning_parser: Optional[str],
+    model_type: Optional[str],
+    guided_decoding_backend: Optional[str],
+) -> Optional[str]:
+    """Resolve the reasoning format that raw LLM requests should adapt.
+
+    Raw LLM only needs new final-content scoping for Harmony, and structural
+    tags are supported by xgrammar only. Explicit normal parsers and
+    llguidance retain their pre-existing raw guided-decoding behavior.
+    """
+    resolved_parser = resolve_guided_decoding_reasoning_parser(
+        reasoning_parser, model_type)
+    if (resolved_parser is not None
+            and resolved_parser.lower() == HARMONY_REASONING_PARSER
+            and guided_decoding_backend == "xgrammar"):
+        return HARMONY_REASONING_PARSER
+    return None
+
+
+def _normalize_json_schema_for_structural_tag(json_schema: Any) -> Any:
+    """Convert supported schema representations to structural-tag JSON."""
+    if hasattr(json_schema, "model_json_schema"):
+        json_schema = json_schema.model_json_schema()
+    if isinstance(json_schema, str):
+        json_schema = json.loads(json_schema)
+    return json_schema
+
+
+def _guided_decoding_content(
+        guided_decoding_params: GuidedDecodingParams) -> Optional[dict]:
+    """Translate an ordinary guide into structural-tag content."""
+    if guided_decoding_params.json is not None:
+        json_schema = _normalize_json_schema_for_structural_tag(
+            guided_decoding_params.json)
+        return {"type": "json_schema", "json_schema": json_schema}
+    if guided_decoding_params.json_object:
+        return {"type": "json_schema", "json_schema": {"type": "object"}}
+    if guided_decoding_params.regex is not None:
+        return {"type": "regex", "pattern": guided_decoding_params.regex}
+    if guided_decoding_params.grammar is not None:
+        return {"type": "grammar", "grammar": guided_decoding_params.grammar}
+    return None
+
+
+def adapt_guided_decoding_params_for_reasoning_parser(
+    guided_decoding_params: Optional[GuidedDecodingParams],
+    reasoning_parser: Optional[str],
+) -> Optional[GuidedDecodingParams]:
+    """Scope a guide to final content while leaving reasoning unconstrained.
+
+    Normal reasoning formats use a reasoning-tag sequence. Harmony instead
+    activates the guide when the assistant's final channel begins. Existing
+    structural-tag guides are already fully specified and remain untouched.
+    """
+    if guided_decoding_params is None or reasoning_parser is None:
+        return guided_decoding_params
+    if guided_decoding_params.structural_tag is not None:
+        return guided_decoding_params
+
+    content = _guided_decoding_content(guided_decoding_params)
+    if content is None:
+        return guided_decoding_params
+
+    if reasoning_parser.lower() == HARMONY_REASONING_PARSER:
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": [HARMONY_FINAL_CHANNEL_TRIGGER],
+            "tags": [{
+                "begin": HARMONY_FINAL_CHANNEL_TRIGGER,
+                "content": content,
+                "end": "",
+            }],
+            "stop_after_first":
+            True,
+        }
+    else:
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            reasoning_parser)
+        stag_format = {
+            "type":
+            "sequence",
+            "elements": [
+                {
+                    "type": "tag",
+                    "begin": parser.reasoning_start,
+                    "content": {
+                        "type": "any_text"
+                    },
+                    "end": parser.reasoning_end,
+                },
+                content,
+            ],
+        }
+
+    structural_tag = {
+        "type": "structural_tag",
+        "format": stag_format,
+    }
+    return GuidedDecodingParams(
+        structural_tag=json.dumps(structural_tag, separators=(",", ":")))
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
