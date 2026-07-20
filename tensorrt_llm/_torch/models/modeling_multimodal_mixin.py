@@ -1001,6 +1001,19 @@ class MultimodalModelMixin:
         for them this cache stays empty in the executor loop (their requests
         arrive here with embeddings already attached). The key format is
         shared (`_encoder_cache_item_key`) so the two stores can unify later.
+
+        TODO(TRTLLM-14477): unify the full-request consumers onto the
+        `MultimodalEncoderCacheManager` and retire this clone cache:
+        (1) inject the manager into the model and switch
+        `_attach_encoder_cache_hit` to `get_and_hold` and
+        `_write_encoder_cache_entries` to a clone-adopt `put` (batch-tensor
+        slices must not retain the whole batch allocation) — this also puts
+        side-stream prefetch under the byte budget; (2) assemble partial
+        hits by encoding only the misses through
+        `prepare_multimodal_encoder_inputs` (resolves TRTLLM-13996 for all
+        consumers); (3) delete this getter, `_encoder_cache_keys`,
+        `supports_encoder_cache`, and the legacy reservation branch in
+        `_reserve_multimodal_encoder_cache_memory`.
         """
         if not self.encoder_cache_active:
             logger.debug_once(

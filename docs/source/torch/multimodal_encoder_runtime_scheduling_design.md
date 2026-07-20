@@ -91,11 +91,11 @@ boundaries. The scheduler therefore needs an MM-specific unit of work and budget
 2. Keep one MM item atomic and preserve numerically equivalent encoder and end-to-end results.
 3. Preserve the existing MM behavior in which encoder output can feed an LLM forward in the same
    iteration.
-4. Preserve the exact non-MM scheduling path and avoid measurable overhead for non-MM models.
-5. Reuse existing request metadata, schedule distribution, and model-specific input processors where
+5. Preserve the exact non-MM scheduling path and avoid measurable overhead for non-MM models.
+6. Reuse existing request metadata, schedule distribution, and model-specific input processors where
    practical.
-6. Support Qwen2-VL/Qwen2.5-VL, Qwen3-VL, and Mistral3/Pixtral in the initial implementation.
-7. Provide a controlled experiment for eager encoder scheduling without making it the default.
+7. Support Qwen2-VL/Qwen2.5-VL, Qwen3-VL, and Mistral3/Pixtral in the initial implementation.
+8. Provide a controlled experiment for eager encoder scheduling without making it the default.
 
 ## Non-goals
 
@@ -416,7 +416,7 @@ The current request path is:
 7. **LLM execution.** A request whose last pending items were selected can enter the same iteration's
    LLM context batch. A request still missing items is absent from the LLM batch and retries next
    iteration. An iteration with only encoder progress skips the empty LLM work.
-8. **Post-completion lifetime.** Once all item slots are ready, the contiguous buffer becomes
+9. **Post-completion lifetime.** Once all item slots are ready, the contiguous buffer becomes
    `multimodal_embedding` and raw media tensors are removed. Later chunked-prefill iterations reuse the
    embedding without recharging the encoder budget. Normal request teardown eventually releases it.
 
@@ -907,7 +907,7 @@ Required comparisons include:
 6. Complete precomputed embeddings bypassing the encoder budget.
 7. Cancellation while an item is pending and while it is in flight.
 8. Distributed schedule serialization and reconstruction.
-9. Default versus eager admission with identical encoder output and final greedy tokens.
+10. Default versus eager admission with identical encoder output and final greedy tokens.
 
 Tests compare encoder outputs using dtype-appropriate numerical tolerances. Bitwise equality is not
 always possible when a kernel sees a different physical batch, but deterministic greedy generation
@@ -1070,19 +1070,28 @@ minimum for models without an override.
 
 The following are intentionally not required to land the first runtime-enforcement change:
 
-1. What resident-output byte limit and eviction policy should eager mode use? GPU-to-host offload
-   is not planned for the current work.
+1. ~~What resident-output byte limit and eviction policy should eager mode use?~~ Resolved by the
+   single budgeted storage: `encoder_cache_max_bytes` bounds residency for both policies, with
+   zero-ref LRU eviction. GPU-to-host offload remains unplanned.
 2. How should MM prefetch and the overlap scheduler coordinate item ownership and execution ordering?
-3. What production benchmark threshold should justify enabling the eager policy for a workload?
-4. Is strict FCFS waiting admission preferable after production traces, or should a bounded bypass or
+   Partially planned: storage unification (see below) puts prefetch under the same byte budget.
+3. **Storage/manifest unification plan ([TRTLLM-14477](https://jirasw.nvidia.com/browse/TRTLLM-14477); TODO markers in code):** (a) migrate the full-request
+   consumers (prefetch, `mm_encoder_only`/disagg, non-item models) onto the
+   `MultimodalEncoderCacheManager` — see the TODO on `_get_multimodal_encoder_cache()`; (b) assemble
+   partial hits by encoding only misses through the item-slicing machinery, resolving TRTLLM-13996
+   for all consumers; (c) retire the legacy clone cache; (d) single-source the prompt-order manifest
+   (`item_refs` vs `MultimodalParams.mm_item_order`) at the input processor — see the TODO on
+   `MultimodalEncoderItemMetadata`.
+4. What production benchmark threshold should justify enabling the eager policy for a workload?
+5. Is strict FCFS waiting admission preferable after production traces, or should a bounded bypass or
    best-fit policy be added?
-5. Which model families can prove semantically equivalent item-internal chunking?
-6. How should a cross-request cache coordinate ownership across DP and disaggregated deployments?
-7. When encoder/tower LoRA is supported, how should adapter residency interact with batching and cache
+6. Which model families can prove semantically equivalent item-internal chunking?
+7. How should a cross-request cache coordinate ownership across DP and disaggregated deployments?
+8. When encoder/tower LoRA is supported, how should adapter residency interact with batching and cache
    keys?
-8. Should MM encoder execution move to PP stage 0 with an embedding broadcast, or should duplicated
+9. Should MM encoder execution move to PP stage 0 with an embedding broadcast, or should duplicated
    all-stage execution remain the supported ownership model?
-9. Can a request-lifecycle counter make text-only iterations constant time without adding fragile
+10. Can a request-lifecycle counter make text-only iterations constant time without adding fragile
    bookkeeping on completion, cancellation, and error paths?
 
 ## Reference implementation map
