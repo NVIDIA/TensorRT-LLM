@@ -57,7 +57,7 @@ from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -120,6 +120,24 @@ def _red_global_fmax_ordered(addr_i64, fval, *, loc=None, ip=None):
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def _atom_global_add_s32(addr_i64, ival, *, loc=None, ip=None):
+    """atom.global.add.s32 returning the OLD value (warp batch-claim)."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr_i64.ir_value(loc=loc, ip=ip), ival.ir_value(loc=loc, ip=ip)],
+            "atom.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 
@@ -451,6 +469,8 @@ class FP4MQALogitsKernel:
         emit_block_meta: bool = False,
         emit_hit_stats: bool = True,
         emit_seed_counts: bool = False,
+        emit_cand: bool = False,
+        cand_cap: int = 5120,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -539,6 +559,19 @@ class FP4MQALogitsKernel:
         if emit_seed_counts and not emit_block_meta:
             raise ValueError("emit_seed_counts requires emit_block_meta")
         self.emit_seed_counts = emit_seed_counts
+        # emit_cand (L2 of the epilogue suite): unordered pre-collect of all
+        # (value, index) pairs >= the t_0 seed threshold via warp ballot +
+        # lane0 batch atomic claim. claimed >= K certifies the candidate
+        # set covers the true top-K (contract in epilogue_topk_interface.md).
+        if emit_cand and not emit_seed_counts:
+            raise ValueError("emit_cand requires emit_seed_counts (t_0 source)")
+        self.emit_cand = emit_cand
+        self.cand_cap = cand_cap
+        # Per-warp claim window: one atomic claims (hits + CAND_WIN) slots;
+        # subsequent hits consume the window latency-free. The unconsumed
+        # tail is sentinel-filled (idx = -1) at q-transition/loop end, so
+        # `claimed` over-approximates the true count (counts[r][0] exact).
+        self.CAND_WIN = 8
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -765,6 +798,8 @@ class FP4MQALogitsKernel:
         stream: cuda.CUstream,
         seed_thr: cute.Tensor = None,  # [num_rows, 3] fp32 (emit_seed_counts)
         seed_counts: cute.Tensor = None,  # [num_rows, 3] int32 out, caller-zeroed
+        cand: cute.Tensor = None,  # [num_rows, CAP*2] int32 {val bits, idx} pairs
+        cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 {claimed, void}, zeroed
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
         # Fused layout per phys block: [data half_head_dim*phys_block_kv bytes]
@@ -968,6 +1003,8 @@ class FP4MQALogitsKernel:
             hit_bitmap,
             seed_thr,
             seed_counts,
+            cand,
+            cand_ctl,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -1046,6 +1083,32 @@ class FP4MQALogitsKernel:
                     _red_global_add_s32(addr, w_cnt)
                 scnt[t * 3 + j] = cutlass.Int32(0)
 
+    @cute.jit
+    def _flush_cand_window(self, mCand, q_idx, cwbase, cwleft, meta_lane):
+        """Sentinel-fill the unconsumed tail of each per-(warp, t) claim
+        window (idx word = -1; consumers skip sentinels) and invalidate the
+        window. wleft <= CAND_WIN + 31 always fits one lane round."""
+        next_n = cutlass.const_expr(self.next_n)
+        CAP_C = cutlass.const_expr(self.cand_cap)
+        cand_base = mCand.iterator.toint()
+        for t in cutlass.range_constexpr(next_n):
+            if cwleft[t] > cutlass.Int32(0):
+                row_c = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                sl_f = cwbase[t] + meta_lane
+                if meta_lane < cwleft[t] and sl_f < cutlass.Int32(CAP_C):
+                    pair_f = cand_base + (
+                        cutlass.Int64(row_c) * cutlass.Int64(CAP_C) + cutlass.Int64(sl_f)
+                    ) * cutlass.Int64(8)
+                    iptr_f = cute.make_ptr(
+                        cutlass.Int32,
+                        pair_f + cutlass.Int64(4),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    cute.make_tensor(iptr_f, cute.make_layout((1,)))[0] = cutlass.Int32(-1)
+            cwbase[t] = cutlass.Int32(0)
+            cwleft[t] = cutlass.Int32(0)
+
     @cute.kernel
     def kernel(
         self,
@@ -1070,6 +1133,8 @@ class FP4MQALogitsKernel:
         mHitBitmap: cute.Tensor,  # [batch, nb_pad*4] int32 (or None)
         mSeedThr: cute.Tensor,  # [num_rows, 3] fp32 seed thresholds (or None)
         mSeedCounts: cute.Tensor,  # [num_rows, 3] int32 counts out (or None)
+        mCand: cute.Tensor,  # [num_rows, CAP*2] int32 pair scatter (or None)
+        mCandCtl: cute.Tensor,  # [num_rows, 2] int32 {claimed, void} (or None)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -2078,6 +2143,12 @@ class FP4MQALogitsKernel:
                         for _i in cutlass.range_constexpr(next_n * 3):
                             sthr[_i] = cutlass.Float32(_META_FLT_MAX)
                             scnt[_i] = cutlass.Int32(0)
+                    if cutlass.const_expr(self.emit_cand):
+                        cwbase = cute.make_fragment(next_n, cutlass.Int32)
+                        cwleft = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            cwbase[_i] = cutlass.Int32(0)
+                            cwleft[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Per-lane hit accumulators, carried across ALL
                         # tiles of the same q and flushed once per
@@ -2145,6 +2216,11 @@ class FP4MQALogitsKernel:
                             if cutlass.const_expr(self.emit_seed_counts):
                                 if q_idx_old < batch_size:
                                     self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                            if cutlass.const_expr(self.emit_cand):
+                                if q_idx_old < batch_size:
+                                    self._flush_cand_window(
+                                        mCand, q_idx_old, cwbase, cwleft, meta_lane
+                                    )
                                 for _t in cutlass.range_constexpr(next_n):
                                     for _j in cutlass.range_constexpr(3):
                                         sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
@@ -2386,6 +2462,99 @@ class FP4MQALogitsKernel:
                                 for _j in cutlass.range_constexpr(3):
                                     ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
                                     scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
+                            if cutlass.const_expr(self.emit_cand):
+                                # L2 pre-collect at t_0 with per-warp claim
+                                # WINDOWS: refills claim (hits + CAND_WIN)
+                                # slots in ONE atomic; between refills the
+                                # warp consumes its window latency-free (a
+                                # per-hit atomic round-trip stalled the
+                                # epilogue 2x at 131k ctx). Unconsumed tail
+                                # is sentinel-filled on flush; counts[r][0]
+                                # stays the exact count. Gated on the
+                                # already-computed warp-uniform 32-position
+                                # bound: r_bmax < t_0 proves zero hits, so
+                                # the common no-hit iteration costs ONE fp
+                                # compare (no ballot, no select). bound >=
+                                # t_0 guarantees a nonzero ballot (exact
+                                # per-lane max, invalid -> -FLT_MAX).
+                                if r_bmax >= sthr[t * 3 + 0]:
+                                    pred_c = cutlass.Int32(0)
+                                    if meta_valid:
+                                        if f32_t >= sthr[t * 3 + 0]:
+                                            pred_c = cutlass.Int32(1)
+                                    mask_c = cute.arch.vote_ballot_sync(pred_c != cutlass.Int32(0))
+                                    row_c = q_idx * next_n + t
+                                    cnt_c = cutlass.Int32(cute.arch.popc(mask_c))
+                                    lm_c = (
+                                        cutlass.Uint32(1) << cutlass.Uint32(meta_lane)
+                                    ) - cutlass.Uint32(1)
+                                    off_c = cutlass.Int32(cute.arch.popc(mask_c & lm_c))
+                                    CAP_C = cutlass.const_expr(self.cand_cap)
+                                    cand_b = mCand.iterator.toint()
+                                    if cnt_c > cwleft[t]:
+                                        # sentinel-fill the old tail, then
+                                        # refill: one atomic per window.
+                                        sl_o = cwbase[t] + meta_lane
+                                        if meta_lane < cwleft[t] and sl_o < cutlass.Int32(CAP_C):
+                                            pair_o = cand_b + (
+                                                cutlass.Int64(row_c) * cutlass.Int64(CAP_C)
+                                                + cutlass.Int64(sl_o)
+                                            ) * cutlass.Int64(8)
+                                            iptr_o = cute.make_ptr(
+                                                cutlass.Int32,
+                                                pair_o + cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            cute.make_tensor(iptr_o, cute.make_layout((1,)))[0] = (
+                                                cutlass.Int32(-1)
+                                            )
+                                        m_c = cnt_c + cutlass.Int32(self.CAND_WIN)
+                                        ctl_addr = mCandCtl.iterator.toint() + (
+                                            cutlass.Int64(row_c) * cutlass.Int64(8)
+                                        )
+                                        nb_c = cutlass.Int32(0)
+                                        if meta_lane == cutlass.Int32(0):
+                                            nb_c = _atom_global_add_s32(ctl_addr, m_c)
+                                        nb_c = cute.arch.shuffle_sync(nb_c, cutlass.Int32(0))
+                                        cwbase[t] = nb_c
+                                        cwleft[t] = m_c
+                                        # one-shot void mark on crossing CAP
+                                        if meta_lane == cutlass.Int32(0):
+                                            if nb_c + m_c > cutlass.Int32(
+                                                CAP_C
+                                            ) and nb_c <= cutlass.Int32(CAP_C):
+                                                vdptr = cute.make_ptr(
+                                                    cutlass.Int32,
+                                                    ctl_addr + cutlass.Int64(4),
+                                                    cute.AddressSpace.gmem,
+                                                    assumed_align=4,
+                                                )
+                                                cute.make_tensor(vdptr, cute.make_layout((1,)))[
+                                                    0
+                                                ] = cutlass.Int32(1)
+                                    slot_c = cwbase[t] + off_c
+                                    if pred_c != cutlass.Int32(0) and slot_c < cutlass.Int32(CAP_C):
+                                        pair_addr = cand_b + (
+                                            cutlass.Int64(row_c) * cutlass.Int64(CAP_C)
+                                            + cutlass.Int64(slot_c)
+                                        ) * cutlass.Int64(8)
+                                        vptr_c = cute.make_ptr(
+                                            cutlass.Float32,
+                                            pair_addr,
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=8,
+                                        )
+                                        cute.make_tensor(vptr_c, cute.make_layout((1,)))[0] = f32_t
+                                        iptr_c = cute.make_ptr(
+                                            cutlass.Int32,
+                                            pair_addr + cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(iptr_c, cute.make_layout((1,)))[0] = kv_pos
+                                    cwbase[t] = cwbase[t] + cnt_c
+                                    cwleft[t] = cwleft[t] - cnt_c
                             if cutlass.const_expr(self.emit_hit_stats):
                                 # Lane-local accumulation, fully BRANCHLESS
                                 # (data-dependent `if meta_hit` compiled to
@@ -2458,6 +2627,9 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.emit_seed_counts):
                     if q_idx < batch_size:
                         self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane)
+                if cutlass.const_expr(self.emit_cand):
+                    if q_idx < batch_size:
+                        self._flush_cand_window(mCand, q_idx, cwbase, cwleft, meta_lane)
 
                 # Release last Q stage (WG 0)
                 if q_idx < batch_size:
@@ -2515,6 +2687,12 @@ class FP4MQALogitsKernel:
                         for _i in cutlass.range_constexpr(next_n * 3):
                             sthr[_i] = cutlass.Float32(_META_FLT_MAX)
                             scnt[_i] = cutlass.Int32(0)
+                    if cutlass.const_expr(self.emit_cand):
+                        cwbase = cute.make_fragment(next_n, cutlass.Int32)
+                        cwleft = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            cwbase[_i] = cutlass.Int32(0)
+                            cwleft[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Per-lane hit accumulators, carried across ALL
                         # tiles of the same q and flushed once per
@@ -2582,6 +2760,11 @@ class FP4MQALogitsKernel:
                             if cutlass.const_expr(self.emit_seed_counts):
                                 if q_idx_old < batch_size:
                                     self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                            if cutlass.const_expr(self.emit_cand):
+                                if q_idx_old < batch_size:
+                                    self._flush_cand_window(
+                                        mCand, q_idx_old, cwbase, cwleft, meta_lane
+                                    )
                                 for _t in cutlass.range_constexpr(next_n):
                                     for _j in cutlass.range_constexpr(3):
                                         sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
@@ -2817,6 +3000,99 @@ class FP4MQALogitsKernel:
                                 for _j in cutlass.range_constexpr(3):
                                     ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
                                     scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
+                            if cutlass.const_expr(self.emit_cand):
+                                # L2 pre-collect at t_0 with per-warp claim
+                                # WINDOWS: refills claim (hits + CAND_WIN)
+                                # slots in ONE atomic; between refills the
+                                # warp consumes its window latency-free (a
+                                # per-hit atomic round-trip stalled the
+                                # epilogue 2x at 131k ctx). Unconsumed tail
+                                # is sentinel-filled on flush; counts[r][0]
+                                # stays the exact count. Gated on the
+                                # already-computed warp-uniform 32-position
+                                # bound: r_bmax < t_0 proves zero hits, so
+                                # the common no-hit iteration costs ONE fp
+                                # compare (no ballot, no select). bound >=
+                                # t_0 guarantees a nonzero ballot (exact
+                                # per-lane max, invalid -> -FLT_MAX).
+                                if r_bmax >= sthr[t * 3 + 0]:
+                                    pred_c = cutlass.Int32(0)
+                                    if meta_valid:
+                                        if f32_t >= sthr[t * 3 + 0]:
+                                            pred_c = cutlass.Int32(1)
+                                    mask_c = cute.arch.vote_ballot_sync(pred_c != cutlass.Int32(0))
+                                    row_c = q_idx * next_n + t
+                                    cnt_c = cutlass.Int32(cute.arch.popc(mask_c))
+                                    lm_c = (
+                                        cutlass.Uint32(1) << cutlass.Uint32(meta_lane)
+                                    ) - cutlass.Uint32(1)
+                                    off_c = cutlass.Int32(cute.arch.popc(mask_c & lm_c))
+                                    CAP_C = cutlass.const_expr(self.cand_cap)
+                                    cand_b = mCand.iterator.toint()
+                                    if cnt_c > cwleft[t]:
+                                        # sentinel-fill the old tail, then
+                                        # refill: one atomic per window.
+                                        sl_o = cwbase[t] + meta_lane
+                                        if meta_lane < cwleft[t] and sl_o < cutlass.Int32(CAP_C):
+                                            pair_o = cand_b + (
+                                                cutlass.Int64(row_c) * cutlass.Int64(CAP_C)
+                                                + cutlass.Int64(sl_o)
+                                            ) * cutlass.Int64(8)
+                                            iptr_o = cute.make_ptr(
+                                                cutlass.Int32,
+                                                pair_o + cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            cute.make_tensor(iptr_o, cute.make_layout((1,)))[0] = (
+                                                cutlass.Int32(-1)
+                                            )
+                                        m_c = cnt_c + cutlass.Int32(self.CAND_WIN)
+                                        ctl_addr = mCandCtl.iterator.toint() + (
+                                            cutlass.Int64(row_c) * cutlass.Int64(8)
+                                        )
+                                        nb_c = cutlass.Int32(0)
+                                        if meta_lane == cutlass.Int32(0):
+                                            nb_c = _atom_global_add_s32(ctl_addr, m_c)
+                                        nb_c = cute.arch.shuffle_sync(nb_c, cutlass.Int32(0))
+                                        cwbase[t] = nb_c
+                                        cwleft[t] = m_c
+                                        # one-shot void mark on crossing CAP
+                                        if meta_lane == cutlass.Int32(0):
+                                            if nb_c + m_c > cutlass.Int32(
+                                                CAP_C
+                                            ) and nb_c <= cutlass.Int32(CAP_C):
+                                                vdptr = cute.make_ptr(
+                                                    cutlass.Int32,
+                                                    ctl_addr + cutlass.Int64(4),
+                                                    cute.AddressSpace.gmem,
+                                                    assumed_align=4,
+                                                )
+                                                cute.make_tensor(vdptr, cute.make_layout((1,)))[
+                                                    0
+                                                ] = cutlass.Int32(1)
+                                    slot_c = cwbase[t] + off_c
+                                    if pred_c != cutlass.Int32(0) and slot_c < cutlass.Int32(CAP_C):
+                                        pair_addr = cand_b + (
+                                            cutlass.Int64(row_c) * cutlass.Int64(CAP_C)
+                                            + cutlass.Int64(slot_c)
+                                        ) * cutlass.Int64(8)
+                                        vptr_c = cute.make_ptr(
+                                            cutlass.Float32,
+                                            pair_addr,
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=8,
+                                        )
+                                        cute.make_tensor(vptr_c, cute.make_layout((1,)))[0] = f32_t
+                                        iptr_c = cute.make_ptr(
+                                            cutlass.Int32,
+                                            pair_addr + cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(iptr_c, cute.make_layout((1,)))[0] = kv_pos
+                                    cwbase[t] = cwbase[t] + cnt_c
+                                    cwleft[t] = cwleft[t] - cnt_c
                             if cutlass.const_expr(self.emit_hit_stats):
                                 # Lane-local accumulation, fully BRANCHLESS
                                 # (data-dependent `if meta_hit` compiled to
@@ -2889,6 +3165,9 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.emit_seed_counts):
                     if q_idx < batch_size:
                         self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane)
+                if cutlass.const_expr(self.emit_cand):
+                    if q_idx < batch_size:
+                        self._flush_cand_window(mCand, q_idx, cwbase, cwleft, meta_lane)
 
                 # Release last Q stage (WG 1)
                 if q_idx < batch_size:

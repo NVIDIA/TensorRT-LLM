@@ -900,6 +900,171 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         )
 
 
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+@pytest.mark.parametrize("cap_mode", ["roomy", "tight"])
+def test_cute_dsl_fp4_paged_mqa_logits_cand(
+    batch_size,
+    next_n,
+    avg_ctx,
+    phys_block_kv,
+    cap_mode,
+):
+    """emit_cand correctness: the unordered (value, index) pre-collect at
+    t_0 must contain EXACTLY the set {i < ctx : logits[r, i] >= t_0} when
+    it fits (void == 0), and degrade safely on overflow (void == 1, all
+    written slots valid + unique, claimed and counts[0] still exact)."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLFP4PagedMQALogitsRunner
+
+    torch.manual_seed(13)
+    torch.cuda.manual_seed(13)
+    num_heads, head_dim = 64, 128
+    max_model_len = max(avg_ctx * 2, 2048)
+    device = "cuda"
+
+    context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = int(num_blocks_per_seq.sum().item()) + batch_size * 2
+    max_blocks_per_seq = int(num_blocks_per_seq.max().item())
+    block_table = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[off : off + n_blks]
+        off += n_blks
+
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    remove_online_sf_transpose = phys_block_kv == 128
+    kv_fused, _ = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
+    DG_METADATA_BLOCK_KV = 64
+    num_sms = deep_gemm.get_num_sms()
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
+    )
+    aligned_max_ctx = align(max_model_len, 256)
+    nb_pad = aligned_max_ctx // 128
+    num_rows = batch_size * next_n
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    common = dict(
+        num_epi_subtiles=1,
+        epi_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        remove_online_sf_transpose=remove_online_sf_transpose,
+    )
+    base_args = (
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    )
+
+    # Pass 1: harvest logits for threshold picking.
+    logits0, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        *base_args,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        **common,
+    )
+    torch.cuda.synchronize()
+    lf0 = logits0.float()
+
+    seed_thr = torch.empty((num_rows, 3), dtype=torch.float32, device=device)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        vals = lf0[row, :ctx]
+        seed_thr[row, 0] = torch.quantile(vals, 0.90)  # t_0: ~10% of ctx
+        seed_thr[row, 1] = torch.quantile(vals, 0.97)
+        seed_thr[row, 2] = torch.quantile(vals, 0.998)
+
+    # Window claiming over-claims by up to ~CAND_WIN per epilogue warp
+    # touching the row (sentinel-filled tails); B=1 rows spread over many
+    # CTAs, so roomy needs slack well beyond the ~410 true hits.
+    cap = 4096 if cap_mode == "roomy" else 128
+    seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=device)
+    cand = torch.full((num_rows, cap * 2), -1, dtype=torch.int32, device=device)
+    ctl = torch.zeros((num_rows, 2), dtype=torch.int32, device=device)
+    block_max.fill_(nan)
+    logits, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        *base_args,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        emit_seed_counts=True,
+        seed_thr=seed_thr,
+        seed_counts_out=seed_counts,
+        emit_cand=True,
+        cand_out=cand,
+        cand_ctl_out=ctl,
+        **common,
+    )
+    torch.cuda.synchronize()
+    lf = logits.float()
+    torch.testing.assert_close(lf, lf0, atol=0.0, rtol=0.0)
+
+    pairs = cand.view(num_rows, cap, 2)
+    vals_bits = pairs[..., 0]
+    idxs = pairs[..., 1]
+    vals = vals_bits.view(torch.float32)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        t0 = seed_thr[row, 0]
+        ref_mask = lf[row, :ctx] >= t0
+        ref_count = int(ref_mask.sum())
+        ref_idx = set(torch.nonzero(ref_mask, as_tuple=False).flatten().tolist())
+        tag = f"row={row} ctx={ctx} cap={cap} ref={ref_count} mode={cap_mode}"
+        claimed = int(ctl[row, 0])
+        void = int(ctl[row, 1])
+        # counts[0] is the exact count regardless of windows/overflow;
+        # claimed >= true count (sentinel-padded window tails).
+        assert int(seed_counts[row, 0]) == ref_count, f"counts0: {tag}"
+        assert claimed >= ref_count, f"claimed < true count: {tag} got={claimed}"
+        n_written = min(claimed, cap)
+        got_idx = idxs[row, :n_written].long()
+        live = got_idx >= 0
+        got_list = got_idx[live].tolist()
+        assert len(set(got_list)) == len(got_list), f"duplicate idx: {tag}"
+        assert set(got_list).issubset(ref_idx), f"non-member idx: {tag}"
+        # pair integrity on live entries: value word == stored logit bits.
+        live_idx = got_idx[live]
+        torch.testing.assert_close(
+            vals[row, :n_written][live],
+            lf[row, live_idx],
+            atol=0.0,
+            rtol=0.0,
+            msg=lambda m, tag=tag: f"pair value mismatch: {tag}\n{m}",
+        )
+        if cap_mode == "roomy":
+            assert void == 0, f"void set without overflow: {tag} claimed={claimed}"
+            assert claimed <= cap, f"claimed past cap without void: {tag}"
+            assert set(got_list) == ref_idx, f"set mismatch: {tag}"
+            # every claimed slot is live or sentinel; unclaimed tail untouched
+            assert bool((idxs[row, claimed:] == -1).all()), f"stray write: {tag}"
+            assert int(live.sum()) == ref_count, f"live count: {tag}"
+        else:
+            assert ref_count > cap, f"test setup wants overflow: {tag}"
+            assert void == 1, f"void not set on overflow: {tag}"
+
+
 # ---------------------------------------------------------------------------
 # Benchmarking entry point (run module directly).
 # ---------------------------------------------------------------------------
