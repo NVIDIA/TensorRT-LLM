@@ -347,10 +347,14 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        quant_algo = quant_config.quant_algo if quant_config is not None else None
+        is_fp8_block_scales = quant_algo in (QuantAlgo.FP8_BLOCK_SCALES,
+                                             "FP8_BLOCK_SCALES")
+
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
             sm_version = get_sm_version()
             if 100 <= sm_version < 120:
-                return "TRTLLM"
+                return "WIDEEP" if is_fp8_block_scales else "TRTLLM"
 
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()
@@ -362,9 +366,6 @@ class ModelConfig(Generic[TConfig]):
             else:
                 return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
 
-        quant_algo = quant_config.quant_algo if quant_config is not None else None
-        is_fp8_block_scales = quant_algo in (QuantAlgo.FP8_BLOCK_SCALES,
-                                             "FP8_BLOCK_SCALES")
         if is_fp8_block_scales and is_sm_100f():
             return "TRTLLM"
 
