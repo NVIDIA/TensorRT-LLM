@@ -311,6 +311,18 @@ class GenerationExecutorProxy(GenerationExecutor):
                 result.queue.put(dead_error)
             except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
                 pass
+        # Release the session's exit joins here, not at teardown: interpreter
+        # exit joins non-daemon threads before any teardown code runs, so a
+        # wedged pool manager thread must be deregistered while user code is
+        # still alive. Non-destructive, hence safe for unowned sessions.
+        release = getattr(getattr(self, 'mpi_session', None),
+                          'release_exit_joins', None)
+        if release is not None:
+            try:
+                release()
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(
+                    f"MPI session exit-join release failed (ignored): {e!r}")
 
     def _handle_worker_death(self, error: BaseException) -> None:
         """Event-driven worker-death handler.
@@ -639,7 +651,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
+        # An abruptly-killed worker world (MPI_Abort, SIGKILL, OOM) never
+        # completes its mpi4py futures: give them one short collective grace
+        # instead of blocking on each, and skip the ones still pending.
+        if self._engine_dead:
+            concurrent.futures.wait(self.mpi_futures, timeout=5.0)
+
         for f in self.mpi_futures:
+            if self._engine_dead and not f.done():
+                continue
             try:
                 f.result()
             except:
@@ -656,7 +676,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
         ):
             self.dispatch_result_thread.stop()
-            self.dispatch_result_thread.join()
+            # With the engine dead, the shutdown sentinel will never arrive
+            # and the dispatcher may be blocked in a ZMQ recv forever: bound
+            # the join and leak the daemon thread.
+            self.dispatch_result_thread.join(
+                timeout=5.0 if self._engine_dead else None)
 
         # step3: finish all remaining work
 
@@ -674,7 +698,11 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = False
         if self._owns_mpi_session:
-            self.mpi_session.shutdown()
+            if self._engine_dead:
+                # Anything joining a dead worker world blocks forever.
+                self.mpi_session.abandon()
+            else:
+                self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()

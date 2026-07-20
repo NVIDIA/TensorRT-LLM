@@ -276,8 +276,8 @@ def test_apply_mm_hashes_with_uuids():
         0]  # UUID changes hash
     # Second hash should be content-only (same as without UUID)
     assert hashes_partial["image"][1] == hashes_no_uuid["image"][1]
-    # UUIDs list should have the UUID and None
-    assert uuids_partial == ["sku-1234-a", None]
+    # UUIDs are returned per-modality, parallel to mm_hashes.
+    assert uuids_partial == {"image": ["sku-1234-a", None]}
 
     # Test with all UUIDs
     mm_uuids_all = {"image": ["sku-1234-a", "sku-1234-b"]}
@@ -290,7 +290,7 @@ def test_apply_mm_hashes_with_uuids():
     assert hashes_all["image"][1] != hashes_no_uuid["image"][1]
     # Different UUIDs with different content should produce different hashes
     assert hashes_all["image"][0] != hashes_all["image"][1]
-    assert uuids_all == ["sku-1234-a", "sku-1234-b"]
+    assert uuids_all == {"image": ["sku-1234-a", "sku-1234-b"]}
 
 
 def test_apply_mm_hashes_uuid_content_combined():
@@ -781,8 +781,9 @@ def test_apply_mm_hashes_multiple_modalities():
     assert hashes["image"][0] != hashes_no_uuid["image"][0]
     assert hashes["video"][0] != hashes_no_uuid["video"][0]
 
-    # Check flattened UUID list (order may vary based on dict iteration)
-    assert set(uuids_list) == {"img-uuid-001", "vid-uuid-001"}
+    # UUIDs are returned per-modality; flatten across modalities to compare.
+    flat_uuids = [u for lst in uuids_list.values() for u in lst]
+    assert set(flat_uuids) == {"img-uuid-001", "vid-uuid-001"}
 
 
 def test_mm_keys_in_stored_events():
