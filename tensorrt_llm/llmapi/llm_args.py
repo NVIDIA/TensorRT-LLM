@@ -3413,6 +3413,14 @@ class KvCacheCompressionConfig(StrictBaseModel):
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
+    @property
+    def kv_cache_compression_mode(self):
+        # The mode carries algorithm-level traits (``is_*`` predicates) the
+        # raw algorithm string does not.
+        from tensorrt_llm._torch.kv_cache_compression.interface import \
+            KvCacheCompressionMode
+        return KvCacheCompressionMode.from_string(self.algorithm)
+
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
 class AgentTreeConfig(StrictBaseModel, PybindMirror):
