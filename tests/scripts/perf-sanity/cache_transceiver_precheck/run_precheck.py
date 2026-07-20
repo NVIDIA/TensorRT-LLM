@@ -467,10 +467,28 @@ def addr_path(work_dir, ctx_idx, gen_idx):
     return os.path.join(work_dir, "rendezvous", f"ctx{ctx_idx}_gen{gen_idx}.addr")
 
 
+def run_token():
+    """Identity of THIS run, stamped into addr files and checked by readers.
+
+    A reused --work-dir (Slurm requeue reruns the batch script with the same
+    directories; manual reruns) can hold addr files from a previous run --
+    connecting to that stale host:port would block until the hello timeout
+    and misreport TIMEOUT. Within one precheck all instances share
+    SLURM_JOB_ID; empty (non-Slurm manual runs) disables the check.
+    """
+    return os.environ.get("SLURM_JOB_ID", "")
+
+
 def write_addr(path, payload):
-    """Atomically publish an addr file. It carries the session HMAC key, so
-    restrict it to the owning user before it becomes visible."""
+    """Atomically publish an addr file (clearing any stale one first). It
+    carries the session HMAC key, so restrict it to the owning user before
+    it becomes visible."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        os.remove(path)  # stale file from a previous run in a reused work dir
+    except FileNotFoundError:
+        pass
+    payload = dict(payload, job=run_token())
     tmp = f"{path}.tmp.{os.getpid()}"
     with open(tmp, "w") as f:
         os.fchmod(f.fileno(), 0o600)
@@ -481,14 +499,22 @@ def write_addr(path, payload):
 
 
 def wait_for_addr(path, timeout_s):
+    """Wait for THIS run's addr file; files stamped with another run's job id
+    are treated as stale and skipped (keep polling)."""
+    expect_job = run_token()
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if os.path.exists(path):
             try:
                 with open(path) as f:
-                    return json.load(f)
+                    payload = json.load(f)
             except (OSError, json.JSONDecodeError):
-                pass  # mid-rename/NFS staleness; retry
+                payload = None  # mid-rename/NFS staleness; retry
+            if payload is not None:
+                stamped = payload.get("job", "")
+                if not expect_job or not stamped or stamped == expect_job:
+                    return payload
+                # Stale addr from a previous run in a reused work dir.
         time.sleep(1.0)
     raise _Timeout(f"rendezvous file {path} not published within {timeout_s}s")
 
