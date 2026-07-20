@@ -379,6 +379,14 @@ class BatchStatePP(BatchState):
     microbatch_id: int = -1
 
 
+class AsyncTransferProvider(StrEnum):
+    """Owner of an asynchronous KV-cache transfer leg."""
+
+    GENERIC = "generic"
+    TRANSCEIVER = "transceiver"
+    CONNECTOR = "connector"
+
+
 class AsyncTransferManager:
     """
     Handle asynchronous transfer of KV cache after a request has completed.
@@ -395,18 +403,37 @@ class AsyncTransferManager:
 
         def __init__(self, block_id: Optional[int]):
             self.block_id = block_id
-            self.counter = 0
+            self.provider_counts: Dict[AsyncTransferProvider, int] = {}
 
-        def start_transfer(self):
-            self.counter += 1
+        @property
+        def counter(self) -> int:
+            """Total leg count retained for backward-compatible inspection."""
 
-        def end_transfer(self) -> bool:
+            return sum(self.provider_counts.values())
+
+        def start_transfer(self, provider: AsyncTransferProvider):
+            self.provider_counts[provider] = (
+                self.provider_counts.get(provider, 0) + 1)
+
+        def end_transfer(self,
+                         provider: AsyncTransferProvider) -> Optional[bool]:
             """
             Returns:
-                bool: True if there are no more transfers for this request
+                Optional[bool]: True if there are no more transfers for this
+                    request, False if another leg remains, or None if the
+                    requested provider did not own a leg.
             """
-            self.counter -= 1
+            provider_count = self.provider_counts.get(provider, 0)
+            if provider_count == 0:
+                return None
+            if provider_count == 1:
+                self.provider_counts.pop(provider)
+            else:
+                self.provider_counts[provider] = provider_count - 1
             return self.counter == 0
+
+        def has_transfer(self, provider: AsyncTransferProvider) -> bool:
+            return self.provider_counts.get(provider, 0) > 0
 
     def __init__(self,
                  resource_manager: "ResourceManager",
@@ -427,7 +454,11 @@ class AsyncTransferManager:
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
 
-    def start_transfer(self, request: LlmRequest):
+    def start_transfer(
+        self,
+        request: LlmRequest,
+        provider: AsyncTransferProvider = AsyncTransferProvider.GENERIC,
+    ):
         """
         Called when a Cache transceiver or connector transfer is started.
         1. Increment the counter for the request.
@@ -435,6 +466,7 @@ class AsyncTransferManager:
         3. Store KV cache blocks for reuse.
         """
 
+        provider = AsyncTransferProvider(provider)
         req_id = request.py_request_id
 
         if req_id not in self._requests_in_transfer:
@@ -458,9 +490,13 @@ class AsyncTransferManager:
             self._request_transfer_metadata[
                 req_id] = self.RequestTransferMetadata(block_id)
 
-        self._request_transfer_metadata[req_id].start_transfer()
+        self._request_transfer_metadata[req_id].start_transfer(provider)
 
-    def end_transfer(self, request: LlmRequest) -> bool:
+    def end_transfer(
+        self,
+        request: LlmRequest,
+        provider: AsyncTransferProvider = AsyncTransferProvider.GENERIC,
+    ) -> bool:
         """
         Called after a send of KV cache is complete.
         1. Decrements counter for request.
@@ -478,7 +514,15 @@ class AsyncTransferManager:
             )
             return False
 
-        if transfer_metadata.end_transfer():
+        provider = AsyncTransferProvider(provider)
+        is_last_transfer = transfer_metadata.end_transfer(provider)
+        if is_last_transfer is None:
+            logger.warning(
+                f"Request {request.py_request_id} has no {provider.value} "
+                "transfer leg")
+            return False
+
+        if is_last_transfer:
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
@@ -493,6 +537,19 @@ class AsyncTransferManager:
             return True
 
         return False
+
+    def has_transfer(
+        self,
+        request: LlmRequest,
+        provider: AsyncTransferProvider = AsyncTransferProvider.GENERIC,
+    ) -> bool:
+        """Return whether ``provider`` currently owns a request leg."""
+
+        transfer_metadata = self._request_transfer_metadata.get(
+            request.py_request_id)
+        if transfer_metadata is None:
+            return False
+        return transfer_metadata.has_transfer(AsyncTransferProvider(provider))
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0
@@ -824,6 +881,8 @@ class PyExecutor:
         self._error_budget = ErrorBudget()
         self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
         self._disagg_timed_out_gen_cancelled_ids: set[int] = set()
+        self._disagg_acknowledged_ctx_cancel_legs: set[int] = set()
+        self._disagg_peer_cancelled_ctx_ids: set[int] = set()
         self._disagg_inflight_cancel_unsupported_logged = False
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
@@ -1075,14 +1134,25 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
-    def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+    def _end_transfer_and_maybe_terminate(
+        self,
+        request: LlmRequest,
+        provider: AsyncTransferProvider = AsyncTransferProvider.GENERIC,
+    ):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        user_cancel_pending = (request.py_request_id in getattr(
+            self, "_disagg_acknowledged_ctx_cancel_legs", ())
+                               and self._request_vote_id(request) in getattr(
+                                   self, "canceled_req_ids", ()))
         if self.kv_cache_transceiver and request in self.active_requests:
-            if transfer_failed:
+            if transfer_failed or user_cancel_pending:
                 # End only the transfer that just became terminal. Keep the
-                # request active so the synchronized error path can emit an
-                # error response after every async transfer releases ownership.
-                self.async_transfer_manager.end_transfer(request)
+                # request active so the synchronized error or user-cancel path
+                # can emit the terminal response after every async transfer
+                # releases ownership. In particular, a connector completion
+                # after the transceiver cancellation leg was acknowledged must
+                # not create a success response or terminate the request.
+                self.async_transfer_manager.end_transfer(request, provider)
                 return
             # Fast-transfer: KV transfer completed in the same iteration
             # before _handle_responses could run. Create the response now
@@ -1101,11 +1171,11 @@ class PyExecutor:
                 # participate.
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
-            if self.async_transfer_manager.end_transfer(request):
+            if self.async_transfer_manager.end_transfer(request, provider):
                 self.active_requests.remove(request)
                 self._terminate_request(request)
             return
-        if self.async_transfer_manager.end_transfer(request):
+        if self.async_transfer_manager.end_transfer(request, provider):
             if transfer_failed:
                 return
             # Skip if the PP=1 early path already terminated this request;
@@ -1452,6 +1522,17 @@ class PyExecutor:
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()
         self.worker_started = False
+        shutdown_errors: List[Tuple[str, Exception]] = []
+
+        def run_shutdown_step(name: str, callback: Callable[[], None]) -> None:
+            try:
+                callback()
+            except Exception as error:
+                logger.error(
+                    f"Shutdown step {name!r} failed: {error}\n{traceback.format_exc()}"
+                )
+                shutdown_errors.append((name, error))
+
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -1461,14 +1542,70 @@ class PyExecutor:
         # for the now-freed memory regions.
         for engine in (self.model_engine, self.draft_model_engine):
             if engine is not None and hasattr(engine, '_release_cuda_graphs'):
-                engine._release_cuda_graphs()
+                run_shutdown_step("release CUDA graphs",
+                                  engine._release_cuda_graphs)
         # Ensure graph destruction has fully completed on device before
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        for manager in self.resource_manager.resource_managers.values():
-            if manager:
-                manager.shutdown()
+            run_shutdown_step("synchronize CUDA graph teardown",
+                              torch.cuda.synchronize)
+        # Drain transfer workers and any dedicated consensus communicator
+        # before KV-cache managers release registered memory. The transceiver
+        # shutdown hook is idempotent and a no-op for implementations that do
+        # not own background resources.
+        transceiver_shutdown_terminal = self.kv_cache_transceiver is None
+        if self.kv_cache_transceiver is not None:
+
+            def shutdown_cache_transceiver() -> None:
+                nonlocal transceiver_shutdown_terminal
+                primary_error: Optional[Exception] = None
+                max_attempts = 3
+                deadline = time.monotonic() + 90.0
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        result = self.kv_cache_transceiver.shutdown()
+                    except Exception as error:
+                        if primary_error is None:
+                            primary_error = error
+                        if attempt == max_attempts or time.monotonic(
+                        ) >= deadline:
+                            raise primary_error
+                        continue
+
+                    if isinstance(result, threading.Event):
+                        # An internal transfer progress thread cannot join
+                        # itself. Registered memory remains owned until the
+                        # event fires and a follow-up call confirms terminal
+                        # teardown or surfaces its stored error.
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not result.wait(remaining):
+                            if primary_error is None:
+                                primary_error = TimeoutError(
+                                    "timed out waiting for KV cache transceiver shutdown"
+                                )
+                            raise primary_error
+                        continue
+
+                    transceiver_shutdown_terminal = True
+                    if primary_error is not None:
+                        raise primary_error
+                    return
+
+                raise RuntimeError(
+                    "KV cache transceiver shutdown did not reach a terminal state"
+                )
+
+            run_shutdown_step("KV cache transceiver",
+                              shutdown_cache_transceiver)
+        if transceiver_shutdown_terminal:
+            for manager in self.resource_manager.resource_managers.values():
+                if manager:
+                    run_shutdown_step(
+                        f"resource manager {type(manager).__name__}",
+                        manager.shutdown)
+        else:
+            logger.error("Skipping resource-manager shutdown because KV cache "
+                         "transceiver ownership did not reach a terminal state")
         # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
         # also invoked mid-init by configure_kv_cache_capacity() in
         # tensorrt_llm/_torch/pyexecutor/_util.py — the warmup pass calls
@@ -1489,10 +1626,22 @@ class PyExecutor:
         # Stop the sampler's async worker, if it was used
         if (isinstance(self.sampler, AsyncWorkerMixin)
                 and self.sampler.async_worker_enabled()):
-            self.sampler.async_worker_stop()
+            run_shutdown_step("sampler async worker",
+                              self.sampler.async_worker_stop)
         if self.dwdp_manager is not None:
-            self.dwdp_manager.__exit__(None, None, None)
+            run_shutdown_step(
+                "DWDP manager",
+                lambda: self.dwdp_manager.__exit__(None, None, None),
+            )
             self.dwdp_manager = None
+        if shutdown_errors:
+            primary_name, primary_error = shutdown_errors[0]
+            if len(shutdown_errors) > 1:
+                secondary_names = [name for name, _error in shutdown_errors[1:]]
+                logger.error(
+                    f"Shutdown primary failure was {primary_name!r}; "
+                    f"secondary failures occurred in {secondary_names}")
+            raise primary_error
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -2457,6 +2606,14 @@ class PyExecutor:
                 self.active_requests)
             wait_for_disagg_gen_transfer_progress = (
                 serializable_schedule.wait_for_disagg_gen_transfer_progress)
+        if self.kv_cache_transceiver:
+            # The exact rank-zero PP schedule is the activation token for the
+            # asynchronous Python readiness protocol. Followers remain hidden
+            # until this point, immediately before their mirrored scheduler
+            # pass, so no rank can speculatively mutate scheduler/KV state for
+            # a request that rank zero did not select.
+            self.kv_cache_transceiver.activate_context_requests_for_schedule(
+                scheduled_batch.all_requests())
         return (scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
 
@@ -3718,7 +3875,8 @@ class PyExecutor:
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
-                self._end_transfer_and_maybe_terminate(req)
+                self._end_transfer_and_maybe_terminate(
+                    req, AsyncTransferProvider.CONNECTOR)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -5576,7 +5734,9 @@ class PyExecutor:
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
-            flag_if_kv_transfer_timed_out(req, "context")
+            if self.async_transfer_manager.has_transfer(
+                    req, AsyncTransferProvider.TRANSCEIVER):
+                flag_if_kv_transfer_timed_out(req, "context")
 
         for req in self.active_requests:
             if req.is_disagg_generation_transmission_in_progress:
@@ -5593,10 +5753,28 @@ class PyExecutor:
         """
         if not self.kv_cache_transceiver:
             return
+        canceled_request_ids = set(self.canceled_req_ids)
+        canceled_gen_first_ctx_requests = [
+            req for req in self.active_requests
+            if req.is_context_only_request and req.py_disaggregated_params.
+            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and self._request_vote_id(req) in canceled_request_ids
+        ]
+        exclude_from_readiness = getattr(
+            self.kv_cache_transceiver,
+            "exclude_context_requests_from_readiness",
+            None,
+        )
+        if canceled_gen_first_ctx_requests and callable(exclude_from_readiness):
+            # Cancellation queue items are known before readiness progresses.
+            # Publish withdrawals first so prepare/ACK/release cannot make a
+            # cancelled request schedulable in this iteration.
+            exclude_from_readiness(canceled_gen_first_ctx_requests)
         gen_first_ctx_requests = [
             req for req in new_requests
             if req.is_context_only_request and req.py_disaggregated_params.
             schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and self._request_vote_id(req) not in canceled_request_ids
         ]
         # Always call prepare_context_requests when there are new requests
         # or previously-waiting requests, so the tp_allgather consensus
@@ -6019,7 +6197,8 @@ class PyExecutor:
             else:
                 if self.kv_connector_manager.request_finished(
                         req, cache_block_ids):
-                    self.async_transfer_manager.start_transfer(req)
+                    self.async_transfer_manager.start_transfer(
+                        req, AsyncTransferProvider.CONNECTOR)
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
@@ -6034,7 +6213,8 @@ class PyExecutor:
                             req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
+                    self.async_transfer_manager.start_transfer(
+                        req, AsyncTransferProvider.TRANSCEIVER)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -6097,7 +6277,26 @@ class PyExecutor:
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
+        take_cancelled_ids = getattr(
+            self.kv_cache_transceiver,
+            "take_context_cancelled_request_ids",
+            None,
+        )
+        newly_cancelled_ids = []
+        if callable(take_cancelled_ids):
+            peer_cancelled_ids = getattr(self, "_disagg_peer_cancelled_ctx_ids",
+                                         None)
+            if peer_cancelled_ids is None:
+                peer_cancelled_ids = set()
+                self._disagg_peer_cancelled_ctx_ids = peer_cancelled_ids
+            newly_cancelled_ids = list(take_cancelled_ids())
+            peer_cancelled_ids.update(newly_cancelled_ids)
+
         completed_req_ids = set(finished_requests + error_requests)
+        # A newly surfaced cancellation is terminal for timeout suppression,
+        # but it must not pass through the ordinary completion loop: its state
+        # and finish reason are assigned by the peer-cancellation path below.
+        terminal_req_ids = completed_req_ids | set(newly_cancelled_ids)
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
@@ -6111,7 +6310,59 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
 
-            self._end_transfer_and_maybe_terminate(request)
+            if not self.async_transfer_manager.has_transfer(
+                    request, AsyncTransferProvider.TRANSCEIVER):
+                logger.warning(
+                    f"Ignoring duplicate transceiver completion for request "
+                    f"{request_id}; only a non-transceiver transfer leg remains"
+                )
+                continue
+            self._end_transfer_and_maybe_terminate(
+                request, AsyncTransferProvider.TRANSCEIVER)
+
+        # A peer/global cancellation is terminal only after the transceiver
+        # reports local quiescence. Acknowledge its request-scoped tombstone,
+        # retire exactly the transceiver's AsyncTransferManager leg, and route
+        # it through the ordinary transfer-error path. A locally queued user
+        # cancellation keeps its CANCELLED finish reason and is completed by
+        # _handle_canceled_requests instead.
+        local_user_cancelled_ids = set(self.canceled_req_ids)
+        peer_cancelled_ids = getattr(self, "_disagg_peer_cancelled_ctx_ids",
+                                     set())
+        for request_id in list(peer_cancelled_ids):
+            requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+            )
+            request = requests_in_transfer.get(request_id)
+            if request is None:
+                request = next(
+                    (active_request for active_request in self.active_requests
+                     if active_request.py_request_id == request_id),
+                    None,
+                )
+            if request is None:
+                logger.warning(
+                    f"Peer-cancelled request {request_id} was not found in "
+                    "the transfer manager or active request set; retaining "
+                    "the cancellation handoff for retry")
+                continue
+            if self._request_vote_id(request) in local_user_cancelled_ids:
+                peer_cancelled_ids.discard(request_id)
+                continue
+            if not self.async_transfer_manager.has_transfer(
+                    request, AsyncTransferProvider.TRANSCEIVER):
+                # Preserve the globally committed terminal decision without
+                # consuming the connector's independently owned leg. Error
+                # cleanup remains deferred until the connector callback.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                peer_cancelled_ids.discard(request_id)
+                continue
+            if not self._request_kv_transfer_cancellation(request):
+                continue
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            if request_id in requests_in_transfer:
+                self._end_transfer_and_maybe_terminate(
+                    request, AsyncTransferProvider.TRANSCEIVER)
+            peer_cancelled_ids.discard(request_id)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
@@ -6119,8 +6370,11 @@ class PyExecutor:
 
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
+            if not self.async_transfer_manager.has_transfer(
+                    request, AsyncTransferProvider.TRANSCEIVER):
+                continue
             if (not request.py_kv_transfer_timed_out
-                    or request_id in completed_req_ids
+                    or request_id in terminal_req_ids
                     or request_id in self._disagg_timed_out_ctx_cancelled_ids):
                 continue
 
@@ -6139,7 +6393,8 @@ class PyExecutor:
                 # cancelled is immediately released from the async manager.
                 request.py_kv_transfer_start_time = None
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-                self._end_transfer_and_maybe_terminate(request)
+                self._end_transfer_and_maybe_terminate(
+                    request, AsyncTransferProvider.TRANSCEIVER)
 
         self._check_cache_transfer_errors("context requests")
 
@@ -6539,6 +6794,10 @@ class PyExecutor:
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
+        getattr(self, "_disagg_acknowledged_ctx_cancel_legs",
+                set()).discard(request.py_request_id)
+        getattr(self, "_disagg_peer_cancelled_ctx_ids",
+                set()).discard(request.py_request_id)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
@@ -6560,14 +6819,60 @@ class PyExecutor:
             return True
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)
-        if (getattr(request, "is_context_only_request", False) is True
-                and async_transfer_manager is not None and request.py_request_id
-                in async_transfer_manager.requests_in_transfer()):
-            if self._is_disagg_inflight_cancel_active():
-                self._request_kv_transfer_cancellation(request)
+        is_context_request = (getattr(request, "is_context_only_request", False)
+                              is True)
+        requests_in_transfer = (async_transfer_manager.requests_in_transfer()
+                                if is_context_request
+                                and async_transfer_manager is not None else {})
+        acknowledged_legs = getattr(self,
+                                    "_disagg_acknowledged_ctx_cancel_legs",
+                                    None)
+        if is_context_request and async_transfer_manager is not None:
+            if acknowledged_legs is None:
+                acknowledged_legs = set()
+                self._disagg_acknowledged_ctx_cancel_legs = acknowledged_legs
+            request_id = request.py_request_id
+            if request_id in acknowledged_legs:
+                if request_id not in requests_in_transfer:
+                    # The transceiver leg was acknowledged on an earlier
+                    # cancellation pass and the final connector leg is now
+                    # quiescent. Do not retry transceiver cancellation based
+                    # on a stale TRANS_IN_PROGRESS request state.
+                    acknowledged_legs.discard(request_id)
+                    return True
+                # Another asynchronous transfer (for example, a cache
+                # connector save) still owns the request. Do not decrement its
+                # transfer-manager leg while retrying the user cancellation.
+                return False
+
+        transceiver_owns_request = self.kv_cache_transceiver.owns_request(
+            request) is True
+
+        if (is_context_request and async_transfer_manager is not None
+                and request.py_request_id in requests_in_transfer):
+            request_id = request.py_request_id
+            transceiver_leg_inflight = async_transfer_manager.has_transfer(
+                request, AsyncTransferProvider.TRANSCEIVER) is True
+            if not transceiver_leg_inflight:
+                # A connector can outlive a normally completed transceiver.
+                # A process-global cancellation capability (or a no-session
+                # transceiver cancel that reports success) is not evidence
+                # that the remaining connector leg is quiescent.
+                return False
+            if (transceiver_owns_request
+                    or self._is_disagg_inflight_cancel_active()
+                ) and self._request_kv_transfer_cancellation(request):
+                assert acknowledged_legs is not None
+                acknowledged_legs.add(request_id)
+                if async_transfer_manager.end_transfer(
+                        request, AsyncTransferProvider.TRANSCEIVER):
+                    acknowledged_legs.discard(request_id)
+                    return True
             return False
 
         if not self._is_request_in_transmission(request):
+            if transceiver_owns_request:
+                return self._request_kv_transfer_cancellation(request)
             return True
 
         if self._is_disagg_inflight_cancel_active():
