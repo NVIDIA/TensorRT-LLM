@@ -223,10 +223,11 @@ Native `LlmRequestState.ENCODER_INIT` belongs to encoder-decoder scheduling and 
 semantics that do not match the existing MM workflow. The implementation must not reuse it and must
 not add a native `MM_INIT` state.
 
-An MM request remains in `CONTEXT_INIT`. Python attaches an immutable request-kind flag:
+An MM request remains in `CONTEXT_INIT`. Python attaches a per-item state object whose
+presence doubles as the immutable request-kind signal:
 
 ```text
-py_is_multimodal_encoder_request =
+py_mm_encoder_state is not None ==
     runtime_item_scheduling_is_enabled_for_model_and_processor
     and request_has_raw_mm_payload
     and request_has_no_complete_precomputed_mm_embedding
@@ -328,12 +329,17 @@ declared-versus-runtime cost assertion remains a possible hardening step.
 
 ## Mutable request-local state
 
-The Python request owns fixed-size item slots, one contiguous output buffer, and precomputed offsets:
+The Python request owns one `MultimodalEncoderRequestState` holding fixed-size item slots,
+one contiguous output buffer, and precomputed offsets, with the state transitions as methods:
 
 ```python
-py_mm_encoder_outputs: list[Optional[torch.Tensor]]
-py_mm_encoder_output_buffer: Optional[torch.Tensor]
-py_mm_encoder_output_offsets: list[int]
+py_mm_encoder_state: Optional[MultimodalEncoderRequestState]
+#   .outputs: list[Optional[torch.Tensor]]   # slots; views into the buffer
+#   .output_buffer: Optional[torch.Tensor]   # lazily allocated by fill()
+#   .output_offsets: list[int]
+#   .fill(item_idx, output)                  # single writer (encode + cache attach)
+#   .finalize_into(multimodal_data)          # publish embedding + strip raw inputs
+#   .progress / .pending_item_indices()
 ```
 
 An item has exactly one of two persistent states:
@@ -343,10 +349,12 @@ An item has exactly one of two persistent states:
 | `PENDING` | `None` | Eligible for selection |
 | `READY` | tensor | Reusable request-local result |
 
-For readability, `get_multimodal_encoder_progress()` derives request-level
-`MultimodalEncoderProgress.PENDING`, `PARTIAL`, or `READY` from these slots and the existing full-request
-embedding. It is not a second stored state and does not modify the C++ `LlmRequestState`; MM requests
-remain in `CONTEXT_INIT` so same-iteration encoder-to-LLM execution is preserved.
+For readability, `MultimodalEncoderRequestState.progress` derives item-level
+`MultimodalEncoderProgress.PENDING`, `PARTIAL`, or `READY` from these slots, and
+`is_multimodal_encoder_ready()` lifts that to a request-level readiness check (a request without item
+state needs no encoder work). Neither is a second stored state and neither modifies the C++
+`LlmRequestState`; MM requests remain in `CONTEXT_INIT` so same-iteration encoder-to-LLM execution is
+preserved.
 
 Selection does not mutate request state. The current executor consumes one schedule result before
 constructing another result that could select the same item. Keeping selection in the serialized
@@ -854,8 +862,8 @@ The cross-request embeddings cache (#15734's `TensorLRUCache`) is now integrated
 those lines, without changing scheduler identity:
 
 - **Read side**: `PyExecutor._attach_mm_encoder_cache_hits()` runs in `_schedule()` before item
-  selection. A hit is committed into the request-local item slot via
-  `fill_mm_encoder_output_into_request()` and consumes no encoder item or token budget; a fully
+  selection. A hit is filled into the request-local item slot via
+  `MultimodalEncoderRequestState.fill()` and consumes no encoder item or token budget; a fully
   attached request reaches `READY` without any encoder work, and a partially attached request
   proceeds through the item path, which re-computes only the misses.
 - **Write side**: `forward_multimodal_encoder_items()` write-throughs each freshly encoded item

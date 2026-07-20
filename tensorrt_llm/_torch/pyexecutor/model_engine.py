@@ -82,10 +82,7 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, LlmRequestState,
-                          fill_mm_encoder_output_into_request,
-                          finalize_multimodal_encoder_request,
-                          get_draft_token_length,
+from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -2605,21 +2602,26 @@ class PyTorchModelEngine(ModelEngine):
         for output, (request, item_idx) in zip(outputs,
                                                selected_owners,
                                                strict=True):
-            fill_mm_encoder_output_into_request(request, item_idx, output)
+            state = request.py_mm_encoder_state
+            if state is None:
+                raise RuntimeError(
+                    f"Scheduled MM request {request.py_request_id} has no "
+                    "encoder item state")
+            output_view = state.fill(item_idx, output)
             cache_and_keys = cache_and_keys_by_id[request.request_id]
             if cache_and_keys is not None:
                 encoder_cache, item_keys = cache_and_keys
                 # `put` clones, so the entry neither aliases the request
                 # buffer nor pins it alive after the request completes.
-                encoder_cache.put(item_keys[item_idx],
-                                  request.py_mm_encoder_outputs[item_idx])
+                encoder_cache.put(item_keys[item_idx], output_view)
 
         touched_requests = {
             request.request_id: request
             for request, _ in selected_owners
         }
         for request in touched_requests.values():
-            finalize_multimodal_encoder_request(request)
+            request.py_mm_encoder_state.finalize_into(
+                request.py_multimodal_data)
 
     def get_mm_encoder_cache_and_keys(
             self, request: LlmRequest

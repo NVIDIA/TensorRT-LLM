@@ -72,16 +72,12 @@ from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
-
-# isort and yapf disagree on how to wrap the block below.
-# isort: off
-from .llm_request import (
-    ATTENTION_DP_DUMMY_REQUEST_ID, MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
-    LlmRequest, LlmRequestState, LlmResponse,
-    fill_mm_encoder_output_into_request, finalize_multimodal_encoder_request,
-    get_draft_token_length, initialize_multimodal_encoder_request,
-    is_multimodal_encoder_ready)
-# isort: on
+from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
+                          MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
+                          LlmRequest, LlmRequestState, LlmResponse,
+                          get_draft_token_length,
+                          initialize_multimodal_encoder_request,
+                          is_multimodal_encoder_ready)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -252,9 +248,10 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
-    request.py_mm_encoder_outputs.clear()
-    request.py_mm_encoder_output_buffer = None
-    request.py_mm_encoder_output_offsets.clear()
+    # Drop the per-item encoder state; the published `multimodal_embedding`
+    # (an alias of its buffer) survives through the dict above as long as
+    # generation still needs it.
+    request.py_mm_encoder_state = None
 
 
 @dataclasses.dataclass
@@ -4961,14 +4958,13 @@ class PyExecutor:
         remaining_items = self.model_engine.encoder_max_num_items
         remaining_tokens = self.model_engine.encoder_max_num_tokens
 
-        def consume_pending(costs, ready_outputs=None):
+        def consume_pending(costs, pending_indices=None):
             nonlocal remaining_items, remaining_tokens
-            ready_outputs = ready_outputs or [None] * len(costs)
+            if pending_indices is None:
+                pending_indices = range(len(costs))
             progressed = False
-            for item_idx, (cost, output) in enumerate(zip(costs,
-                                                          ready_outputs)):
-                if output is not None:
-                    continue
+            for item_idx in pending_indices:
+                cost = costs[item_idx]
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
                 remaining_items -= 1
@@ -4977,14 +4973,15 @@ class PyExecutor:
             return progressed
 
         for request in self.active_requests:
-            if (not request.py_is_multimodal_encoder_request
-                    or is_multimodal_encoder_ready(request)):
+            state = request.py_mm_encoder_state
+            if state is None or is_multimodal_encoder_ready(request):
                 continue
             mm_data = request.py_multimodal_data or {}
             item_metadata = get_multimodal_encoder_item_metadata(mm_data)
-            costs = (item_metadata.encoder_token_lengths
-                     if item_metadata is not None else [])
-            consume_pending(costs, request.py_mm_encoder_outputs)
+            if item_metadata is None:
+                continue
+            consume_pending(item_metadata.encoder_token_lengths,
+                            state.pending_item_indices())
 
         admitted = []
         deferred = []
@@ -5343,23 +5340,20 @@ class PyExecutor:
         fully attached request graduates to READY without any encoder work.
         """
         for request in self.active_requests:
-            if (not request.py_is_multimodal_encoder_request
-                    or is_multimodal_encoder_ready(request)):
+            state = request.py_mm_encoder_state
+            if state is None or is_multimodal_encoder_ready(request):
                 continue
             cache_and_keys = self.model_engine.get_mm_encoder_cache_and_keys(
                 request)
             if cache_and_keys is None:
                 continue
             encoder_cache, item_keys = cache_and_keys
-            for item_idx, output in enumerate(request.py_mm_encoder_outputs):
-                if output is not None:
-                    continue
+            for item_idx in state.pending_item_indices():
                 cached_output = encoder_cache.get(item_keys[item_idx])
                 if cached_output is None:
                     continue
-                fill_mm_encoder_output_into_request(request, item_idx,
-                                                    cached_output)
-            finalize_multimodal_encoder_request(request)
+                state.fill(item_idx, cached_output)
+            state.finalize_into(request.py_multimodal_data)
 
     @nvtx_range("_schedule")
     def _schedule(self):
