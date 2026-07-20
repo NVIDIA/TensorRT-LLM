@@ -67,6 +67,8 @@ def _compile(
     enable_block_skip: bool = False,
     use_ext_counts: bool = False,
     emit_xstate: bool = False,
+    use_ext_cand: bool = False,
+    cand_cap: int = 5120,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -149,6 +151,20 @@ def _compile(
         if use_ext_counts
         else None
     )
+    cand_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_rows, cand_cap * 2), stride_order=(1, 0), assumed_align=8
+        )
+        if use_ext_cand
+        else None
+    )
+    cand_ctl_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_rows, 2), stride_order=(1, 0), assumed_align=8
+        )
+        if use_ext_cand
+        else None
+    )
     xstate_fake = (
         cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (n_rows, 8), stride_order=(1, 0), assumed_align=4
@@ -177,6 +193,8 @@ def _compile(
         enable_block_skip=enable_block_skip,
         use_ext_counts=use_ext_counts,
         emit_xstate=emit_xstate,
+        use_ext_cand=use_ext_cand,
+        cand_cap=cand_cap,
         # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
         # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
         # the slot count matters.
@@ -195,6 +213,8 @@ def _compile(
         seed_thr=seed_thr_fake,
         seed_counts=seed_counts_fake,
         xstate=xstate_fake,
+        cand=cand_fake,
+        cand_ctl=cand_ctl_fake,
         options="--enable-tvm-ffi",
     )
 
@@ -450,6 +470,8 @@ def gvr_topk_decode(
     seed_thr: Optional[torch.Tensor] = None,
     seed_counts: Optional[torch.Tensor] = None,
     xstate: Optional[torch.Tensor] = None,
+    cand: Optional[torch.Tensor] = None,
+    cand_ctl: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -546,6 +568,24 @@ def gvr_topk_decode(
             and seed_counts.is_contiguous()
             and seed_counts.shape == (num_rows, 3)
         ), "seed_counts must be contiguous CUDA int32 [num_rows, 3]"
+    use_ext_cand = cand is not None and cand_ctl is not None
+    cand_cap = 5120
+    if use_ext_cand:
+        assert (
+            cand.dtype == torch.int32
+            and cand.is_cuda
+            and cand.is_contiguous()
+            and cand.dim() == 2
+            and cand.shape[0] == num_rows
+            and cand.shape[1] % 2 == 0
+        ), "cand must be contiguous CUDA int32 [num_rows, CAP*2]"
+        assert (
+            cand_ctl.dtype == torch.int32
+            and cand_ctl.is_cuda
+            and cand_ctl.is_contiguous()
+            and cand_ctl.shape == (num_rows, 2)
+        ), "cand_ctl must be contiguous CUDA int32 [num_rows, 2]"
+        cand_cap = cand.shape[1] // 2
     emit_xstate = xstate is not None
     if emit_xstate:
         assert (
@@ -634,6 +674,8 @@ def gvr_topk_decode(
         enable_block_skip,
         use_ext_counts,
         emit_xstate,
+        use_ext_cand,
+        cand_cap,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -650,6 +692,8 @@ def gvr_topk_decode(
         seed_thr if use_ext_counts else None,
         seed_counts if use_ext_counts else None,
         xstate if emit_xstate else None,
+        cand if use_ext_cand else None,
+        cand_ctl if use_ext_cand else None,
     )
     if return_output_values:
         return out_values, out_indices
