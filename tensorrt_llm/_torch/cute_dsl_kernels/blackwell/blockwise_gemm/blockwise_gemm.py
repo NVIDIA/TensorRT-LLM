@@ -2068,17 +2068,33 @@ class Sm100BlockwiseGemmKernel:
                     global_kblock = (
                         mma_tile_coord_mnl[2] * n_tiles_per_group + mma_tile_coord_mnl[1]
                     )
-                    # Only the scale store needs an M-tail guard.
                     runtime_m = cutlass.Int32(mC_mnl.shape[0])
+                    col = global_kblock >> cutlass.Int32(2)
+                    byte_in_col = global_kblock & cutlass.Int32(3)
+                    sf_byte_base = col * sf_aligned_mn * cutlass.Int32(4) + byte_in_col
                     if global_m < runtime_m:
-                        col = global_kblock >> cutlass.Int32(2)
-                        byte_in_col = global_kblock & cutlass.Int32(3)
-                        byte_offset = (
-                            col * sf_aligned_mn * cutlass.Int32(4)
-                            + global_m * cutlass.Int32(4)
-                            + byte_in_col
-                        )
+                        byte_offset = sf_byte_base + global_m * cutlass.Int32(4)
                         stg_u8_raw(sf_out_addr + cutlass.Int64(byte_offset), ue8m0_byte_i32)
+
+                    # One lane clears at most three padded rows for this K
+                    # block, keeping padding control flow off the row owners.
+                    tile_m_offset = mma_tile_coord_mnl[0] * cutlass.Int32(
+                        self.cta_tile_shape_mnk[0]
+                    )
+                    tile_m_end = tile_m_offset + cutlass.Int32(self.cta_tile_shape_mnk[0])
+                    if (
+                        epi_warp_local == 0
+                        and lane_idx == 0
+                        and runtime_m > tile_m_offset
+                        and runtime_m <= tile_m_end
+                    ):
+                        for padding_offset in cutlass.range_constexpr(3):
+                            padding_m = runtime_m + cutlass.Int32(padding_offset)
+                            if padding_m < sf_aligned_mn:
+                                byte_offset = sf_byte_base + padding_m * cutlass.Int32(4)
+                                stg_u8_raw(
+                                    sf_out_addr + cutlass.Int64(byte_offset), cutlass.Int32(0)
+                                )
 
                     # Quantize from the cached BF16 row.
                     sf_rcp = cutlass.Float32(1.0) / sf_fp32
@@ -2242,6 +2258,24 @@ class Sm100BlockwiseGemmKernel:
                             fp8_fragment,
                             fp8_dest,
                         )
+
+                    # Keep the row-wise quantization path unchanged; one lane
+                    # clears the packed-layout M padding after all row stores.
+                    tile_m_end = tile_m_offset + cutlass.Int32(self.cta_tile_shape_mnk[0])
+                    if (
+                        epi_warp_local == 0
+                        and lane_idx == 0
+                        and runtime_m > tile_m_offset
+                        and runtime_m <= tile_m_end
+                    ):
+                        for padding_offset in cutlass.range_constexpr(3):
+                            padding_m = runtime_m + cutlass.Int32(padding_offset)
+                            if padding_m < sf_aligned_mn:
+                                stg_u8_raw(
+                                    sf_out_addr
+                                    + cutlass.Int64(sf_base_offset + padding_m * cutlass.Int32(4)),
+                                    cutlass.Int32(0),
+                                )
 
                     cute.arch.fence_view_async_shared()
                     self.epilog_sync_barrier.arrive_and_wait()
