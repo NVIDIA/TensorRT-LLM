@@ -7,11 +7,13 @@ SPDX-License-Identifier: Apache-2.0
 
 > **Review-time design notes — to be removed before merging.**
 >
-> **Updated 2026-07-16** to match the current diff: the user-facing knob is now
-> `encoder_max_num_items` (renamed from the original `encoder_max_batch_size`),
-> the full-request fast path is removed in favor of a single encode site (see
-> "Scheduler architecture"), and the item path integrates with the #15734
-> embeddings cache (see "Memory ownership and encoder cache integration").
+> **Updated 2026-07-20**: encoder outputs now live exclusively in a budgeted
+> `MultimodalEncoderCacheManager` (single storage; pin/adopt semantics), item
+> selection performs allocate-before-compute with a head-of-line reservation,
+> and KV estimation reserves the manager budget — encoder-output residency is
+> bounded and profiled (see "Memory ownership: single budgeted storage").
+> Earlier update (07-16): `encoder_max_num_items` rename, single encode site,
+> #15734 embeddings-cache integration.
 
 | Field | Value |
 | --- | --- |
@@ -20,7 +22,7 @@ SPDX-License-Identifier: Apache-2.0
 | Follow-up | [PR #13503: encoder sizing controls](https://github.com/NVIDIA/TensorRT-LLM/pull/13503) |
 | Implementation | [PR #16051](https://github.com/NVIDIA/TensorRT-LLM/pull/16051) |
 | Korean version | [멀티모달 인코더 런타임 스케줄링](multimodal_encoder_runtime_scheduling_design_KR.md) |
-| Last updated | 2026-07-15 |
+| Last updated | 2026-07-20 |
 
 ## Summary
 
@@ -50,8 +52,8 @@ does not split an original MM item, and does not create a separate encoder-only 
 ## Implementation diagram
 
 The diagram below follows the current code from engine initialization through waiting admission,
-per-iteration scheduling (cache attach → item selection), single-site encoder execution with cache
-write-through, request-local commit, and same-step LLM forward. It also shows PP behavior, the
+per-iteration scheduling (cache-hit attach → byte-budgeted item selection), single-site encoder
+execution adopting outputs into the budgeted cache manager, and same-step LLM forward. It also shows PP behavior, the
 boundary from native encoder-decoder scheduling, a concrete two-iteration packing trace, and the
 embeddings-cache integration region.
 
@@ -99,9 +101,8 @@ boundaries. The scheduler therefore needs an MM-specific unit of work and budget
 
 - Splitting a single image, video, or audio item into spatial, temporal, window, or patch microbatches.
 - Introducing a user-facing partial precomputed-embedding API.
-- Implementing cross-request MM encoder output caching. The design reserves stable item identities and
-  lifecycle hooks so a separate cache effort can integrate later.
-- Bounding, evicting, or offloading request-local encoder outputs in the first implementation.
+- Offloading encoder outputs to CPU memory (GPU residency is bounded by the cache-manager
+  budget; offload/eviction tiers remain future work).
 - Changing native encoder-decoder scheduling or execution.
 - Supporting MM tower LoRA. The target encoders currently do not accept request-level LoRA parameters.
 - Redesigning overlap scheduler or MM prefetch compatibility in the first implementation.
@@ -329,16 +330,17 @@ declared-versus-runtime cost assertion remains a possible hardening step.
 
 ## Mutable request-local state
 
-The Python request owns one `MultimodalEncoderRequestState` holding fixed-size item slots,
-one contiguous output buffer, and precomputed offsets, with the state transitions as methods:
+The Python request owns one `MultimodalEncoderRequestState` holding fixed-size item slots and the
+declared per-item embedding lengths, with the state transitions as methods. The state holds no
+storage of its own: every recorded slot aliases an entry of the engine-owned
+`MultimodalEncoderCacheManager` that the request pins until prefill consumes it.
 
 ```python
 py_mm_encoder_state: Optional[MultimodalEncoderRequestState]
-#   .outputs: list[Optional[torch.Tensor]]   # slots; views into the buffer
-#   .output_buffer: Optional[torch.Tensor]   # lazily allocated by fill()
-#   .output_offsets: list[int]
-#   .fill(item_idx, output)                  # single writer (encode + cache attach)
-#   .finalize_into(multimodal_data)          # publish embedding + strip raw inputs
+#   .outputs: list[Optional[torch.Tensor]]   # slots; aliases of pinned manager entries
+#   .embedding_lengths: list[int]            # declared rows; record() validates against these
+#   .record(item_idx, output_view)           # single writer (encode adopt + attach hit)
+#   .finalize_into(multimodal_data)          # publish item-view list + strip raw inputs
 #   .progress / .pending_item_indices()
 ```
 
@@ -356,16 +358,19 @@ state needs no encoder work). Neither is a second stored state and neither modif
 `LlmRequestState`; MM requests remain in `CONTEXT_INIT` so same-iteration encoder-to-LLM execution is
 preserved.
 
-Selection does not mutate request state. The current executor consumes one schedule result before
-constructing another result that could select the same item. Keeping selection in the serialized
-scheduler output avoids reservations that could leak when a result is canceled or discarded.
+Selection does not mutate request slots. The current executor consumes one schedule result before
+constructing another result that could select the same item, and the byte-budget bookkeeping that
+selection does perform (allocate-before-compute, see the storage section) is recomputed fresh each
+pass rather than persisted, so a canceled or discarded result cannot leak reservations.
 
-On the first successful item, the executor allocates one contiguous final output buffer using the
-declared per-item embedding lengths. Each completed item is copied directly into its canonical slice;
-the output slots hold views into this buffer rather than independent allocations. Once all slots are
-ready, that same buffer becomes `multimodal_embedding` without a final `torch.cat` allocation. On
-request cancellation, validation failure, or execution error, the buffer and slots are released with
-the request.
+Encoder outputs are adopted directly into the `MultimodalEncoderCacheManager` (no copy) and the
+slots record the returned aliases. Once all slots are recorded, `finalize_into()` publishes the
+prompt-ordered item-view list as `multimodal_embedding`; the per-request contiguous embedding is
+materialized lazily inside the prefill forward (`get_multimodal_embeddings` already concatenates
+list-valued embeddings), so between encode and prefill the only GPU residency is the manager's
+budgeted entries. Pins are released through a single teardown funnel — the post-prefill strip and
+`_do_terminate_request` (cancellation, errors, disagg timeouts) both route to the idempotent
+`unpin_request` — so a pin can never outlive its request.
 
 ## End-to-end request workflow
 
@@ -841,47 +846,50 @@ tensors. Selection does not create an in-flight reservation in the request, so t
 to roll back when a schedule result is discarded. A selected request that is no longer present in
 `active_requests` at execution is treated as an explicit scheduler lifecycle error.
 
-## Memory ownership and future cache integration
+## Memory ownership: single budgeted storage
 
-The initial implementation intentionally has no separate byte or item limit for accumulated
-request-local outputs. This is acceptable for the first correctness/performance evaluation but is a
-known risk, especially in eager mode where an already-active request can finish encoding while
-it is repeatedly rejected by the current iteration's LLM capacity decision.
+Encoder outputs for item-scheduling models live exclusively in the engine-owned
+`MultimodalEncoderCacheManager` (the vLLM `EncoderCacheManager` shape adapted to this executor):
+requests reference entries by content key and pin them, and the manager's byte budget therefore
+bounds total encoder-output GPU residency. Cross-request reuse is a side effect of the storage
+being content-addressed, not a separate cache. This closes the encode-ahead residency hole of the
+earlier two-pool design (request-owned buffers plus a clone cache), where buffers held by requests
+awaiting prefill were unbounded and unprofiled, and could OOM at high `free_gpu_memory_fraction`.
 
-The following follow-up is required before eager mode becomes a supported default:
-
-1. Track resident MM output embeddings by items and bytes.
-2. Reserve resident capacity before scheduling an item, not after its forward.
-3. Stop eager selection when the resident budget is exhausted.
-4. Release capacity on LLM consumption, cancellation, validation failure, and executor error.
-5. Define whether completed outputs remain on GPU, move to pinned CPU memory, or are evicted.
-6. Define per-DP-replica ownership and distributed accounting.
-7. Add stress tests for waiting-request accumulation and cancellation storms.
-
-The cross-request embeddings cache (#15734's `TensorLRUCache`) is now integrated exactly along
-those lines, without changing scheduler identity:
-
+- **Budget**: `multimodal_config.encoder_cache_max_bytes`, clamped from below to one prefill
+  iteration's embeddings (`max_num_tokens x embedding_row_bytes`) because the executor is
+  guaranteed to need that much co-resident; `embedding_row_bytes` comes from the model-declared
+  `embedding_dim`/`embedding_dtype` (Qwen3-VL folds deepstack maps into each row, 4x the text
+  hidden size), falling back to the embedding layer's weight, then config hidden size.
+- **Allocate-before-compute**: `_select_items` checks `can_allocate()` per pending item, counting
+  bytes claimed earlier in the same pass, and the first request left incomplete reserves its
+  remaining bytes (head-of-line reservation) so requests behind it cannot squat the space it needs
+  — without this, several partially stored requests could pin fragments of the budget and deadlock
+  waiting on one another. A request whose total can never fit fails fast with a clear error.
 - **Read side**: `PyExecutor._attach_mm_encoder_cache_hits()` runs in `_schedule()` before item
-  selection. A hit is filled into the request-local item slot via
-  `MultimodalEncoderRequestState.fill()` and consumes no encoder item or token budget; a fully
-  attached request reaches `READY` without any encoder work, and a partially attached request
-  proceeds through the item path, which re-computes only the misses.
-- **Write side**: `forward_multimodal_encoder_items()` write-throughs each freshly encoded item
-  with `cache.put()` (which clones, so entries neither alias nor pin the request buffer).
+  selection; a hit is pinned via `get_and_pin()` and recorded into the request's slot, consuming
+  no encoder item or token budget.
+- **Write side**: `forward_multimodal_encoder_items()` adopts each fresh output with `adopt()` —
+  no clone, and duplicate keys collapse to the already resident tensor, which also resolves
+  within-iteration duplicate encodes.
 - **Keys**: per item, `(modality, item_hash, embedding_length, mm_processor_kwargs_hash)` —
-  single-sourced in `_encoder_cache_item_key()` so the item path and the full-request consumers
-  (prefetch, `mm_encoder_only`) hit each other's entries. Per-item modality comes from
-  `item_refs`, so mixed-modality requests are keyable on this path.
-- **Guard**: `ModelEngine.get_mm_encoder_cache_and_keys()` — model capability, enabled cache,
-  item metadata, hashes/kwargs-hash present and count-matched. Any failure means the request runs
-  exactly as without a cache.
-- **Lifetime**: eviction can never regress progress because requests own their committed copies;
-  cache bytes are bounded by `encoder_cache_max_bytes` and accounted by #15734's memory
-  estimation.
+  single-sourced in `_encoder_cache_item_key()`. Requests that cannot build stable keys
+  (`get_mm_encoder_item_keys()` returns `None`) store under request-scoped temporary keys:
+  never shared, reclaimed once the request's pins are released.
+- **Lifetime and liveness**: pinned entries are never evicted, so a recorded slot cannot regress;
+  zero-reference entries stay resident in LRU order for reuse and are reclaimed on allocation
+  pressure. Pins release through the single teardown funnel (post-prefill strip and
+  `_do_terminate_request`), and the min-clamp plus head-of-line reservation guarantee forward
+  progress (no partial-allocation deadlock).
+- **Profiling guarantee**: KV estimation profiles boundary encoder batches with the last output
+  held across the LLM dummy forward and additionally reserves the manager budget, so runtime
+  (bounded transient + bounded residency) cannot exceed the estimated peak. Validated empirically:
+  a `free_gpu_memory_fraction=0.98` burst (7x1024px images/request, concurrency 32) that
+  OOM-crashed the two-pool design completes cleanly at throughput parity with main.
 
-Remaining follow-ups: within-iteration key dedup (concurrent duplicates still encode once each),
-an admission-time probe-only check, and partial-hit assembly for the remaining full-request
-consumers (TRTLLM-13996).
+Remaining follow-ups: an admission-time probe-only check, and partial-hit assembly for the
+remaining full-request consumers (prefetch, `mm_encoder_only` — TRTLLM-13996), which still use the
+legacy `TensorLRUCache` clone cache.
 
 ## Correctness requirements
 
@@ -912,9 +920,11 @@ model-level proof and accuracy suite.
 
 Committed unit tests cover atomic packing and cross-request backfill, all-items selection for
 in-budget batches, eager selection after LLM-capacity rejection, ready-request admission
-accounting, oversized-item admission into validation, CPU item slicing, selected output assembly
-into one buffer, embeddings-cache attach/write-through (key parity, full and partial hits,
-eviction safety, per-request guards), raw-input
+accounting, oversized-item admission into validation, CPU item slicing, manager adopt/pin semantics
+(clone-free adoption, dedup, pinned-never-evicted, zero-ref LRU eviction, idempotent unpin),
+allocate-before-compute with head-of-line reservation and the fail-fast liveness guard,
+embeddings attach (key parity, full and partial hits, per-request key guards with
+temporary-key fallback), raw-input
 cleanup, prompt-order metadata, original-video item identity, and Qwen/Mistral token-unit calculations.
 They also cover typed processor metadata materialization and validation.
 
