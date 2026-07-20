@@ -223,3 +223,51 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
     assert not index_k_strided.is_contiguous()
     assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
     assert torch.equal(strided_scores, packed_scores)
+
+
+def test_msa_scratch_sizing_covers_spec_verify_tokens():
+    """Under one-model Eagle3 spec verify a decode step carries
+    1 + draft_len query tokens per request, so the proxy scratch must be
+    sized by the worst-case decode TOKEN count, not the batch size.
+    """
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    metadata.kv_cache_manager = None
+    # 2 sequences, 4 tokens each (draft_len=3): 8 decode tokens per step.
+    metadata.max_num_sequences = 2
+    metadata.max_num_tokens = 8
+    # Store sized for batch-only sizing (4 heads * 16 k-tiles * 2), which is
+    # too small once tokens are accounted for (4 * 16 * 8).
+    metadata.msa_max_score = torch.zeros(4 * 16 * 2)
+
+    with pytest.raises(ValueError, match=r"msa_max_score backing store"):
+        metadata._ensure_msa_decode_scratch_buffers(
+            num_index_heads=4,
+            max_batch=2,
+            capture_graph=False,
+            required_max_k_tiles=16,
+        )
+
+
+def test_per_token_valid_blocks_multi_token_decode():
+    """Spec-verify decode rows expose one entry per query TOKEN, walking the
+    causal ladder within the verify window."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        per_token_valid_blocks,
+    )
+
+    # One request verifying 4 tokens against kv_len 10 (offset 6): token t
+    # attends 7 + t positions; with 2-token blocks that is ceil((7+t)/2).
+    qo = torch.tensor([4], dtype=torch.int32)
+    kv = torch.tensor([10], dtype=torch.int32)
+    off = torch.tensor([6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=2)
+    assert n_valid.tolist() == [4, 4, 5, 5]
+
+    # Mixed batch: an ordinary decode row (qo=1) alongside a verify row.
+    qo = torch.tensor([1, 3], dtype=torch.int32)
+    kv = torch.tensor([9, 6], dtype=torch.int32)
+    off = kv - qo
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
+    # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
+    assert n_valid.tolist() == [3, 1, 2, 2]
