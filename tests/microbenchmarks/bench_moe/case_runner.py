@@ -258,11 +258,13 @@ def _initial_instrumentation(
     analysis: Tuple[str, ...],
     config: ConfigSpec,
     cupti_ctx: Optional[Any],
+    nsys: bool = False,
 ) -> Dict[str, Any]:
     return {
         "level": ",".join(sorted(analysis)) if analysis else "summary",
         "cuda_graph": bool(config.cuda_graph),
         "cupti_available": bool(cupti_ctx is not None and cupti_ctx.ok),
+        "nsys_capture": bool(nsys),
         "phase_timing_available": False,
         "kernel_breakdown_available": "kernels" in analysis,
         "autotune_status": "not_run",
@@ -615,6 +617,7 @@ def _run_one_candidate(
     random_seed: int,
     input_cache: Optional[_InputCache],
     enable_perfect_router_requested: bool,
+    nsys: bool = False,
 ) -> RunResult:
     """Build, autotune, and time one ``ConfigSpec`` candidate.
 
@@ -653,7 +656,7 @@ def _run_one_candidate(
     local_num_tokens = per_rank[rank] if rank < len(per_rank) else 0
     all_rank_num_tokens = list(per_rank)
 
-    result.instrumentation = _initial_instrumentation(analysis, config, cupti_ctx)
+    result.instrumentation = _initial_instrumentation(analysis, config, cupti_ctx, nsys)
 
     # ---- Step 2: mapping + AutoTuner + comm env -------------------------
     try:
@@ -801,6 +804,7 @@ def _run_one_candidate(
                         warmup=int(warmup),
                         iters=int(iters),
                         cupti_ctx=cupti_ctx,
+                        nsys=nsys,
                     )
                 else:
                     fwd_times_ms, detailed_stats = _time_moe_forward_eager(
@@ -811,6 +815,7 @@ def _run_one_candidate(
                         warmup=int(warmup),
                         iters=int(iters),
                         collect_kernels="kernels" in analysis,
+                        nsys=nsys,
                     )
             except Exception as exc:
                 reason = f"timed phase error: {type(exc).__name__}: {exc}"

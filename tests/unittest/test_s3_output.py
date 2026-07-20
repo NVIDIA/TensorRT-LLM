@@ -24,6 +24,14 @@ class Report:
         self.sections = []
 
 
+class RecordingS3Client:
+    def __init__(self):
+        self.uploads = []
+
+    def upload_file(self, filepath, bucket, object_key, ExtraArgs=None):
+        self.uploads.append((filepath, bucket, object_key, ExtraArgs))
+
+
 def make_plugin(tmp_path, inline_output_max_bytes):
     return UploadLogPlugin(
         endpoint_url="https://example.com",
@@ -53,6 +61,20 @@ def test_small_stdout_is_inlined_without_upload(tmp_path):
 
     assert report.sections == [("Captured stdout", "ok\n")]
     assert plugin._deferred_uploads == []
+    assert not (tmp_path / test_name).exists()
+
+
+def test_empty_stdout_is_removed_after_report(tmp_path):
+    test_name = "test-empty"
+    write_log(tmp_path, test_name, "stdout.log", "")
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=4)
+    report = Report()
+
+    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+
+    assert report.sections == [("Captured stdout", "<empty>")]
+    assert plugin._deferred_uploads == []
+    assert not (tmp_path / test_name).exists()
 
 
 def test_large_stdout_keeps_existing_upload_report(tmp_path):
@@ -68,6 +90,49 @@ def test_large_stdout_keeps_existing_upload_report(tmp_path):
     assert section_name == "Captured stdout"
     assert "upload skipped" in section_content
     assert "large output" not in section_content
+    assert (tmp_path / test_name / "stdout.log").exists()
+
+
+def test_uploaded_stdout_is_removed_after_sync_upload(tmp_path):
+    test_name = "test-uploaded"
+    write_log(tmp_path, test_name, "stdout.log", "large output")
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=3)
+    plugin.skip_upload = False
+    plugin.s3 = RecordingS3Client()
+    report = Report()
+
+    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+
+    assert len(plugin.s3.uploads) == 1
+    assert plugin.s3.uploads[0][1:] == (
+        "bucket",
+        "logs/test-uploaded/stdout.log",
+        {"ContentType": "text/plain"},
+    )
+    assert len(report.sections) == 1
+    assert "uploaded to" in report.sections[0][1]
+    assert not (tmp_path / test_name).exists()
+
+
+def test_deferred_stdout_is_removed_after_upload_finishes(tmp_path):
+    test_name = "test-deferred"
+    write_log(tmp_path, test_name, "stdout.log", "large output")
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=3)
+    plugin.skip_upload = False
+    plugin.upload_mode = "deferred"
+    plugin.s3 = RecordingS3Client()
+    report = Report()
+
+    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+
+    assert (tmp_path / test_name / "stdout.log").exists()
+    assert len(plugin._deferred_uploads) == 1
+
+    plugin.pytest_sessionfinish(session=None, exitstatus=0)
+
+    assert len(plugin.s3.uploads) == 1
+    assert plugin._deferred_uploads == []
+    assert not (tmp_path / test_name).exists()
 
 
 def test_small_log_file_is_not_inlined(tmp_path):

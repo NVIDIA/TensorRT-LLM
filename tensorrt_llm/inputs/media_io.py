@@ -32,21 +32,16 @@ from typing import (
 from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
-import lazy_loader as lazy
 import numpy as np
 import requests
 import soundfile
 import torch
+from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
-
-# Lazy import: OpenCV is large and only needed when the cv2-backed video
-# decode path is exercised. The proxy triggers the actual `import cv2` on
-# first attribute access (e.g. `cv2.VideoCapture`).
-cv2 = lazy.load("cv2")
 
 
 def rgba_to_rgb(
@@ -338,6 +333,18 @@ def extract_audio_from_video(
     return audio, target_sr
 
 
+def _get_cv2():
+    """Import OpenCV on demand for the optional cv2-backed video decode path."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV (cv2) is required for video decoding but is not installed. "
+            "Install it with `pip install opencv-python-headless`."
+        ) from exc
+    return cv2
+
+
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
     """Return a VideoCapture backend that can read from a Python `BytesIO`.
 
@@ -351,6 +358,8 @@ def _select_cv2_stream_buffered_backend() -> Optional[int]:
     open. Built-in backends (the FFMPEG path in the PyPI wheels) are always
     safe to use.
     """
+    cv2 = _get_cv2()
+
     # The stream-buffered API was introduced in OpenCV 4.13.0. Older builds
     # don't have `cv2.videoio_registry.getStreamBufferedBackends`, so signal
     # "no usable backend" and let the caller fall back to the tempfile path.
@@ -401,6 +410,7 @@ def _load_video_by_cv2(
     device: str = "cpu",
     extract_audio: bool = False,
     cv2_backend: Optional[int] = None,
+    raw_bytes_hash: Optional[str] = None,
 ) -> VideoData:
     """Decode a video and return sampled frames as a list.
 
@@ -419,6 +429,8 @@ def _load_video_by_cv2(
       `"pil"`   - list[PIL.Image], one per sampled frame.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
+
+    cv2 = _get_cv2()
 
     # Open the source. Two cases:
     #   (a) `video` is a file path / URL str -> hand it straight to cv2.
@@ -532,7 +544,12 @@ def _load_video_by_cv2(
             else:
                 raise
 
-    return VideoData(frames=loaded_frames, metadata=metadata, audio=audio)
+    return VideoData(
+        frames=loaded_frames,
+        metadata=metadata,
+        audio=audio,
+        raw_bytes_hash=raw_bytes_hash,
+    )
 
 
 def _normalize_file_uri(uri: str) -> str:
@@ -750,6 +767,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         # is unlinked on context exit; the inode survives until cv2 closes
         # its own fd (Linux semantics), so the decode inside the `with`
         # block reads safely.
+        raw_bytes_hash = blake3(data).hexdigest()
         cv2_backend = _select_cv2_stream_buffered_backend()
         if cv2_backend is not None:
             return _load_video_by_cv2(
@@ -760,6 +778,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 self._device,
                 extract_audio=self._extract_audio,
                 cv2_backend=cv2_backend,
+                raw_bytes_hash=raw_bytes_hash,
             )
         with tempfile.NamedTemporaryFile(suffix=".mp4", dir=_VIDEO_TEMPFILE_DIR) as tmp:
             tmp.write(data)
@@ -771,20 +790,14 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 self._format,
                 self._device,
                 extract_audio=self._extract_audio,
+                raw_bytes_hash=raw_bytes_hash,
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        return _load_video_by_cv2(
-            _normalize_file_uri(url),
-            self._num_frames,
-            self._fps,
-            self._format,
-            self._device,
-            extract_audio=self._extract_audio,
-        )
+        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(
