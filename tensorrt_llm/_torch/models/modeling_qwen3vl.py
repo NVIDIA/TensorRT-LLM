@@ -1272,6 +1272,24 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         )
         return mm_embeds[0]
 
+    @property
+    def embedding_dim(self) -> int:
+        """Width of each encoder output row (`MultimodalModelMixin` contract).
+
+        Qwen3-VL folds the deepstack feature maps into the hidden dim of
+        every embedding row, so a row is wider than the text hidden size —
+        byte accounting that assumed `hidden_size` would undercount 4x.
+        """
+        # `self.config` is narrowed to the text sub-config during init, and
+        # `deepstack_num_level` is cached there as a plain attribute (0 when
+        # the checkpoint has no deepstack).
+        text_config = getattr(self.config, "text_config", self.config)
+        return text_config.hidden_size * (1 + self.deepstack_num_level)
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
     def _check_and_adjust_experts_implementation(self, *args, **kwargs):
         """No-op override.
 

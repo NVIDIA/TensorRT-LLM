@@ -2647,8 +2647,7 @@ class PyTorchModelEngine(ModelEngine):
         embeddings the executor is guaranteed to need, so it is raised
         with a warning instead of honored.
         """
-        embedding_weight = self.model.text_embedding_layer.weight
-        row_bytes = embedding_weight.shape[-1] * embedding_weight.element_size()
+        row_bytes = self._resolve_mm_embedding_row_bytes()
         self.mm_embedding_row_bytes = row_bytes
         min_bytes = self.max_num_tokens * row_bytes
         multimodal_config = getattr(llm_args, "multimodal_config", None)
@@ -2665,6 +2664,40 @@ class PyTorchModelEngine(ModelEngine):
                 key="raise_mm_encoder_cache_budget",
             )
         return MultimodalEncoderCacheManager(budget, name="mm_encoder_cache")
+
+    def _resolve_mm_embedding_row_bytes(self) -> int:
+        """Bytes of one MM embedding row (hidden size x element size).
+
+        Prefers the mixin's explicit `embedding_dim`/`embedding_dtype`
+        contract, then the text embedding layer's weight, then the
+        pretrained config's hidden size with the loaded weights' dtype —
+        both mixin properties are optional and most VLMs implement
+        neither.
+        """
+        model = self.model
+        try:
+            return (model.embedding_dim * torch.empty(
+                (), dtype=model.embedding_dtype).element_size())
+        except NotImplementedError:
+            pass
+        try:
+            weight = model.text_embedding_layer.weight
+            return weight.shape[-1] * weight.element_size()
+        except NotImplementedError:
+            pass
+        pretrained = model.model_config.pretrained_config
+        hidden_size = getattr(pretrained, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(getattr(pretrained, "text_config", None),
+                                  "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError(
+                "Cannot derive the MM embedding row size: the model "
+                "implements neither embedding_dim/embedding_dtype nor "
+                "text_embedding_layer, and its pretrained config exposes "
+                "no (text_config.)hidden_size")
+        element_size = next(model.parameters()).dtype.itemsize
+        return hidden_size * element_size
 
     def get_mm_encoder_item_keys(
             self, request: LlmRequest) -> Optional[List[Hashable]]:
