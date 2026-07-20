@@ -5334,7 +5334,7 @@ class PyExecutor:
         """Complete pending MM items from resident cache entries before
         scheduling.
 
-        Hits are pinned for the request and recorded into its item slots
+        Hits are held for the request and recorded into its item slots
         ahead of scheduler selection, so they neither consume the encoder
         budgets nor get re-encoded. A request with remaining misses becomes
         PARTIAL and keeps following the item path, which re-computes only
@@ -5354,8 +5354,8 @@ class PyExecutor:
             if item_keys is None:
                 continue
             for item_idx in state.pending_item_indices():
-                cached_output = manager.get_and_pin(item_keys[item_idx],
-                                                    request.request_id)
+                cached_output = manager.get_and_hold(item_keys[item_idx],
+                                                     request.request_id)
                 if cached_output is None:
                     continue
                 state.record(item_idx, cached_output)
@@ -6461,7 +6461,7 @@ class PyExecutor:
                 # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
                 # at high concurrency.
                 _strip_py_multimodal_data_post_prefill(request)
-                self._unpin_mm_encoder_entries(request)
+                self._release_mm_encoder_holds(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -6689,20 +6689,20 @@ class PyExecutor:
         else:
             self._do_terminate_request(request)
 
-    def _unpin_mm_encoder_entries(self, request: LlmRequest) -> None:
-        """Release the request's MM encoder cache pins (idempotent).
+    def _release_mm_encoder_holds(self, request: LlmRequest) -> None:
+        """Release the request's MM encoder cache holds (idempotent).
 
         Part of the single teardown funnel: the post-prefill strip releases
-        pins as soon as the embedding is consumed, and `_do_terminate_request`
+        holds as soon as the embedding is consumed, and `_do_terminate_request`
         catches every other exit (cancellation, errors, disagg timeouts), so
-        a pin can never outlive its request.
+        a hold can never outlive its request.
         """
         manager = getattr(self.model_engine, "mm_encoder_cache_manager", None)
         if manager is not None:
-            manager.unpin_request(request.request_id)
+            manager.release_holds(request.request_id)
 
     def _do_terminate_request(self, request: LlmRequest):
-        self._unpin_mm_encoder_entries(request)
+        self._release_mm_encoder_holds(request)
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)

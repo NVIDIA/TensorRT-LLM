@@ -2617,10 +2617,10 @@ class PyTorchModelEngine(ModelEngine):
             item_keys = item_keys_by_id[request.request_id]
             # Requests without stable content keys store under
             # request-scoped temporary keys: never shared, reclaimed once
-            # the request's pins are released.
+            # the request's holds are released.
             key = (item_keys[item_idx] if item_keys is not None else
                    ("mm_tmp", request.request_id, item_idx))
-            # `adopt` takes ownership without cloning and pins the entry
+            # `adopt` takes ownership without cloning and holds the entry
             # for this request; duplicate keys collapse to the already
             # resident tensor (within-iteration dedup).
             output_view = manager.adopt(key, output, request.request_id)
@@ -2708,7 +2708,7 @@ class PyTorchModelEngine(ModelEngine):
         stable keys — it lacks item metadata, content hashes, or a
         processor-kwargs hash — and its encoder outputs are stored under
         request-scoped temporary keys instead (never shared, reclaimed
-        after its pins are released).
+        after its holds are released).
         """
         # `getattr`: unit tests exercise partially constructed engines.
         if not getattr(self, "supports_mm_encoder_item_scheduling", False):

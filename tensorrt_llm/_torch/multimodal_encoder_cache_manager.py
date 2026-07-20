@@ -38,9 +38,9 @@ class _Entry(NamedTuple):
 class MultimodalEncoderCacheStats(NamedTuple):
     max_bytes: int
     current_bytes: int
-    pinned_bytes: int
+    held_bytes: int
     item_count: int
-    pinned_count: int
+    held_count: int
     hits: int
     misses: int
     adoptions: int
@@ -59,8 +59,8 @@ class MultimodalEncoderCacheManager(Generic[K]):
 
     Semantics:
 
-    - **Pinning.** An entry is pinned while at least one request references
-      it. Pinned entries are never evicted; a pin is the request's guarantee
+    - **Holding.** An entry is held while at least one request references
+      it. Held entries are never evicted; a hold is the request's guarantee
       that the embedding survives until its prefill consumes it.
     - **Allocate-before-compute.** Callers (the MM item scheduler) must check
       `can_allocate()` before encoding an item. `adopt()` evicting only
@@ -68,9 +68,9 @@ class MultimodalEncoderCacheManager(Generic[K]):
       make room.
     - **Adopt, not copy.** `adopt()` takes ownership of the caller's tensor
       without cloning. If the key already exists, the existing entry is
-      pinned and returned instead — concurrent duplicate encodes of the same
+      held and returned instead — concurrent duplicate encodes of the same
       content collapse to one resident copy.
-    - **Zero-ref residency.** Entries whose last pin was released stay
+    - **Zero-ref residency.** Entries whose last hold was released stay
       resident in LRU order for reuse and are reclaimed only when a later
       allocation needs the space.
 
@@ -94,11 +94,11 @@ class MultimodalEncoderCacheManager(Generic[K]):
         self._max_bytes = max_bytes
         self._name = name
         self._current_bytes = 0
-        self._pinned_bytes = 0
+        self._held_bytes = 0
         # Recency order over all entries; eviction walks from the LRU end
-        # skipping pinned entries.
+        # skipping held entries.
         self._entries: OrderedDict[K, _Entry] = OrderedDict()
-        self._key_pins: dict[K, set[RequestId]] = {}
+        self._key_holders: dict[K, set[RequestId]] = {}
         self._request_keys: dict[RequestId, set[K]] = {}
         self._lock = RLock()
         self._hits = 0
@@ -117,9 +117,9 @@ class MultimodalEncoderCacheManager(Generic[K]):
             return self._current_bytes
 
     @property
-    def pinned_bytes(self) -> int:
+    def held_bytes(self) -> int:
         with self._lock:
-            return self._pinned_bytes
+            return self._held_bytes
 
     def __len__(self) -> int:
         with self._lock:
@@ -129,10 +129,10 @@ class MultimodalEncoderCacheManager(Generic[K]):
         """Bytes obtainable for new allocations: free plus zero-ref
         reclaimable space, minus the caller's outstanding reservation."""
         with self._lock:
-            return max(0, self._max_bytes - self._pinned_bytes - reserved_bytes)
+            return max(0, self._max_bytes - self._held_bytes - reserved_bytes)
 
     def can_allocate(self, nbytes: int, *, reserved_bytes: int = 0) -> bool:
-        """Whether `nbytes` can be admitted without evicting pinned entries.
+        """Whether `nbytes` can be admitted without evicting held entries.
 
         `reserved_bytes` lets the scheduler set space aside for the
         head-of-line request's remaining items before admitting items of
@@ -143,8 +143,8 @@ class MultimodalEncoderCacheManager(Generic[K]):
         with self._lock:
             return key in self._entries
 
-    def get_and_pin(self, key: K, request_id: RequestId) -> torch.Tensor | None:
-        """Return the entry for `key` pinned on behalf of `request_id`,
+    def get_and_hold(self, key: K, request_id: RequestId) -> torch.Tensor | None:
+        """Return the entry for `key` held on behalf of `request_id`,
         or `None` on miss. The hit is promoted to most-recently-used."""
         with self._lock:
             entry = self._entries.get(key)
@@ -153,13 +153,13 @@ class MultimodalEncoderCacheManager(Generic[K]):
                 return None
             self._hits += 1
             self._entries.move_to_end(key)
-            self._pin(key, entry, request_id)
+            self._hold(key, entry, request_id)
             return entry.value
 
     def adopt(self, key: K, value: torch.Tensor, request_id: RequestId) -> torch.Tensor:
-        """Store `value` (taking ownership, no clone) pinned for `request_id`.
+        """Store `value` (taking ownership, no clone) held for `request_id`.
 
-        If `key` is already resident the existing tensor is pinned and
+        If `key` is already resident the existing tensor is held and
         returned and `value` is dropped. Evicts zero-reference entries as
         needed; raises `RuntimeError` when space cannot be made — callers
         must have passed `can_allocate()` first (allocate-before-compute).
@@ -171,13 +171,13 @@ class MultimodalEncoderCacheManager(Generic[K]):
             if existing is not None:
                 self._dedup_adoptions += 1
                 self._entries.move_to_end(key)
-                self._pin(key, existing, request_id)
+                self._hold(key, existing, request_id)
                 return existing.value
 
             if not self.can_allocate(size_bytes):
                 raise RuntimeError(
                     f"{self._name}: cannot adopt {size_bytes} bytes; "
-                    f"pinned={self._pinned_bytes}, max={self._max_bytes}. "
+                    f"held={self._held_bytes}, max={self._max_bytes}. "
                     "The MM item scheduler must reserve space via "
                     "can_allocate() before encoding."
                 )
@@ -187,11 +187,11 @@ class MultimodalEncoderCacheManager(Generic[K]):
             self._entries[key] = entry
             self._current_bytes += size_bytes
             self._adoptions += 1
-            self._pin(key, entry, request_id)
+            self._hold(key, entry, request_id)
             return entry.value
 
-    def unpin_request(self, request_id: RequestId) -> None:
-        """Release every pin held by `request_id` (idempotent).
+    def release_holds(self, request_id: RequestId) -> None:
+        """Release every hold of `request_id` (idempotent).
 
         This is the single teardown funnel: prefill completion, cancellation,
         and error paths all route here. Entries left with zero references
@@ -202,34 +202,34 @@ class MultimodalEncoderCacheManager(Generic[K]):
             if not keys:
                 return
             for key in keys:
-                pins = self._key_pins.get(key)
-                if pins is None:
+                holders = self._key_holders.get(key)
+                if holders is None:
                     continue
-                pins.discard(request_id)
-                if not pins:
-                    del self._key_pins[key]
+                holders.discard(request_id)
+                if not holders:
+                    del self._key_holders[key]
                     entry = self._entries.get(key)
                     if entry is not None:
-                        self._pinned_bytes -= entry.size_bytes
+                        self._held_bytes -= entry.size_bytes
 
     def clear(self) -> None:
-        """Drop all entries and pins. Only safe when no request is active
+        """Drop all entries and holds. Only safe when no request is active
         (e.g. warmup teardown or weight updates)."""
         with self._lock:
             self._entries.clear()
-            self._key_pins.clear()
+            self._key_holders.clear()
             self._request_keys.clear()
             self._current_bytes = 0
-            self._pinned_bytes = 0
+            self._held_bytes = 0
 
     def stats(self) -> MultimodalEncoderCacheStats:
         with self._lock:
             return MultimodalEncoderCacheStats(
                 max_bytes=self._max_bytes,
                 current_bytes=self._current_bytes,
-                pinned_bytes=self._pinned_bytes,
+                held_bytes=self._held_bytes,
                 item_count=len(self._entries),
-                pinned_count=len(self._key_pins),
+                held_count=len(self._key_holders),
                 hits=self._hits,
                 misses=self._misses,
                 adoptions=self._adoptions,
@@ -241,18 +241,18 @@ class MultimodalEncoderCacheManager(Generic[K]):
         stats = self.stats()
         logger.debug(
             f"{self._name}: stats after {reason}: items={stats.item_count} "
-            f"(pinned={stats.pinned_count}), bytes={stats.current_bytes}"
-            f"/{stats.max_bytes} (pinned={stats.pinned_bytes}), "
+            f"(held={stats.held_count}), bytes={stats.current_bytes}"
+            f"/{stats.max_bytes} (held={stats.held_bytes}), "
             f"hits={stats.hits}, misses={stats.misses}, "
             f"adoptions={stats.adoptions} (dedup={stats.dedup_adoptions}), "
             f"evictions={stats.evictions}"
         )
 
-    def _pin(self, key: K, entry: _Entry, request_id: RequestId) -> None:
-        pins = self._key_pins.setdefault(key, set())
-        if not pins:
-            self._pinned_bytes += entry.size_bytes
-        pins.add(request_id)
+    def _hold(self, key: K, entry: _Entry, request_id: RequestId) -> None:
+        holders = self._key_holders.setdefault(key, set())
+        if not holders:
+            self._held_bytes += entry.size_bytes
+        holders.add(request_id)
         self._request_keys.setdefault(request_id, set()).add(key)
 
     def _evict_zero_ref_until(self, target_bytes: int) -> None:
@@ -261,7 +261,7 @@ class MultimodalEncoderCacheManager(Generic[K]):
         for key in list(self._entries):
             if self._current_bytes <= target_bytes:
                 break
-            if key in self._key_pins:
+            if key in self._key_holders:
                 continue
             entry = self._entries.pop(key)
             self._current_bytes -= entry.size_bytes

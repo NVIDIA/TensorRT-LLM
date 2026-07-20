@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 > **Review-time design notes — to be removed before merging.**
 >
 > **Updated 2026-07-20**: encoder outputs now live exclusively in a budgeted
-> `MultimodalEncoderCacheManager` (single storage; pin/adopt semantics), item
+> `MultimodalEncoderCacheManager` (single storage; hold/adopt semantics), item
 > selection performs allocate-before-compute with a head-of-line reservation,
 > and KV estimation reserves the manager budget — encoder-output residency is
 > bounded and profiled (see "Memory ownership: single budgeted storage").
@@ -333,11 +333,11 @@ declared-versus-runtime cost assertion remains a possible hardening step.
 The Python request owns one `MultimodalEncoderRequestState` holding fixed-size item slots and the
 declared per-item embedding lengths, with the state transitions as methods. The state holds no
 storage of its own: every recorded slot aliases an entry of the engine-owned
-`MultimodalEncoderCacheManager` that the request pins until prefill consumes it.
+`MultimodalEncoderCacheManager` that the request holds until prefill consumes it.
 
 ```python
 py_mm_encoder_state: Optional[MultimodalEncoderRequestState]
-#   .outputs: list[Optional[torch.Tensor]]   # slots; aliases of pinned manager entries
+#   .outputs: list[Optional[torch.Tensor]]   # slots; aliases of held manager entries
 #   .embedding_lengths: list[int]            # declared rows; record() validates against these
 #   .record(item_idx, output_view)           # single writer (encode adopt + attach hit)
 #   .finalize_into(multimodal_data)          # publish item-view list + strip raw inputs
@@ -370,7 +370,7 @@ materialized lazily inside the prefill forward (`get_multimodal_embeddings` alre
 list-valued embeddings), so between encode and prefill the only GPU residency is the manager's
 budgeted entries. Pins are released through a single teardown funnel — the post-prefill strip and
 `_do_terminate_request` (cancellation, errors, disagg timeouts) both route to the idempotent
-`unpin_request` — so a pin can never outlive its request.
+`release_holds` — so a pin can never outlive its request.
 
 ## End-to-end request workflow
 
@@ -850,7 +850,7 @@ to roll back when a schedule result is discarded. A selected request that is no 
 
 Encoder outputs for item-scheduling models live exclusively in the engine-owned
 `MultimodalEncoderCacheManager` (the vLLM `EncoderCacheManager` shape adapted to this executor):
-requests reference entries by content key and pin them, and the manager's byte budget therefore
+requests reference entries by content key and hold them, and the manager's byte budget therefore
 bounds total encoder-output GPU residency. Cross-request reuse is a side effect of the storage
 being content-addressed, not a separate cache. This closes the encode-ahead residency hole of the
 earlier two-pool design (request-owned buffers plus a clone cache), where buffers held by requests
@@ -864,10 +864,10 @@ awaiting prefill were unbounded and unprofiled, and could OOM at high `free_gpu_
 - **Allocate-before-compute**: `_select_items` checks `can_allocate()` per pending item, counting
   bytes claimed earlier in the same pass, and the first request left incomplete reserves its
   remaining bytes (head-of-line reservation) so requests behind it cannot squat the space it needs
-  — without this, several partially stored requests could pin fragments of the budget and deadlock
+  — without this, several partially stored requests could hold fragments of the budget and deadlock
   waiting on one another. A request whose total can never fit fails fast with a clear error.
 - **Read side**: `PyExecutor._attach_mm_encoder_cache_hits()` runs in `_schedule()` before item
-  selection; a hit is pinned via `get_and_pin()` and recorded into the request's slot, consuming
+  selection; a hit is held via `get_and_hold()` and recorded into the request's slot, consuming
   no encoder item or token budget.
 - **Write side**: `forward_multimodal_encoder_items()` adopts each fresh output with `adopt()` —
   no clone, and duplicate keys collapse to the already resident tensor, which also resolves
@@ -875,10 +875,10 @@ awaiting prefill were unbounded and unprofiled, and could OOM at high `free_gpu_
 - **Keys**: per item, `(modality, item_hash, embedding_length, mm_processor_kwargs_hash)` —
   single-sourced in `_encoder_cache_item_key()`. Requests that cannot build stable keys
   (`get_mm_encoder_item_keys()` returns `None`) store under request-scoped temporary keys:
-  never shared, reclaimed once the request's pins are released.
-- **Lifetime and liveness**: pinned entries are never evicted, so a recorded slot cannot regress;
+  never shared, reclaimed once the request's holds are released.
+- **Lifetime and liveness**: held entries are never evicted, so a recorded slot cannot regress;
   zero-reference entries stay resident in LRU order for reuse and are reclaimed on allocation
-  pressure. Pins release through the single teardown funnel (post-prefill strip and
+  pressure. Holds release through the single teardown funnel (post-prefill strip and
   `_do_terminate_request`), and the min-clamp plus head-of-line reservation guarantee forward
   progress (no partial-allocation deadlock).
 - **Profiling guarantee**: KV estimation profiles boundary encoder batches with the last output
@@ -920,8 +920,8 @@ model-level proof and accuracy suite.
 
 Committed unit tests cover atomic packing and cross-request backfill, all-items selection for
 in-budget batches, eager selection after LLM-capacity rejection, ready-request admission
-accounting, oversized-item admission into validation, CPU item slicing, manager adopt/pin semantics
-(clone-free adoption, dedup, pinned-never-evicted, zero-ref LRU eviction, idempotent unpin),
+accounting, oversized-item admission into validation, CPU item slicing, manager adopt/hold semantics
+(clone-free adoption, dedup, held-never-evicted, zero-ref LRU eviction, idempotent release),
 allocate-before-compute with head-of-line reservation and the fail-fast liveness guard,
 embeddings attach (key parity, full and partial hits, per-request key guards with
 temporary-key fallback), raw-input

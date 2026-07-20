@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 > **리뷰용 설계 노트 — 머지 전에 제거 예정.**
 >
 > **상태 갱신 (2026-07-20)**: encoder 출력이 이제 예산이 걸린
-> `MultimodalEncoderCacheManager` **단일 저장소**에만 산다 (pin/adopt 의미론).
+> `MultimodalEncoderCacheManager` **단일 저장소**에만 산다 (hold/adopt 의미론).
 > item 선택은 allocate-before-compute + head-of-line 예약으로 byte 예산을
 > 강제하고, KV estimation이 manager 예산을 reserve하므로 encoder-output GPU
 > residency가 bounded + profiled 된다 ("Memory ownership: 단일 예산 저장소" 참조).
@@ -336,11 +336,11 @@ Declared-versus-runtime cost assertion은 향후 hardening 항목이다.
 
 Python request는 fixed-size item slot과 declared embedding length를 소유한다. 자체 저장소는
 없다: record된 slot은 전부 engine 소유 `MultimodalEncoderCacheManager` entry의 alias이며, request가
-prefill 소비 시점까지 pin한다.
+prefill 소비 시점까지 hold한다.
 
 ```python
 py_mm_encoder_state: Optional[MultimodalEncoderRequestState]
-#   .outputs: list[Optional[torch.Tensor]]   # 슬롯; pinned manager entry의 alias
+#   .outputs: list[Optional[torch.Tensor]]   # 슬롯; held manager entry의 alias
 #   .embedding_lengths: list[int]            # declared row 수; record()가 검증
 #   .record(item_idx, output_view)           # 단일 writer (encode adopt + attach hit)
 #   .finalize_into(multimodal_data)          # item-view 리스트 발행 + raw strip
@@ -369,9 +369,9 @@ Encoder 출력은 복사 없이 `MultimodalEncoderCacheManager`에 adopt되고 s
 record한다. 전 slot이 record되면 `finalize_into()`가 prompt 순서의 item-view 리스트를
 `multimodal_embedding`으로 발행한다. Request 단위 연속 embedding은 prefill forward 안에서 lazy하게
 구체화되므로(`get_multimodal_embeddings`가 리스트를 이미 concat), encode와 prefill 사이의 GPU
-residency는 manager의 예산 잡힌 entry뿐이다. Pin 해제는 단일 teardown 깔때기 — post-prefill strip과
-`_do_terminate_request`(cancel/error/disagg timeout) 둘 다 멱등 `unpin_request`로 수렴 — 를 지나므로
-pin이 request보다 오래 살 수 없다.
+residency는 manager의 예산 잡힌 entry뿐이다. Hold 해제는 단일 teardown 깔때기 — post-prefill strip과
+`_do_terminate_request`(cancel/error/disagg timeout) 둘 다 멱등 `release_holds`로 수렴 — 를 지나므로
+hold가 request보다 오래 살 수 없다.
 
 ## End-to-end request workflow
 
@@ -830,17 +830,17 @@ buffer가 unbounded·unprofiled여서 높은 `free_gpu_memory_fraction`에서 OO
   4배); 미구현 모델은 embedding layer weight → config hidden size로 폴백.
 - **Allocate-before-compute**: `_select_items`가 pending item마다 `can_allocate()`를 체크하고(같은
   pass에서 먼저 선택된 바이트 포함), 이번 pass에서 미완으로 남는 첫 request의 잔여 바이트를 예약한다
-  (head-of-line 예약). 이 예약이 없으면 부분 저장된 request 여럿이 예산 조각을 pin한 채 서로를
+  (head-of-line 예약). 이 예약이 없으면 부분 저장된 request 여럿이 예산 조각을 hold한 채 서로를
   기다리는 교착이 가능하다. 예산에 영원히 못 들어가는 request는 명확한 에러로 fail-fast.
 - **Read**: `PyExecutor._attach_mm_encoder_cache_hits()`가 `_schedule()`에서 item 선택 전에 실행된다.
-  Hit는 `get_and_pin()`으로 pin되어 slot에 record되며 encoder item/token 예산을 소비하지 않는다.
+  Hit는 `get_and_hold()`로 hold되어 slot에 record되며 encoder item/token 예산을 소비하지 않는다.
 - **Write**: `forward_multimodal_encoder_items()`가 fresh output을 `adopt()`한다 — clone 없음, 중복
   key는 이미 상주하는 tensor로 collapse (iteration 내 중복 인코딩 dedup도 이걸로 해결).
 - **Key**: item별 `(modality, item_hash, embedding_length, mm_processor_kwargs_hash)` —
   `_encoder_cache_item_key()` 단일 출처. 안정적인 key를 못 만드는 request
-  (`get_mm_encoder_item_keys()`가 `None`)는 request-scoped 임시 key로 저장: 공유 불가, pin 해제 후 회수.
-- **Lifetime과 liveness**: pinned entry는 절대 evict되지 않으므로 record된 slot은 되돌아갈 수 없다.
-  zero-ref entry는 재사용을 위해 LRU 순서로 상주하다가 할당 압력 시 회수된다. Pin은 단일 teardown
+  (`get_mm_encoder_item_keys()`가 `None`)는 request-scoped 임시 key로 저장: 공유 불가, hold 해제 후 회수.
+- **Lifetime과 liveness**: held entry는 절대 evict되지 않으므로 record된 slot은 되돌아갈 수 없다.
+  zero-ref entry는 재사용을 위해 LRU 순서로 상주하다가 할당 압력 시 회수된다. Hold는 단일 teardown
   깔때기(post-prefill strip + `_do_terminate_request`)로 해제되고, min-clamp + head-of-line 예약이
   전진(부분 할당 교착 없음)을 보장한다.
 - **Profiling 보증**: KV estimation이 boundary encoder batch를 마지막 출력을 잡아둔 채 LLM dummy
