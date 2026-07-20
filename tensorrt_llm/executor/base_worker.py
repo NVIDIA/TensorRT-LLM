@@ -207,24 +207,8 @@ class BaseWorker(GenerationExecutor):
                 self.max_seq_len = _executor.max_seq_len
             return _executor
 
-        def _create_engine(executor_config):
-            engine = self._engine
-            if executor_config is None:
-                executor_config = tllm.ExecutorConfig(1)
-            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-                processor_batched=self._batched_logits_processor,
-                replicate=False)
-            comm_ranks, device_ids = self._get_comm_ranks_device_id()
-            executor_config.parallel_config = tllm.ParallelConfig(
-                participant_ids=comm_ranks, device_ids=device_ids)
-
-            assert not hasattr(executor_config, "backend")
-            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                 executor_config)
-
-        self.engine = _create_py_executor(
-        ) if self.llm_args is not None else _create_engine(
-            self._executor_config)
+        assert self.llm_args is not None, "llm_args is required to set up the worker engine"
+        self.engine = _create_py_executor()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
@@ -245,16 +229,10 @@ class BaseWorker(GenerationExecutor):
             seconds=timeout) if timeout is not None else None)
 
     def fetch_stats(self) -> list:
-        if isinstance(self.engine, tllm.Executor):
-            iter_stats = self.engine.get_latest_iteration_stats()
-            #TODO: Support req stats with TRT engine
-            #      This would require ensuring iter and req stats have same size
-            return [(iter_stat, None, None) for iter_stat in iter_stats]
-        else:
-            return self.engine.get_latest_iteration_stats()
+        return self.engine.get_latest_iteration_stats()
 
     def fetch_kv_cache_capacity(self) -> dict:
-        if self.engine is None or isinstance(self.engine, tllm.Executor):
+        if self.engine is None:
             return {}
 
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -264,10 +242,7 @@ class BaseWorker(GenerationExecutor):
         return {}
 
     def fetch_kv_cache_events(self) -> list:
-        if isinstance(self.engine, tllm.Executor):
-            return self.engine.get_latest_kv_cache_events()
-        else:
-            return self.engine.get_latest_kv_cache_events()
+        return self.engine.get_latest_kv_cache_events()
 
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
@@ -437,6 +412,10 @@ class BaseWorker(GenerationExecutor):
                                llm_args: Optional[BaseLlmArgs] = None) -> int:
             # deduce max_tokens when it's not set by user
             max_tokens = request.sampling_params.max_tokens
+            output_prefix_len = len(
+                request.sampling_params._decoder_output_token_prefix)
+            if max_tokens is not None:
+                max_tokens -= output_prefix_len
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
 
