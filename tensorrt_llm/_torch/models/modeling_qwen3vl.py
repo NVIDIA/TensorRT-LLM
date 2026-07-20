@@ -1111,6 +1111,18 @@ class Qwen3VisionModelBase(nn.Module):
         # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
         return torch.cat([embeds] + deepstack, dim=1)
 
+    def forward(self, multimodal_params: List[MultimodalParams]):
+        """Standalone mm-encoder-only executor entry.
+
+        The disaggregated MM-encoder path (`_forward_step_mm_encoder_only`)
+        invokes the vision model's `forward()` and expects a list of embedding
+        tensors (it asserts a single element — mixed modality is unsupported
+        there). Build the batched ViT input the same way the encoder group does
+        and run one encode. Mirrors the `forward()` contract that
+        `Qwen2VisionModelBase` still exposes for this path.
+        """
+        return [self.encode_batched(**_qwen3vl_build_batched_input(multimodal_params))]
+
 
 class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def encode_multimodal_inputs(
