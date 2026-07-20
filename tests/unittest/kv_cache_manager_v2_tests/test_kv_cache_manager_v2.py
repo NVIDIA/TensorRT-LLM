@@ -2443,6 +2443,31 @@ class TestInitRatioConfig(unittest.TestCase):
         mgr_unconstrained.shutdown()
         mgr_constrained.shutdown()
 
+    def test_constraint_reserves_resume_headroom(self):
+        """A full constraint batch must stay below the resume utilization gate."""
+        num_requests = 32
+        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=1, history_length=0)] * num_requests)
+        granularity = 2 << 20
+        gpu_quota = round_up(num_requests * self.PG0_SLOT_SIZE, granularity) + round_up(
+            num_requests * self.PG1_SLOT_SIZE, granularity
+        )
+        cfg = self._make_config(gpu_quota=gpu_quota, constraints=[constraint])
+        cfg.max_util_for_resume = 0.95
+        manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        kv_caches = []
+        for _ in range(num_requests):
+            kv_cache = manager.create_kv_cache()
+            self.assertTrue(kv_cache.resume(stream))
+            kv_cache.capacity = 1
+            kv_caches.append(kv_cache)
+
+        for kv_cache in kv_caches:
+            kv_cache.close()
+        manager.shutdown()
+
     def test_initial_pool_ratio_overrides_typical_step_and_constraints(self):
         """Explicit initial_pool_ratio takes precedence over inferred sizing inputs."""
         typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)

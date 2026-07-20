@@ -19,7 +19,7 @@
 # Usage: compile.sh <repo_dir> [build_wheel_args...]
 #
 # Default build_wheel.py flags:
-#   --trt_root /usr/local/tensorrt --benchmarks -a "100-real" --nvtx --no-venv
+#   --trt_root /usr/local/tensorrt -a "100-real" --nvtx --no-venv
 # Any extra arguments after repo_dir are forwarded to build_wheel.py,
 # overriding the defaults above.
 
@@ -37,7 +37,6 @@ else
     echo "[compile.sh] Running default build command"
     python3 ./scripts/build_wheel.py \
         --trt_root /usr/local/tensorrt \
-        --benchmarks \
         -a "100-real" \
         --nvtx
 fi

@@ -109,6 +109,7 @@ l0_b200:
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
+  - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
@@ -294,7 +295,6 @@ l0_b200:
   tests:
   # ------------- TRT tests ---------------
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
-  - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_openai_server_info.py
 - condition:
     ranges:

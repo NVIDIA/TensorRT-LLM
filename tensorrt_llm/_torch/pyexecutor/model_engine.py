@@ -2699,14 +2699,26 @@ class PyTorchModelEngine(ModelEngine):
         return None
 
     def _set_spec_metadata_all_rank_num_tokens(
-            self, spec_metadata: SpecMetadata,
+            self,
+            spec_metadata: SpecMetadata,
             spec_all_rank_num_tokens: List[int],
-            all_rank_num_seqs: List[int]) -> None:
+            all_rank_num_seqs: List[int],
+            all_rank_num_gens: Optional[List[int]] = None) -> None:
         # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
         # draft loop iterations i>0 (per-sequence counts, since each
         # sequence contributes one token per iteration).
         spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
         spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+        # DSpark can draft only after the target processes the current bonus token,
+        # because it consumes captured target-layer hidden states for that token.
+        # Prefill computes hidden states for prompt tokens; the first generated token
+        # is sampled from the last prompt logits and has not itself passed through the
+        # target layers. Thus context requests seed the rolling window but do not run
+        # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
+        # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
+        # chunk loop identical across EP ranks.
+        if all_rank_num_gens is not None:
+            spec_metadata.all_rank_num_gens = all_rank_num_gens
         if (spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
                 or spec_metadata.spec_dec_mode.is_eagle3_one_model()):
             spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
@@ -3035,12 +3047,14 @@ class PyTorchModelEngine(ModelEngine):
             # Handle distributed spec metadata
             if enable_attention_dp:
                 sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [spec_metadata.num_tokens,
-                     len(sequence_lengths)])
+                all_rank_num_tokens = self.dist.tp_cp_allgather([
+                    spec_metadata.num_tokens,
+                    len(sequence_lengths), attn_metadata.num_generations
+                ])
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens])
+                    [item[1] for item in all_rank_num_tokens],
+                    [item[2] for item in all_rank_num_tokens])
 
         # Set iteration states - batch dictionary updates
         self.iter_states.update({
@@ -3294,6 +3308,10 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 prompt_lengths[idx] = request.py_prompt_len
 
+            # Physical KV length for the kernels: subtract the tokens a
+            # KV-cache compression manager evicted (tracked on the request,
+            # 0 without compression). Position ids and the cached_tokens stat
+            # keep the logical count.
             if request.is_dummy:
                 num_cached_tokens_per_seq[idx] = base_past_seen
                 request.cached_tokens = base_past_seen
@@ -3304,9 +3322,11 @@ class PyTorchModelEngine(ModelEngine):
                     num_previous_batch] = request.py_batch_idx
                 num_previous_batch += 1
 
-                num_cached_tokens_per_seq[
-                    idx] = base_past_seen + num_tokens_per_extend_request
-                request.cached_tokens = num_cached_tokens_per_seq[idx].item()
+                request.cached_tokens = (base_past_seen +
+                                         num_tokens_per_extend_request)
+                num_cached_tokens_per_seq[idx] = (
+                    base_past_seen + num_tokens_per_extend_request -
+                    request.py_num_compressed_tokens)
 
             request.py_batch_idx = request.py_seq_slot
 
@@ -3705,8 +3725,9 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.cached_tokens = num_cached_tokens_per_seq[-1]
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             request.py_num_compressed_tokens)
+            request.cached_tokens = past_seen_token_num
             append_cross_attention_state(
                 request,
                 project_encoder_output=not request.py_skip_cross_kv_projection
@@ -3898,8 +3919,9 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
-                num_cached_tokens_per_seq.append(past_seen_token_num)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                num_cached_tokens_per_seq.append(
+                    past_seen_token_num - request.py_num_compressed_tokens)
+                request.cached_tokens = past_seen_token_num
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -3926,9 +3948,11 @@ class PyTorchModelEngine(ModelEngine):
                 previous_pos_indices.extend([previous_batch_idx] *
                                             runtime_tokens_per_gen_step)
 
-                num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 runtime_tokens_per_gen_step)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                num_cached_tokens_per_seq.append(
+                    past_seen_token_num + runtime_tokens_per_gen_step -
+                    request.py_num_compressed_tokens)
+                request.cached_tokens = (past_seen_token_num +
+                                         runtime_tokens_per_gen_step)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -3985,7 +4009,8 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             request.py_num_compressed_tokens)
             append_cross_attention_state(request, project_encoder_output=False)
 
             # update batch index
@@ -4062,7 +4087,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
                     position_ids.append(position_id)
-                    num_cached_tokens_per_seq.append(past_seen_token_num)
+                    num_cached_tokens_per_seq.append(
+                        past_seen_token_num - request.py_num_compressed_tokens)
                     prompt_lengths.append(request.py_prompt_len)
                     gather_ids.append(len(position_ids) - 1)
 
@@ -4611,12 +4637,14 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [spec_metadata.num_tokens,
-                     len(sequence_lengths)])
+                all_rank_num_tokens = self.dist.tp_cp_allgather([
+                    spec_metadata.num_tokens,
+                    len(sequence_lengths), spec_metadata.num_generations
+                ])
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
-                    [item[1] for item in all_rank_num_tokens])
+                    [item[1] for item in all_rank_num_tokens],
+                    [item[2] for item in all_rank_num_tokens])
 
         if mm_token_indices is not None:
             self._ship_multimodal_indices(
@@ -4856,14 +4884,15 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata is not None:
                 all_rank_num_tokens = self.dist.tp_cp_allgather([
                     attn_metadata.num_tokens, spec_metadata.num_tokens,
-                    len(sequence_lengths)
+                    len(sequence_lengths), spec_metadata.num_generations
                 ])
                 attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens])
+                    [item[2] for item in all_rank_num_tokens],
+                    [item[3] for item in all_rank_num_tokens])
             else:
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
                     attn_metadata.num_tokens)
