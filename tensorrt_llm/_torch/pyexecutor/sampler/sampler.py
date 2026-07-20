@@ -5222,7 +5222,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             request_offsets=sampling_requests_metadata.req_offsets,
             request_num_steps=sampling_requests_metadata.req_num_steps,
         )
-        
+
         if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
             stale_by_one: list[bool] | None = None
             if self._track_pending_steps and not self._is_draft_batch(sampling_requests):
