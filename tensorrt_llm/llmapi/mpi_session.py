@@ -8,6 +8,7 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
@@ -153,12 +154,67 @@ class MpiSession(abc.ABC):
         killer.join()
 
 
+def _process_start_time(pid: int) -> Optional[bytes]:
+    """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
+
+    PIDs are recycled by the OS, but the (pid, start_time) pair uniquely
+    identifies a process incarnation — comparing it prevents waiting on an
+    unrelated process that inherited a dead worker's PID.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+        # Field 2 (comm) may contain spaces/parens; parse after the last ')'.
+        return stat.rsplit(b")", 1)[1].split()[19]  # field 22 overall
+    except OSError:
+        return None
+
+
+def _worker_identity_barrier():
+    """Runs inside a pool worker; module-level so it is picklable.
+
+    The leading barrier pins the ``n_workers`` submitted tasks one-per-worker
+    (a worker holding one task blocks until every other worker holds its own,
+    so no worker can drain a second one), collecting every worker's identity
+    exactly once. The workers' ``MPI_COMM_WORLD`` is the spawned worker world
+    (the parent process is not a member).
+    """
+    from mpi4py import MPI
+    MPI.COMM_WORLD.barrier()
+    pid = os.getpid()
+    return (pid, _process_start_time(pid))
+
+
 class MpiPoolSession(MpiSession):
 
-    def __init__(self, n_workers: int):
+    def __init__(self,
+                 n_workers: int,
+                 wait_shutdown: bool = False,
+                 env_overrides: Optional[Dict[str, str]] = None):
+        """Args:
+        n_workers: number of MPI workers to spawn.
+        wait_shutdown: when True, ``shutdown()`` blocks until the spawned
+            worker processes have actually exited. ``MPIPoolExecutor.shutdown``
+            returns at disconnect, but a worker's GPU memory is only released
+            when its process exits; callers that start new GPU work right
+            after ``shutdown()`` (e.g. CI test infrastructure handing a
+            pre-spawned pool to the next test) race that release and can OOM.
+            Off by default: production teardown does not need the barrier and
+            keeps its current latency.
+        env_overrides: extra environment variables to set in the WORKERS at
+            spawn, on top of the TRTLLM*/TLLM* variables forwarded from the
+            parent. The parent process environment is never touched — this
+            replaces the racy "set os.environ around the spawn, then restore"
+            pattern for callers that spawn pools from background threads.
+        """
         self.n_workers = n_workers
+        self._wait_shutdown = wait_shutdown
+        self._env_overrides = dict(env_overrides) if env_overrides else {}
+        self._worker_identities: Tuple = ()
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
+        if wait_shutdown:
+            self._worker_identities = self._collect_worker_identities()
         if ENABLE_MULTI_DEVICE:
             self.comm = mpi4py.MPI.COMM_WORLD
 
@@ -187,6 +243,87 @@ class MpiPoolSession(MpiSession):
             self.mpi_pool.shutdown(wait=wait)
             logger.info("MpiPoolSession.shutdown: done")
             self.mpi_pool = None
+            if self._wait_shutdown:
+                self._wait_workers_exit()
+
+    def _collect_worker_identities(self) -> Tuple:
+        """(pid, start_time) of every worker, recorded right after spawn.
+
+        FAIL-CLOSED (review requirement): ``wait_shutdown=True`` is a
+        contract — shutdown blocks until the workers exited. A pool without
+        complete identities cannot honor it, and returning it anyway would
+        silently downgrade to the old non-waiting behavior (the timeout can
+        trip on a slow-but-healthy bootstrap, and ``futures_wait`` does not
+        cancel the pending tasks). Instead of handing out such a pool, tear
+        it down and raise; callers fall back to a fresh spawn.
+        """
+        try:
+            futures = [
+                self.mpi_pool.submit(_worker_identity_barrier)
+                for _ in range(self.n_workers)
+            ]
+            done, not_done = futures_wait(futures, timeout=60.0)
+            identities = tuple(f.result() for f in done)
+        except Exception as e:
+            self._teardown_unidentified_pool(())
+            raise RuntimeError(
+                f"MpiPoolSession(wait_shutdown=True): worker identity "
+                f"collection failed ({e}); pool torn down") from e
+        if (not_done or len(identities) != self.n_workers
+                or len({pid
+                        for pid, _ in identities}) != self.n_workers
+                or any(start is None for _, start in identities)):
+            self._teardown_unidentified_pool(identities)
+            raise RuntimeError(
+                "MpiPoolSession(wait_shutdown=True): worker identity "
+                f"collection incomplete ({len(identities)}/{self.n_workers} "
+                "valid identities); pool torn down instead of handing out a "
+                "session that cannot honor the wait_shutdown contract")
+        return identities
+
+    def _teardown_unidentified_pool(self, partial_identities: Tuple) -> None:
+        """Dispose of a pool whose identity collection failed.
+
+        The workers may be stuck in the collection barrier (one of them
+        never picked up its task), so a graceful blocking shutdown could
+        hang; disconnect without waiting and SIGKILL the workers we did
+        identify (with the pid-recycling guard). Workers we never identified
+        exit with the MPI runtime teardown; if one is truly wedged it leaks
+        until job end — the same bounded leak class as any wedged pool.
+        """
+        import signal
+
+        try:
+            self.mpi_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        self.mpi_pool = None
+        for pid, start in partial_identities:
+            if start is None or _process_start_time(pid) != start:
+                continue  # gone already, or the PID was recycled
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def _wait_workers_exit(self, timeout: float = 30.0) -> None:
+        """Block until the spawned worker processes have actually exited.
+
+        Bounded: a wedged worker stops blocking the caller after ``timeout``
+        (its memory is not coming back anyway; the caller's own recovery —
+        e.g. an OOM retry or a fresh spawn — takes over from there).
+        """
+        deadline = time.monotonic() + timeout
+        for pid, start in self._worker_identities:
+            if start is None:
+                continue
+            while _process_start_time(pid) == start:
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        f"MpiPoolSession.shutdown: worker pid {pid} still "
+                        f"alive after {timeout}s; not waiting further")
+                    return
+                time.sleep(0.05)
 
     def abort(self):
         self.get_comm().Abort(1)
@@ -199,6 +336,7 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
+        env.update(self._env_overrides)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)
