@@ -25,7 +25,7 @@
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <future>
 #include <memory>
@@ -147,7 +147,7 @@ public:
     void updateTaskState(uint64_t taskId, uint64_t reqId, bool terminate = false, bool pause = false);
 
     static std::pair<uint64_t, uint64_t> getMaxNumSlots(PeftCacheManagerConfig const& config,
-        nvinfer1::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
+        tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
         runtime::BufferManager const& bufferManager);
 
     static std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConfig> getPageManagerConfig(

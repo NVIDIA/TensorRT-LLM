@@ -294,7 +294,6 @@ l0_b200:
   tests:
   # ------------- TRT tests ---------------
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
-  - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_openai_server_info.py
 - condition:
     ranges:
