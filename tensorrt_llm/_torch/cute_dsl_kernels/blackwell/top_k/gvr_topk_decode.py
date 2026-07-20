@@ -460,6 +460,20 @@ class GvrTopKKernel:
         self.p1b_cache = bool(p1b_cache)
         if enable_r0 and top_k == 512 and cluster_size == 1 and self.kC > 3072:
             self.kC = 3072
+        # K2048 R0 Phase-4 histogram diet: 2048 -> 512 bins (2026-07-19
+        # paired nsys cold-L2 A/B on B200, all cells exact). The P4 zero /
+        # atomic build / serial scan all shrink 4x; the deeper boundary-bin
+        # recursion costs less than the saved passes at kC=6144 candidates.
+        # Measured vs this head: real V3.2 decode captures geomean +6.1%
+        # (fp32) / +10.9% (bf16) / +6.3% (fp16); favorable synthetic
+        # +5.2-11.0%, adverse synthetic +5.1-10.6%; no losing cell
+        # (fp32 min 0.994, bf16 min 1.035, fp16 min 0.999). Gated on
+        # enable_r0 so the retained secant path (which shares GvrParams
+        # and its own P4 histogram) stays byte-identical. P1b reuses this
+        # buffer and needs >= 256 bins, so 512 is safe. K512/K1024
+        # measured as a wash under the same protocol and stay stock.
+        if enable_r0 and top_k == 2048 and self.kNumBins > 512:
+            self.kNumBins = 512
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
             assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
