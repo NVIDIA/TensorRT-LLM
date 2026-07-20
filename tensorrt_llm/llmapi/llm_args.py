@@ -3625,7 +3625,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     max_util_for_resume: float = Field(
         default=0.95,
-        ge=0,
+        gt=0,
         le=1,
         status="prototype",
         description=
@@ -3779,14 +3779,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
-        return v
-
-    @field_validator('max_util_for_resume')
-    @classmethod
-    def validate_max_util_for_resume(cls, v: float):
-        if not 0 <= v <= 1:
-            raise ValueError(
-                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
     @field_validator('pool_ratio')
