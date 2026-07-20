@@ -20,6 +20,7 @@ accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False] SKIP (https://nvbugs/6427411)
 accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True] SKIP (https://nvbugs/6402054)
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
+accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-attn_dp_off-trtllm] SKIP (https://nvbugs/6367792)
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[nvfp4_ws8_80gb-trtllm] SKIP (https://nvbugs/6450341)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/6428101)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp_trtllm] SKIP (https://nvbugs/6426868)
