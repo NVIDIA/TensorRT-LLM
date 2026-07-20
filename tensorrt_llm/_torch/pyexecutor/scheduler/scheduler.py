@@ -506,13 +506,28 @@ class MultimodalScheduler(RequestScheduler):
         )
 
     def _select_items(self, requests: RequestList) -> tuple[dict[int, list[int]], RequestList]:
+        """Greedily select pending MM items under the encoder budgets.
+
+        Requests are visited in the wrapped capacity scheduler's FCFS order
+        with no explicit `MultimodalEncoderProgress`-based priority: a
+        request left `PARTIAL` by a budget split necessarily sits ahead of
+        anything admitted later, so its remaining items resume before newer
+        work by order alone. A request that arrives `PARTIAL` through cache
+        hits gets no boost over older `PENDING` requests — a deliberate
+        fairness default.
+
+        Returns the selected item indices per request id, plus the requests
+        eligible for LLM microbatch scheduling this iteration (encoder
+        outputs already ready, or every pending item selected above).
+        """
         remaining_items = self.max_num_items
         remaining_tokens = self.max_num_tokens
         selected: dict[int, list[int]] = {}
         llm_eligible: RequestList = []
 
         for request in requests:
-            if not request.py_is_multimodal_encoder_request:
+            state = request.py_mm_encoder_state
+            if state is None:
                 llm_eligible.append(request)
                 continue
             if is_multimodal_encoder_ready(request):
@@ -525,13 +540,17 @@ class MultimodalScheduler(RequestScheduler):
                     f"Multimodal request {request.py_request_id} is missing "
                     "multimodal_encoder_item_metadata"
                 )
+            if len(token_lengths) != state.num_items:
+                raise ValueError(
+                    f"Multimodal request {request.py_request_id} has "
+                    f"{state.num_items} item slots but {len(token_lengths)} "
+                    "encoder token lengths"
+                )
 
+            pending = state.pending_item_indices()
             request_items: list[int] = []
-            for item_idx, (cost, output) in enumerate(
-                zip(token_lengths, request.py_mm_encoder_outputs, strict=True)
-            ):
-                if output is not None:
-                    continue
+            for item_idx in pending:
+                cost = token_lengths[item_idx]
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
                 request_items.append(item_idx)
@@ -541,12 +560,7 @@ class MultimodalScheduler(RequestScheduler):
             if request_items:
                 selected[request.request_id] = request_items
 
-            unresolved = [
-                item_idx
-                for item_idx, output in enumerate(request.py_mm_encoder_outputs)
-                if output is None
-            ]
-            if unresolved and all(item_idx in request_items for item_idx in unresolved):
+            if pending and len(request_items) == len(pending):
                 llm_eligible.append(request)
 
         return selected, llm_eligible
