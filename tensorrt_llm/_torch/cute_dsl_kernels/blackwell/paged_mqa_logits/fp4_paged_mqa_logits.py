@@ -2054,9 +2054,10 @@ class FP4MQALogitsKernel:
                         # Hit accumulators + bitmap word add ~6 more live
                         # registers across the tile loop.
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
-                    if cutlass.const_expr(self.emit_seed_counts):
-                        # 3 thresholds + 3 counters per t.
-                        MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
+                    # emit_seed_counts: no budget cut — ncu shows the cost
+                    # is epilogue ALU/issue, not registers (occupancy and
+                    # block limits identical with or without a -8 cut; the
+                    # cut itself measured neutral-to-slower).
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2490,9 +2491,10 @@ class FP4MQALogitsKernel:
                         # Hit accumulators + bitmap word add ~6 more live
                         # registers across the tile loop.
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
-                    if cutlass.const_expr(self.emit_seed_counts):
-                        # 3 thresholds + 3 counters per t.
-                        MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
+                    # emit_seed_counts: no budget cut — ncu shows the cost
+                    # is epilogue ALU/issue, not registers (occupancy and
+                    # block limits identical with or without a -8 cut; the
+                    # cut itself measured neutral-to-slower).
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
