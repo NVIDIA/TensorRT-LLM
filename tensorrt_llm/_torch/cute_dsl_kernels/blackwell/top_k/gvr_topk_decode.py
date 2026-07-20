@@ -1447,7 +1447,12 @@ class GvrTopKKernel:
         # position (determinism contract).
         ids_per_thread = cutlass.const_expr(self.SKIP_MAX_BLOCKS // self.num_threads)
         num_threads = cutlass.const_expr(self.num_threads)
-        blk_lo = slice_start >> cutlass.Int32(self.SKIP_BLOCK_LOG2)
+        # first FULL block: a block straddling slice_start would map list
+        # positions outside this CTA's slice; the sub-block head region
+        # [slice_start, blk_lo*32) is scanned separately by the callers.
+        blk_lo = (slice_start + cutlass.Int32(self.SKIP_BLOCK - 1)) >> cutlass.Int32(
+            self.SKIP_BLOCK_LOG2
+        )
         blk_hi = (slice_end + cutlass.Int32(self.SKIP_BLOCK - 1)) >> cutlass.Int32(
             self.SKIP_BLOCK_LOG2
         )
@@ -1541,16 +1546,27 @@ class GvrTopKKernel:
         # ---- block-skip compact iteration (lossless vs the dense path) ----
         # Build the active list at the LOOSEST threshold over all M columns:
         # a skipped block bounds every element below min(t_m), so all M
-        # counts equal their dense values. Slice boundaries must be
-        # 32-aligned for the list's block<->position mapping to stay inside
-        # the slice (runtime-uniform guard; misaligned slices fall through
-        # to the dense path below via skip_ok == 0).
+        # counts equal their dense values. The list covers FULL blocks only;
+        # the sub-block head region of an unaligned slice start is counted
+        # here separately (per-thread order contract: head elements FIRST,
+        # then list entries — Phase 3's compact write replays the same).
         skip_ok = cutlass.Int32(0)
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
-            if (slice_start & cutlass.Int32(self.SKIP_BLOCK - 1)) == cutlass.Int32(0):
-                skip_ok = cutlass.Int32(1)
+            skip_ok = cutlass.Int32(1)
         if cutlass.const_expr(self.enable_block_skip and block_max_row is not None):
             if skip_ok == cutlass.Int32(1):
+                head_end = (
+                    (slice_start + cutlass.Int32(self.SKIP_BLOCK - 1))
+                    >> cutlass.Int32(self.SKIP_BLOCK_LOG2)
+                ) << cutlass.Int32(self.SKIP_BLOCK_LOG2)
+                if head_end > slice_end:
+                    head_end = slice_end
+                hh = slice_start + tidx
+                while hh < head_end:
+                    vh = self._load_fp32(input_row, hh)
+                    for m in cutlass.range_constexpr(M):
+                        cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vh >= thr_frag[m])
+                    hh = hh + cutlass.Int32(num_threads)
                 tmin = thr_frag[0]
                 for m in cutlass.range_constexpr(M):
                     tmin = _fmin_f32_inline(tmin, thr_frag[m])
@@ -2205,6 +2221,21 @@ class GvrTopKKernel:
                 skip_wr = cutlass.Int32(1)
         if cutlass.const_expr(self.enable_block_skip and smem_active is not None):
             if skip_wr == cutlass.Int32(1):
+                # head region first — same per-thread order as the count pass
+                head_end_w = (
+                    (slice_start + cutlass.Int32(self.SKIP_BLOCK - 1))
+                    >> cutlass.Int32(self.SKIP_BLOCK_LOG2)
+                ) << cutlass.Int32(self.SKIP_BLOCK_LOG2)
+                if head_end_w > slice_end:
+                    head_end_w = slice_end
+                hh_w = slice_start + tidx
+                while hh_w < head_end_w:
+                    vh_w = self._load_fp32(input_row, hh_w)
+                    if vh_w >= thr_final and wc < cutlass.Int32(kCC):
+                        smem_keys[wc] = vh_w
+                        smem_vals[wc] = hh_w
+                        wc = wc + cutlass.Int32(1)
+                    hh_w = hh_w + cutlass.Int32(num_threads)
                 chunks_per_block_w = cutlass.const_expr(
                     self.SKIP_BLOCK // (self.vec_bits // self.dtype.width)
                 )
