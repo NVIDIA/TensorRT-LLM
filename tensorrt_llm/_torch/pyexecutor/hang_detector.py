@@ -17,6 +17,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from typing import Callable, Optional
 
@@ -25,6 +26,11 @@ from tensorrt_llm.logger import logger
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137
+
+# Grace (seconds) between a rank's executor-loop crash and the hard kill of the
+# whole world. Negative disables the kill entirely (escape hatch).
+RANK_CRASH_KILL_GRACE_ENV = "TLLM_RANK_CRASH_HARD_KILL_GRACE"
+_RANK_CRASH_KILL_GRACE_DEFAULT = 10.0
 
 
 def _best_effort_flush_streams() -> None:
@@ -78,6 +84,67 @@ def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
         "HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks."
     )
     os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _rank_crash_kill_grace() -> Optional[float]:
+    """Resolve the crash-kill grace period; ``None`` means the kill is disabled."""
+    raw = os.environ.get(RANK_CRASH_KILL_GRACE_ENV)
+    if raw is None:
+        return _RANK_CRASH_KILL_GRACE_DEFAULT
+    try:
+        grace = float(raw)
+    except ValueError:
+        _best_effort_log_error(
+            f"Invalid {RANK_CRASH_KILL_GRACE_ENV}={raw!r}; "
+            f"using default {_RANK_CRASH_KILL_GRACE_DEFAULT}s"
+        )
+        return _RANK_CRASH_KILL_GRACE_DEFAULT
+    return None if grace < 0 else grace
+
+
+def hard_kill_on_rank_crash(world_size: int) -> bool:
+    """Hard-kill the whole world after this rank's executor loop crashed.
+
+    A rank whose executor loop died on an exception can never rejoin its
+    peers' collectives: without an explicit kill, every peer blocks in its
+    next collective until its own HangDetector fires (300 s), and the whole
+    test session burns that long for an error that was already known.
+
+    The grace sleep before the kill is load-bearing: it gives the crashed
+    rank's cleaner error paths time to win the race, so the client reports
+    the ORIGINAL exception instead of a bare worker death —
+    - rank-local response waiters woken by the executor-loop cleanup read
+      the stashed error and surface it through the response path;
+    - during init, the worker's ready handshake returns the real error to
+      the proxy before the abort tears the world down;
+    - the worker main thread returning lets its mpi4py future complete with
+      the original exception.
+
+    Never raises (it runs in a ``finally`` where an exception would mask the
+    original loop error). Returns True when the kill path was taken — only
+    observable in tests, where ``propagate_hard_kill`` is stubbed; in
+    production that call does not return.
+    """
+    try:
+        if world_size <= 1:
+            # No peers to unblock; the worker's own death already completes
+            # its future/handshake with the original exception.
+            return False
+        grace = _rank_crash_kill_grace()
+        if grace is None:
+            return False
+        _best_effort_log_error(
+            f"Executor loop crashed on this rank; hard-killing all "
+            f"{world_size} ranks in {grace}s (peers cannot make progress "
+            f"without this rank). Set {RANK_CRASH_KILL_GRACE_ENV}=-1 to disable."
+        )
+        if grace > 0:
+            time.sleep(grace)
+        propagate_hard_kill()
+        return True
+    except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
+        _best_effort_log_error(f"hard_kill_on_rank_crash failed (ignored): {e!r}")
+        return False
 
 
 class HangDetector:
