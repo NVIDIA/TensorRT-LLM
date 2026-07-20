@@ -439,6 +439,7 @@ class MLA(nn.Module):
         reduce_output: bool = True,
         num_groups: int = 1,
         o_lora_rank: int = 1024,
+        allow_dsv4_split_output: bool = False,
     ):
         """
         Initialize the MLA module.
@@ -464,6 +465,8 @@ class MLA(nn.Module):
             config (ModelConfig): The model configuration.
             num_groups (int): The number of groups.
             o_lora_rank (int): The dimension of the compressed output.
+            allow_dsv4_split_output (bool): Whether the downstream consumer accepts
+                split-major DeepSeek-V4 output projection partials.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -487,6 +490,7 @@ class MLA(nn.Module):
         self.dense_bias = dense_bias
         self.num_groups = num_groups
         self.o_lora_rank = o_lora_rank
+        self.allow_dsv4_split_output = allow_dsv4_split_output
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -1236,7 +1240,8 @@ class MLA(nn.Module):
     def _should_use_fused_oproj(self) -> bool:
         # Eligible Blackwell paths are on by default; keep an emergency fallback.
         return (
-            not _is_env_truthy("TRTLLM_DSV4_DISABLE_FUSED_OPROJ")
+            self.allow_dsv4_split_output
+            and not _is_env_truthy("TRTLLM_DSV4_DISABLE_FUSED_OPROJ")
             and is_sm_100f()
             and IS_CUTLASS_DSL_AVAILABLE
             and self.n_local_groups == self.num_groups

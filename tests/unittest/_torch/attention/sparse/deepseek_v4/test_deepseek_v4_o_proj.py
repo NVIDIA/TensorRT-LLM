@@ -30,6 +30,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, Tunabl
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
+from tensorrt_llm._torch.models.modeling_deepseekv4 import _resolve_enable_fused_hc
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -41,6 +42,46 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..test_sparse_mla_forward import RopeConfig, _calc_diff, apply_rotary_emb, precompute_freqs_cis
 
 FP8_O_PROJ_DIFF_TOL = 2e-3
+
+
+@pytest.mark.parametrize(
+    ("config_enabled", "env_value", "expected"),
+    [
+        (True, None, True),
+        (False, None, False),
+        (True, "0", False),
+        (False, "1", True),
+    ],
+)
+def test_dsv4_fused_oproj_requires_split_output_consumer(
+    config_enabled: bool,
+    env_value: str | None,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(enable_fused_hc=config_enabled)
+    if env_value is None:
+        monkeypatch.delenv("TRTLLM_MHC_ENABLE_FUSED_HC", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_MHC_ENABLE_FUSED_HC", env_value)
+    monkeypatch.delenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", raising=False)
+    monkeypatch.setattr(mla_module, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+
+    module = SimpleNamespace(
+        allow_dsv4_split_output=_resolve_enable_fused_hc(config),
+        n_local_groups=16,
+        num_groups=16,
+        o_a_proj=torch.empty((1,), device="meta", dtype=torch.float8_e4m3fn),
+        o_b_proj=SimpleNamespace(
+            tp_size=1,
+            has_fp8_block_scales=True,
+            use_cute_dsl_blockscaling_mm=False,
+        ),
+        dtype=torch.bfloat16,
+    )
+
+    assert MLA._should_use_fused_oproj(module) is expected
 
 
 @pytest.mark.parametrize(
@@ -80,6 +121,51 @@ def test_dsv4_fmha_epilogue_output_uses_fused_oproj() -> None:
 
     assert output is expected
     assert calls == [(attn_fp8, attn_scale, 4)]
+
+
+def test_dsv4_fmha_epilogue_output_uses_unsplit_fallback_without_fused_hc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    num_tokens, num_groups, o_lora_rank, hidden_size = 4, 16, 1024, 7168
+    attn_fp8 = torch.empty((num_groups, num_tokens, 4096), device="meta", dtype=torch.float8_e4m3fn)
+    attn_scale = torch.empty((num_groups, 32, num_tokens), device="meta")
+    calls = []
+
+    class OutputProjection:
+        def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+            calls.append(("ob", inputs.shape))
+            return inputs.new_empty((inputs.shape[0], hidden_size), dtype=torch.bfloat16)
+
+    module = SimpleNamespace(
+        allow_dsv4_split_output=False,
+        n_local_groups=num_groups,
+        num_groups=num_groups,
+        o_lora_rank=o_lora_rank,
+        o_a_proj=torch.empty((1,), device="meta", dtype=torch.float8_e4m3fn),
+        o_a_proj_scale=torch.empty((1,), device="meta"),
+        o_b_proj=OutputProjection(),
+        dtype=torch.bfloat16,
+    )
+    module.o_b_proj.tp_size = 1
+    module.o_b_proj.has_fp8_block_scales = True
+    module.o_b_proj.use_cute_dsl_blockscaling_mm = False
+    module._should_use_fused_oproj = lambda: MLA._should_use_fused_oproj(module)
+
+    def bmm_fp8out(*args) -> None:
+        calls.append(("oa", args[-1].shape))
+
+    monkeypatch.delenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", raising=False)
+    monkeypatch.setattr(mla_module, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_fp8_bmm_blackwell", bmm_fp8out)
+
+    output = MLA._deepseek_v4_o_proj(module, (attn_fp8, attn_scale))
+
+    assert output.shape == (num_tokens, hidden_size)
+    assert calls == [
+        ("oa", torch.Size([num_groups, num_tokens, o_lora_rank])),
+        ("ob", torch.Size([num_tokens, num_groups * o_lora_rank])),
+    ]
 
 
 def test_dsv4_ob_cute_tactics_are_runtime_tuned() -> None:
