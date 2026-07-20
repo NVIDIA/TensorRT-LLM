@@ -437,6 +437,12 @@ class TestStrategySelection:
         with pytest.raises(ValueError, match="require top_k >= 0, got top_k=-1"):
             SamplingParams(top_k=-1)
 
+        with pytest.raises(ValueError, match="require 0 <= min_p <= 1, got min_p=-1"):
+            SamplingParams(min_p=-1)
+
+        with pytest.raises(ValueError, match="require 0 <= min_p <= 1, got min_p=2"):
+            SamplingParams(min_p=2)
+
     @pytest.mark.parametrize(
         "top_k, top_p",
         [
@@ -1254,7 +1260,7 @@ class TestBatchedSampling:
             TopP: SamplingParams(top_p=0.42, temperature=0.2),
             TopK: SamplingParams(top_k=27, temperature=0.5),
             TopKTopP: SamplingParams(top_k=27, top_p=0.6, temperature=0.5),
-            MinP: SamplingParams(min_p=0.05, temperature=1.0),
+            MinP: SamplingParams(min_p=0.02, top_k=40, top_p=0.9, temperature=1.0),
         }
 
         # Check that all relevant strategies are covered
@@ -1369,9 +1375,13 @@ class TestBatchedSampling:
                         temperature = param.temperature
                         if temperature is not None:
                             temperature *= max(rng.random(), 1e-6)
+                        min_p = param.min_p
+                        if min_p is not None:
+                            min_p *= max(rng.random(), 1e-6)
                         return SamplingParams(
                             top_p=top_p,
                             top_k=top_k,
+                            min_p=min_p,
                             temperature=temperature,
                         )
 
@@ -1798,14 +1808,12 @@ class TestBatchedSampling:
                         ).all()
 
                     if strategy[0] == strategy_tags[MinP]:
-                        # min_p keeps tokens with temp-prob >= min_p * max (ratio
-                        # preserved by renorm; base case has top_k/top_p disabled).
+                        # Renorm preserves the ratio, so every kept token satisfies
+                        # prob >= min_p * max (holds with top_k/top_p also applied).
                         min_p_val = cast(float, strategy[3])
-                        max_temp = expected_probs_after_temperature.amax(dim=-1, keepdim=True)
-                        ratio = expected_probs_after_temperature / max_temp
                         kept = probs != 0.0
+                        ratio = probs / probs.amax(dim=-1, keepdim=True)
                         assert torch.all((ratio >= min_p_val - 1e-6)[kept])
-                        assert torch.all((ratio < min_p_val + 1e-6)[~kept])
 
                     # All indices not selected must have logits less or equal
                     # to the smallest selected logit.

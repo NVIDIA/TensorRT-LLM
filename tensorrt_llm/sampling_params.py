@@ -370,6 +370,8 @@ class SamplingParams:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.min_p is not None and (self.min_p < 0 or self.min_p > 1):
+            raise ValueError(f"require 0 <= min_p <= 1, got min_p={self.min_p}")
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 

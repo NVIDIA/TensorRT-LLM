@@ -87,7 +87,9 @@ def top_k_top_p_sampling_batch(
     assert temperature > 0, "non-greedy sampling requires valid temperature"
     logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
-    if top_k is None:
+    # 0 / non-positive means "keep all" (the min_p disabled-top_k sentinel),
+    # matching sanitize_top_k on the flashinfer path.
+    if top_k is None or top_k <= 0:
         top_k = vocab_size
 
     assert top_k > 1, "non-greedy sampling requires valid top_k"
