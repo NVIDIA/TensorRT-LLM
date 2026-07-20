@@ -166,8 +166,6 @@ def parse_visual_gen_params(
             else:
                 payload = request.input_reference.file.read()
 
-            # Classify by decoding the bytes in memory — nothing touches disk
-            # until the modality is known and validated.
             if is_decodable_image_bytes(payload):
                 # I2V: the stored image file is the cross-model contract.
                 # every I2V pipeline reads ``params.image`` as a path.
