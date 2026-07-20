@@ -17,10 +17,11 @@
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
+#include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -43,6 +44,62 @@ namespace tc = tensorrt_llm::common;
 namespace tb = tensorrt_llm::batch_manager;
 
 using TensorPtr = ITensor::SharedPtr;
+
+namespace
+{
+
+// Local copy of the former MakeDecodingBatchInputOutput::createDecoderBatchInputs
+// helper, which was removed with the TensorRT-engine execution path. The decoder
+// under test is backend-agnostic; this builds its step-batched inputs directly.
+void createDecoderBatchInputs(tb::DecoderInputBuffers& inputBuffers, std::vector<SizeType32> const& activeSlots,
+    decoder::DecoderState const& decoderState)
+{
+    auto const& numDecodingEngineTokens = decoderState.getNumDecodingEngineTokens();
+    auto const& maxDecodingEngineTokens = decoderState.getMaxDecodingEngineTokens();
+    auto const& maxDecodingDecoderTokens = decoderState.getMaxDecodingDecoderTokens();
+    auto const maxDecoderSteps = tc::ceilDiv(maxDecodingEngineTokens, maxDecodingDecoderTokens);
+
+    auto& batchSlots = inputBuffers.forwardBatchSlots;
+    auto& decoderLogits = inputBuffers.decoderLogits;
+
+    for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
+    {
+        batchSlots.at(step)->resize(activeSlots.size());
+    }
+
+    auto constexpr singleRequest = 1;
+
+    std::vector<SizeType32> batchSizes(maxDecoderSteps);
+    std::vector<std::vector<ITensor::SharedConstPtr>> batchLogits(maxDecoderSteps);
+    auto maxActiveDecoderSteps = 1;
+    for (size_t batchIdx = 0; batchIdx < activeSlots.size(); ++batchIdx)
+    {
+        auto const slot = activeSlots.at(batchIdx);
+        auto const& logits = decoderLogits.at(batchIdx);
+
+        auto const numDecoderSteps = tc::ceilDiv(numDecodingEngineTokens.at(slot), maxDecodingDecoderTokens);
+        maxActiveDecoderSteps = std::max(maxActiveDecoderSteps, numDecoderSteps);
+        for (SizeType32 step = 0; step < numDecoderSteps; ++step)
+        {
+            auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots.at(step));
+            batchSlotsRange[batchSizes[step]] = slot;
+            batchSizes[step]++;
+            auto logitsSlice = ITensor::slice(logits, step, singleRequest);
+            batchLogits[step].emplace_back(std::move(logitsSlice));
+        }
+    }
+
+    for (SizeType32 step = 0; step < maxDecoderSteps; ++step)
+    {
+        batchSlots.at(step)->resize(batchSizes[step]);
+    }
+    batchLogits.resize(maxActiveDecoderSteps);
+
+    inputBuffers.maxDecoderSteps = maxActiveDecoderSteps;
+    inputBuffers.batchLogits = batchLogits;
+}
+
+} // namespace
 
 namespace
 {
@@ -93,7 +150,7 @@ std::vector<std::shared_ptr<tb::LlmRequest>> createLlmRequests(std::vector<SizeT
 }
 
 void newRequests(std::vector<std::shared_ptr<tb::LlmRequest>> const& requests, TensorPtr const& batchSlots,
-    nvinfer1::DataType logitsType, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    tensorrt_llm::DataType logitsType, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
     tle::DecodingConfig const& decodingConfig, GptDecoderBatched& decoder, CudaStream const& runtimeStream,
     SizeType32 maxSequenceLength, tb::DecoderInputBuffers& inputBuffers, decoder::DecoderState& decoderState)
 {
@@ -125,7 +182,7 @@ void newRequests(std::vector<std::shared_ptr<tb::LlmRequest>> const& requests, T
 }
 
 void createDecoderInputs(tb::DecoderInputBuffers& inputBuffers, SizeType32 batchSize, SizeType32 vocabSizePadded,
-    nvinfer1::DataType dataType, std::vector<SamplingConfig>& samplingConfigs,
+    tensorrt_llm::DataType dataType, std::vector<SamplingConfig>& samplingConfigs,
     std::vector<SizeType32> const& generatedTokensPerSteps, bool computeLogProbs, BufferManager& manager)
 {
     auto& logits = inputBuffers.decoderLogits;
@@ -242,8 +299,8 @@ void verifyResults(BufferManager& manager, decoder::DecoderState const& decoderS
     }
 }
 
-void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs, SizeType32 maxBeamWidth,
-    bool computeLogProbs)
+void testDecoder(tensorrt_llm::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
+    SizeType32 maxBeamWidth, bool computeLogProbs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     SizeType32 constexpr tensorParallelism{1};
@@ -345,7 +402,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
 
     auto activeSlots = std::vector<SizeType32>(batchSize);
     std::iota(activeSlots.begin(), activeSlots.end(), 0);
-    tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
+    createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
     decoder.forward(decoderState, inputBuffers);
 
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
@@ -375,7 +432,7 @@ void testDecoder(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& sa
     EXPECT_FALSE(getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager)[0]);
 }
 
-void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
+void testDecoderWavefront(tensorrt_llm::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
     SizeType32 maxBeamWidth, bool computeLogProbs)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -474,7 +531,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
 
         auto activeSlots = std::vector<SizeType32>(batchIdx + 1);
         std::iota(activeSlots.begin(), activeSlots.end(), 0);
-        tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
+        createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
         decoder.forward(decoderState, inputBuffers);
 
         advanceSequenceLengths(
@@ -496,7 +553,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
     auto finishedVec = getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager);
     while (!std::all_of(expectedFinished.begin(), expectedFinished.end(), [](bool finish) { return finish; }))
     {
-        tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
+        createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
         decoder.forward(decoderState, inputBuffers);
         finishedVec = getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager);
 
@@ -526,7 +583,7 @@ void testDecoderWavefront(nvinfer1::DataType const dtype, std::vector<SamplingCo
         maxSeqLength, inputTokenId, expectedTokenId, endId);
 }
 
-void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
+void testDecoderDraft(tensorrt_llm::DataType const dtype, std::vector<SamplingConfig>& samplingConfigs,
     SizeType32 maxBeamWidth, std::vector<SizeType32> const& generatedTokensPerSteps,
     std::vector<SizeType32> const& acceptedTokensPerStep, SizeType32 maxGeneratedTokensPerStep)
 {
@@ -631,7 +688,7 @@ void testDecoderDraft(nvinfer1::DataType const dtype, std::vector<SamplingConfig
 
     auto activeSlots = std::vector<SizeType32>(batchSize);
     std::iota(activeSlots.begin(), activeSlots.end(), 0);
-    tb::MakeDecodingBatchInputOutput::createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
+    createDecoderBatchInputs(inputBuffers, activeSlots, decoderState);
     decoder.forward(decoderState, inputBuffers);
     checkSequenceLengths(*decoderState.getSequenceLengths(), expectedLengths, manager);
     EXPECT_THAT(getFinished(*decoderState.getFinishedSum(), samplingConfigs, manager), ::testing::Each(false));
@@ -648,11 +705,11 @@ struct BeamConfig
     std::vector<SizeType32> beamWidths;
 };
 
-using ParamType = std::tuple<nvinfer1::DataType, BeamConfig, bool>;
+using ParamType = std::tuple<tensorrt_llm::DataType, BeamConfig, bool>;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)
 {
-    std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
+    std::string name{std::get<0>(info.param) == tensorrt_llm::DataType::kFLOAT ? "Float" : "Half"};
     BeamConfig const beamConfig = std::get<1>(info.param);
     name.append("MaxBeamWidth" + std::to_string(beamConfig.maxBeamWidth));
     for (auto const beamWdith : beamConfig.beamWidths)
@@ -673,7 +730,7 @@ class ParamTest : public ::testing::TestWithParam<ParamType>
 
 TEST_P(ParamTest, Test)
 {
-    nvinfer1::DataType const dtype{std::get<0>(GetParam())};
+    tensorrt_llm::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
     bool const computeLogProbs{std::get<2>(GetParam())};
     std::vector<SamplingConfig> samplingConfigs;
@@ -686,7 +743,7 @@ TEST_P(ParamTest, Test)
 }
 
 INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamTest,
-    testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
+    testing::Combine(testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {4, 4, 4}},
             BeamConfig{10, {10, 10, 10}}),
         testing::Values(false, true)),
@@ -698,7 +755,7 @@ class ParamWavefrontTest : public ::testing::TestWithParam<ParamType>
 
 TEST_P(ParamWavefrontTest, Test)
 {
-    nvinfer1::DataType const dtype{std::get<0>(GetParam())};
+    tensorrt_llm::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
     bool const computeLogProbs{std::get<2>(GetParam())};
     bool const normalizeLogProbs{true};
@@ -712,7 +769,7 @@ TEST_P(ParamWavefrontTest, Test)
 }
 
 INSTANTIATE_TEST_SUITE_P(DecoderBwTest, ParamWavefrontTest,
-    testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
+    testing::Combine(testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}, BeamConfig{3, {3, 3, 3, 3}}, BeamConfig{4, {4, 4, 4}},
             BeamConfig{10, {10, 10, 10}}),
         testing::Values(false, true)),
@@ -725,7 +782,7 @@ struct DraftConfig
     std::vector<SizeType32> acceptedTokensPerStep;
 };
 
-using DraftTestParamType = std::tuple<nvinfer1::DataType, BeamConfig, DraftConfig>;
+using DraftTestParamType = std::tuple<tensorrt_llm::DataType, BeamConfig, DraftConfig>;
 
 class ParamDraftTest : public ::testing::TestWithParam<DraftTestParamType>
 {
@@ -733,7 +790,7 @@ class ParamDraftTest : public ::testing::TestWithParam<DraftTestParamType>
 
 TEST_P(ParamDraftTest, Test)
 {
-    nvinfer1::DataType const dtype{std::get<0>(GetParam())};
+    tensorrt_llm::DataType const dtype{std::get<0>(GetParam())};
     BeamConfig const beamConfig{std::get<1>(GetParam())};
     DraftConfig const draftConfig{std::get<2>(GetParam())};
 
@@ -751,7 +808,7 @@ TEST_P(ParamDraftTest, Test)
 }
 
 INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamDraftTest,
-    testing::Combine(testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kHALF),
+    testing::Combine(testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kHALF),
         testing::Values(BeamConfig{1, {1, 1, 1}}),
         testing::Values( //
             DraftConfig{2, {1, 1, 1}, {0, 0, 0}}, DraftConfig{2, {2, 2, 2}, {1, 1, 1}},
@@ -760,7 +817,7 @@ INSTANTIATE_TEST_SUITE_P(DecoderTest, ParamDraftTest,
             )),
     [](testing::TestParamInfo<DraftTestParamType> const& info)
     {
-        std::string name{std::get<0>(info.param) == nvinfer1::DataType::kFLOAT ? "Float" : "Half"};
+        std::string name{std::get<0>(info.param) == tensorrt_llm::DataType::kFLOAT ? "Float" : "Half"};
         BeamConfig const beamConfig = std::get<1>(info.param);
         DraftConfig const draftConfig = std::get<2>(info.param);
         name.append("MaxBeamWidth" + std::to_string(beamConfig.maxBeamWidth));

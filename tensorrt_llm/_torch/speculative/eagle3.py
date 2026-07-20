@@ -624,6 +624,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
         self._is_mamba_hybrid_cache = None
 
+        # Worker-side saved spec-dec params; initialized so that a failure
+        # inside _prepare_attn_metadata_for_spec_dec (e.g. an OOM in the
+        # clone calls) cannot turn the cleanup restore into AttributeError.
+        self._saved_packed_mask = None
+        self._saved_position_offsets = None
+        self._saved_position_offsets_cpp = None
+        self._saved_generation_lengths = None
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -679,15 +687,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
 
-    def forward(self,
-                input_ids,
-                position_ids,
-                hidden_states,
-                logits,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                resource_manager=None):
+    def _forward_impl(self,
+                      input_ids,
+                      position_ids,
+                      hidden_states,
+                      logits,
+                      attn_metadata,
+                      spec_metadata,
+                      draft_model,
+                      resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
@@ -894,18 +902,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                                 self._d2t,
                                                                 draft_step=i)
 
-                # When ADP+LM-head-TP pads logits to max_num_requests, the
-                # padded rows are zero-filled placeholders only required so
-                # every TP rank produces logits of identical shape for the
-                # LM-head-TP all-gather. Drop them *before* sampling: the
-                # per-request sampling params (temperatures/top_k/top_p) are
-                # sized to token_count (== batch_size), so the padded logits
-                # would otherwise fail to broadcast in apply_temperature. This
-                # also keeps next_draft_tokens and the draft_probs buffer
-                # token_count-sized without a post-hoc trim.
+                # ADP+LM-head-TP logits are the LM-head-TP group's row-stacked
+                # batch (each rank's rows padded to max_num_requests, then
+                # all-gathered along dim 0) with the vocab sharded across the
+                # group. Rows [:token_count] would be group rank 0's requests,
+                # not this rank's, and a per-rank argmax would return a
+                # shard-local index -- so keep the full stacked logits and let
+                # greedy_sample_draft_with_tp_gather combine the group's vocab
+                # shards and slice this rank's own row segment; only then trim
+                # the max_num_requests padding down to token_count.
                 mapping_lm_head_tp = None
                 if use_lm_head_tp_in_adp:
-                    logits = logits[:token_count]
                     # The MTP head built this per-forward mapping when producing
                     # the vocab-sharded logits; the sampler needs it to gather.
                     mapping_lm_head_tp = getattr(
@@ -917,6 +924,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     batch_size,
                     draft_step=i,
                     mapping_lm_head_tp=mapping_lm_head_tp)
+                if use_lm_head_tp_in_adp:
+                    new_draft_token = new_draft_token[:token_count]
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
