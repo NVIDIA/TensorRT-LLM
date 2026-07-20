@@ -61,6 +61,7 @@ class MPINodeState:
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
     """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+
     e.g. mpirun -np 4 python script.py
     """
     if ENABLE_MULTI_DEVICE:
@@ -241,7 +242,9 @@ class MpiPoolSession(MpiSession):
                  n_workers: int,
                  wait_shutdown: bool = False,
                  env_overrides: Optional[Dict[str, str]] = None):
-        """Args:
+        """Create a pool session that spawns and manages MPI worker processes.
+
+        Args:
         n_workers: number of MPI workers to spawn.
         wait_shutdown: when True, ``shutdown()`` blocks until the spawned
             worker processes have actually exited. ``MPIPoolExecutor.shutdown``
@@ -292,12 +295,12 @@ class MpiPoolSession(MpiSession):
             wait = False
         if self.mpi_pool is not None:
             logger.info(
-                f"MpiPoolSession.shutdown: joining {self.n_workers} worker(s) "
-                f"(wait={wait})")
+                "MpiPoolSession.shutdown: joining "
+                f"{getattr(self, 'n_workers', '?')} worker(s) (wait={wait})")
             self.mpi_pool.shutdown(wait=wait)
             logger.info("MpiPoolSession.shutdown: done")
             self.mpi_pool = None
-            if self._wait_shutdown:
+            if getattr(self, '_wait_shutdown', False):
                 self._wait_workers_exit()
 
     def _collect_worker_identities(self) -> Tuple:
