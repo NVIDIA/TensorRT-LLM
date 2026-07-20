@@ -272,6 +272,7 @@ class GvrTopKKernel:
         p2_warp_redundant: bool = True,
         enable_block_skip: bool = False,
         use_ext_counts: bool = False,
+        emit_xstate: bool = False,
     ):
         # Redundant-warp sync reduction: every warp replays the block
         # reduce + decision from the same staged SMEM partials in the
@@ -545,6 +546,12 @@ class GvrTopKKernel:
         # P1b and the M-ary count pass are skipped; an in-band rung is
         # re-measured ONCE through the seeded refine (per-thread hand-off)
         # and accepted; a miss seeds log-falsi with the external brackets.
+        # emit_xstate: write the per-row closed-loop state at Phase 4 exit
+        # (interface v2: [0] valid, [1] kth proxy, [2] accepted threshold,
+        # [3] cand_count). cs==1 only (leader-gather rows land later).
+        self.emit_xstate = bool(emit_xstate)
+        if emit_xstate and cluster_size != 1:
+            raise ValueError("emit_xstate is single-CTA (cs==1) only")
         self.use_ext_counts = bool(use_ext_counts) and bool(enable_r0)
         if self.use_ext_counts:
             if not self.fb_fix:
@@ -4119,6 +4126,7 @@ class GvrTopKKernel:
         block_max: cute.Tensor,  # [numRows, nb_pad*4] fp32 (or None: no block-skip)
         seed_thr: cute.Tensor,  # [numRows, 3] fp32 (or None: no ext counts)
         seed_counts: cute.Tensor,  # [numRows, 3] int32 (or None)
+        xstate: cute.Tensor,  # [numRows, 8] fp32 closed-loop state (or None)
     ):
         """Thin entry: bidx → row_idx → run_one_row.
 
@@ -4173,6 +4181,7 @@ class GvrTopKKernel:
             block_max=block_max,
             seed_thr=seed_thr,
             seed_counts=seed_counts,
+            xstate=xstate,
         )
 
     @cute.jit
@@ -4187,6 +4196,7 @@ class GvrTopKKernel:
         block_max: cute.Tensor = None,  # [numRows, nb_pad*4] fp32
         seed_thr: cute.Tensor = None,  # [numRows, 3] fp32 (ext counts)
         seed_counts: cute.Tensor = None,  # [numRows, 3] int32 (ext counts)
+        xstate: cute.Tensor = None,  # [numRows, 8] fp32 (emit_xstate)
     ):
         """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
@@ -4255,6 +4265,10 @@ class GvrTopKKernel:
         else:
             seed_thr_row = None
             seed_counts_row = None
+        if cutlass.const_expr(self.emit_xstate and xstate is not None):
+            xstate_row = xstate[row_idx, None]
+        else:
+            xstate_row = None
         # When return_output_values=False, ``output_values`` is None at
         # launch and the gated writes below are compiled out; slicing into
         # None would crash so we keep the view None as well.
@@ -4553,6 +4567,7 @@ class GvrTopKKernel:
                         block_max_row=block_max_row,
                         seed_thr_row=seed_thr_row,
                         seed_counts_row=seed_counts_row,
+                        xstate_row=xstate_row,
                         smem_active=smem_active,
                         s_active_cnt=s_active_cnt,
                     )
@@ -4599,6 +4614,7 @@ class GvrTopKKernel:
                             block_max_row=block_max_row,
                             seed_thr_row=seed_thr_row,
                             seed_counts_row=seed_counts_row,
+                            xstate_row=xstate_row,
                             smem_active=smem_active,
                             s_active_cnt=s_active_cnt,
                         )
@@ -4642,6 +4658,7 @@ class GvrTopKKernel:
                     block_max_row=block_max_row,
                     seed_thr_row=seed_thr_row,
                     seed_counts_row=seed_counts_row,
+                    xstate_row=xstate_row,
                     smem_active=smem_active,
                     s_active_cnt=s_active_cnt,
                 )
@@ -4688,6 +4705,7 @@ class GvrTopKKernel:
         block_max_row=None,  # block-skip: this row's per-32-position bounds
         seed_thr_row=None,  # ext counts: this row's 3 seed thresholds (fp32)
         seed_counts_row=None,  # ext counts: this row's 3 exact counts (int32)
+        xstate_row=None,  # emit_xstate: this row's [8] fp32 state slot
         smem_active=None,
         s_active_cnt=None,
     ):
@@ -4767,6 +4785,8 @@ class GvrTopKKernel:
                         if cutlass.const_expr(self.return_output_values):
                             output_values_row[je] = input_row[je]
                         je = je + cutlass.Int32(1)
+                    if cutlass.const_expr(self.emit_xstate):
+                        xstate_row[0] = cutlass.Float32(0.0)  # degenerate
             else:
                 # cs>1: all cluster CTAs enter _run_phases; only leader writes.
                 if is_leader & (tidx == cutlass.Int32(0)):
@@ -4779,6 +4799,8 @@ class GvrTopKKernel:
                         if cutlass.const_expr(self.return_output_values):
                             output_values_row[je] = input_row[je]
                         je = je + cutlass.Int32(1)
+                    if cutlass.const_expr(self.emit_xstate):
+                        xstate_row[0] = cutlass.Float32(0.0)  # degenerate
         else:
             # Stage this CTA's slice into SMEM once before Phase 2's
             # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
@@ -5202,6 +5224,19 @@ class GvrTopKKernel:
                         warp_id,
                         lane,
                     )
+                if cutlass.const_expr(self.emit_xstate):
+                    # Closed-loop state (interface v2): [0] valid, [1] kth
+                    # proxy (= accepted threshold; the tie-fill makes it a
+                    # tight lower bound of the true kth), [2] accepted
+                    # threshold, [3] cand_count. The next step derives its
+                    # seed rung group from these.
+                    if tidx == cutlass.Int32(0):
+                        xstate_row[0] = cutlass.Float32(1.0)
+                        xstate_row[1] = s_thr[0]
+                        xstate_row[2] = s_thr[0]
+                        # cand_count_p4 = pre-P4 snapshot (P4 repurposes
+                        # the s_iscalars slots).
+                        xstate_row[3] = cutlass.Float32(cand_count_p4)
             else:
                 # cs>1: only the leader (CTA 0 in cluster) runs Phase 4.
                 if is_leader:
@@ -5305,6 +5340,7 @@ class GvrTopKKernel:
         block_max: cute.Tensor = None,  # block-skip bounds; None = disabled
         seed_thr: cute.Tensor = None,  # [num_rows, 3] fp32 (ext counts)
         seed_counts: cute.Tensor = None,  # [num_rows, 3] int32 (ext counts)
+        xstate: cute.Tensor = None,  # [num_rows, 8] fp32 (emit_xstate)
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
@@ -5329,6 +5365,7 @@ class GvrTopKKernel:
             block_max,
             seed_thr,
             seed_counts,
+            xstate,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),

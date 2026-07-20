@@ -66,6 +66,7 @@ def _compile(
     p2_warp_redundant: bool = True,
     enable_block_skip: bool = False,
     use_ext_counts: bool = False,
+    emit_xstate: bool = False,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -148,6 +149,13 @@ def _compile(
         if use_ext_counts
         else None
     )
+    xstate_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (n_rows, 8), stride_order=(1, 0), assumed_align=4
+        )
+        if emit_xstate
+        else None
+    )
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = GvrTopKKernel(
         dtype=cute_dtype,
@@ -168,6 +176,7 @@ def _compile(
         p2_warp_redundant=p2_warp_redundant,
         enable_block_skip=enable_block_skip,
         use_ext_counts=use_ext_counts,
+        emit_xstate=emit_xstate,
         # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
         # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
         # the slot count matters.
@@ -185,6 +194,7 @@ def _compile(
         block_max=block_max_fake,
         seed_thr=seed_thr_fake,
         seed_counts=seed_counts_fake,
+        xstate=xstate_fake,
         options="--enable-tvm-ffi",
     )
 
@@ -439,6 +449,7 @@ def gvr_topk_decode(
     skip_min_n: Optional[int] = 200_000,
     seed_thr: Optional[torch.Tensor] = None,
     seed_counts: Optional[torch.Tensor] = None,
+    xstate: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -535,6 +546,14 @@ def gvr_topk_decode(
             and seed_counts.is_contiguous()
             and seed_counts.shape == (num_rows, 3)
         ), "seed_counts must be contiguous CUDA int32 [num_rows, 3]"
+    emit_xstate = xstate is not None
+    if emit_xstate:
+        assert (
+            xstate.dtype == torch.float32
+            and xstate.is_cuda
+            and xstate.is_contiguous()
+            and xstate.shape == (num_rows, 8)
+        ), "xstate must be contiguous CUDA fp32 [num_rows, 8]"
     enable_block_skip = block_max is not None
     if enable_block_skip:
         assert (
@@ -614,6 +633,7 @@ def gvr_topk_decode(
         p2_warp_redundant,
         enable_block_skip,
         use_ext_counts,
+        emit_xstate,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -629,6 +649,7 @@ def gvr_topk_decode(
         block_max if enable_block_skip else None,
         seed_thr if use_ext_counts else None,
         seed_counts if use_ext_counts else None,
+        xstate if emit_xstate else None,
     )
     if return_output_values:
         return out_values, out_indices
