@@ -657,6 +657,8 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_mask=layer_mask,
         )
         self.is_draft = is_draft
+        # Set True by a compression manager; generation-step resize then leaves history untouched.
+        self.kv_compression_manages_history: bool = False
         self.enable_swa_scratch_reuse = (
             kv_cache_config.enable_swa_scratch_reuse and not self.is_draft
         )
@@ -3179,12 +3181,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - req.py_rewind_len
             )
-            success = kv_cache.resize(new_capacity, req.max_beam_num_tokens - 1)
+            history_length = (
+                None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
+            )
+            success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
                     f"Failed to resize KV cache for request {req.py_request_id} "
                     f"to capacity {new_capacity} and history length "
-                    f"{req.max_beam_num_tokens - 1} tokens at generation update"
+                    f"{history_length} tokens at generation update"
                 )
 
     def copy_batch_block_offsets(
@@ -3194,7 +3199,10 @@ class KVCacheManagerV2(BaseResourceManager):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ):
+        # max_blocks is accepted for signature parity with KVCacheManager; the
+        # device-side copy op here already scales with allocated blocks only.
         assert beam_width == 1, "beam_width must be 1 for KVCacheManagerV2"
 
         copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)

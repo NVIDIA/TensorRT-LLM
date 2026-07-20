@@ -888,7 +888,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # the typical step. An all-generation typical_step over-provisions the
             # compressed-cache pool at the expense of the SWA pool, starving the
             # SWA pool and artificially capping the achievable batch size.
-            ctx_capacity = max_num_tokens if max_num_tokens is not None else typical_seq_len
+            ctx_capacity = (
+                max_num_tokens if max_num_tokens is not None else typical_seq_len
+            ) + self.num_extra_kv_tokens
             generation_history_length = max(0, typical_seq_len - max_draft_len - 1)
             typical_step = BatchDesc(
                 kv_caches=[
@@ -1301,8 +1303,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         beam_width: int,
         num_contexts: int,
         num_seqs: int,
+        max_blocks: Optional[int] = None,
     ) -> None:
-        """For compatibility with AttentionOp, copy only the SWA block offsets."""
+        """For compatibility with AttentionOp, copy only the SWA block offsets.
+
+        max_blocks is accepted for signature parity with KVCacheManager; the
+        copy below is already bounded by the precomputed SWA table width.
+        """
         assert beam_width == 1, "DSV4 only supports beam width 1 now"
         assert dst_tensor.is_cuda, "copy_batch_block_offsets expects a CUDA destination"
         dst_tensor.fill_(BAD_PAGE_INDEX)
