@@ -582,7 +582,8 @@ protected:
     void setUpCacheManager(int numLayers, int numHeads, int sizePerHead, int tokensPerBlock,
         tensorrt_llm::DataType dataType, int kvFactor = 2, bool isMLA = false, bool enableDPAttention = false,
         bool isWindow = false, bool isIndexerKCache = true, int indexerDimPerHead = 0,
-        int indexerKCacheQuantBlockSize = 128)
+        int indexerKCacheQuantBlockSize = 128,
+        std::optional<std::vector<bool>> const& indexerKCacheLayerMask = std::nullopt)
     {
         mIsWindowAttention = isWindow;
 
@@ -610,6 +611,51 @@ protected:
         for (int ppRank = 0; ppRank < mContextPpSize; ppRank++)
         {
             contextAttentionLayerNumPerPP[ppRank] = getLayerNumPPRank(numLayers, ppRank, mContextPpSize);
+        }
+
+        // Per-PP indexer K cache layer counts for a masked indexer pool (per-layer indexer
+        // mask over the global layers). Without a mask every layer owns a row (dense).
+        if (indexerKCacheLayerMask.has_value())
+        {
+            TLLM_CHECK(static_cast<int>(indexerKCacheLayerMask->size()) == numLayers);
+        }
+        auto countIndexerLayers = [&](int startLayer, int layerCount)
+        {
+            if (!indexerKCacheLayerMask.has_value())
+            {
+                return layerCount;
+            }
+            int count = 0;
+            for (int layerId = startLayer; layerId < startLayer + layerCount; layerId++)
+            {
+                count += indexerKCacheLayerMask->at(layerId) ? 1 : 0;
+            }
+            return count;
+        };
+        mIndexerLayerNumPerPP = std::vector<SizeType32>(mPpSize, 0);
+        std::optional<std::vector<bool>> localIndexerKCacheLayerMask = std::nullopt;
+        {
+            int startLayer = 0;
+            for (int ppRank = 0; ppRank < mPpSize; ppRank++)
+            {
+                mIndexerLayerNumPerPP[ppRank] = countIndexerLayers(startLayer, mAttentionLayerNumPerPP[ppRank]);
+                if (ppRank == mPpRank && indexerKCacheLayerMask.has_value())
+                {
+                    localIndexerKCacheLayerMask = std::vector<bool>(indexerKCacheLayerMask->begin() + startLayer,
+                        indexerKCacheLayerMask->begin() + startLayer + mAttentionLayerNumPerPP[ppRank]);
+                }
+                startLayer += mAttentionLayerNumPerPP[ppRank];
+            }
+        }
+        auto contextIndexerLayerNumPerPP = std::vector<SizeType32>(mContextPpSize, 0);
+        {
+            int startLayer = 0;
+            for (int ppRank = 0; ppRank < mContextPpSize; ppRank++)
+            {
+                contextIndexerLayerNumPerPP[ppRank]
+                    = countIndexerLayers(startLayer, contextAttentionLayerNumPerPP[ppRank]);
+                startLayer += contextAttentionLayerNumPerPP[ppRank];
+            }
         }
 
         if (!isMLA)
@@ -695,17 +741,21 @@ protected:
             /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
             /*kvCacheConnectorManager=*/nullptr, /*enableIndexerKCache=*/isIndexerKCache,
             /*indexerKCacheQuantBlockSize=*/indexerKCacheQuantBlockSize,
-            /*indexerKCacheIndexHeadDim=*/indexerDimPerHead);
+            /*indexerKCacheIndexHeadDim=*/indexerDimPerHead,
+            /*indexerKCacheUseFp4=*/false, localIndexerKCacheLayerMask);
         texec::kv_cache::CacheState::AttentionType attentionType = isMLA
             ? texec::kv_cache::CacheState::AttentionType::kMLA
             : texec::kv_cache::CacheState::AttentionType::kDEFAULT;
         mCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRank, sizePerHead,
             tokensPerBlock, mTpSize, mPpSize, mCpSize, mAttentionLayerNumPerPP, dataType, attentionType, kvFactor,
-            enableDPAttention, DPrank, DPsize, false, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
+            enableDPAttention, DPrank, DPsize, /*enableBlockReuse=*/false, /*enablePartialReuse=*/false,
+            /*hasIndexerKCache=*/isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize,
+            /*indexerKCacheUseFp4=*/false, mIndexerLayerNumPerPP);
         mContextCacheState = std::make_unique<texec::kv_cache::CacheState>(numLayers, numHeadsPerRankForContext,
             sizePerHead, tokensPerBlock, mContextTpSize, mContextPpSize, mContextCpSize, contextAttentionLayerNumPerPP,
-            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize, false, isIndexerKCache,
-            indexerDimPerHead, indexerKCacheQuantBlockSize);
+            dataType, attentionType, kvFactor, mContextDP, DPrank, mContextTpSize, /*enableBlockReuse=*/false,
+            /*enablePartialReuse=*/false, /*hasIndexerKCache=*/isIndexerKCache, indexerDimPerHead,
+            indexerKCacheQuantBlockSize, /*indexerKCacheUseFp4=*/false, contextIndexerLayerNumPerPP);
 
         // UVM seems to be incompatible with MPI, and it is continuing to investigate.
         bool constexpr useUvm = false;
@@ -1071,9 +1121,12 @@ protected:
         }
         else
         {
+            // The (possibly masked) indexer pool lives in "indexer layer space": one row per
+            // full-indexer layer, so global row ids use the indexer per-PP prefix.
+            auto const& layerNumPerPP = isIndexerKCache ? mIndexerLayerNumPerPP : mAttentionLayerNumPerPP;
             for (int ppRank = 0; ppRank < mPpRank; ppRank++)
             {
-                startLayerId += mAttentionLayerNumPerPP[ppRank];
+                startLayerId += layerNumPerPP[ppRank];
             }
         }
         int headSizePerRank;
@@ -1169,9 +1222,12 @@ protected:
         }
         else
         {
+            // The (possibly masked) indexer pool lives in "indexer layer space": one row per
+            // full-indexer layer, so global row ids use the indexer per-PP prefix.
+            auto const& layerNumPerPP = isIndexerKCache ? mIndexerLayerNumPerPP : mAttentionLayerNumPerPP;
             for (int ppRank = 0; ppRank < mPpRank; ppRank++)
             {
-                startLayerId += mAttentionLayerNumPerPP[ppRank];
+                startLayerId += layerNumPerPP[ppRank];
             }
         }
 
@@ -1290,6 +1346,8 @@ protected:
     bool mIsWindowAttention{false};
     int mDupHeadFactor{1};
     std::vector<SizeType32> mAttentionLayerNumPerPP;
+    // Per-PP indexer K cache layer counts (== attention counts without a mask).
+    std::vector<SizeType32> mIndexerLayerNumPerPP;
 
     SizeType32 mMaxNumSequences{};
     std::unique_ptr<KVCacheManager> mManager;
@@ -1805,6 +1863,121 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLAWithIndexerKCache, Asymmetrical
         testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         testing::Values(1), testing::Values(true), testing::Values(false), testing::Values(false),
         testing::Values(false), testing::Values(true), testing::Values(256), testing::Values(128)));
+
+// Masked indexer K cache pool (per-layer indexer mask, GLM 5.2-style cross-layer indexer
+// sharing): only full-indexer layers own a pool row, so the indexer pass runs in "indexer
+// layer space". Exercises PP resharding of masked indexer blocks end to end.
+class AsymmetricalCacheTestWithIndexerLayerMask : public AsymmetricalCacheTest
+{
+};
+
+TEST_P(AsymmetricalCacheTestWithIndexerLayerMask, TestCase)
+{
+    AsymmetricTestParam param = GetParam();
+    int contextTp = std::get<0>(param);
+    int contextPp = std::get<1>(param);
+    int contextCp = std::get<2>(param);
+    int genTp = std::get<3>(param);
+    int genPp = std::get<4>(param);
+    int genCp = std::get<5>(param);
+    int numLayers = std::get<6>(param);
+    int numHeads = std::get<7>(param);
+    int sizePerHead = std::get<8>(param);
+    int tokensPerBlock = std::get<9>(param);
+    tensorrt_llm::DataType dataType = std::get<10>(param);
+    int kvFactor = std::get<11>(param);
+    bool isMLA = std::get<12>(param);
+    bool contextDP = std::get<13>(param);
+    bool generationDP = std::get<14>(param);
+    bool isWindow = std::get<15>(param);
+    bool isIndexerKCache = std::get<16>(param);
+    int indexerDimPerHead = std::get<17>(param);
+    int indexerKCacheQuantBlockSize = std::get<18>(param);
+
+    if (isIndexerKCache && tensorrt_llm::common::getEnvUseMooncakeKvCache())
+    {
+        // https://nvbugs/5760737
+        GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
+    }
+
+    // GLM 5.2-style schedule (index_topk_freq=4, index_skip_topk_offset=2): full-indexer
+    // layers are {0, 1, 5, 9, ...}; every PP slice below keeps at least one full layer.
+    std::vector<bool> indexerKCacheLayerMask(numLayers);
+    for (int layerId = 0; layerId < numLayers; layerId++)
+    {
+        indexerKCacheLayerMask[layerId] = (std::max(layerId - 2 + 1, 0) % 4) == 0;
+    }
+
+    std::vector<int> lenList = {30, 10, 60, 80};
+
+    setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
+
+    if (mIsContext || mIsGeneration)
+    {
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, false, isWindow,
+            isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize, indexerKCacheLayerMask);
+        setUpCacheTransceiver();
+        std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
+
+        // the second loop is for cache reuse
+        for (int i = 0; i < 2; i++)
+        {
+            for (auto len : lenList)
+            {
+                requests.emplace_back(makeLlmRequest(len));
+            }
+
+            if (mIsContext)
+            {
+                std::vector<std::future<void>> contextFutures;
+                for (auto&& request : requests)
+                {
+                    contextFutures.push_back(addRequestAndTransportCacheForContext(request));
+                }
+                mComm->barrier();
+                for (auto&& cfuture : contextFutures)
+                {
+                    cfuture.get();
+                }
+            }
+            else
+            {
+                std::vector<std::future<void>> generationFutures;
+                mComm->barrier();
+                for (auto&& request : requests)
+                {
+                    generationFutures.push_back(addRequestAndTransportCacheForGeneration(request));
+                }
+
+                for (auto&& gfuture : generationFutures)
+                {
+                    gfuture.get();
+                }
+                for (auto&& request : requests)
+                {
+                    generationVerifyKVCache(request);
+                }
+            }
+            for (auto&& request : requests)
+            {
+                tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request->mLlmRequest);
+                mManager->removeSequence(request->mLlmRequest->mRequestId, request->mLlmRequest);
+            }
+            requests.clear();
+            mComm->barrier();
+        }
+    }
+    tensorrt_llm::mpi::MpiComm::world().barrier();
+}
+
+// 8 layers with full-indexer layers {0, 1, 5}: PP=2 slices hold {2, 1} indexer rows, so
+// ctx/gen PP resharding exchanges masked indexer blocks with asymmetric per-PP counts.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLAWithIndexerKCacheLayerMask, AsymmetricalCacheTestWithIndexerLayerMask,
+    testing::Combine(testing::Values(1), testing::Values(1, 2), testing::Values(1), testing::Values(1),
+        testing::Values(1, 2), testing::Values(1), testing::Values(8), testing::Values(1), testing::Values(4),
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(1), testing::Values(true),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true),
+        testing::Values(256), testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,

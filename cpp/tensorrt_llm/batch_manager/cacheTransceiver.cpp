@@ -348,7 +348,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
-    std::vector<SizeType32> const& rnnLayerNumPerPP)
+    std::vector<SizeType32> const& rnnLayerNumPerPP, std::vector<SizeType32> const& indexerLayerNumPerPP)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
@@ -402,11 +402,11 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         kvFactor = 1;
     }
-    mCacheState
-        = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig, attentionLayerNumPerPP,
-            dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(), cacheManager->isEnablePartialReuse(),
-            cacheManager->isEnableIndexerKCache(), cacheManager->getIndexerKCacheIndexHeadDim(),
-            cacheManager->getIndexerKCacheQuantBlockSize(), cacheManager->getIndexerKCacheUseFp4());
+    mCacheState = std::make_unique<executor::kv_cache::CacheState>(cacheStateModelCfg, worldConfig,
+        attentionLayerNumPerPP, dataType, attentionType, kvFactor, cacheManager->isEnableBlockReuse(),
+        cacheManager->isEnablePartialReuse(), cacheManager->isEnableIndexerKCache(),
+        cacheManager->getIndexerKCacheIndexHeadDim(), cacheManager->getIndexerKCacheQuantBlockSize(),
+        cacheManager->getIndexerKCacheUseFp4(), indexerLayerNumPerPP);
 
     if (mCacheState->getParallelConfig().mEnableAttentionDP)
     {
@@ -432,24 +432,21 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
     if (isMLA && cacheManager->isEnableIndexerKCache())
     {
-        // The indexer K cache split/concat path strides indexer blocks by the per-rank
-        // attention layer count. A masked indexer pool (per-layer indexer mask, e.g.
-        // GLM 5.2 cross-layer indexer sharing) holds fewer rows than that -- possibly
-        // zero, in which case no pool exists at all -- which the transfer kernels do
-        // not understand yet. Fail fast instead of corrupting ctx->gen transfers (or
-        // dereferencing a null pool in CacheTransBufferManager).
+        // The advertised per-PP indexer layer counts must match the local pool. A rank
+        // without any indexer rows is not supported by the transfer machinery, so reject
+        // it up front.
         auto const indexerPool = cacheManager->getIndexerKCachePool();
         TLLM_CHECK_WITH_INFO(indexerPool != nullptr,
-            "The KV cache transceiver does not support a per-layer masked indexer K cache pool yet: "
-            "this rank owns no indexer K cache rows (every local layer uses cross-layer indexer sharing). Disable "
-            "the cache transceiver for models with cross-layer indexer sharing (e.g. GLM 5.2).");
+            "The KV cache transceiver does not support a rank without indexer K cache rows (every local layer "
+            "uses cross-layer indexer sharing).");
+        auto const selfPPRank = worldConfig.getPipelineParallelRank();
+        auto const advertisedIndexerLayerNum = indexerLayerNumPerPP.empty() ? attentionLayerNumPerPP.at(selfPPRank)
+                                                                            : indexerLayerNumPerPP.at(selfPPRank);
         auto const numIndexerLayers = indexerPool->getShape().d[1];
-        auto const numLocalLayers = cacheManager->getBlockManager().getNumLayers();
-        TLLM_CHECK_WITH_INFO(numIndexerLayers == static_cast<int64_t>(numLocalLayers),
-            "The KV cache transceiver does not support a per-layer masked indexer K cache pool yet: "
-            "the indexer pool holds %ld layer rows but this rank manages %d attention layers. Disable the cache "
-            "transceiver for models with cross-layer indexer sharing (e.g. GLM 5.2).",
-            static_cast<long>(numIndexerLayers), numLocalLayers);
+        TLLM_CHECK_WITH_INFO(numIndexerLayers == static_cast<int64_t>(advertisedIndexerLayerNum),
+            "The indexer K cache pool holds %ld layer rows but indexerLayerNumPerPP advertises %d for PP rank "
+            "%d. Pass the per-PP indexer layer counts matching the (masked) indexer pool layout.",
+            static_cast<long>(numIndexerLayers), advertisedIndexerLayerNum, selfPPRank);
         mCacheTransBufferManagers.push_back(
             std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
     }

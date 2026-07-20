@@ -274,6 +274,55 @@ TargetRanksInfo targetIRanksForRnn(
     return targetInfo;
 }
 
+TargetRanksInfo targetIRanksForIndexerKCache(
+    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank)
+{
+    auto targetInfo = targetIRanks(peerCacheState, selfCacheState, selfRank);
+    if (targetInfo.mIRanks.empty())
+    {
+        return targetInfo;
+    }
+    auto const& peerIndexerPerPP = peerCacheState.getIndexerLayerNumPerPP();
+    auto const& selfIndexerPerPP = selfCacheState.getIndexerLayerNumPerPP();
+    auto const& peerParConfig = peerCacheState.getParallelConfig();
+    auto const& selfParConfig = selfCacheState.getParallelConfig();
+    TLLM_CHECK(static_cast<SizeType32>(peerIndexerPerPP.size()) == peerParConfig.mPipelineParallelism);
+    TLLM_CHECK(static_cast<SizeType32>(selfIndexerPerPP.size()) == selfParConfig.mPipelineParallelism);
+
+    auto const selfPPRank = selfRank / (selfParConfig.mTensorParallelism * selfParConfig.mContextParallelism);
+    int64_t selfStart = 0;
+    for (int ppRank = 0; ppRank < selfPPRank; ppRank++)
+    {
+        selfStart += selfIndexerPerPP[ppRank];
+    }
+    int64_t const selfEnd = selfStart + selfIndexerPerPP[selfPPRank];
+
+    // First peer PP rank of the attention domain (mIRanks is ordered CP-major, then TP, then
+    // PP ascending from the domain start).
+    auto const peerPPRankStart
+        = targetInfo.mIRanks.front() / (peerParConfig.mTensorParallelism * peerParConfig.mContextParallelism);
+    int64_t peerStart = 0;
+    for (int ppRank = 0; ppRank < peerPPRankStart; ppRank++)
+    {
+        peerStart += peerIndexerPerPP[ppRank];
+    }
+
+    int64_t peerLayerNumSum = 0;
+    for (int i = 0; i < targetInfo.mDomainPPSize; i++)
+    {
+        int64_t const peerEnd = peerStart + peerIndexerPerPP.at(peerPPRankStart + i);
+        auto const overlap = std::max<int64_t>(0, std::min(peerEnd, selfEnd) - std::max(peerStart, selfStart));
+        targetInfo.mPeerLayerNumInDomainPP.at(i) = static_cast<int>(overlap);
+        peerLayerNumSum += overlap;
+        peerStart = peerEnd;
+    }
+    TLLM_CHECK_WITH_INFO(peerLayerNumSum == selfIndexerPerPP[selfPPRank],
+        "Indexer K cache layer counts are inconsistent between the two sides: the attention-domain peers cover "
+        "%ld indexer layers but this rank owns %d. Both sides must derive the same per-layer indexer schedule.",
+        static_cast<long>(peerLayerNumSum), selfIndexerPerPP[selfPPRank]);
+    return targetInfo;
+}
+
 template <typename T>
 struct BlockInfo
 {
@@ -1107,7 +1156,8 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     {
         inputBlockNumSum += blocks.size();
     }
-    auto targetRankInfo = targetIRanks(destCacheState, selfCacheState, selfIdx);
+    auto targetRankInfo = isIndexerKCache ? targetIRanksForIndexerKCache(destCacheState, selfCacheState, selfIdx)
+                                          : targetIRanks(destCacheState, selfCacheState, selfIdx);
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(
             targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize * targetRankInfo.mDomainCPSize)));
@@ -1231,7 +1281,10 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
 
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
     int const selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
-    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
+    // For the indexer K cache pass only full-indexer layers own a pool row (masked layout),
+    // so the per-rank layer count comes from the indexer layer counts.
+    int const numLayers = isIndexerKCache ? selfCacheState.getIndexerLayerNumPerPP().at(selfPPRank)
+                                          : selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
 
     int const dimsPerHead = computeDimsPerHead(selfCacheState, isIndexerKCache);
@@ -1454,7 +1507,8 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         outputBlockNumSum += blocks.size();
     }
 
-    auto targetRankInfo = targetIRanks(destCacheState, selfCacheState, selfIdx);
+    auto targetRankInfo = isIndexerKCache ? targetIRanksForIndexerKCache(destCacheState, selfCacheState, selfIdx)
+                                          : targetIRanks(destCacheState, selfCacheState, selfIdx);
     TLLM_CHECK(targetRankInfo.mIRanks.size()
         == (static_cast<size_t>(targetRankInfo.mDomainPPSize * targetRankInfo.mDomainTPSize)));
 
@@ -1560,7 +1614,10 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
         = static_cast<uint64_t*>(PtrsDeviceBuffer->data()) + outputBlockNumSum + inputSplitBlocks.size();
     int const tokensPerBlock = selfModelConfig.mTokensPerBlock;
     int const selfPPRank = selfIdx / (selfParallelConfig.mTensorParallelism * selfParallelConfig.mContextParallelism);
-    int const numLayers = selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
+    // For the indexer K cache pass only full-indexer layers own a pool row (masked layout),
+    // so the per-rank layer count comes from the indexer layer counts.
+    int const numLayers = isIndexerKCache ? selfCacheState.getIndexerLayerNumPerPP().at(selfPPRank)
+                                          : selfParallelConfig.mAttentionLayerNumPerPP.at(selfPPRank);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "concatKVCache numLayers:%d", numLayers);
     int const headNum = selfModelConfig.mNbKvHeadsPerLayer[0];
     int const dimsPerHead = computeDimsPerHead(selfCacheState, isIndexerKCache);

@@ -199,25 +199,16 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
 
         # Indexer K cache support
         if getattr(kv_cache_manager, "enable_indexer_k_cache", False):
-            # The FLAT PoolView contract assumes the pool covers ALL layers of
-            # the layer group with a uniform per-layer stride. A masked
-            # indexer pool (per-layer indexer mask, e.g. GLM 5.2 cross-layer
-            # indexer sharing) holds fewer rows than layers — possibly zero,
-            # in which case no pool exists at all — so the stride math would
-            # corrupt transfers. Fail fast until the extractor publishes
-            # per-layer buffer_entries for the indexer pool. Check the mask
-            # BEFORE fetching the pool: a fully masked-out rank has no pool
-            # to fetch.
             local_indexer_mask = getattr(kv_cache_manager, "indexer_k_cache_local_layer_mask", None)
             if local_indexer_mask is not None and not all(
                 local_indexer_mask[lid] for lid in local_layer_ids
             ):
                 raise NotImplementedError(
-                    "Disaggregated KV transfer does not support a per-layer "
-                    "masked indexer k-cache pool yet: "
+                    "The Python KV transceiver runtime does not support a "
+                    "per-layer masked indexer k-cache pool yet: "
                     f"{sum(local_indexer_mask[lid] for lid in local_layer_ids)}"
                     f" of {len(local_layer_ids)} layers in this layer group "
-                    "own an indexer k-cache. Disable disaggregated serving "
+                    "own an indexer k-cache. Use the C++ cache transceiver "
                     "for models with cross-layer indexer sharing (e.g. "
                     "GLM 5.2)."
                 )
@@ -231,7 +222,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                     f"pool holds {indexer_pool.shape[1]} layer rows but the "
                     f"layer group has {len(local_layer_ids)} layers. Disable "
                     "disaggregated serving for models with cross-layer "
-                    "indexer sharing (e.g. GLM 5.2)."
+                    "indexer sharing."
                 )
             per_block_elems = 1
             for d in indexer_pool.shape[1:]:  # skip numBlocks dim
