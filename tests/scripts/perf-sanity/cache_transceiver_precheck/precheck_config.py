@@ -178,6 +178,16 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         "gen_num_nextn_predict_layers": gen_nextn,
         "ctx_kv_dtype": str((ctx_side.get("kv_cache_config") or {}).get("dtype", "auto")),
         "gen_kv_dtype": str((gen_side.get("kv_cache_config") or {}).get("dtype", "auto")),
+        # Tri-state, matching KvCacheConfig's pydantic default: explicit
+        # True/False from the yaml wins; absent means "auto", which the
+        # driver resolves against the model class's get_model_defaults() at
+        # runtime — exactly like serving (_resolve_kv_cache_manager_v2_auto).
+        "ctx_use_kv_cache_manager_v2": (ctx_side.get("kv_cache_config") or {}).get(
+            "use_kv_cache_manager_v2", "auto"
+        ),
+        "gen_use_kv_cache_manager_v2": (gen_side.get("kv_cache_config") or {}).get(
+            "use_kv_cache_manager_v2", "auto"
+        ),
         "tokens_per_block": tokens_per_block,
         "request_lengths": req_lens,
         "num_requests": int(knobs["num_requests"]),
@@ -223,6 +233,7 @@ def side_plan(plan, role):
         "cache_transceiver_config": plan[f"{role}_cache_transceiver_config"],
         "kv_dtype": plan[f"{role}_kv_dtype"],
         "num_nextn_predict_layers": plan[f"{role}_num_nextn_predict_layers"],
+        "use_kv_cache_manager_v2": plan[f"{role}_use_kv_cache_manager_v2"],
         "num_peers": plan["num_gen_servers" if role == "ctx" else "num_ctx_servers"],
     }
 
@@ -322,12 +333,15 @@ def model_kv_shape(model_dir):
     if num_layers is None:
         return dict(FALLBACK_KV_SHAPE)
 
+    vocab_size = int(hf_cfg.get("vocab_size") or 0) or None  # V2 ctor input
+
     if hf_cfg.get("kv_lora_rank"):  # MLA (DeepSeek-family, Kimi K2, ...)
         return {
             "num_layers": int(num_layers),
             "num_kv_heads": 1,
             "head_dim": int(hf_cfg["kv_lora_rank"]) + int(hf_cfg.get("qk_rope_head_dim", 0)),
             "is_mla": True,
+            "vocab_size": vocab_size,
             "source": "config.json (MLA)",
         }
 
@@ -342,5 +356,6 @@ def model_kv_shape(model_dir):
         "num_kv_heads": int(num_kv_heads),
         "head_dim": int(head_dim),
         "is_mla": False,
+        "vocab_size": vocab_size,
         "source": "config.json",
     }
