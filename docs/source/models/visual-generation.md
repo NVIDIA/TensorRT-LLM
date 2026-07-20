@@ -41,6 +41,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Qwen/Qwen-Image-Edit-2511` | Image Editing (text+images-to-image) |
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
+| `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
 
@@ -53,6 +54,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FastWan 2.2** [^7] | Yes | Yes | No | No | No [^7] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **LTX-2** | Yes | Yes | Yes [^4] | Yes | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image** [^5] | Yes | Yes | No | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
@@ -70,6 +72,8 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 [^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
 
 [^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
+
+[^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B. Its transformer, VAE, and text encoder are identical to Wan2.2-5B; only the sampling loop changes: 3 denoising steps with fixed timesteps, no CFG, and a distribution-matching-distillation (DMD) noise update. It runs through the `WanDMDPipeline` and currently supports text-to-video only. Because there is no CFG path, CFG parallelism does not apply; and with only 3 steps, step caching (TeaCache / Cache-DiT) gives no benefit. VSA is not enabled in this full-attention checkpoint.
 
 ## Quick Start
 
