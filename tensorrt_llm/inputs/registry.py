@@ -67,6 +67,11 @@ class MultimodalEncoderItemMetadata(NamedTuple):
     identifies the item within that modality's processed payload (for
     example, its row range in ``pixel_values``), so an item can be sliced
     out for a single-item encoder call.
+
+    TODO(TRTLLM-14477): `MultimodalParams.mm_item_order` carries the same prompt-order
+    manifest for the mixed-modality full-request encode path. Single-source
+    the two representations at the input processor so one manifest serves
+    both the item-scheduling path and the full-request interleave.
     """
 
     encoder_token_lengths: List[int]

@@ -485,6 +485,19 @@ class MultimodalModelMixin:
         for them this cache stays empty in the executor loop (their requests
         arrive here with embeddings already attached). The key format is
         shared (`_encoder_cache_item_key`) so the two stores can unify later.
+
+        TODO(TRTLLM-14477): unify the full-request consumers onto the
+        `MultimodalEncoderCacheManager` and retire this clone cache:
+        (1) inject the manager into the model and switch
+        `_attach_encoder_cache_hit` to `get_and_hold` and
+        `_write_encoder_cache_entries` to a clone-adopt `put` (batch-tensor
+        slices must not retain the whole batch allocation) — this also puts
+        side-stream prefetch under the byte budget; (2) assemble partial
+        hits by encoding only the misses through
+        `prepare_multimodal_encoder_inputs` (resolves TRTLLM-13996 for all
+        consumers); (3) delete this getter, `_encoder_cache_keys`,
+        `supports_encoder_cache`, and the legacy reservation branch in
+        `_reserve_multimodal_encoder_cache_memory`.
         """
         multimodal_config = self.model_config.multimodal_config
         if multimodal_config is None:
@@ -687,7 +700,11 @@ class MultimodalModelMixin:
         for key in keys:
             cached_embedding = encoder_cache.get(key)
             if cached_embedding is None:
-                # TODO(TRTLLM-13996): allow re-computing only the uncached items.
+                # TODO(TRTLLM-13996): allow re-computing only the uncached items —
+                # planned via storage unification (TRTLLM-14477): once this path reads the
+                # `MultimodalEncoderCacheManager`, misses can be encoded per
+                # item through `prepare_multimodal_encoder_inputs` and
+                # assembled as a view list (see `_get_multimodal_encoder_cache`).
                 # `get_multimodal_embeddings` treats a param as either fully cached or uncached.
                 # Attaching partial hits would make the later concatenated tensor ambiguous because
                 # there is no placeholder for missing item rows inside `multimodal_embedding`.
