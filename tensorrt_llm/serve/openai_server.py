@@ -2348,6 +2348,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
+        # Note: calling self.generator.disaggregated_params and startup_metrics below
+        # may trigger an RPC sync call, blocking the server event loop. Since this server_info
+        # is usually called only once before accepting requests, it's not a big concern.
         content = {"disaggregated_params": self.generator.disaggregated_params}
         args = getattr(self.generator, "args", None)
         if args is not None:
