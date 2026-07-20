@@ -234,23 +234,12 @@ class GvrTopKKernel:
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
     ):
-        # Redundant-warp sync reduction: after per-warp partials land in
-        # SMEM (one barrier for visibility), EVERY warp redundantly
-        # performs the block reduce + decision that a single leader
-        # (tid0 / warp0) used to do, in a fixed order — identical inputs
-        # and identical fp32 operation order make the result bit-identical
-        # across warps, so the publish barrier + leader serialization +
-        # the SMEM scalar re-reads (and their per-access cluster-window
-        # S2R recompute) all disappear.
-        #   p4_warp_redundant: Phase 4 k-th bin search (3 barriers -> 1,
-        #     serial 16-slot prefix and 64-deep bin walk -> lane-parallel)
-        #     and the snap loop (2 barriers/iter -> 1; threshold and
-        #     convergence state live in registers; warp partial staging is
-        #     parity double-buffered so iterations may overlap by one).
-        #   p2_warp_redundant: Phase 2 secant cadence (cluster_size == 1
-        #     only): one barrier per round; every warp reduces the warp
-        #     counts and runs the classify + secant update redundantly in
-        #     registers; canonical exit state written once for Phase 3.
+        # Redundant-warp sync reduction: every warp replays the block
+        # reduce + decision from the same staged SMEM partials in the
+        # same fp32 order, so results are bit-identical across warps and
+        # the publish barrier + leader serialization disappear.
+        #   p4_warp_redundant: P4 k-th bin search + snap loop (1 barrier/iter).
+        #   p2_warp_redundant: P2 secant cadence (cluster_size == 1 only).
         # Both default ON; OFF restores the leader-based paths (A/B).
         self.p4_warp_redundant = p4_warp_redundant
         self.p2_warp_redundant = p2_warp_redundant
@@ -527,45 +516,23 @@ class GvrTopKKernel:
     # S2R at all.
     # ------------------------------------------------------------------
     @cute.jit
-    def _smem_ld_f32(self, base_addr, idx):
+    def _smem_ref(self, dtype: cutlass.Constexpr, base_addr, idx):
+        elem_bytes = cutlass.const_expr(dtype.width // 8)
         p = cute.make_ptr(
-            cutlass.Float32,
-            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
+            dtype,
+            base_addr + cutlass.Int64(idx) * cutlass.Int64(elem_bytes),
             cute.AddressSpace.smem,
             assumed_align=4,
         )
-        return cute.make_tensor(p, cute.make_layout((1,)))[0]
+        return cute.make_tensor(p, cute.make_layout((1,)))
 
     @cute.jit
-    def _smem_ld_i32(self, base_addr, idx):
-        p = cute.make_ptr(
-            cutlass.Int32,
-            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
-            cute.AddressSpace.smem,
-            assumed_align=4,
-        )
-        return cute.make_tensor(p, cute.make_layout((1,)))[0]
+    def _smem_ld(self, dtype: cutlass.Constexpr, base_addr, idx):
+        return self._smem_ref(dtype, base_addr, idx)[0]
 
     @cute.jit
-    def _smem_st_f32(self, base_addr, idx, val):
-        p = cute.make_ptr(
-            cutlass.Float32,
-            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
-            cute.AddressSpace.smem,
-            assumed_align=4,
-        )
-        t = cute.make_tensor(p, cute.make_layout((1,)))
-        t[0] = val
-
-    @cute.jit
-    def _smem_st_i32(self, base_addr, idx, val):
-        p = cute.make_ptr(
-            cutlass.Int32,
-            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
-            cute.AddressSpace.smem,
-            assumed_align=4,
-        )
-        t = cute.make_tensor(p, cute.make_layout((1,)))
+    def _smem_st(self, dtype: cutlass.Constexpr, base_addr, idx, val):
+        t = self._smem_ref(dtype, base_addr, idx)
         t[0] = val
 
     # ------------------------------------------------------------------
@@ -963,22 +930,13 @@ class GvrTopKKernel:
         if cutlass.const_expr(cluster_size > 1):
             if do_cluster_sync:
                 cute.arch.barrier()  # publish s_iscalars[0] to all threads of this CTA
-                # Parity double-buffer (fixes a pre-existing PTX-model
-                # race): with a single slot and a single rendezvous
-                # per call, a straggler CTA's post-wait DSMEM read of a peer's
-                # slot is unfenced against that peer's NEXT-call overwrite — a
-                # PTX-model data race (counts diverge → thresholds diverge →
-                # peer under-collection or cluster-barrier phase mismatch).
-                # Writing call k into slot k&1 closes it with zero extra
-                # synchronization: the peer's call-(k+2) overwrite of the same
-                # slot is transitively ordered after my call-k reads by the
-                # call-(k+1) rendezvous (my arrive follows my reads in program
-                # order). Slot 2 is a tid0-private call counter, zeroed in
-                # run_one_row; CTAs call this function in lockstep, so parity
-                # stays aligned cluster-wide. Short-row degrade keeps the
-                # invariant: do_cluster_sync is per-row uniform across the
-                # cluster's CTAs, so peers skip (or run) the exchange — and
-                # its counter increment — together.
+                # Parity double-buffer: with a single slot, a straggler's
+                # post-wait DSMEM read races the peer's next-call overwrite
+                # (PTX-model data race). Writing call k into slot k&1 orders
+                # the call-(k+2) overwrite after my call-k reads via the
+                # call-(k+1) rendezvous. Slot 2 = tid0-private call counter
+                # (zeroed per row); do_cluster_sync is row-uniform, so CTAs
+                # step the counter in lockstep and parity stays aligned.
                 par = cutlass.Int32(0)
                 if tidx == cutlass.Int32(0):
                     par = s_cluster_partial[2]
@@ -1500,8 +1458,10 @@ class GvrTopKKernel:
                         else:
                             vj = cutlass.Float32(rng_frag[j])
                         if vj >= thr_final and wc < cutlass.Int32(kCC):
-                            self._smem_st_f32(keys_base, wc, vj)
-                            self._smem_st_i32(vals_base, wc, global_base + cutlass.Int32(j))
+                            self._smem_st(cutlass.Float32, keys_base, wc, vj)
+                            self._smem_st(
+                                cutlass.Int32, vals_base, wc, global_base + cutlass.Int32(j)
+                            )
                             wc = wc + cutlass.Int32(1)
                 # Advance ic past all consumed vec_w-aligned positions.
                 ic = ic + big_iters * cutlass.Int32(step_elem)
@@ -1533,8 +1493,8 @@ class GvrTopKKernel:
                 else:
                     vj = cutlass.Float32(tail_frag[j])
                 if vj >= thr_final and wc < cutlass.Int32(kCC):
-                    self._smem_st_f32(keys_base, wc, vj)
-                    self._smem_st_i32(vals_base, wc, global_base_t + cutlass.Int32(j))
+                    self._smem_st(cutlass.Float32, keys_base, wc, vj)
+                    self._smem_st(cutlass.Int32, vals_base, wc, global_base_t + cutlass.Int32(j))
                     wc = wc + cutlass.Int32(1)
             ic = ic + step
 
@@ -1550,8 +1510,8 @@ class GvrTopKKernel:
                 v = self._load_fp32(input_row, it)
                 pos_global = it
             if v >= thr_final and wc < cutlass.Int32(kCC):
-                self._smem_st_f32(keys_base, wc, v)
-                self._smem_st_i32(vals_base, wc, pos_global)
+                self._smem_st(cutlass.Float32, keys_base, wc, v)
+                self._smem_st(cutlass.Int32, vals_base, wc, pos_global)
                 wc = wc + cutlass.Int32(1)
             it = it + cutlass.Int32(num_threads)
         cute.arch.barrier()
@@ -1587,7 +1547,7 @@ class GvrTopKKernel:
 
         isi = tidx
         while isi < count:
-            v = self._smem_ld_f32(keys_base, isi)
+            v = self._smem_ld(cutlass.Float32, keys_base, isi)
             if v >= thr:
                 lge = lge + cutlass.Int32(1)
             if v > thr:
@@ -1696,7 +1656,7 @@ class GvrTopKKernel:
         cute.arch.barrier()
         i7 = tidx
         while i7 < cand_count:
-            vk = self._smem_ld_f32(keys_base, i7)
+            vk = self._smem_ld(cutlass.Float32, keys_base, i7)
             bin_f = (vk - lo) * inv
             # Clamp in the FLOAT domain before the int cast: fptosi is
             # undefined for out-of-range/NaN inputs at the IR level (PTX
@@ -1955,7 +1915,7 @@ class GvrTopKKernel:
         kBins = cutlass.const_expr(self.kNumBins)
         num_threads = cutlass.const_expr(self.num_threads)
         # Hoisted SMEM window bases: every keys/vals element access below
-        # goes through raw integer addressing (see _smem_ld_f32 rationale).
+        # goes through raw integer addressing (see _smem_ref rationale).
         keys_base = smem_keys.iterator.toint()
         vals_base = smem_vals.iterator.toint()
         # Scalars base for the snap-loop convergence check (read by ALL
@@ -1968,8 +1928,10 @@ class GvrTopKKernel:
             i4 = tidx
             while i4 < cutlass.Int32(kK):
                 if cutlass.const_expr(self.return_output_values):
-                    output_values_row[i4] = self.dtype(self._smem_ld_f32(keys_base, i4))
-                output_indices_row[i4] = self._smem_ld_i32(vals_base, i4)
+                    output_values_row[i4] = self.dtype(
+                        self._smem_ld(cutlass.Float32, keys_base, i4)
+                    )
+                output_indices_row[i4] = self._smem_ld(cutlass.Int32, vals_base, i4)
                 i4 = i4 + cutlass.Int32(num_threads)
         elif cand_count > cutlass.Int32(kK):
             # ----- Branch B: cand_count > kK → histogram snap -----
@@ -2002,7 +1964,7 @@ class GvrTopKKernel:
                 local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
                 i5 = tidx
                 while i5 < cand_count:
-                    v = self._smem_ld_f32(keys_base, i5)
+                    v = self._smem_ld(cutlass.Float32, keys_base, i5)
                     local_cmin = _fmin_f32_inline(local_cmin, v)
                     local_cmax = cute.arch.fmax(local_cmax, v)
                     i5 = i5 + cutlass.Int32(num_threads)
@@ -2168,7 +2130,7 @@ class GvrTopKKernel:
                     dn4 = cutlass.Float32(self.NEG_FLT_MAX)
                     isi4 = tidx
                     while isi4 < cand_count:
-                        v4 = self._smem_ld_f32(keys_base, isi4)
+                        v4 = self._smem_ld(cutlass.Float32, keys_base, isi4)
                         if v4 >= thr_s:
                             lge4 = lge4 + cutlass.Int32(1)
                         if v4 > thr_s:
@@ -2230,8 +2192,8 @@ class GvrTopKKernel:
                         lane,
                     )
                     # After block_fused_snap_iter, s_iscalars[2]=cge, s_iscalars[3]=cgt.
-                    cgt_c = self._smem_ld_i32(isc_base, cutlass.Int32(3))
-                    cge_c = self._smem_ld_i32(isc_base, cutlass.Int32(2))
+                    cgt_c = self._smem_ld(cutlass.Int32, isc_base, cutlass.Int32(3))
+                    cge_c = self._smem_ld(cutlass.Int32, isc_base, cutlass.Int32(2))
                     if cgt_c < cutlass.Int32(kK) and cge_c >= cutlass.Int32(kK):
                         done_snap = cutlass.Int32(1)
                     si = si + cutlass.Int32(1)
@@ -2298,7 +2260,7 @@ class GvrTopKKernel:
                     emit_eq = cutlass.Int32(0)
                     v_p1 = cutlass.Float32(self.NEG_FLT_MAX)
                     if ix1 < cand_count:
-                        v_p1 = self._smem_ld_f32(keys_base, ix1)
+                        v_p1 = self._smem_ld(cutlass.Float32, keys_base, ix1)
                         if v_p1 > sel_thr:
                             emit_gt = cutlass.Int32(1)
                         if v_p1 == sel_thr:
@@ -2311,7 +2273,9 @@ class GvrTopKKernel:
                         if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
                             if cutlass.const_expr(self.return_output_values):
                                 output_values_row[wpos_p1] = self.dtype(v_p1)
-                            output_indices_row[wpos_p1] = self._smem_ld_i32(vals_base, ix1)
+                            output_indices_row[wpos_p1] = self._smem_ld(
+                                cutlass.Int32, vals_base, ix1
+                            )
                         gt_run = gt_run + cutlass.Int32(cute.arch.popc(mask_gt))
                     mask_eq = cute.arch.vote_ballot_sync(emit_eq != cutlass.Int32(0))
                     if mask_eq != cutlass.Uint32(0):
@@ -2320,7 +2284,9 @@ class GvrTopKKernel:
                         if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
                             if cutlass.const_expr(self.return_output_values):
                                 output_values_row[wpos_p2] = self.dtype(v_p1)
-                            output_indices_row[wpos_p2] = self._smem_ld_i32(vals_base, ix1)
+                            output_indices_row[wpos_p2] = self._smem_ld(
+                                cutlass.Int32, vals_base, ix1
+                            )
                         eq_run = eq_run + cutlass.Int32(cute.arch.popc(mask_eq))
                     base_w = base_w + cutlass.Int32(num_threads)
                 cute.arch.barrier()
@@ -2332,7 +2298,7 @@ class GvrTopKKernel:
                     emit_gt = cutlass.Int32(0)
                     v_p1 = cutlass.Float32(self.NEG_FLT_MAX)
                     if ix1 < cand_count:
-                        v_p1 = self._smem_ld_f32(keys_base, ix1)
+                        v_p1 = self._smem_ld(cutlass.Float32, keys_base, ix1)
                         if v_p1 > sel_thr:
                             emit_gt = cutlass.Int32(1)
                     mask_gt = cute.arch.vote_ballot_sync(emit_gt != cutlass.Int32(0))
@@ -2353,7 +2319,9 @@ class GvrTopKKernel:
                         if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
                             if cutlass.const_expr(self.return_output_values):
                                 output_values_row[wpos_p1] = self.dtype(v_p1)
-                            output_indices_row[wpos_p1] = self._smem_ld_i32(vals_base, ix1)
+                            output_indices_row[wpos_p1] = self._smem_ld(
+                                cutlass.Int32, vals_base, ix1
+                            )
                     base_w = base_w + cutlass.Int32(num_threads)
                 cute.arch.barrier()
 
@@ -2364,7 +2332,7 @@ class GvrTopKKernel:
                     emit_eq = cutlass.Int32(0)
                     v_p2 = cutlass.Float32(self.NEG_FLT_MAX)
                     if ix2 < cand_count:
-                        v_p2 = self._smem_ld_f32(keys_base, ix2)
+                        v_p2 = self._smem_ld(cutlass.Float32, keys_base, ix2)
                         if v_p2 == sel_thr:
                             emit_eq = cutlass.Int32(1)
                     mask_eq = cute.arch.vote_ballot_sync(emit_eq != cutlass.Int32(0))
@@ -2385,7 +2353,9 @@ class GvrTopKKernel:
                         if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
                             if cutlass.const_expr(self.return_output_values):
                                 output_values_row[wpos_p2] = self.dtype(v_p2)
-                            output_indices_row[wpos_p2] = self._smem_ld_i32(vals_base, ix2)
+                            output_indices_row[wpos_p2] = self._smem_ld(
+                                cutlass.Int32, vals_base, ix2
+                            )
                     base_w2 = base_w2 + cutlass.Int32(num_threads)
                 cute.arch.barrier()
 
@@ -2416,8 +2386,10 @@ class GvrTopKKernel:
             i10 = tidx
             while i10 < cand_count:
                 if cutlass.const_expr(self.return_output_values):
-                    output_values_row[i10] = self.dtype(self._smem_ld_f32(keys_base, i10))
-                output_indices_row[i10] = self._smem_ld_i32(vals_base, i10)
+                    output_values_row[i10] = self.dtype(
+                        self._smem_ld(cutlass.Float32, keys_base, i10)
+                    )
+                output_indices_row[i10] = self._smem_ld(cutlass.Int32, vals_base, i10)
                 i10 = i10 + cutlass.Int32(num_threads)
             i11 = cand_count + tidx
             while i11 < cutlass.Int32(kK):
