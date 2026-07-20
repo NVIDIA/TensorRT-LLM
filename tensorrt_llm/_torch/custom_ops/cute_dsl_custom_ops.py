@@ -8250,11 +8250,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      num_epi_subtiles,
                      epi_dtype,
                      output_dtype,
-                     remove_online_sf_transpose=False):
+                     remove_online_sf_transpose=False,
+                     emit_block_meta=False,
+                     emit_hit_stats=True):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
-                   remove_online_sf_transpose)
+                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats)
             if key in cls.kernel_cache:
                 return
 
@@ -8317,6 +8319,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                             (num_ctas, 2),
                                                             stride_order=(1, 0))
 
+            # Block-meta tensors (fused-GVR support): nb_pad*4 records.
+            block_max_fake = None
+            hit_stats_fake = None
+            hit_bitmap_fake = None
+            if emit_block_meta:
+                nb_sym = cute.sym_int()
+                block_max_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (cute.sym_int(), nb_sym),
+                    stride_order=(1, 0),
+                    assumed_align=16)
+                if emit_hit_stats:
+                    hit_stats_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Float32, (cute.sym_int(), 4),
+                        stride_order=(1, 0),
+                        assumed_align=16)
+                    hit_bitmap_fake = cute.runtime.make_fake_compact_tensor(
+                        cutlass.Int32, (sym_B, cute.sym_int()),
+                        stride_order=(1, 0),
+                        assumed_align=16)
+
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
@@ -8331,6 +8353,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 epi_dtype=to_cutlass[epi_dtype],
                 output_dtype=to_cutlass[output_dtype],
                 remove_online_sf_transpose=remove_online_sf_transpose,
+                emit_block_meta=emit_block_meta,
+                emit_hit_stats=emit_hit_stats,
             )
 
             compiled = cute.compile(
@@ -8345,6 +8369,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sm_fake,
                 cutlass.Int32(1),
                 cutlass.Int32(1),
+                block_max_fake,
+                hit_stats_fake,
+                hit_bitmap_fake,
                 fake_stream,
                 options="--enable-tvm-ffi",
             )
@@ -8366,6 +8393,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             epi_dtype: torch.dtype = torch.float32,
             output_dtype: torch.dtype = torch.float32,
             remove_online_sf_transpose: bool = False,
+            emit_block_meta: bool = False,
+            emit_hit_stats: bool = True,
+            hit_bitmap: Optional[torch.Tensor] = None,
+            block_max_out: Optional[torch.Tensor] = None,
+            hit_stats_out: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -8381,8 +8413,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_epi_subtiles: epilogue sub-tile count (1, 2, or 4)
                 epi_dtype: epilogue compute dtype
                 output_dtype: output logits dtype
+                emit_block_meta: also emit per-128-block metadata for the
+                    fused GVR top-k. Requires ``hit_bitmap``
+                    [B, nb_pad*4] int32 (1 bit per compressed kv position,
+                    request-level). ``block_max_out``/``hit_stats_out``
+                    ([B*next_n, nb_pad] fp32 / [B*next_n, nb_pad, 4] fp32)
+                    are allocated when not supplied.
             Returns:
-                logits: [B*next_n, max_context_len] output_dtype
+                logits [B*next_n, max_context_len]; with emit_block_meta,
+                the tuple (logits, block_max, hit_stats).
             """
             B, next_n, H, half_D = q.shape
             N = next_n * H
@@ -8435,10 +8474,46 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             logits = logits[:, :max_context_len]
 
+            # Block-meta buffers (fused-GVR support). nb_pad mirrors the
+            # logits padding so WG1's odd-num_kv OOB tile lands in padding.
+            if emit_block_meta:
+                nb_pad = aligned_max_ctx // compute_block_kv
+                # 4 warp-partial records per block (see FP4MQALogitsKernel).
+                nrec = nb_pad * 4
+                if emit_hit_stats:
+                    assert (
+                        hit_bitmap is not None
+                        and hit_bitmap.dtype == torch.int32
+                        and hit_bitmap.is_cuda and hit_bitmap.is_contiguous()
+                        and hit_bitmap.dim() == 2 and hit_bitmap.shape[0] == B
+                        and hit_bitmap.shape[1] >= nb_pad * 4
+                    ), (f"emit_hit_stats requires hit_bitmap int32 "
+                        f"[{B}, >= {nb_pad * 4}]; got "
+                        f"{None if hit_bitmap is None else (hit_bitmap.dtype, tuple(hit_bitmap.shape))}"
+                        )
+                    # Per-row aggregate {enc_min, enc_max, sum, cnt}. The
+                    # kernel only ATOMICALLY MERGES into this buffer — the
+                    # caller must pre-initialize it to the identities
+                    # {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} each step.
+                    assert hit_stats_out is not None, (
+                        "emit_hit_stats requires a caller-initialized "
+                        "hit_stats_out [B*next_n, 4] fp32 (identity-filled)")
+                    assert (hit_stats_out.shape == (B * next_n, 4)
+                            and hit_stats_out.is_contiguous())
+                else:
+                    hit_bitmap = None
+                    hit_stats_out = None
+                if block_max_out is None:
+                    block_max_out = torch.empty((B * next_n, nrec),
+                                                device=q.device,
+                                                dtype=torch.float32)
+                assert (block_max_out.shape == (B * next_n, nrec)
+                        and block_max_out.is_contiguous())
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
-                   remove_online_sf_transpose)
+                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -8450,12 +8525,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_epi_subtiles,
                     epi_dtype,
                     output_dtype,
-                    remove_online_sf_transpose=remove_online_sf_transpose)
+                    remove_online_sf_transpose=remove_online_sf_transpose,
+                    emit_block_meta=emit_block_meta,
+                    emit_hit_stats=emit_hit_stats)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
+            if emit_block_meta:
+                compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
+                         context_lens, schedule_meta, num_phys_blocks, B,
+                         block_max_out, hit_stats_out, hit_bitmap)
+                return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
-                     context_lens, schedule_meta, num_phys_blocks, B)
+                     context_lens, schedule_meta, num_phys_blocks, B, None,
+                     None, None)
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",

@@ -64,6 +64,79 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
 
+# Reduction identities for the emit_block_meta epilogue path; match the GVR
+# kernel's FLT_MAX/NEG_FLT_MAX sentinels (gvr_topk_decode.py) so the fused
+# Phase 1's degenerate checks behave identically to the gather path.
+_META_FLT_MAX = 3.4028235e38
+_META_NEG_FLT_MAX = -3.4028235e38
+
+
+# ---------------------------------------------------------------------------
+# Global-memory reductions for the per-row hit aggregate (emit_hit_stats).
+# fp32 has no native atomic min/max; we use the standard order-preserving
+# int encoding enc(f) = bits(f) >= 0 ? bits(f) : bits(f) ^ 0x7FFFFFFF
+# (an involution; signed-int order == float order, -0.0 quirk harmless for
+# min/max seeding) and red.global.{min,max}.s32. Sum uses red.global.add.f32
+# (order-nondeterministic — perturbs only the heuristic mean seed).
+# ---------------------------------------------------------------------------
+@dsl_user_op
+def _red_global_fmin_ordered(addr_i64, fval, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), fval.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b32 k;\n\t"
+        ".reg .pred p;\n\t"
+        "mov.b32 k, $1;\n\t"
+        "setp.lt.s32 p, k, 0;\n\t"
+        "@p xor.b32 k, k, 0x7FFFFFFF;\n\t"
+        "red.global.min.s32 [$0], k;\n\t"
+        "}",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _red_global_fmax_ordered(addr_i64, fval, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), fval.ir_value(loc=loc, ip=ip)],
+        "{\n\t"
+        ".reg .b32 k;\n\t"
+        ".reg .pred p;\n\t"
+        "mov.b32 k, $1;\n\t"
+        "setp.lt.s32 p, k, 0;\n\t"
+        "@p xor.b32 k, k, 0x7FFFFFFF;\n\t"
+        "red.global.max.s32 [$0], k;\n\t"
+        "}",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _red_global_add_f32(addr_i64, fval, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), fval.ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
 
 @dsl_user_op
 def pack_f16x2(
@@ -363,6 +436,8 @@ class FP4MQALogitsKernel:
         output_dtype=cutlass.Float32,
         remove_online_sf_transpose: bool = False,
         use_batched_store: bool = True,
+        emit_block_meta: bool = False,
+        emit_hit_stats: bool = True,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -407,6 +482,38 @@ class FP4MQALogitsKernel:
         # When True, defer per-t STG to register array and emit all STGs in
         # one contiguous LSU phase after the for-t loop (epilogue micro-opt).
         self.use_batched_store = use_batched_store
+        # When True, the epilogue additionally emits per-128-token-block
+        # metadata consumed by the fused GVR top-k (gvr_topk_decode.py —
+        # fused_preidx_stats / enable_block_skip). Emission is fully
+        # WARP-AUTONOMOUS: each of the WG's 4 warps writes one partial
+        # record per tile per t (record index = tile*4 + warp); the GVR
+        # consumer folds the 4 partials per block. No cross-warp barrier —
+        # a per-tile named-barrier fold costs +53% indexer wall-clock.
+        #   block_max [num_rows, nb_pad*4]    fp32 — warp-partial max of
+        #     f32(stored logit) over valid positions (kv_pos < ctx);
+        #     fold(4) is the lossless block-skip upper bound. Computed on
+        #     the POST-conversion value so it bounds what GVR reads back,
+        #     bit-exactly.
+        #   hit_agg [num_rows, 4] fp32 — PER-ROW aggregate
+        #     {enc_min, enc_max, sum, cnt} of stored logits at positions
+        #     flagged in hit_bitmap; min/max slots hold the
+        #     order-preserving int encoding (see _red_global_fmin_ordered).
+        #     Buffer must be pre-initialized to
+        #     {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} per step. Replaces GVR
+        #     Phase 1's random gather.
+        #   hit_bitmap [batch, nb_pad*4]      int32 — 1 bit per kv
+        #     position (request-level; from the previous step's top-k).
+        # Cost per tile per t: 1 bitmap LDG/thread + 1 warp redux + 1
+        # lane-0 STG (block_max) + <= 4 LANE-LOCAL accumulator ops (hit
+        # stats); the hit accumulators flush ONCE per q-transition via
+        # atomics (_flush_hit_agg). A per-tile warp-redux emission of the
+        # hit stats was tried first and cost +72% indexer wall-clock.
+        #
+        # emit_hit_stats sub-knob (only meaningful with emit_block_meta):
+        # False emits block_max ONLY (no bitmap read, no hit aggregate) —
+        # sufficient for GVR block-skip without the fused Phase 1.
+        self.emit_block_meta = emit_block_meta
+        self.emit_hit_stats = emit_hit_stats
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -627,6 +734,9 @@ class FP4MQALogitsKernel:
         schedule_meta: cute.Tensor,  # [num_sms+1, 2] int32
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
+        block_max: cute.Tensor,  # [num_rows, nb_pad*4] fp32 warp-partials (or None)
+        hit_stats: cute.Tensor,  # [num_rows, 4] fp32 hit aggregate (or None unless emit_hit_stats)
+        hit_bitmap: cute.Tensor,  # [batch, nb_pad*4] int32 (or None unless emit_block_meta)
         stream: cuda.CUstream,
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
@@ -826,6 +936,9 @@ class FP4MQALogitsKernel:
             context_lens,
             schedule_meta,
             batch_size,
+            block_max,
+            hit_stats,
+            hit_bitmap,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -848,6 +961,44 @@ class FP4MQALogitsKernel:
             stream=stream,
         )
 
+    @cute.jit
+    def _flush_hit_agg(
+        self,
+        mHitAgg,  # [num_rows, 4] fp32 {enc_min, enc_max, sum, cnt}
+        q_flush,  # request whose accumulators are being flushed
+        hacc_min,
+        hacc_max,
+        hacc_sum,
+        hacc_cnt,
+        meta_lane,
+    ):
+        """Warp-reduce the per-lane hit accumulators and merge them into the
+        per-row global aggregate via one set of atomics (encoded-int
+        min/max + fp32 adds), then reset to identities. Called once per
+        q-transition per warp — atomic traffic is negligible. The
+        aggregate buffer must be pre-initialized to
+        {enc(+FLT_MAX), enc(-FLT_MAX), 0, 0} per step (prototype: test
+        harness; production: folded into the bitmap prepare kernel)."""
+        next_n = cutlass.const_expr(self.next_n)
+        base_addr = mHitAgg.iterator.toint()
+        for t in cutlass.range_constexpr(next_n):
+            w_min = cute.arch.warp_redux_sync(hacc_min[t], "fmin")
+            w_max = cute.arch.warp_redux_sync(hacc_max[t], "fmax")
+            w_sum = cute.arch.warp_reduction_sum(hacc_sum[t])
+            w_cnt = cute.arch.warp_redux_sync(hacc_cnt[t], "add")
+            if meta_lane == cutlass.Int32(0):
+                if w_cnt > cutlass.Int32(0):
+                    row = q_flush * cutlass.Int32(next_n) + cutlass.Int32(t)
+                    row_addr = base_addr + cutlass.Int64(row) * cutlass.Int64(16)
+                    _red_global_fmin_ordered(row_addr, w_min)
+                    _red_global_fmax_ordered(row_addr + cutlass.Int64(4), w_max)
+                    _red_global_add_f32(row_addr + cutlass.Int64(8), w_sum)
+                    _red_global_add_f32(row_addr + cutlass.Int64(12), cutlass.Float32(w_cnt))
+            hacc_min[t] = cutlass.Float32(_META_FLT_MAX)
+            hacc_max[t] = cutlass.Float32(_META_NEG_FLT_MAX)
+            hacc_sum[t] = cutlass.Float32(0.0)
+            hacc_cnt[t] = cutlass.Int32(0)
+
     @cute.kernel
     def kernel(
         self,
@@ -867,6 +1018,9 @@ class FP4MQALogitsKernel:
         mContextLens: cute.Tensor,  # [batch_size]
         mScheduleMeta: cute.Tensor,  # [num_sms+1, 2] int32
         batch_size: cutlass.Int32,
+        mBlockMax: cute.Tensor,  # [num_rows, nb_pad*4] fp32 warp-partials (or None)
+        mHitAgg: cute.Tensor,  # [num_rows, 4] fp32 {enc_min, enc_max, sum, cnt} (or None)
+        mHitBitmap: cute.Tensor,  # [batch, nb_pad*4] int32 (or None)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -1115,6 +1269,12 @@ class FP4MQALogitsKernel:
             layout=sf_kv_smem_layout_staged,
             byte_alignment=128,
         )
+        # Block-meta emission is fully warp-autonomous (each warp's lane 0
+        # writes its own warp-partial record straight to GMEM; the GVR
+        # side folds 4 partials per block) — no SMEM scratch, no named
+        # barrier. A cross-warp SMEM fold + per-tile named barrier was
+        # tried first and cost +53% indexer wall-clock by serializing the
+        # epilogue's warp pipelining.
 
         a_mcast_mask = cpasync.create_tma_multicast_mask(
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
@@ -1661,7 +1821,6 @@ class FP4MQALogitsKernel:
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
-
         elif is_umma_warp_1:
             # UMMA warp for group 1
             # Explicitly waits on Q pipeline — critical because TMA warp 1
@@ -1794,7 +1953,6 @@ class FP4MQALogitsKernel:
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
-
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
 
@@ -1838,6 +1996,15 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                if cutlass.const_expr(self.emit_block_meta):
+                    # Free ~8 registers for the meta accumulators/fragments
+                    # — the epilogue's weight cache is tuned to the spill
+                    # edge (see MAX_NUM_W_IN_REG SASS notes above).
+                    MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
+                    if cutlass.const_expr(self.emit_hit_stats):
+                        # Hit accumulators + bitmap word add ~6 more live
+                        # registers across the tile loop.
+                        MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -1848,6 +2015,33 @@ class FP4MQALogitsKernel:
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
+                if cutlass.const_expr(self.emit_block_meta):
+                    ctx_cur = cutlass.Int32(0)
+                    meta_warp = local_tidx // 32
+                    meta_lane = local_tidx % 32
+                    if cutlass.const_expr(self.emit_hit_stats):
+                        # Per-lane hit accumulators, carried across ALL
+                        # tiles of the same q and flushed once per
+                        # q-transition — zero warp-wide ops per tile (the
+                        # per-tile redux version cost +72% wall-clock).
+                        hacc_min = cute.make_fragment(next_n, cutlass.Float32)
+                        hacc_max = cute.make_fragment(next_n, cutlass.Float32)
+                        hacc_sum = cute.make_fragment(next_n, cutlass.Float32)
+                        hacc_cnt = cute.make_fragment(next_n, cutlass.Int32)
+                        for _t in cutlass.range_constexpr(next_n):
+                            hacc_min[_t] = cutlass.Float32(_META_FLT_MAX)
+                            hacc_max[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            hacc_sum[_t] = cutlass.Float32(0.0)
+                            hacc_cnt[_t] = cutlass.Int32(0)
+                        # Batched bitmap read state: a per-tile LDG's
+                        # ~300cy L2 trip lands on the critical path every
+                        # tile (isolated at +42% kernel time; one-ahead
+                        # prefetch did not help). All 32 lanes of a warp
+                        # need the SAME word per tile, so instead lane l
+                        # loads the word for tile j+l once per 32 tiles
+                        # and each tile takes its word via one shuffle.
+                        meta_j = cutlass.Int32(0)
+                        hitw_batch = cutlass.Int32(0)
 
                 while has_work:
                     # fetch_next_task: commit next → current
@@ -1869,11 +2063,51 @@ class FP4MQALogitsKernel:
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
+                        if cutlass.const_expr(self.emit_block_meta):
+                            # Flush the PREVIOUS request's hit accumulators
+                            # before switching context.
+                            if cutlass.const_expr(self.emit_hit_stats):
+                                if q_idx_old < batch_size:
+                                    self._flush_hit_agg(
+                                        mHitAgg,
+                                        q_idx_old,
+                                        hacc_min,
+                                        hacc_max,
+                                        hacc_sum,
+                                        hacc_cnt,
+                                        meta_lane,
+                                    )
+                                # New bitmap row: invalidate the batched
+                                # word cache (forces a reload).
+                                meta_j = cutlass.Int32(0)
+                            # Compressed-space context len; the meta valid
+                            # mask (kv_pos < ctx_cur) keeps GEMM garbage in
+                            # the aligned padding region out of block_max.
+                            ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 0 (kv_idx + 0)
                     # Unconditional Math: OOB results
                     # written to aligned padding region in logits buffer.
                     kv_pos = kv_idx * block_kv_val + m_coord
+                    if cutlass.const_expr(self.emit_block_meta):
+                        meta_kv_tile = kv_idx
+                        meta_valid = kv_pos < ctx_cur
+                        if cutlass.const_expr(self.emit_hit_stats):
+                            # Warp-uniform reload once per 32 tiles: this
+                            # WG's tile at counter j+l is kv_tile + 2*l,
+                            # whose warp word index is (kv_tile+2*l)*4 +
+                            # warp. Clamp keeps end-of-row lanes in
+                            # bounds (their tiles are never consumed).
+                            if (meta_j & cutlass.Int32(31)) == cutlass.Int32(0):
+                                w_idx = (
+                                    meta_kv_tile + cutlass.Int32(2) * meta_lane
+                                ) * cutlass.Int32(4) + meta_warp
+                                w_idx = min(w_idx, mHitBitmap.shape[1] - cutlass.Int32(1))
+                                hitw_batch = mHitBitmap[(q_idx, w_idx)]
+                            hit_word = cute.arch.shuffle_sync(
+                                hitw_batch, meta_j & cutlass.Int32(31)
+                            )
+                            meta_j = meta_j + cutlass.Int32(1)
 
                     # Step 5.7: drop kv_pipeline.consumer_wait/release and
                     # scale_val LDS — UMMA owns KV+SF pipe; SF is baked into
@@ -2054,11 +2288,74 @@ class FP4MQALogitsKernel:
                         else:
                             result_t = s0x + s0y + s1x + s1y
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
+                        stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
-                            result_arr[t] = self.output_dtype(result_t)
+                            result_arr[t] = stored_t
                         else:
                             out_row = q_idx * next_n + t
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+                            mLogits[(out_row, kv_pos)] = stored_t
+                        if cutlass.const_expr(self.emit_block_meta):
+                            # Meta reduction on the POST-conversion value so
+                            # block_max bounds what GVR reads back bit-exactly
+                            # (pre-conversion fp32 max could round up past a
+                            # stored logit's converted value's block max).
+                            f32_t = cutlass.Float32(stored_t)
+                            bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
+                            if meta_valid:
+                                bmax_v = f32_t
+                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                            # Warp-autonomous store: record index =
+                            # tile*4 + warp; the GVR consumer folds the 4
+                            # warp-partials per block (fold of partials ==
+                            # block stat — associative + identity-padded).
+                            if meta_lane == cutlass.Int32(0):
+                                out_row_m = q_idx * next_n + t
+                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
+                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_hit_stats):
+                                # Lane-local accumulation, fully BRANCHLESS
+                                # (data-dependent `if meta_hit` compiled to
+                                # real divergent branches whose condition
+                                # waits on the bitmap LDG — 43% of all warp
+                                # stall samples). Bit-mask select is also
+                                # NaN-safe for OOB-tile garbage logits. No
+                                # valid-mask needed: the bitmap contract
+                                # only sets bits inside [0, ctx).
+                                meta_hit = (
+                                    hit_word >> (kv_pos & cutlass.Int32(31))
+                                ) & cutlass.Int32(1)
+                                msk = cutlass.Int32(0) - meta_hit  # 0 / ~0
+                                inv = cutlass.Int32(-1) - msk
+                                fbits = cutlass.Int32(
+                                    llvm.bitcast(cutlass.Int32.mlir_type, f32_t.ir_value())
+                                )
+                                # bits(+FLT_MAX)=0x7F7FFFFF,
+                                # bits(-FLT_MAX)=0xFF7FFFFF (as i32: neg).
+                                selmin = cutlass.Float32(
+                                    llvm.bitcast(
+                                        cutlass.Float32.mlir_type,
+                                        (
+                                            (fbits & msk) | (cutlass.Int32(0x7F7FFFFF) & inv)
+                                        ).ir_value(),
+                                    )
+                                )
+                                selmax = cutlass.Float32(
+                                    llvm.bitcast(
+                                        cutlass.Float32.mlir_type,
+                                        (
+                                            (fbits & msk) | (cutlass.Int32(-8388609) & inv)
+                                        ).ir_value(),
+                                    )
+                                )
+                                seladd = cutlass.Float32(
+                                    llvm.bitcast(
+                                        cutlass.Float32.mlir_type, (fbits & msk).ir_value()
+                                    )
+                                )
+                                hacc_min[t] = cutlass.min(hacc_min[t], selmin)
+                                hacc_max[t] = cutlass.max(hacc_max[t], selmax)
+                                hacc_sum[t] = hacc_sum[t] + seladd
+                                hacc_cnt[t] = hacc_cnt[t] + meta_hit
 
                     if cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
@@ -2077,6 +2374,13 @@ class FP4MQALogitsKernel:
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                # Flush the final request's hit accumulators (WG 0).
+                if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
+                    if q_idx < batch_size:
+                        self._flush_hit_agg(
+                            mHitAgg, q_idx, hacc_min, hacc_max, hacc_sum, hacc_cnt, meta_lane
+                        )
 
                 # Release last Q stage (WG 0)
                 if q_idx < batch_size:
@@ -2101,6 +2405,15 @@ class FP4MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64
                 else:
                     MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                if cutlass.const_expr(self.emit_block_meta):
+                    # Free ~8 registers for the meta accumulators/fragments
+                    # — the epilogue's weight cache is tuned to the spill
+                    # edge (see MAX_NUM_W_IN_REG SASS notes above).
+                    MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
+                    if cutlass.const_expr(self.emit_hit_stats):
+                        # Hit accumulators + bitmap word add ~6 more live
+                        # registers across the tile loop.
+                        MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2111,6 +2424,33 @@ class FP4MQALogitsKernel:
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
+                if cutlass.const_expr(self.emit_block_meta):
+                    ctx_cur = cutlass.Int32(0)
+                    meta_warp = local_tidx // 32
+                    meta_lane = local_tidx % 32
+                    if cutlass.const_expr(self.emit_hit_stats):
+                        # Per-lane hit accumulators, carried across ALL
+                        # tiles of the same q and flushed once per
+                        # q-transition — zero warp-wide ops per tile (the
+                        # per-tile redux version cost +72% wall-clock).
+                        hacc_min = cute.make_fragment(next_n, cutlass.Float32)
+                        hacc_max = cute.make_fragment(next_n, cutlass.Float32)
+                        hacc_sum = cute.make_fragment(next_n, cutlass.Float32)
+                        hacc_cnt = cute.make_fragment(next_n, cutlass.Int32)
+                        for _t in cutlass.range_constexpr(next_n):
+                            hacc_min[_t] = cutlass.Float32(_META_FLT_MAX)
+                            hacc_max[_t] = cutlass.Float32(_META_NEG_FLT_MAX)
+                            hacc_sum[_t] = cutlass.Float32(0.0)
+                            hacc_cnt[_t] = cutlass.Int32(0)
+                        # Batched bitmap read state: a per-tile LDG's
+                        # ~300cy L2 trip lands on the critical path every
+                        # tile (isolated at +42% kernel time; one-ahead
+                        # prefetch did not help). All 32 lanes of a warp
+                        # need the SAME word per tile, so instead lane l
+                        # loads the word for tile j+l once per 32 tiles
+                        # and each tile takes its word via one shuffle.
+                        meta_j = cutlass.Int32(0)
+                        hitw_batch = cutlass.Int32(0)
 
                 while has_work:
                     # fetch_next_task: commit next → current
@@ -2132,12 +2472,56 @@ class FP4MQALogitsKernel:
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
+                        if cutlass.const_expr(self.emit_block_meta):
+                            # Flush the PREVIOUS request's hit accumulators
+                            # before switching context.
+                            if cutlass.const_expr(self.emit_hit_stats):
+                                if q_idx_old < batch_size:
+                                    self._flush_hit_agg(
+                                        mHitAgg,
+                                        q_idx_old,
+                                        hacc_min,
+                                        hacc_max,
+                                        hacc_sum,
+                                        hacc_cnt,
+                                        meta_lane,
+                                    )
+                                # New bitmap row: invalidate the batched
+                                # word cache (forces a reload).
+                                meta_j = cutlass.Int32(0)
+                            # Compressed-space context len; the meta valid
+                            # mask (kv_pos < ctx_cur) keeps GEMM garbage in
+                            # the aligned padding region out of block_max.
+                            ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional Math
                     kv_idx_1 = kv_idx + 1
 
                     kv_pos = kv_idx_1 * block_kv_val + m_coord
+                    if cutlass.const_expr(self.emit_block_meta):
+                        meta_kv_tile = kv_idx_1
+                        # See WG 0. For the odd-num_kv OOB tile
+                        # (kv_idx_1 == num_kv) every lane has
+                        # kv_pos >= ctx_cur, so identities land in the
+                        # nb_pad padding slot — never read by GVR.
+                        meta_valid = kv_pos < ctx_cur
+                        if cutlass.const_expr(self.emit_hit_stats):
+                            # Warp-uniform reload once per 32 tiles: this
+                            # WG's tile at counter j+l is kv_tile + 2*l,
+                            # whose warp word index is (kv_tile+2*l)*4 +
+                            # warp. Clamp keeps end-of-row lanes in
+                            # bounds (their tiles are never consumed).
+                            if (meta_j & cutlass.Int32(31)) == cutlass.Int32(0):
+                                w_idx = (
+                                    meta_kv_tile + cutlass.Int32(2) * meta_lane
+                                ) * cutlass.Int32(4) + meta_warp
+                                w_idx = min(w_idx, mHitBitmap.shape[1] - cutlass.Int32(1))
+                                hitw_batch = mHitBitmap[(q_idx, w_idx)]
+                            hit_word = cute.arch.shuffle_sync(
+                                hitw_batch, meta_j & cutlass.Int32(31)
+                            )
+                            meta_j = meta_j + cutlass.Int32(1)
 
                     # Step 5.7: drop kv_pipeline.consumer_wait/release and
                     # scale_val LDS — UMMA owns KV+SF pipe.
@@ -2307,11 +2691,74 @@ class FP4MQALogitsKernel:
                         else:
                             result_t = s0x + s0y + s1x + s1y
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
+                        stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
-                            result_arr[t] = self.output_dtype(result_t)
+                            result_arr[t] = stored_t
                         else:
                             out_row = q_idx * next_n + t
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
+                            mLogits[(out_row, kv_pos)] = stored_t
+                        if cutlass.const_expr(self.emit_block_meta):
+                            # Meta reduction on the POST-conversion value so
+                            # block_max bounds what GVR reads back bit-exactly
+                            # (pre-conversion fp32 max could round up past a
+                            # stored logit's converted value's block max).
+                            f32_t = cutlass.Float32(stored_t)
+                            bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
+                            if meta_valid:
+                                bmax_v = f32_t
+                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                            # Warp-autonomous store: record index =
+                            # tile*4 + warp; the GVR consumer folds the 4
+                            # warp-partials per block (fold of partials ==
+                            # block stat — associative + identity-padded).
+                            if meta_lane == cutlass.Int32(0):
+                                out_row_m = q_idx * next_n + t
+                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
+                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_hit_stats):
+                                # Lane-local accumulation, fully BRANCHLESS
+                                # (data-dependent `if meta_hit` compiled to
+                                # real divergent branches whose condition
+                                # waits on the bitmap LDG — 43% of all warp
+                                # stall samples). Bit-mask select is also
+                                # NaN-safe for OOB-tile garbage logits. No
+                                # valid-mask needed: the bitmap contract
+                                # only sets bits inside [0, ctx).
+                                meta_hit = (
+                                    hit_word >> (kv_pos & cutlass.Int32(31))
+                                ) & cutlass.Int32(1)
+                                msk = cutlass.Int32(0) - meta_hit  # 0 / ~0
+                                inv = cutlass.Int32(-1) - msk
+                                fbits = cutlass.Int32(
+                                    llvm.bitcast(cutlass.Int32.mlir_type, f32_t.ir_value())
+                                )
+                                # bits(+FLT_MAX)=0x7F7FFFFF,
+                                # bits(-FLT_MAX)=0xFF7FFFFF (as i32: neg).
+                                selmin = cutlass.Float32(
+                                    llvm.bitcast(
+                                        cutlass.Float32.mlir_type,
+                                        (
+                                            (fbits & msk) | (cutlass.Int32(0x7F7FFFFF) & inv)
+                                        ).ir_value(),
+                                    )
+                                )
+                                selmax = cutlass.Float32(
+                                    llvm.bitcast(
+                                        cutlass.Float32.mlir_type,
+                                        (
+                                            (fbits & msk) | (cutlass.Int32(-8388609) & inv)
+                                        ).ir_value(),
+                                    )
+                                )
+                                seladd = cutlass.Float32(
+                                    llvm.bitcast(
+                                        cutlass.Float32.mlir_type, (fbits & msk).ir_value()
+                                    )
+                                )
+                                hacc_min[t] = cutlass.min(hacc_min[t], selmin)
+                                hacc_max[t] = cutlass.max(hacc_max[t], selmax)
+                                hacc_sum[t] = hacc_sum[t] + seladd
+                                hacc_cnt[t] = hacc_cnt[t] + meta_hit
 
                     if cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
@@ -2330,6 +2777,13 @@ class FP4MQALogitsKernel:
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                # Flush the final request's hit accumulators (WG 1).
+                if cutlass.const_expr(self.emit_block_meta and self.emit_hit_stats):
+                    if q_idx < batch_size:
+                        self._flush_hit_agg(
+                            mHitAgg, q_idx, hacc_min, hacc_max, hacc_sum, hacc_cnt, meta_lane
+                        )
 
                 # Release last Q stage (WG 1)
                 if q_idx < batch_size:
