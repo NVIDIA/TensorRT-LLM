@@ -8,7 +8,10 @@ the score launcher and its persistent metadata; scoring itself runs through
 the compiled ``trtllm`` CUDA ops (coefficient fold + folded paged score) for
 every supported geometry. The original Triton score kernel has been deleted;
 the unit tests validate the CUDA ops against an independent PyTorch oracle.
-Selection and compaction live in their respective runtime modules.
+Selection and compaction live in their respective runtime modules. An
+optional SM100 CuTe-DSL specialization (``triattention_cute_score.py``,
+default off behind ``TRTLLM_TRIATTENTION_CUTE_SCORE=1``) can take over the
+mean-aggregation score launch for one exactly-validated geometry.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
@@ -19,6 +22,8 @@ House rules honored throughout:
 
 from __future__ import annotations
 
+import os
+import warnings
 from typing import List
 
 import torch
@@ -398,6 +403,115 @@ class _FixedScoreGroup:
             mlr_coef_LHF.view(-1),
         )
         self.pointer_tail = (freq_scale_sq, omega, offsets)
+        # Optional SM100 CuTe mean-score specialization (see
+        # triattention_cute_score.py), compiled by the first
+        # ``prepare_cute_score`` call and default OFF behind the
+        # TRTLLM_TRIATTENTION_CUTE_SCORE environment knob (read once here).
+        # The CuTe runner encodes TMA descriptors from the actual pool
+        # tensors, so pool references are retained ONLY when the knob is on;
+        # the default path keeps the raw-address-only lifetime contract
+        # documented above.
+        self.seq_len = int(seq_len)
+        self._cute_score_runner = None
+        self._cute_score_attempted = False
+        cute_score_enabled = os.environ.get("TRTLLM_TRIATTENTION_CUTE_SCORE", "0") == "1"
+        self._cute_layer_pools = list(layer_pools) if cute_score_enabled else None
+        self._cute_layer_indices = [int(layer) for layer in layer_indices]
+
+    def prepare_cute_score(self, mean_cos: torch.Tensor, mean_sin: torch.Tensor) -> None:
+        """Compile the optional SM100 CuTe mean-score specialization once.
+
+        Call this outside CUDA graph capture: compilation allocates memory
+        and synchronizes. With the environment knob unset (the default) or on
+        any unsupported geometry this returns without importing the CuTe
+        module, and every launch keeps using the compiled C++ score ops.
+
+        Geometry reality check: the supported contract below (SM100 exactly,
+        BF16 pools, 128-token pages, 64-element K rows / 32 frequencies,
+        8 query heads per KV head) matches none of the current production
+        models (Qwen3 uses 128-element K rows, 32-token pages, and 4 query
+        heads per KV head; GPT-OSS uses 32-token pages), so today the kernel
+        fires only on the synthetic unit-test geometry. This wiring exists to
+        validate the kernel end to end while wider geometry support lands.
+        """
+        if self._cute_score_attempted:
+            return
+        self._cute_score_attempted = True
+        if self._cute_layer_pools is None:
+            return
+        anchor = self.pointer_prefix[0]
+        num_q_heads, num_kv_heads, num_freqs, tokens_per_block, kv_factor = self.geometry_args[:5]
+        max_segments = self.max_requests * self.num_layers
+        supported = (
+            torch.cuda.get_device_capability(anchor.device) == (10, 0)
+            and anchor.dtype == torch.bfloat16
+            and kv_factor == 2
+            and tokens_per_block == 128
+            and num_freqs == 32
+            and num_q_heads == num_kv_heads * 8
+            and int(anchor.stride(-1)) == 1
+            # The kernel computes flat score offsets in 32-bit arithmetic.
+            and num_q_heads * max_segments * self.seq_len < 2**31
+        )
+        if not supported:
+            return
+        device = anchor.device
+        try:
+            from .triattention_cute_score import TriAttentionCuteScoreRunner
+
+            # The kernel scores the FULL sequence from physical token zero
+            # into its own head-major scratch (row = query head, column =
+            # segment * seq_len + token); ``launch`` gathers each request's
+            # decode window from that scratch into ``self.output``. All
+            # buffers below are persistent because the compiled kernel
+            # captures their device pointers.
+            scratch = torch.empty(
+                num_q_heads * max_segments * self.seq_len,
+                dtype=torch.float32,
+                device=device,
+            )
+            seg_seq_len = torch.zeros(max_segments, dtype=torch.int32, device=device)
+            seg_out_offset = (
+                torch.arange(max_segments, dtype=torch.int64, device=device) * self.seq_len
+            ).to(torch.int32)
+            gather_columns = torch.arange(self.output_width, dtype=torch.int64, device=device)
+            self._cute_score_runner = TriAttentionCuteScoreRunner(
+                layer_pools=self._cute_layer_pools,
+                layer_indices=self._cute_layer_indices,
+                max_requests=self.max_requests,
+                num_layers=self.num_layers,
+                seq_len=self.seq_len,
+                # Always score from physical token zero: per-request prompt
+                # windows are applied by the gather in ``launch`` instead of
+                # one global page-aligned start.
+                score_start=0,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                num_freqs=num_freqs,
+                tokens_per_block=tokens_per_block,
+                page_ids=self.pointer_prefix[2],
+                seg_page_off=self.pointer_prefix[3],
+                seg_req_id=self.pointer_prefix[4],
+                seg_layer_id=self.pointer_prefix[5],
+                seg_seq_len=seg_seq_len,
+                seg_out_offset=seg_out_offset,
+                q_real=self.pointer_middle[0],
+                q_imag=self.pointer_middle[1],
+                mlr_coef=self.pointer_middle[2],
+                mean_cos=mean_cos,
+                mean_sin=mean_sin,
+                freq_scale_sq=self.pointer_tail[0],
+                output=scratch,
+            )
+            self._cute_scratch = scratch
+            self._cute_seg_seq_len = seg_seq_len
+            self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
+        except (ImportError, RuntimeError, ValueError, AssertionError) as error:
+            warnings.warn(
+                f"TriAttention CuTe score setup failed; using the C++ score ops: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def _fold_coefficient_buffers(
         self, offset_planes: int
@@ -451,6 +565,44 @@ class _FixedScoreGroup:
             # unbounded x axis can hold the token tiles of long sequences.
             raise ValueError("request*layer segment count exceeds the CUDA grid limit")
         output = self.output[:request_count]
+        if score_aggregation == "mean":
+            # Lazy compile covers groups used without their owning workspace
+            # (unit tests); production compiles in the workspace constructor,
+            # outside CUDA graph capture. Default off: one attribute check.
+            self.prepare_cute_score(mean_cos, mean_sin)
+            runner = self._cute_score_runner
+            if runner is not None and runner.supports(request_count):
+                # Stage per-segment valid lengths (segment = request x layer).
+                torch.index_select(
+                    valid_seq_lens,
+                    0,
+                    self.pointer_prefix[4][:num_segments],
+                    out=self._cute_seg_seq_len[:num_segments],
+                )
+                runner.launch(request_count, mean_cos, mean_sin)
+                # The kernel wrote full-sequence scores from physical token
+                # zero into its head-major scratch. Gather each request's
+                # decode window (starting at its pinned prompt length) into
+                # the group output so callers see exactly the layout the C++
+                # score ops produce. This costs one extra read+write of the
+                # score volume per round, only on this opt-in path; columns
+                # past a request's valid width carry unscored scratch data,
+                # matching the C++ op, whose consumers mask by valid width.
+                num_q_heads = int(self.geometry_args[0])
+                source = (
+                    self._cute_scratch[: num_q_heads * num_segments * self.seq_len]
+                    .view(num_q_heads, request_count, self.num_layers, self.seq_len)
+                    .permute(1, 2, 0, 3)
+                )
+                columns = (
+                    token_starts_device[:request_count].to(torch.int64).view(-1, 1, 1, 1)
+                    + self._cute_gather_columns
+                )
+                columns = columns.clamp_(max=self.seq_len - 1).expand(
+                    request_count, self.num_layers, num_q_heads, self.output_width
+                )
+                torch.gather(source, 3, columns, out=output)
+                return output
         _launch_tri_score_perhead(
             self,
             request_count,

@@ -670,6 +670,11 @@ class _FixedScoreStagingBuffers:
             offsets,
             output_width=decode_width,
         )
+        # Compile the optional SM100 CuTe score specialization here, outside
+        # any CUDA graph capture (compilation allocates and synchronizes).
+        # Default off: without TRTLLM_TRIATTENTION_CUTE_SCORE=1 this is a
+        # no-op and scoring stays on the compiled C++ score ops.
+        self.fused_group.prepare_cute_score(self.mean_cos, self.mean_sin)
         self.copy_done = torch.cuda.Event()
         # First record publishes constructor allocations to the V2 copy stream;
         # later records protect pinned metadata before the next cohort reuses it.
