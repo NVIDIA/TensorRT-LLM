@@ -43,11 +43,11 @@ def normalize_video_input_path(path: Path, max_frames: Optional[int] = None) -> 
     # one conditioning frame; a decodable video is expanded to its frames.
     # Extensions are unreliable — the serve path stores references with no
     # type-suffix at all — so the container decides, not the name.
-    from tensorrt_llm.inputs.media_io import is_image_file, is_video_file
+    from tensorrt_llm.inputs.media_io import is_decodable_image_file, is_decodable_video_file
 
-    if is_image_file(path):
+    if is_decodable_image_file(path):
         return [str(path)]
-    if is_video_file(path):
+    if is_decodable_video_file(path):
         return decode_video_file(path, max_frames=max_frames)
     raise ValueError(
         f"Cosmos3 reference must be a frame directory, a decodable image, "

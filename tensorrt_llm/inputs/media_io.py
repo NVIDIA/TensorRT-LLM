@@ -345,7 +345,23 @@ def _get_cv2():
     return cv2
 
 
-def is_image_file(path) -> bool:
+# --- Content-classification probes ------------------------------------------
+# These classify media by asking the decoder itself, deliberately:
+#  * File suffixes are unreliable — client-controlled, often absent (the serve
+#    handles raw uploaded bytes with no filename at all), and never proof that
+#    the content matches the name.
+#  * Sniffing signatures ("magic numbers") would need an extra dependency
+#    (libmagic, as behind Unix `file`) or a hand-rolled signature table — and
+#    would still only name the container, not prove that this build's decoder
+#    can actually open it (codec support varies per PIL/OpenCV build).
+#  * A classifier that can disagree with the decoder is a deferred failure:
+#    content that passes the check but fails to decode later, deeper in the
+#    pipeline. Probing PIL/OpenCV directly makes "classified as X" and
+#    "decodes as X" the same statement by construction.
+# Hence the names: these predicates promise decodability, not format identity.
+
+
+def is_decodable_image_file(path) -> bool:
     """True when ``path`` holds still-image content (anything PIL opens).
 
     Header-only probe: identifies the container without decoding pixels.
@@ -358,7 +374,7 @@ def is_image_file(path) -> bool:
         return False
 
 
-def is_video_file(path) -> bool:
+def is_decodable_video_file(path) -> bool:
     """True when ``path`` holds a decodable video stream (OpenCV-openable).
 
     Total predicate over content: False for images, audio, and undecodable
@@ -366,7 +382,7 @@ def is_video_file(path) -> bool:
     image as a one-frame video stream, so a bare video probe would accept
     every PNG/JPEG. ``_get_cv2`` raises a clear install hint if cv2 is absent.
     """
-    if is_image_file(path):
+    if is_decodable_image_file(path):
         return False
     cv2 = _get_cv2()
     capture = cv2.VideoCapture(str(path))
@@ -376,10 +392,10 @@ def is_video_file(path) -> bool:
         capture.release()
 
 
-def is_image_bytes(data) -> bool:
+def is_decodable_image_bytes(data) -> bool:
     """True when ``data`` holds still-image content (anything PIL opens).
 
-    In-memory counterpart of :func:`is_image_file` — header-only probe, no
+    In-memory counterpart of :func:`is_decodable_image_file` — header-only probe, no
     pixel decode, no filesystem.
     """
     try:

@@ -64,8 +64,9 @@ def _assert_llm_envelope(
 def _require_opencv():
     """Skip unless OpenCV is installed (the shared optional video decoder).
 
-    These tests drive ``is_video_file``, which decodes references via OpenCV
-    (the same optional dep the multimodal video path uses). CI installs
+    These tests drive the serve's in-memory reference classification/decode
+    (``is_decodable_image_bytes`` / ``decode_video_frames_from_bytes``), which decodes
+    via OpenCV (the same optional dep the multimodal video path uses). CI installs
     ``opencv-python-headless`` in every test stage (``jenkins/L0_Test.groovy``),
     so these tests always run there; the skip only spares bare local
     environments, where cv2 stays optional (kept out of requirements by the

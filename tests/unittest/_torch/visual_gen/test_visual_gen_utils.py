@@ -412,15 +412,15 @@ class TestInputReferenceMaterialization:
 class TestMediaBytesProbes:
     """The in-memory probe/decode primitives the serve boundary runs on."""
 
-    def test_is_image_bytes(self):
-        from tensorrt_llm.inputs.media_io import is_image_bytes
+    def test_is_decodable_image_bytes(self):
+        from tensorrt_llm.inputs.media_io import is_decodable_image_bytes
 
         buf = BytesIO()
         Image.new("RGB", (4, 4), (1, 2, 3)).save(buf, format="PNG")
-        assert is_image_bytes(buf.getvalue())
-        assert not is_image_bytes(b"definitely not an image")
+        assert is_decodable_image_bytes(buf.getvalue())
+        assert not is_decodable_image_bytes(b"definitely not an image")
         # Video bytes are not an image (mp4 has no PIL-openable header).
-        assert not is_image_bytes(TestInputReferenceMaterialization._mp4_bytes())
+        assert not is_decodable_image_bytes(TestInputReferenceMaterialization._mp4_bytes())
 
     def test_decode_video_frames_from_bytes(self):
         pytest.importorskip("cv2")
