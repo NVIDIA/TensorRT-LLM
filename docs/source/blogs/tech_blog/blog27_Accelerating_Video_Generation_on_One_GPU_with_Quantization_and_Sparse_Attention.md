@@ -41,7 +41,7 @@ compiled dense BF16 baseline. Skip Softmax uses `target_sparsity=0.65` and
 - [Quality and the dense-family anchor](#quality-and-the-dense-family-anchor)
 - [Choosing an operating point](#choosing-an-operating-point)
 - [Configuration](#configuration)
-- [Limitations](#limitations)
+- [Scope of the results](#scope-of-the-results)
 - [Conclusion](#conclusion)
 - [References](#references)
 
@@ -104,8 +104,8 @@ The sweep used the following controlled setup:
 | Output | 1280×720, 81 frames at 16 FPS, 50 denoising steps |
 | Guidance | 5.0 / 4.0, maximum text sequence length 512 |
 | Prompts | Seven prompts, one fixed seed each |
-| Runtime | TensorRT-LLM 1.3.0rc19 at `e1135bbdfa` plus [TensorRT-LLM PR #15318](https://github.com/NVIDIA/TensorRT-LLM/pull/15318) |
-| Checkpoint | ModelOpt 0.45.0.dev89 export using the VisualGen calibration schema from [ModelOpt PR #1816](https://github.com/NVIDIA/Model-Optimizer/pull/1816) |
+| Runtime | TensorRT-LLM release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc19` |
+| Checkpoint | ModelOpt 0.45.0.dev89 calibrated export with Skip Softmax metadata |
 | Compilation | `torch.compile` enabled, CUDA graphs disabled; timed after compilation warmup |
 
 The grid was
@@ -132,9 +132,10 @@ has mean LPIPS 0.118 against eager BF16, so the absolute LPIPS values include co
 
 ## Where the BF16 baseline time goes
 
-Profiling the compiled dense BF16 pipeline shows where the optimization opportunity is
-concentrated. Attention accounts for nearly three quarters of end-to-end latency, while GEMMs
-account for roughly one fifth.
+An Nsight Systems profile of a representative compiled dense BF16 run using the TensorRT-LLM
+release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21` shows where the optimization
+opportunity is concentrated. Attention accounts for nearly three quarters of end-to-end latency,
+while GEMMs account for roughly one fifth.
 
 | Work | Share of pipeline time |
 | :--- | ---: |
@@ -254,26 +255,21 @@ trtllm-serve <calibrated_wan_checkpoint> \
     --visual_gen_args single_gpu_nvfp4_sage_skip.yaml
 ```
 
-The checkpoint must contain the calibration formula that maps `target_sparsity` to
-`threshold_scale_factor`. Without that metadata, set a calibrated `threshold_scale_factor`
-directly instead. See the [VisualGen sparse-attention guide](../../visual-gen/features/sparse-attention.md)
-for the checkpoint schema and Python API. To test FP8, change `quant_algo` to
-`FP8_BLOCK_SCALES`; to test BF16, omit `quant_config`.
+The checkpoint must contain the component-specific calibration formulas that map
+`target_sparsity` to `threshold_scale_factor`. See the
+[VisualGen sparse-attention guide](../../visual-gen/features/sparse-attention.md) for the
+checkpoint schema and Python API. To test FP8, change `quant_algo` to `FP8_BLOCK_SCALES`; to test
+BF16, omit `quant_config`.
 
-## Limitations
+## Scope of the results
 
-- The sweep covers one model, one B200, seven prompts, and one seed per prompt. It does not prove
-  the same operating point for other models, resolutions, schedulers, or GPUs.
-- LPIPS measures distance from one eager BF16 realization. It does not measure prompt adherence,
-  motion quality, temporal consistency, or human preference.
-- There are no repeated runs, confidence intervals, or latency percentiles. Small LPIPS and
-  latency differences should not be treated as statistically significant.
-- `target_sparsity` is a calibrated request. The experiment did not report achieved sparsity per
-  layer or denoising step.
-- Dynamic quantization and compiled BF16 both introduce reference drift. Absolute LPIPS values
-  should not be compared across builds; within-build family anchors are the valid comparison.
-- The component breakdown comes from a representative single-prompt profile. Workload mix may
-  vary across prompts and configurations.
+These results cover Wan 2.2 T2V-A14B at 1280×720 with 81 frames, 50 denoising steps, seven fixed
+prompt-and-seed pairs, and one B200 per request. Performance and the preferred sparsity schedule
+may differ for other models, resolutions, schedulers, prompts, and GPUs.
+
+LPIPS measures framewise distance from the eager BF16 reference; it does not evaluate prompt
+adherence, motion, temporal consistency, or human preference. Each prompt was generated once, and
+the component breakdown comes from one representative BF16 prompt.
 
 ## Conclusion
 
