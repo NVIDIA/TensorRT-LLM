@@ -13,9 +13,10 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueIt
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     MultimodalEncoderProgress,
-    get_multimodal_encoder_progress,
+    MultimodalEncoderRequestState,
     get_multimodal_encoder_token_lengths,
     initialize_multimodal_encoder_request,
+    is_multimodal_encoder_ready,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
@@ -44,7 +45,7 @@ class _CapacityScheduler:
 
 class _RejectMultimodalCapacityScheduler:
     def schedule_request(self, requests):
-        fitting = [request for request in requests if not request.py_is_multimodal_encoder_request]
+        fitting = [request for request in requests if request.py_mm_encoder_state is None]
         return fitting, [], []
 
 
@@ -89,7 +90,7 @@ def _request(request_id, costs, *, ready=()):
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
     for item_idx in ready:
-        request.py_mm_encoder_outputs[item_idx] = torch.empty(1)
+        request.py_mm_encoder_state.outputs[item_idx] = torch.empty(1)
     return request
 
 
@@ -103,19 +104,23 @@ def test_mm_encoder_token_lengths_distinguishes_missing_and_invalid_data():
         get_multimodal_encoder_token_lengths(request)
 
 
-def test_mm_encoder_progress_is_derived_from_request_local_outputs():
+def test_mm_encoder_readiness_is_derived_from_request_local_outputs():
     request = _request(1, [4, 4])
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.PENDING
+    assert request.py_mm_encoder_state.progress is MultimodalEncoderProgress.PENDING
+    assert not is_multimodal_encoder_ready(request)
 
-    request.py_mm_encoder_outputs[0] = torch.empty(1)
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.PARTIAL
+    request.py_mm_encoder_state.outputs[0] = torch.empty(1)
+    assert request.py_mm_encoder_state.progress is MultimodalEncoderProgress.PARTIAL
+    assert not is_multimodal_encoder_ready(request)
 
-    request.py_mm_encoder_outputs[1] = torch.empty(1)
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+    request.py_mm_encoder_state.outputs[1] = torch.empty(1)
+    assert is_multimodal_encoder_ready(request)
 
-    request.py_mm_encoder_outputs = [None, None]
-    request.py_multimodal_data["multimodal_embedding"] = torch.empty(2, 1)
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+    # A precomputed-embedding request never gets item state in the first
+    # place (initialize skips it), and post-prefill strip drops the state:
+    # both report ready through the state-absence branch.
+    request.py_mm_encoder_state = None
+    assert is_multimodal_encoder_ready(request)
 
 
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
@@ -237,8 +242,7 @@ def _waiting_item(request_id, costs=None):
 
 
 def test_mm_admission_does_not_charge_ready_active_request():
-    active = _request(1, [8])
-    active.py_multimodal_data["multimodal_embedding"] = torch.empty(1, 1)
+    active = _request(1, [8], ready=(0,))
     waiting = FCFSWaitingQueue([_waiting_item(2, [8])])
     executor = _executor_for_mm_admission([active])
 
@@ -375,21 +379,21 @@ def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatc
         },
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=8)
-    assert request.py_mm_encoder_output_offsets == [0, 2, 5]
+    assert request.py_mm_encoder_state.output_offsets == [0, 2, 5]
 
     engine.forward_multimodal_encoder_items([request], {1: [0]})
 
-    output_buffer = request.py_mm_encoder_output_buffer
+    output_buffer = request.py_mm_encoder_state.output_buffer
     assert output_buffer.shape == (5, 2)
-    assert request.py_mm_encoder_outputs[0].data_ptr() == output_buffer.data_ptr()
-    assert request.py_mm_encoder_outputs[1] is None
+    assert request.py_mm_encoder_state.outputs[0].data_ptr() == output_buffer.data_ptr()
+    assert request.py_mm_encoder_state.outputs[1] is None
     assert "image" in request.py_multimodal_data
 
     engine.forward_multimodal_encoder_items([request], {1: [1]})
 
     assert request.py_multimodal_data["multimodal_embedding"] is output_buffer
     assert (
-        request.py_mm_encoder_outputs[1].untyped_storage().data_ptr()
+        request.py_mm_encoder_state.outputs[1].untyped_storage().data_ptr()
         == output_buffer.untyped_storage().data_ptr()
     )
     assert output_buffer.tolist() == [[2.0, 2.0], [2.0, 2.0], [3.0, 3.0], [3.0, 3.0], [3.0, 3.0]]
@@ -540,10 +544,10 @@ def test_item_encode_writes_independent_cache_entries(monkeypatch):
     key0, key1 = MultimodalModelMixin.build_encoder_cache_item_keys(
         [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
     )
-    assert torch.equal(cache.get(key0), request.py_mm_encoder_outputs[0])
-    assert torch.equal(cache.get(key1), request.py_mm_encoder_outputs[1])
+    assert torch.equal(cache.get(key0), request.py_mm_encoder_state.outputs[0])
+    assert torch.equal(cache.get(key1), request.py_mm_encoder_state.outputs[1])
     # Entries are clones: they must not alias the request's shared buffer.
-    buffer_storage_ptr = request.py_mm_encoder_output_buffer.untyped_storage().data_ptr()
+    buffer_storage_ptr = request.py_mm_encoder_state.output_buffer.untyped_storage().data_ptr()
     assert cache.get(key0).untyped_storage().data_ptr() != buffer_storage_ptr
     assert cache.get(key1).untyped_storage().data_ptr() != buffer_storage_ptr
 
@@ -565,8 +569,11 @@ def test_sweep_completes_duplicate_request_without_encoding_or_budget(monkeypatc
     executor._attach_mm_encoder_cache_hits()
 
     assert engine.model.encoded_item_counts == [2]  # no further encoding
-    assert get_multimodal_encoder_progress(second) is MultimodalEncoderProgress.READY
-    assert second.py_multimodal_data["multimodal_embedding"] is second.py_mm_encoder_output_buffer
+    assert is_multimodal_encoder_ready(second)
+    assert (
+        second.py_multimodal_data["multimodal_embedding"]
+        is second.py_mm_encoder_state.output_buffer
+    )
     assert "image" not in second.py_multimodal_data
 
     scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=8, max_num_tokens=1 << 20)
@@ -587,7 +594,7 @@ def test_partial_hit_routes_to_item_path_and_schedules_only_misses(monkeypatch):
     executor = _sweep_executor(engine, [request])
     executor._attach_mm_encoder_cache_hits()
 
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.PARTIAL
+    assert request.py_mm_encoder_state.progress is MultimodalEncoderProgress.PARTIAL
 
     # A PARTIAL request must take the item path even though the whole batch
     # would fit the budgets, and only the miss is scheduled.
@@ -597,7 +604,7 @@ def test_partial_hit_routes_to_item_path_and_schedules_only_misses(monkeypatch):
 
     engine.forward_multimodal_encoder_items([request], {1: [1]})
     assert engine.model.encoded_item_counts == [1]
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+    assert is_multimodal_encoder_ready(request)
 
 
 def test_eviction_after_commit_does_not_regress_progress(monkeypatch):
@@ -608,7 +615,7 @@ def test_eviction_after_commit_does_not_regress_progress(monkeypatch):
 
     cache.clear()
 
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+    assert is_multimodal_encoder_ready(request)
     assert request.py_multimodal_data["multimodal_embedding"].shape == (2, 2)
 
 
@@ -634,4 +641,53 @@ def test_cache_context_guards_disable_cache_per_request(case, monkeypatch):
 
     # The request still runs the item path exactly as without a cache.
     engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
-    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+    assert is_multimodal_encoder_ready(request)
+
+
+# ---------------------------------------------------------------------------
+# MultimodalEncoderRequestState unit behavior
+# ---------------------------------------------------------------------------
+
+
+def test_mm_encoder_state_enforces_offsets_slot_invariant():
+    with pytest.raises(ValueError, match="one more entry"):
+        MultimodalEncoderRequestState(output_offsets=[0, 2], outputs=[None, None])
+
+
+def test_mm_encoder_state_progress_and_pending_transitions():
+    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
+
+    assert state.progress is MultimodalEncoderProgress.PENDING
+    assert state.pending_item_indices() == [0, 1]
+
+    state.fill(1, torch.ones(3, 2))
+    assert state.progress is MultimodalEncoderProgress.PARTIAL
+    assert state.pending_item_indices() == [0]
+
+    state.fill(0, torch.zeros(2, 2))
+    assert state.progress is MultimodalEncoderProgress.READY
+    assert state.output_buffer.tolist() == [[0, 0], [0, 0], [1, 1], [1, 1], [1, 1]]
+
+
+def test_mm_encoder_state_fill_rejects_mismatched_outputs():
+    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
+
+    with pytest.raises(ValueError, match="expected 2"):
+        state.fill(0, torch.ones(5, 2))
+
+    state.fill(0, torch.ones(2, 2))
+    with pytest.raises(ValueError, match="matching"):
+        state.fill(1, torch.ones(3, 4))  # hidden dim mismatch vs buffer
+
+
+def test_mm_encoder_state_finalize_into_is_a_conditional_no_op():
+    state = MultimodalEncoderRequestState.from_embedding_lengths([2])
+    multimodal_data = {"image": {"pixel_values": torch.empty(2, 1)}}
+
+    assert state.finalize_into(multimodal_data) is False
+    assert "multimodal_embedding" not in multimodal_data
+
+    state.fill(0, torch.ones(2, 2))
+    assert state.finalize_into(multimodal_data) is True
+    assert multimodal_data["multimodal_embedding"] is state.output_buffer
+    assert "image" not in multimodal_data
