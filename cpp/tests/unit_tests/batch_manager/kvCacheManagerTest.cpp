@@ -8360,6 +8360,47 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalContextTokenAfterReuse)
     EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
 }
 
+TEST_F(KVCacheManagerTest, AddSequenceBatchPreservesGuidanceAndContextLogitsAfterReuse)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr promptLen = 9;
+    auto constexpr reusableLen = promptLen - 1;
+    auto constexpr beamWidth = 1;
+    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+
+    auto seedReq = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{0}, SizeType32{1}, inputTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch({{{0, promptLen, beamWidth}}}, {std::ref(*seedReq)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedReq);
+    (void) mgr->removeSequence(0, seedReq);
+
+    tle::OutputConfig outputConfig;
+    outputConfig.returnContextLogits = true;
+    auto const guidedParams = tle::GuidedDecodingParams(tle::GuidedDecodingParams::GuideType::kREGEX, R"([0-9]+)");
+    tle::Request executorRequest(
+        *inputTokens, /*maxTokens=*/1, /*streaming=*/false, tle::SamplingConfig{}, outputConfig);
+    executorRequest.setGuidedDecodingParams(guidedParams);
+    auto req = std::make_shared<LlmRequest>(LlmRequest::RequestIdType{1}, executorRequest);
+    auto const semanticState = req->getState();
+    auto const semanticType = req->getLlmRequestType();
+
+    mgr->addSequenceBatch({{{1, promptLen, beamWidth}}}, {std::ref(*req)});
+
+    EXPECT_EQ(req->getContextCurrentPosition(), reusableLen);
+    EXPECT_EQ(req->getContextRemainingLength(), 1);
+    EXPECT_EQ(req->getContextChunkSize(), 1);
+    EXPECT_TRUE(req->getReturnContextLogits());
+    ASSERT_TRUE(req->getGuidedDecodingParams().has_value());
+    EXPECT_EQ(req->getGuidedDecodingParams().value(), guidedParams);
+    EXPECT_EQ(req->getState(), semanticState);
+    EXPECT_EQ(req->getLlmRequestType(), semanticType);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(1, req)));
+}
+
 TEST_F(KVCacheManagerTest, AddSequenceBatchOnboardsOffloadedPrefixForFinalContextToken)
 {
     auto const stream = std::make_shared<tr::CudaStream>();

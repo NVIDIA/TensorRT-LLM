@@ -342,7 +342,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             ("disaggregated", "py_disaggregated_params", object()),
             ("multimodal", "py_multimodal_data", {}),
             ("multimodal_event", "py_mm_encoder_event", object()),
-            ("context_logits", "py_return_context_logits", True),
         )
         for name, attribute, value in cases:
             with self.subTest(name=name):
@@ -357,6 +356,20 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 self.assertIs(graph_batch, batch)
                 self.assertFalse(promoted_ids)
 
+    def test_context_logits_use_final_token_graph_candidate(self) -> None:
+        context = _make_request_stub(1)
+        context.py_return_context_logits = True
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [context]
+
+        graph_batch, promoted_ids = _make_single_token_context_graph_batch(
+            batch)
+
+        self.assertIsNot(graph_batch, batch)
+        self.assertEqual(graph_batch.generation_requests, [context])
+        self.assertEqual(promoted_ids, frozenset({context.py_request_id}))
+
+    def test_generation_only_request_in_context_list_falls_back(self) -> None:
         context = _make_request_stub(1)
         context.is_generation_only_request = lambda: True
         batch = ScheduledRequests()
@@ -649,6 +662,31 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine._execute_logit_post_processors.assert_called_once_with(
             batch, outputs)
 
+    def test_forward_allows_guided_context_logits_on_graph_hit(self) -> None:
+        key = (1, 0, False, False, True)
+        engine, runner, resource_manager, _, outputs = \
+            _make_forward_only_engine(key)
+        engine.guided_decoder = Mock()
+        context = _make_request_stub(1)
+        context.py_return_context_logits = True
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [context]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                return_value=Mock()):
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            gather_context_logits=True)
+
+        self.assertIs(actual_outputs, outputs)
+        graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
+        self.assertEqual(graph_batch.generation_requests, [context])
+        prepare_args = engine._prepare_inputs.call_args.args
+        self.assertIs(prepare_args[0], graph_batch)
+        self.assertEqual(prepare_args[-1], frozenset({context.py_request_id}))
+        runner.replay.assert_called_once_with(key, {"prepared": True})
+
     def test_multimodal_graph_miss_preserves_semantic_payload(self) -> None:
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(None)
         engine.model.config = SimpleNamespace(vocab_size=100)
@@ -700,9 +738,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         cases = (
             "graphs_disabled",
             "speculative",
-            "guided",
             "beam",
-            "context_logits",
             "encoder_decoder",
             "encode_only",
             "mm_encoder_only",
@@ -717,12 +753,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     runner.enabled = False
                 elif case == "speculative":
                     engine.enable_spec_decode = True
-                elif case == "guided":
-                    engine.guided_decoder = object()
                 elif case == "beam":
                     engine.max_beam_width = 2
-                elif case == "context_logits":
-                    gather_context_logits = True
                 elif case == "encoder_decoder":
                     engine._is_encoder_decoder_model.return_value = True
                 elif case == "encode_only":

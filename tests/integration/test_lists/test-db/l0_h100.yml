@@ -232,6 +232,9 @@ l0_h100:
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_openai_chat_guided_decoding[meta-llama/Llama-3.1-8B-Instruct]
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_context_logits_after_final_token_reuse
+  - kv_cache/test_final_single_token_context_cuda_graph.py::test_guided_decoding_after_final_token_reuse
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[guaranteed-chunked]

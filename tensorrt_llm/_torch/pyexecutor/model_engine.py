@@ -118,8 +118,7 @@ def _make_single_token_context_graph_batch(
                 or request.py_mm_encoder_event is not None
                 or (request.py_multimodal_data is not None and
                     (is_multimodal_decode_compatible is None
-                     or not is_multimodal_decode_compatible(request)))
-                or request.py_return_context_logits):
+                     or not is_multimodal_decode_compatible(request)))):
             return scheduled_requests, frozenset()
 
     for request in scheduled_requests.generation_requests:
@@ -5455,16 +5454,15 @@ class PyTorchModelEngine(ModelEngine):
 
         graph_requests = scheduled_requests
         promoted_context_request_ids: frozenset[int] = frozenset()
-        # TODO: Generalize these conservative gates as speculative, guided,
-        # beam, context-logit, context-parallel, and remaining multimodal
-        # placeholder providers for decoder-only LLMs gain support for promoted
-        # final-context rows. Each relaxation must preserve whole-batch fallback
-        # on graph miss and prove parity with the provider's native q_len=1
-        # path. Encoder-decoder and non-LLM engines remain out of scope.
+        # TODO: Generalize these conservative gates as speculative, beam,
+        # context-parallel, and remaining multimodal placeholder providers for
+        # decoder-only LLMs gain support for promoted final-context rows. Each
+        # relaxation must preserve whole-batch fallback on graph miss and prove
+        # parity with the provider's native q_len=1 path. Encoder-decoder and
+        # non-LLM engines remain out of scope.
         if (scheduled_requests.num_context_requests > 0
                 and self.cuda_graph_runner.enabled
-                and not self.enable_spec_decode and self.guided_decoder is None
-                and not self.use_beam_search and not gather_context_logits
+                and not self.enable_spec_decode and not self.use_beam_search
                 and not self._is_encoder_decoder_model()
                 and not self._is_encode_only
                 and not self.llm_args.mm_encoder_only
