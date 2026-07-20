@@ -240,7 +240,7 @@ def test_dsv4_ob_tuning_input_hook_restores_packed_scale_layout() -> None:
         torch.empty((m, packed_k), dtype=torch.int32),
         torch.empty((n, k), dtype=torch.float8_e4m3fn),
         torch.empty((n, packed_k), dtype=torch.int32),
-        torch.empty((2, m, n), dtype=torch.bfloat16),
+        torch.empty((2 * m, n), dtype=torch.bfloat16),
     ]
 
     prepared = cute_dsl_custom_ops._prepare_dsv4_ob_tuning_inputs(inputs)
@@ -258,7 +258,7 @@ def _check_dsv4_oa_fp8out_tensor_contract() -> None:
     b = torch.empty((batch_size, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     a_sf = torch.empty((batch_size, sf_k, sf_m), device="cuda", dtype=torch.float32)
     b_sf = torch.empty((batch_size, sf_n, sf_k), device="cuda", dtype=torch.float32)
-    output = torch.empty((m, batch_size, n), device="cuda", dtype=torch.float8_e4m3fn)
+    output = torch.empty((m, batch_size * n), device="cuda", dtype=torch.float8_e4m3fn)
     sf_padded = torch.empty_strided(
         (sf_m, packed_sf_n), (1, sf_m), device="cuda", dtype=torch.int32
     )
@@ -276,8 +276,8 @@ def _check_dsv4_oa_fp8out_tensor_contract() -> None:
     noncontiguous_a = torch.empty((batch_size, m, k + 1), device="cuda", dtype=torch.float8_e4m3fn)[
         ..., :k
     ]
-    overlapping_output = torch.empty((m, 1, n), device="cuda", dtype=torch.float8_e4m3fn).expand(
-        -1, batch_size, -1
+    overlapping_output = torch.empty((m, 1), device="cuda", dtype=torch.float8_e4m3fn).expand(
+        -1, batch_size * n
     )
     bad_sf_storage = torch.empty(sf_m * 2, device="cuda", dtype=torch.int32)
     bad_sf_shape = torch.as_strided(bad_sf_storage, (m, 2), (1, sf_m))
@@ -308,7 +308,7 @@ def test_dsv4_oa_fp8out_clears_packed_scale_padding(m: int) -> None:
     b = torch.zeros((batch_size, n, k), device="cuda", dtype=torch.float8_e4m3fn)
     a_sf = torch.ones((batch_size, 1, sf_m), device="cuda")
     b_sf = torch.ones((batch_size, 1, 1), device="cuda")
-    output = torch.empty((m, batch_size, n), device="cuda", dtype=torch.float8_e4m3fn)
+    output = torch.empty((m, batch_size * n), device="cuda", dtype=torch.float8_e4m3fn)
     sf_padded = torch.empty_strided((sf_m, 1), (1, sf_m), device="cuda", dtype=torch.int32).fill_(
         0x7F7F7F7F
     )
