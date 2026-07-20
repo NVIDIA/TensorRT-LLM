@@ -77,6 +77,7 @@ l0_h100:
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_transfer_quiescence.py
+  - unittest/disaggregated/test_transceiver_bounded_polling.py
   - unittest/disaggregated/test_async_consensus.py
   # Launches a four-rank CPU protocol exercise with mpirun. This belongs in
   # the MPI-enabled single-GPU stage; it does not require four physical GPUs.
