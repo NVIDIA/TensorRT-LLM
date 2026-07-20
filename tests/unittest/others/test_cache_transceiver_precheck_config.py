@@ -294,3 +294,47 @@ def test_model_kv_shape_vocab_size(tmp_path):
         )
     )
     assert pcfg.model_kv_shape(str(model_dir))["vocab_size"] == 129280
+
+
+class TestRendezvousStaleness:
+    """wait_for_addr must skip addr files stamped by a previous run."""
+
+    def _rp(self):
+        import run_precheck as rp
+
+        return rp
+
+    def test_same_job_accepted(self, tmp_path, monkeypatch):
+        rp = self._rp()
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
+        rp.write_addr(p, {"host": "h", "port": 1, "key": "aa"})
+        got = rp.wait_for_addr(p, timeout_s=2)
+        assert got["job"] == "12345" and got["port"] == 1
+
+    def test_stale_job_skipped_until_timeout(self, tmp_path, monkeypatch):
+        rp = self._rp()
+        monkeypatch.setenv("SLURM_JOB_ID", "11111")
+        p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
+        rp.write_addr(p, {"host": "h", "port": 1, "key": "aa"})  # stamped 11111
+        monkeypatch.setenv("SLURM_JOB_ID", "22222")  # new run
+        with pytest.raises(rp._Timeout):
+            rp.wait_for_addr(p, timeout_s=2)
+
+    def test_no_job_id_accepts_any(self, tmp_path, monkeypatch):
+        rp = self._rp()
+        monkeypatch.setenv("SLURM_JOB_ID", "11111")
+        p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
+        rp.write_addr(p, {"host": "h", "port": 1, "key": "aa"})
+        monkeypatch.delenv("SLURM_JOB_ID")  # manual non-slurm run
+        assert rp.wait_for_addr(p, timeout_s=2)["port"] == 1
+
+    def test_write_addr_replaces_stale_file(self, tmp_path, monkeypatch):
+        rp = self._rp()
+        monkeypatch.setenv("SLURM_JOB_ID", "11111")
+        p = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
+        rp.write_addr(p, {"host": "old", "port": 1, "key": "aa"})
+        monkeypatch.setenv("SLURM_JOB_ID", "22222")
+        rp.write_addr(p, {"host": "new", "port": 2, "key": "bb"})
+        got = rp.wait_for_addr(p, timeout_s=2)
+        assert got["host"] == "new" and got["job"] == "22222"

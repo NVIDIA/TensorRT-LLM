@@ -106,6 +106,13 @@ run_cache_transceiver_precheck() {
     echo "Starting cache transceiver precheck..."
     precheckDir="$testOutputDir/cache_transceiver_precheck"
     mkdir -p "$precheckDir/logs"
+    # A reused work dir (Slurm requeue reruns this batch script with the same
+    # directories) may hold a previous run's rendezvous/status files: stale
+    # addr files would point gen leaders at dead ports, and stale status
+    # files would pollute the verdict aggregation below. The driver also
+    # job-id-stamps addr files as a second line of defense.
+    rm -f "$precheckDir"/rendezvous/*.addr "$precheckDir"/status/*.status \
+        "$precheckDir"/status/*.json 2>/dev/null || true
     precheckPids=()
     precheckNames=()
     local i gen_world_size ctx_world_size
