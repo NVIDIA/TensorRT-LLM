@@ -38,6 +38,26 @@ def test_adopt_takes_ownership_without_clone():
     assert manager.held_bytes == 4 * ROW_BYTES
 
 
+def test_adopt_materializes_views_of_shared_storage():
+    # Grouped encoder forwards split one batch tensor into per-item views;
+    # storing the views directly would let a surviving sibling entry keep
+    # the whole batch allocation resident after another entry is evicted,
+    # decoupling accounted bytes from physical memory.
+    manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
+    batch = torch.full((4, 2), 1.0, dtype=torch.float32)
+    view_a, view_b = torch.split(batch, 2, dim=0)
+
+    stored_a = manager.adopt("a", view_a, request_id=1)
+    stored_b = manager.adopt("b", view_b, request_id=2)
+
+    batch_ptr = batch.untyped_storage().data_ptr()
+    assert stored_a.untyped_storage().data_ptr() != batch_ptr
+    assert stored_b.untyped_storage().data_ptr() != batch_ptr
+    assert stored_a.untyped_storage().data_ptr() != stored_b.untyped_storage().data_ptr()
+    # Accounted bytes equal each entry's exclusive storage.
+    assert manager.current_bytes == 4 * ROW_BYTES
+
+
 def test_duplicate_adopt_collapses_to_one_entry():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
     first = manager.adopt("k", _tensor(4), request_id=1)

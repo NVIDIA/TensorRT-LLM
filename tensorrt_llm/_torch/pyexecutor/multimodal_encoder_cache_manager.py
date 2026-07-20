@@ -78,7 +78,9 @@ class MultimodalEncoderCacheManager(BaseResourceManager, Generic[K]):
       zero-reference entries relies on that contract and raises if it cannot
       make room.
     - **Adopt, not copy.** `adopt()` takes ownership of the caller's tensor
-      without cloning. If the key already exists, the existing entry is
+      without cloning when it exclusively owns its storage; views into a
+      larger allocation are materialized so accounted bytes always equal
+      physical residency. If the key already exists, the existing entry is
       held and returned instead — concurrent duplicate encodes of the same
       content collapse to one resident copy.
     - **Zero-ref residency.** Entries whose last hold was released stay
@@ -168,7 +170,14 @@ class MultimodalEncoderCacheManager(BaseResourceManager, Generic[K]):
             return entry.value
 
     def adopt(self, key: K, value: torch.Tensor, request_id: RequestId) -> torch.Tensor:
-        """Store `value` (taking ownership, no clone) held for `request_id`.
+        """Store `value` (taking ownership) held for `request_id`.
+
+        Tensors that exclusively own their storage are stored without a
+        copy. Views into a larger backing allocation (e.g. `torch.split`
+        outputs of a grouped encoder forward) are materialized first:
+        entries from one batch would otherwise share storage, so evicting
+        one while a sibling survives frees accounted bytes without freeing
+        physical memory, breaking the budget's residency guarantee.
 
         If `key` is already resident the existing tensor is held and
         returned and `value` is dropped. Evicts zero-reference entries as
@@ -176,6 +185,8 @@ class MultimodalEncoderCacheManager(BaseResourceManager, Generic[K]):
         must have passed `can_allocate()` first (allocate-before-compute).
         """
         size_bytes = value.numel() * value.element_size()
+        if value.untyped_storage().nbytes() != size_bytes:
+            value = value.clone()
 
         with self._lock:
             existing = self._entries.get(key)
