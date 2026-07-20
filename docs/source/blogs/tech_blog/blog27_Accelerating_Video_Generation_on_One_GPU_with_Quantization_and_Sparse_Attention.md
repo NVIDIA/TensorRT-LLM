@@ -4,14 +4,14 @@ By NVIDIA TensorRT-LLM Team
 
 ## Abstract
 
-Our [previous post](blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)
+Our [earlier post](blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)
 scaled video generation from one NVIDIA B200 GPU to a GB200 NVL72 rack. This post addresses the
 complementary problem: reducing the work on each GPU before scaling out.
 
 We combine three composable optimizations in TensorRT-LLM VisualGen:
 
 - **FP8 block-scaled or NVFP4 GEMMs** reduce linear-layer cost.
-- **SAGE attention** dynamically quantizes Q and K to INT8 and V to FP8 inside the attention kernel.
+- **SAGE attention** dynamically quantizes Q and K to INT8 and V to FP8 in the attention path.
 - **Skip Softmax Attention** skips softmax and value accumulation for attention blocks whose scores
   fall below a dynamic threshold.
 
@@ -19,10 +19,9 @@ We evaluated 96 configurations on Wan 2.2 T2V-A14B, generating 81-frame 1280×72
 denoising steps on one B200. Against a compiled dense BF16 baseline of **525.0 seconds**, the
 NVFP4 + SAGE + conservative Skip Softmax configuration completed in **374.9 seconds (1.40×)**.
 Its mean LPIPS distance to eager BF16 was **0.504**, compared with **0.506** for its own dense
-NVFP4 + SAGE anchor. The fastest measured point reached **348.0 seconds (1.51×)**, but with a
-larger reference distance. The distinction matters: Skip Softmax added little measured distance on
-top of the quantized anchor, but quantization itself had already moved the result away from eager
-BF16.
+NVFP4 + SAGE anchor. The fastest point reached **348.0 seconds (1.51×)** at mean LPIPS **0.523**.
+Across the sweep, most of the distance from eager BF16 came from the quantized dense anchor, while
+conservative Skip Softmax added only a small incremental change.
 
 <p align="center">
   <img src="../media/tech_blog27_single_gpu_latency.png" alt="Grouped bar chart showing single-B200 end-to-end latency for BF16, FP8 block-scaled, and NVFP4 GEMMs with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
@@ -56,8 +55,8 @@ sequence. One request therefore exposes three different sources of work:
 | SAGE attention | QK and PV computation inside attention | INT8 Q/K, FP8 V, block sizes 1/16/1 |
 | Skip Softmax Attention | Softmax and PV work for dynamically rejected score blocks | Calibrated target sparsity and timestep cutoff |
 
-These layers target different kernels. They can be enabled independently, and their end-to-end
-gains must be measured together rather than multiplied from isolated kernel speedups.
+These layers target different kernels and can be enabled independently. Because they affect
+different parts of the pipeline, their combined benefit is evaluated end to end.
 
 ### FP8 block-scaled and NVFP4 GEMMs
 
@@ -83,15 +82,15 @@ accumulation. It requires no static sparsity pattern.
 
 VisualGen exposes two controls:
 
-- `target_sparsity` is a request to a calibrated checkpoint, not a guarantee of achieved kernel
-  sparsity. Checkpoint metadata maps it to the kernel threshold.
+- `target_sparsity` selects a calibrated operating point. Checkpoint metadata maps it to the kernel
+  threshold, and achieved skip rate can vary by layer and timestep.
 - `disabled_until_timestep` keeps early, high-timestep denoising dense. Denoising proceeds from a
   normalized timestep near 1 toward 0; Skip Softmax is enabled only after the timestep falls below
   the cutoff. A lower cutoff leaves a longer dense prefix. `0` disables skipping and `1` is the
   most aggressive setting.
 
-The schedule is essential. The sweep shows that applying the same threshold from the start can
-change BF16 output substantially for a modest additional latency gain.
+The timestep schedule matters: applying the same threshold from the start produced a larger BF16
+output change for only a modest additional latency gain.
 
 ## Benchmark design
 
@@ -117,8 +116,8 @@ The grid was
 × disabled_until_timestep {0.86, 0.90, 0.94, 0.97, 1.00}
 ```
 
-This gives 90 Skip Softmax variants plus six skip-off family anchors. The seven prompts ran in
-parallel on separate B200 GPUs to complete the sweep, but every measured request used one GPU.
+The sweep contains 90 Skip Softmax variants and six skip-off family anchors. Each request ran on
+one B200, with the seven prompts evaluated in parallel.
 
 Latency is the CUDA-synchronized full pipeline forward, averaged over seven prompts. Speedup uses
 the **compiled, skip-off BF16** anchor of 525.011 seconds. Quality uses LPIPS with an AlexNet
@@ -126,9 +125,10 @@ backbone: first average over all 81 frames of each clip, then over all seven pro
 candidate is compared with the same **eager, skip-off BF16** video generated from the same prompt
 and seed.
 
-The two baselines serve different purposes. Compiled BF16 isolates performance changes among
-compiled candidates. Eager BF16 supplies a fixed image-space reference. Even compiled dense BF16
-has mean LPIPS 0.118 against eager BF16, so the absolute LPIPS values include compilation drift.
+Latency and quality use different anchors: compiled BF16 isolates performance changes among
+compiled candidates, while eager BF16 supplies the image-space reference. Compiled dense BF16 has
+mean LPIPS 0.118 against eager BF16, so incremental Skip Softmax effects are best read relative to
+the matching dense precision-family anchor.
 
 ## Where the BF16 baseline time goes
 
@@ -147,9 +147,8 @@ Attention includes TensorRT-LLM FMHA and cuDNN SDPA kernels. GEMM includes linea
 multiplications. The remaining category includes normalization, RoPE, activations, scheduler and
 VAE work, memory operations, and host or GPU-idle time.
 
-This distribution explains why the optimizations compose asymmetrically. SAGE and Skip Softmax
-target the largest component, while FP8 block-scaled and NVFP4 GEMMs target another substantial
-part of the pipeline. Work outside attention and GEMM limits the total end-to-end speedup.
+Attention-focused optimizations address the largest share, low-precision GEMMs target the next
+largest, and the remaining pipeline work bounds the total end-to-end speedup.
 
 ## End-to-end results
 
@@ -171,8 +170,7 @@ Several effects are visible:
   1.11× with NVFP4.
 - SAGE adds an observed 1.08×, 1.09×, and 1.15× within the BF16, FP8, and NVFP4 dense families.
 - Conservative Skip Softmax adds 1.05–1.09× within the three SAGE families.
-- The full NVFP4 + SAGE + Skip Softmax stack reaches 1.40×. This is a measured end-to-end result,
-  not a product of the individual ratios.
+- Together, NVFP4, SAGE, and conservative Skip Softmax reach 1.40× end-to-end speedup.
 
 ## Quality and the dense-family anchor
 
@@ -186,13 +184,10 @@ GEMM and attention combination.</em></sub></p>
 
 The dense anchors separate the effect of quantization from the incremental effect of skipping.
 Mean LPIPS is 0.118 for compiled BF16, 0.425 for FP8 block scaling, and 0.504 for NVFP4. With SAGE,
-the corresponding anchors are 0.256, 0.397, and 0.506. These are reference distances, not direct
-human-preference scores.
+the corresponding anchors are 0.256, 0.397, and 0.506.
 
-At the conservative 0.65/0.86 point, Skip Softmax changes mean LPIPS by only **-0.003 to +0.005**
-for the four FP8 and NVFP4 families. The negative values do not establish a quality improvement;
-there were no repeated generations to estimate variance. They show only that the measured
-increment is small relative to each quantized family's dense anchor.
+At the conservative 0.65/0.86 point, Skip Softmax changes mean LPIPS by **-0.003 to +0.005** across
+the four FP8 and NVFP4 families, a small shift relative to their dense-family anchors.
 
 BF16 exposes the scheduling cost more clearly. At fixed `target_sparsity=0.65`, its mean LPIPS
 rises from **0.141 at cutoff 0.86** to **0.443 at cutoff 1.0**, while speedup moves only from 1.08×
@@ -202,7 +197,7 @@ before increasing target sparsity.
 
 ## Choosing an operating point
 
-The sweep suggests three starting points, each with a different contract:
+The sweep suggests three starting points for different speed-quality priorities:
 
 | Goal | Configuration | Latency | Speedup | Mean LPIPS vs eager BF16 |
 | :--- | :--- | ---: | ---: | ---: |
@@ -210,9 +205,8 @@ The sweep suggests three starting points, each with a different contract:
 | Preserve the NVFP4 + SAGE anchor | NVFP4 + SAGE, Skip 0.65/0.86 | 374.9s | 1.40× | 0.504 (dense anchor 0.506) |
 | Maximum measured speed | NVFP4 + SAGE, Skip 0.75/1.00 | 348.0s | 1.51× | 0.523 (dense anchor 0.506) |
 
-The second and third rows preserve proximity to the **quantized family anchor**, not to eager BF16.
-A deployment should first accept its dense quantized output, then tune Skip Softmax against that
-anchor on prompts representative of the application.
+For quantized configurations, compare Skip Softmax with the matching dense quantized anchor.
+Validate that anchor on application-representative prompts before tuning sparsity.
 
 ## Configuration
 
@@ -275,10 +269,10 @@ the component breakdown comes from one representative BF16 prompt.
 
 Single-GPU video generation has more than one optimization axis. Low-precision GEMMs reduce linear
 work, SAGE lowers attention precision, and Skip Softmax removes dynamically unimportant attention
-work. On Wan 2.2 T2V-A14B, the conservative combination reduces end-to-end latency from 525.0 to
-374.9 seconds, a measured 1.40× speedup, without a measured LPIPS increase relative to its dense
-NVFP4 + SAGE anchor in this sweep. The fastest point reaches 1.51×, but it should be treated as a
-different quality operating point.
+work. On Wan 2.2 T2V-A14B, NVFP4, SAGE, and conservative Skip Softmax reduce end-to-end latency
+from 525.0 to 374.9 seconds (1.40×), while mean LPIPS versus eager BF16 changes from 0.506 for the
+dense NVFP4 + SAGE anchor to 0.504. The fastest tested point reaches 348.0 seconds (1.51×) at mean
+LPIPS 0.523.
 
 The practical rule is simple: select and validate the dense precision family first, add SAGE, then
 tune Skip Softmax from a conservative timestep cutoff. These optimizations reduce the work on each

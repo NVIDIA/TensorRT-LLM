@@ -59,10 +59,10 @@
 
 - [x] Replace the six-item `Limitations` checklist with a short audience-facing
   scope statement.
-- [ ] Remove repeated reviewer-facing defenses around family anchors,
+- [x] Remove repeated reviewer-facing defenses around family anchors,
   end-to-end measurement, single-GPU attribution, and the interpretation of
   small LPIPS deltas.
-- [ ] Change “previous post” to “earlier post” and describe SAGE quantization
+- [x] Change “previous post” to “earlier post” and describe SAGE quantization
   as occurring in the attention path rather than necessarily inside one
   kernel.
 - [x] State the RC21 provenance of the representative profile in one concise
