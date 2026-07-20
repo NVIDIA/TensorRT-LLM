@@ -1,0 +1,326 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The fused settle-and-pack kernel must reproduce the original two-kernel
+sequence byte for byte.
+
+The original tie settlement and move-source packing kernels stay in the
+module as the reference here: every case launches them on one set of buffers
+and the fused kernel on an identically initialized set, then requires
+``torch.equal`` on the kept ordinals, the dense move sources, and the SWA
+move sources -- including the buffer regions neither path overwrites (rows
+shorter than the keep count leave stale entries behind, and the packing
+forwards those stale entries the same way in both paths).
+"""
+
+import pytest
+import torch
+from conftest import encode_block_offsets as _encode_block_offsets
+
+from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
+    BatchedKVCacheCompaction,
+)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+    _BatchedUnionKeepSetSelector,
+)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    _pack_compaction_sources_kernel,
+    _settle_ties_after_topk_kernel,
+    _settle_ties_and_pack_compaction_sources_kernel,
+)
+
+_BLOCK = 256
+_NUM_WARPS = 4
+
+
+def _selection_rows_for(eviction_mode: str, num_layers: int, num_kv_heads: int) -> int:
+    if eviction_mode == "union":
+        return 1
+    if eviction_mode == "per_head":
+        return num_kv_heads
+    return num_layers * num_kv_heads
+
+
+def _staged_offsets(counts, device):
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    return torch.tensor(offsets, dtype=torch.int32, device=device)
+
+
+@pytest.mark.parametrize("has_swa", [False, True])
+@pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
+@pytest.mark.parametrize(
+    "width,keep_count",
+    [
+        # Small and ragged: rows shorter than the keep count, empty rows.
+        (21, 5),
+        # More than one 256-lane block along both the settle and move axes.
+        (350, 300),
+    ],
+)
+def test_fused_settle_pack_matches_two_kernel_sequence(eviction_mode, has_swa, width, keep_count):
+    device = torch.device("cuda", torch.cuda.current_device())
+    request_count, num_layers, num_kv_heads = 3, 2, 2
+    union = eviction_mode == "union"
+    per_layer = eviction_mode == "per_layer_perhead"
+    selection_rows = _selection_rows_for(eviction_mode, num_layers, num_kv_heads)
+    rows_total = request_count * selection_rows
+    packed_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
+
+    # Move geometry: the last request is a padded row that moves nothing.
+    protected_tails = [2, 0, 0]
+    tail_capacity = max(protected_tails)
+    dense_counts = [keep_count + protected_tails[0], keep_count + protected_tails[1], 0]
+    swa_window = 6
+    swa_counts = [swa_window + protected_tails[0], swa_window + protected_tails[1], 0]
+    move_capacity = keep_count + tail_capacity
+    if has_swa:
+        move_capacity = max(move_capacity, swa_window + tail_capacity)
+    dense_total = request_count * (keep_count + tail_capacity)
+    swa_total = request_count * (swa_window + tail_capacity)
+    valid_seq_lens = torch.tensor([10, 8, 0], dtype=torch.int32, device=device)
+    dense_offsets = _staged_offsets(dense_counts, device)
+    swa_offsets = _staged_offsets(swa_counts, device)
+
+    for seed in range(5):
+        generator = torch.Generator(device=device).manual_seed(seed)
+        # Heavily tied integer scores force the tie-quota emission path.
+        scores = torch.randint(
+            -2, 3, (rows_total, width), generator=generator, dtype=torch.int32, device=device
+        ).to(torch.float32)
+        # Ragged rows: empty, shorter than the keep count (stale output
+        # entries survive), and full width.
+        row_lengths = torch.tensor(
+            [[0, keep_count - 2, width - 4, width][row % 4] for row in range(rows_total)],
+            dtype=torch.int32,
+            device=device,
+        )
+        row_prompt_offsets = torch.tensor(
+            [3 * (row % 3) for row in range(rows_total)], dtype=torch.int32, device=device
+        )
+        # Stand-in for the CuTE top-k: in-range indices covering the top
+        # scores of each row with arbitrary tie breaking.
+        masked = scores.clone()
+        for row in range(rows_total):
+            masked[row, int(row_lengths[row]) :] = float("-inf")
+        provisional = torch.topk(masked, keep_count, dim=1).indices.to(torch.int32).contiguous()
+
+        # Identical stale garbage on both sides so untouched regions must
+        # match too.
+        output_stale = torch.randint(
+            -(2**30), 2**30, (rows_total, keep_count), dtype=torch.int32, device=device
+        )
+        dense_stale = torch.randint(
+            -(2**30), 2**30, (packed_rows, dense_total), dtype=torch.int32, device=device
+        )
+        swa_stale = torch.randint(
+            -(2**30), 2**30, (num_kv_heads, swa_total), dtype=torch.int32, device=device
+        )
+
+        output_reference = output_stale.clone()
+        dense_reference = dense_stale.clone()
+        swa_reference = swa_stale.clone()
+        _settle_ties_after_topk_kernel[(rows_total,)](
+            scores,
+            row_lengths,
+            row_prompt_offsets,
+            provisional,
+            output_reference,
+            WIDTH=width,
+            KEEP_COUNT=keep_count,
+            OUTPUT_WIDTH=keep_count,
+            BLOCK=_BLOCK,
+            num_warps=_NUM_WARPS,
+        )
+        swa_offsets_arg = swa_offsets if has_swa else dense_offsets
+        swa_reference_arg = swa_reference if has_swa else dense_reference
+        _pack_compaction_sources_kernel[
+            (request_count, packed_rows, (move_capacity + _BLOCK - 1) // _BLOCK)
+        ](
+            output_reference,
+            valid_seq_lens,
+            dense_offsets,
+            dense_reference,
+            swa_offsets_arg,
+            swa_reference_arg,
+            DENSE_TOTAL=dense_total,
+            SWA_TOTAL=swa_total if has_swa else 0,
+            SELECTION_ROWS=selection_rows,
+            SELECTION_STRIDE=keep_count,
+            KEEP_COUNT=keep_count,
+            NUM_KV_HEADS=num_kv_heads,
+            SWA_WINDOW=swa_window if has_swa else 0,
+            UNION=union,
+            PER_LAYER=per_layer,
+            HAS_SWA=has_swa,
+            BLOCK=_BLOCK,
+            num_warps=_NUM_WARPS,
+        )
+
+        output_fused = output_stale.clone()
+        dense_fused = dense_stale.clone()
+        swa_fused = swa_stale.clone()
+        swa_fused_arg = swa_fused if has_swa else dense_fused
+        _settle_ties_and_pack_compaction_sources_kernel[(request_count, selection_rows)](
+            scores,
+            row_lengths,
+            row_prompt_offsets,
+            provisional,
+            output_fused,
+            valid_seq_lens,
+            dense_offsets,
+            dense_fused,
+            swa_offsets_arg,
+            swa_fused_arg,
+            WIDTH=width,
+            KEEP_COUNT=keep_count,
+            OUTPUT_WIDTH=keep_count,
+            SELECTION_ROWS=selection_rows,
+            DENSE_TOTAL=dense_total,
+            SWA_TOTAL=swa_total if has_swa else 0,
+            MOVE_CAPACITY=move_capacity,
+            NUM_KV_HEADS=num_kv_heads,
+            SWA_WINDOW=swa_window if has_swa else 0,
+            UNION=union,
+            PER_LAYER=per_layer,
+            HAS_SWA=has_swa,
+            HAS_PACK=True,
+            BLOCK=_BLOCK,
+            num_warps=_NUM_WARPS,
+        )
+        torch.cuda.synchronize(device)
+
+        assert torch.equal(output_fused, output_reference), f"kept ordinals differ (seed {seed})"
+        assert torch.equal(dense_fused, dense_reference), f"dense moves differ (seed {seed})"
+        assert torch.equal(swa_fused, swa_reference), f"SWA moves differ (seed {seed})"
+
+
+def test_fused_kernel_without_pack_matches_standalone_settle():
+    """``HAS_PACK=False`` must leave exactly the standalone settle kernel."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows_total, width, keep_count = 6, 33, 7
+    generator = torch.Generator(device=device).manual_seed(11)
+    scores = torch.randint(
+        -2, 3, (rows_total, width), generator=generator, dtype=torch.int32, device=device
+    ).to(torch.float32)
+    row_lengths = torch.tensor([0, 3, 9, 17, 33, 33], dtype=torch.int32, device=device)
+    row_prompt_offsets = torch.tensor([5, 0, 2, 0, 1, 4], dtype=torch.int32, device=device)
+    masked = scores.clone()
+    for row in range(rows_total):
+        masked[row, int(row_lengths[row]) :] = float("-inf")
+    provisional = torch.topk(masked, keep_count, dim=1).indices.to(torch.int32).contiguous()
+    output_stale = torch.randint(
+        -(2**30), 2**30, (rows_total, keep_count), dtype=torch.int32, device=device
+    )
+
+    output_reference = output_stale.clone()
+    _settle_ties_after_topk_kernel[(rows_total,)](
+        scores,
+        row_lengths,
+        row_prompt_offsets,
+        provisional,
+        output_reference,
+        WIDTH=width,
+        KEEP_COUNT=keep_count,
+        OUTPUT_WIDTH=keep_count,
+        BLOCK=_BLOCK,
+        num_warps=_NUM_WARPS,
+    )
+
+    output_fused = output_stale.clone()
+    placeholder = row_lengths
+    _settle_ties_and_pack_compaction_sources_kernel[(rows_total, 1)](
+        scores,
+        row_lengths,
+        row_prompt_offsets,
+        provisional,
+        output_fused,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        WIDTH=width,
+        KEEP_COUNT=keep_count,
+        OUTPUT_WIDTH=keep_count,
+        SELECTION_ROWS=1,
+        DENSE_TOTAL=0,
+        SWA_TOTAL=0,
+        MOVE_CAPACITY=0,
+        NUM_KV_HEADS=1,
+        SWA_WINDOW=0,
+        UNION=False,
+        PER_LAYER=False,
+        HAS_SWA=False,
+        HAS_PACK=False,
+        BLOCK=_BLOCK,
+        num_warps=_NUM_WARPS,
+    )
+    torch.cuda.synchronize(device)
+
+    assert torch.equal(output_fused, output_reference)
+
+
+def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buffers():
+    """The handoff exports the live move buffers, drops the compaction-time
+    dense pack launch, and the selector only accepts a packing that reads its
+    own keep buffer."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    request_count, num_kv_heads, keep_count, width = 2, 2, 4, 16
+    tokens_per_block, head_dim = 4, 8
+    pools = [
+        torch.zeros(6, 2, num_kv_heads, tokens_per_block, head_dim, device=device) for _ in range(2)
+    ]
+    page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
+
+    selector = _BatchedUnionKeepSetSelector(
+        rows=3,
+        width=width,
+        keep_count=keep_count,
+        dtype=torch.float32,
+        device=device,
+        max_requests=request_count,
+        input_scores=torch.zeros(request_count, 3, width, device=device),
+        normalize_scores=False,
+    )
+
+    def build_compaction(kept_token_ordinals):
+        return BatchedKVCacheCompaction(
+            eviction_mode="union",
+            layer_pools=pools,
+            dense_layers=[0, 1],
+            swa_layers=[],
+            layer_group_representative={0: 0, 1: 1},
+            layer_pool_keys=[("dense", 0), ("dense", 0)],
+            kept_token_ordinals=kept_token_ordinals,
+            valid_sequence_lengths=torch.full(
+                (request_count,), 10, dtype=torch.int32, device=device
+            ),
+            kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
+            page_table_slots={0: 0, 1: 0},
+            request_count=request_count,
+            prompt_offsets=torch.zeros(request_count, dtype=torch.int32, device=device),
+            decode_keep_count=keep_count,
+            swa_window=None,
+            protected_tail_capacity=1,
+        )
+
+    compaction = build_compaction(selector.keep)
+    assert compaction.target_dense_compaction.move_index_pack is not None
+
+    pack_arguments = compaction.hand_move_source_pack_to_selection()
+    assert compaction.target_dense_compaction.move_index_pack is None
+    assert len(compaction.cache_compactions) == 1
+    assert compaction.cache_compactions[0] is compaction.target_dense_compaction
+    assert pack_arguments.dense_indices is compaction.target_dense_compaction.move_source_indices
+    assert pack_arguments.dense_offsets is compaction.target_dense_compaction.move_source_offsets
+
+    selector.fuse_move_source_pack(pack_arguments)
+    assert selector._move_source_pack is pack_arguments
+
+    # A packing built over any other keep buffer must be rejected: the fused
+    # kernel reads back the ordinals it just wrote.
+    foreign = build_compaction(torch.zeros_like(selector.keep))
+    with pytest.raises(ValueError, match="keep buffer"):
+        selector.fuse_move_source_pack(foreign.hand_move_source_pack_to_selection())

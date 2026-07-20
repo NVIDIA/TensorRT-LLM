@@ -989,7 +989,12 @@ def _settle_ties_after_topk_kernel(
     OUTPUT_WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Resolve boundary ties and emit increasing physical token indices."""
+    """Resolve boundary ties and emit increasing physical token indices.
+
+    The production selectors launch the fused settle-and-pack kernel below;
+    this standalone version is kept as the reference the unit tests compare
+    the fused kernel against.
+    """
     row = tl.program_id(0)
     row_scores = scores + row * WIDTH
     row_selected = provisional_indices + row * KEEP_COUNT
@@ -1123,3 +1128,178 @@ def _pack_compaction_sources_kernel(
             swa_source,
             mask=write_swa & (move < swa_count),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Fused finalize: settle the top-k ties and pack the move indices in one      #
+# launch (fusion suggested by Fanrong Li, torch-graph review 2026-07-20).     #
+# --------------------------------------------------------------------------- #
+
+
+@triton.jit
+def _settle_ties_and_pack_compaction_sources_kernel(
+    scores,
+    seq_lens,
+    prompt_offsets,
+    provisional_indices,
+    output_indices,
+    valid_seq_lens,
+    dense_offsets,
+    dense_indices,
+    swa_offsets,
+    swa_indices,
+    WIDTH: tl.constexpr,
+    KEEP_COUNT: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    SELECTION_ROWS: tl.constexpr,
+    DENSE_TOTAL: tl.constexpr,
+    SWA_TOTAL: tl.constexpr,
+    MOVE_CAPACITY: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    SWA_WINDOW: tl.constexpr,
+    UNION: tl.constexpr,
+    PER_LAYER: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+    HAS_PACK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Settle one selection row's ties, then pack its compaction move sources.
+
+    One program per (request, selection row). The first half repeats
+    ``_settle_ties_after_topk_kernel`` verbatim: recover the top-k threshold
+    from the provisional selection, count the strictly greater scores, then
+    emit the kept ordinals in increasing order, rebased by the row's pinned
+    prompt length. With ``HAS_PACK`` the same program then continues with the
+    ``_pack_compaction_sources_kernel`` work for the packed rows this
+    selection row feeds: the kept ordinals it just wrote, followed by the
+    request's protected tail, plus the SWA rows (latest window) under the
+    same conditions as the standalone kernel. Union selection has one row per
+    request feeding every KV head's packed row, so that single program writes
+    all of them. ``HAS_PACK=False`` compiles the second half away, leaving
+    exactly the standalone settle. Fusing the two launches was suggested by
+    Fanrong Li (torch-graph review 2026-07-20).
+    """
+    request = tl.program_id(0)
+    selection_domain = tl.program_id(1)
+    row = request * SELECTION_ROWS + selection_domain
+    row_scores = scores + row * WIDTH
+    row_selected = provisional_indices + row * KEEP_COUNT
+    row_output = output_indices + row * OUTPUT_WIDTH
+    # Scores are decode-relative; this row's pinned prompt length rebases the
+    # emitted ordinals to absolute positions (per row, so one launch may mix
+    # prompt lengths).
+    prompt_len = tl.load(prompt_offsets + row)
+
+    threshold = float("inf")
+    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
+        selected_offset = start + tl.arange(0, BLOCK)
+        selected_mask = selected_offset < KEEP_COUNT
+        token_index = tl.load(
+            row_selected + selected_offset,
+            mask=selected_mask,
+            other=0,
+        )
+        selected_score = tl.load(
+            row_scores + token_index,
+            mask=selected_mask,
+            other=float("inf"),
+        ).to(tl.float32)
+        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
+
+    seq_len = tl.load(seq_lens + row)
+    greater_count = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
+
+    tie_quota = KEEP_COUNT - greater_count
+    output_count = 0
+    ties_seen = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater = valid & (score > threshold)
+        tied = valid & (score == threshold)
+        tied_i32 = tied.to(tl.int32)
+        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
+        selected = greater | (tied & (tie_rank < tie_quota))
+        selected_i32 = selected.to(tl.int32)
+        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
+        tl.store(
+            row_output + write_offset,
+            token_index + prompt_len,
+            mask=selected,
+        )
+        output_count += tl.sum(selected_i32)
+        ties_seen += tl.sum(tied_i32)
+
+    if HAS_PACK:
+        # The emission above scatters through other lanes of this program;
+        # make those global stores visible to every lane before the pack
+        # half reads the row back.
+        tl.debug_barrier()
+        dense_begin = tl.load(dense_offsets + request)
+        dense_end = tl.load(dense_offsets + request + 1)
+        dense_count = dense_end - dense_begin
+        valid_len = tl.load(valid_seq_lens + request)
+        if HAS_SWA:
+            swa_begin = tl.load(swa_offsets + request)
+            swa_end = tl.load(swa_offsets + request + 1)
+            swa_count = swa_end - swa_begin
+        for move_start in tl.static_range(0, MOVE_CAPACITY, BLOCK):
+            move = move_start + tl.arange(0, BLOCK)
+            selected = tl.load(
+                row_output + move,
+                mask=move < KEEP_COUNT,
+                other=0,
+            )
+            dense_source = tl.where(move < KEEP_COUNT, selected, valid_len + move - KEEP_COUNT)
+            if UNION:
+                # The one union row per request feeds every KV head's packed
+                # row with the same move sources.
+                for head in tl.static_range(0, NUM_KV_HEADS):
+                    tl.store(
+                        dense_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
+                        dense_source,
+                        mask=move < dense_count,
+                    )
+            else:
+                domain = tl.program_id(1)
+                dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
+                tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
+            if HAS_SWA:
+                swa_source = valid_len - SWA_WINDOW + move
+                if UNION:
+                    for head in tl.static_range(0, NUM_KV_HEADS):
+                        tl.store(
+                            swa_indices + head * SWA_TOTAL + swa_begin.to(tl.int64) + move,
+                            swa_source,
+                            mask=move < swa_count,
+                        )
+                else:
+                    domain = tl.program_id(1)
+                    # Per-layer selection has one dense domain per (layer,
+                    # head). SWA uses one shared source row per head, so only
+                    # the first layer writes it.
+                    if PER_LAYER:
+                        write_swa = domain < NUM_KV_HEADS
+                    else:
+                        write_swa = move >= 0
+                    head = domain % NUM_KV_HEADS
+                    swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
+                    tl.store(
+                        swa_indices + swa_output,
+                        swa_source,
+                        mask=write_swa & (move < swa_count),
+                    )

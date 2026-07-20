@@ -21,7 +21,9 @@ Triton launch per compacted cache (one launch covers the target's dense and
 SWA families; a co-compressed draft adds a second) and then moves the
 surviving KV in place with batched C++ compact launches. Inputs are plain
 tensors, so any eviction method that produces a kept-token set per request
-can drive it.
+can drive it. A driver that finalizes the keep set in its own GPU launch can
+take the target's dense/SWA packing over into that launch instead (see
+``hand_move_source_pack_to_selection``); the draft always packs here.
 """
 
 from collections import OrderedDict
@@ -220,6 +222,38 @@ _PACK_BLOCK_TOKENS = 256
 _PACK_NUM_WARPS = 4
 
 
+class _MoveSourcePackArguments(NamedTuple):
+    """One cache family's move-index packing, described as plain launch data.
+
+    The selection-side fused settle-and-pack launch (design suggested by
+    Fanrong Li, torch-graph review 2026-07-20) consumes this to pack the
+    dense/SWA move sources in the same kernel that finalizes the kept
+    ordinals, instead of a second launch at compaction time.
+    """
+
+    kept_token_ordinals: torch.Tensor
+    valid_sequence_lengths: torch.Tensor
+    dense_offsets: torch.Tensor
+    dense_indices: torch.Tensor
+    # With no SWA family these alias the dense tensors and ``has_swa``
+    # specializes every SWA load and store away.
+    swa_offsets: torch.Tensor
+    swa_indices: torch.Tensor
+    dense_total: int
+    swa_total: int
+    selection_rows: int
+    keep_count: int
+    request_count: int
+    num_kv_heads: int
+    swa_window: int
+    # Widest per-request move count any staged offsets may express; the
+    # packing loop covers exactly this many move slots per packed row.
+    move_capacity: int
+    union: bool
+    per_layer: bool
+    has_swa: bool
+
+
 def _move_index_pack_launcher(
     kept_token_ordinals: torch.Tensor,
     valid_sequence_lengths: torch.Tensor,
@@ -234,13 +268,15 @@ def _move_index_pack_launcher(
     swa_window: int,
     swa_move_source_offsets: Optional[torch.Tensor],
     swa_move_source_indices: Optional[torch.Tensor],
-) -> Callable[[], None]:
+) -> Tuple[Callable[[], None], _MoveSourcePackArguments]:
     """Build one launch of the move-index packing kernel.
 
     The kernel reads the kept-token ordinals and each request's valid length
     and writes the packed per-(layer, head) move source indices consumed by
     the C++ compact launches. Only the caller-provided selection tensors are
-    validated here; the move buffers are allocated by this module.
+    validated here; the move buffers are allocated by this module. The
+    returned arguments bundle describes the same packing so a fused
+    selection-side launch can take it over.
     """
     per_layer = eviction_mode == "per_layer_perhead"
     union = eviction_mode == "union"
@@ -282,6 +318,25 @@ def _move_index_pack_launcher(
     max_move = decode_keep_count + max_protected_tail
     if swa_total:
         max_move = max(max_move, swa_window + max_protected_tail)
+    pack_arguments = _MoveSourcePackArguments(
+        kept_token_ordinals=kept_token_ordinals,
+        valid_sequence_lengths=valid_sequence_lengths,
+        dense_offsets=move_source_offsets,
+        dense_indices=move_source_indices,
+        swa_offsets=swa_offsets_arg,
+        swa_indices=swa_indices_arg,
+        dense_total=int(move_source_indices.shape[-1]),
+        swa_total=swa_total,
+        selection_rows=selection_rows,
+        keep_count=decode_keep_count,
+        request_count=request_count,
+        num_kv_heads=num_kv_heads,
+        swa_window=swa_window,
+        move_capacity=max_move,
+        union=union,
+        per_layer=per_layer,
+        has_swa=swa_total > 0,
+    )
     packed_row_count = num_dense_layers * num_kv_heads if per_layer else num_kv_heads
     grid = (
         request_count,
@@ -298,16 +353,16 @@ def _move_index_pack_launcher(
     )
     # Ordered to match the kernel's constexpr parameter declaration.
     constexpr_values = dict(
-        DENSE_TOTAL=int(move_source_indices.shape[-1]),
-        SWA_TOTAL=swa_total,
-        SELECTION_ROWS=selection_rows,
-        SELECTION_STRIDE=decode_keep_count,
-        KEEP_COUNT=decode_keep_count,
-        NUM_KV_HEADS=num_kv_heads,
-        SWA_WINDOW=swa_window,
-        UNION=union,
-        PER_LAYER=per_layer,
-        HAS_SWA=swa_total > 0,
+        DENSE_TOTAL=pack_arguments.dense_total,
+        SWA_TOTAL=pack_arguments.swa_total,
+        SELECTION_ROWS=pack_arguments.selection_rows,
+        SELECTION_STRIDE=pack_arguments.keep_count,
+        KEEP_COUNT=pack_arguments.keep_count,
+        NUM_KV_HEADS=pack_arguments.num_kv_heads,
+        SWA_WINDOW=pack_arguments.swa_window,
+        UNION=pack_arguments.union,
+        PER_LAYER=pack_arguments.per_layer,
+        HAS_SWA=pack_arguments.has_swa,
         BLOCK=_PACK_BLOCK_TOKENS,
     )
 
@@ -318,7 +373,7 @@ def _move_index_pack_launcher(
             num_warps=_PACK_NUM_WARPS,
         )
 
-    return launch_pack
+    return launch_pack, pack_arguments
 
 
 class BatchedKVCacheCompaction:
@@ -482,7 +537,7 @@ class BatchedKVCacheCompaction:
         dense_slots = (
             {layer: slot for slot, layer in enumerate(self.dense_layers)} if per_layer else None
         )
-        dense_pack = _move_index_pack_launcher(
+        dense_pack, self._dense_pack_arguments = _move_index_pack_launcher(
             kept_token_ordinals,
             valid_sequence_lengths,
             dense_move_offsets,
@@ -541,6 +596,28 @@ class BatchedKVCacheCompaction:
             )
             if compaction is not None
         )
+
+    def hand_move_source_pack_to_selection(self) -> _MoveSourcePackArguments:
+        """Hand the dense/SWA move packing over to the selection launch.
+
+        Returns the packing description and drops this object's own dense
+        pack launch, so each round packs exactly once: the caller's fused
+        settle-and-pack kernel fills the move buffers when it finalizes the
+        kept ordinals, and ``compact`` then only runs the C++ moves. The
+        co-compressed draft keeps its own pack launch because it broadcasts
+        the finalized keep set over the draft's own KV-head layout.
+        """
+        self.target_dense_compaction = self.target_dense_compaction._replace(move_index_pack=None)
+        self.cache_compactions = tuple(
+            compaction
+            for compaction in (
+                self.target_dense_compaction,
+                self.target_swa_compaction,
+                self.draft_compaction,
+            )
+            if compaction is not None
+        )
+        return self._dense_pack_arguments
 
     def _build_draft_compaction(
         self,
@@ -607,7 +684,7 @@ class BatchedKVCacheCompaction:
         # packed row, so one more pack launch broadcasts the target keep
         # set over the draft KV heads and appends the draft's own tail
         # ordinals (valid_seq_len + 0..tail-1).
-        draft_pack = _move_index_pack_launcher(
+        draft_pack, _ = _move_index_pack_launcher(
             kept_token_ordinals,
             valid_sequence_lengths,
             draft_move_offsets,

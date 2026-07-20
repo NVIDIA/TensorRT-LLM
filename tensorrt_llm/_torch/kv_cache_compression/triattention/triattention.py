@@ -164,6 +164,9 @@ class _BatchedKeepSetSelectorBase:
         # cohort may mix prompt lengths. ``row_prompt_offsets`` is the
         # row-major expansion consumed by the finalizer.
         self.selection_rows_per_request = int(selection_rows_per_request)
+        # Optional compaction move packing fused into the settle launch; set
+        # once the compaction buffers exist (see ``fuse_move_source_pack``).
+        self._move_source_pack = None
         if prompt_offsets_buffer is not None:
             # Share the staging buffers' per-request prompt lengths so the
             # values are written once per round.
@@ -210,15 +213,41 @@ class _BatchedKeepSetSelectorBase:
         self._provisional_rows = provisional_indices
         self._keep_rows = keep_rows
 
+    def fuse_move_source_pack(self, pack_arguments) -> None:
+        """Pack compaction move sources inside this selector's settle launch.
+
+        ``pack_arguments`` is the dense/SWA packing description exported by
+        ``BatchedKVCacheCompaction.hand_move_source_pack_to_selection``
+        (fusion suggested by Fanrong Li, torch-graph review 2026-07-20). The
+        fused kernel reads back the kept ordinals it just wrote, so the
+        packing must read this selector's own keep buffer, and the packing
+        geometry must match the selection rows this selector settles.
+        """
+        if (
+            pack_arguments.kept_token_ordinals.data_ptr() != self._keep_rows.data_ptr()
+            or pack_arguments.kept_token_ordinals.numel() != self._keep_rows.numel()
+        ):
+            raise ValueError("fused move packing must read this selector's keep buffer")
+        if (
+            pack_arguments.selection_rows != self.selection_rows_per_request
+            or pack_arguments.keep_count != self.keep_count
+            or pack_arguments.request_count * self.selection_rows_per_request
+            != int(self._keep_rows.shape[0])
+        ):
+            raise ValueError("fused move packing does not match the selector geometry")
+        self._move_source_pack = pack_arguments
+
     def _select_top_tokens(self) -> None:
         """Pick the top-k with the CuTE selector, then settle its output.
 
         The CuTE top-k is fast but breaks score ties arbitrarily and emits
         indices in arbitrary order; the settle kernel recomputes the threshold
         membership with lowest-index-wins ties, rebases each row by its prompt
-        offset, and writes sorted ordinals.
+        offset, and writes sorted ordinals. When a compaction move packing is
+        fused in, the same launch also packs each request's dense/SWA move
+        source indices from the ordinals it just settled.
         """
-        from .triattention_kernels import _settle_ties_after_topk_kernel
+        from .triattention_kernels import _settle_ties_and_pack_compaction_sources_kernel
 
         rows = int(self._selection_scores_rows.shape[0])
         # The trailing 1 is next_n: decode scores one query token per request.
@@ -229,15 +258,56 @@ class _BatchedKeepSetSelectorBase:
             self.keep_count,
             1,
         )
-        _settle_ties_after_topk_kernel[(rows,)](
+        pack = self._move_source_pack
+        if pack is None:
+            # Settle only: the pack half is compiled away, so its tensor
+            # parameters are never read; any resident tensor stands in.
+            placeholder = self._selection_row_lengths
+            pack_tensors = (placeholder,) * 5
+            pack_shape = dict(
+                DENSE_TOTAL=0,
+                SWA_TOTAL=0,
+                MOVE_CAPACITY=0,
+                NUM_KV_HEADS=1,
+                SWA_WINDOW=0,
+                UNION=False,
+                PER_LAYER=False,
+                HAS_SWA=False,
+                HAS_PACK=False,
+            )
+        else:
+            pack_tensors = (
+                pack.valid_sequence_lengths,
+                pack.dense_offsets,
+                pack.dense_indices,
+                pack.swa_offsets,
+                pack.swa_indices,
+            )
+            pack_shape = dict(
+                DENSE_TOTAL=pack.dense_total,
+                SWA_TOTAL=pack.swa_total,
+                MOVE_CAPACITY=pack.move_capacity,
+                NUM_KV_HEADS=pack.num_kv_heads,
+                SWA_WINDOW=pack.swa_window,
+                UNION=pack.union,
+                PER_LAYER=pack.per_layer,
+                HAS_SWA=pack.has_swa,
+                HAS_PACK=True,
+            )
+        _settle_ties_and_pack_compaction_sources_kernel[
+            (rows // self.selection_rows_per_request, self.selection_rows_per_request)
+        ](
             self._selection_scores_rows,
             self._selection_row_lengths,
             self.row_prompt_offsets,
             self._provisional_rows,
             self._keep_rows,
+            *pack_tensors,
             WIDTH=self.width,
             KEEP_COUNT=self.keep_count,
             OUTPUT_WIDTH=self.keep_count,
+            SELECTION_ROWS=self.selection_rows_per_request,
+            **pack_shape,
             BLOCK=256,
             num_warps=4,
         )
@@ -1995,6 +2065,13 @@ class TriAttention(BaseKVCacheCompressionManager):
                 swa_move_offsets=score_staging.swa_move_offsets,
                 draft_move_offsets=score_staging.draft_move_offsets,
                 **draft_kwargs,
+            )
+            # One launch settles the kept ordinals and packs the dense/SWA
+            # move sources; the compaction keeps only its C++ moves (plus the
+            # draft's own pack). Both caches are invalidated together, so the
+            # fused packing always points at the live compaction buffers.
+            keep_set_selector.fuse_move_source_pack(
+                batched_compaction.hand_move_source_pack_to_selection()
             )
             self._batched_compaction = batched_compaction
         # Tails vary per round (in-flight growth), so the per-family move
