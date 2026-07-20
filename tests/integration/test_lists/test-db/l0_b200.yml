@@ -15,6 +15,7 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
@@ -22,6 +23,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=True-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_nvfp4_dflash
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
@@ -54,42 +57,12 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8_mmmu_encoder_cuda_graph]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-off-greedy-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-greedy-batch2-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-cuda-graph-off-greedy-batch2-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-small0]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-base]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-large]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-base]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-large]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-xl]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-flan-t5-xxl]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-beam2-t5-small1]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-off-beam2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v1-cuda-graph-off-beam2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-off-beam2-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v1-cuda-graph-off-beam2-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-off-greedy-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-off-greedy-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-off-greedy-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-off-greedy-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-byt5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-beam2-batch2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-beam2-batch2-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-cuda-graph-off-greedy-batch2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-cuda-graph-off-greedy-batch2-t5-small]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
   - test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
@@ -103,6 +76,7 @@ l0_b200:
   - unittest/_torch/compilation
   - unittest/_torch/debugger
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
+  - unittest/disaggregated/test_deepseek_v4_kv_transfer.py
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
   - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
@@ -120,6 +94,12 @@ l0_b200:
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
+  - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
+  - unittest/_torch/modules/test_fused_rmsnorm_fp4_quantize.py
+  - unittest/_torch/modules/test_fp4_num_tokens_slice.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
@@ -149,7 +129,11 @@ l0_b200:
   # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
-  - unittest/_torch/sampler
+  # test_speculative_d2h_parity_real_predictor (both no_stop_token and
+  # stop_token_15) is a HW-agnostic sampler D2H-parity invariant (plain CUDA
+  # stream/event, no SM gating), covered on A30 pre-merge; drop that whole
+  # function's leaves on Blackwell, keep the rest of the sampler dir.
+  - unittest/_torch/sampler -k "not test_speculative_d2h_parity_real_predictor"
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
@@ -159,9 +143,12 @@ l0_b200:
   - unittest/_torch/modeling/test_modeling_afmoe.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
+  - unittest/_torch/modeling/test_modeling_gemma4_unified.py
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[256]
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[512]
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
@@ -169,7 +156,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
-  - unittest/kv_cache_manager_v2_tests/
+  - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache V2 Scheduler IT ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited
@@ -212,6 +199,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
+  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_perf.py
@@ -229,6 +217,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
+  - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
+  - unittest/_torch/visual_gen/test_wan_vae.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache_user_coefficients.py
@@ -271,33 +261,8 @@ l0_b200:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-enable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-disable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8
-  - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
-  - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: triton
-  tests:
-  - triton_server/test_triton.py::test_llava[llava]
-  - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
-  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora]
+  - unittest/disaggregated/test_openai_server_info.py
 - condition:
     ranges:
       system_gpu_count:
@@ -353,6 +318,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4]
   # ------------- VisualGen single-GPU tests ---------------
@@ -362,11 +328,13 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
+  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
   - examples/visual_gen/test_visual_gen.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark

@@ -5,7 +5,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import zmq
 
@@ -13,7 +13,6 @@ from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -28,6 +27,7 @@ from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
+from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -38,7 +38,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -132,6 +132,20 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
+        # Return this rank's GPU memory to the driver. Under an external MPI
+        # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+        # shared across successive LLM instances: a new GenerationExecutorWorker
+        # is built for each LLM, but the OS process -- and with it the CUDA
+        # context and PyTorch caching allocator -- persists. Setting
+        # `self.engine = None` above is not enough to free the GPU: reference
+        # cycles keep the model tensors alive until a later GC, and the allocator
+        # holds freed blocks as "reserved" instead of returning them. Without
+        # this, the previous model's ~weights-sized reservation carries into the
+        # next LLM built in this process and can OOM its load (e.g. back-to-back
+        # tests in one CI shard).
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
@@ -139,11 +153,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def block_subordinates(self):
         if self.rank != 0:
-            if isinstance(self.engine, tllm.Executor):
-                self.shutdown()
-                raise self.WorkerExit(
-                    "block_subordinates() should be used in a `with GenerationExecutorWorker() as ...:` block"
-                )
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
@@ -151,7 +160,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -297,6 +306,8 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
+    worker_process_identities = mpi_comm().allgather(
+        capture_worker_process_identity(mpi_rank()))
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
@@ -337,7 +348,7 @@ def worker_main(
                     worker.set_result_queue(result_queue)
 
                 # Send ready signal with confirmation
-                ready_msg = (ready_signal, None)
+                ready_msg = (ready_signal, None, worker_process_identities)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"

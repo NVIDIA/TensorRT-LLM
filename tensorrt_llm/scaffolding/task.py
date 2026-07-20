@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
 
+import openai
 import torch
 
 from tensorrt_llm.executor.result import TokenLogprobs
 
 from .result import ScaffoldingOutput
+
+if TYPE_CHECKING:
+    from .trace_replay.execution_trace import TraceEvent
 
 
 @dataclass
@@ -49,7 +55,7 @@ class GenerationTask(Task):
     input_str: Optional[str] = None
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
-    #streaming: bool = False
+    # streaming: bool = False
 
     # sampling params for openai
     # Ordered by official OpenAI API documentation
@@ -61,6 +67,7 @@ class GenerationTask(Task):
     logit_bias: Optional[Dict[str, float]] = None
     num_logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
+    min_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = None
@@ -83,11 +90,39 @@ class GenerationTask(Task):
     output_str: Optional[str] = None
     output_tokens: Optional[List[int]] = None
     finish_reason: Optional[str] = None
+    llm_request_params: Optional[Dict[str, Any]] = None
     # TODO: support openai API format context logits
     context_logits: Optional[torch.Tensor] = None
     # TODO: don't not use TokenLogprobs for general support
     logprobs: Optional[TokenLogprobs] = None
     customized_result_fields: Dict[str, Any] = field(default_factory=dict)
+
+    # Per-request timing + usage captured by streaming OpenAI workers.
+    # ``ttft_s`` is the wall-time from request submission to the first
+    # server chunk carrying a token (prefill + first decode token + in-flight
+    # scheduler wait); ``latency_s`` is wall-time to the final chunk (full
+    # generation). ``usage_completion_tokens`` / ``usage_prompt_tokens`` come
+    # from the server's ``usage`` chunk (``stream_options.include_usage``)
+    # and are the authoritative per-request token counts — the
+    # ``/v1/completions`` endpoint does not stream ``token_ids`` when
+    # ``detokenize`` is on, so ``len(output_tokens)`` alone is unreliable.
+    # TPOT (tokens-per-output-token) is derived downstream as
+    # ``(latency_s - ttft_s) / (usage_completion_tokens - 1)``, matching
+    # SemiAnalysis's InferenceMAX ``intvty`` definition.
+    ttft_s: Optional[float] = None
+    latency_s: Optional[float] = None
+    usage_completion_tokens: Optional[int] = None
+    usage_prompt_tokens: Optional[int] = None
+
+    # Server-side request id captured from the OpenAI client's streaming
+    # chunks (every chunk's ``chunk.id`` field).  Trace-replay clients use
+    # this to look up the matching record in trtllm-serve's
+    # ``/perf_metrics`` drain and attach per-request KV-cache statistics
+    # (``num_reused_blocks`` / ``num_missed_blocks`` / ``free_num_blocks``)
+    # to the per-LLM-call row in the step JSON.  ``None`` until the worker
+    # observes the first chunk (or when not running against an
+    # OpenAI-compatible server, e.g. the in-process executor path).
+    request_id: Optional[str] = None
 
     @staticmethod
     def create_from_prompt(prompt: str) -> "GenerationTask":
@@ -98,7 +133,15 @@ class GenerationTask(Task):
         return task
 
     def create_scaffolding_output(self) -> ScaffoldingOutput:
-        return ScaffoldingOutput(self.output_str, self.output_tokens)
+        meta = None
+        # customized for running swebench
+        if self.customized_result_fields:
+            meta = {
+                key: self.customized_result_fields[key]
+                for key in ("swebench_model_patch", "swebench_summary")
+                if key in self.customized_result_fields
+            } or None
+        return ScaffoldingOutput(self.output_str, self.output_tokens, meta)
 
 
 @dataclass
@@ -112,7 +155,7 @@ class StreamGenerationTask(GenerationTask):
     # new tokens that have already been generated.
     streaming_step: Optional[int] = field(default=1)
 
-    #result field
+    # result field
     # worker set this field and identify the same task by this field
     request_handle: Any = field(default=None)
     # worker set this field to True when the generation is finished
@@ -139,7 +182,6 @@ class RewardTask(Task):
 class RoleMessage:
     role: Optional[str] = field(default=None)
     content: Optional[str] = field(default=None)
-    prefix: Optional[str] = field(default=None)
 
     def __str__(self) -> str:
         return json.dumps({
@@ -153,33 +195,39 @@ class RoleMessage:
     def to_dict(self) -> Dict[str, Any]:
         return {"role": self.role, "content": self.content}
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]):
-        return cls(role=data["role"], content=data["content"])
-
 
 @dataclass
 class UserMessage(RoleMessage):
 
-    def __init__(self, content: str, prefix: Optional[str] = None):
-        super().__init__(role="user", content=content, prefix=prefix)
+    def __init__(self, content: str):
+        super().__init__(role="user", content=content)
 
 
 @dataclass
 class AssistantMessage(RoleMessage):
     reasoning: Optional[str] = field(default=None)
     reasoning_content: Optional[str] = field(default=None)
-    tool_calls: Optional[List[Any]] = field(default=None)
+    tool_calls: Optional[List[
+        openai.types.chat.ChatCompletionMessageFunctionToolCall]] = field(
+            default=None)
+    # Set by the chat worker for the completion that produced this message;
+    # not sent in ``to_dict()`` (OpenAI message schema).
+    finish_reason: Optional[str] = field(default=None)
 
-    def __init__(self,
-                 content: str,
-                 reasoning: Optional[str] = None,
-                 reasoning_content: Optional[str] = None,
-                 tool_calls: Optional[List[Any]] = None):
+    def __init__(
+        self,
+        content: str,
+        reasoning: Optional[str] = None,
+        reasoning_content: Optional[str] = None,
+        tool_calls: Optional[List[
+            openai.types.chat.ChatCompletionMessageFunctionToolCall]] = None,
+        finish_reason: Optional[str] = None,
+    ):
         super().__init__(role="assistant", content=content)
         self.reasoning = reasoning
         self.reasoning_content = reasoning_content
         self.tool_calls = tool_calls
+        self.finish_reason = finish_reason
 
     def __str__(self) -> str:
         return json.dumps({
@@ -191,16 +239,76 @@ class AssistantMessage(RoleMessage):
             self.reasoning,
             "reasoning_content":
             self.reasoning_content,
-            "tool_calls": [str(tool) for tool in self.tool_calls]
+            "tool_calls": [{
+                "id": tool.id,
+                "type": "function",
+                "function": {
+                    "name": tool.function.name,
+                    "arguments": tool.function.arguments,
+                },
+            } for tool in self.tool_calls]
             if self.tool_calls is not None else None,
         })
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role":
+            "assistant",
+            "content":
+            self.content,
+            "tool_calls": [{
+                "id": tool.id,
+                "type": "function",
+                "function": {
+                    "name": tool.function.name,
+                    "arguments": tool.function.arguments,
+                },
+            } for tool in self.tool_calls]
+            if self.tool_calls is not None else None,
+        }
 
 
 @dataclass
 class SystemMessage(RoleMessage):
 
-    def __init__(self, content: str, prefix: Optional[str] = None):
-        super().__init__(role="system", content=content, prefix=prefix)
+    def __init__(self, content: str):
+        super().__init__(role="system", content=content)
+
+
+@dataclass
+class ToolMessage(RoleMessage):
+
+    def __init__(
+        self,
+        content: str,
+        tool_call_id: str,
+        *,
+        trace_stdout: Optional[str] = None,
+        trace_stderr: Optional[str] = None,
+    ):
+        super().__init__(role="tool", content=content)
+        self.tool_call_id = tool_call_id
+        self.trace_stdout = trace_stdout
+        self.trace_stderr = trace_stderr
+
+    def __str__(self) -> str:
+        return json.dumps({
+            "role": "tool",
+            "content": self.content,
+            "tool_call_id": self.tool_call_id,
+        })
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "role": "tool",
+            "content": self.content,
+            "tool_call_id": self.tool_call_id,
+        }
+        if self.trace_stdout is not None:
+            d["trace_stdout"] = self.trace_stdout
+        if self.trace_stderr is not None:
+            d["trace_stderr"] = self.trace_stderr
+        return d
 
 
 class ToolDescription:
@@ -259,10 +367,19 @@ class ChatTask(StreamGenerationTask):
     def add_messages(self, messages: list[RoleMessage]):
         self.messages.extend(messages)
 
+    def last_assistant_content(self) -> str:
+        """Return the latest assistant message content, or empty if none."""
+        for message in reversed(self.messages):
+            if isinstance(message, AssistantMessage):
+                return message.content or ""
+        return ""
+
     @staticmethod
-    def create_from_prompt(user_prompt: Optional[str],
-                           system_prompts: Optional[list[SystemMessage]] = None,
-                           tools: Optional[Any] = None) -> "ChatTask":
+    def create_from_prompt(
+        user_prompt: Optional[str],
+        system_prompts: Optional[list[SystemMessage]] = None,
+        tools: Optional[Any] = None,
+    ) -> "ChatTask":
         task = ChatTask()
         if system_prompts is not None:
             task.messages.extend(system_prompts)
@@ -283,16 +400,20 @@ class ChatTask(StreamGenerationTask):
 @dataclass
 class MCPCallTask(Task):
     # mcp inputs
+    tool_call_id: Optional[str] = field(default=None)
     tool_name: Optional[str] = field(default=None)
     args: Optional[dict] = field(default=None)
 
-    #result field
+    # result field
     result_str: Optional[str] = None
+    result_stdout: Optional[str] = None
+    result_stderr: Optional[str] = None
 
     @staticmethod
-    def create_mcptask(tool_name: str, args: dict,
+    def create_mcptask(tool_call_id: str, tool_name: str, args: dict,
                        worker_tag: str) -> "MCPCallTask":
         task = MCPCallTask()
+        task.tool_call_id = tool_call_id
         task.tool_name = tool_name
         task.args = args
         task.worker_tag = worker_tag
@@ -302,23 +423,23 @@ class MCPCallTask(Task):
 @dataclass
 class DropKVCacheTask(Task):
     messages_to_retain: list[RoleMessage] = field(default_factory=list)
-    partial_prefix: Optional[str] = field(
-        default=None)  # Currently unused since it's hard to tackle
     chat_task: ChatTask = field(default=None)
 
     def __init__(self, chat_task: ChatTask, worker_tag: str):
         self.worker_tag = worker_tag
 
         self.messages_to_retain = []
-        self.partial_prefix = None
         self.chat_task = chat_task
 
-        retain = True
-        for message in chat_task.messages:
-            if (message.role == "system" or message.role == "user") and retain:
-                if message.prefix is not None:
-                    self.messages_to_retain.append(message)
-                if message.prefix is None or len(message.prefix) < len(
-                        message.content):
-                    self.partial_prefix = message.prefix
-                    retain = False
+        self.messages_to_retain = [
+            message for message in chat_task.messages
+            if message.role in ("system", "user")
+        ]
+
+
+@dataclass
+class TokenizeTask(Task):
+    content: Optional[str] = None
+    event: Optional[TraceEvent] = None
+    token_count: Optional[int] = None
+    tokenize_error: Optional[str] = None

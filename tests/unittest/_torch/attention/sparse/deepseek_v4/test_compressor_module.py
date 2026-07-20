@@ -36,11 +36,15 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import 
     KVCacheDtype,
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+    DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
+    DeepseekV4Indexer,
+    DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
@@ -88,7 +92,9 @@ class DummyAttentionMetadata:
         num_ctx_tokens: int,
         num_tokens: int,
         kv_cache_manager: DeepseekV4CacheManager,
-        block_tables: dict,
+        sliding_block_tables: torch.Tensor,
+        compress_block_tables: Dict[int, torch.Tensor],
+        indexer_k_cache_block_offsets: torch.Tensor,
         cu_seq_lens: dict,
         cu_new_comp_kv: dict,
         compressed_position_ids: dict,
@@ -106,7 +112,9 @@ class DummyAttentionMetadata:
         self.num_ctx_tokens = num_ctx_tokens
         self.num_tokens = num_tokens
         self.kv_cache_manager = kv_cache_manager
-        self.block_tables = block_tables
+        self.sliding_block_tables = sliding_block_tables
+        self.compress_block_tables = compress_block_tables
+        self.indexer_k_cache_block_offsets = indexer_k_cache_block_offsets
         self.cu_seq_lens_cuda = cu_seq_lens
         self.cu_new_comp_kv_cuda = cu_new_comp_kv
         self.compressed_position_ids_cuda = compressed_position_ids
@@ -352,6 +360,93 @@ INDEX_HEAD_DIM = 128  # Fixed head_dim for indexer (INDEXER_COMPRESS)
 MAX_BATCH, MAX_SEQ, PAGE_SIZE = 16, 4096, 128
 ORI_SEQ_LEN = 65536
 ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW = 40000.0, 4, 32, 1
+
+
+def _active_compressed_position_ids(
+    compress_ratio, num_contexts, num_gen_tokens_per_seq, cached_tokens, kv_lens
+):
+    """Run the real metadata helpers and return IDs consumed by postprocess."""
+    batch_size = len(cached_tokens)
+    num_generations = batch_size - num_contexts
+    cached_tokens = torch.tensor(cached_tokens, dtype=torch.int32, device=DEVICE)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
+
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.num_contexts = num_contexts
+    metadata.num_generations = num_generations
+    metadata.num_gen_tokens_per_seq = num_gen_tokens_per_seq
+    metadata._compress_ratios_sorted = [compress_ratio]
+    metadata.compressed_kv_lens_cuda = {
+        compress_ratio: torch.empty(batch_size, dtype=torch.int32, device=DEVICE)
+    }
+    metadata.past_kv_lens_cuda = {
+        compress_ratio: torch.empty(batch_size, dtype=torch.int32, device=DEVICE)
+    }
+    metadata.new_comp_kv_lens_cuda = {
+        compress_ratio: torch.empty(batch_size, dtype=torch.int32, device=DEVICE)
+    }
+    metadata.cu_new_comp_kv_cuda = {
+        compress_ratio: torch.empty(batch_size + 1, dtype=torch.int32, device=DEVICE)
+    }
+
+    ctx_comp = (
+        (kv_lens[:num_contexts] // compress_ratio)
+        - (cached_tokens[:num_contexts] // compress_ratio)
+    ).sum()
+    gen_slots = num_generations * ((num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio)
+    total_slots = int(ctx_comp.item()) + gen_slots
+    metadata.compressed_position_ids_cuda = {
+        compress_ratio: torch.full((total_slots,), -1, dtype=torch.int32, device=DEVICE)
+    }
+    compressed_mask = {compress_ratio: torch.empty(total_slots, dtype=torch.bool, device=DEVICE)}
+
+    metadata.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
+    metadata._compute_compressed_mask(
+        metadata.new_comp_kv_lens_cuda,
+        metadata.cu_new_comp_kv_cuda,
+        compressed_mask,
+        batch_size,
+        {compress_ratio: total_slots},
+        [compress_ratio],
+    )
+
+    position_ids = metadata.compressed_position_ids_cuda[compress_ratio]
+    return position_ids[compressed_mask[compress_ratio]].cpu().tolist()
+
+
+@pytest.mark.parametrize(
+    "compress_ratio,next_n,cached_tokens,expected_position_ids",
+    [
+        pytest.param(4, 5, [4, 4], [4, 4], id="cr4_next5"),
+        pytest.param(4, 6, [4, 7], [4, 4, 8], id="cr4_next6_mixed"),
+        pytest.param(4, 7, [4, 6, 7], [4, 4, 8, 4, 8], id="cr4_next7_mixed"),
+        pytest.param(128, 8, [120, 128, 383], [0, 256], id="cr128_boundary_mixed"),
+    ],
+)
+def test_generation_position_ids_follow_compact_compressor_output(
+    compress_ratio, next_n, cached_tokens, expected_position_ids
+):
+    """Active postprocess rows use IDs in exact cu_new_comp ownership order."""
+    kv_lens = [cached + next_n for cached in cached_tokens]
+
+    actual_position_ids = _active_compressed_position_ids(
+        compress_ratio, 0, next_n, cached_tokens, kv_lens
+    )
+
+    assert actual_position_ids == expected_position_ids
+
+
+def test_mixed_context_generation_position_ids_follow_compact_output():
+    """Generation IDs remain compact after an exact context output prefix."""
+    actual_position_ids = _active_compressed_position_ids(
+        compress_ratio=4,
+        num_contexts=1,
+        num_gen_tokens_per_seq=5,
+        cached_tokens=[0, 4, 4],
+        kv_lens=[8, 9, 9],
+    )
+
+    assert actual_position_ids == [0, 4, 4, 4]
 
 
 def precompute_freqs_cis(
@@ -758,10 +853,14 @@ class CompressorWrapper:
         compress_ratios = [compress_ratio]
 
         # Create sparse attention config
+        indexer_k_dtype = (
+            "fp4" if get_sm_version() >= 100 and self.kv_cache_dtype != "fp8_blockwise" else "fp8"
+        )
         sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=INDEX_HEAD_DIM,
             window_size=self.WINDOW_SIZE,
             compress_ratios=compress_ratios,
+            indexer_k_dtype=indexer_k_dtype,
         )
 
         # Create KV cache config
@@ -794,7 +893,7 @@ class CompressorWrapper:
             dtype=cache_dtype,
             compressor_dtype=DataType.FLOAT,  # State caches always use FP32
             vocab_size=self.VOCAB_SIZE,
-            max_num_tokens=MAX_SEQ + MAX_BATCH,
+            max_num_tokens=MAX_SEQ * MAX_BATCH,
             sparse_attn_config=sparse_attn_config,
         )
 
@@ -1130,21 +1229,21 @@ class CompressorWrapper:
         # Determine attention types based on is_indexer
         if self.is_indexer:
             compress_type = DeepseekV4AttentionType.INDEXER_COMPRESS
-            state_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
+            kv_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE
         else:
             compress_type = DeepseekV4AttentionType.COMPRESS
-            state_type = DeepseekV4AttentionType.COMPRESSOR_STATE
+            kv_type = DeepseekV4AttentionType.COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.COMPRESSOR_SCORE
 
-        # Build block_tables dict keyed by DeepseekV4AttentionType using cache manager
+        # Build sliding block tables using cache manager indices.
         block_table_compress_list = []
         block_table_kv_state_list = []
         block_table_score_state_list = []
 
         for b, req in enumerate(requests):
             block_table_compress_list.append(self._get_block_table_for_request(req, compress_type))
-            block_table_kv_state_list.append(self._get_block_table_for_request(req, state_type))
+            block_table_kv_state_list.append(self._get_block_table_for_request(req, kv_type))
             block_table_score_state_list.append(self._get_block_table_for_request(req, score_type))
 
         # Pad and stack block tables to handle variable-length block indices
@@ -1170,11 +1269,45 @@ class CompressorWrapper:
         # Update block_offsets for test compatibility
         self.block_offsets = block_table_compress
 
-        block_tables = {
-            (ratio, compress_type): block_table_compress,
-            (ratio, state_type): block_table_kv_state,
-            (ratio, score_type): block_table_score_state,
+        max_blocks = max(max_blocks_compress, max_blocks_state)
+        sliding_block_tables = torch.zeros(
+            1,
+            len(DEEPSEEK_V4_SLIDING_ATTENTION),
+            bsz,
+            max_blocks,
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        compress_block_tables = {
+            ratio: torch.zeros(
+                bsz,
+                max_blocks,
+                dtype=torch.int32,
+                device=DEVICE,
+            )
         }
+        indexer_k_cache_block_offsets = torch.zeros(
+            bsz,
+            max_blocks,
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        if self.is_indexer:
+            indexer_k_cache_block_offsets[:, :max_blocks_compress] = block_table_compress
+        else:
+            compress_block_tables[ratio][:, :max_blocks_compress] = block_table_compress
+        sliding_block_tables[
+            0,
+            kv_type.value,
+            :,
+            :max_blocks_state,
+        ] = block_table_kv_state
+        sliding_block_tables[
+            0,
+            score_type.value,
+            :,
+            :max_blocks_state,
+        ] = block_table_score_state
 
         # Both prefill and decode kernels use absolute token positions for the
         # state cache, so pass the absolute kv_lens directly.
@@ -1206,7 +1339,9 @@ class CompressorWrapper:
             num_ctx_tokens=num_ctx_tokens,
             num_tokens=num_ctx_tokens + num_gen_tokens,
             kv_cache_manager=self.cache_manager,
-            block_tables=block_tables,
+            sliding_block_tables=sliding_block_tables,
+            compress_block_tables=compress_block_tables,
+            indexer_k_cache_block_offsets=indexer_k_cache_block_offsets,
             cu_seq_lens=cu_seq_lens,
             cu_new_comp_kv=cu_new_comp_kv_dict,
             compressed_position_ids=compressed_position_ids_dict,
@@ -1237,6 +1372,7 @@ class CompressorWrapper:
                 req.context_current_position = token_count
             # Call add_new_token for BOTH prefill and generation requests.
             req.add_new_token(token_count, 0)
+        self.cache_manager.update_context_resources(scheduled_batch)
         self.cache_manager.update_resources(scheduled_batch)
 
         # Compressor.forward() returns (kv_comp, scale) tuple.
@@ -1596,6 +1732,7 @@ class _FakeCompressorCacheManager:
     def __init__(self, head_dim: int, tokens_per_block: int = 4):
         self.tokens_per_block = tokens_per_block
         self.compressed_block_sizes = {0: tokens_per_block}
+        self.layer_offsets = {0: 0}
         self._buffer = torch.empty(1, tokens_per_block * head_dim, device=DEVICE, dtype=DTYPE)
 
     def get_buffers(self, layer_idx, attn_type):
@@ -1639,15 +1776,25 @@ def _create_small_compressor(kv_cache_dtype: str, is_indexer: bool) -> Compresso
 def _create_minimal_metadata(compressor: Compressor, total_compressed_tokens: int = 1):
     ratio = compressor.compress_ratio
     bsz = 1
-    block_table = torch.zeros(bsz, 1, device=DEVICE, dtype=torch.int32)
-    block_tables = {(ratio, attn_type): block_table for attn_type in DeepseekV4AttentionType}
+    sliding_block_tables = torch.zeros(
+        1,
+        len(DEEPSEEK_V4_SLIDING_ATTENTION),
+        bsz,
+        1,
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    compress_block_tables = {ratio: torch.zeros(bsz, 1, device=DEVICE, dtype=torch.int32)}
+    indexer_k_cache_block_offsets = torch.zeros(bsz, 1, device=DEVICE, dtype=torch.int32)
     metadata = DummyAttentionMetadata(
         num_contexts=1,
         num_generations=0,
         num_ctx_tokens=ratio,
         num_tokens=ratio,
         kv_cache_manager=_FakeCompressorCacheManager(compressor.head_dim),
-        block_tables=block_tables,
+        sliding_block_tables=sliding_block_tables,
+        compress_block_tables=compress_block_tables,
+        indexer_k_cache_block_offsets=indexer_k_cache_block_offsets,
         cu_seq_lens=torch.tensor([0, ratio], device=DEVICE, dtype=torch.int32),
         cu_new_comp_kv={
             ratio: torch.tensor([0, total_compressed_tokens], device=DEVICE, dtype=torch.int32)
@@ -1812,6 +1959,24 @@ def test_indexer_returns_fused_quant_outputs(
         assert torch.equal(scale_output, torch.full_like(scale_output, 2.0))
     else:
         assert torch.equal(scale_output, torch.full_like(scale_output, 0x7F))
+
+
+def test_deepseek_v4_indexer_keeps_shared_indexer_block_table():
+    class _Metadata:
+        indexer_k_cache_block_offsets = torch.arange(
+            4 * 5, dtype=torch.int32, device=DEVICE
+        ).reshape(4, 5)
+
+    indexer = DeepseekV4Indexer.__new__(DeepseekV4Indexer)
+    indexer.layer_idx = 7
+    metadata = _Metadata()
+    expected = metadata.indexer_k_cache_block_offsets
+
+    indexer._update_k_cache(None, None, metadata)
+
+    selected = metadata.indexer_k_cache_block_offsets
+    assert selected.data_ptr() == expected.data_ptr()
+    torch.testing.assert_close(selected, expected)
 
 
 # ============================================================================

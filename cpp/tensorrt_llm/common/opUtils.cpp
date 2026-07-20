@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/ncclUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiTags.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -33,18 +34,18 @@
 TRTLLM_NAMESPACE_BEGIN
 #if ENABLE_MULTI_DEVICE
 
-std::unordered_map<nvinfer1::DataType, ncclDataType_t>* getDtypeMap()
+std::unordered_map<tensorrt_llm::DataType, ncclDataType_t>* getDtypeMap()
 {
-    static std::unordered_map<nvinfer1::DataType, ncclDataType_t> dtypeMap = {
-        {nvinfer1::DataType::kFLOAT, ncclFloat32},
-        {nvinfer1::DataType::kHALF, ncclFloat16},
-        {nvinfer1::DataType::kBF16, ncclBfloat16},
-        {nvinfer1::DataType::kFP8, ncclInt8},
-        {nvinfer1::DataType::kBOOL, ncclInt8},
-        {nvinfer1::DataType::kINT32, ncclInt32},
-        {nvinfer1::DataType::kINT64, ncclInt64},
-        {nvinfer1::DataType::kUINT8, ncclUint8},
-        {nvinfer1::DataType::kINT8, ncclInt8},
+    static std::unordered_map<tensorrt_llm::DataType, ncclDataType_t> dtypeMap = {
+        {tensorrt_llm::DataType::kFLOAT, ncclFloat32},
+        {tensorrt_llm::DataType::kHALF, ncclFloat16},
+        {tensorrt_llm::DataType::kBF16, ncclBfloat16},
+        {tensorrt_llm::DataType::kFP8, ncclInt8},
+        {tensorrt_llm::DataType::kBOOL, ncclInt8},
+        {tensorrt_llm::DataType::kINT32, ncclInt32},
+        {tensorrt_llm::DataType::kINT64, ncclInt64},
+        {tensorrt_llm::DataType::kUINT8, ncclUint8},
+        {tensorrt_llm::DataType::kINT8, ncclInt8},
     };
     return &dtypeMap;
 }
@@ -162,9 +163,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     setenv("NCCL_GRAPH_REGISTER", "0", 0);
     // NCCL aborts during init if it tries NVLS multicast but the fabric/IMEX
-    // plane can't bind it. Disable NVLS when it isn't actually usable so NCCL
+    // plane can't bind it. Disable NVLS when the fabric is not usable so NCCL
     // falls back to NVLink P2P. No-overwrite preserves an explicit user setting.
-    if (!tensorrt_llm::runtime::ipcNvlsSupported())
+    if (!tensorrt_llm::runtime::ipcNvlsFabricUsable())
     {
         setenv("NCCL_NVLS_ENABLE", "0", 0);
     }

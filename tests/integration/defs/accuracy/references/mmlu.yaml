@@ -222,6 +222,9 @@ deepseek-ai/DeepSeek-V3.2-Exp:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 87.2
+deepseek-ai/DeepSeek-V4-Flash:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.2
 Qwen3/Qwen3-8B:
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 72.70
@@ -274,7 +277,13 @@ Qwen/Qwen3.5-397B-A17B:
 MiniMaxAI/MiniMax-M2:
   - accuracy: 83.82
 MiniMaxAI/MiniMax-M3:
-  - accuracy: 80
+  - accuracy: 85
+MiniMaxAI/MiniMax-M3-MXFP8:
+  - quant_algo: MXFP8
+    accuracy: 85
+nvidia/MiniMax-M3-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    accuracy: 83
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 87.65
@@ -353,6 +362,17 @@ poolside/laguna-XS.2:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 73.66
+poolside/Laguna-XS-2.1:
+  - spec_dec_algo: DFlash
+    accuracy: 76.194
+  - spec_dec_algo: DFlash
+    quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 75.780
+  - spec_dec_algo: DFlash
+    quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 75.317
 mistral/Mistral-Large-3-675B:
   - accuracy: 85.30
   - spec_dec_algo: Eagle

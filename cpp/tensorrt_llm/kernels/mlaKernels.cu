@@ -184,12 +184,42 @@ inline __device__ void dequantCopy(
     }
 }
 
-template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
+// `kOutputFp8Q`: when true, write the rotated Q rope segment directly to
+// `quant_q_buf` as FP8 (scaled by `*quant_scale_qkv`) and skip the bf16 STG to
+// `q_ptr`. Companion: `deepseek_v4_q_norm_fused_fp8` pre-fills the nope segment
+// of `quant_q_buf`, so the standalone quantizeCopyInputToFp8Kernel can be
+// dropped. `quant_q_buf`/`quant_scale_qkv`/bmm_scale outputs are unused when
+// `kOutputFp8Q == false`.
+template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer, bool kOutputFp8Q = false>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
     int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode)
+    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode,
+    __nv_fp8_e4m3* quant_q_buf = nullptr, float const* quant_scale_qkv = nullptr, float* bmm1_scale_out = nullptr,
+    float* bmm2_scale_out = nullptr, float const* dequant_scale_q = nullptr, float const* dequant_scale_kv = nullptr,
+    float const* quant_scale_o = nullptr, float host_bmm1_scale = 1.0f)
 {
+    // bmm scales — single thread emits them when we skip quantizeCopyInputToFp8Kernel.
+    if constexpr (kOutputFp8Q)
+    {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+        {
+            float const dq_q = dequant_scale_q ? dequant_scale_q[0] : 1.f;
+            float const dq_kv = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
+            float const q_o = quant_scale_o ? quant_scale_o[0] : 1.f;
+            if (bmm1_scale_out)
+            {
+                constexpr float kLog2e = 1.4426950408889634074f;
+                float const bmm1 = dq_q * dq_kv * host_bmm1_scale;
+                bmm1_scale_out[0] = bmm1;
+                bmm1_scale_out[1] = bmm1 * kLog2e;
+            }
+            if (bmm2_scale_out)
+            {
+                bmm2_scale_out[0] = q_o * dq_kv;
+            }
+        }
+    }
 
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -223,6 +253,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
         float quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
+        float quant_scale_qkv_val = (kOutputFp8Q && quant_scale_qkv) ? quant_scale_qkv[0] : 1.f;
 
         // Mainloop.
         for (int local_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
@@ -297,7 +328,15 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
                     + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
                 auto const dst_k_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                     + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
-                reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
+                if constexpr (kOutputFp8Q)
+                {
+                    quantCopy<T, ELTS_PER_VEC>(
+                        quant_q_buf + dst_q_idx, reinterpret_cast<T const*>(&q), quant_scale_qkv_val);
+                }
+                else
+                {
+                    reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
+                }
                 // Only write to k_pe to k_buf in the non-absorption mode.
                 if (!absorption_mode)
                 {
@@ -970,21 +1009,54 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
+    // Fused FP8-Q path: write the rotated Q rope segment directly to quant_q_buf
+    // as FP8 so the caller can drop the standalone quantizeCopyInputToFp8Kernel.
+    bool const useFusedFp8Q = params.fuse_q_fp8_in_rope && params.absorption_mode
+        && params.cache_type == KvCacheDataType::FP8 && params.quant_q_buf != nullptr
+        && params.quant_scale_qkv != nullptr;
+
+    auto* quant_q_fp8 = useFusedFp8Q ? static_cast<__nv_fp8_e4m3*>(params.quant_q_buf) : nullptr;
     if (params.meta.rope_append)
     {
-        applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-            params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
-            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
-            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
-            params.helix_position_offsets, params.absorption_mode);
+        if (useFusedFp8Q)
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer, true>
+                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
+                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
+                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
+                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
+        }
+        else
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer, false><<<grid, 256, 0, stream>>>(
+                params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+                params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
+                params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode);
+        }
     }
     else
     {
-        applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-            params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
-            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
-            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
-            params.helix_position_offsets, params.absorption_mode);
+        if (useFusedFp8Q)
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, true>
+                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
+                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
+                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
+                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
+        }
+        else
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, false><<<grid, 256, 0, stream>>>(
+                params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+                params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
+                params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode);
+        }
     }
 }
 

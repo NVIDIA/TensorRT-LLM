@@ -56,7 +56,7 @@ commands:
         flags:
         - "--allow_request_chat_template"
       backend:
-        type: Choice(['_autodeploy', 'pytorch', 'tensorrt'])
+        type: Choice(['_autodeploy', 'pytorch'])
         default: pytorch
         status: beta
         required: false
@@ -303,6 +303,24 @@ commands:
         is_flag: false
         flags:
         - "--num_postprocess_workers"
+      num_input_processor_workers:
+        type: int
+        default: 8
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--num_input_processor_workers"
+      num_media_load_workers:
+        type: int
+        default: 8
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--num_media_load_workers"
       otlp_traces_endpoint:
         type: str
         default: null

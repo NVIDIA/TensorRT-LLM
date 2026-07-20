@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig
+from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
 
 # =============================================================================
 # Type aliases
@@ -46,18 +46,19 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 class QuantAttentionConfig(StrictBaseModel):
     """Attention quantization recipe (TRTLLM / CUTEDSL backends).
 
-    Describes user intent for quantized attention: per-bmm dtype and per-block layout for Q, K, V.
-    Providing this config to AttentionConfig enables quantized attention; setting
-    AttentionConfig.quant_attention_config = None disables it.
+    Specifies Q/K and V quantization formats and their optional block sizes.
 
     Bare QuantAttentionConfig() is a valid Qk16Pv8 recipe.
     Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
     """
 
-    qk_dtype: Literal["bf16", "int8", "fp8"] = Field(
+    qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
         "bf16",
         status="prototype",
-        description="Q/K quantization dtype; bf16 leaves Q/K unquantized.",
+        description=(
+            "Q/K quantization format. bf16 leaves Q/K unquantized; int8 and fp8 use 8-bit "
+            "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
+        ),
     )
     v_dtype: Literal["fp8"] = Field(
         "fp8",
@@ -68,25 +69,27 @@ class QuantAttentionConfig(StrictBaseModel):
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for Q; 0 for per-tensor quantization.",
+        description="Number of Q tokens per SageAttention quantization block; 0 otherwise.",
     )
     k_block_size: int = Field(
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for K; 0 for per-tensor quantization.",
+        description="Number of K tokens per SageAttention quantization block; 0 otherwise.",
     )
     v_block_size: int = Field(
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for V; 0 for per-tensor quantization.",
+        description=(
+            "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
+        ),
     )
 
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -111,12 +114,15 @@ class AttentionConfig(StrictBaseModel):
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
         None,
         status="prototype",
-        description="Sparse attention configuration. Currently supports: skip_softmax.",
+        description=(
+            "Sparse attention recipe. Discriminated by algorithm: "
+            "skip_softmax (TRTLLM backend) or VSA (CUTEDSL backend)."
+        ),
     )
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # SAGE recipes target the TRTLLM backend (per-block Q/K/V scales).
+        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block)).
         SAGE_RECIPES = {
             ("int8", "fp8", (1, 1, 1)),
             ("int8", "fp8", (1, 4, 1)),
@@ -124,9 +130,12 @@ class AttentionConfig(StrictBaseModel):
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
         }
-        # QK16PV8 (CUTEDSL backend): Q/K kept in bf16, V quantized to FP8.
-        QK16PV8_DTYPES = {
+        CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("mxfp8", "fp8", (0, 0, 0)),
+            ("mxfp8", "fp8", (0, 0, 1)),
+            ("nvfp4", "fp8", (0, 0, 0)),
+            ("nvfp4", "fp8", (0, 0, 1)),
         }
 
         if self.quant_attention_config is None:
@@ -147,17 +156,53 @@ class AttentionConfig(StrictBaseModel):
                     f"{sorted(SAGE_RECIPES)}."
                 )
         elif self.backend == "CUTEDSL":
-            if recipe not in QK16PV8_DTYPES:
+            if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported (qk_dtype, v_dtype): "
-                    f"{sorted(QK16PV8_DTYPES)}."
+                    f"for backend='CUTEDSL'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(CUTEDSL_RECIPES)}."
                 )
         else:
             raise ValueError(
                 f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sparse_attention_config(self) -> "AttentionConfig":
+        if self.sparse_attention_config is None:
+            return self
+
+        algo = self.sparse_attention_config.algorithm
+        required_backend = {"skip_softmax": "TRTLLM", "vsa": "CUTEDSL"}.get(algo)
+        if required_backend is None:
+            return self
+
+        if self.backend != required_backend:
+            raise ValueError(
+                f"sparse_attention_config with algorithm='{algo}' requires "
+                f"backend='{required_backend}', got backend='{self.backend}'. "
+                f"Either set backend='{required_backend}' or remove "
+                f"sparse_attention_config."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
+        # quant_attention_config and sparse_attention_config are mutually exclusive.
+        if (
+            self.backend == "CUTEDSL"
+            and self.quant_attention_config is not None
+            and self.sparse_attention_config is not None
+        ):
+            raise ValueError(
+                "CUTEDSL backend: quant_attention_config and "
+                "sparse_attention_config are mutually exclusive (the "
+                "CuTeDSLAttention dispatcher selects either the dense path "
+                "or the sparse VSA path, not both)."
             )
         return self
 
@@ -620,6 +665,7 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "VideoSparseAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",

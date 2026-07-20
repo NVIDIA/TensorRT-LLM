@@ -259,6 +259,12 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
+}
+
 bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
 {
     static std::once_flag flag;
@@ -393,6 +399,12 @@ bool getEnvTryZCopyForKVCacheTransfer()
 {
     static bool const zcopyForSysmmetricKVCache = getBoolEnv("TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER");
     return zcopyForSysmmetricKVCache;
+}
+
+bool getEnvDisaggEnableInflightCancel()
+{
+    static bool const enabled = getBoolEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+    return enabled;
 }
 
 bool getEnvForceDeterministic()

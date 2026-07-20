@@ -51,6 +51,9 @@ CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
 
+class PlannedDropHandle:
+    def drop(self) -> None: ...
+
 class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
@@ -62,6 +65,7 @@ BeamIndex = NewType("BeamIndex", int)
 MemAddress = NewType("MemAddress", int)
 Priority = NewType("Priority", int)
 PoolGroupIndex = NewType("PoolGroupIndex", int)
+PoolIndex = NewType("PoolIndex", int)
 
 # From _stats.py
 @dataclass(slots=True)
@@ -86,6 +90,14 @@ class KVCacheIterationStatsDelta:
     iter_offload_bytes: int = 0
     iter_intra_device_copy_blocks: int = 0
     iter_intra_device_copy_bytes: int = 0
+    iter_host_dropped_blocks: int = 0
+    iter_host_dropped_bytes: int = 0
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupPeakBlockStats:
+    available: int
+    unavailable: int
+    evictable: int
 
 # From _config.py
 DataRole = NewType("DataRole", str)
@@ -125,13 +137,6 @@ class BufferConfig:
     tokens_per_block_override: int | None = None
 
 @dataclass(slots=True)
-class HelixConfig:
-    helix_group_size: int
-    helix_gpu_rank: int
-    helix_shard_size: int
-    shared_comm_port: int
-
-@dataclass(slots=True)
 class AttentionLayerConfig:
     layer_id: LayerId
     buffers: list[BufferConfig]
@@ -164,17 +169,16 @@ class SwaScratchReuseConfig:
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
-    vocab_size: int
     cache_tiers: list[CacheTierConfig]
     layers: list[LayerConfig]
     max_util_for_resume: float = ...
     enable_partial_reuse: bool = True
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
-    ssm_reuse_interval: int = 512
+    initial_pool_ratio: list[float] | None = None
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    commit_min_snapshot: bool = False
     enable_stats: bool = True
-    helix_config: HelixConfig | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -340,9 +344,15 @@ class _KVCache:
         self,
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
+        is_end: bool = False,
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]: ...
+    @property
+    def reuse_scope(self) -> ReuseScope: ...
+    def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
     def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
@@ -363,14 +373,10 @@ class _KVCache:
     def tokens_per_block(self) -> int: ...
 
 @dataclass(slots=True, frozen=True)
-class MemoryPoolDesc:
-    base: MemAddress
-    page_size: int
-
-@dataclass(slots=True, frozen=True)
-class MemoryPoolGroupDesc:
-    num_pages: int
-    pools: Sequence[MemoryPoolDesc]
+class PoolDesc:
+    pool_index: PoolIndex
+    base_address: MemAddress
+    slot_bytes: int
 
 class BufferId(NamedTuple):
     layer_id: LayerId
@@ -393,6 +399,36 @@ class AggregatedPageDesc:
     stride: int
     layer_group_id: LayerGroupId
     buffers: Sequence[ExpandedBuffer]
+
+@dataclass(slots=True, frozen=True)
+class CoalescedBuffer:
+    single_buffer_size: int
+    buffer_ids: Sequence[BufferId]
+    @property
+    def size(self) -> int: ...
+    @property
+    def num_buffers(self) -> int: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDescVariant:
+    coalesced_buffers: Sequence[CoalescedBuffer]
+    @property
+    def layer_group_id(self) -> LayerGroupId: ...
+    @property
+    def slot_size_list(self) -> Sequence[int]: ...
+
+@dataclass(slots=True, frozen=True)
+class SlotDesc:
+    variants: Sequence[SlotDescVariant]
+    @property
+    def slot_size_list(self) -> Sequence[int]: ...
+
+@dataclass(slots=True, frozen=True)
+class PoolGroupDesc:
+    pool_group_index: PoolGroupIndex
+    num_slots: int
+    slot_desc: SlotDesc
+    pools: Sequence[PoolDesc]
 
 # From _core/_kv_cache_manager.py
 @dataclass(slots=True, frozen=True)
@@ -449,6 +485,9 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def get_and_reset_iteration_peak_block_stats(
+        self, cache_level: CacheLevel
+    ) -> Sequence[PoolGroupPeakBlockStats]: ...
     def mark_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def clear_stats_dirty(self, kv_cache_id: int | None) -> None: ...
     def get_dirty_stats_kv_cache_ids(self) -> set[int]: ...
@@ -461,6 +500,8 @@ class KVCacheManager:
     def tokens_per_block(self) -> int: ...
     @property
     def event_manager(self) -> Any | None: ...
+    @property
+    def init_config(self) -> KVCacheManagerConfig: ...
     @property
     def allow_seq_rebasing(self) -> bool: ...
     @property
@@ -476,9 +517,11 @@ class KVCacheManager:
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
     def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
+    @property
+    def pool_group_descs(self) -> Sequence[PoolGroupDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...
     def adjust(self) -> None: ...
     @property
     def need_adjustment(self) -> bool: ...
     @property
-    def ssm_reuse_interval(self) -> int: ...
+    def commit_min_snapshot(self) -> bool: ...

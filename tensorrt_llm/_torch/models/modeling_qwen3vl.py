@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import math
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -161,6 +162,61 @@ def _expand_prompt_token_ids_for_mm_handoff(
     )
 
 
+def _decide_do_sample_frames(
+    video_datas: Optional[List[Any]],
+    mm_processor_kwargs: Dict[str, Any],
+) -> bool:
+    """Pick a single `do_sample_frames` flag for the HF processor call.
+
+    HF's video processor takes a scalar `do_sample_frames` that applies to
+    every video in the request. Decide it as follows:
+
+      1. If `mm_processor_kwargs.do_sample_frames` is explicitly set
+         (True or False), honor it.
+      2. If the caller supplies no frame target (`num_frames` / `fps`),
+         match HF's class default, which samples frames (returns True).
+      3. Otherwise, for each video compute the target frame count from the
+         kwargs (`num_frames` directly, or `floor(duration * fps)` if
+         `fps` is given) and compare to `len(vd.frames)`. If any video
+         needs a different count, the batch is sampled (returns True).
+
+    Per-video targets that match the IO-decoded count don't need HF
+    sampling; the all-or-nothing reduction over the batch means a single
+    video needing resampling pulls the rest along through a no-op
+    identity `np.linspace`.
+    """
+    if "do_sample_frames" in mm_processor_kwargs:
+        return bool(mm_processor_kwargs["do_sample_frames"])
+
+    if not video_datas:
+        return False
+
+    user_num_frames = mm_processor_kwargs.get("num_frames")
+    user_fps = mm_processor_kwargs.get("fps")
+    has_num_frames = user_num_frames is not None and user_num_frames != -1
+    has_fps = user_fps is not None and user_fps != -1
+
+    # No explicit frame target from the caller: defer to HF's class-default
+    # sampling (the stock processor sets `do_sample_frames=True` when neither
+    # `num_frames` nor `fps` is given). Returning False here would hand the
+    # IO-decoded frames straight to HF unchanged and diverge from stock HF
+    # whenever the IO loader decoded a different number of frames than HF's
+    # default sampler would select.
+    if not has_num_frames and not has_fps:
+        return True
+
+    for vd in video_datas:
+        n_decoded = len(vd.frames)
+        if has_num_frames:
+            n_target = user_num_frames
+        else:  # has_fps
+            duration = (vd.metadata or {}).get("duration") or 0
+            n_target = math.floor(duration * user_fps)
+        if n_target != n_decoded:
+            return True
+    return False
+
+
 class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     """Qwen3-VL input processor.
 
@@ -253,19 +309,42 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
 
-        # Forward video metadata only when the caller opts into per-request kwargs;
-        # the default path pre-samples frames in the IO loader, so unconditional
-        # metadata triggers IndexError in HF's _decode_and_sample_videos.
-        video_metadata = (
-            [vd.metadata for vd in video_datas] if video_datas and mm_processor_kwargs else None
-        )
+        do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
-        # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
-        # If the caller set num_frames without fps, null fps explicitly so the class-level
-        # default fps=2 does not interfere.
-        proc_kwargs = dict(mm_processor_kwargs)
-        if "num_frames" in proc_kwargs and "fps" not in proc_kwargs:
-            proc_kwargs["fps"] = None
+        # Pass `do_sample_frames` plus, when sampling is needed, the
+        # caller's `num_frames` / `fps` target. Everything else the caller
+        # supplied (resize, normalize knobs, etc.) flows through unchanged.
+        proc_kwargs: Dict[str, Any] = {"do_sample_frames": do_sample_frames}
+        for k, v in mm_processor_kwargs.items():
+            if k in ("num_frames", "fps", "do_sample_frames"):
+                continue
+            proc_kwargs[k] = v
+        if do_sample_frames:
+            if "num_frames" in mm_processor_kwargs:
+                proc_kwargs["num_frames"] = mm_processor_kwargs["num_frames"]
+            if "fps" in mm_processor_kwargs:
+                proc_kwargs["fps"] = mm_processor_kwargs["fps"]
+            elif "num_frames" in mm_processor_kwargs:
+                # HF's `sample_frames` honors `num_frames` only when `fps` is
+                # not also set; the class-default `fps=2` would otherwise cap
+                # the returned count below the caller's requested
+                # `num_frames` for short clips. Null `fps` so `num_frames` is
+                # respected verbatim.
+                proc_kwargs["fps"] = None
+
+        # Forward per-video metadata with `total_num_frames` rewritten to the
+        # actual decoded frame count. HF's `sample_frames` computes indices
+        # via `np.linspace(0, total_num_frames - 1, num_frames)` and indexes
+        # the frame tensor with them; the rewrite keeps those indices in
+        # range and the no-sampling path consistent for downstream qwen3vl
+        # code that consults the metadata.
+        video_metadata: Optional[List[Dict[str, Any]]] = None
+        if video_datas:
+            video_metadata = []
+            for vd in video_datas:
+                m = dict(vd.metadata or {})
+                m["total_num_frames"] = len(vd.frames)
+                video_metadata.append(m)
 
         return self.processor(
             text=[text],
@@ -317,6 +396,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 "video_grid_thw for the provided video."
             )
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
+
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # uint8 HWC frames let the HF processor rescale/permute once, skipping
+        # the per-frame CHW-float conversion in the IO loader.
+        return {"video": {"format": "np"}}
 
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
@@ -978,6 +1062,27 @@ class Qwen3VisionModelBase(nn.Module):
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+        # Only the request itself knows how its image and video items
+        # interleave in the prompt, so a mixed request must carry a manifest.
+        for mp in multimodal_params:
+            data = mp.multimodal_data or {}
+            if (
+                data.get("image") is not None
+                and data.get("video") is not None
+                and not mp.mm_item_order
+            ):
+                raise ValueError(
+                    "Qwen3-VL mixed-modality requests must carry mm_item_order on MultimodalParams."
+                )
+
+        # Any batch that contains both modalities — whether within a single
+        # request or spread across heterogeneous single-modality requests —
+        # goes through the modality-blind ViT via one cat'd stream.
+        has_image = any(mp.multimodal_data.get("image") is not None for mp in multimodal_params)
+        has_video = any(mp.multimodal_data.get("video") is not None for mp in multimodal_params)
+        if has_image and has_video:
+            return self._interleave_multimodal_data(multimodal_params)
+
         pixel_values_list = []
         pixel_values_videos_list = []
         image_grid_thw_list = []
@@ -1027,19 +1132,71 @@ class Qwen3VisionModelBase(nn.Module):
 
         return mm_content_dict, mm_extra_data
 
+    def _interleave_multimodal_data(
+        self, multimodal_params: List[MultimodalParams]
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Build one prompt-order pixel_values + grid_thw for mixed batches.
+
+        The ViT is modality-blind (image = grid_thw row with t=1, video = t>1),
+        so we cat everything into a single stream in prompt order. Emits only
+        the "pixel_values" + "image_grid_thw" keys so forward() takes its
+        image branch uniformly over both modalities.
+        """
+        pixels: List[torch.Tensor] = []
+        grids: List[torch.Tensor] = []
+        for mp in multimodal_params:
+            data = mp.multimodal_data
+            order = mp.mm_item_order or []
+            img = data.get("image") or {}
+            vid = data.get("video") or {}
+            img_pv, img_thw = img.get("pixel_values"), img.get("image_grid_thw")
+            vid_pv = vid.get("pixel_values_videos")
+            vid_thw = vid.get("video_grid_thw")
+
+            # Single-modality request in a mixed batch — no interleave
+            # needed, just append its rows.
+            if not order or img_pv is None or vid_pv is None:
+                if img_pv is not None:
+                    pixels.append(img_pv)
+                    grids.append(img_thw)
+                if vid_pv is not None:
+                    pixels.append(vid_pv)
+                    grids.append(vid_thw)
+                continue
+
+            img_off = vid_off = 0
+            for entry in order:
+                modality = entry["modality"]
+                idx = entry["index"]
+                if modality == "image":
+                    thw = img_thw[idx]
+                    n = int(thw.prod().item())
+                    pixels.append(img_pv[img_off : img_off + n])
+                    img_off += n
+                elif modality == "video":
+                    thw = vid_thw[idx]
+                    n = int(thw.prod().item())
+                    pixels.append(vid_pv[vid_off : vid_off + n])
+                    vid_off += n
+                else:
+                    raise ValueError(f"Unknown modality in mm_item_order: {modality}")
+                grids.append(thw.unsqueeze(0))
+
+        return (
+            {"pixel_values": torch.cat(pixels, dim=0)},
+            {"image_grid_thw": torch.cat(grids, dim=0)},
+        )
+
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
         pixel_values = mm_content_data.get("pixel_values", None)
         pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
 
-        if pixel_values is not None and pixel_values_videos is not None:
-            raise ValueError("Currently only support single modality per request")
-
         image_grid_thw = mm_extra_data.get("image_grid_thw", None)
         video_grid_thw = mm_extra_data.get("video_grid_thw", None)
 
-        embeds = []
+        embeds: List[torch.Tensor] = []
         if pixel_values is not None:
             pixel_values = pixel_values.to(self.model_dtype)
             image_embeds, deepstack_image_embeds = self.visual(
@@ -1150,6 +1307,8 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
             "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
         }
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
@@ -1167,11 +1326,18 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.mm_encoder = None
-        # Normal workers own the encoder. MM E/P handoff uses attached embeddings.
-        if not _is_mm_disagg():
+        # Normal workers own the encoder. MM E/P handoff uses attached
+        # embeddings; disable_mm_encoder serves the checkpoint text-only and
+        # saves the encoder's GPU memory for the KV cache pool.
+        if not (_is_mm_disagg() or model_config.disable_mm_encoder):
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
+        elif model_config.disable_mm_encoder:
+            logger.info(
+                f"{type(self).__name__}: multimodal encoder disabled "
+                "(disable_mm_encoder=True); serving text-only requests."
+            )
 
         self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
         self.deepstack_num_level = (
@@ -1224,6 +1390,26 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
+    # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
+    # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
+    # calls `load_draft_weights` on the *outer* model it resolved, but the
+    # spec-decoding wrapper (`SpecDecOneEngineForCausalLM`) is applied to the
+    # inner `self.llm` when this VLM composes it. Composite checkpoints
+    # (e.g. Qwen3.5-4B publishes text_config + vision_config) route text-only
+    # spec tests through this wrapper, so surface the inner LM's draft state.
+    # Note: `load_draft_weights` must keep an explicit signature — the loader
+    # dispatches kwargs via `inspect.getfullargspec`.
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
+        return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
+
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
         # consistently expose an LLM compile contract.
@@ -1238,9 +1424,12 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             mrope_section=config.rope_scaling.get("mrope_section", None),
             mrope_interleaved=config.rope_scaling.get("mrope_interleaved", False),
         )
+        head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = config.hidden_size // config.num_attention_heads
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=head_dim,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
@@ -1370,6 +1559,13 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             )
             deepstack_embeds = list(deepstack_buffer.unbind(0))
 
+        # Preserve the pre-fusion token IDs. `fuse_input_embeds` collapses
+        # input_ids -> None when MM embeddings are fused in, but spec
+        # decoding (MTP / Eagle) still needs the original prompt token
+        # IDs for drafter context preparation; pass them through as a
+        # dedicated kwarg consumed by `SpecDecOneEngineForCausalLM.forward`.
+        orig_input_ids = input_ids
+
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
@@ -1386,8 +1582,14 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             return_context_logits=return_context_logits,
             deepstack_embeds=deepstack_embeds,
             mrope_config=mrope_config,
+            spec_metadata=kwargs.get("spec_metadata"),
+            resource_manager=kwargs.get("resource_manager"),
+            orig_input_ids=orig_input_ids,
         )
-        logger.debug(f"output shape: {output_prob.shape}")
+        # Spec-decoding (MTP / Eagle) returns a dict (accepted tokens,
+        # draft tokens, logits); plain forward returns a tensor.
+        if hasattr(output_prob, "shape"):
+            logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
 
     def _get_requests_with_mm_data(self, multimodal_params):
