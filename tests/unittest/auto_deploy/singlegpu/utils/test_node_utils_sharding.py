@@ -24,7 +24,12 @@ from torch.fx import GraphModule
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 — register custom ops
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ShardableNode
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_any_split_op, is_any_view_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
+    get_all_layer_subgraphs,
+    get_weight_shape,
+    is_any_split_op,
+    is_any_view_op,
+)
 
 
 def _call_function_nodes(gm: GraphModule):
@@ -166,3 +171,54 @@ def test_enable_sharding_node_none_for_aten():
     aten_linear = [n for n in _call_function_nodes(gm) if n.target == torch.ops.aten.linear.default]
     assert len(aten_linear) == 1
     assert ShardableNode.from_node(aten_linear[0]) is None
+
+
+def test_get_weight_shape_shared_weight_used_by_embedding_and_linear():
+    class Shell(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared_weight = nn.Parameter(torch.randn(16, 8))
+
+    root = Shell()
+    graph = fx.Graph()
+    input_ids = graph.placeholder("input_ids")
+    x = graph.placeholder("x")
+    shared_weight = graph.get_attr("shared_weight")
+    shared_weight.meta["val"] = root.shared_weight
+    embedding = graph.call_function(
+        torch.ops.aten.embedding.default,
+        args=(shared_weight, input_ids, -1, False, False),
+    )
+    linear = graph.call_function(torch.ops.aten.linear.default, args=(x, shared_weight, None))
+    graph.output((embedding, linear))
+    gm = GraphModule(root, graph)
+    gm.graph.lint()
+
+    assert get_weight_shape(linear) == [16, 8]
+    assert get_weight_shape(linear, dim=-1) == 8
+
+
+def test_get_weight_shape_returns_none_for_linear_without_weight_node():
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    runtime_weight = graph.placeholder("runtime_weight")
+    linear = graph.call_function(torch.ops.aten.linear.default, args=(x, runtime_weight, None))
+    graph.output(linear)
+    gm = GraphModule(nn.Module(), graph)
+    gm.graph.lint()
+
+    assert get_weight_shape(linear) is None
+    assert get_weight_shape(linear, dim=-1) is None
+
+
+def test_get_all_layer_subgraphs_returns_empty_without_linear_nodes():
+    class NoLinear(nn.Module):
+        def forward(self, x):
+            return x + 1
+
+    gm = torch.fx.symbolic_trace(NoLinear())
+
+    layer_subgraphs, unprocessed_linear_nodes = get_all_layer_subgraphs(gm)
+
+    assert layer_subgraphs == []
+    assert unprocessed_linear_nodes == set()
