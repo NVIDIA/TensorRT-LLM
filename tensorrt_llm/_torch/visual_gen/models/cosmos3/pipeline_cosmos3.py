@@ -45,7 +45,7 @@ from .defaults import (
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
-from .utils import normalize_video_input, pil_to_rgb
+from .utils import pil_to_rgb
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
 # NOTE: Intentional typo in "give" instead of "given" to match training setup.
@@ -63,17 +63,11 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
 
 
 def _normalize_condition_video_latent_indexes(
-    indexes: Iterable[int] | int | str | None,
+    indexes: Iterable[int] | None,
 ) -> tuple[int, ...]:
     if indexes is None:
         return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
-    if isinstance(indexes, int):
-        normalized = (indexes,)
-    elif isinstance(indexes, str):
-        parts = [part.strip() for part in indexes.split(",") if part.strip()]
-        normalized = tuple(int(part) for part in parts)
-    else:
-        normalized = tuple(int(index) for index in indexes)
+    normalized = tuple(int(index) for index in indexes)
 
     if not normalized:
         raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
@@ -308,14 +302,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
-
-        # The V2V reference rides in ``multi_modal_data["video"]`` as a
-        # ``VideoData`` (framework convention); the worker crops + VAE-encodes its
-        # frames. Both producers (offline and serve) build it, so there is no
-        # legacy-path fallback.
-        mm_data = req.params.multi_modal_data or {}
-        video_data = mm_data.get("video")
-        video = video_data.frames if video_data is not None else None
+        video = extra_params.get("video")  # Tensor[T, H, W, C, dtype=uint8]
 
         return self.forward(
             prompt=req.prompt,
@@ -687,7 +674,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         video_tensor: torch.Tensor,
         num_frames: int,
         generator: torch.Generator,
-        condition_video_latent_indexes: Iterable[int] | int | str | None = None,
+        condition_video_latent_indexes: Iterable[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare V2V latents with explicit clean conditioned latent frames."""
         if video_tensor.ndim == 4:
@@ -776,9 +763,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
-        video: Any = None,
-        condition_video_latent_indexes: Any = None,
-        condition_video_keep: Any = None,
+        video: torch.Tensor | None = None, # uint8 [T, H, W, C, dtype=uint8]
+        condition_video_latent_indexes: Iterable[int] | None = None,
+        condition_video_keep: str | None = None,
         flow_shift: Optional[float] = None,
     ):
         pipeline_start = time.time()
@@ -980,19 +967,20 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 ),
                 num_frames,
             )
-            # ``video`` is the reference frames (a list, from the producer's
-            # ``VideoData``). The worker crops the first/last conditioning window
-            # uniformly — producers never crop, so behavior never depends on them.
-            video = normalize_video_input(
-                video,
-                max_frames=None if condition_video_keep == "last" else condition_pixel_frames,
-            )
-            video = (
+            if not isinstance(video, torch.Tensor) or video.ndim != 4:
+                raise ValueError(
+                    "Cosmos3 V2V reference must be a uint8 [T, H, W, C] tensor "
+                    f"(the 'video' extra-param contract), got {type(video).__name__}"
+                    f"{' of shape ' + str(tuple(video.shape)) if isinstance(video, torch.Tensor) else ''}."
+                )
+            # Crop the first/last conditioning window uniformly
+            window = (
                 video[-condition_pixel_frames:]
                 if condition_video_keep == "last"
                 else video[:condition_pixel_frames]
             )
-            video = self._preprocess_condition_video(video, height, width)
+            frames = [PIL.Image.fromarray(frame.cpu().numpy()) for frame in window]
+            video = self._preprocess_condition_video(frames, height, width)
 
             if self.rank == 0:
                 logger.info(

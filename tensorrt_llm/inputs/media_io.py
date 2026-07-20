@@ -468,6 +468,57 @@ def decode_video_frames_from_bytes(data, max_frames: Optional[int] = None) -> Li
     return frames
 
 
+# Frame-image suffixes recognized when expanding a frame directory (see the
+# selection rationale in ``load_video_frames_tensor``).
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
+
+
+def frames_to_tensor(frames: List["Image.Image"]) -> torch.Tensor:
+    """Stack PIL frames into a uint8 ``[T, H, W, C]`` RGB CPU tensor.
+
+    The plain-tensor form video references travel in (e.g.
+    ``extra_params["video"]`` for video-to-video pipelines).
+    """
+    if not frames:
+        raise ValueError("Cannot build a video tensor from an empty frame list.")
+    return torch.from_numpy(np.stack([np.asarray(f.convert("RGB")) for f in frames]))
+
+
+def load_video_frames_tensor(source, max_frames: Optional[int] = None) -> torch.Tensor:
+    """Load a video reference from disk as a uint8 ``[T, H, W, C]`` RGB tensor.
+
+    Public helper for building video-reference tensors client-side. Accepts a
+    video file, a single still image (one frame), or a directory of frame
+    images (sorted lexicographically). Dispatch is by content, not suffix
+    (see the content-classification probes above).
+    """
+    path = Path(source)
+    if not path.exists():
+        raise ValueError(f"Video reference path does not exist: {path}")
+    if path.is_dir():
+        # Directories are selected by suffix, deliberately unlike single files:
+        # a frame directory is user-curated (names are the interface), suffix
+        # selection costs no file opens (a decodability probe is an open per
+        # entry — painful for thousands of frames on network filesystems), and
+        # it fails the right way — a selected frame that doesn't decode raises
+        # below, whereas a probe would silently drop corrupt frames and produce
+        # a video with holes.
+        frame_paths = sorted(p for p in path.iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES)
+        if not frame_paths:
+            raise ValueError(f"No image frames found in directory: {path}")
+        if max_frames is not None:
+            frame_paths = frame_paths[:max_frames]
+        return frames_to_tensor([Image.open(p) for p in frame_paths])
+    if is_decodable_image_file(path):
+        return frames_to_tensor([Image.open(path)])
+    if is_decodable_video_file(path):
+        return frames_to_tensor(decode_video_frames(path, max_frames=max_frames))
+    raise ValueError(
+        f"Video reference must be a decodable video, a decodable image, or a "
+        f"directory of frame images; got undecodable {path}"
+    )
+
+
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
     """Return a VideoCapture backend that can read from a Python `BytesIO`.
 

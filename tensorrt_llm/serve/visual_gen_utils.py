@@ -3,8 +3,11 @@ import base64
 import os
 from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes, is_decodable_image_bytes
-from tensorrt_llm.inputs.multimodal_data import VideoData
+from tensorrt_llm.inputs.media_io import (
+    decode_video_frames_from_bytes,
+    frames_to_tensor,
+    is_decodable_image_bytes,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -166,10 +169,8 @@ def parse_visual_gen_params(
             # Classify by decoding the bytes in memory — nothing touches disk
             # until the modality is known and validated.
             if is_decodable_image_bytes(payload):
-                # I2V: the stored image file is the cross-model contract —
-                # every I2V pipeline reads ``params.image`` as a path. One
-                # write, straight to the final name; the id is unique per
-                # request, so no reader can observe it early.
+                # I2V: the stored image file is the cross-model contract.
+                # every I2V pipeline reads ``params.image`` as a path.
                 if media_storage_path is None:
                     raise ValueError(
                         "media_storage_path is required when input_reference is an image"
@@ -179,11 +180,7 @@ def parse_visual_gen_params(
                     f.write(payload)
                 params.image = ref_path
             else:
-                # V2V: decode in memory into ``VideoData`` under
-                # ``multi_modal_data["video"]`` — the one intake video-capable
-                # pipelines read; no file is materialized. The decode is
-                # model-agnostic (all frames, no crop); each pipeline picks
-                # its own conditioning window.
+                # V2V: decode in memory into a uint8 [T, H, W, C] tensor
                 try:
                     frames = decode_video_frames_from_bytes(payload)
                 except ValueError as exc:
@@ -191,7 +188,9 @@ def parse_visual_gen_params(
                         "input_reference content is neither a decodable image "
                         "nor a decodable video."
                     ) from exc
-                params.multi_modal_data = {"video": VideoData(frames=frames, metadata={})}
+                if params.extra_params is None:
+                    params.extra_params = {}
+                params.extra_params["video"] = frames_to_tensor(frames)
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
