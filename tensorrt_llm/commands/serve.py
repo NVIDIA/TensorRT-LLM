@@ -5,10 +5,12 @@ import inspect
 import json
 import os
 import secrets
+import select
 import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
@@ -404,6 +406,13 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     carrying the launcher executor's attach endpoints; its executor
     attaches to the already-running worker instead of launching one (see
     GenerationExecutor.create / GenerationExecutorFrontendProxy).
+
+    Blocks until every child signals READY over its inherited pipe: a
+    successful Popen only proves the process exists, while the frontend
+    can still fail during executor attach or server setup. Any child
+    failure (or a missed deadline) fails the whole group, terminating
+    the children already started, so num_serve_frontends=K never
+    silently degrades to fewer frontends.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -417,21 +426,81 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     # once consumed (GenerationExecutor.create).
     attach_env = json.dumps(attach_info)
 
-    children = []
-    for frontend_id in range(1, num_frontends):
-        # Strip MPI/SLURM identity vars: an inherited rank identity would
-        # make the child's mpi4py try to (re-)join the launcher's job.
-        env, _ = split_mpi_env()
-        env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
-        env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
-        env["TLLM_DISABLE_MPI"] = "1"
-        child = subprocess.Popen([sys.executable] + sys.argv,
-                                 env=env)  # nosec B603
-        children.append(child)
-        logger.info(
-            f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
-        )
+    children, ready_fds = [], []
+    try:
+        for frontend_id in range(1, num_frontends):
+            # Strip MPI/SLURM identity vars: an inherited rank identity would
+            # make the child's mpi4py try to (re-)join the launcher's job.
+            env, _ = split_mpi_env()
+            env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
+            env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
+            env["TLLM_DISABLE_MPI"] = "1"
+            read_fd, write_fd = os.pipe()
+            ready_fds.append(read_fd)
+            env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
+            try:
+                child = subprocess.Popen([sys.executable] + sys.argv,
+                                         env=env,
+                                         pass_fds=(write_fd, ))  # nosec B603
+            finally:
+                # The child now holds the only write end; its exit before
+                # READY surfaces as EOF on read_fd.
+                os.close(write_fd)
+            children.append(child)
+            logger.info(
+                f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
+            )
+        _wait_attached_frontends_ready(children, ready_fds)
+    except BaseException:
+        _terminate_attached_frontends(children)
+        raise
+    finally:
+        for fd in ready_fds:
+            os.close(fd)
     return children
+
+
+def _wait_attached_frontends_ready(children: list, ready_fds: list) -> None:
+    """Block until every attached frontend writes its READY byte."""
+    timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
+    deadline = time.monotonic() + timeout
+    pending = dict(zip(ready_fds, children))
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"{len(pending)} attached frontend(s) not ready within "
+                f"{timeout:.0f}s (TLLM_FRONTEND_READY_TIMEOUT)")
+        readable, _, _ = select.select(list(pending), [], [],
+                                       min(remaining, 1.0))
+        for fd in readable:
+            child = pending.pop(fd)
+            if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
+                raise RuntimeError(
+                    f"Attached frontend (pid {child.pid}) exited before "
+                    "signaling READY")
+            logger.info(f"Attached frontend (pid {child.pid}) is ready")
+        for fd, child in list(pending.items()):
+            if child.poll() is not None:
+                raise RuntimeError(
+                    f"Attached frontend (pid {child.pid}) exited with code "
+                    f"{child.returncode} before signaling READY")
+
+
+def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
+    """Report READY to the launcher over the inherited pipe.
+
+    Called once everything fallible in an attached frontend's startup
+    (port bind, executor attach, LLM and OpenAIServer construction,
+    middleware registration) has succeeded; the launcher blocks group
+    startup on this byte (see _wait_attached_frontends_ready).
+    """
+    ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
+    if not (multi_frontend.is_attached_frontend and ready_fd):
+        return
+    fd = int(ready_fd)
+    os.write(fd, b"R")
+    os.close(fd)
 
 
 def _terminate_attached_frontends(children: list) -> None:
@@ -503,30 +572,35 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
+        # The finally below is the cleanup boundary for the attached
+        # frontends: it must cover everything from their spawn through
+        # server construction, middleware registration, and runtime, or a
+        # failure in between leaks the child processes.
         frontend_children = []
-        if multi_frontend.is_launcher:
-            frontend_children = _spawn_attached_frontends(
-                llm, multi_frontend.num_frontends)
-
-        server = OpenAIServer(
-            generator=llm,
-            model=model,
-            tool_parser=tool_parser,
-            server_role=server_role,
-            metadata_server_cfg=metadata_server_cfg,
-            disagg_cluster_config=disagg_cluster_config,
-            multimodal_server_config=multimodal_server_config,
-            chat_template=chat_template,
-            allow_request_chat_template=allow_request_chat_template,
-            input_processor_workers=num_input_processor_workers,
-            media_load_workers=num_media_load_workers)
-        _apply_fastapi_middlewares(server.app, middleware)
-
-        # Optionally disable GC (default: not disabled)
-        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-            gc.disable()
-
         try:
+            if multi_frontend.is_launcher:
+                frontend_children = _spawn_attached_frontends(
+                    llm, multi_frontend.num_frontends)
+
+            server = OpenAIServer(
+                generator=llm,
+                model=model,
+                tool_parser=tool_parser,
+                server_role=server_role,
+                metadata_server_cfg=metadata_server_cfg,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
+                chat_template=chat_template,
+                allow_request_chat_template=allow_request_chat_template,
+                input_processor_workers=num_input_processor_workers,
+                media_load_workers=num_media_load_workers)
+            _apply_fastapi_middlewares(server.app, middleware)
+
+            # Optionally disable GC (default: not disabled)
+            if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                gc.disable()
+
+            _signal_frontend_ready(multi_frontend)
             uvloop.run(server(host, port, sockets=[s]))
         finally:
             if frontend_children:
