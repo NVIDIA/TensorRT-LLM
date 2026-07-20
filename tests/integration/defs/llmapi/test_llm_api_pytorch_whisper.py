@@ -209,19 +209,38 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
         assert generated[: len(expected)] == expected
 
 
-def test_whisper_pytorch_beam_search(monkeypatch):
+# Beam always rides kv-v1: KVCacheManagerV2 requires beam width 1 (a v2
+# preference with beam > 1 silently falls back to v1). The bf16 graphs-on case
+# captures decode graphs over batch_size * beam_width sequences.
+_BEAM_SEARCH_CASES = [
+    pytest.param(None, None, False, id="fp32-kv-v1-graphs-off-beam2"),
+    pytest.param("bfloat16", [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
+]
+
+
+@pytest.mark.parametrize("torch_dtype,cuda_graph_batch_sizes,graphs_captured", _BEAM_SEARCH_CASES)
+def test_whisper_pytorch_beam_search(
+    monkeypatch, torch_dtype, cuda_graph_batch_sizes, graphs_captured
+):
     """Beam-2 transcription (cross-KV shared across beams)."""
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
 
-    with _make_llm(model_path, max_beam_width=2) as llm:
+    llm = _make_llm(
+        model_path,
+        max_beam_width=2,
+        torch_dtype=torch_dtype,
+        cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+    )
+    with llm:
         beam_params = SamplingParams(
             best_of=2, n=1, temperature=0.0, use_beam_search=True, max_tokens=_MAX_NEW_TOKENS
         )
         outputs = llm.generate([_audio_prompt(wave, sample_rate)], beam_params)
         assert _EXPECTED_TRANSCRIPT_FRAGMENT in outputs[0].outputs[0].text.lower()
+        _assert_decoder_cuda_graph_state(llm, captured=graphs_captured)
 
 
 def _assert_decoder_cuda_graph_state(llm: LLM, captured: bool) -> None:
@@ -245,7 +264,7 @@ _FEATURE_COMBINATION_CASES = [
     pytest.param(None, True, None, False, 1, id="fp32-kv-v2-graphs-off-greedy"),
     pytest.param(None, False, [1, 2], False, 1, id="fp32-kv-v1-graphs-requested-greedy"),
     pytest.param("bfloat16", False, [1, 2], True, 1, id="bf16-kv-v1-decoder-graphs-on-greedy"),
-    pytest.param("bfloat16", True, None, False, 1, id="bf16-kv-v2-graphs-off-greedy"),
+    pytest.param("bfloat16", True, [1, 2], True, 1, id="bf16-kv-v2-decoder-graphs-on-greedy"),
     pytest.param("float16", False, None, False, 1, id="fp16-kv-v1-graphs-off-greedy"),
     pytest.param(
         None,

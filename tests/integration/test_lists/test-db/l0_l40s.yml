@@ -38,7 +38,7 @@ l0_l40s:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
   # Whisper (encoder-decoder) — customer-side deployment targets L40S/H200
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
 - condition:
     ranges:
       system_gpu_count:
@@ -53,10 +53,11 @@ l0_l40s:
       backend: pytorch
   tests:
   # Whisper (encoder-decoder) — customer-side deployment targets L40S/H200
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[fp32-kv-v1-graphs-off-beam2]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v1-decoder-graphs-on-beam2]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v2-graphs-off-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-requested-greedy]
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-graphs-off-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v1-graphs-off-greedy]
 - condition:
     ranges:
