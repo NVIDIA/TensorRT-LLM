@@ -5,7 +5,6 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
@@ -72,50 +71,46 @@ class MultimodalEncoderProgress(Enum):
 
 @dataclass
 class MultimodalEncoderRequestState:
-    """Per-item MM encoder state owned by one request.
+    """Per-item MM encoder bookkeeping owned by one request.
 
     Created at admission by `initialize_multimodal_encoder_request` for
     requests whose raw MM payloads run through the item scheduler; the
     request's `py_mm_encoder_state` is `None` otherwise. Item slots are
-    filled from two sources — fresh encoder outputs and embeddings-cache
-    hits — through the single `fill()` writer, so validation and buffer
-    allocation cannot diverge between them.
+    recorded from two sources — fresh encoder outputs adopted into the
+    `MultimodalEncoderCacheManager` and manager hits — through the single
+    `record()` writer, so validation cannot diverge between them.
+
+    The state holds no storage of its own: every slot aliases a
+    manager-owned entry that the request pins until its prefill consumes
+    the embedding. Pins are released through the executor's teardown
+    funnel (`unpin_request`), never by this object; pinned entries cannot
+    be evicted, so a recorded slot cannot regress.
 
     The state is rank-local and never crosses a serialization boundary:
     schedule distribution carries request/item IDs only, and every rank
-    constructs its own state at admission. The embedding that
-    `finalize_into()` publishes is the `output_buffer` itself, so it stays
-    alive through the request's `multimodal_data` dict even after this
-    state object is dropped post-prefill.
+    constructs its own state at admission.
     """
 
-    output_offsets: List[int]
-    """Row offset of each item inside ``output_buffer``:
-    ``accumulate(embedding_lengths, initial=0)``."""
+    embedding_lengths: List[int]
+    """Declared embedding row count of each atomic item, in prompt order.
+    `record()` validates incoming views against these."""
 
     outputs: List[Optional[torch.Tensor]]
     """One slot per atomic item, in prompt order. ``None`` until the item is
-    filled; then a view into ``output_buffer``. Because the slot holds an
-    owned copy, a later embeddings-cache eviction cannot regress
-    progress."""
-
-    output_buffer: Optional[torch.Tensor] = None
-    """Single contiguous tensor covering all items, lazily allocated by the
-    first ``fill()`` so items filled across iterations and sources land in
-    one fuse-ready embedding."""
+    recorded; then an alias of a pinned ``MultimodalEncoderCacheManager``
+    entry."""
 
     @classmethod
     def from_embedding_lengths(
             cls,
             embedding_lengths: List[int]) -> "MultimodalEncoderRequestState":
-        return cls(output_offsets=list(accumulate(embedding_lengths,
-                                                  initial=0)),
+        return cls(embedding_lengths=list(embedding_lengths),
                    outputs=[None] * len(embedding_lengths))
 
     def __post_init__(self) -> None:
-        if len(self.output_offsets) != len(self.outputs) + 1:
-            raise ValueError("MM encoder output offsets must have exactly one "
-                             "more entry than item slots")
+        if len(self.embedding_lengths) != len(self.outputs):
+            raise ValueError("MM encoder embedding lengths must have exactly "
+                             "one entry per item slot")
 
     @property
     def num_items(self) -> int:
@@ -136,50 +131,49 @@ class MultimodalEncoderRequestState:
             if output is None
         ]
 
-    def fill(self, item_idx: int, output: torch.Tensor) -> torch.Tensor:
-        """Copy one item's encoder output into the owned buffer and slot.
+    def record(self, item_idx: int, output_view: torch.Tensor) -> None:
+        """Record one item's manager-owned output view into its slot.
 
-        ``output`` may come from a fresh encoder forward or from the
-        embeddings cache; either way its rows are copied into the contiguous
-        buffer at this item's reserved offsets and the slot records the
-        resulting view, which is also returned so callers never need to
-        reach into the slots directly. Raises when the output does not match
-        the item's reserved row count or the buffer's shape/dtype/device.
+        ``output_view`` must come from the `MultimodalEncoderCacheManager`
+        (`adopt()` for fresh encoder outputs, `get_and_pin()` for hits) so
+        it is already pinned on this request's behalf; no copy happens
+        here. Raises when the view does not match the item's declared row
+        count, when the item was already recorded, or when it disagrees
+        with previously recorded items on trailing shape/dtype/device
+        (items of one request must concatenate cleanly at fuse time).
         """
-        expected_rows = (self.output_offsets[item_idx + 1] -
-                         self.output_offsets[item_idx])
-        if output.shape[0] != expected_rows:
+        expected_rows = self.embedding_lengths[item_idx]
+        if output_view.shape[0] != expected_rows:
             raise ValueError(
-                f"MM item {item_idx} produced {output.shape[0]} embeddings; "
-                f"expected {expected_rows}")
-        if self.output_buffer is None:
-            self.output_buffer = torch.empty(
-                (self.output_offsets[-1], *output.shape[1:]),
-                dtype=output.dtype,
-                device=output.device,
-            )
-        if (self.output_buffer.shape[1:] != output.shape[1:]
-                or self.output_buffer.dtype != output.dtype
-                or self.output_buffer.device != output.device):
+                f"MM item {item_idx} produced {output_view.shape[0]} "
+                f"embeddings; expected {expected_rows}")
+        if self.outputs[item_idx] is not None:
+            raise ValueError(
+                f"MM item {item_idx} was already recorded; items are "
+                "encoded at most once per request")
+        reference = next((o for o in self.outputs if o is not None), None)
+        if reference is not None and (
+                reference.shape[1:] != output_view.shape[1:] or reference.dtype
+                != output_view.dtype or reference.device != output_view.device):
             raise ValueError(
                 "MM encoder items for one request must have matching "
                 "output shape, dtype, and device")
-        output_view = self.output_buffer[self.output_offsets[item_idx]:self.
-                                         output_offsets[item_idx + 1]]
-        output_view.copy_(output)
         self.outputs[item_idx] = output_view
-        return output_view
 
     def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
-        """Publish the fuse-ready embedding once every item slot is filled.
+        """Publish the item views once every slot is recorded.
 
-        Attaches ``output_buffer`` as ``multimodal_embedding`` (an alias, not
-        a copy) and drops the raw pre-encoder inputs. No-op returning
-        ``False`` while any slot is still pending.
+        Attaches the prompt-ordered list of pinned item views as
+        ``multimodal_embedding`` and drops the raw pre-encoder inputs. The
+        views stay manager-owned; the per-request contiguous embedding is
+        materialized lazily inside the prefill forward
+        (`get_multimodal_embeddings`), so between encode and prefill the
+        only GPU residency is the manager's accounted entries. No-op
+        returning ``False`` while any slot is still pending.
         """
         if not self.outputs or any(output is None for output in self.outputs):
             return False
-        multimodal_data["multimodal_embedding"] = self.output_buffer
+        multimodal_data["multimodal_embedding"] = list(self.outputs)
         strip_mm_encoder_inputs(multimodal_data)
         return True
 

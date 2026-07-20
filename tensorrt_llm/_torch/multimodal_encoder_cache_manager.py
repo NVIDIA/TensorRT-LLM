@@ -1,0 +1,268 @@
+# Copyright 2026 NVIDIA CORPORATION & AFFILIATES
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from collections.abc import Hashable
+from threading import RLock
+from typing import Generic, NamedTuple, TypeVar
+
+import torch
+
+from tensorrt_llm.logger import logger
+
+K = TypeVar("K", bound=Hashable)
+
+RequestId = int
+
+
+class _Entry(NamedTuple):
+    value: torch.Tensor
+    size_bytes: int
+
+
+class MultimodalEncoderCacheStats(NamedTuple):
+    max_bytes: int
+    current_bytes: int
+    pinned_bytes: int
+    item_count: int
+    pinned_count: int
+    hits: int
+    misses: int
+    adoptions: int
+    dedup_adoptions: int
+    evictions: int
+
+
+class MultimodalEncoderCacheManager(Generic[K]):
+    """Budgeted single storage for multimodal encoder outputs.
+
+    This is the item-scheduling counterpart of vLLM's ``EncoderCacheManager``:
+    encoder outputs live *only* here, requests reference entries by key, and
+    the byte budget therefore bounds the total GPU memory resident encoder
+    outputs can occupy. Cross-request reuse is a side effect of the storage
+    being content-addressed, not a separate cache.
+
+    Semantics:
+
+    - **Pinning.** An entry is pinned while at least one request references
+      it. Pinned entries are never evicted; a pin is the request's guarantee
+      that the embedding survives until its prefill consumes it.
+    - **Allocate-before-compute.** Callers (the MM item scheduler) must check
+      `can_allocate()` before encoding an item. `adopt()` evicting only
+      zero-reference entries relies on that contract and raises if it cannot
+      make room.
+    - **Adopt, not copy.** `adopt()` takes ownership of the caller's tensor
+      without cloning. If the key already exists, the existing entry is
+      pinned and returned instead — concurrent duplicate encodes of the same
+      content collapse to one resident copy.
+    - **Zero-ref residency.** Entries whose last pin was released stay
+      resident in LRU order for reuse and are reclaimed only when a later
+      allocation needs the space.
+
+    Returned tensors alias manager-owned storage and must be treated as
+    immutable by callers.
+
+    Args:
+        max_bytes: Maximum logical tensor bytes held by this manager.
+        name: Short label used in debug log messages.
+    """
+
+    def __init__(
+        self,
+        max_bytes: int,
+        *,
+        name: str = "mm_encoder_cache",
+    ) -> None:
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+
+        self._max_bytes = max_bytes
+        self._name = name
+        self._current_bytes = 0
+        self._pinned_bytes = 0
+        # Recency order over all entries; eviction walks from the LRU end
+        # skipping pinned entries.
+        self._entries: OrderedDict[K, _Entry] = OrderedDict()
+        self._key_pins: dict[K, set[RequestId]] = {}
+        self._request_keys: dict[RequestId, set[K]] = {}
+        self._lock = RLock()
+        self._hits = 0
+        self._misses = 0
+        self._adoptions = 0
+        self._dedup_adoptions = 0
+        self._evictions = 0
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def current_bytes(self) -> int:
+        with self._lock:
+            return self._current_bytes
+
+    @property
+    def pinned_bytes(self) -> int:
+        with self._lock:
+            return self._pinned_bytes
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def available_bytes(self, *, reserved_bytes: int = 0) -> int:
+        """Bytes obtainable for new allocations: free plus zero-ref
+        reclaimable space, minus the caller's outstanding reservation."""
+        with self._lock:
+            return max(0, self._max_bytes - self._pinned_bytes - reserved_bytes)
+
+    def can_allocate(self, nbytes: int, *, reserved_bytes: int = 0) -> bool:
+        """Whether `nbytes` can be admitted without evicting pinned entries.
+
+        `reserved_bytes` lets the scheduler set space aside for the
+        head-of-line request's remaining items before admitting items of
+        later requests (deadlock avoidance)."""
+        return nbytes <= self.available_bytes(reserved_bytes=reserved_bytes)
+
+    def contains(self, key: K) -> bool:
+        with self._lock:
+            return key in self._entries
+
+    def get_and_pin(self, key: K, request_id: RequestId) -> torch.Tensor | None:
+        """Return the entry for `key` pinned on behalf of `request_id`,
+        or `None` on miss. The hit is promoted to most-recently-used."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self._misses += 1
+                return None
+            self._hits += 1
+            self._entries.move_to_end(key)
+            self._pin(key, entry, request_id)
+            return entry.value
+
+    def adopt(self, key: K, value: torch.Tensor, request_id: RequestId) -> torch.Tensor:
+        """Store `value` (taking ownership, no clone) pinned for `request_id`.
+
+        If `key` is already resident the existing tensor is pinned and
+        returned and `value` is dropped. Evicts zero-reference entries as
+        needed; raises `RuntimeError` when space cannot be made — callers
+        must have passed `can_allocate()` first (allocate-before-compute).
+        """
+        size_bytes = value.numel() * value.element_size()
+
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is not None:
+                self._dedup_adoptions += 1
+                self._entries.move_to_end(key)
+                self._pin(key, existing, request_id)
+                return existing.value
+
+            if not self.can_allocate(size_bytes):
+                raise RuntimeError(
+                    f"{self._name}: cannot adopt {size_bytes} bytes; "
+                    f"pinned={self._pinned_bytes}, max={self._max_bytes}. "
+                    "The MM item scheduler must reserve space via "
+                    "can_allocate() before encoding."
+                )
+
+            self._evict_zero_ref_until(self._max_bytes - size_bytes)
+            entry = _Entry(value=value, size_bytes=size_bytes)
+            self._entries[key] = entry
+            self._current_bytes += size_bytes
+            self._adoptions += 1
+            self._pin(key, entry, request_id)
+            return entry.value
+
+    def unpin_request(self, request_id: RequestId) -> None:
+        """Release every pin held by `request_id` (idempotent).
+
+        This is the single teardown funnel: prefill completion, cancellation,
+        and error paths all route here. Entries left with zero references
+        stay resident for reuse until eviction needs their space.
+        """
+        with self._lock:
+            keys = self._request_keys.pop(request_id, None)
+            if not keys:
+                return
+            for key in keys:
+                pins = self._key_pins.get(key)
+                if pins is None:
+                    continue
+                pins.discard(request_id)
+                if not pins:
+                    del self._key_pins[key]
+                    entry = self._entries.get(key)
+                    if entry is not None:
+                        self._pinned_bytes -= entry.size_bytes
+
+    def clear(self) -> None:
+        """Drop all entries and pins. Only safe when no request is active
+        (e.g. warmup teardown or weight updates)."""
+        with self._lock:
+            self._entries.clear()
+            self._key_pins.clear()
+            self._request_keys.clear()
+            self._current_bytes = 0
+            self._pinned_bytes = 0
+
+    def stats(self) -> MultimodalEncoderCacheStats:
+        with self._lock:
+            return MultimodalEncoderCacheStats(
+                max_bytes=self._max_bytes,
+                current_bytes=self._current_bytes,
+                pinned_bytes=self._pinned_bytes,
+                item_count=len(self._entries),
+                pinned_count=len(self._key_pins),
+                hits=self._hits,
+                misses=self._misses,
+                adoptions=self._adoptions,
+                dedup_adoptions=self._dedup_adoptions,
+                evictions=self._evictions,
+            )
+
+    def log_stats(self, reason: str) -> None:
+        stats = self.stats()
+        logger.debug(
+            f"{self._name}: stats after {reason}: items={stats.item_count} "
+            f"(pinned={stats.pinned_count}), bytes={stats.current_bytes}"
+            f"/{stats.max_bytes} (pinned={stats.pinned_bytes}), "
+            f"hits={stats.hits}, misses={stats.misses}, "
+            f"adoptions={stats.adoptions} (dedup={stats.dedup_adoptions}), "
+            f"evictions={stats.evictions}"
+        )
+
+    def _pin(self, key: K, entry: _Entry, request_id: RequestId) -> None:
+        pins = self._key_pins.setdefault(key, set())
+        if not pins:
+            self._pinned_bytes += entry.size_bytes
+        pins.add(request_id)
+        self._request_keys.setdefault(request_id, set()).add(key)
+
+    def _evict_zero_ref_until(self, target_bytes: int) -> None:
+        if self._current_bytes <= target_bytes:
+            return
+        for key in list(self._entries):
+            if self._current_bytes <= target_bytes:
+                break
+            if key in self._key_pins:
+                continue
+            entry = self._entries.pop(key)
+            self._current_bytes -= entry.size_bytes
+            self._evictions += 1
