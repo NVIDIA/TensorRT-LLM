@@ -2012,14 +2012,7 @@ class PyExecutor:
 
             # Aggregate stats from all generation requests
             for req in scheduled_batch.generation_requests:
-                # Skip attention-DP / cuda-graph padding dummy requests: they
-                # carry synthetic py_draft_tokens=[1]*k (resource_manager
-                # add_dummy_requests is_gen branch) and a spec-sampler-assigned
-                # accepted count, which otherwise pollute the specdec AR/AL
-                # metric (the parallel speculation-gate loop already filters
-                # is_dummy). Without this, idle-rank gen dummies inflate the
-                # denominator with mostly-rejected rows and depress AR/AL,
-                # especially on disagg-GEN workers under attention-DP.
+                # exclude attention dp dummy / CUDA Graph padding requests from AL calculation
                 if getattr(req, 'is_dummy', False):
                     continue
                 draft_len = getattr(req, 'num_draft_tokens', 0)
