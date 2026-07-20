@@ -14,9 +14,8 @@
 # limitations under the License.
 
 # 1-GPU Qwen-Image-Edit-2511 with selective NVFP4 dynamic quantization.
-# Q/K/V projections remain in BF16 because they preserve edit strength better
-# in the Qwen-Image-Edit LPIPS sweep. Shared by offline examples
-# (--visual_gen_args) and trtllm-serve.
+# Q/K/V projections remain in BF16 because they preserve accuracy
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
 quant_config:
   quant_algo: NVFP4
   dynamic: true
