@@ -25,7 +25,7 @@ top of the quantized anchor, but quantization itself had already moved the resul
 BF16.
 
 <p align="center">
-  <img src="../media/tech_blog26_single_gpu_latency.png" alt="Grouped bar chart showing single-B200 end-to-end latency for BF16, FP8 block-scaled, and NVFP4 GEMMs with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
+  <img src="../media/tech_blog27_single_gpu_latency.png" alt="Grouped bar chart showing single-B200 end-to-end latency for BF16, FP8 block-scaled, and NVFP4 GEMMs with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 1. The three optimizations compose. All speedups use the same
@@ -132,28 +132,23 @@ has mean LPIPS 0.118 against eager BF16, so the absolute LPIPS values include co
 
 ## Where the BF16 baseline time goes
 
-An Nsight Systems trace on the current TensorRT-LLM 1.3.0rc21 image provides a representative
-breakdown of the compiled dense BF16 path. It uses the same p07 prompt, seed, resolution, frame
-count, and denoising steps as the sweep. The captured forward on one B200 took 537.2 seconds. A
-configuration-matched unprofiled run on another B200 took 528.2 seconds, a cross-GPU delta of
-1.7%; treat that delta only as an estimate of tracing overhead. The percentages below are
-projected onto the historical 525.0-second baseline for intuition; they are not a trace of the
-original seven-prompt rc19 run.
+Profiling the compiled dense BF16 pipeline shows where the optimization opportunity is
+concentrated. Attention accounts for nearly three quarters of end-to-end latency, while GEMMs
+account for roughly one fifth.
 
-| Work | Captured share | Projected time at 525.0s |
-| :--- | ---: | ---: |
-| Attention | 71.73% | 376.6s |
-| GEMM | 20.77% | 109.0s |
-| Other GPU work and host/idle | 7.50% | 39.4s |
+| Work | Share of pipeline time |
+| :--- | ---: |
+| Attention | 71.7% |
+| GEMM | 20.8% |
+| Other pipeline work | 7.5% |
 
-Attention includes TensorRT-LLM FMHA and cuDNN SDPA kernels. GEMM includes the NVJET
-matrix-multiply launches. The remaining category includes normalization, RoPE, activations,
-scheduler and VAE work, memory operations, and host or GPU-idle time. Device-event overlap was
-less than 0.004% of wall time, so the categories close to 100% without double-counting.
+Attention includes TensorRT-LLM FMHA and cuDNN SDPA kernels. GEMM includes linear-layer matrix
+multiplications. The remaining category includes normalization, RoPE, activations, scheduler and
+VAE work, memory operations, and host or GPU-idle time.
 
 This distribution explains why the optimizations compose asymmetrically. SAGE and Skip Softmax
-target the largest component, while FP8 block-scaled and NVFP4 GEMMs target roughly one fifth of
-the baseline. End-to-end gains also depend on the kernels left in the final category.
+target the largest component, while FP8 block-scaled and NVFP4 GEMMs target another substantial
+part of the pipeline. Work outside attention and GEMM limits the total end-to-end speedup.
 
 ## End-to-end results
 
@@ -181,7 +176,7 @@ Several effects are visible:
 ## Quality and the dense-family anchor
 
 <p align="center">
-  <img src="../media/tech_blog26_quality_speed_frontier.png" alt="Scatter plot of all 96 configurations showing speedup over compiled dense BF16 against mean LPIPS distance to eager BF16, with dense family anchors marked as stars" width="1080">
+  <img src="../media/tech_blog27_quality_speed_frontier.png" alt="Scatter plot of all 96 configurations showing speedup over compiled dense BF16 against mean LPIPS distance to eager BF16, with dense family anchors marked as stars" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 2. All 90 Skip Softmax variants and six dense family anchors.
@@ -277,8 +272,8 @@ for the checkpoint schema and Python API. To test FP8, change `quant_algo` to
   layer or denoising step.
 - Dynamic quantization and compiled BF16 both introduce reference drift. Absolute LPIPS values
   should not be compared across builds; within-build family anchors are the valid comparison.
-- The component breakdown is one current-RC, single-prompt profile. Its percentages are useful
-  for attribution but are not a replacement for profiling every row of the historical sweep.
+- The component breakdown comes from a representative single-prompt profile. Workload mix may
+  vary across prompts and configurations.
 
 ## Conclusion
 
