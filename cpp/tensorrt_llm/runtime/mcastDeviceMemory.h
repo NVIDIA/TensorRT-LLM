@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ namespace tensorrt_llm::runtime
 
 //! \brief A class that manages multicast device memory for efficient communication between GPUs.
 //!
-//! This class uses IPC-based allocation if mnNvlink is true, otherwise it uses fabric allocation.
+//! This class uses fabric-backed allocation if mnNvlink is true, otherwise it uses intra-node NVLS allocation.
 //! The fabric allocation can also be used for single-node/intra-node-only communication, but the machine
 //! must properly configure IMEX services. See:
 //! https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/gettingstarted.html
@@ -86,6 +86,17 @@ public:
         return mGroupSize;
     }
 
+    //! Release fabric-backed physical memory while retaining virtual-address reservations.
+    void checkpointPrepare();
+
+    //! Recreate fabric-backed physical memory and remap it at the retained virtual addresses.
+    void checkpointRestore(int64_t mpiCommFortranHandle);
+
+    [[nodiscard]] bool isMapped() const
+    {
+        return mMapped;
+    }
+
     ~McastDeviceMemory();
 
 private:
@@ -97,6 +108,7 @@ private:
     size_t mAllocationSize;
 
     CUdeviceptr mMcPtr;
+    CUdeviceptr mUcBasePtr;
     CUmemGenericAllocationHandle mMcHandle;
     std::vector<CUmemGenericAllocationHandle> mUcHandles;
 
@@ -109,12 +121,15 @@ private:
     // Device array of pointers
     void** mUcPtrsDev;
     void** mSignalPadsDev;
+    bool mMapped;
 
     // For intra-node mcast
     tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle;
 
     void allocMnMcastMem(size_t bufSize);
+    void releaseMnMcastMem();
     void allocNvlsMcastMem(size_t bufSize);
+    void initializePointerTables();
 };
 
 constexpr size_t kSIGNAL_PAD_SIZE = 2048;

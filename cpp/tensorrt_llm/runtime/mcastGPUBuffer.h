@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,6 +53,7 @@ public:
     //! \return An ATen tensor wrapping the unicast buffer section.
     at::Tensor getUCBuffer(uint32_t rank, std::vector<long int> sizes, torch::ScalarType dtype, int64_t storageOffset)
     {
+        TORCH_CHECK(mMcastDeviceMemory.isMapped(), "McastGpuBuffer handles are not attached");
         size_t const numel = std::accumulate(sizes.begin(), sizes.end(), 1UL, std::multiplies<size_t>());
         size_t const elementSize = c10::elementSize(dtype);
         size_t const reqSize = (numel + storageOffset) * elementSize;
@@ -74,6 +75,7 @@ public:
     //! \return An ATen tensor wrapping the multicast buffer section.
     at::Tensor getMCBuffer(std::vector<long int> sizes, torch::ScalarType dtype, int64_t storageOffset)
     {
+        TORCH_CHECK(mMcastDeviceMemory.isMapped(), "McastGpuBuffer handles are not attached");
         size_t const numel = std::accumulate(sizes.begin(), sizes.end(), 1UL, std::multiplies<size_t>());
         size_t const elementSize = c10::elementSize(dtype);
         size_t const reqSize = (numel + storageOffset) * elementSize;
@@ -86,6 +88,21 @@ public:
             .options(options)
             .target_device(mLocalDevice)
             .make_tensor();
+    }
+
+    void checkpointPrepare()
+    {
+        mMcastDeviceMemory.checkpointPrepare();
+    }
+
+    void checkpointRestore(int64_t mpiCommFortranHandle)
+    {
+        mMcastDeviceMemory.checkpointRestore(mpiCommFortranHandle);
+    }
+
+    [[nodiscard]] bool isMapped() const
+    {
+        return mMcastDeviceMemory.isMapped();
     }
 
 private:

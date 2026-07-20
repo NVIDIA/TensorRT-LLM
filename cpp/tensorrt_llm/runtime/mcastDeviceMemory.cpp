@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cuda_runtime_api.h>
 
 namespace tensorrt_llm::runtime
@@ -47,12 +48,17 @@ McastDeviceMemory::McastDeviceMemory(
     , mSignalPadOffset(0)
     , mAllocationSize(0)
     , mMcPtr(0)
+    , mUcBasePtr(0)
     , mMcHandle(0)
 #if ENABLE_MULTI_DEVICE
     , mGroupComm(MPI_Comm_f2c(mpiCommFortranHandle), false)
 #else
     , mGroupComm(nullptr, false)
 #endif
+    , mUcPtrsDev(nullptr)
+    , mSignalPadsDev(nullptr)
+    , mMapped(false)
+    , mNvlsHandle(nullptr)
 {
 
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
@@ -90,19 +96,29 @@ McastDeviceMemory::McastDeviceMemory(
     {
         allocNvlsMcastMem(mSignalPadOffset + kSIGNAL_PAD_SIZE);
     }
-    // Initialize signal pads
+    initializePointerTables();
+}
+
+void McastDeviceMemory::initializePointerTables()
+{
+    // Initialize signal pads and rebuild graph-independent peer pointer tables.
     mSignalPads.resize(mGroupSize);
     for (size_t i = 0; i < mGroupSize; i++)
     {
         mSignalPads[i] = mUcPtrs[i] + mSignalPadOffset;
         if (i == mGroupRank)
         {
-            cuMemsetD8(mSignalPads[i], 0, kSIGNAL_PAD_SIZE);
+            TLLM_CU_CHECK(cuMemsetD8(mSignalPads[i], 0, kSIGNAL_PAD_SIZE));
         }
     }
-    // Copy host array of pointers to device array
-    TLLM_CUDA_CHECK(cudaMalloc(&mSignalPadsDev, mGroupSize * sizeof(CUdeviceptr)));
-    TLLM_CUDA_CHECK(cudaMalloc(&mUcPtrsDev, mGroupSize * sizeof(CUdeviceptr)));
+    if (mSignalPadsDev == nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaMalloc(&mSignalPadsDev, mGroupSize * sizeof(CUdeviceptr)));
+    }
+    if (mUcPtrsDev == nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaMalloc(&mUcPtrsDev, mGroupSize * sizeof(CUdeviceptr)));
+    }
     TLLM_CUDA_CHECK(
         cudaMemcpy(mSignalPadsDev, mSignalPads.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
     TLLM_CUDA_CHECK(cudaMemcpy(mUcPtrsDev, mUcPtrs.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
@@ -111,25 +127,34 @@ McastDeviceMemory::McastDeviceMemory(
 McastDeviceMemory::~McastDeviceMemory()
 {
     tensorrt_llm::common::unregisterMcastDevMemBuffer(this);
-    TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev));
-    TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev));
-
     if (mIsMNNvlink)
     {
-        for (uint32_t rank = 0; rank < mGroupSize; rank++)
+        if (mMapped)
         {
-            TLLM_CU_CHECK(cuMemUnmap(mUcPtrs[rank], mAllocationSize));
-            // We need to release the handle on each rank
-            TLLM_CU_CHECK(cuMemRelease(mUcHandles[rank]));
+            releaseMnMcastMem();
         }
-        TLLM_CU_CHECK(cuMemUnmap(mMcPtr, mAllocationSize));
-        TLLM_CU_CHECK(cuMemAddressFree(mMcPtr, mAllocationSize));
-        TLLM_CU_CHECK(cuMemRelease(mMcHandle));
+        if (mUcBasePtr != 0)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mUcBasePtr, mAllocationSize * mGroupSize));
+        }
+        if (mMcPtr != 0)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mMcPtr, mAllocationSize));
+        }
     }
     else
     {
         // The nvlsfree function will free the handle pointer as well
         tensorrt_llm::runtime::ipcNvlsFree(mNvlsHandle);
+    }
+
+    if (mSignalPadsDev != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev));
+    }
+    if (mUcPtrsDev != nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev));
     }
 }
 
@@ -146,11 +171,21 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     size_t alloc_granularity{0}, mc_granularity{0};
     TLLM_CU_CHECK(cuMemGetAllocationGranularity(&alloc_granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     // Round up the buffer size for grnularity
-    mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, alloc_granularity);
-    CUmulticastObjectProp mcProp = {.numDevices = mGroupSize, .size = mAllocationSize, .handleTypes = handle_type};
+    size_t allocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, alloc_granularity);
+    CUmulticastObjectProp mcProp = {.numDevices = mGroupSize, .size = allocationSize, .handleTypes = handle_type};
     TLLM_CU_CHECK(cuMulticastGetGranularity(&mc_granularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
-    mAllocationSize = roundUp(mAllocationSize, mc_granularity);
-    mUcHandles.resize(mGroupSize);
+    allocationSize = roundUp(allocationSize, mc_granularity);
+    mcProp.size = allocationSize;
+    if (mAllocationSize == 0)
+    {
+        mAllocationSize = allocationSize;
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(mAllocationSize == allocationSize,
+            "[McastDeviceMemory] Restored allocation layout differs from the retained virtual-address layout.");
+    }
+    mUcHandles.assign(mGroupSize, 0);
     // Allocates local gpu memory
     TLLM_CU_CHECK(cuMemCreate(&(mUcHandles[mGroupRank]), mAllocationSize, &prop, 0));
 
@@ -159,40 +194,45 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     CUmemFabricHandle myhndl;
     TLLM_CU_CHECK(cuMemExportToShareableHandle(&myhndl, mUcHandles[mGroupRank], CU_MEM_HANDLE_TYPE_FABRIC, 0));
     // All gather
-    cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle));
-    memcpy(exphndl + mGroupRank * sizeof(CUmemFabricHandle), &myhndl, sizeof(CUmemFabricHandle));
-    mGroupComm.allgather(
-        exphndl + mGroupRank * sizeof(CUmemFabricHandle), exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
-    cudaDeviceSynchronize();
+    TLLM_CUDA_CHECK(cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle)));
+    std::memcpy(exphndl + mGroupRank, &myhndl, sizeof(CUmemFabricHandle));
+    mGroupComm.allgather(exphndl + mGroupRank, exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
 
     for (uint32_t p = 0; p < mGroupSize; p++)
+    {
         if (p != mGroupRank)
+        {
             TLLM_CU_CHECK(cuMemImportFromShareableHandle(
                 &mUcHandles[p], reinterpret_cast<void*>(&exphndl[p]), CU_MEM_HANDLE_TYPE_FABRIC));
-    cudaFreeHost(exphndl);
+        }
+    }
+    TLLM_CUDA_CHECK(cudaFreeHost(exphndl));
 
     // Initialize multicasting
     CUmemFabricHandle* fabric_handle;
-    cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle));
+    TLLM_CUDA_CHECK(cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle)));
     if (mGroupRank == 0)
     {
         TLLM_CU_CHECK(cuMulticastCreate(&mMcHandle, &mcProp));
-        TLLM_CU_CHECK(cuMemExportToShareableHandle((void*) fabric_handle, mMcHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+        TLLM_CU_CHECK(cuMemExportToShareableHandle(fabric_handle, mMcHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
     }
     // Broadcast
     mGroupComm.bcast(fabric_handle, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR, 0);
-    cudaDeviceSynchronize();
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
     if (mGroupRank != 0)
     {
-        TLLM_CU_CHECK(cuMemImportFromShareableHandle(&mMcHandle, (void*) fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC));
+        TLLM_CU_CHECK(cuMemImportFromShareableHandle(&mMcHandle, fabric_handle, CU_MEM_HANDLE_TYPE_FABRIC));
     }
     TLLM_CU_CHECK(cuMulticastAddDevice(mMcHandle, mDeviceIdx));
-    cudaFreeHost(fabric_handle);
+    TLLM_CUDA_CHECK(cudaFreeHost(fabric_handle));
 
     // Bind memory addresses
     mUcPtrs.resize(mGroupSize);
-    CUdeviceptr ptr;
-    TLLM_CU_CHECK(cuMemAddressReserve(&ptr, mAllocationSize * mGroupSize, mc_granularity, 0ULL, 0));
+    if (mUcBasePtr == 0)
+    {
+        TLLM_CU_CHECK(cuMemAddressReserve(&mUcBasePtr, mAllocationSize * mGroupSize, mc_granularity, 0ULL, 0));
+    }
     CUmemAccessDesc accessDesc = {};
     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
@@ -200,17 +240,76 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 
     for (uint32_t i = 0; i < mGroupSize; i++)
     {
-        TLLM_CU_CHECK(cuMemMap(ptr + (mAllocationSize * i), mAllocationSize, 0, mUcHandles[i], 0));
-        mUcPtrs[i] = (ptr + (mAllocationSize * i));
+        mUcPtrs[i] = mUcBasePtr + (mAllocationSize * i);
+        TLLM_CU_CHECK(cuMemMap(mUcPtrs[i], mAllocationSize, 0, mUcHandles[i], 0));
     }
-    TLLM_CU_CHECK(cuMemSetAccess(ptr, mAllocationSize * mGroupSize, &accessDesc, 1));
+    TLLM_CU_CHECK(cuMemSetAccess(mUcBasePtr, mAllocationSize * mGroupSize, &accessDesc, 1));
 
     // Bind MC Pointers
-    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
+    if (mMcPtr == 0)
+    {
+        TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
+    }
     TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
     TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
 
     TLLM_CU_CHECK(cuMulticastBindMem(mMcHandle, 0, mUcHandles[mGroupRank], 0 /*memOffset*/, mAllocationSize, 0));
+    mMapped = true;
+}
+
+void McastDeviceMemory::releaseMnMcastMem()
+{
+    TLLM_CU_CHECK(cuMulticastUnbind(mMcHandle, mDeviceIdx, 0, mAllocationSize));
+    TLLM_CU_CHECK(cuMemUnmap(mMcPtr, mAllocationSize));
+    for (uint32_t rank = 0; rank < mGroupSize; rank++)
+    {
+        TLLM_CU_CHECK(cuMemUnmap(mUcPtrs[rank], mAllocationSize));
+    }
+    TLLM_CU_CHECK(cuMemRelease(mMcHandle));
+    mMcHandle = 0;
+    for (auto& handle : mUcHandles)
+    {
+        TLLM_CU_CHECK(cuMemRelease(handle));
+        handle = 0;
+    }
+    mMapped = false;
+}
+
+void McastDeviceMemory::checkpointPrepare()
+{
+    TLLM_CHECK_WITH_INFO(
+        mIsMNNvlink, "[McastDeviceMemory] Stable-VA checkpointing is only supported for fabric-backed MNNVL memory.");
+    if (!mMapped)
+    {
+        return;
+    }
+    TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    mGroupComm.barrier();
+    releaseMnMcastMem();
+    mGroupComm.barrier();
+}
+
+void McastDeviceMemory::checkpointRestore(int64_t mpiCommFortranHandle)
+{
+    TLLM_CHECK_WITH_INFO(
+        mIsMNNvlink, "[McastDeviceMemory] Stable-VA checkpointing is only supported for fabric-backed MNNVL memory.");
+    if (mMapped)
+    {
+        return;
+    }
+#if ENABLE_MULTI_DEVICE
+    mGroupComm = tensorrt_llm::mpi::MpiComm(MPI_Comm_f2c(mpiCommFortranHandle), false);
+#else
+    mGroupComm = tensorrt_llm::mpi::MpiComm(nullptr, false);
+#endif
+    TLLM_CHECK_WITH_INFO(
+        mGroupComm.getRank() == static_cast<int>(mGroupRank) && mGroupComm.getSize() == static_cast<int>(mGroupSize),
+        "[McastDeviceMemory] Restore communicator does not match the original rank or group size.");
+    TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
+    allocMnMcastMem(mBufSize);
+    initializePointerTables();
+    mGroupComm.barrier();
 }
 
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
@@ -224,6 +323,7 @@ void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
     mMcPtr = mNvlsHandle->mc_va;
     mUcPtrs = mNvlsHandle->ipc_uc_vas;
     mUcHandles = mNvlsHandle->ipc_uc_handles;
+    mMapped = true;
 }
 
 } // namespace tensorrt_llm::runtime
