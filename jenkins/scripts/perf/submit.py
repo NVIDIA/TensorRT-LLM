@@ -606,6 +606,42 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
+
+        # Cache-transceiver network precheck: runs BEFORE the real ctx/gen
+        # servers with the same instance topology, and reuses the exact
+        # $ucx_tls_cmd / $CTX_WORKER_ENV_VARS / $GEN_WORKER_ENV_VARS strings
+        # of the worker steps so the UCX environment matches by construction.
+        # On by default. Disabled per-yaml (cache_transceiver_precheck.
+        # enabled: false); TRTLLM_DISAGG_CT_PRECHECK=0/1 at generation time
+        # overrides the yaml either way (global kill switch).
+        precheck_cfg = config.get("cache_transceiver_precheck", {}) or {}
+        precheck_env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
+        if precheck_env is not None:
+            precheck_enabled = precheck_env == "1"
+        else:
+            precheck_enabled = bool(precheck_cfg.get("enabled", True))
+        config_yaml_node = f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}"
+        precheck_cmd = (
+            "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
+            f"run_precheck.py --config {config_yaml_node} "
+            "--work-dir $testOutputDir/cache_transceiver_precheck "
+            f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
+        )
+        script_prefix_lines.extend(
+            [
+                f"export ctPrecheckEnabled={1 if precheck_enabled else 0}",
+                f"export ctPrecheckTimeout={int(precheck_cfg.get('step_timeout_s', 900))}",
+                # Suite name for the synthetic junit xml the launch script
+                # writes when the precheck fails.
+                f'export stageName="{args.stage_name}"',
+                "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
+                "disaggregated/slurm_precheck_run.sh",
+                f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS'
+                f' {precheck_cmd} --role ctx"',
+                f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS'
+                f' {precheck_cmd} --role gen"',
+            ]
+        )
         srun_args_lines.extend(
             [
                 "--container-env=DISAGG_SERVING_TYPE",
@@ -625,8 +661,18 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_content.split("\n"))
     draft_launch_content = "\n".join(draft_launch_lines)
 
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the
+    # gate function library (sibling of the draft) ahead of it.
+    gate_content = ""
+    if runtime_mode == "disaggregated":
+        gate_sh = os.path.join(
+            os.path.dirname(args.draft_launch_sh), "slurm_ct_precheck_gate.sh"
+        )
+        with open(gate_sh, "r") as f:
+            gate_content = "\n".join(remove_whitespace_lines(f.read().split("\n"))) + "\n"
+
     with open(args.launch_sh, "w") as f:
-        f.write(f"{script_prefix}\n{srun_args}\n{draft_launch_content}")
+        f.write(f"{script_prefix}\n{srun_args}\n{gate_content}{draft_launch_content}")
 
     print(f"Launch script generated at: {args.launch_sh}")
     print(f"Launch script:\n{script_prefix}\n{srun_args}\n{draft_launch_content}")

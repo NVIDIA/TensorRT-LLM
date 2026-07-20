@@ -45,32 +45,11 @@ else
     sleep 30
 fi
 
-containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')
-containerPipLLMLibPath=$(echo "$containerPipLLMLibPath" | sed 's/[[:space:]]+/_/g')
-containerLDLibPath=$LD_LIBRARY_PATH
-containerLDLibPath=$(echo "$containerLDLibPath" | sed 's/[[:space:]]+/_/g')
-if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
-  containerLDLibPath="$containerPipLLMLibPath:$containerLDLibPath"
-  containerLDLibPath="${containerLDLibPath%:}"
-fi
-export LD_LIBRARY_PATH=$containerLDLibPath
-
-# Slurm ENROOT/pyxis may inject UCX_TLS=tcp from the host MPI stack (intended for
-# host-only MPI jobs). That disables CUDA transports and breaks NIXL GPU memory
-# registration. Unset it so UCX can auto-select.
-if [ "${UCX_TLS:-}" = "tcp" ]; then
-    unset UCX_TLS
-    echo "Unset UCX_TLS (cluster injected UCX_TLS=tcp)"
-fi
-
-# Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.
-# Under `srun --mpi=pmix` with the DLFW 26.04 OpenMPI build, the shared-memory
-# GDS modes can fail to publish UCX worker addresses across nodes, producing:
-#   pml_ucx.c:178  Error: Failed to receive UCX worker address: Not found (-13)
-#   pml_ucx.c:482  Error: Failed to resolve UCX endpoint for rank N
-# See https://github.com/open-mpi/ompi/issues/6981. Setting this is a no-op
-# when PMIx isn't used.
-export PMIX_MCA_gds=hash
+# Library path + UCX/PMIx fixups shared with the disagg cache-transceiver
+# precheck (slurm_precheck_run.sh) -- keeping them in one place guarantees the
+# precheck observes the same network environment as the real test steps.
+source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
+slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
