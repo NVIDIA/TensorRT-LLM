@@ -5,9 +5,10 @@
 The production path uses one fixed-shape trig-score launch across all dense
 layers, CuTE-DSL TopK selection, and grouped C++ compaction. This module owns
 the score launcher and its persistent metadata; scoring itself runs through
-the compiled ``trtllm`` CUDA ops (per-round coefficient rotation over
-init-time phase tables on the mean path, trigonometric coefficient fold on
-the max path, then the folded paged score) for every supported geometry. The
+the compiled ``trtllm`` CUDA ops (on the mean path ONE folded paged-score
+launch whose CTAs rotate their own coefficients from init-time phase tables;
+on the max path a trigonometric coefficient fold, then the folded paged
+score) for every supported geometry. The
 original Triton score kernel has been deleted;
 the unit tests validate the CUDA ops against an independent PyTorch oracle.
 Selection and compaction live in their respective runtime modules. An
@@ -118,6 +119,7 @@ def _launch_tri_score_perhead(
     token_starts_device: torch.Tensor,
     *,
     score_aggregation: str,
+    mean_rotate_in_cta: bool = True,
 ) -> None:
     """Prepare the per-round coefficients, then score paged KV via the C++ ops.
 
@@ -125,6 +127,15 @@ def _launch_tri_score_perhead(
     geometry this launcher accepts; unsupported inputs fail loudly inside the
     ops (TORCH_CHECK) instead of routing to another kernel. The unit tests
     validate them against an independent PyTorch oracle.
+
+    ``mean_rotate_in_cta`` (mean aggregation only, default on) hands the
+    per-round coefficient rotation to the score kernels' own CTA prologue:
+    one launch per round, zero coefficient scratch. The two-launch
+    preparation (standalone rotation kernel writing global tables the score
+    kernels then read) stays selectable because the unit tests prove the two
+    paths produce bit-identical scores — the kernels share one rotation
+    expression — and because geometries whose coefficient block exceeds the
+    score launch's shared-memory bound must fall back to it.
     """
     if score_aggregation not in ("mean", "max"):
         raise ValueError(f"unsupported score aggregation: {score_aggregation}")
@@ -155,8 +166,11 @@ def _launch_tri_score_perhead(
     # keeps one c_re/c_im plane per offset because max does not commute
     # through the frequency sum.
     offset_planes = num_offsets if use_max else 1
-    c_re, c_im, c_mlr = group._fold_coefficient_buffers(offset_planes, with_mlr=use_max)
+    # Keyword operands of the score op that trigger its in-CTA coefficient
+    # rotation; empty when pre-rotated c_re/c_im planes are passed instead.
+    rotate_in_cta_kwargs: dict = {}
     if use_max:
+        c_re, c_im, c_mlr = group._fold_coefficient_buffers(offset_planes, with_mlr=True)
         q_real, q_imag, mlr_coef = group.pointer_middle
         freq_scale_sq, omega, offsets = group.pointer_tail
         torch.ops.trtllm.tri_attention_fold_score_coefficients(
@@ -183,12 +197,32 @@ def _launch_tri_score_perhead(
             # below reads raw quantized elements at zero hot-loop cost.
             group._kv_scales,
         )
+    elif mean_rotate_in_cta:
+        # Production mean path: the score kernels rotate the pre-scaled
+        # calibration query by the tabulated offset-mean phase of each
+        # request's round start in their own CTA prologue (tables built once
+        # at group construction; phase-table design: Fanrong Li, torch-graph
+        # review 2026-07-20). No rotation launch, no per-round coefficient
+        # scratch; c_mlr is the static init-time table. The prologue compiles
+        # the standalone rotation kernel's exact arithmetic, so scores are
+        # bit-identical to the two-launch path below.
+        c_re = None
+        c_im = None
+        c_mlr = group._mlr_fold
+        rotate_in_cta_kwargs = dict(
+            phase_cos=group._phase_cos,
+            phase_sin=group._phase_sin,
+            q_real_scaled=group._q_real_scaled,
+            q_imag_scaled=group._q_imag_scaled,
+            round_starts=round_starts_device,
+            max_position=group._max_position,
+        )
     else:
-        # Mean aggregation rotates the pre-scaled calibration query by the
-        # tabulated offset-mean phase of each request's round start (tables
-        # built once at group construction; design: Fanrong Li, torch-graph
-        # review 2026-07-20). c_mlr is the static init-time table, so the
-        # round writes only c_re/c_im and runs zero trigonometry.
+        # Two-launch mean preparation: the standalone rotation kernel writes
+        # global c_re/c_im planes the score kernels then read. Kept callable
+        # as the unit tests' bit-equality reference leg and as the fallback
+        # for coefficient blocks past the score launch's shared-memory bound.
+        c_re, c_im, _ = group._fold_coefficient_buffers(offset_planes, with_mlr=False)
         c_mlr = group._mlr_fold
         torch.ops.trtllm.tri_attention_rotate_mean_score_coefficients(
             c_re,
@@ -242,6 +276,7 @@ def _launch_tri_score_perhead(
         # fold above or the init-time pre-scaled mean tables already consumed
         # the values).
         group._kv_scales,
+        **rotate_in_cta_kwargs,
     )
 
 
@@ -384,7 +419,10 @@ class _FixedScoreGroup:
         # (kv_scale * freq_scale_sq * mlr) is fully static: the request axis
         # disappears and nothing about it is recomputed per round. Every
         # eviction round then gathers one table row per request and rotates
-        # the static query by it -- zero trigonometry at runtime.
+        # the static query by it -- zero trigonometry at runtime. The score
+        # kernels perform that rotation themselves in an in-CTA prologue by
+        # default; the standalone rotation kernel remains the two-launch
+        # reference flavor (bit-identical scores, proven by the unit tests).
         #
         # Positions can legitimately reach the full sequence capacity, so the
         # table covers [0, seq_len] inclusive. The 64-row floor keeps tiny
@@ -604,9 +642,11 @@ class _FixedScoreGroup:
 
         Sized on ``max_requests`` so any launch's active ``request_count``
         fits without reallocation (each launch prepares only its active
-        rows). Only the max aggregation still writes a per-round c_mlr; the
-        mean path reads the static init-time MLR table instead (request axis
-        removed), so its scratch skips c_mlr entirely.
+        rows). The production mean path allocates NOTHING here: its score
+        kernels rotate coefficients in-CTA, so only the max aggregation
+        (which also writes a per-round c_mlr) and the two-launch mean
+        reference path (static MLR table, c_re/c_im planes only) ever call
+        this.
         """
         key = (offset_planes, with_mlr)
         buffers = self._fold_buffers.get(key)
@@ -635,8 +675,16 @@ class _FixedScoreGroup:
         mean_cos: torch.Tensor,
         mean_sin: torch.Tensor,
         score_aggregation: str,
+        *,
+        mean_rotate_in_cta: bool = True,
     ) -> torch.Tensor:
-        """Return decode-only scores as ``[request, layer, head, token]``."""
+        """Return decode-only scores as ``[request, layer, head, token]``.
+
+        ``mean_rotate_in_cta=False`` selects the two-launch mean coefficient
+        preparation (standalone rotation kernel + global-table score reads);
+        see ``_launch_tri_score_perhead``. Scores are bit-identical either
+        way — the unit tests compare the two with ``torch.equal``.
+        """
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds fixed score capacity")
         if (
@@ -699,6 +747,7 @@ class _FixedScoreGroup:
             round_starts_device,
             token_starts_device,
             score_aggregation=score_aggregation,
+            mean_rotate_in_cta=mean_rotate_in_cta,
         )
         return output
 

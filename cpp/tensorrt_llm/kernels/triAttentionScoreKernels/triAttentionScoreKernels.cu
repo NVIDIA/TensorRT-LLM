@@ -26,14 +26,16 @@
 //   score(t, h) = sum_f K_re(t,f)*c_re + K_im(t,f)*c_im + |K(t,f)|*c_mlr
 //
 // One thread scores one token across all frequencies; a 128-thread CTA covers
-// 128 consecutive tokens of one (request, layer, KV-head) segment. There are
-// no shuffles, no shared memory, and no barriers: each thread keeps one fused
+// 128 consecutive tokens of one (request, layer, KV-head) segment. The hot
+// loop has no shuffles and no barriers: each thread keeps one fused
 // accumulator per query head of its GQA group ("mean" aggregation) or one
 // partial sum per offset plane ("max" aggregation, where max over offsets
 // does not commute through the frequency sum). Coefficient loads are
-// lane-uniform 16-byte reads served by L1 broadcast; K loads are 16-byte
-// chunks of 8 frequencies when the pool layout allows it, otherwise a fully
-// strided scalar path runs the same math.
+// lane-uniform 16-byte reads served by L1 broadcast (or by shared memory on
+// the mean path's default in-CTA rotation, whose prologue is the one place a
+// score CTA uses shared memory and a barrier); K loads are 16-byte chunks of
+// 8 frequencies when the pool layout allows it, otherwise a fully strided
+// scalar path runs the same math.
 //
 // The kernel accumulates the frequency reduction in sequential chunks (not a
 // block-wide tree), so results are tolerance-equal, not bit-equal, against
@@ -80,6 +82,22 @@ __device__ __forceinline__ float triSqrtApprox(float x)
     asm("sqrt.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
 #endif
+}
+
+// The ONE mean-path coefficient rotation, compiled by BOTH the standalone
+// triRotateMeanScoreCoefficientsKernel and the score kernels' in-CTA
+// prologue. The operand order is load-bearing: a single source expression
+// makes the compiler emit the same multiply/FMA contraction in every
+// inlining site, so the in-CTA coefficients are bit-identical to the
+// standalone kernel's output and end-to-end mean scores are bit-identical
+// between the two preparation paths (the unit suite proves this with
+// torch.equal). Do not reorder or "simplify" these expressions.
+__device__ __forceinline__ float2 rotateCoefficientPair(float qre, float qim, float pc, float ps)
+{
+    float2 c;
+    c.x = qre * pc - qim * ps;
+    c.y = qim * pc + qre * ps;
+    return c;
 }
 
 template <typename T>
@@ -164,21 +182,53 @@ __device__ __forceinline__ void scoreLoadChunk(char const* row, bool valid, int 
     }
 }
 
-// Accumulate one 8-frequency chunk into this thread's per-head accumulators.
-// coff0 = flat index of (request, layer, first head of this block, chunk
-// frequency 0) in the c_re/c_im tables; cMlr = the matching chunk pointer
-// into the static request-independent [layer, head, freq] c_mlr table,
-// pre-offset by the caller. Passing the resolved pointer (instead of a
-// second flat offset) keeps this loop's live set at the tuned ~72-register
-// baseline: one pointer register replaces the base + request-strided offset
-// pair the c_mlr reads consumed before the table went static. All
-// coefficient reads are lane-uniform 16-byte loads. |K| is computed once per
-// (token, frequency) BEFORE the head loop so the GROUP heads share it from
-// registers.
-template <typename T, int GROUP, bool USE_MAX>
-__device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, int64_t coff0, float const* cMlr,
-    int64_t planeStride, uint4 re4, uint4 im4, float* accMean, float* accMlr, float* accPos)
+// Mean-path in-CTA rotation prologue shared by the vectorized and scalar
+// score kernels: rebuild the [coefCount = group * numFreqs] coefficient block
+// this CTA will read — gather the request's phase-table row (L2-resident,
+// shared by all of the request's CTAs) and the CTA's slice of the static
+// pre-scaled calibration query, rotate with rotateCoefficientPair (the SAME
+// arithmetic the standalone rotation kernel compiles, the bit-equality
+// contract), and stage the results in shared memory. Thread-strided plain
+// loads + FMAs only, one barrier; the prologue's temporaries die here, so
+// ptxas can fold them into the main loop's register budget.
+__device__ __forceinline__ void rotateCoefficientsIntoShared(
+    FoldedScoreParams const& a, int reqId, int layerId, int headBase, int coefCount, float* sCRe, float* sCIm)
 {
+    int64_t const phaseRow = static_cast<int64_t>(a.roundStarts[reqId]) * a.numFreqs;
+    int64_t const qBase = (static_cast<int64_t>(layerId) * a.numQueryHeads + headBase) * a.numFreqs;
+    for (int i = threadIdx.x; i < coefCount; i += kScoreBlockThreads)
+    {
+        int const f = i % a.numFreqs;
+        float const pc = a.phaseCos[phaseRow + f];
+        float const ps = a.phaseSin[phaseRow + f];
+        float2 const c = rotateCoefficientPair(a.qReS[qBase + i], a.qImS[qBase + i], pc, ps);
+        sCRe[i] = c.x;
+        sCIm[i] = c.y;
+    }
+    __syncthreads();
+}
+
+// Accumulate one 8-frequency chunk into this thread's per-head accumulators.
+// cRe/cIm point at the coefficient source: the global per-round tables (with
+// coff0 = flat index of (request, layer, first head of this block, chunk
+// frequency 0)) or, under ROTATE_IN_CTA, this CTA's shared-memory block
+// (with coff0 = the chunk's frequency offset — the head-block origin is the
+// shared block itself). cMlr = the matching chunk pointer into the static
+// request-independent [layer, head, freq] c_mlr table, pre-offset by the
+// caller. Passing the resolved pointer (instead of a second flat offset)
+// keeps this loop's live set at the tuned ~72-register baseline: one pointer
+// register replaces the base + request-strided offset pair the c_mlr reads
+// consumed before the table went static. All coefficient reads are
+// lane-uniform 16-byte loads (__ldg is global-memory-only, so the shared
+// block reads through plain loads — same values either way). |K| is computed
+// once per (token, frequency) BEFORE the head loop so the GROUP heads share
+// it from registers.
+template <typename T, int GROUP, bool USE_MAX, bool ROTATE_IN_CTA>
+__device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, float const* cRe, float const* cIm,
+    int64_t coff0, float const* cMlr, int64_t planeStride, uint4 re4, uint4 im4, float* accMean, float* accMlr,
+    float* accPos)
+{
+    static_assert(!(ROTATE_IN_CTA && USE_MAX), "in-CTA coefficient rotation exists only on the mean path");
     float kRe[8], kIm[8], kMag[8];
     unpackChunk8<T>(re4, kRe);
     unpackChunk8<T>(im4, kIm);
@@ -213,8 +263,8 @@ __device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, in
             {
                 if (o < a.numOffsets)
                 {
-                    float const* crp = a.cRe + o * planeStride + coff;
-                    float const* cip = a.cIm + o * planeStride + coff;
+                    float const* crp = cRe + o * planeStride + coff;
+                    float const* cip = cIm + o * planeStride + coff;
                     float4 const cr0 = __ldg(reinterpret_cast<float4 const*>(crp));
                     float4 const cr1 = __ldg(reinterpret_cast<float4 const*>(crp + 4));
                     float4 const ci0 = __ldg(reinterpret_cast<float4 const*>(cip));
@@ -233,12 +283,26 @@ __device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, in
         }
         else
         {
-            float const* crp = a.cRe + coff;
-            float const* cip = a.cIm + coff;
-            float4 const cr0 = __ldg(reinterpret_cast<float4 const*>(crp));
-            float4 const cr1 = __ldg(reinterpret_cast<float4 const*>(crp + 4));
-            float4 const ci0 = __ldg(reinterpret_cast<float4 const*>(cip));
-            float4 const ci1 = __ldg(reinterpret_cast<float4 const*>(cip + 4));
+            float const* crp = cRe + coff;
+            float const* cip = cIm + coff;
+            float4 cr0, cr1, ci0, ci1;
+            if constexpr (ROTATE_IN_CTA)
+            {
+                // Shared-memory coefficient block written by this CTA's
+                // rotation prologue (16-byte aligned: numFreqs % 8 == 0 on
+                // the vectorized path).
+                cr0 = *reinterpret_cast<float4 const*>(crp);
+                cr1 = *reinterpret_cast<float4 const*>(crp + 4);
+                ci0 = *reinterpret_cast<float4 const*>(cip);
+                ci1 = *reinterpret_cast<float4 const*>(cip + 4);
+            }
+            else
+            {
+                cr0 = __ldg(reinterpret_cast<float4 const*>(crp));
+                cr1 = __ldg(reinterpret_cast<float4 const*>(crp + 4));
+                ci0 = __ldg(reinterpret_cast<float4 const*>(cip));
+                ci1 = __ldg(reinterpret_cast<float4 const*>(cip + 4));
+            }
             float const cre[8] = {cr0.x, cr0.y, cr0.z, cr0.w, cr1.x, cr1.y, cr1.z, cr1.w};
             float const cim[8] = {ci0.x, ci0.y, ci0.z, ci0.w, ci1.x, ci1.y, ci1.z, ci1.w};
             float t = accMean[hg];
@@ -265,9 +329,15 @@ __device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, in
 // minBlocksPerMultiprocessor = 7: tighter caps force ptxas into ~48-56
 // registers with stack spills in the fully unrolled inner loops; 7 CTAs/SM
 // admits the ~72-register spill-free allocation this kernel was tuned at.
-template <typename T, int GROUP, int STATIC_CHUNKS, bool USE_MAX>
+//
+// ROTATE_IN_CTA (mean path only) prepends the shared-memory coefficient
+// rotation prologue and points the mean coefficient reads at it; the
+// standalone-rotation read path (ROTATE_IN_CTA == false) stays compiled for
+// the max aggregation and for the unit tests' bit-equality reference leg.
+template <typename T, int GROUP, int STATIC_CHUNKS, bool USE_MAX, bool ROTATE_IN_CTA>
 __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKernel(FoldedScoreParams a)
 {
+    static_assert(!(ROTATE_IN_CTA && USE_MAX), "in-CTA coefficient rotation exists only on the mean path");
     int const seg = blockIdx.y;
     int const reqId = a.segRequestIds[seg];
     int const seqLen = a.requestSeqLens[reqId];
@@ -303,6 +373,20 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
     }
 
     int const layerId = a.segLayerIds[seg];
+    // Mean-path in-CTA rotation: stage this CTA's GROUP x numFreqs
+    // coefficient block in shared memory (the early-out above is
+    // CTA-uniform, so the barrier inside is safe here and skipped CTAs do no
+    // rotation work).
+    float* sCRe = nullptr;
+    float* sCIm = nullptr;
+    if constexpr (ROTATE_IN_CTA)
+    {
+        extern __shared__ float coefficientSmem[];
+        int const coefCount = GROUP * a.numFreqs;
+        sCRe = coefficientSmem;
+        sCIm = coefficientSmem + coefCount;
+        rotateCoefficientsIntoShared(a, reqId, layerId, headBase, coefCount, sCRe, sCIm);
+    }
     int const page = absT / a.tokensPerBlock;
     int const slot = absT - page * a.tokensPerBlock;
     // Threads past the sequence tail must not touch the page table (their
@@ -322,8 +406,18 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
             * (physPage * a.stridePage + static_cast<int64_t>(kvHead) * a.strideKvHead
                 + static_cast<int64_t>(slot) * a.strideSlot);
 
-    int64_t const coff0 = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
+    // Coefficient source: the global per-round tables, or this CTA's shared
+    // block (whose head-block origin is index 0).
+    float const* coefRe = a.cRe;
+    float const* coefIm = a.cIm;
+    int64_t coff0 = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
         + static_cast<int64_t>(headBase) * a.numFreqs;
+    if constexpr (ROTATE_IN_CTA)
+    {
+        coefRe = sCRe;
+        coefIm = sCIm;
+        coff0 = 0;
+    }
     // The MLR coefficient is position independent, so its table is folded once
     // at initialization without a request axis: [layer, head, freq]. Hoist the
     // row pointer here (no request stride) so the fully unrolled chunk loop
@@ -361,8 +455,8 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
         {
             uint4 re4, im4;
             scoreLoadChunk<T>(row, valid, a.numFreqs, c, re4, im4);
-            scoreComputeChunk<T, GROUP, USE_MAX>(
-                a, coff0 + c * 8, cMlrRow + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
+            scoreComputeChunk<T, GROUP, USE_MAX, ROTATE_IN_CTA>(
+                a, coefRe, coefIm, coff0 + c * 8, cMlrRow + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
         }
     }
     else
@@ -372,8 +466,8 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
         {
             uint4 re4, im4;
             scoreLoadChunk<T>(row, valid, a.numFreqs, c, re4, im4);
-            scoreComputeChunk<T, GROUP, USE_MAX>(
-                a, coff0 + c * 8, cMlrRow + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
+            scoreComputeChunk<T, GROUP, USE_MAX, ROTATE_IN_CTA>(
+                a, coefRe, coefIm, coff0 + c * 8, cMlrRow + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
         }
     }
 
@@ -413,9 +507,12 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
 // stride set (any frequency count, any element stride, fp32 pools included).
 // The GQA head loop runs at runtime, so any group size is covered. |K| is
 // recomputed per head from the same loads — bit-identical to hoisting it.
-template <typename T, bool USE_MAX>
+// ROTATE_IN_CTA carries the same mean-path shared-memory rotation prologue
+// as the vectorized kernel (here sized by the runtime GQA group).
+template <typename T, bool USE_MAX, bool ROTATE_IN_CTA>
 __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(FoldedScoreParams a)
 {
+    static_assert(!(ROTATE_IN_CTA && USE_MAX), "in-CTA coefficient rotation exists only on the mean path");
     int const seg = blockIdx.y;
     int const reqId = a.segRequestIds[seg];
     int const seqLen = a.requestSeqLens[reqId];
@@ -436,6 +533,21 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
     int const kvHead = blockIdx.z;
     int const groupSize = a.numQueryHeads / a.numKvHeads;
     int const layerId = a.segLayerIds[seg];
+    // Mean-path in-CTA rotation: stage this CTA's groupSize x numFreqs
+    // coefficient block in shared memory (the early-out above is
+    // CTA-uniform, so the barrier inside is safe here).
+    float const* coefRe = a.cRe;
+    float const* coefIm = a.cIm;
+    if constexpr (ROTATE_IN_CTA)
+    {
+        extern __shared__ float coefficientSmem[];
+        int const coefCount = groupSize * a.numFreqs;
+        float* sCRe = coefficientSmem;
+        float* sCIm = coefficientSmem + coefCount;
+        rotateCoefficientsIntoShared(a, reqId, layerId, kvHead * groupSize, coefCount, sCRe, sCIm);
+        coefRe = sCRe;
+        coefIm = sCIm;
+    }
     int const page = absT / a.tokensPerBlock;
     int const slot = absT - page * a.tokensPerBlock;
     int encoded = 0;
@@ -460,9 +572,13 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
     for (int hg = 0; hg < groupSize; ++hg)
     {
         int const h = kvHead * groupSize + hg;
-        int64_t const coff
-            = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
+        int64_t coff = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
             + static_cast<int64_t>(h) * a.numFreqs;
+        if constexpr (ROTATE_IN_CTA)
+        {
+            // The shared coefficient block's origin is this CTA's head block.
+            coff = static_cast<int64_t>(hg) * a.numFreqs;
+        }
         float const* const cml = cMlrRow + static_cast<int64_t>(hg) * a.numFreqs;
         float acc = 0.0f;
         float accMlr = 0.0f;
@@ -497,7 +613,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
             }
             else
             {
-                acc = fmaf(kRe, a.cRe[coff + f], fmaf(kIm, a.cIm[coff + f], fmaf(kMag, cml[f], acc)));
+                acc = fmaf(kRe, coefRe[coff + f], fmaf(kIm, coefIm[coff + f], fmaf(kMag, cml[f], acc)));
             }
         }
         if (store)
@@ -606,6 +722,13 @@ __global__ void triFoldScoreCoefficientsKernel(float const* __restrict__ qReal, 
 // (request, layer, head, freq) element. The host wrapper guarantees every
 // round start indexes inside the tables.
 // Design: Fanrong Li (torch-graph review, 2026-07-20).
+//
+// The production mean path now runs this rotation inside the score kernels'
+// CTA prologue instead (rotateCoefficientsIntoShared, sharing
+// rotateCoefficientPair with this kernel so the two paths stay bit-identical
+// end to end). This standalone kernel remains as the unit tests' equality
+// reference leg and as the fallback for coefficient blocks past the score
+// launch's dynamic shared memory bound.
 __global__ void triRotateMeanScoreCoefficientsKernel(float const* __restrict__ qRealScaled,
     float const* __restrict__ qImagScaled, float const* __restrict__ phaseCos, float const* __restrict__ phaseSin,
     int32_t const* __restrict__ roundStarts, float* __restrict__ cRe, float* __restrict__ cIm,
@@ -626,33 +749,52 @@ __global__ void triRotateMeanScoreCoefficientsKernel(float const* __restrict__ q
     int64_t const phaseIdx = static_cast<int64_t>(roundStarts[req]) * numFreqs + f;
     float const pc = phaseCos[phaseIdx];
     float const ps = phaseSin[phaseIdx];
-    float const qre = qRealScaled[cIdx];
-    float const qim = qImagScaled[cIdx];
-    cRe[idx] = qre * pc - qim * ps;
-    cIm[idx] = qim * pc + qre * ps;
+    // rotateCoefficientPair is the ONE rotation expression shared with the
+    // score kernels' in-CTA prologue — the bit-equality contract between the
+    // two mean-path preparation flavors.
+    float2 const c = rotateCoefficientPair(qRealScaled[cIdx], qImagScaled[cIdx], pc, ps);
+    cRe[idx] = c.x;
+    cIm[idx] = c.y;
 }
 
+// The in-CTA rotation flavor adds one instantiation per (T, GROUP, chunk
+// mode) — mean-only, so the instantiation count per element type grows from
+// 4 to 6 per GROUP (binary-size cost of keeping the standalone-rotation read
+// path compiled for the max aggregation and the unit tests' equality leg).
 template <typename T>
-void launchVectorized(FoldedScoreParams const& params, int32_t groupSize, dim3 grid, bool useMax, cudaStream_t stream)
+void launchVectorized(
+    FoldedScoreParams const& params, int32_t groupSize, dim3 grid, bool useMax, bool rotateInCta, cudaStream_t stream)
 {
     bool const staticChunks = params.numFreqs == 64;
     int32_t const effectiveGroup = params.zIsQueryHead ? 1 : groupSize;
+    // Dynamic shared memory for the rotation prologue's coefficient block
+    // (re + im); zero on the other paths.
+    size_t const smemBytes
+        = rotateInCta ? sizeof(float) * 2 * static_cast<size_t>(effectiveGroup) * params.numFreqs : 0;
 #define TRTLLM_TRI_SCORE_LAUNCH_GROUP(GROUP_V)                                                                         \
     do                                                                                                                 \
     {                                                                                                                  \
         if (staticChunks)                                                                                              \
         {                                                                                                              \
             if (useMax)                                                                                                \
-                triScoreVectorizedKernel<T, GROUP_V, 8, true><<<grid, kScoreBlockThreads, 0, stream>>>(params);        \
+                triScoreVectorizedKernel<T, GROUP_V, 8, true, false><<<grid, kScoreBlockThreads, 0, stream>>>(params); \
+            else if (rotateInCta)                                                                                      \
+                triScoreVectorizedKernel<T, GROUP_V, 8, false, true>                                                   \
+                    <<<grid, kScoreBlockThreads, smemBytes, stream>>>(params);                                         \
             else                                                                                                       \
-                triScoreVectorizedKernel<T, GROUP_V, 8, false><<<grid, kScoreBlockThreads, 0, stream>>>(params);       \
+                triScoreVectorizedKernel<T, GROUP_V, 8, false, false>                                                  \
+                    <<<grid, kScoreBlockThreads, 0, stream>>>(params);                                                 \
         }                                                                                                              \
         else                                                                                                           \
         {                                                                                                              \
             if (useMax)                                                                                                \
-                triScoreVectorizedKernel<T, GROUP_V, 0, true><<<grid, kScoreBlockThreads, 0, stream>>>(params);        \
+                triScoreVectorizedKernel<T, GROUP_V, 0, true, false><<<grid, kScoreBlockThreads, 0, stream>>>(params); \
+            else if (rotateInCta)                                                                                      \
+                triScoreVectorizedKernel<T, GROUP_V, 0, false, true>                                                   \
+                    <<<grid, kScoreBlockThreads, smemBytes, stream>>>(params);                                         \
             else                                                                                                       \
-                triScoreVectorizedKernel<T, GROUP_V, 0, false><<<grid, kScoreBlockThreads, 0, stream>>>(params);       \
+                triScoreVectorizedKernel<T, GROUP_V, 0, false, false>                                                  \
+                    <<<grid, kScoreBlockThreads, 0, stream>>>(params);                                                 \
         }                                                                                                              \
     } while (0)
     switch (effectiveGroup)
@@ -671,31 +813,40 @@ void launchVectorized(FoldedScoreParams const& params, int32_t groupSize, dim3 g
 }
 
 template <typename T>
-void launchScalar(FoldedScoreParams const& params, dim3 grid, bool useMax, cudaStream_t stream)
+void launchScalar(FoldedScoreParams const& params, dim3 grid, bool useMax, bool rotateInCta, cudaStream_t stream)
 {
+    // The scalar rotation prologue sizes its shared coefficient block by the
+    // runtime GQA group (any group size is covered here).
+    size_t const smemBytes = rotateInCta
+        ? sizeof(float) * 2 * static_cast<size_t>(params.numQueryHeads / params.numKvHeads) * params.numFreqs
+        : 0;
     if (useMax)
     {
-        triScoreScalarKernel<T, true><<<grid, kScoreBlockThreads, 0, stream>>>(params);
+        triScoreScalarKernel<T, true, false><<<grid, kScoreBlockThreads, 0, stream>>>(params);
+    }
+    else if (rotateInCta)
+    {
+        triScoreScalarKernel<T, false, true><<<grid, kScoreBlockThreads, smemBytes, stream>>>(params);
     }
     else
     {
-        triScoreScalarKernel<T, false><<<grid, kScoreBlockThreads, 0, stream>>>(params);
+        triScoreScalarKernel<T, false, false><<<grid, kScoreBlockThreads, 0, stream>>>(params);
     }
 }
 
 // Launch flavor for bf16/fp16 pools, the only element types owning both load
 // paths (the vectorized 16-byte chunk kernel and the strided scalar kernel).
 template <typename T>
-void launchVectorizedOrScalar(
-    FoldedScoreParams const& params, int32_t groupSize, dim3 grid, bool useVectorized, bool useMax, cudaStream_t stream)
+void launchVectorizedOrScalar(FoldedScoreParams const& params, int32_t groupSize, dim3 grid, bool useVectorized,
+    bool useMax, bool rotateInCta, cudaStream_t stream)
 {
     if (useVectorized)
     {
-        launchVectorized<T>(params, groupSize, grid, useMax, stream);
+        launchVectorized<T>(params, groupSize, grid, useMax, rotateInCta, stream);
     }
     else
     {
-        launchScalar<T>(params, grid, useMax, stream);
+        launchScalar<T>(params, grid, useMax, rotateInCta, stream);
     }
 }
 
@@ -704,10 +855,10 @@ void launchVectorizedOrScalar(
 // only the scalar load path knows how to read them).
 template <typename T>
 void launchQuantizedScalar(
-    FoldedScoreParams const& params, dim3 grid, bool useVectorized, bool useMax, cudaStream_t stream)
+    FoldedScoreParams const& params, dim3 grid, bool useVectorized, bool useMax, bool rotateInCta, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(!useVectorized, "tri_attention_score: quantized pools must use the scalar path");
-    launchScalar<T>(params, grid, useMax, stream);
+    launchScalar<T>(params, grid, useMax, rotateInCta, stream);
 }
 
 } // namespace
@@ -742,7 +893,7 @@ void rotateMeanScoreCoefficientsLaunch(float const* qRealScaled, float const* qI
 }
 
 void foldedScoreLaunch(FoldedScoreParams const& params, PoolElementType poolType, int32_t groupSize,
-    int32_t numSegments, bool useVectorized, bool useMax, cudaStream_t stream)
+    int32_t numSegments, bool useVectorized, bool useMax, bool rotateInCta, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(numSegments > 0 && numSegments <= 65535,
         "tri_attention_score: request*layer segment count exceeds the CUDA grid limit");
@@ -750,6 +901,19 @@ void foldedScoreLaunch(FoldedScoreParams const& params, PoolElementType poolType
         "tri_attention_score: offset planes exceed the per-thread accumulator budget");
     TLLM_CHECK_WITH_INFO(!useVectorized || (params.numFreqs % 8 == 0 && params.strideDim == 1),
         "tri_attention_score: vectorized path requires 8-frequency chunks with unit stride");
+    TLLM_CHECK_WITH_INFO(!(rotateInCta && useMax), "tri_attention_score: in-CTA coefficient rotation is mean-only");
+    TLLM_CHECK_WITH_INFO(!rotateInCta
+            || (params.phaseCos != nullptr && params.phaseSin != nullptr && params.qReS != nullptr
+                && params.qImS != nullptr && params.roundStarts != nullptr),
+        "tri_attention_score: in-CTA rotation inputs are missing");
+    // Launches request dynamic shared memory without opting into the
+    // above-48KB attribute, so oversized coefficient blocks must fail loudly
+    // here; such geometries can still score through the standalone rotation
+    // launch (rotateInCta == false). The scalar prologue's runtime GQA group
+    // is the worst case (the vectorized per-query-head mapping uses 1).
+    TLLM_CHECK_WITH_INFO(
+        !rotateInCta || sizeof(float) * 2 * static_cast<size_t>(groupSize) * params.numFreqs <= 48u * 1024u,
+        "tri_attention_score: in-CTA rotation coefficient block exceeds the 48KB dynamic shared memory bound");
     // Tile count covers the decode span plus the worst-case page-alignment
     // slack (tokenStart may sit up to tokensPerBlock - 1 tokens into a page).
     auto const tiles = static_cast<uint32_t>(
@@ -759,21 +923,23 @@ void foldedScoreLaunch(FoldedScoreParams const& params, PoolElementType poolType
     switch (poolType)
     {
     case PoolElementType::kBFloat16:
-        launchVectorizedOrScalar<__nv_bfloat16>(params, groupSize, grid, useVectorized, useMax, stream);
+        launchVectorizedOrScalar<__nv_bfloat16>(params, groupSize, grid, useVectorized, useMax, rotateInCta, stream);
         break;
     case PoolElementType::kHalf:
-        launchVectorizedOrScalar<half>(params, groupSize, grid, useVectorized, useMax, stream);
+        launchVectorizedOrScalar<half>(params, groupSize, grid, useVectorized, useMax, rotateInCta, stream);
         break;
     case PoolElementType::kFloat32:
         // fp32 pools have 32-byte 8-frequency rows; the 16-byte chunk path
         // does not apply, so they always take the strided scalar kernel.
         TLLM_CHECK_WITH_INFO(!useVectorized, "tri_attention_score: fp32 pools must use the scalar path");
-        launchScalar<float>(params, grid, useMax, stream);
+        launchScalar<float>(params, grid, useMax, rotateInCta, stream);
         break;
     case PoolElementType::kFloat8E4M3:
-        launchQuantizedScalar<__nv_fp8_e4m3>(params, grid, useVectorized, useMax, stream);
+        launchQuantizedScalar<__nv_fp8_e4m3>(params, grid, useVectorized, useMax, rotateInCta, stream);
         break;
-    case PoolElementType::kInt8: launchQuantizedScalar<int8_t>(params, grid, useVectorized, useMax, stream); break;
+    case PoolElementType::kInt8:
+        launchQuantizedScalar<int8_t>(params, grid, useVectorized, useMax, rotateInCta, stream);
+        break;
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 }

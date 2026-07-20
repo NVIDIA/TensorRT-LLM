@@ -120,6 +120,15 @@ void foldScoreCoefficientsLaunch(float const* qReal, // [L_cal * HQ * F]
 // aggregation keeps foldScoreCoefficientsLaunch unchanged. Every round start
 // must lie in [0, maxPosition); the host wrapper enforces that loudly before
 // launch. Design: Fanrong Li (torch-graph review, 2026-07-20).
+//
+// The production mean path no longer runs this standalone launch either: the
+// score kernels rebuild the same coefficients in an in-CTA shared-memory
+// prologue (see FoldedScoreParams and foldedScoreLaunch's rotateInCta). The
+// prologue compiles the SAME rotation arithmetic as this kernel, so the two
+// preparation paths produce bit-identical scores; this launch stays as that
+// equality proof's reference leg (the unit suite compares them with
+// torch.equal) and as the fallback for coefficient blocks past the dynamic
+// shared memory bound.
 void rotateMeanScoreCoefficientsLaunch(float const* qRealScaled, // [L_cal * HQ * F]
     float const* qImagScaled,                                    // [L_cal * HQ * F]
     float const* phaseCos,                                       // [maxPosition * F]
@@ -142,12 +151,26 @@ struct FoldedScoreParams
     int32_t const* requestSeqLens;     // [numRequests]
     int32_t* validWidthOut;            // [numRequests] side-store: seqLen - tokenStart, once per request
     int32_t const* requestTokenStarts; // [numRequests] pinned prompt length = decode-region origin
-    float const* cRe;  // per-round output (see foldScoreCoefficientsLaunch / rotateMeanScoreCoefficientsLaunch)
+    // Per-round coefficient planes (see foldScoreCoefficientsLaunch /
+    // rotateMeanScoreCoefficientsLaunch); nullptr when the mean-path kernels
+    // rotate their coefficients in-CTA instead (rotateInCta below).
+    float const* cRe;
     float const* cIm;
     float const* cMlr; // static, request-independent [L_cal, HQ, F] MLR table
-    float* out;        // [segment, numQueryHeads, outputWidth] fp32 decode-only scores
+    // Mean-path in-CTA rotation inputs, consumed only by rotateInCta launches
+    // (nullptr otherwise). Table contract and arithmetic are EXACTLY those of
+    // rotateMeanScoreCoefficientsLaunch; round starts must be host-validated
+    // against the tabulated position extent BEFORE launch (the kernels gather
+    // phase rows unguarded — a device-side bound would need its own check
+    // kernel).
+    float const* phaseCos;      // [maxPosition, F]
+    float const* phaseSin;      // [maxPosition, F]
+    float const* qReS;          // [L_cal, HQ, F] pre-scaled calibration query, real part
+    float const* qImS;          // [L_cal, HQ, F] pre-scaled calibration query, imaginary part
+    int32_t const* roundStarts; // [numRequests], each in [0, maxPosition)
+    float* out;                 // [segment, numQueryHeads, outputWidth] fp32 decode-only scores
     int32_t outputWidth;
-    int32_t numLayers; // scored layers per request (the segment period)
+    int32_t numLayers;          // scored layers per request (the segment period)
     int32_t numRequests;
     int32_t numCalibratedLayers;
     int32_t numQueryHeads;
@@ -173,8 +196,17 @@ struct FoldedScoreParams
 // alignment); otherwise a fully strided scalar path runs the same math.
 // groupSize = numQueryHeads / numKvHeads must be 1, 2, 4, or 8 unless
 // params.zIsQueryHead maps grid.z to single query heads.
+//
+// rotateInCta (mean aggregation only) makes each score CTA rotate its own
+// coefficient block from params.phaseCos/phaseSin/qReS/qImS/roundStarts into
+// dynamic shared memory instead of reading pre-rotated global c_re/c_im
+// planes, eliminating the standalone rotation launch and its per-round
+// coefficient scratch. The prologue shares the standalone kernel's rotation
+// arithmetic, so scores are bit-identical between the two preparation paths.
+// The coefficient block (2 * group * numFreqs fp32) must fit the default
+// 48KB dynamic shared memory bound — enforced loudly here.
 void foldedScoreLaunch(FoldedScoreParams const& params, PoolElementType poolType, int32_t groupSize,
-    int32_t numSegments, bool useVectorized, bool useMax, cudaStream_t stream);
+    int32_t numSegments, bool useVectorized, bool useMax, bool rotateInCta, cudaStream_t stream);
 
 } // namespace kernels::tri_attention_score
 

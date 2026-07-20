@@ -786,8 +786,9 @@ class _FixedScoreStagingBuffers:
             # mean_cos/mean_sin feed ONLY the opt-in CuTe score runner, whose
             # compiled kernel captured their device pointers, so they must be
             # refreshed before it launches. The default C++ mean path rotates
-            # init-time phase tables inside its coefficient op instead, so
-            # production rounds launch zero phase kernels.
+            # init-time phase tables inside the score kernels' own CTA
+            # prologue instead, so production rounds launch zero phase or
+            # coefficient kernels.
             prepare_mean_phase(
                 self.round_starts_device,
                 self.offsets,

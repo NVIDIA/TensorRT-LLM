@@ -23,9 +23,11 @@ namespace tk = tensorrt_llm::kernels::tri_attention_score;
 
 // One op per kernel launch, matching the file-level granularity of sibling
 // kernel wrappers: the per-round coefficient preparation (the rotation op on
-// the mean path, the trigonometric fold on the max path) writes persistent
-// buffers whose plane count depends on the aggregation mode, while the score
-// launch consumes those buffers; callers time and re-plan them independently.
+// the legacy mean path, the trigonometric fold on the max path) writes
+// persistent buffers whose plane count depends on the aggregation mode, while
+// the score launch consumes those buffers; callers time and re-plan them
+// independently. The default mean path collapses to the score op alone (its
+// kernels rotate coefficients in-CTA), so no preparation op runs there.
 
 namespace
 {
@@ -154,6 +156,12 @@ void triAttentionFoldScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im,
 // kv_scales positivity check above, the bounds reduction costs one small
 // host sync per eviction round. Design: Fanrong Li (torch-graph review,
 // 2026-07-20).
+//
+// The production mean path no longer calls this op: the paged score op below
+// performs the same rotation in its kernels' CTA prologue (bit-identically —
+// the two paths share one device rotation expression). This op stays as the
+// unit tests' equality reference leg and as the fallback for coefficient
+// blocks past the score launch's dynamic shared memory bound.
 void triAttentionRotateMeanScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im, torch::Tensor q_real_scaled,
     torch::Tensor q_imag_scaled, torch::Tensor phase_cos, torch::Tensor phase_sin, torch::Tensor round_starts,
     int64_t num_requests, int64_t num_calibrated_layers, int64_t num_query_heads, int64_t num_freqs,
@@ -199,14 +207,30 @@ void triAttentionRotateMeanScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor
 // the kernel reads all layers through layer_base_addrs (V2 exposes each layer
 // as its own storage), and the anchor only supplies their common element type
 // and the device; its data is never read through this argument.
+//
+// Mean-path coefficient preparation comes in two flavors. Passing phase_cos/
+// phase_sin/q_real_scaled/q_imag_scaled/round_starts (+ max_position) makes
+// the score kernels rotate their own coefficient block in an in-CTA prologue
+// — c_re/c_im must then be omitted (no per-round coefficient scratch exists
+// at all). Passing c_re/c_im instead scores against pre-rotated global planes
+// (the rotation op above, or the fold op on the max path). The two mean
+// flavors share one rotation expression device-side, so their scores are
+// bit-identical. The round-start bounds contract of the rotation op moves
+// here on the in-CTA flavor: a start at or past max_position would gather
+// past the phase tables, and a device-side guard would need its own check
+// kernel, so the same host-side aminmax reduction (one small sync per
+// eviction round) runs before the launch.
 void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_base_addrs, torch::Tensor block_offsets,
     torch::Tensor seg_page_offsets, torch::Tensor seg_request_ids, torch::Tensor seg_layer_ids,
-    torch::Tensor request_seq_lens, torch::Tensor valid_widths, torch::Tensor request_token_starts, torch::Tensor c_re,
-    torch::Tensor c_im, torch::Tensor c_mlr, torch::Tensor out, int64_t output_width, int64_t num_layers,
-    int64_t num_requests, int64_t num_calibrated_layers, int64_t num_query_heads, int64_t num_kv_heads,
-    int64_t num_freqs, int64_t tokens_per_block, int64_t kv_factor, int64_t num_offsets, int64_t stride_page,
-    int64_t stride_kv_head, int64_t stride_slot, int64_t stride_dim, int64_t num_segments, bool use_max,
-    bool use_vectorized, std::optional<torch::Tensor> kv_scales)
+    torch::Tensor request_seq_lens, torch::Tensor valid_widths, torch::Tensor request_token_starts,
+    std::optional<torch::Tensor> c_re, std::optional<torch::Tensor> c_im, torch::Tensor c_mlr, torch::Tensor out,
+    int64_t output_width, int64_t num_layers, int64_t num_requests, int64_t num_calibrated_layers,
+    int64_t num_query_heads, int64_t num_kv_heads, int64_t num_freqs, int64_t tokens_per_block, int64_t kv_factor,
+    int64_t num_offsets, int64_t stride_page, int64_t stride_kv_head, int64_t stride_slot, int64_t stride_dim,
+    int64_t num_segments, bool use_max, bool use_vectorized, std::optional<torch::Tensor> kv_scales,
+    std::optional<torch::Tensor> phase_cos, std::optional<torch::Tensor> phase_sin,
+    std::optional<torch::Tensor> q_real_scaled, std::optional<torch::Tensor> q_imag_scaled,
+    std::optional<torch::Tensor> round_starts, int64_t max_position)
 {
     TORCH_CHECK(use_max || num_offsets == 1,
         "tri_attention_paged_score: mean aggregation consumes exactly one folded coefficient plane");
@@ -218,8 +242,6 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
     checkContiguousCuda(request_seq_lens, at::kInt, "int32", "request_seq_lens");
     checkContiguousCuda(valid_widths, at::kInt, "int32", "valid_widths");
     checkContiguousCuda(request_token_starts, at::kInt, "int32", "request_token_starts");
-    checkContiguousCuda(c_re, at::kFloat, "fp32", "c_re");
-    checkContiguousCuda(c_im, at::kFloat, "fp32", "c_im");
     checkContiguousCuda(c_mlr, at::kFloat, "fp32", "c_mlr");
     checkContiguousCuda(out, at::kFloat, "fp32", "out");
     TORCH_CHECK(pool_anchor.is_cuda(), "tri_attention_paged_score: pool anchor must be a CUDA tensor");
@@ -247,9 +269,46 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
     // c_mlr is request independent: the score kernels index it as one static
     // [layer, head, freq] table, so only the calibration extent is required.
     int64_t const calibration = num_calibrated_layers * num_query_heads * num_freqs;
-    TORCH_CHECK(
-        c_re.numel() >= num_offsets * total && c_im.numel() >= num_offsets * total && c_mlr.numel() >= calibration,
-        "tri_attention_paged_score: folded coefficient buffers are undersized");
+    bool const rotateInCta = phase_cos.has_value() || phase_sin.has_value() || q_real_scaled.has_value()
+        || q_imag_scaled.has_value() || round_starts.has_value();
+    if (rotateInCta)
+    {
+        TORCH_CHECK(!use_max, "tri_attention_paged_score: in-CTA coefficient rotation is mean-only");
+        TORCH_CHECK(phase_cos.has_value() && phase_sin.has_value() && q_real_scaled.has_value()
+                && q_imag_scaled.has_value() && round_starts.has_value(),
+            "tri_attention_paged_score: in-CTA rotation requires phase_cos, phase_sin, q_real_scaled, "
+            "q_imag_scaled, and round_starts together");
+        TORCH_CHECK(!c_re.has_value() && !c_im.has_value(),
+            "tri_attention_paged_score: in-CTA rotation reads no c_re/c_im planes; omit them");
+        checkContiguousCuda(*phase_cos, at::kFloat, "fp32", "phase_cos");
+        checkContiguousCuda(*phase_sin, at::kFloat, "fp32", "phase_sin");
+        checkContiguousCuda(*q_real_scaled, at::kFloat, "fp32", "q_real_scaled");
+        checkContiguousCuda(*q_imag_scaled, at::kFloat, "fp32", "q_imag_scaled");
+        checkContiguousCuda(*round_starts, at::kInt, "int32", "round_starts");
+        TORCH_CHECK(max_position > 0, "tri_attention_paged_score: in-CTA rotation requires a positive max_position");
+        TORCH_CHECK(phase_cos->numel() >= max_position * num_freqs && phase_sin->numel() >= max_position * num_freqs,
+            "tri_attention_paged_score: phase tables do not cover max_position rows");
+        TORCH_CHECK(q_real_scaled->numel() >= calibration && q_imag_scaled->numel() >= calibration,
+            "tri_attention_paged_score: scaled calibration tensors are undersized");
+        TORCH_CHECK(round_starts->numel() >= num_requests, "tri_attention_paged_score: round_starts are undersized");
+        // Same host-side bounds reduction as the standalone rotation op (one
+        // small sync per eviction round): the kernels gather phase rows
+        // unguarded, so an out-of-range start must fail loudly here.
+        auto const [minStart, maxStart] = round_starts->narrow(0, 0, num_requests).aminmax();
+        TORCH_CHECK(minStart.item<int32_t>() >= 0 && maxStart.item<int32_t>() < max_position,
+            "tri_attention_paged_score: a round start lies outside the tabulated position range [0, ", max_position,
+            ")");
+    }
+    else
+    {
+        TORCH_CHECK(c_re.has_value() && c_im.has_value(),
+            "tri_attention_paged_score: pre-rotated scoring requires c_re and c_im");
+        checkContiguousCuda(*c_re, at::kFloat, "fp32", "c_re");
+        checkContiguousCuda(*c_im, at::kFloat, "fp32", "c_im");
+        TORCH_CHECK(c_re->numel() >= num_offsets * total && c_im->numel() >= num_offsets * total,
+            "tri_attention_paged_score: folded coefficient buffers are undersized");
+    }
+    TORCH_CHECK(c_mlr.numel() >= calibration, "tri_attention_paged_score: folded coefficient buffers are undersized");
     TORCH_CHECK(out.numel() >= num_segments * num_query_heads * output_width,
         "tri_attention_paged_score: score output buffer is undersized");
 
@@ -313,9 +372,14 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
     params.requestSeqLens = request_seq_lens.data_ptr<int32_t>();
     params.validWidthOut = valid_widths.data_ptr<int32_t>();
     params.requestTokenStarts = request_token_starts.data_ptr<int32_t>();
-    params.cRe = c_re.data_ptr<float>();
-    params.cIm = c_im.data_ptr<float>();
+    params.cRe = rotateInCta ? nullptr : c_re->data_ptr<float>();
+    params.cIm = rotateInCta ? nullptr : c_im->data_ptr<float>();
     params.cMlr = c_mlr.data_ptr<float>();
+    params.phaseCos = rotateInCta ? phase_cos->data_ptr<float>() : nullptr;
+    params.phaseSin = rotateInCta ? phase_sin->data_ptr<float>() : nullptr;
+    params.qReS = rotateInCta ? q_real_scaled->data_ptr<float>() : nullptr;
+    params.qImS = rotateInCta ? q_imag_scaled->data_ptr<float>() : nullptr;
+    params.roundStarts = rotateInCta ? round_starts->data_ptr<int32_t>() : nullptr;
     params.out = out.data_ptr<float>();
     params.outputWidth = static_cast<int32_t>(output_width);
     params.numLayers = static_cast<int32_t>(num_layers);
@@ -335,7 +399,7 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
 
     auto stream = at::cuda::getCurrentCUDAStream();
     tk::foldedScoreLaunch(
-        params, poolType, groupSize, static_cast<int32_t>(num_segments), use_vectorized, use_max, stream);
+        params, poolType, groupSize, static_cast<int32_t>(num_segments), use_vectorized, use_max, rotateInCta, stream);
 }
 
 } // anonymous namespace
@@ -360,17 +424,24 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int num_requests, int num_calibrated_layers, "
         "int num_query_heads, int num_freqs, int max_position) -> ()");
 
+    // c_re/c_im are optional: the mean path's default in-CTA coefficient
+    // rotation (phase_cos .. round_starts + max_position, all-or-nothing)
+    // replaces them entirely; the max path and the legacy mean path keep
+    // passing pre-rotated planes.
     m.def(
         "tri_attention_paged_score("
         "Tensor pool_anchor, Tensor layer_base_addrs, Tensor block_offsets, "
         "Tensor seg_page_offsets, Tensor seg_request_ids, Tensor seg_layer_ids, "
         "Tensor request_seq_lens, Tensor(a!) valid_widths, Tensor request_token_starts, "
-        "Tensor c_re, Tensor c_im, Tensor c_mlr, Tensor(b!) out, "
+        "Tensor? c_re, Tensor? c_im, Tensor c_mlr, Tensor(b!) out, "
         "int output_width, int num_layers, int num_requests, int num_calibrated_layers, "
         "int num_query_heads, int num_kv_heads, int num_freqs, int tokens_per_block, "
         "int kv_factor, int num_offsets, int stride_page, int stride_kv_head, "
         "int stride_slot, int stride_dim, int num_segments, bool use_max, bool use_vectorized, "
-        "Tensor? kv_scales=None) -> ()");
+        "Tensor? kv_scales=None, "
+        "Tensor? phase_cos=None, Tensor? phase_sin=None, "
+        "Tensor? q_real_scaled=None, Tensor? q_imag_scaled=None, "
+        "Tensor? round_starts=None, int max_position=0) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
