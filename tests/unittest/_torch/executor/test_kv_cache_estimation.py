@@ -272,7 +272,9 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
 
 
 def test_reserve_uses_manager_budget_for_item_scheduling_models():
-    from tensorrt_llm._torch.multimodal_encoder_cache_manager import MultimodalEncoderCacheManager
+    from tensorrt_llm._torch.pyexecutor.multimodal_encoder_cache_manager import (
+        MultimodalEncoderCacheManager,
+    )
 
     creator = object.__new__(KvCacheCreator)
     # The min-clamped manager budget (not the raw config bytes) bounds all

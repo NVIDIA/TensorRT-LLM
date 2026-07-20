@@ -9,7 +9,6 @@ import torch
 from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
-from tensorrt_llm._torch.multimodal_encoder_cache_manager import MultimodalEncoderCacheManager
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
@@ -22,6 +21,9 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
     _resolve_mm_encoder_token_budget,
+)
+from tensorrt_llm._torch.pyexecutor.multimodal_encoder_cache_manager import (
+    MultimodalEncoderCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
