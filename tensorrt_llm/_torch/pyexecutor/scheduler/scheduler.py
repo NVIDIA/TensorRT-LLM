@@ -613,8 +613,11 @@ class MultimodalScheduler(RequestScheduler):
                 )
                 total_request_bytes = sum(state.embedding_lengths) * self.embedding_row_bytes
                 if total_request_bytes > manager.max_bytes:
-                    # Liveness guard: this request's holds can never coexist
-                    # within the budget, so it would starve forever.
+                    # Liveness backstop: admission
+                    # (`initialize_multimodal_encoder_request`) already
+                    # rejects requests whose holds can never coexist within
+                    # the budget, so reaching this means an accounting bug
+                    # rather than a user input.
                     raise RuntimeError(
                         f"Multimodal request {request.py_request_id} needs "
                         f"{total_request_bytes} bytes of encoder output "
