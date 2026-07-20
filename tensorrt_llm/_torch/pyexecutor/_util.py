@@ -2455,6 +2455,12 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
+    if getattr(model_engine, "mm_encoder_cache_manager", None) is not None:
+        # Route MM encoder-output teardown through the standard
+        # free_resources funnel (completion, cancellation, and error paths).
+        resources[ResourceManagerType.MM_ENCODER_CACHE_MANAGER] = (
+            model_engine.mm_encoder_cache_manager)
+
     # Register the compression manager (if one is configured) with the other
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.

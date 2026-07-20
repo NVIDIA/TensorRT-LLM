@@ -369,9 +369,9 @@ Encoder 출력은 복사 없이 `MultimodalEncoderCacheManager`에 adopt되고 s
 record한다. 전 slot이 record되면 `finalize_into()`가 prompt 순서의 item-view 리스트를
 `multimodal_embedding`으로 발행한다. Request 단위 연속 embedding은 prefill forward 안에서 lazy하게
 구체화되므로(`get_multimodal_embeddings`가 리스트를 이미 concat), encode와 prefill 사이의 GPU
-residency는 manager의 예산 잡힌 entry뿐이다. Hold 해제는 단일 teardown 깔때기 — post-prefill strip과
-`_do_terminate_request`(cancel/error/disagg timeout) 둘 다 멱등 `release_holds`로 수렴 — 를 지나므로
-hold가 request보다 오래 살 수 없다.
+residency는 manager의 예산 잡힌 entry뿐이다. Hold 해제는 executor 표준 teardown을 지난다 — 매니저가
+등록된 `BaseResourceManager`라서 모든 종료 경로(완료·취소·에러·disagg timeout)가 `free_resources`에
+도달하고, post-prefill strip이 이를 조기 호출한다 — 그러므로 hold가 request보다 오래 살 수 없다.
 
 ## End-to-end request workflow
 
@@ -816,8 +816,9 @@ Selection은 request에 in-flight reservation을 만들지 않으므로 schedule
 
 ## Memory ownership: 단일 예산 저장소
 
-Item-scheduling 모델의 encoder 출력은 engine 소유 `MultimodalEncoderCacheManager`에만 산다
-(vLLM `EncoderCacheManager` 구조를 이 executor에 맞게 이식): request는 content key로 entry를 참조하고
+Item-scheduling 모델의 encoder 출력은 engine 소유 `MultimodalEncoderCacheManager`에만 산다.
+이 매니저는 executor의 resource manager로 등록된 `BaseResourceManager`라서 teardown이 표준
+`free_resources` 깔때기를 지난다: request는 content key로 entry를 참조하고
 pin하며, manager의 byte 예산이 encoder-output GPU residency 총량을 bound한다. Cross-request 재사용은
 저장소가 content-addressed라는 것의 부수효과이지 별도 캐시가 아니다. 이로써 이전 두-풀 설계
 (request 소유 buffer + clone 캐시)의 encode-ahead residency 구멍 — prefill 대기 중인 request들이 든
@@ -840,8 +841,7 @@ buffer가 unbounded·unprofiled여서 높은 `free_gpu_memory_fraction`에서 OO
   `_encoder_cache_item_key()` 단일 출처. 안정적인 key를 못 만드는 request
   (`get_mm_encoder_item_keys()`가 `None`)는 request-scoped 임시 key로 저장: 공유 불가, hold 해제 후 회수.
 - **Lifetime과 liveness**: held entry는 절대 evict되지 않으므로 record된 slot은 되돌아갈 수 없다.
-  zero-ref entry는 재사용을 위해 LRU 순서로 상주하다가 할당 압력 시 회수된다. Hold는 단일 teardown
-  깔때기(post-prefill strip + `_do_terminate_request`)로 해제되고, min-clamp + head-of-line 예약이
+  zero-ref entry는 재사용을 위해 LRU 순서로 상주하다가 할당 압력 시 회수된다. Hold는 등록된 resource manager의 `free_resources`(+ post-prefill 조기 호출)로 해제되고, min-clamp + head-of-line 예약이
   전진(부분 할당 교착 없음)을 보장한다.
 - **Profiling 보증**: KV estimation이 boundary encoder batch를 마지막 출력을 잡아둔 채 LLM dummy
   forward와 함께 프로파일하고 manager 예산을 추가로 reserve하므로, 런타임(bounded transient +

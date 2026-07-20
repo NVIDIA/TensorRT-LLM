@@ -61,7 +61,6 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                    MoeLoadBalancerIterContext)
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
-from ..multimodal_encoder_cache_manager import MultimodalEncoderCacheManager
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -86,6 +85,7 @@ from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .multimodal_encoder_cache_manager import MultimodalEncoderCacheManager
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)

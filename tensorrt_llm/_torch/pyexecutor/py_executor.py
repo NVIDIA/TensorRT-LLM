@@ -6691,19 +6691,21 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _release_mm_encoder_holds(self, request: LlmRequest) -> None:
-        """Release the request's MM encoder cache holds (idempotent).
+        """Release the request's MM encoder cache holds early (idempotent).
 
-        Part of the single teardown funnel: the post-prefill strip releases
-        holds as soon as the embedding is consumed, and `_do_terminate_request`
-        catches every other exit (cancellation, errors, disagg timeouts), so
-        a hold can never outlive its request.
+        The registered MM_ENCODER_CACHE_MANAGER resource manager already
+        releases holds on every termination path via
+        `resource_manager.free_resources`; this early call at the
+        post-prefill strip makes entries reclaimable as soon as their
+        embedding has been consumed instead of at request end.
         """
         manager = getattr(self.model_engine, "mm_encoder_cache_manager", None)
         if manager is not None:
-            manager.release_holds(request.request_id)
+            manager.free_resources(request)
 
     def _do_terminate_request(self, request: LlmRequest):
-        self._release_mm_encoder_holds(request)
+        # MM encoder holds release inside free_resources via the registered
+        # MM_ENCODER_CACHE_MANAGER resource manager.
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)

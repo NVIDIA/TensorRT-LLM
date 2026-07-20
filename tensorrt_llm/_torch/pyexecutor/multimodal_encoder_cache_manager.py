@@ -19,11 +19,16 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Hashable
 from threading import RLock
-from typing import Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 
 import torch
 
 from tensorrt_llm.logger import logger
+
+from .resource_manager import BaseResourceManager
+
+if TYPE_CHECKING:
+    from .llm_request import LlmRequest
 
 K = TypeVar("K", bound=Hashable)
 
@@ -48,14 +53,20 @@ class MultimodalEncoderCacheStats(NamedTuple):
     evictions: int
 
 
-class MultimodalEncoderCacheManager(Generic[K]):
+class MultimodalEncoderCacheManager(BaseResourceManager, Generic[K]):
     """Budgeted single storage for multimodal encoder outputs.
 
-    This is the item-scheduling counterpart of vLLM's ``EncoderCacheManager``:
-    encoder outputs live *only* here, requests reference entries by key, and
-    the byte budget therefore bounds the total GPU memory resident encoder
-    outputs can occupy. Cross-request reuse is a side effect of the storage
-    being content-addressed, not a separate cache.
+    Encoder outputs of item-scheduling models live *only* here: requests
+    reference entries by key, and the byte budget therefore bounds the
+    total GPU memory resident encoder outputs can occupy. Cross-request
+    reuse is a side effect of the storage being content-addressed, not a
+    separate cache.
+
+    Registered as a ``BaseResourceManager`` so request teardown flows
+    through the executor's standard ``free_resources`` funnel; admission is
+    NOT capacity-gated here (the MM item scheduler enforces the byte budget
+    via allocate-before-compute), so the scheduler-facing resource counts
+    are zero.
 
     Semantics:
 
@@ -211,6 +222,29 @@ class MultimodalEncoderCacheManager(Generic[K]):
                     entry = self._entries.get(key)
                     if entry is not None:
                         self._held_bytes -= entry.size_bytes
+
+    def free_resources(self, request: "LlmRequest") -> None:
+        """`BaseResourceManager` teardown hook: release the request's holds.
+
+        Runs for every request termination (completion, cancellation,
+        errors) through `ResourceManager.free_resources`; the post-prefill
+        strip additionally calls it early so entries become reclaimable as
+        soon as their embedding has been consumed.
+        """
+        self.release_holds(request.request_id)
+
+    def get_max_resource_count(self) -> int:
+        """Encoder-output bytes are not a capacity-scheduler resource (the
+        MM item scheduler budgets them at selection); return 0 so the
+        executor does not gate admission on this manager."""
+        return 0
+
+    def get_needed_resource_to_completion(self, request: "LlmRequest") -> int:
+        """See `get_max_resource_count`."""
+        return 0
+
+    def shutdown(self) -> None:
+        self.clear()
 
     def clear(self) -> None:
         """Drop all entries and holds. Only safe when no request is active

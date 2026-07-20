@@ -16,7 +16,9 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.multimodal_encoder_cache_manager import MultimodalEncoderCacheManager
+from tensorrt_llm._torch.pyexecutor.multimodal_encoder_cache_manager import (
+    MultimodalEncoderCacheManager,
+)
 
 
 def _tensor(rows: int) -> torch.Tensor:
@@ -113,6 +115,23 @@ def test_reserved_bytes_shrink_allocatable_space():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
     assert manager.can_allocate(4 * ROW_BYTES, reserved_bytes=6 * ROW_BYTES)
     assert not manager.can_allocate(5 * ROW_BYTES, reserved_bytes=6 * ROW_BYTES)
+
+
+def test_free_resources_is_the_resource_manager_teardown_hook():
+    from types import SimpleNamespace
+
+    manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
+    manager.adopt("k", _tensor(4), request_id=7)
+
+    # BaseResourceManager surface: teardown by LlmRequest, zero
+    # scheduler-facing resource counts (budgeting happens at MM item
+    # selection, not capacity admission).
+    request = SimpleNamespace(request_id=7)
+    assert manager.get_max_resource_count() == 0
+    assert manager.get_needed_resource_to_completion(request) == 0
+    manager.free_resources(request)
+    assert manager.held_bytes == 0
+    manager.free_resources(request)  # idempotent like release_holds
 
 
 def test_rejects_nonpositive_budget():
