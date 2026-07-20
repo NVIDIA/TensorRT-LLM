@@ -16,7 +16,6 @@
 
 Usage:
     python glm_image.py
-    python glm_image.py --visual_gen_args ../configs/glm-image-fp8-1gpu.yaml
 """
 
 import argparse
