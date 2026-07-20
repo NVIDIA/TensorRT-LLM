@@ -806,6 +806,12 @@ class PyTorchModelEngine(ModelEngine):
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
 
+        # Cache for enc-dec cross-attention stable generation steps.
+        # Populated on the first CUDA-graph generation step; cleared whenever
+        # the batch composition changes (new encoder request arrives).
+        self._cross_attn_stable_cached_tokens: Optional[List[int]] = None
+        self._cross_attn_stable_request_ids: Optional[List[int]] = None
+
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
@@ -2868,12 +2874,45 @@ class PyTorchModelEngine(ModelEngine):
             skip_cross_kv_projection = True
 
         if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
-            cross_attn_metadata = attn_metadata.update_cross_metadata(
-                encoder_seq_lens=encoder_seq_lens,
-                cross_kv_cache_manager=cross_kv_cache_manager,
-                encoder_num_cached_tokens_per_seq=
-                encoder_num_cached_tokens_per_seq,
+            # Fast path for stable CUDA-graph generation steps: the encoder
+            # KV lengths (kv_lens_cuda) and the frozen prompt lengths
+            # (prompt_lens_cuda) are identical across all generation steps
+            # for a fixed batch. Skip the expensive torch.tensor() allocations
+            # and H2D copies inside prepare() when nothing has changed.
+            is_stable_gen_step = (
+                new_encoder_tokens == 0  # pure generation, no new cross-KV
+                and self._cross_attn_stable_cached_tokens
+                == encoder_num_cached_tokens_per_seq
+                and self._cross_attn_stable_request_ids
+                == attn_metadata.request_ids  # same batch and row order
             )
+            if is_stable_gen_step:
+                cross_attn_metadata = attn_metadata.cross
+                # Only refresh the decoder-side Python references that the
+                # kernel reads; these are pointer-level updates with no alloc.
+                cross_attn_metadata._seq_lens = attn_metadata.seq_lens
+                cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
+                cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
+                cross_attn_metadata.request_ids = attn_metadata.request_ids
+                cross_attn_metadata.num_contexts = attn_metadata.num_contexts
+            else:
+                cross_attn_metadata = attn_metadata.update_cross_metadata(
+                    encoder_seq_lens=encoder_seq_lens,
+                    cross_kv_cache_manager=cross_kv_cache_manager,
+                    encoder_num_cached_tokens_per_seq=
+                    encoder_num_cached_tokens_per_seq,
+                )
+                cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    # Record this stable state for future fast-path use.
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(
+                        attn_metadata.request_ids)
+                else:
+                    # Batch changed (new encoder request); reset cache.
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
                 cross_kv_cache_manager=cross_kv_cache_manager,
@@ -2883,7 +2922,18 @@ class PyTorchModelEngine(ModelEngine):
             )
             if attn_metadata.is_cuda_graph:
                 attn_metadata.cross = cross_attn_metadata
-        cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(
+                        attn_metadata.request_ids)
+                else:
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
+            else:
+                self._cross_attn_stable_cached_tokens = None
+                self._cross_attn_stable_request_ids = None
+            cross_attn_metadata.prepare()
 
         return {
             "encoder_hidden_states": packed_encoder_hidden_states,
@@ -3308,6 +3358,10 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 prompt_lengths[idx] = request.py_prompt_len
 
+            # Physical KV length for the kernels: subtract the tokens a
+            # KV-cache compression manager evicted (tracked on the request,
+            # 0 without compression). Position ids and the cached_tokens stat
+            # keep the logical count.
             if request.is_dummy:
                 num_cached_tokens_per_seq[idx] = base_past_seen
                 request.cached_tokens = base_past_seen
@@ -3318,9 +3372,11 @@ class PyTorchModelEngine(ModelEngine):
                     num_previous_batch] = request.py_batch_idx
                 num_previous_batch += 1
 
-                num_cached_tokens_per_seq[
-                    idx] = base_past_seen + num_tokens_per_extend_request
-                request.cached_tokens = num_cached_tokens_per_seq[idx].item()
+                request.cached_tokens = (base_past_seen +
+                                         num_tokens_per_extend_request)
+                num_cached_tokens_per_seq[idx] = (
+                    base_past_seen + num_tokens_per_extend_request -
+                    request.py_num_compressed_tokens)
 
             request.py_batch_idx = request.py_seq_slot
 
@@ -3719,8 +3775,9 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.cached_tokens = num_cached_tokens_per_seq[-1]
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             request.py_num_compressed_tokens)
+            request.cached_tokens = past_seen_token_num
             append_cross_attention_state(
                 request,
                 project_encoder_output=not request.py_skip_cross_kv_projection
@@ -3912,8 +3969,9 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
-                num_cached_tokens_per_seq.append(past_seen_token_num)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                num_cached_tokens_per_seq.append(
+                    past_seen_token_num - request.py_num_compressed_tokens)
+                request.cached_tokens = past_seen_token_num
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -3940,9 +3998,11 @@ class PyTorchModelEngine(ModelEngine):
                 previous_pos_indices.extend([previous_batch_idx] *
                                             runtime_tokens_per_gen_step)
 
-                num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 runtime_tokens_per_gen_step)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                num_cached_tokens_per_seq.append(
+                    past_seen_token_num + runtime_tokens_per_gen_step -
+                    request.py_num_compressed_tokens)
+                request.cached_tokens = (past_seen_token_num +
+                                         runtime_tokens_per_gen_step)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -3999,7 +4059,8 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             request.py_num_compressed_tokens)
             append_cross_attention_state(request, project_encoder_output=False)
 
             # update batch index
@@ -4076,7 +4137,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
                     position_ids.append(position_id)
-                    num_cached_tokens_per_seq.append(past_seen_token_num)
+                    num_cached_tokens_per_seq.append(
+                        past_seen_token_num - request.py_num_compressed_tokens)
                     prompt_lengths.append(request.py_prompt_len)
                     gather_ids.append(len(position_ids) - 1)
 
@@ -6173,7 +6235,7 @@ class PyTorchModelEngine(ModelEngine):
         encoder_attn_metadata.num_contexts = len(encoder_requests)
         encoder_attn_metadata.max_seq_len = self.max_seq_len
         encoder_attn_metadata.request_ids = request_ids
-        encoder_attn_metadata.prepare()
+        encoder_attn_metadata.prepare_encoder_only()
 
         encoder_input_ids_t = torch.tensor(encoder_input_ids,
                                            dtype=torch.int,
