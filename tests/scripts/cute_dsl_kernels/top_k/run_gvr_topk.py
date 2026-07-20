@@ -161,8 +161,8 @@ def _compile(
         out_values_fake,
         out_indices_fake,
         order_row_fake,
-        block_max_fake,
         stream=fake_stream,
+        block_max=block_max_fake,
         options="--enable-tvm-ffi",
     )
 

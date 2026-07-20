@@ -5083,8 +5083,8 @@ class GvrTopKKernel:
         output_values: cute.Tensor,  # or None.
         output_indices: cute.Tensor,
         order_row: cute.Tensor,  # or None when seqlen_sorted=False
-        block_max: cute.Tensor,  # or None: block-skip disabled
         stream,
+        block_max: cute.Tensor = None,  # block-skip bounds; None = disabled
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
