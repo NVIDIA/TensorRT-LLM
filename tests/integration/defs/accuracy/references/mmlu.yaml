@@ -287,6 +287,9 @@ nvidia/MiniMax-M3-NVFP4:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 81
+  - quant_algo: MIXED_PRECISION
+    spec_dec_algo: Eagle3
+    accuracy: 83
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 87.65
