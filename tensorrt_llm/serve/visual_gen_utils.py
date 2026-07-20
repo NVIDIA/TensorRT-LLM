@@ -1,10 +1,9 @@
 import asyncio
 import base64
 import os
-import shutil
 from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.inputs.media_io import decode_video_frames, is_image_file, is_video_file
+from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes, is_image_bytes
 from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
@@ -156,48 +155,43 @@ def parse_visual_gen_params(
                 )
             params.num_frames = derived
         if request.input_reference is not None:
-            if media_storage_path is None:
-                raise ValueError("media_storage_path is required when input_reference is provided")
-            tmp_path = os.path.join(media_storage_path, f"{id}_reference.part")
-            try:
-                if isinstance(request.input_reference, str):
-                    try:
-                        payload = base64.b64decode(request.input_reference)
-                    except ValueError as exc:
-                        raise ValueError("input_reference is not valid base64 data.") from exc
-                    with open(tmp_path, "wb") as f:
-                        f.write(payload)
-                else:
-                    with open(tmp_path, "wb") as f:
-                        shutil.copyfileobj(request.input_reference.file, f)
+            if isinstance(request.input_reference, str):
+                try:
+                    payload = base64.b64decode(request.input_reference)
+                except ValueError as exc:
+                    raise ValueError("input_reference is not valid base64 data.") from exc
+            else:
+                payload = request.input_reference.file.read()
 
-                if is_image_file(tmp_path):
-                    is_video = False
-                elif is_video_file(tmp_path):
-                    is_video = True
-                else:
+            # Classify by decoding the bytes in memory — nothing touches disk
+            # until the modality is known and validated.
+            if is_image_bytes(payload):
+                # I2V: the stored image file is the cross-model contract —
+                # every I2V pipeline reads ``params.image`` as a path. One
+                # write, straight to the final name; the id is unique per
+                # request, so no reader can observe it early.
+                if media_storage_path is None:
                     raise ValueError(
-                        "input_reference content is neither a decodable image nor a decodable video."
+                        "media_storage_path is required when input_reference is an image"
                     )
                 ref_path = os.path.join(media_storage_path, f"{id}_reference")
-                os.replace(tmp_path, ref_path)
-            except Exception:
-                # Cleanup-and-reraise, not handling: every failure path —
-                # validation errors (400) and I/O or dependency errors (500)
-                # alike — must not leak the temporary materialization.
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
-            if is_video:
-                # V2V reference: decode into ``VideoData`` under
-                # ``multi_modal_data["video"]`` — the one intake video-capable
-                # pipelines read. The decode is model-agnostic (all frames, no
-                # crop); each pipeline picks its own conditioning window.
-                params.multi_modal_data = {
-                    "video": VideoData(frames=decode_video_frames(ref_path), metadata={})
-                }
-            else:
+                with open(ref_path, "wb") as f:
+                    f.write(payload)
                 params.image = ref_path
+            else:
+                # V2V: decode in memory into ``VideoData`` under
+                # ``multi_modal_data["video"]`` — the one intake video-capable
+                # pipelines read; no file is materialized. The decode is
+                # model-agnostic (all frames, no crop); each pipeline picks
+                # its own conditioning window.
+                try:
+                    frames = decode_video_frames_from_bytes(payload)
+                except ValueError as exc:
+                    raise ValueError(
+                        "input_reference content is neither a decodable image "
+                        "nor a decodable video."
+                    ) from exc
+                params.multi_modal_data = {"video": VideoData(frames=frames, metadata={})}
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
