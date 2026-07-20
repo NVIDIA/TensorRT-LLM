@@ -33,27 +33,27 @@ def test_adopt_takes_ownership_without_clone():
     stored = manager.adopt("k", value, request_id=1)
     assert stored.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
     assert manager.current_bytes == 4 * ROW_BYTES
-    assert manager.pinned_bytes == 4 * ROW_BYTES
+    assert manager.held_bytes == 4 * ROW_BYTES
 
 
 def test_duplicate_adopt_collapses_to_one_entry():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
     first = manager.adopt("k", _tensor(4), request_id=1)
     second = manager.adopt("k", _tensor(4), request_id=2)
-    assert second is first  # single resident copy, both requests pinned
+    assert second is first  # single resident copy, both requests holding
     assert manager.current_bytes == 4 * ROW_BYTES
     assert len(manager) == 1
     assert manager.stats().dedup_adoptions == 1
 
-    # Entry stays pinned until the *last* referencing request releases it.
-    manager.unpin_request(1)
-    assert manager.pinned_bytes == 4 * ROW_BYTES
-    manager.unpin_request(2)
-    assert manager.pinned_bytes == 0
+    # Entry stays held until the *last* referencing request releases it.
+    manager.release_holds(1)
+    assert manager.held_bytes == 4 * ROW_BYTES
+    manager.release_holds(2)
+    assert manager.held_bytes == 0
     assert manager.current_bytes == 4 * ROW_BYTES  # still resident for reuse
 
 
-def test_pinned_entries_are_never_evicted():
+def test_held_entries_are_never_evicted():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
     manager.adopt("a", _tensor(6), request_id=1)
     manager.adopt("b", _tensor(4), request_id=1)
@@ -68,7 +68,7 @@ def test_zero_ref_lru_eviction_makes_room():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
     manager.adopt("old", _tensor(6), request_id=1)
     manager.adopt("new", _tensor(4), request_id=2)
-    manager.unpin_request(1)
+    manager.release_holds(1)
 
     assert manager.can_allocate(6 * ROW_BYTES)
     manager.adopt("c", _tensor(6), request_id=3)
@@ -77,36 +77,36 @@ def test_zero_ref_lru_eviction_makes_room():
     assert manager.stats().evictions == 1
 
 
-def test_get_and_pin_revives_freeable_entry():
+def test_get_and_hold_revives_freeable_entry():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
     manager.adopt("k", _tensor(6), request_id=1)
-    manager.unpin_request(1)
-    assert manager.pinned_bytes == 0
+    manager.release_holds(1)
+    assert manager.held_bytes == 0
 
-    hit = manager.get_and_pin("k", request_id=2)
+    hit = manager.get_and_hold("k", request_id=2)
     assert hit is not None
-    assert manager.pinned_bytes == 6 * ROW_BYTES
-    # Re-pinned entry is protected again.
+    assert manager.held_bytes == 6 * ROW_BYTES
+    # Re-held entry is protected again.
     with pytest.raises(RuntimeError):
         manager.adopt("big", _tensor(5), request_id=3)
 
 
-def test_get_and_pin_miss_returns_none():
+def test_get_and_hold_miss_returns_none():
     manager = MultimodalEncoderCacheManager(10 * ROW_BYTES)
-    assert manager.get_and_pin("absent", request_id=1) is None
+    assert manager.get_and_hold("absent", request_id=1) is None
     assert manager.stats().misses == 1
 
 
-def test_unpin_request_is_idempotent_and_scoped():
+def test_release_holds_is_idempotent_and_scoped():
     manager = MultimodalEncoderCacheManager(20 * ROW_BYTES)
     manager.adopt("a", _tensor(4), request_id=1)
     manager.adopt("b", _tensor(4), request_id=1)
     manager.adopt("c", _tensor(4), request_id=2)
 
-    manager.unpin_request(1)
-    manager.unpin_request(1)  # idempotent: cancel path may race normal strip
-    manager.unpin_request(99)  # unknown request is a no-op
-    assert manager.pinned_bytes == 4 * ROW_BYTES  # only request 2's entry
+    manager.release_holds(1)
+    manager.release_holds(1)  # idempotent: cancel path may race normal strip
+    manager.release_holds(99)  # unknown request is a no-op
+    assert manager.held_bytes == 4 * ROW_BYTES  # only request 2's entry
 
 
 def test_reserved_bytes_shrink_allocatable_space():

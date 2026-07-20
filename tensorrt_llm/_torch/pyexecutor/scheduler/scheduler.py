@@ -538,7 +538,7 @@ class MultimodalScheduler(RequestScheduler):
         first request left incomplete additionally reserves its remaining
         bytes so requests behind it cannot squat the space it needs across
         iterations — without this head-of-line reservation, several
-        partially-stored requests could pin fragments of the budget and
+        partially-stored requests could hold fragments of the budget and
         deadlock waiting on one another.
 
         Returns the selected item indices per request id, plus the requests
@@ -608,7 +608,7 @@ class MultimodalScheduler(RequestScheduler):
                 )
                 total_request_bytes = sum(state.embedding_lengths) * self.embedding_row_bytes
                 if total_request_bytes > manager.max_bytes:
-                    # Liveness guard: this request's pins can never coexist
+                    # Liveness guard: this request's holds can never coexist
                     # within the budget, so it would starve forever.
                     raise RuntimeError(
                         f"Multimodal request {request.py_request_id} needs "
