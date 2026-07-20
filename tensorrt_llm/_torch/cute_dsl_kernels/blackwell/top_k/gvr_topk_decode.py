@@ -1567,24 +1567,71 @@ class GvrTopKKernel:
                     for m in cutlass.range_constexpr(M):
                         cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vh >= thr_frag[m])
                     hh = hh + cutlass.Int32(num_threads)
-                tmin = thr_frag[0]
-                for m in cutlass.range_constexpr(M):
-                    tmin = _fmin_f32_inline(tmin, thr_frag[m])
-                # smem_wcnt_multi's first num_warps slots double as the
-                # build's warp-total scratch: the build's own barriers
-                # complete before any count lands there.
-                self._full_build_active(
-                    block_max_row,
-                    slice_start,
-                    slice_end,
-                    tmin,
-                    smem_wcnt_multi,
-                    smem_active,
-                    s_active_cnt,
-                    tidx,
-                    warp_id,
-                    lane,
-                )
+                # Rung-tightening build (cs==1): a rung whose active list
+                # exceeds CAP blocks is provably or near-provably
+                # unacceptable (count >= list length; on real low-hit-rate
+                # rows the loosest sample-quantile rung retains 60%+ of the
+                # blocks and destroys the skip). DROP it — a dropped rung is
+                # merely an unmeasured probe (recorded in the mask at
+                # s_active_cnt[2]; classify and the fallback seeding skip
+                # it) — and rebuild at the next tighter threshold. Bounded
+                # by M-1 extra builds (~2-5us each at nb=8192). At cs>1 the
+                # per-CTA list lengths differ, so the drop decision would
+                # diverge across the cluster: keep the plain loosest-rung
+                # build there.
+                CAP_BLOCKS = cutlass.const_expr(3 * self.kC // 4)
+                if cutlass.const_expr(cluster_size == 1):
+                    build_done = cutlass.Int32(0)
+                    for _attempt in cutlass.range_constexpr(M):
+                        if build_done == cutlass.Int32(0):
+                            dmask = s_active_cnt[2]
+                            tcur = cutlass.Float32(self.FLT_MAX)
+                            mcur = cutlass.Int32(-1)
+                            kept = cutlass.Int32(0)
+                            for m in cutlass.range_constexpr(M):
+                                if (
+                                    dmask & (cutlass.Int32(1) << cutlass.Int32(m))
+                                ) == cutlass.Int32(0):
+                                    kept = kept + cutlass.Int32(1)
+                                    if thr_frag[m] < tcur:
+                                        tcur = thr_frag[m]
+                                        mcur = cutlass.Int32(m)
+                            self._full_build_active(
+                                block_max_row,
+                                slice_start,
+                                slice_end,
+                                tcur,
+                                smem_wcnt_multi,
+                                smem_active,
+                                s_active_cnt,
+                                tidx,
+                                warp_id,
+                                lane,
+                            )
+                            if s_active_cnt[0] <= cutlass.Int32(
+                                CAP_BLOCKS
+                            ) or kept <= cutlass.Int32(1):
+                                build_done = cutlass.Int32(1)
+                            else:
+                                if tidx == 0:
+                                    s_active_cnt[2] = dmask | (cutlass.Int32(1) << mcur)
+                                cute.arch.barrier()
+                else:
+                    tmin = thr_frag[0]
+                    for m in cutlass.range_constexpr(M):
+                        tmin = _fmin_f32_inline(tmin, thr_frag[m])
+                    self._full_build_active(
+                        block_max_row,
+                        slice_start,
+                        slice_end,
+                        tmin,
+                        smem_wcnt_multi,
+                        smem_active,
+                        s_active_cnt,
+                        tidx,
+                        warp_id,
+                        lane,
+                    )
                 if tidx == 0:
                     s_active_cnt[1] = cutlass.Int32(1)  # list-current flag
                 chunks_per_block = cutlass.const_expr(
@@ -4203,7 +4250,7 @@ class GvrTopKKernel:
             )
             s_active_cnt = smem.allocate_tensor(
                 element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((2,), order=(0,)),
+                layout=cute.make_ordered_layout((4,), order=(0,)),
                 byte_alignment=16,
             )
         else:
@@ -4601,6 +4648,7 @@ class GvrTopKKernel:
         if cutlass.const_expr(self.enable_block_skip):
             if tidx == cutlass.Int32(0):
                 s_active_cnt[1] = cutlass.Int32(0)
+                s_active_cnt[2] = cutlass.Int32(0)  # dropped-rung mask
 
         # ---- Phase 1: preIdx Min/Max/Mean ----
         self.phase1_preidx_stats(
@@ -4721,6 +4769,11 @@ class GvrTopKKernel:
                     # (Explicit argmin: with r0_vseed the pmean column is not
                     # sorted into the rung order; for sorted rungs this is
                     # equivalent to the old "last m in window" rule.)
+                    # Dropped rungs (block-skip rung tightening) hold PARTIAL
+                    # counts — never admissible.
+                    dmask_c = cutlass.Int32(0)
+                    if cutlass.const_expr(self.enable_block_skip):
+                        dmask_c = s_active_cnt[2]
                     best_m = cutlass.Int32(-1)
                     best_c = cutlass.Int32(2147483647)
                     for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
@@ -4729,6 +4782,8 @@ class GvrTopKKernel:
                             cm >= cutlass.Int32(self.top_k)
                             and cm <= cutlass.Int32(self.kC)
                             and cm < best_c
+                            and (dmask_c & (cutlass.Int32(1) << cutlass.Int32(m)))
+                            == cutlass.Int32(0)
                         ):
                             best_m = cutlass.Int32(m)
                             best_c = cm
@@ -4776,16 +4831,26 @@ class GvrTopKKernel:
                             bhi = v_hi
                             clo = cutlass.Int32(-1)
                             chi = cutlass.Int32(-1)
+                            dmask_f = cutlass.Int32(0)
+                            if cutlass.const_expr(self.enable_block_skip):
+                                dmask_f = s_active_cnt[2]
                             for m in cutlass.range_constexpr(M):
                                 cm = s_mt_cnt[m]
                                 tm = s_mt_thr[m]
-                                if cm > cutlass.Int32(self.kC) and (
-                                    clo < cutlass.Int32(0) or tm > blo
+                                m_ok = (
+                                    dmask_f & (cutlass.Int32(1) << cutlass.Int32(m))
+                                ) == cutlass.Int32(0)
+                                if (
+                                    m_ok
+                                    and cm > cutlass.Int32(self.kC)
+                                    and (clo < cutlass.Int32(0) or tm > blo)
                                 ):
                                     blo = tm
                                     clo = cm
-                                if cm < cutlass.Int32(self.top_k) and (
-                                    chi < cutlass.Int32(0) or tm < bhi
+                                if (
+                                    m_ok
+                                    and cm < cutlass.Int32(self.top_k)
+                                    and (chi < cutlass.Int32(0) or tm < bhi)
                                 ):
                                     bhi = tm
                                     chi = cm
