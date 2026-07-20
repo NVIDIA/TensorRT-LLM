@@ -33,6 +33,8 @@ CONFIG = {
     "num_attention_heads": 32,
 }
 
+NUM_TRAIN_TIMESTEPS = 1000
+
 
 def _create_model_config(config_dict: dict, backend: str = "VANILLA") -> DiffusionModelConfig:
     """Create DiffusionModelConfig from config dict."""
@@ -73,7 +75,8 @@ def _make_inputs(config, dtype, device):
     prior_token_id = torch.randint(0, 64, size=(batch_size,), generator=generator, device=device)
     prior_token_drop = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-    timestep = torch.randint(0, 1000, size=(batch_size,), generator=generator, device=device)
+    # Normalized timestep in [0, 1]; 0.5 is exact in bf16 so it round-trips cleanly.
+    timestep = torch.tensor([0.5] * batch_size, device=device, dtype=dtype)
     target_size = torch.tensor([[height, width]] * batch_size, dtype=torch.float32, device=device)
     crop_coords = torch.tensor([[0, 0]] * batch_size, dtype=torch.float32, device=device)
 
@@ -214,10 +217,11 @@ class TestGlmImageHuggingFaceComparison(unittest.TestCase):
         ) = _make_inputs(config, dtype, self.DEVICE)
 
         with torch.no_grad():
+            # HF consumes the raw timestep; TRT-LLM consumes the normalized one.
             hf_output = hf_model(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                timestep=timestep,
+                timestep=timestep * NUM_TRAIN_TIMESTEPS,
                 prior_token_id=prior_token_id,
                 prior_token_drop=prior_token_drop,
                 target_size=target_size,

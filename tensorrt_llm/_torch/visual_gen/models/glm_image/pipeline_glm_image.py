@@ -987,7 +987,7 @@ class GlmImagePipeline(BasePipeline):
                 encoder_hidden_states=encoder_hidden_states,
                 prior_token_id=extra_tensors["prior_token_id"],
                 prior_token_drop=extra_tensors["prior_token_drop"],
-                timestep=timestep - 1,
+                timestep=(timestep - 1) / self.scheduler.config.num_train_timesteps,
                 target_size=extra_tensors["target_size"],
                 crop_coords=extra_tensors["crop_coords"],
                 attention_mask=extra_tensors.get("attention_mask"),

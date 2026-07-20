@@ -440,7 +440,7 @@ def _transformer_inputs(transformer, device: str = "cuda", dtype=torch.bfloat16,
             0, min(codebook_size, 64), size=(batch_size,), device=device, generator=g
         ),
         "prior_token_drop": torch.zeros(batch_size, dtype=torch.bool, device=device),
-        "timestep": torch.randint(0, 1000, size=(batch_size,), device=device, generator=g),
+        "timestep": torch.tensor([0.5] * batch_size, device=device, dtype=dtype),
         "target_size": torch.tensor(
             [[height, width]] * batch_size, dtype=torch.float32, device=device
         ),

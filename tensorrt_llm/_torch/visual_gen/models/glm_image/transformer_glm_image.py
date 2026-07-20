@@ -607,6 +607,7 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         )
         text_embed_dim = getattr(pretrained_config, "text_embed_dim", 1472)
         time_embed_dim = getattr(pretrained_config, "time_embed_dim", 512)
+        num_train_timesteps = getattr(pretrained_config, "num_train_timesteps", 1000)
         pooled_projection_dim = 2 * 2 * condition_dim
         inner_dim = num_attention_heads * attention_head_dim
 
@@ -624,6 +625,7 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
                 "prior_vq_quantizer_codebook_size": prior_vq_quantizer_codebook_size,
                 "text_embed_dim": text_embed_dim,
                 "time_embed_dim": time_embed_dim,
+                "num_train_timesteps": num_train_timesteps,
                 "pooled_projection_dim": pooled_projection_dim,
                 "inner_dim": inner_dim,
                 "dtype": dtype,
@@ -720,7 +722,7 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         encoder_hidden_states: torch.Tensor,
         prior_token_id: torch.Tensor,
         prior_token_drop: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         target_size: torch.Tensor,
         crop_coords: torch.Tensor,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -733,6 +735,10 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
             ]
         ] = None,
     ) -> Union[Tuple[torch.Tensor], Transformer2DModelOutput]:
+        """
+        Args:
+            timestep: Normalized scheduler timestep tensor in [0, 1].
+        """
         batch_size, num_channels, height, width = hidden_states.shape
 
         # 1. RoPE
@@ -752,6 +758,8 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
 
         hidden_states = hidden_states + prior_hidden_states
 
+        # GlmImage timestep embeddings use the scheduler's 1000-step scale internally.
+        timestep = timestep * self.config.num_train_timesteps
         temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
 
         # 3. Transformer blocks
