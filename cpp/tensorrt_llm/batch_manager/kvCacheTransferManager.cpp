@@ -555,8 +555,8 @@ void KVCacheTransferManager::enqueueDiskWriteCommon(DiskWriteJob&& job)
 {
     {
         std::unique_lock<std::mutex> lock(mDiskMutex);
-        // Per-slot serialization + bounded-queue backpressure: a retained spill is never dropped (that gate is
-        // upstream at eviction) but still waits here for room, so retained load can't grow RAM unbounded.
+        // Per-slot serialization + bounded-queue backpressure: a retained spill is never dropped (the drop
+        // gate runs at eviction) but still waits here for room, so retained load can't grow RAM unbounded.
         mDiskQueueCv.wait(lock,
             [this, &job]
             {
@@ -611,8 +611,8 @@ void KVCacheTransferManager::diskReaderLoop()
     cudaStream_t stream;
     TLLM_CUDA_CHECK(cudaStreamCreate(&stream));
     // Per-reader PINNED staging buffer, grown on demand to one job's total pool bytes (fixed after the first
-    // job). Pinned so cudaMemcpyAsync is a real async DMA (~20+ GB/s) instead of the driver's hidden pageable
-    // staging copy (~5-8 GB/s, secretly synchronous). pageableFallback is used only if a pinned alloc is refused.
+    // job). Pinned so cudaMemcpyAsync is a real async DMA instead of the driver's hidden pageable
+    // staging copy, which is effectively synchronous. pageableFallback is used only if a pinned alloc is refused.
     std::uint8_t* pinnedBuf = nullptr;
     std::size_t pinnedCap = 0;
     std::vector<std::uint8_t> pageableFallback;

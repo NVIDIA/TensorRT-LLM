@@ -243,7 +243,7 @@ private:
     void waitForDiskSlotWrites(std::string const& filename);
 
     // ---- Disk-tier async ONBOARD: read slot files disk->GPU OFF the scheduler thread ----
-    // Gated by TLLM_KV_DISK_READERS (0/unset => synchronous read = current behavior; N>=1 => N reader
+    // Gated by TLLM_KV_DISK_READERS (0/unset => synchronous read, the default; N>=1 => N reader
     // threads drain a shared read queue). A job carries all of one block's pools; a request is forward-safe
     // once areBlocksReady() reports every block it holds has landed. See loadFromFile / isBlockReadPending.
     struct DiskReadJob

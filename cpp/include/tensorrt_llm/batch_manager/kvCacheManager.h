@@ -1500,7 +1500,7 @@ public:
 
 private:
     //! Disk-tier displacement order among retained blocks: exact earliest deadline;
-    //! among equal deadlines, first-spilled first. Upstream releases and evicts chains
+    //! among equal deadlines, first-spilled first. Block release and eviction walk chains
     //! leaf-first, so arrival order at the disk is deepest-first and FIFO here equals
     //! suffix-first within a chain (and LRU-like across requests). Entries are lazy:
     //! validated against live block state on pop, stale ones discarded.

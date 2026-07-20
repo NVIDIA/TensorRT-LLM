@@ -10698,11 +10698,9 @@ TEST_F(KVCacheManagerTest, VswaDisaggDtypeMismatchTriggersGuard)
 }
 
 // ============================== Disk tier tests ==============================
-// Appended to cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp — reuses
-// the file's fixtures (KVCacheManagerTest, KvCacheManagerTestUtil). Covers the
-// disk cache tier: spill/onboard round trip, the retained-only gate, retention
-// stamping (fresh + reuse), expiry, deadline-ordered displacement, and
-// suffix-first FIFO among equal deadlines.
+// Covers the disk cache tier: spill/onboard round trip, the retained-only gate,
+// retention stamping (fresh + reuse), expiry, deadline-ordered displacement, and
+// suffix-first FIFO among equal deadlines. Reuses the file's fixtures.
 
 #include <filesystem>
 #include <thread>
@@ -11219,8 +11217,8 @@ TEST_F(KVCacheManagerTest, DiskTierSyncOnboardByteExactTest)
 }
 
 // A failed async spill (unwritable slot file) must be contained on the writer thread: per-slot bookkeeping
-// still runs (the spill id is published for the reserved-pool reap) and the worker keeps serving later jobs.
-// Before the fix the TLLM_CHECK throw escaped the thread entry point and std::terminate'd the process.
+// still runs (the spill id is published for the reserved-pool reap) and the worker keeps serving later
+// jobs; an escaped throw from the thread entry point would std::terminate the process.
 TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
 {
     ScopedEnvVar asyncStoreEnv{"TLLM_KV_DISK_ASYNC_STORE", "1"};
@@ -11260,8 +11258,8 @@ TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
 }
 
 // A failed detached onboard read (missing slot file) must not crash the reader thread; the failure surfaces
-// as a throw from areBlocksReady() on the calling (scheduler) thread, and no request is unparked onto the
-// never-filled block. Before the fix the reader's TLLM_CHECK throw std::terminate'd the process.
+// as a throw from areBlocksReady() on the calling (scheduler) thread, and no request is unparked onto
+// the never-filled block.
 TEST_F(KVCacheManagerTest, DiskTierOnboardReadFailureSurfacesTest)
 {
     ScopedEnvVar readersEnv{"TLLM_KV_DISK_READERS", "2"};

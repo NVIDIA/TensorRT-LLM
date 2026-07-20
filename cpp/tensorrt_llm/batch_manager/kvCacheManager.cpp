@@ -1417,12 +1417,8 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     }
     auto victim = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
     mEvictionPolicy->claimBlock(victim);
-    // Reap landed read-pending releases BEFORE testing disk free space. Parked onboarded cards (and
-    // release-deferred blocks) sit OUTSIDE the free queues until reaped, so an onboard-heavy burst that
-    // parks every free disk card would drive getNumFreeBlocks(kDiskLevel) to 0, fire the early-return
-    // below, and never reach claimDiskTarget() -- the only other reap site -- wedging spills permanently.
-    // Reaping here (covering both reclaimSecondaryBlock callers) lets landed cards rejoin the disk free
-    // queue so the check sees the true count.
+    // Blocks with an in-flight onboard read sit outside the free queues; reap the landed ones
+    // before the free-space check below.
     if (mNumDiskBlocks > 0)
     {
         reapReadPendingReleases();
@@ -1438,7 +1434,7 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         {
             TLLM_LOG_INFO("[disk-tier] gate dropped=%zu (windowSize=%d)", mDiskGateDropped, mWindowSize);
         }
-        return victim; // unmarked or expired: discard, exactly as stock
+        return victim; // unmarked or expired: discard, as when no disk tier is configured
     }
     // Reuse-gate: only spill blocks whose content has been reused >= k times (TLLM_KV_DISK_MIN_REUSE; 0=off).
     // Skips one-shot blocks so the SSD tier holds only genuinely-hot prefixes. Env read once, cached.
@@ -1474,13 +1470,13 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
             TLLM_LOG_INFO(
                 "[disk-tier] write-pressure dropped=%zu (windowSize=%d)", mDiskWritePressureDropped, mWindowSize);
         }
-        return victim; // best-effort spill shed under writer saturation: evict as stock (no scheduler stall)
+        return victim; // best-effort spill shed under writer saturation: plain eviction, no scheduler stall
     }
     auto diskTarget = claimDiskTarget();
     if (diskTarget == nullptr)
     {
         // Protect mode + disk full of unexpired blocks: refuse so live TTLs are served.
-        // Victim drops from host exactly as an unmarked block (stock eviction).
+        // Victim drops from host exactly as an unmarked block would.
         ++mDiskAdmissionRefused;
         if (mDiskAdmissionRefused == 1 || mDiskAdmissionRefused % 10000 == 0)
         {
@@ -1504,7 +1500,7 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         mTransferManager->spillToFile(victim, diskSlot, mPools, mDiskCachePath);
     }
     victim->swapDiskResidency(diskTarget); // victim's identity now disk-resident, tree intact
-    victim->setDurationMs(std::nullopt);   // keep it out of upstream's expiring-block machinery
+    victim->setDurationMs(std::nullopt);   // keep it out of the eviction policy's expiring-block machinery
     if (victim->isRetainedNow())
     {
         // Parked at max priority: displacement order among retained blocks is decided by
