@@ -8252,11 +8252,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      output_dtype,
                      remove_online_sf_transpose=False,
                      emit_block_meta=False,
-                     emit_hit_stats=True):
+                     emit_hit_stats=True,
+                     emit_seed_counts=False):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
                    num_sms, num_epi_subtiles, epi_dtype, output_dtype,
-                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats)
+                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
+                   emit_seed_counts)
             if key in cls.kernel_cache:
                 return
 
@@ -8338,6 +8340,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cutlass.Int32, (sym_B, cute.sym_int()),
                         stride_order=(1, 0),
                         assumed_align=16)
+            seed_thr_fake = None
+            seed_counts_fake = None
+            if emit_seed_counts:
+                seed_thr_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (cute.sym_int(), 3),
+                    stride_order=(1, 0),
+                    assumed_align=4)
+                seed_counts_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (cute.sym_int(), 3),
+                    stride_order=(1, 0),
+                    assumed_align=4)
 
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
@@ -8355,6 +8368,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 remove_online_sf_transpose=remove_online_sf_transpose,
                 emit_block_meta=emit_block_meta,
                 emit_hit_stats=emit_hit_stats,
+                emit_seed_counts=emit_seed_counts,
             )
 
             compiled = cute.compile(
@@ -8373,6 +8387,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 hit_stats_fake,
                 hit_bitmap_fake,
                 fake_stream,
+                seed_thr=seed_thr_fake,
+                seed_counts=seed_counts_fake,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled
@@ -8398,6 +8414,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             hit_bitmap: Optional[torch.Tensor] = None,
             block_max_out: Optional[torch.Tensor] = None,
             hit_stats_out: Optional[torch.Tensor] = None,
+            emit_seed_counts: bool = False,
+            seed_thr: Optional[torch.Tensor] = None,
+            seed_counts_out: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -8510,10 +8529,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert (block_max_out.shape == (B * next_n, nrec)
                         and block_max_out.is_contiguous())
 
+            if emit_seed_counts:
+                assert emit_block_meta, (
+                    "emit_seed_counts requires emit_block_meta")
+                # Per-row seed-count emission: 3 thresholds per row (fp32,
+                # post-conversion value domain), counts accumulated with
+                # red.global.add.s32 — the caller must zero seed_counts_out
+                # each step.
+                assert (
+                    seed_thr is not None and seed_thr.dtype == torch.float32
+                    and seed_thr.is_cuda and seed_thr.is_contiguous()
+                    and seed_thr.shape == (B * next_n, 3)
+                ), (f"emit_seed_counts requires seed_thr fp32 "
+                    f"[{B * next_n}, 3]; got "
+                    f"{None if seed_thr is None else (seed_thr.dtype, tuple(seed_thr.shape))}"
+                    )
+                assert (seed_counts_out is not None
+                        and seed_counts_out.dtype == torch.int32
+                        and seed_counts_out.is_cuda
+                        and seed_counts_out.is_contiguous()
+                        and seed_counts_out.shape == (B * next_n, 3)), (
+                            "emit_seed_counts requires a caller-zeroed "
+                            "seed_counts_out int32 [B*next_n, 3]")
+            else:
+                seed_thr = None
+                seed_counts_out = None
+
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
                    num_epi_subtiles, epi_dtype, output_dtype,
-                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats)
+                   remove_online_sf_transpose, emit_block_meta, emit_hit_stats,
+                   emit_seed_counts)
             if key not in cls.kernel_cache:
                 cls._compile(
                     compute_block_kv,
@@ -8527,18 +8573,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output_dtype,
                     remove_online_sf_transpose=remove_online_sf_transpose,
                     emit_block_meta=emit_block_meta,
-                    emit_hit_stats=emit_hit_stats)
+                    emit_hit_stats=emit_hit_stats,
+                    emit_seed_counts=emit_seed_counts)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
             if emit_block_meta:
                 compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                          context_lens, schedule_meta, num_phys_blocks, B,
-                         block_max_out, hit_stats_out, hit_bitmap)
+                         block_max_out, hit_stats_out, hit_bitmap, seed_thr,
+                         seed_counts_out)
                 return logits, block_max_out, hit_stats_out
             compiled(kv_flat, q_3d, sf_q_2d, w_2d, logits, block_table,
                      context_lens, schedule_meta, num_phys_blocks, B, None,
-                     None, None)
+                     None, None, None, None)
             return logits
 
     @torch.library.custom_op("trtllm::cute_dsl_fp4_paged_mqa_logits",

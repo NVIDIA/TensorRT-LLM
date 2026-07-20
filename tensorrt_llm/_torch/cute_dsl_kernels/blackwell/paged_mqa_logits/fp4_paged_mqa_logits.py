@@ -124,6 +124,18 @@ def _red_global_fmax_ordered(addr_i64, fval, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _red_global_add_s32(addr_i64, ival, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [addr_i64.ir_value(loc=loc, ip=ip), ival.ir_value(loc=loc, ip=ip)],
+        "red.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def _red_global_add_f32(addr_i64, fval, *, loc=None, ip=None):
     llvm.inline_asm(
         None,
@@ -438,6 +450,7 @@ class FP4MQALogitsKernel:
         use_batched_store: bool = True,
         emit_block_meta: bool = False,
         emit_hit_stats: bool = True,
+        emit_seed_counts: bool = False,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -514,6 +527,18 @@ class FP4MQALogitsKernel:
         # sufficient for GVR block-skip without the fused Phase 1.
         self.emit_block_meta = emit_block_meta
         self.emit_hit_stats = emit_hit_stats
+        # emit_seed_counts (L1 of the epilogue suite; requires
+        # emit_block_meta): per row, count stored logits >= each of the
+        # T=3 caller-provided thresholds (cross-step seed thresholds from
+        # the GVR xstate). Lane-local accumulation across tiles + one
+        # warp-redux + lane-0 red.global.add.s32 per threshold per row
+        # transition — the hit-stats cost profile. Counts are computed on
+        # the POST-conversION value over valid positions only, matching
+        # the top-k consumer's verification semantics
+        # (workspace/epilogue_topk_interface.md).
+        if emit_seed_counts and not emit_block_meta:
+            raise ValueError("emit_seed_counts requires emit_block_meta")
+        self.emit_seed_counts = emit_seed_counts
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -738,6 +763,8 @@ class FP4MQALogitsKernel:
         hit_stats: cute.Tensor,  # [num_rows, 4] fp32 hit aggregate (or None unless emit_hit_stats)
         hit_bitmap: cute.Tensor,  # [batch, nb_pad*4] int32 (or None unless emit_block_meta)
         stream: cuda.CUstream,
+        seed_thr: cute.Tensor = None,  # [num_rows, 3] fp32 (emit_seed_counts)
+        seed_counts: cute.Tensor = None,  # [num_rows, 3] int32 out, caller-zeroed
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
         # Fused layout per phys block: [data half_head_dim*phys_block_kv bytes]
@@ -939,6 +966,8 @@ class FP4MQALogitsKernel:
             block_max,
             hit_stats,
             hit_bitmap,
+            seed_thr,
+            seed_counts,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -999,6 +1028,24 @@ class FP4MQALogitsKernel:
             hacc_sum[t] = cutlass.Float32(0.0)
             hacc_cnt[t] = cutlass.Int32(0)
 
+    @cute.jit
+    def _flush_seed_counts(self, mSeedCounts, q_idx, scnt, meta_lane):
+        """Warp-redux the lane-local seed counters and fire one lane-0
+        red.global.add.s32 per (t, threshold). Caller zero-initializes
+        mSeedCounts each step; cross-CTA totals accumulate atomically."""
+        next_n = cutlass.const_expr(self.next_n)
+        base_addr = mSeedCounts.iterator.toint()
+        for t in cutlass.range_constexpr(next_n):
+            for j in cutlass.range_constexpr(3):
+                w_cnt = cute.arch.warp_redux_sync(scnt[t * 3 + j], "add")
+                if meta_lane == cutlass.Int32(0):
+                    row = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                    addr = base_addr + (
+                        cutlass.Int64(row) * cutlass.Int64(3) + cutlass.Int64(j)
+                    ) * cutlass.Int64(4)
+                    _red_global_add_s32(addr, w_cnt)
+                scnt[t * 3 + j] = cutlass.Int32(0)
+
     @cute.kernel
     def kernel(
         self,
@@ -1021,6 +1068,8 @@ class FP4MQALogitsKernel:
         mBlockMax: cute.Tensor,  # [num_rows, nb_pad*4] fp32 warp-partials (or None)
         mHitAgg: cute.Tensor,  # [num_rows, 4] fp32 {enc_min, enc_max, sum, cnt} (or None)
         mHitBitmap: cute.Tensor,  # [batch, nb_pad*4] int32 (or None)
+        mSeedThr: cute.Tensor,  # [num_rows, 3] fp32 seed thresholds (or None)
+        mSeedCounts: cute.Tensor,  # [num_rows, 3] int32 counts out (or None)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -2005,6 +2054,9 @@ class FP4MQALogitsKernel:
                         # Hit accumulators + bitmap word add ~6 more live
                         # registers across the tile loop.
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
+                    if cutlass.const_expr(self.emit_seed_counts):
+                        # 3 thresholds + 3 counters per t.
+                        MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2019,6 +2071,12 @@ class FP4MQALogitsKernel:
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
+                    if cutlass.const_expr(self.emit_seed_counts):
+                        sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
+                        scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n * 3):
+                            sthr[_i] = cutlass.Float32(_META_FLT_MAX)
+                            scnt[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Per-lane hit accumulators, carried across ALL
                         # tiles of the same q and flushed once per
@@ -2083,6 +2141,12 @@ class FP4MQALogitsKernel:
                             # Compressed-space context len; the meta valid
                             # mask (kv_pos < ctx_cur) keeps GEMM garbage in
                             # the aligned padding region out of block_max.
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                if q_idx_old < batch_size:
+                                    self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                                for _t in cutlass.range_constexpr(next_n):
+                                    for _j in cutlass.range_constexpr(3):
+                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
                             ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 0 (kv_idx + 0)
@@ -2312,6 +2376,15 @@ class FP4MQALogitsKernel:
                                 out_row_m = q_idx * next_n + t
                                 rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
                                 mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                # Seed-count accumulation: branchless 0/1
+                                # adds on the post-conversion value; the
+                                # valid mask keeps aligned-padding garbage
+                                # out (same contract as block_max).
+                                valid_i1 = cutlass.Int32(meta_valid)
+                                for _j in cutlass.range_constexpr(3):
+                                    ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
+                                    scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
                             if cutlass.const_expr(self.emit_hit_stats):
                                 # Lane-local accumulation, fully BRANCHLESS
                                 # (data-dependent `if meta_hit` compiled to
@@ -2381,6 +2454,9 @@ class FP4MQALogitsKernel:
                         self._flush_hit_agg(
                             mHitAgg, q_idx, hacc_min, hacc_max, hacc_sum, hacc_cnt, meta_lane
                         )
+                if cutlass.const_expr(self.emit_seed_counts):
+                    if q_idx < batch_size:
+                        self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane)
 
                 # Release last Q stage (WG 0)
                 if q_idx < batch_size:
@@ -2414,6 +2490,9 @@ class FP4MQALogitsKernel:
                         # Hit accumulators + bitmap word add ~6 more live
                         # registers across the tile loop.
                         MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
+                    if cutlass.const_expr(self.emit_seed_counts):
+                        # 3 thresholds + 3 counters per t.
+                        MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2428,6 +2507,12 @@ class FP4MQALogitsKernel:
                     ctx_cur = cutlass.Int32(0)
                     meta_warp = local_tidx // 32
                     meta_lane = local_tidx % 32
+                    if cutlass.const_expr(self.emit_seed_counts):
+                        sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
+                        scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n * 3):
+                            sthr[_i] = cutlass.Float32(_META_FLT_MAX)
+                            scnt[_i] = cutlass.Int32(0)
                     if cutlass.const_expr(self.emit_hit_stats):
                         # Per-lane hit accumulators, carried across ALL
                         # tiles of the same q and flushed once per
@@ -2492,6 +2577,12 @@ class FP4MQALogitsKernel:
                             # Compressed-space context len; the meta valid
                             # mask (kv_pos < ctx_cur) keeps GEMM garbage in
                             # the aligned padding region out of block_max.
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                if q_idx_old < batch_size:
+                                    self._flush_seed_counts(mSeedCounts, q_idx_old, scnt, meta_lane)
+                                for _t in cutlass.range_constexpr(next_n):
+                                    for _j in cutlass.range_constexpr(3):
+                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
                             ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 1 (kv_idx + 1)
@@ -2715,6 +2806,15 @@ class FP4MQALogitsKernel:
                                 out_row_m = q_idx * next_n + t
                                 rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
                                 mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                # Seed-count accumulation: branchless 0/1
+                                # adds on the post-conversion value; the
+                                # valid mask keeps aligned-padding garbage
+                                # out (same contract as block_max).
+                                valid_i1 = cutlass.Int32(meta_valid)
+                                for _j in cutlass.range_constexpr(3):
+                                    ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
+                                    scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
                             if cutlass.const_expr(self.emit_hit_stats):
                                 # Lane-local accumulation, fully BRANCHLESS
                                 # (data-dependent `if meta_hit` compiled to
@@ -2784,6 +2884,9 @@ class FP4MQALogitsKernel:
                         self._flush_hit_agg(
                             mHitAgg, q_idx, hacc_min, hacc_max, hacc_sum, hacc_cnt, meta_lane
                         )
+                if cutlass.const_expr(self.emit_seed_counts):
+                    if q_idx < batch_size:
+                        self._flush_seed_counts(mSeedCounts, q_idx, scnt, meta_lane)
 
                 # Release last Q stage (WG 1)
                 if q_idx < batch_size:

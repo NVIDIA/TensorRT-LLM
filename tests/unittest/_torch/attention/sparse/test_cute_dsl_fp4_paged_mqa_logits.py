@@ -759,6 +759,147 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
         assert bm[row, written_hi * 4 :].isnan().all(), f"stray block_max write: {tag}"
 
 
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+# 4224 = 33 blocks of 128 -> odd num_kv exercises WG1's OOB padding tile.
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+@pytest.mark.parametrize("fix_length", [True, False])
+def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
+    batch_size,
+    next_n,
+    avg_ctx,
+    phys_block_kv,
+    fix_length,
+):
+    """emit_seed_counts exactness: per-row counts of logits >= threshold
+    recomputed from the KERNEL'S OWN logits output (the count contract is
+    defined on post-conversion values, same as block_max). Thresholds are
+    per-row quantiles of the row's own logits so each of the 3 counters
+    lands in a different regime (loose/mid/tight)."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLFP4PagedMQALogitsRunner
+
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    num_heads, head_dim = 64, 128
+    max_model_len = max(avg_ctx * 2, 2048)
+    device = "cuda"
+
+    if fix_length:
+        context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    else:
+        lo = max(phys_block_kv, int(0.7 * avg_ctx))
+        context_lens = torch.randint(
+            lo, int(1.3 * avg_ctx) + 1, (batch_size,), dtype=torch.int32, device=device
+        ).clamp(max=max_model_len)
+
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = int(num_blocks_per_seq.sum().item()) + batch_size * 2
+    max_blocks_per_seq = int(num_blocks_per_seq.max().item())
+    block_table = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[off : off + n_blks]
+        off += n_blks
+
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    remove_online_sf_transpose = phys_block_kv == 128
+    kv_fused, _ = kv_cache_cast_to_fp4(
+        kv_cache, remove_online_sf_transpose=remove_online_sf_transpose
+    )
+
+    DG_METADATA_BLOCK_KV = 64
+    num_sms = deep_gemm.get_num_sms()
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
+    )
+
+    aligned_max_ctx = align(max_model_len, 256)
+    nb_pad = aligned_max_ctx // 128
+    num_rows = batch_size * next_n
+
+    # First pass without seed counts to harvest per-row logits for
+    # threshold picking (post-conversion value domain).
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    common = dict(
+        num_epi_subtiles=1,
+        epi_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+        remove_online_sf_transpose=remove_online_sf_transpose,
+    )
+    logits0, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        **common,
+    )
+    torch.cuda.synchronize()
+    lf0 = logits0.float()
+
+    seed_thr = torch.empty((num_rows, 3), dtype=torch.float32, device=device)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        vals = lf0[row, :ctx]
+        # Loose / mid / tight rungs; ties on exact stored values are the
+        # point (>= must count them all).
+        seed_thr[row, 0] = torch.quantile(vals, 0.10)
+        seed_thr[row, 1] = torch.quantile(vals, 0.90)
+        seed_thr[row, 2] = torch.quantile(vals, 0.998)
+
+    seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=device)
+    block_max.fill_(nan)
+    logits, _, _ = CuteDSLFP4PagedMQALogitsRunner.forward(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        emit_block_meta=True,
+        emit_hit_stats=False,
+        block_max_out=block_max,
+        emit_seed_counts=True,
+        seed_thr=seed_thr,
+        seed_counts_out=seed_counts,
+        **common,
+    )
+    torch.cuda.synchronize()
+
+    lf = logits.float()
+    torch.testing.assert_close(lf, lf0, atol=0.0, rtol=0.0)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        tag = f"row={row} ctx={ctx} next_n={next_n} pbk={phys_block_kv}"
+        ref = (lf[row, :ctx].unsqueeze(0) >= seed_thr[row].unsqueeze(1)).sum(-1)
+        got = seed_counts[row].to(torch.int64)
+        assert torch.equal(got.cpu(), ref.cpu().to(torch.int64)), (
+            f"seed_counts mismatch: {tag} got={got.tolist()} ref={ref.tolist()}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Benchmarking entry point (run module directly).
 # ---------------------------------------------------------------------------
