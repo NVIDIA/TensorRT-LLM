@@ -702,7 +702,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
 
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
-                timestep=timestep,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=extra_tensors["encoder_attention_mask"],
                 encoder_hidden_states_2=extra_tensors["encoder_hidden_states_2"],

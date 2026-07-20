@@ -35,6 +35,8 @@ CONFIG = {
     "torch_dtype": "bfloat16",
 }
 
+NUM_TRAIN_TIMESTEPS = 1000
+
 
 def _create_model_config(config_dict: dict, backend: str = "VANILLA") -> DiffusionModelConfig:
     """Create DiffusionModelConfig from config dict."""
@@ -98,7 +100,8 @@ def _make_inputs(config, dtype, device):
 
     encoder_attention_mask_2 = torch.ones(batch_size, sequence_length, device=device, dtype=dtype)
 
-    timestep = torch.tensor([1], device=device, dtype=dtype)
+    # Normalized timestep in [0, 1]; 0.5 is exact in bf16 so it round-trips cleanly.
+    timestep = torch.tensor([0.5], device=device, dtype=dtype)
 
     return (
         hidden_states,
@@ -238,10 +241,11 @@ class TestHunyuanVideo15HuggingFaceComparison(unittest.TestCase):
         ) = _make_inputs(config, dtype, self.DEVICE)
 
         with torch.no_grad():
+            # HF consumes the raw timestep; TRT-LLM consumes the normalized one.
             hf_output = hf_model(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                timestep=timestep,
+                timestep=timestep * NUM_TRAIN_TIMESTEPS,
                 encoder_attention_mask=encoder_attention_mask,
                 encoder_hidden_states_2=encoder_hidden_states_2,
                 image_embeds=image_embeds,

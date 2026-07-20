@@ -456,7 +456,7 @@ class HunyuanVideo15TokenRefiner(torch.nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         attention_mask: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
         if attention_mask is None:
@@ -818,6 +818,7 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         num_layers = getattr(pretrained_config, "num_layers", 54)
         mlp_ratio = getattr(pretrained_config, "mlp_ratio", 4.0)
         target_size = getattr(pretrained_config, "target_size", 640)
+        num_train_timesteps = getattr(pretrained_config, "num_train_timesteps", 1000)
 
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
@@ -864,6 +865,7 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
                 "patch_size_t": patch_size_t,
                 "dtype": dtype,
                 "target_size": target_size,
+                "num_train_timesteps": num_train_timesteps,
                 "image_embed_dim": image_embed_dim,
                 "force_dynamic_quantization": force_dynamic_quant,
                 "skip_create_weights": skip_create_weights,
@@ -948,16 +950,20 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        timestep: torch.LongTensor,
+        timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        timestep_r: Optional[torch.LongTensor] = None,
+        timestep_r: Optional[torch.Tensor] = None,
         encoder_hidden_states_2: Optional[torch.Tensor] = None,
         encoder_attention_mask_2: Optional[torch.Tensor] = None,
         image_embeds: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> Union[Tuple[torch.Tensor], Transformer2DModelOutput]:
+        """
+        Args:
+            timestep: Normalized scheduler timestep tensor in [0, 1].
+        """
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size_t, self.config.patch_size, self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -967,9 +973,15 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         # 1. RoPE
         image_rotary_emb = self.rope(hidden_states)
 
-        # 2. Conditional embeddings
-        timestep_r = timestep_r.to(self.config.dtype) if timestep_r is not None else None
-        temb = self.time_embed(timestep.to(self.config.dtype), timestep_r=timestep_r)
+        # 2. Conditional embeddings. HunyuanVideo1.5 timestep embeddings use the
+        # scheduler's 1000-step scale internally.
+        timestep = timestep.to(self.config.dtype) * self.config.num_train_timesteps
+        timestep_r = (
+            timestep_r.to(self.config.dtype) * self.config.num_train_timesteps
+            if timestep_r is not None
+            else None
+        )
+        temb = self.time_embed(timestep, timestep_r=timestep_r)
 
         hidden_states = self.x_embedder(hidden_states)
 
