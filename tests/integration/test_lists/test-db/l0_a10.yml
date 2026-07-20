@@ -37,6 +37,7 @@ l0_a10:
   - unittest/_torch/executor/test_kv_pool_rebalance.py
   - unittest/_torch/executor/test_disagg_index_mapper_early_release.py
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
+  - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
   - unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py
   - unittest/_torch/modules/dwdp/test_dwdp_manager.py
@@ -51,6 +52,7 @@ l0_a10:
   - unittest/inputs/test_url_validation.py
   - unittest/inputs/test_multimodal.py
   - unittest/inputs/test_multimodal_input_processor.py
+  - unittest/inputs/test_video_decode.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py
@@ -58,6 +60,8 @@ l0_a10:
   - unittest/others/test_tracing.py
   - unittest/disaggregated/test_disagg_openai_client.py
   - unittest/disaggregated/test_disagg_utils.py
+  - unittest/disaggregated/test_coordinator_e2e.py
+  - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_openai_disagg_server.py
   - unittest/disaggregated/test_openai_disagg_service.py
   - unittest/disaggregated/test_router.py
@@ -81,7 +85,6 @@ l0_a10:
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -139,7 +142,6 @@ l0_a10:
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_request_priority.py
   # executor
-  - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_postprocessor_hook.py
@@ -189,22 +191,6 @@ l0_a10:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
-      backend: cpp
-  tests:
-  # ------------- CPP tests ---------------
-  - cpp/test_e2e.py::test_model[-redrafter-86]
-  - cpp/test_e2e.py::test_model[-mamba-86]
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a10*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
@@ -212,8 +198,6 @@ l0_a10:
   - unittest/dynamo
   - unittest/api_stability
   - unittest/bindings
-  # usage telemetry (TRT backend)
-  - unittest/llmapi/test_llm_telemetry.py::TestTelemetryTRTBackend
 - condition:
     ranges:
       system_gpu_count:
@@ -229,18 +213,10 @@ l0_a10:
   tests:
   # ------------- Move from pre_merge to post_merge ---------------
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
-  - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]
   - test_e2e.py::test_openai_health
   - test_e2e.py::test_trtllm_serve_example
-  - test_e2e.py::test_trtllm_serve_top_logprobs[trt]
-  - test_e2e.py::test_openai_misc_example[trt]
-  - test_e2e.py::test_openai_completions_example[trt]
-  - test_e2e.py::test_openai_chat_example[trt]
-  - test_e2e.py::test_openai_reasoning[trt]
-  - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
-  - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
 - condition:
     ranges:
