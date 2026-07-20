@@ -5185,9 +5185,15 @@ class PyExecutor:
             try:
                 self._validate_request(request)
                 if self._supports_mm_encoder_item_scheduling:
+                    manager = self.model_engine.mm_encoder_cache_manager
                     initialize_multimodal_encoder_request(
                         request,
-                        max_num_tokens=self.model_engine.encoder_max_num_tokens)
+                        max_num_tokens=self.model_engine.encoder_max_num_tokens,
+                        max_output_bytes=(manager.max_bytes
+                                          if manager is not None else None),
+                        embedding_row_bytes=getattr(self.model_engine,
+                                                    "mm_embedding_row_bytes",
+                                                    0))
                 return False
             except Exception as e:
                 self._handle_errors(str(e),

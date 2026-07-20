@@ -180,6 +180,32 @@ def test_head_of_line_reservation_blocks_later_requests():
     assert output.context_requests == []
 
 
+def test_admission_rejects_requests_larger_than_output_budget():
+    # A long-video request whose total embedding footprint can never fit
+    # the storage budget fails at admission (failing only that request),
+    # with guidance to raise encoder_cache_max_bytes. Reachable once LLM
+    # chunked prefill admits prompts longer than max_num_tokens.
+    request = _llm_request(
+        1,
+        multimodal_data={
+            "video": {"pixel_values_videos": torch.empty(3, 1)},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+                item_refs=[("video", 0)],
+                encoder_token_lengths=[12],
+                output_embedding_lengths=[3],
+            ),
+            "multimodal_embedding_lengths": [3],
+        },
+    )
+    with pytest.raises(ValueError, match="raise the cache budget"):
+        initialize_multimodal_encoder_request(
+            request,
+            max_num_tokens=1 << 30,
+            max_output_bytes=2 * 4,  # fits 2 rows; the video needs 3
+            embedding_row_bytes=4,
+        )
+
+
 def test_oversized_request_fails_fast_instead_of_starving():
     manager = MultimodalEncoderCacheManager(4, name="test")
     scheduler = MultimodalScheduler(

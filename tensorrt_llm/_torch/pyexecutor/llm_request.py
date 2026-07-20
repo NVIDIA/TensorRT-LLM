@@ -1227,9 +1227,23 @@ def get_multimodal_encoder_token_lengths(
     return item_metadata.encoder_token_lengths
 
 
-def initialize_multimodal_encoder_request(request: LlmRequest,
-                                          max_num_tokens: int) -> None:
-    """Initialize immutable request kind and mutable per-item encoder state."""
+def initialize_multimodal_encoder_request(
+        request: LlmRequest,
+        max_num_tokens: int,
+        *,
+        max_output_bytes: Optional[int] = None,
+        embedding_row_bytes: int = 0) -> None:
+    """Initialize immutable request kind and mutable per-item encoder state.
+
+    Raises `ValueError` (failing only this request) when the request can
+    never execute under the startup guarantees: an atomic item larger than
+    the effective encoder token budget, or — when the encoder-output
+    storage budget is supplied — a total embedding footprint that could
+    never fit `multimodal_config.encoder_cache_max_bytes`. The latter is
+    ordinarily unreachable because prompts are bounded by `max_num_tokens`,
+    but LLM chunked prefill admits longer prompts whose full embedding must
+    stay resident across chunks.
+    """
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
         isinstance(mm_data.get(modality), dict)
@@ -1251,6 +1265,14 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
                              "multimodal_embedding_lengths")
+        if max_output_bytes is not None and embedding_row_bytes > 0:
+            total_bytes = sum(embedding_lengths) * embedding_row_bytes
+            if total_bytes > max_output_bytes:
+                raise ValueError(
+                    f"Multimodal request needs {total_bytes} bytes of "
+                    "encoder output storage but multimodal_config."
+                    f"encoder_cache_max_bytes only allows {max_output_bytes}; "
+                    "raise the cache budget to serve inputs of this size")
         request.py_mm_encoder_state = (
             MultimodalEncoderRequestState.from_embedding_lengths(
                 embedding_lengths))
