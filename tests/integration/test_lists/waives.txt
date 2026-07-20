@@ -142,7 +142,6 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6162322)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/6162322)
 disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6162322)
-disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req60-conc64-qwen3_32b_fp8_mixed_stress] SKIP (https://nvbugs/6432832)
 disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6162322)
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16] SKIP (https://nvbugs/6162322)
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6162322)
