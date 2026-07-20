@@ -890,9 +890,9 @@ def wrap_parallel_attention(
         attn = RingAttention(attn, process_group=vgm.ring_group)
 
     if ulysses_group is not None:
-        # Explicit group override (stage-2 topology stacks): wrap iff the group is
-        # non-trivial, independent of vgm.ulysses_size (a u=1 stage-1 config can
-        # still need a >1 stage-2 ulysses wrap).
+        # Explicit group override: wrap iff the override group is non-trivial,
+        # independent of vgm.ulysses_size (the caller's group may be wider or
+        # narrower than the mapping's).
         if use_ulysses and dist.get_world_size(group=ulysses_group) > 1:
             attn = UlyssesAttention(
                 attn,
