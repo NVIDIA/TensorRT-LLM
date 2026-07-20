@@ -57,7 +57,14 @@ class VmmBounceTransport(BounceTransport):
 
     @classmethod
     def from_config(
-        cls, agent, cfg, *, device_id: int, block_bytes_per_group: List[int]
+        cls,
+        agent,
+        cfg,
+        *,
+        device_id: int,
+        block_bytes_per_group: List[int],
+        destination_pool_layouts: Optional[List[List[tuple[int, int, int]]]] = None,
+        valid_destination_ranges: Optional[List[tuple[int, int]]] = None,
     ) -> Optional["VmmBounceTransport"]:
         """Build a transport sized from the config and clamped to free memory, or None if not even one
         chunk fits."""
@@ -83,6 +90,8 @@ class VmmBounceTransport(BounceTransport):
             capacity_bytes=capacity_bytes,
             phys_chunk_size=chunk,
             block_bytes_per_group=block_bytes_per_group,
+            destination_pool_layouts=destination_pool_layouts,
+            valid_destination_ranges=valid_destination_ranges,
             min_blocks=cfg.min_blocks,
         )
 
@@ -94,6 +103,8 @@ class VmmBounceTransport(BounceTransport):
         capacity_bytes: int,
         phys_chunk_size: int,
         block_bytes_per_group: List[int],
+        destination_pool_layouts: Optional[List[List[tuple[int, int, int]]]] = None,
+        valid_destination_ranges: Optional[List[tuple[int, int]]] = None,
         min_blocks: int = 96,
         quarantine_grace_s: float = _QUARANTINE_GRACE_S,
         name: str = "kv_bounce",
@@ -102,6 +113,16 @@ class VmmBounceTransport(BounceTransport):
         self._device_id = device_id
         # The byte size of one cache block, listed for each attention layer group.
         self._block_bytes_per_group = list(block_bytes_per_group)
+        # Receiver-owned physical slot layouts, indexed by layer group. These
+        # produce a request-specific destination allowlist and validate the
+        # exact per-rank plans before any bounce address is advertised.
+        # ``valid_destination_ranges`` is retained only as a compatibility/testing
+        # fallback for callers without page-table metadata; production
+        # construction always supplies the layouts.
+        self._destination_pool_layouts = tuple(
+            tuple(group) for group in (destination_pool_layouts or ())
+        )
+        self._valid_destination_ranges = tuple(valid_destination_ranges or ())
         # Below this many blocks, skip bounce: coalescing only pays off for long context (the default
         # is roughly twelve thousand tokens; a heuristic, and tunable).
         self._min_blocks = min_blocks
@@ -195,14 +216,45 @@ class VmmBounceTransport(BounceTransport):
             raise
         return slot_id, src_addr, total
 
+    @staticmethod
+    def _canonicalize_write_fragments(write_meta) -> None:
+        """Put bounce fragments in receiver-verifiable destination order.
+
+        The contiguous bounce source preserves this order. Sorting all three
+        arrays together therefore keeps source data paired with its destination
+        while making the result tail independently checkable by the receiver.
+        """
+        if write_meta.dst_ptrs.size < 2:
+            return
+        order = sorted(
+            range(write_meta.dst_ptrs.size),
+            key=lambda index: int(write_meta.dst_ptrs[index]),
+        )
+        if order == list(range(write_meta.dst_ptrs.size)):
+            return
+        write_meta.src_ptrs = np.asarray(
+            [write_meta.src_ptrs[index] for index in order], dtype=np.int64
+        )
+        write_meta.dst_ptrs = np.asarray(
+            [write_meta.dst_ptrs[index] for index in order], dtype=np.int64
+        )
+        write_meta.sizes = np.asarray([write_meta.sizes[index] for index in order], dtype=np.int64)
+
     def build_request(self, write_meta):
         """Gather into a send slot and build the coalesced write, or None on backpressure. The gather
         blocks (and frees the slot on failure) inside _reserve_and_gather."""
+        self._canonicalize_write_fragments(write_meta)
         gathered = self._reserve_and_gather(write_meta, timeout=_RESERVE_TIMEOUT_S)
         if gathered is None:  # backpressure: fall back
             return None
         slot_id, src_addr, total = gathered
-        return self._make_write(src_addr, write_meta, total), slot_id
+        try:
+            return self._make_write(src_addr, write_meta, total), slot_id
+        except Exception:
+            # The gather completed but submission has not started, so this
+            # send slot is still locally quiescent and can be released.
+            self._send_alloc.release(slot_id)
+            raise
 
     def release_send(self, slot_id) -> None:
         """Release a send region after its write has completed."""
@@ -217,16 +269,41 @@ class VmmBounceTransport(BounceTransport):
         return False
 
     def reserve(
-        self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = _RESERVE_TIMEOUT_S
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        expected_destination_plans: Optional[dict[int, tuple[np.ndarray, np.ndarray]]] = None,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
         False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
         must divide across the writers."""
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        if getattr(recv_req, "mamba_state_index", None) is not None:
+            return self._skip_bounce("mamba state has no receiver-owned bounce scatter plan")
+
+        valid_block_ids_per_group: list[np.ndarray] = []
+        for block_ids in recv_req.block_ids_per_layer_groups:
+            # Production requests carry int64 ndarrays. The size-only fallback
+            # keeps lightweight unit fakes usable while production remains
+            # request-bound through ``_destination_pool_layouts`` below.
+            try:
+                values = np.asarray(block_ids, dtype=np.int64)
+            except (TypeError, ValueError):
+                values = np.asarray(list(range(int(block_ids.size))), dtype=np.int64)
+            if values.ndim != 1:
+                return self._skip_bounce("receiver block IDs are not one-dimensional")
+            values = np.asarray(
+                [int(block_id) for block_id in values if int(block_id) >= 0],
+                dtype=np.int64,
+            )
+            valid_block_ids_per_group.append(values)
+
+        nblocks = sum(int(a.size) for a in valid_block_ids_per_group)
         if nblocks < self._min_blocks:
             return self._skip_bounce(f"{nblocks} blocks < min {self._min_blocks} (too small)")
         total = 0
-        for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
+        for g, block_ids in enumerate(valid_block_ids_per_group):
             if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(f"layer group {g} has no known slot size (e.g. mamba)")
             total += int(block_ids.size) * self._block_bytes_per_group[g]
@@ -244,7 +321,7 @@ class VmmBounceTransport(BounceTransport):
             # when the per-block sizes match, so require that here, else fall back.
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
-                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
+                for g, block_ids in enumerate(valid_block_ids_per_group)
                 if int(block_ids.size) > 0
             }
             if len(present_slot_bytes) > 1:
@@ -266,6 +343,18 @@ class VmmBounceTransport(BounceTransport):
             )
         slot_id, addr = res
         recv_req.bounce_dst_base = addr
+        try:
+            allowed_destination_ranges = self._request_destination_ranges(valid_block_ids_per_group)
+            normalized_destination_plans = self._normalize_destination_plans(
+                expected_destination_plans,
+                num_writers=num_writers,
+                per_writer_bytes=total // num_writers,
+                allowed_destination_ranges=allowed_destination_ranges,
+            )
+        except ValueError as error:
+            self._recv_alloc.release(slot_id)
+            recv_req.bounce_dst_base = None
+            return self._skip_bounce(str(error))
         with self._reserved_map_lock:
             ctx = TransferContext(
                 rid_slice=(recv_req.unique_rid, recv_req.slice_id),
@@ -273,6 +362,8 @@ class VmmBounceTransport(BounceTransport):
                 base_addr=addr,
                 per_writer_bytes=total // num_writers,
                 num_writers=num_writers,
+                allowed_destination_ranges=allowed_destination_ranges,
+                expected_destination_plans=normalized_destination_plans,
             )
             self._reserved_map[ctx.rid_slice] = ctx  # inactive until the first writer reports
         # Positive marker: all fall-back guards above passed, so this transfer provably takes the
@@ -285,11 +376,136 @@ class VmmBounceTransport(BounceTransport):
         )
         return True
 
+    def _request_destination_ranges(
+        self, block_ids_per_group: List[np.ndarray]
+    ) -> tuple[tuple[int, int], ...]:
+        """Build the immutable receiver-owned destination allowlist.
+
+        Result tails describe scatter fragments for performance, but they must
+        never gain authority to write into another request's cache blocks. The
+        receiver derives the only legal physical slots from its own page table
+        and the block IDs already attached to this receive task.
+        """
+        if not self._destination_pool_layouts:
+            if not self._valid_destination_ranges:
+                raise ValueError("no receiver-owned KV destination ranges are available")
+            return self._valid_destination_ranges
+        if len(block_ids_per_group) > len(self._destination_pool_layouts):
+            raise ValueError("receiver block groups exceed the local KV pool layout")
+
+        ranges: set[tuple[int, int]] = set()
+        for group_index, block_ids in enumerate(block_ids_per_group):
+            layouts = self._destination_pool_layouts[group_index]
+            if block_ids.size and not layouts:
+                raise ValueError(f"layer group {group_index} has no local KV destination pool")
+            for base, slot_bytes, num_slots in layouts:
+                bad = next(
+                    (int(block_id) for block_id in block_ids if int(block_id) >= num_slots),
+                    None,
+                )
+                if bad is not None:
+                    raise ValueError(
+                        f"receiver block ID {bad} exceeds layer-group {group_index} "
+                        f"pool capacity {num_slots}"
+                    )
+                ranges.update(
+                    (base + int(block_id) * slot_bytes, base + (int(block_id) + 1) * slot_bytes)
+                    for block_id in block_ids
+                )
+        if not ranges:
+            raise ValueError("receiver request has no valid KV destination slots")
+        return tuple(sorted(ranges))
+
+    def _normalize_destination_plans(
+        self,
+        plans: Optional[dict[int, tuple[np.ndarray, np.ndarray]]],
+        *,
+        num_writers: int,
+        per_writer_bytes: int,
+        allowed_destination_ranges: tuple[tuple[int, int], ...],
+    ) -> dict[int, tuple[tuple[int, int], ...]]:
+        """Validate and freeze exact receiver-derived plans before advertisement."""
+        if not self._destination_pool_layouts:
+            return {}
+        if plans is None or len(plans) != num_writers:
+            raise ValueError(
+                "receiver-derived bounce destination plans do not match the writer fan-in"
+            )
+
+        normalized: dict[int, tuple[tuple[int, int], ...]] = {}
+        all_fragments: list[tuple[int, int]] = []
+        for peer_rank, (dst_ptrs, sizes) in plans.items():
+            dst_ptrs = np.asarray(dst_ptrs, dtype=np.int64)
+            sizes = np.asarray(sizes, dtype=np.int64)
+            if dst_ptrs.ndim != 1 or sizes.ndim != 1 or dst_ptrs.size != sizes.size:
+                raise ValueError(f"invalid receiver-derived scatter plan for rank {peer_rank}")
+            if np.any(sizes <= 0):
+                raise ValueError(
+                    f"receiver-derived scatter plan for rank {peer_rank} has non-positive sizes"
+                )
+            plan = tuple((int(ptr), int(size)) for ptr, size in zip(dst_ptrs, sizes, strict=True))
+            if sum(size for _ptr, size in plan) != per_writer_bytes:
+                raise ValueError(
+                    f"receiver-derived scatter plan for rank {peer_rank} does not describe "
+                    f"exactly {per_writer_bytes} bytes"
+                )
+            for index, (ptr, size) in enumerate(plan):
+                end = ptr + size
+                if index and ptr < plan[index - 1][0]:
+                    raise ValueError(
+                        f"receiver-derived scatter plan for rank {peer_rank} is not canonical"
+                    )
+                if index and ptr < plan[index - 1][0] + plan[index - 1][1]:
+                    raise ValueError(f"receiver-derived scatter plan for rank {peer_rank} overlaps")
+                if not any(
+                    valid_start <= ptr and end <= valid_end
+                    for valid_start, valid_end in allowed_destination_ranges
+                ):
+                    raise ValueError(
+                        f"receiver-derived scatter plan for rank {peer_rank} is outside "
+                        "the request's KV slots"
+                    )
+                all_fragments.append((ptr, end))
+            normalized[int(peer_rank)] = plan
+
+        try:
+            actual = self._coalesce_destination_ranges(all_fragments, reject_overlap=True)
+            expected = self._coalesce_destination_ranges(
+                allowed_destination_ranges, reject_overlap=False
+            )
+        except RuntimeError as error:
+            raise ValueError(str(error)) from error
+        if actual != expected:
+            raise ValueError(
+                "receiver-derived writer plans do not exactly cover the request's KV slots"
+            )
+        return normalized
+
     def writer_base(self, rid_slice: RidSlice, writer_index: int) -> Optional[int]:
         """Where the given fan-in writer writes in the region."""
         with self._reserved_map_lock:
             ctx = self._reserved_map.get(rid_slice)
             return None if ctx is None else ctx.writer_base(writer_index)
+
+    def bind_writer(self, rid_slice: RidSlice, peer_rank: int, writer_index: int) -> Optional[int]:
+        """Bind a rank before its sub-region address is advertised."""
+        with self._reserved_map_lock:
+            ctx = self._reserved_map.get(rid_slice)
+            if ctx is None:
+                return None
+            src_base = ctx.writer_base(writer_index)
+            ctx.bind_writer(peer_rank, src_base)
+            return src_base
+
+    def set_completion_callback(
+        self, rid_slice: RidSlice, on_settled: Callable[[bool], None]
+    ) -> None:
+        """Install unconditional settlement accounting before any writer is advertised."""
+        with self._reserved_map_lock:
+            ctx = self._reserved_map.get(rid_slice)
+            if ctx is None:
+                raise RuntimeError(f"bounce callback for unknown reservation {rid_slice}")
+            ctx.set_completion_callback(on_settled)
 
     def is_bounced(self, rid_slice: RidSlice) -> bool:
         with self._reserved_map_lock:
@@ -304,12 +520,25 @@ class VmmBounceTransport(BounceTransport):
             self._recv_alloc.release(ctx.slot_id)
 
     def orphan_reservation(self, rid_slice: RidSlice) -> None:
-        """Give up on a reservation whose write may still be in flight (cancel/timeout/lost result).
-        The write can't be aborted, so quarantine the region (reclaimed later) rather than releasing
-        or leaking it. Idempotent; a no-op once the transfer has settled."""
+        """Retain a reservation whose remote write may still be in flight.
+
+        A time-based quarantine is not a safety proof: an RMA can outlive any
+        chosen grace period. ``confirm_drained`` or all writer results must
+        prove quiescence before this slot returns to the allocator.
+        """
         self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
 
-    def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
+    def confirm_drained(self, rid_slice: RidSlice) -> None:
+        """Release an orphan after sender drain ACK proves reuse is safe."""
+        self._apply(rid_slice, lambda ctx: ctx.confirm_drained())
+
+    def _apply(
+        self,
+        rid_slice: RidSlice,
+        mutate: Callable[[TransferContext], None],
+        *,
+        require_present: bool = False,
+    ) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
         released, never holding it across a CUDA sync, a queue put, or a callback. No-op if the
         region is already gone."""
@@ -318,6 +547,8 @@ class VmmBounceTransport(BounceTransport):
         with self._reserved_map_lock:
             ctx = self._reserved_map.get(rid_slice)
             if ctx is None:
+                if require_present:
+                    raise RuntimeError(f"bounced result for unknown reservation {rid_slice}")
                 return
             mutate(ctx)
             if ctx.ready_to_scatter():
@@ -365,18 +596,104 @@ class VmmBounceTransport(BounceTransport):
         the reader never sees completion before the cache is in place."""
 
         def mut(ctx: TransferContext) -> None:
+            validated_dst_ptrs, validated_sizes = self._validate_scatter_tail(
+                ctx, peer_rank, dst_ptrs, sizes, src_base
+            )
             if on_done is not None:
                 ctx.on_done = on_done
             ctx.record_writer_result(
-                peer_rank, succeeded=True, src_base=src_base, dst_ptrs=dst_ptrs, sizes=sizes
+                peer_rank,
+                succeeded=True,
+                src_base=src_base,
+                dst_ptrs=validated_dst_ptrs,
+                sizes=validated_sizes,
             )
 
-        self._apply(rid_slice, mut)
+        self._apply(rid_slice, mut, require_present=True)
 
-    def record_failure(self, rid_slice: RidSlice, peer_rank: int) -> None:
+    def _validate_scatter_tail(
+        self, ctx: TransferContext, peer_rank: int, dst_ptrs, sizes, src_base
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if dst_ptrs is None or sizes is None or src_base is None:
+            raise RuntimeError("incomplete bounced-result scatter tail")
+        dst_ptrs = np.asarray(dst_ptrs, dtype=np.int64)
+        sizes = np.asarray(sizes, dtype=np.int64)
+        if dst_ptrs.ndim != 1 or sizes.ndim != 1 or dst_ptrs.size != sizes.size:
+            raise RuntimeError("invalid bounced-result pointer/size arrays")
+        if np.any(sizes <= 0):
+            raise RuntimeError("bounced-result fragment sizes must be positive")
+        expected_src_base = ctx._expected_writer_bases.get(peer_rank)
+        if expected_src_base is None or src_base != expected_src_base:
+            raise RuntimeError(f"bounced result source identity mismatch for rank {peer_rank}")
+        described_bytes = sum(int(size) for size in sizes)
+        if described_bytes != ctx.per_writer_bytes:
+            raise RuntimeError(
+                f"bounced result describes {described_bytes} bytes, expected {ctx.per_writer_bytes}"
+            )
+        fragments = [
+            (int(ptr), int(ptr) + int(size)) for ptr, size in zip(dst_ptrs, sizes, strict=True)
+        ]
+        for index, (start, end) in enumerate(fragments):
+            if index and start < fragments[index - 1][0]:
+                raise RuntimeError(
+                    "bounced-result destination fragments are not in canonical address order"
+                )
+            if index and start < fragments[index - 1][1]:
+                raise RuntimeError("bounced-result destination fragments overlap or duplicate")
+            if not any(
+                valid_start <= start and end <= valid_end
+                for valid_start, valid_end in ctx.allowed_destination_ranges
+            ):
+                raise RuntimeError(
+                    f"bounced-result destination [{start}, {end}) is outside the "
+                    "receiver-owned KV destination plan"
+                )
+        expected_plan = ctx.expected_destination_plans.get(peer_rank)
+        actual_plan = tuple(
+            (int(ptr), int(size)) for ptr, size in zip(dst_ptrs, sizes, strict=True)
+        )
+        if ctx.expected_destination_plans and actual_plan != expected_plan:
+            raise RuntimeError(
+                f"bounced-result fragments for rank {peer_rank} do not match the exact "
+                "receiver-derived destination plan"
+            )
+        return dst_ptrs, sizes
+
+    @staticmethod
+    def _coalesce_destination_ranges(
+        ranges: list[tuple[int, int]] | tuple[tuple[int, int], ...],
+        *,
+        reject_overlap: bool,
+    ) -> tuple[tuple[int, int], ...]:
+        coalesced: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if coalesced and start < coalesced[-1][1]:
+                if reject_overlap:
+                    raise RuntimeError(
+                        "bounced-result destination fragments overlap or duplicate across writers"
+                    )
+                raise RuntimeError("receiver-owned KV destination ranges overlap")
+            if coalesced and start == coalesced[-1][1]:
+                coalesced[-1] = (coalesced[-1][0], end)
+            else:
+                coalesced.append((start, end))
+        return tuple(coalesced)
+
+    def record_failure(
+        self,
+        rid_slice: RidSlice,
+        peer_rank: int,
+        on_done: Optional[Callable[[bool], None]] = None,
+    ) -> None:
         """A writer reported failure (it has drained). The region is freed only once every writer has
         reported, not here."""
-        self._apply(rid_slice, lambda ctx: ctx.record_writer_result(peer_rank, succeeded=False))
+
+        def mut(ctx: TransferContext) -> None:
+            if on_done is not None:
+                ctx.on_done = on_done
+            ctx.record_writer_result(peer_rank, succeeded=False)
+
+        self._apply(rid_slice, mut)
 
     def _scatter_loop(self):
         CUASSERT(cudart.cudaSetDevice(self._device_id))
@@ -413,6 +730,8 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_q.put(None)
         if self._scatter_thread.is_alive():
             self._scatter_thread.join(timeout=_CLOSE_JOIN_S)
+        if self._scatter_thread.is_alive():
+            raise RuntimeError("KV bounce scatter thread did not exit; retaining registered memory")
         for d in self._reg_descs:
             try:
                 self._agent.deregister_memory(d)
@@ -436,12 +755,23 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def reserve(
-        self, recv_req, num_writers: int = 1, *, timeout: Optional[float] = _RESERVE_TIMEOUT_S
+        self,
+        recv_req,
+        num_writers: int = 1,
+        *,
+        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        expected_destination_plans: Optional[dict[int, tuple[np.ndarray, np.ndarray]]] = None,
     ) -> bool:
         return False
 
     def writer_base(self, rid_slice, writer_index: int):
         return None
+
+    def bind_writer(self, rid_slice, peer_rank: int, writer_index: int):
+        return None
+
+    def set_completion_callback(self, rid_slice, on_settled) -> None:
+        pass
 
     def is_bounced(self, rid_slice) -> bool:
         return False
@@ -452,13 +782,17 @@ class NoBounceTransport(BounceTransport):
     def orphan_reservation(self, rid_slice) -> None:
         pass
 
+    def confirm_drained(self, rid_slice) -> None:
+        pass
+
     def record_result(
         self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
     ):
         pass
 
-    def record_failure(self, rid_slice, peer_rank) -> None:
-        pass
+    def record_failure(self, rid_slice, peer_rank, on_done=None) -> None:
+        if on_done is not None:
+            on_done(False)
 
     def close(self) -> None:
         pass
@@ -470,8 +804,14 @@ def create_bounce(agent, cfg, *, device_id: int, page_table) -> BounceTransport:
     if cfg is None:
         return NoBounceTransport()
     try:
+        destination_pool_layouts = _destination_pool_layouts(page_table)
         transport = VmmBounceTransport.from_config(
-            agent, cfg, device_id=device_id, block_bytes_per_group=block_bytes_per_group(page_table)
+            agent,
+            cfg,
+            device_id=device_id,
+            block_bytes_per_group=block_bytes_per_group(page_table),
+            destination_pool_layouts=destination_pool_layouts,
+            valid_destination_ranges=[],
         )
         return transport if transport is not None else NoBounceTransport()
     except (
@@ -488,6 +828,12 @@ def build_send_request(bounce, write_meta, fallback):
         built = bounce.build_request(write_meta)
         if built is not None:
             return built
+        # The receiver already advertised a leased bounce destination. A
+        # sender-side in-place fallback would make a tail-less SUCCESS
+        # indistinguishable from a malformed or stale bounced result. Fail the
+        # operation explicitly so the receiver retains/retires the reservation
+        # through the normal terminal protocol.
+        raise RuntimeError("receiver-advertised bounce request could not be built")
     return fallback(), None
 
 
@@ -513,14 +859,14 @@ def encode_result_tail(write_meta) -> list:
     ]
 
 
-def decode_result_tail(message):
+def decode_result_tail(message, *, tail_index: int = 2):
     """Recover the destination fragments, sizes, and source from the optional trailing frames, or
     nothing if the tail is absent."""
-    if len(message) >= 5:
+    if len(message) >= tail_index + 3:
         return (
-            np.frombuffer(message[2], dtype=np.int64),
-            np.frombuffer(message[3], dtype=np.int64),
-            int(np.frombuffer(message[4], dtype=np.int64)[0]),
+            np.frombuffer(message[tail_index], dtype=np.int64),
+            np.frombuffer(message[tail_index + 1], dtype=np.int64),
+            int(np.frombuffer(message[tail_index + 2], dtype=np.int64)[0]),
         )
     return None, None, None
 
@@ -528,13 +874,31 @@ def decode_result_tail(message):
 def block_bytes_per_group(page_table) -> list:
     """Byte size of one cache block for each leading attention layer group, stopping at the first
     non-attention group."""
+    assert page_table is not None
+    return [
+        sum(slot_bytes for _base, slot_bytes, _slots in group)
+        for group in _destination_pool_layouts(page_table)
+    ]
+
+
+def _destination_pool_layouts(page_table) -> list[list[tuple[int, int, int]]]:
+    """Return deduplicated physical slot layouts for each leading attention group."""
     from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup
     from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 
     assert page_table is not None
-    out: list = []
-    for lg_idx, lg in enumerate(page_table.layer_groups):
-        if not isinstance(lg, AttentionLayerGroup):
+    groups: list[list[tuple[int, int, int]]] = []
+    for lg_idx, layer_group in enumerate(page_table.layer_groups):
+        if not isinstance(layer_group, AttentionLayerGroup):
             break
-        out.append(int(get_physical_pool(page_table, lg_idx, 0).slot_bytes))
-    return out
+        unique_layouts = {
+            (
+                int(pool.base_address),
+                int(pool.slot_bytes),
+                int(pool.num_slots),
+            )
+            for pool_view in layer_group.pool_views
+            for pool in [get_physical_pool(page_table, lg_idx, pool_view.pool_idx)]
+        }
+        groups.append(sorted(unique_layouts))
+    return groups
