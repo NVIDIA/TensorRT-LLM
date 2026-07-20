@@ -1266,14 +1266,20 @@ class MLA(nn.Module):
             device=attn_fp8.device,
             dtype=torch.float8_e4m3fn,
         )
-        sf_storage = torch.zeros(packed_k * aligned_m, device=attn_fp8.device, dtype=torch.int32)
-        sf_out = torch.as_strided(sf_storage, (num_tokens, packed_k), (1, aligned_m))
+        # Both O_b backends consume MN-major packed UE8M0 scales. Allocate the
+        # final layout directly; the O_a epilogue also clears its M padding.
+        sf_out = torch.empty_strided(
+            (aligned_m, packed_k),
+            (1, aligned_m),
+            device=attn_fp8.device,
+            dtype=torch.int32,
+        )[:num_tokens]
         torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell_fp8out(
             attn_fp8,
             self.o_a_proj,
             attn_scale,
             self.o_a_proj_scale,
-            o_lora_fp8.transpose(0, 1),
+            o_lora_fp8,
             sf_out,
         )
         return self._fused_ob_gemm(o_lora_fp8.flatten(1), sf_out, num_tokens)
@@ -1281,18 +1287,19 @@ class MLA(nn.Module):
     def _fused_ob_gemm(
         self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
-        """Run the DSV4-Pro O_b FP8 GEMM and emit mHC-ready split partials."""
+        """Run DSV4-Pro O_b with DeepGEMM or the opt-in CuTe DSL kernel."""
         m, n = num_tokens, self.hidden_size
         k_ob = o_lora_fp8.shape[1]
         weight, weight_scale = self.o_b_proj.weight, self.o_b_proj.weight_scale
-        use_cute_tactic = (
-            not _is_env_truthy("TRTLLM_DSV4_DISABLE_CUTE_DSL_OB_PROJ")
+        use_cute_ob_proj = (
+            _is_env_truthy("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ")
+            and m > 0
             and n == _DSV4_PRO_OB_N
             and k_ob == _DSV4_PRO_OB_K
         )
 
         cute_weight_scale = weight_scale
-        if use_cute_tactic and cute_weight_scale.dtype != torch.int32:
+        if use_cute_ob_proj and cute_weight_scale.dtype != torch.int32:
             cute_weight_scale = getattr(self.o_b_proj, "_ob_wsf_int", None)
             if cute_weight_scale is None:
                 # Convert the static weight scale once.
@@ -1305,7 +1312,7 @@ class MLA(nn.Module):
                 )
                 self.o_b_proj._ob_wsf_int = cute_weight_scale
 
-        if not use_cute_tactic:
+        if not use_cute_ob_proj:
             from tensorrt_llm import deep_gemm
 
             hidden = torch.empty([m, n], device=o_lora_fp8.device, dtype=self.dtype)

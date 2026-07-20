@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import bisect
 import functools
 import itertools
 import math
@@ -3948,59 +3949,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    def _dsv4_ob_gen_split4_tuning_buckets(
-            max_num_tokens: int) -> tuple[int, ...]:
-        del max_num_tokens
-        return (1, 2, 4, 8, 16)
+    _Dsv4ObBuckets = Tuple[int, ...]
+    _DSV4_OB_TUNING_BUCKETS = {
+        1: (192, 256, 320, 384, 448, 512, 640, 768, 1024, 1280, 1536, 2048,
+            3072, 4096, 6144, 8192, 12288, 16384),
+        2: (32, 64, 128),
+        4: (1, 2, 4, 8, 16),
+    }
 
-    def _dsv4_ob_map_split4_tuning_bucket(num_tokens: int) -> int:
-        return min(next_positive_power_of_2(num_tokens), 16)
+    def _dsv4_ob_gen_tuning_buckets(max_num_tokens: int,
+                                    buckets: _Dsv4ObBuckets,
+                                    truncate: bool) -> _Dsv4ObBuckets:
+        if not truncate:
+            return buckets
+        # Include the first bucket above the engine's configured maximum.
+        return buckets[:bisect.bisect_left(buckets, max_num_tokens) + 1]
 
-    def _dsv4_ob_gen_split2_tuning_buckets(
-            max_num_tokens: int) -> tuple[int, ...]:
-        del max_num_tokens
-        return (32, 64, 128)
-
-    def _dsv4_ob_map_split2_tuning_bucket(num_tokens: int) -> int:
-        return min(max(next_positive_power_of_2(num_tokens), 32), 128)
-
-    _DSV4_OB_SPLIT1_TUNING_BUCKETS = (
-        192,
-        256,
-        320,
-        384,
-        448,
-        512,
-        640,
-        768,
-        1024,
-        1280,
-        1536,
-        2048,
-        3072,
-        4096,
-        6144,
-        8192,
-        12288,
-        16384,
-    )
-
-    def _dsv4_ob_gen_split1_tuning_buckets(
-            max_num_tokens: int) -> tuple[int, ...]:
-        # Include the first bucket above the warmup shape. This guarantees that
-        # every runtime M up to the engine's configured maximum maps to a
-        # profiled cache entry without sweeping hundreds of nearly identical
-        # 64-token points during startup.
-        for index, bucket in enumerate(_DSV4_OB_SPLIT1_TUNING_BUCKETS):
-            if bucket >= max_num_tokens:
-                return _DSV4_OB_SPLIT1_TUNING_BUCKETS[:index + 1]
-        return _DSV4_OB_SPLIT1_TUNING_BUCKETS
-
-    def _dsv4_ob_map_split1_tuning_bucket(num_tokens: int) -> int:
-        for bucket in _DSV4_OB_SPLIT1_TUNING_BUCKETS:
-            if num_tokens <= bucket:
-                return bucket
-        return _DSV4_OB_SPLIT1_TUNING_BUCKETS[-1]
+    def _dsv4_ob_map_tuning_bucket(num_tokens: int,
+                                   buckets: _Dsv4ObBuckets) -> int:
+        index = min(bisect.bisect_left(buckets, num_tokens), len(buckets) - 1)
+        return buckets[index]
 
     def _prepare_dsv4_ob_tuning_inputs(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -4014,6 +3982,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
         packed_sfa = torch.as_strided(sfa_storage, (m, packed_k),
                                       (1, aligned_m))
         return [a, packed_sfa, b, sfb, partials]
+
+    def _make_dsv4_ob_tuning_config(num_splits: int) -> TuningConfig:
+        buckets = _DSV4_OB_TUNING_BUCKETS[num_splits]
+        return TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0,
+                0,
+                functools.partial(_dsv4_ob_gen_tuning_buckets,
+                                  buckets=buckets,
+                                  truncate=num_splits == 1),
+                functools.partial(_dsv4_ob_map_tuning_bucket, buckets=buckets),
+            ), ),
+            constraint_specs=(
+                ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
+            ),
+            inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+            exclude_from_cache=True,
+        )
 
     class CuteDSLFp8SplitKGemmRunner(TunableRunner):
         """DSV4-Pro O_b runner using native block-scaled tcgen05 MMA."""
@@ -4067,51 +4054,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
 
         _TUNING_CONFIGS = {
-            1:
-            TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0,
-                    0,
-                    _dsv4_ob_gen_split1_tuning_buckets,
-                    _dsv4_ob_map_split1_tuning_bucket,
-                ), ),
-                constraint_specs=(
-                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
-                    ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
-                ),
-                inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
-                exclude_from_cache=True,
-            ),
-            2:
-            TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0,
-                    0,
-                    _dsv4_ob_gen_split2_tuning_buckets,
-                    _dsv4_ob_map_split2_tuning_bucket,
-                ), ),
-                constraint_specs=(
-                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
-                    ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
-                ),
-                inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
-                exclude_from_cache=True,
-            ),
-            4:
-            TuningConfig(
-                dynamic_tensor_specs=(DynamicTensorSpec(
-                    0,
-                    0,
-                    _dsv4_ob_gen_split4_tuning_buckets,
-                    _dsv4_ob_map_split4_tuning_bucket,
-                ), ),
-                constraint_specs=(
-                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
-                    ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
-                ),
-                inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
-                exclude_from_cache=True,
-            ),
+            num_splits: _make_dsv4_ob_tuning_config(num_splits)
+            for num_splits in (1, 2, 4)
         }
 
         @staticmethod
@@ -4796,7 +4740,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ("weight", b, (batch_size, n, k)),
                 ("input_scale", a_sf, (batch_size, sf_k, sf_m)),
                 ("weight_scale", b_sf, (batch_size, sf_n, sf_k)),
-                ("output_fp8", output, (batch_size, m, n)),
+                ("output_fp8", output, (m, batch_size, n)),
                 ("sf_out", sf_out, (m, packed_sf_n)),
             )
             for name, tensor, shape in expected_shapes:
@@ -4816,14 +4760,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if tensor.data_ptr() % 16 != 0:
                     raise ValueError(f"{name} must be 16-byte aligned")
 
-            output_strides = {
-                (m * n, n, 1),
-                (n, batch_size * n, 1),
-            }
-            if output.stride() not in output_strides:
-                raise ValueError(
-                    "output_fp8 must be contiguous or an [M,batch,N] batch-transpose view"
-                )
+            if not output.is_contiguous():
+                raise ValueError("output_fp8 must be contiguous")
             if output.data_ptr() % 16 != 0:
                 raise ValueError("output_fp8 must be 16-byte aligned")
             if sf_out.stride() != (1, sf_m):
@@ -4857,7 +4795,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_fp8_smem_epilogue = m <= 32
             fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
 
-            c_tmp = c_tensor.permute(1, 2, 0)
+            c_tmp = c_tensor.permute(0, 2, 1)
             cache_key = (
                 "fp8out",
                 use_2cta_instrs,
@@ -5013,7 +4951,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_fp8: torch.Tensor,
         sf_out: torch.Tensor,
     ) -> None:
-        """Write [L,M,N] FP8 output and MN-major packed scales."""
+        """Write [M,L,N] FP8 output and MN-major packed scales."""
         if not is_sm_100f():
             raise ValueError(
                 f"cute_dsl_fp8_bmm_blackwell_fp8out requires SM100 family, got {get_sm_version()}"
