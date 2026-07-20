@@ -15,11 +15,12 @@
  */
 
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <utility>
 
 tensorrt_llm::runtime::DecodingLayerWorkspace::DecodingLayerWorkspace(std::shared_ptr<BufferManager> bufferManager,
-    tensorrt_llm::layers::DecoderDomain const& decoderDomain, nvinfer1::DataType logitsType,
+    tensorrt_llm::layers::DecoderDomain const& decoderDomain, tensorrt_llm::DataType logitsType,
     size_t workspaceBufferSizeInBytes)
     : mBufferManager(std::move(bufferManager))
     , mBatchSlotsDevice(
@@ -82,7 +83,8 @@ void tensorrt_llm::runtime::DecodingLayerWorkspace::resize(size_t minSize)
 }
 
 tensorrt_llm::runtime::DecodingLayerWorkspace::TensorPtr
-tensorrt_llm::runtime::DecodingLayerWorkspace::getWorkspaceAsDeviceTensor(ITensor::Shape shape, nvinfer1::DataType type)
+tensorrt_llm::runtime::DecodingLayerWorkspace::getWorkspaceAsDeviceTensor(
+    ITensor::Shape shape, tensorrt_llm::DataType type)
 {
     auto const sizeInBytes = ITensor::volume(shape) * BufferDataType(type).getSize();
     return std::make_shared<GenericTensor<BorrowingAllocator<MemoryType::kGPU>>>(
