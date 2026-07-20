@@ -153,6 +153,56 @@ class MpiSession(abc.ABC):
         fut.set_result(None)
         killer.join()
 
+    def release_exit_joins(self):
+        """Mark the worker world dead and release anything that would join it.
+
+        Non-destructive, so it may be called by a component that does not
+        own the session. Must not tear the session down -- only ensure that
+        nothing (interpreter exit, a later blocking ``shutdown()`` by the
+        owner) waits forever on the dead world. Default: no-op.
+        """
+
+    def abandon(self):
+        """Tear the session down without waiting on a dead worker world."""
+        self.release_exit_joins()
+        self.shutdown(wait=False)
+
+
+def _abandon_mpi_pool_threads(mpi_pool) -> None:
+    """Let interpreter exit proceed despite a wedged pool manager thread.
+
+    When the worker world dies abruptly, the ``MPIPoolExecutor`` manager
+    thread stays blocked in an MPI call forever, and process exit hangs on
+    it twice: mpi4py's exit hook joins every registered manager thread, and
+    CPython joins every non-daemon thread. Deregister the thread from both;
+    it is reaped with the process.
+
+    Best-effort: the touched names are private to mpi4py (``THREADS_QUEUES``
+    in ``_lib``/3.x and ``_core``/4.x) and CPython
+    (``threading._shutdown_locks``, 3.9-3.12). Where a name is absent, that
+    mechanism is left alone and exit may still block on it.
+    """
+    thread = getattr(getattr(mpi_pool, '_pool', None), 'thread', None)
+    if thread is None:
+        return
+    # mpi4py's own exit hook (joins all registered manager threads).
+    for mod_name in ('mpi4py.futures._lib', 'mpi4py.futures._core'):
+        mod = sys.modules.get(mod_name)
+        registry = getattr(mod, 'THREADS_QUEUES', None) if mod else None
+        if registry is not None:
+            try:
+                registry.pop(thread, None)
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(f"THREADS_QUEUES cleanup failed (ignored): {e!r}")
+    # CPython's non-daemon thread join at interpreter shutdown.
+    tstate_lock = getattr(thread, '_tstate_lock', None)
+    shutdown_locks = getattr(threading, '_shutdown_locks', None)
+    if tstate_lock is not None and shutdown_locks is not None:
+        try:
+            shutdown_locks.discard(tstate_lock)
+        except Exception as e:  # noqa: BLE001 - best-effort cleanup
+            logger.debug(f"_shutdown_locks cleanup failed (ignored): {e!r}")
+
 
 def _process_start_time(pid: int) -> Optional[bytes]:
     """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
@@ -236,6 +286,10 @@ class MpiPoolSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
+        if getattr(self, '_pool_dead', False):
+            # A dead pool can never be joined; never block on it, no matter
+            # what the caller asked for.
+            wait = False
         if self.mpi_pool is not None:
             logger.info(
                 f"MpiPoolSession.shutdown: joining {self.n_workers} worker(s) "
@@ -324,6 +378,11 @@ class MpiPoolSession(MpiSession):
                         f"alive after {timeout}s; not waiting further")
                     return
                 time.sleep(0.05)
+
+    def release_exit_joins(self):
+        if self.mpi_pool is not None:
+            _abandon_mpi_pool_threads(self.mpi_pool)
+        self._pool_dead = True
 
     def abort(self):
         self.get_comm().Abort(1)
