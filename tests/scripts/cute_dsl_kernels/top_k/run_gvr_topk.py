@@ -293,6 +293,77 @@ def emu_block_meta(
     return meta.contiguous()
 
 
+def emu_seed_counts(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seed_thr: torch.Tensor,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+) -> torch.Tensor:
+    """L1 emu: exact per-row threshold counts.
+
+    counts[r][j] = |{i < N_eff(r) : logits[r, i] >= t_j}| on the
+    post-conversion values (contract: epilogue_topk_interface.md).
+    """
+    R, C = logits.shape
+    n_eff = _row_n_eff(seq_lens, R, next_n, compress_ratio).unsqueeze(1)
+    pos = torch.arange(C, device=logits.device).unsqueeze(0)
+    lf = logits.to(torch.float32)
+    valid = pos < n_eff
+    counts = torch.empty((R, seed_thr.shape[1]), dtype=torch.int32, device=logits.device)
+    for j in range(seed_thr.shape[1]):
+        counts[:, j] = ((lf >= seed_thr[:, j : j + 1]) & valid).sum(-1, dtype=torch.int32)
+    return counts
+
+
+def emu_cand(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seed_thr: torch.Tensor,
+    cap: int,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    sentinel_pad: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """L2 emu: unordered candidate pre-collect.
+
+    Unordered (value fp32-bits, index) pairs of all valid positions
+    >= t_0 = seed_thr[:, 0]; ctl = {claimed, void}. claimed may
+    over-approximate the true count (window sentinels, idx word = -1) —
+    ``sentinel_pad`` injects that legally. void=1 when claimed > cap; on
+    overflow only the first ``cap`` entries are materialized (contract v2:
+    consumers scan [0, min(claimed, cap)) skipping sentinels).
+    """
+    R, C = logits.shape
+    dev = logits.device
+    n_eff = _row_n_eff(seq_lens, R, next_n, compress_ratio)
+    lf = logits.to(torch.float32)
+    cand = torch.full((R, cap * 2), -1, dtype=torch.int32, device=dev)
+    ctl = torch.zeros((R, 2), dtype=torch.int32, device=dev)
+    pairs = cand.view(R, cap, 2)
+    for r in range(R):
+        ne = int(n_eff[r])
+        hits = torch.nonzero(lf[r, :ne] >= seed_thr[r, 0], as_tuple=False).flatten()
+        cnt = hits.numel()
+        # unordered contract: shuffle, then interleave sentinels
+        perm = hits[torch.randperm(cnt, device=dev)]
+        ent = torch.full((cnt + sentinel_pad,), -1, dtype=torch.int64, device=dev)
+        if sentinel_pad:
+            slots = torch.randperm(cnt + sentinel_pad, device=dev)[:cnt]
+            slots = slots.sort().values
+        else:
+            slots = torch.arange(cnt, device=dev)
+        ent[slots] = perm
+        claimed = int(ent.numel())
+        nwr = min(claimed, cap)
+        live = ent[:nwr] >= 0
+        pairs[r, :nwr, 1] = ent[:nwr].to(torch.int32)
+        pairs[r, :nwr, 0][live] = lf[r, ent[:nwr][live]].view(torch.int32)
+        ctl[r, 0] = claimed
+        ctl[r, 1] = 1 if claimed > cap else 0
+    return cand, ctl
+
+
 def enc_ordered_f32(t: torch.Tensor) -> torch.Tensor:
     """Order-preserving int encoding of fp32 (an involution).
 
