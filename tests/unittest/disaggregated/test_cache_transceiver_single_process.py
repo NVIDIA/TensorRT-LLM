@@ -235,9 +235,13 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._pp_size
             self._s[key][self._pp_rank] = obj
-        self._s["barrier"].wait()
+        # Sync only the PP group that shares this tp_rank. With attention data parallelism
+        # each tp_rank is an independent instance that may run a different number of
+        # collectives, so a single global barrier would deadlock; a per-group one does not.
+        pp_barrier = self._s["pp_barriers"][self._tp_rank]
+        pp_barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        pp_barrier.wait()
         return result
 
     def tp_allgather(self, obj):
@@ -248,9 +252,11 @@ class ThreadSafeDistributed:
             if key not in self._s:
                 self._s[key] = [None] * self._tp_size
             self._s[key][self._tp_rank] = obj
-        self._s["barrier"].wait()
+        # Sync only the TP group that shares this pp_rank (see pp_allgather).
+        tp_barrier = self._s["tp_barriers"][self._pp_rank]
+        tp_barrier.wait()
         result = list(self._s[key])
-        self._s["barrier"].wait()
+        tp_barrier.wait()
         return result
 
 
@@ -551,7 +557,15 @@ def create_instance_transceivers(
 ) -> List[KvCacheTransceiverV2]:
     """Create KvCacheTransceiverV2 for all ranks via threaded init."""
     world_size = tp * pp
-    shared = {"barrier": threading.Barrier(world_size), "lock": threading.Lock()}
+    shared = {
+        "barrier": threading.Barrier(world_size),
+        # Per-group barriers for the grouped collectives, so attention-DP instances can
+        # diverge in how many collectives they issue: pp_allgather syncs the PP ranks that
+        # share a tp_rank, tp_allgather the TP ranks that share a pp_rank.
+        "pp_barriers": [threading.Barrier(pp) for _ in range(tp)],
+        "tp_barriers": [threading.Barrier(tp) for _ in range(pp)],
+        "lock": threading.Lock(),
+    }
     results = [None] * world_size
     errors = [None] * world_size
     threads = []
