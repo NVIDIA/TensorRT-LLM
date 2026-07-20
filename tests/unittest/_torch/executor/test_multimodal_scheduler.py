@@ -458,7 +458,7 @@ def test_item_outputs_accumulate_in_manager_and_release_raw_data(monkeypatch):
     # raw inputs stay until the request completes.
     assert request.py_mm_encoder_state.outputs[0].shape == (2, 2)
     assert request.py_mm_encoder_state.outputs[1] is None
-    assert engine.mm_encoder_cache_manager.pinned_bytes == 2 * 2 * 4
+    assert engine.mm_encoder_cache_manager.held_bytes == 2 * 2 * 4
     assert "image" in request.py_multimodal_data
 
     engine.forward_multimodal_encoder_items([request], {1: [1]})
@@ -615,10 +615,10 @@ def test_item_encode_adopts_outputs_into_manager(monkeypatch):
         [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
     )
     # Slots alias the manager-owned entries (single storage, no clones), and
-    # the entries are pinned on the request's behalf.
-    assert manager.get_and_pin(key0, 99) is request.py_mm_encoder_state.outputs[0]
-    assert manager.get_and_pin(key1, 99) is request.py_mm_encoder_state.outputs[1]
-    assert manager.pinned_bytes == manager.current_bytes > 0
+    # the entries are held on the request's behalf.
+    assert manager.get_and_hold(key0, 99) is request.py_mm_encoder_state.outputs[0]
+    assert manager.get_and_hold(key1, 99) is request.py_mm_encoder_state.outputs[1]
+    assert manager.held_bytes == manager.current_bytes > 0
 
 
 def test_sweep_completes_duplicate_request_without_encoding_or_budget(monkeypatch):
@@ -639,7 +639,7 @@ def test_sweep_completes_duplicate_request_without_encoding_or_budget(monkeypatc
 
     assert engine.model.encoded_item_counts == [2]  # no further encoding
     assert is_multimodal_encoder_ready(second)
-    # Published embedding is the prompt-ordered list of pinned views, and the
+    # Published embedding is the prompt-ordered list of held views, and the
     # duplicate request shares the first request's storage (dedup).
     published = second.py_multimodal_data["multimodal_embedding"]
     assert published == second.py_mm_encoder_state.outputs
@@ -662,7 +662,7 @@ def test_partial_hit_routes_to_item_path_and_schedules_only_misses(monkeypatch):
     )
     # Resident zero-ref entry left behind by an earlier request.
     manager.adopt(key0, torch.full((2, 2), 7.0), request_id=999)
-    manager.unpin_request(999)
+    manager.release_holds(999)
 
     executor = _sweep_executor(engine, [request])
     executor._attach_mm_encoder_cache_hits()
@@ -680,10 +680,10 @@ def test_partial_hit_routes_to_item_path_and_schedules_only_misses(monkeypatch):
     assert is_multimodal_encoder_ready(request)
 
 
-def test_pinned_entries_survive_allocation_pressure(monkeypatch):
+def test_held_entries_survive_allocation_pressure(monkeypatch):
     # Budget fits the pinned request plus one extra row, but not another
     # 2-row item: allocation pressure must fail loudly rather than evict a
-    # pinned entry, so progress cannot regress.
+    # held entry, so progress cannot regress.
     manager = MultimodalEncoderCacheManager(3 * 2 * 4, name="test")
     engine = _cache_engine(manager, monkeypatch)
     request = _cache_request(1, hashes=[[1, 2]], embedding_lengths=[2])
@@ -697,9 +697,9 @@ def test_pinned_entries_survive_allocation_pressure(monkeypatch):
     published = request.py_multimodal_data["multimodal_embedding"]
     assert published[0].shape == (2, 2)
 
-    # After the pins are released (post-prefill / termination funnel), the
+    # After the holds are released (post-prefill / termination funnel), the
     # same allocation succeeds by evicting the now zero-ref entry.
-    manager.unpin_request(request.request_id)
+    manager.release_holds(request.request_id)
     assert manager.can_allocate(2 * 2 * 4)
 
 

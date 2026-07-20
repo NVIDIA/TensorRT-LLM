@@ -81,9 +81,9 @@ class MultimodalEncoderRequestState:
     `record()` writer, so validation cannot diverge between them.
 
     The state holds no storage of its own: every slot aliases a
-    manager-owned entry that the request pins until its prefill consumes
-    the embedding. Pins are released through the executor's teardown
-    funnel (`unpin_request`), never by this object; pinned entries cannot
+    manager-owned entry that the request holds until its prefill consumes
+    the embedding. Holds are released through the executor's teardown
+    funnel (`release_holds`), never by this object; held entries cannot
     be evicted, so a recorded slot cannot regress.
 
     The state is rank-local and never crosses a serialization boundary:
@@ -97,7 +97,7 @@ class MultimodalEncoderRequestState:
 
     outputs: List[Optional[torch.Tensor]]
     """One slot per atomic item, in prompt order. ``None`` until the item is
-    recorded; then an alias of a pinned ``MultimodalEncoderCacheManager``
+    recorded; then an alias of a held ``MultimodalEncoderCacheManager``
     entry."""
 
     @classmethod
@@ -135,8 +135,8 @@ class MultimodalEncoderRequestState:
         """Record one item's manager-owned output view into its slot.
 
         ``output_view`` must come from the `MultimodalEncoderCacheManager`
-        (`adopt()` for fresh encoder outputs, `get_and_pin()` for hits) so
-        it is already pinned on this request's behalf; no copy happens
+        (`adopt()` for fresh encoder outputs, `get_and_hold()` for hits) so
+        it is already held on this request's behalf; no copy happens
         here. Raises when the view does not match the item's declared row
         count, when the item was already recorded, or when it disagrees
         with previously recorded items on trailing shape/dtype/device
@@ -163,7 +163,7 @@ class MultimodalEncoderRequestState:
     def finalize_into(self, multimodal_data: Dict[str, Any]) -> bool:
         """Publish the item views once every slot is recorded.
 
-        Attaches the prompt-ordered list of pinned item views as
+        Attaches the prompt-ordered list of held item views as
         ``multimodal_embedding`` and drops the raw pre-encoder inputs. The
         views stay manager-owned; the per-request contiguous embedding is
         materialized lazily inside the prefill forward
