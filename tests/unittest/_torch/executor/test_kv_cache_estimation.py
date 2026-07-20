@@ -271,6 +271,19 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     assert creator._reserve_multimodal_encoder_cache_memory(1000) == expected
 
 
+def test_reserve_uses_manager_budget_for_item_scheduling_models():
+    from tensorrt_llm._torch.multimodal_encoder_cache_manager import MultimodalEncoderCacheManager
+
+    creator = object.__new__(KvCacheCreator)
+    # The min-clamped manager budget (not the raw config bytes) bounds all
+    # encoder-output residency for item-scheduling models.
+    creator._model_engine = SimpleNamespace(
+        mm_encoder_cache_manager=MultimodalEncoderCacheManager(512, name="t")
+    )
+
+    assert creator._reserve_multimodal_encoder_cache_memory(1000) == 1512
+
+
 # ---------------------------------------------------------------------------
 # VSWA hybrid attention pool-group scaling (Gemma4 hybrid MMMU Pro hang fix)
 # ---------------------------------------------------------------------------
@@ -656,6 +669,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     )
     model_engine = Mock()
     model_engine.model.model_config.attn_backend = "TRTLLM"
+    # A bare Mock would auto-create the manager attribute; real engines set
+    # it to None unless the model opted into MM item scheduling.
+    model_engine.mm_encoder_cache_manager = None
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(

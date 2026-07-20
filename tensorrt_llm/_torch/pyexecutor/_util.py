@@ -690,7 +690,20 @@ class KvCacheCreator:
         self,
         peak_memory: int,
     ) -> int:
-        """Reserve encoder-cache capacity when the model implements that cache."""
+        """Reserve encoder-output storage capacity in the estimated peak.
+
+        Item-scheduling models store every encoder output in the
+        engine-owned `MultimodalEncoderCacheManager`, so reserving its
+        (min-clamped) byte budget bounds ALL runtime encoder-output
+        residency: together with the boundary-batch transient profiled by
+        `_run_dummy_encoder_forwards`, runtime cannot exceed the estimated
+        peak. Other models keep the legacy full-request clone cache
+        reservation.
+        """
+        manager = getattr(self._model_engine, "mm_encoder_cache_manager", None)
+        if manager is not None:
+            return peak_memory + manager.max_bytes
+
         model = self._model_engine.model
         if (not isinstance(model, MultimodalModelMixin)
                 or not model.supports_encoder_cache):
