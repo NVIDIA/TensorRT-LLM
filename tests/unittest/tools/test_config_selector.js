@@ -138,7 +138,7 @@ test("selector keeps both 4x and 8x B200 topologies visible for DeepSeek NVFP4",
   assert.ok(findOption(view.groups.topology, "8|B200_NVL"));
 });
 
-test("selector marks 1024/1024 unavailable for 4x B200 on DeepSeek NVFP4", () => {
+test("selector includes automated 1024/1024 configs for 4x B200", () => {
   const { selector, payload, entries } = setupDeepSeekNvfp4();
 
   const view = selector.createSelectorViewModel(entries, payload.models, {
@@ -148,16 +148,31 @@ test("selector marks 1024/1024 unavailable for 4x B200 on DeepSeek NVFP4", () =>
     concurrency: "",
   });
 
-  assert.equal(findOption(view.groups.islOsl, "1024|1024").status, "incompatible");
+  assert.equal(findOption(view.groups.islOsl, "1024|1024").status, "available");
   assert.equal(findOption(view.groups.islOsl, "1024|8192").status, "available");
   assert.equal(findOption(view.groups.islOsl, "8192|1024").status, "available");
 });
 
 test("selector preserves invalid active selections and explains the clash", () => {
-  const { selector, payload, entries } = setupDeepSeekNvfp4();
+  const selector = loadSelectorExports();
+  const entries = [
+    [4, 1024, 8192],
+    [4, 8192, 1024],
+    [8, 1024, 1024],
+  ].map(([numGpus, isl, osl]) => ({
+    model: "example/model",
+    gpu: "B200_NVL",
+    gpu_display: `${numGpus}xB200_NVL`,
+    num_gpus: numGpus,
+    isl,
+    osl,
+    concurrency: 1,
+    config_path: `${numGpus}-${isl}-${osl}.yaml`,
+    command: `${numGpus}-${isl}-${osl}`,
+  }));
 
-  const view = selector.createSelectorViewModel(entries, payload.models, {
-    model: DEEPSEEK_NVFP4_MODEL,
+  const view = selector.createSelectorViewModel(entries, {}, {
+    model: "example/model",
     topology: "4|B200_NVL",
     islOsl: "1024|1024",
     concurrency: "",
