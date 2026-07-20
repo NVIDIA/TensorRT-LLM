@@ -4,6 +4,7 @@
 import copy
 import os
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -16,6 +17,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import PreparedLlmInputs
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
     Qwen3VLInputProcessorBase,
@@ -82,6 +84,39 @@ QWEN3_VL_8B_CONFIG = {
     "_attn_implementation": "flash_attention_2",
     "_name_or_path": str(os.path.join(llm_models_root(), "Qwen3", "Qwen3-VL-8B-Instruct")),
 }
+
+
+def test_qwen3vl_forwards_fused_deepstack_embeddings_without_rescattering():
+    """Deepstack features are sequence-shaped after the shared fusion step."""
+    hidden_size = 4
+    model = object.__new__(Qwen3VLModel)
+    torch.nn.Module.__init__(model)
+    model.use_deepstack = True
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(disable_fuse_rope=True))
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(num_embeddings=32),
+        )
+    )
+
+    deepstack_embeds = [torch.randn(5, hidden_size) for _ in range(3)]
+    result = model.get_language_model_extra_forward_kwargs(
+        raw_input_ids=torch.tensor([1, 7, 2, 7, 3]),
+        position_ids=None,
+        mm_inputs=PreparedLlmInputs(
+            input_ids=None,
+            inputs_embeds=torch.randn(5, hidden_size),
+            extra_embeds=deepstack_embeds,
+        ),
+        multimodal_params=[],
+        num_generation_requests=0,
+        spec_metadata=None,
+        mm_token_indices=torch.tensor([1, 3]),
+    )
+
+    assert len(result["deepstack_embeds"]) == len(deepstack_embeds)
+    for actual, expected in zip(result["deepstack_embeds"], deepstack_embeds):
+        assert actual is expected
 
 
 @dataclass(repr=False)

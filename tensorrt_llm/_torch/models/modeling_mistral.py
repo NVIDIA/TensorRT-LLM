@@ -799,25 +799,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     def embedding_dtype(self) -> torch.dtype:
         return self.text_embedding_layer.weight.dtype
 
-    @property
-    def draft_config(self):
-        return self.llm.draft_config
-
-    @property
-    def draft_model(self):
-        return self.llm.draft_model
-
-    @property
-    def load_draft_weights(self):
-        return self.llm.load_draft_weights
-
-    @property
-    def vocab_size_padded(self) -> int:
-        return self.llm.vocab_size_padded
-
-    def infer_max_seq_len(self) -> int:
-        return self.llm.infer_max_seq_len()
-
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
@@ -825,80 +806,21 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         mm_embeds = self._vision_forward(list(multimodal_params))
         return mm_embeds[0]
 
-    def get_language_model_forward_kwargs(
+    def get_language_model_extra_forward_kwargs(
         self,
         *,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.Tensor | None,
+        raw_input_ids: torch.Tensor | None,
         position_ids: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None,
         mm_inputs: PreparedLlmInputs,
-        return_context_logits: bool,
         spec_metadata: SpecMetadata | None,
-        resource_manager: Any | None,
+        resource_manager: Any | None = None,
+        **forward_kwargs: Any,
     ) -> dict[str, Any]:
+        del raw_input_ids, position_ids, mm_inputs, forward_kwargs
         return {
-            "attn_metadata": attn_metadata,
-            "input_ids": input_ids,
-            "position_ids": position_ids,
-            "inputs_embeds": inputs_embeds,
-            "return_context_logits": return_context_logits,
             "spec_metadata": spec_metadata,
             "resource_manager": resource_manager,
         }
-
-    @torch.inference_mode()
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        return_context_logits: bool = False,
-        spec_metadata: SpecMetadata | None = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Forward method."""
-        num_context_requests = attn_metadata.num_contexts
-        # multimodal_params is consumed by prepare_multimodal_inputs; remove it
-        # from passthrough kwargs to avoid rebinding it via **kwargs.
-        multimodal_params = kwargs.pop("multimodal_params", [])
-
-        mm_inputs = self.prepare_multimodal_inputs(
-            input_ids=input_ids,
-            positions=position_ids,
-            multimodal_params=multimodal_params,
-            num_context_requests=num_context_requests,
-            attn_metadata=attn_metadata,
-            **kwargs,
-        )
-        if inputs_embeds is not None:
-            if mm_inputs.inputs_embeds is not None:
-                # The caller supplied pre-computed inputs_embeds while the
-                # multimodal pipeline also produced fused embeds. Refuse to
-                # silently drop one or the other; let the caller resolve it.
-                raise ValueError(
-                    "Mistral3VLM.forward received both caller-supplied inputs_embeds "
-                    "and multimodal-derived inputs_embeds. These paths are mutually "
-                    "exclusive; pass at most one.")
-            mm_inputs = PreparedLlmInputs(
-                input_ids=None,
-                inputs_embeds=inputs_embeds,
-                extra_embeds=mm_inputs.extra_embeds,
-            )
-
-        llm_kwargs = self.get_language_model_forward_kwargs(
-            attn_metadata=attn_metadata,
-            input_ids=mm_inputs.input_ids,
-            position_ids=position_ids,
-            inputs_embeds=mm_inputs.inputs_embeds,
-            mm_inputs=mm_inputs,
-            return_context_logits=return_context_logits,
-            spec_metadata=spec_metadata,
-            resource_manager=kwargs.get("resource_manager"),
-        )
-
-        return self.language_model.forward(**llm_kwargs)
 
     @staticmethod
     def _get_sub_model_config(

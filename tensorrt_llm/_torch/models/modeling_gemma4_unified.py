@@ -55,7 +55,7 @@ import json
 import math
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict
 
 import numpy as np
 import torch
@@ -77,8 +77,6 @@ from ...inputs import (
     MultimodalPlaceholderPlacement,
     register_input_processor,
 )
-from ...inputs.multimodal import MultimodalParams
-from ..attention_backend import AttentionMetadata
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
@@ -86,11 +84,6 @@ from .modeling_gemma4mm import (
     Gemma4ForConditionalGeneration,
     Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
-)
-from .modeling_multimodal_utils import (
-    find_input_mm_embeds,
-    fuse_input_embeds,
-    get_multimodal_embeddings,
 )
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -353,169 +346,6 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         else:
             features = features.reshape(-1, features.shape[-1])
         return features.contiguous()
-
-    @property
-    def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values",
-            "image.image_position_ids",
-            "video.pixel_values",
-            "video.image_position_ids",
-            "audio.audio_features",
-            "audio.audio_features_mask",
-        ]
-
-    @staticmethod
-    def _has_active_multimodal_tokens(multimodal_param: MultimodalParams) -> bool:
-        """Whether a context parameter needs embeddings in this forward.
-
-        Mirrors `Gemma4ForConditionalGeneration._has_active_multimodal_tokens`
-        from #15848 (this class overrides `forward` entirely, so the parent's
-        version would not apply here; deduplicate once #15848 lands on main).
-        """
-        runtime = multimodal_param.multimodal_runtime
-        if runtime is not None and runtime.num_mm_tokens_in_chunk == 0:
-            return False
-
-        multimodal_data = multimodal_param.multimodal_data
-        if multimodal_data.get("multimodal_embedding") is not None:
-            return True
-
-        payload_fields = (
-            ("image", "pixel_values"),
-            ("video", "pixel_values"),
-            ("audio", "audio_features"),
-        )
-        return any(
-            multimodal_data.get(modality, {}).get(field) is not None
-            for modality, field in payload_fields
-        )
-
-    def _forward_multimodal_encoder(
-        self, multimodal_params: List[MultimodalParams]
-    ) -> torch.Tensor:
-        """Run the encoder-free projectors for all uncached multimodal payloads.
-
-        Called by `get_multimodal_embeddings`, which caches the result in
-        `multimodal_data["multimodal_embedding"]` so later prefill chunks reuse
-        the embedding without re-running the projectors (mirrors the pattern in
-        `Gemma4ForConditionalGeneration._forward_multimodal_encoder` from #15848).
-        """
-        pixel_values_list, image_position_ids_list = [], []
-        audio_features_list, audio_mask_list = [], []
-        video_pixel_values_list, video_position_ids_list = [], []
-        for multimodal_param in multimodal_params:
-            image_data = multimodal_param.multimodal_data.get("image", {})
-            if image_data.get("pixel_values") is not None:
-                pixel_values_list.append(image_data["pixel_values"])
-                if image_data.get("image_position_ids") is not None:
-                    image_position_ids_list.append(image_data["image_position_ids"])
-            audio_data = multimodal_param.multimodal_data.get("audio", {})
-            if audio_data.get("audio_features") is not None:
-                audio_features_list.append(audio_data["audio_features"])
-                audio_mask_list.append(audio_data.get("audio_features_mask"))
-            video_data = multimodal_param.multimodal_data.get("video", {})
-            if video_data.get("pixel_values") is not None:
-                video_pixel_values_list.append(video_data["pixel_values"])
-                if video_data.get("image_position_ids") is not None:
-                    video_position_ids_list.append(video_data["image_position_ids"])
-
-        embeddings = []
-        if pixel_values_list and self.embed_vision is not None:
-            pixel_values = torch.cat(pixel_values_list)
-            image_position_ids = (
-                torch.cat(image_position_ids_list)
-                if len(image_position_ids_list) == len(pixel_values_list)
-                else None
-            )
-            embeddings.append(self._get_image_features(pixel_values, image_position_ids))
-
-        if video_pixel_values_list and self.embed_vision is not None:
-            video_pixel_values = torch.cat(video_pixel_values_list)
-            video_position_ids = (
-                torch.cat(video_position_ids_list)
-                if len(video_position_ids_list) == len(video_pixel_values_list)
-                else None
-            )
-            embeddings.append(self._get_image_features(video_pixel_values, video_position_ids))
-
-        if audio_features_list and self.embed_audio is not None:
-            per_clip = []
-            for clip_index, audio_feature in enumerate(audio_features_list):
-                per_clip.append(
-                    self._get_audio_features(audio_feature, audio_mask_list[clip_index])
-                )
-            embeddings.append(torch.cat(per_clip, dim=0))
-
-        return torch.cat(embeddings, dim=0) if embeddings else torch.empty(0)
-
-    def forward(
-        self,
-        attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
-        **kwargs,
-    ) -> torch.Tensor:
-        multimodal_params = kwargs.get("multimodal_params", [])
-
-        # Filter to params that have active multimodal tokens in this chunk.
-        # get_multimodal_embeddings caches the result after the first run, so
-        # later prefill chunks reuse the embedding without re-running the projectors.
-        active_multimodal_params = [
-            mp for mp in multimodal_params if self._has_active_multimodal_tokens(mp)
-        ]
-
-        mm_embeds: List[torch.Tensor] = []
-        all_mm_token_ids: List[torch.Tensor] = []
-        mm_token_type_ids = None
-
-        if active_multimodal_params:
-            mm_embeds = get_multimodal_embeddings(
-                encoder_forward_fn=self._forward_multimodal_encoder,
-                multimodal_params=active_multimodal_params,
-            )
-            mm_embeds = find_input_mm_embeds(mm_embeds, active_multimodal_params)
-
-            # Collect every defined multimodal token id. On cache-hit chunks the
-            # raw payloads (pixel_values / audio_features) may be absent while the
-            # cached embedding is used, so the ids cannot be derived from payload
-            # presence; extra ids are harmless (they simply match no position).
-            for token_ids in (self.image_token_ids, self.video_token_ids, self.audio_token_ids):
-                if token_ids is not None:
-                    all_mm_token_ids.append(token_ids)
-
-        # Integer mm_token_type_ids (0=text,1=image,2=video,3=audio) drive the
-        # inherited bidirectional-vision attention mask in Gemma4ForCausalLM.
-        if mm_embeds and input_ids is not None:
-            mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
-            if self.image_token_ids is not None:
-                mm_token_type_ids[torch.isin(input_ids, self.image_token_ids)] = 1
-            if self.video_token_ids is not None:
-                mm_token_type_ids[torch.isin(input_ids, self.video_token_ids)] = 2
-            if self.audio_token_ids is not None:
-                mm_token_type_ids[torch.isin(input_ids, self.audio_token_ids)] = 3
-
-        fuse_token_ids = torch.cat(all_mm_token_ids) if all_mm_token_ids else self.image_token_ids
-
-        input_ids, inputs_embeds = fuse_input_embeds(
-            embedding_layer=self.llm.model.embed_tokens,
-            input_ids=input_ids,
-            mm_embeds=mm_embeds,
-            mm_token_ids=fuse_token_ids,
-            **kwargs,
-        )
-        # 12B has PLE off (hidden_size_per_layer_input=0) -> no ple_input_ids.
-        return self.llm.forward(
-            attn_metadata=attn_metadata,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            return_context_logits=return_context_logits,
-            mm_token_type_ids=mm_token_type_ids,
-            lora_params=kwargs.get("lora_params", None),
-        )
 
     def load_weights(self, weights: Dict, weight_mapper):
         # Text backbone: "model.language_model.X" -> "model.X" (same as the
