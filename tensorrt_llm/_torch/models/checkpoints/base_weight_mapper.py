@@ -72,6 +72,10 @@ class BaseWeightMapper(ABC):
 
         self.map_weights()
 
+    def cleanup(self) -> None:
+        self._model = None
+        self._config = None
+
     @abstractmethod
     def map_weights(self) -> None:
         """Initialize mapping for modules that need special weight loading like weight fusion.
@@ -83,67 +87,33 @@ class BaseWeightMapper(ABC):
         - 'gate_up_proj': ['gate_proj', 'up_proj']
         """
 
-    def cleanup(self) -> None:
-        self._model = None
-        self._config = None
+    @abstractmethod
+    def apply_callbacks(
+            self, module: nn.Module, module_name: str,
+            module_names_breakdown: list[str],
+            weights: Mapping[str,
+                             torch.Tensor]) -> list[dict[str, torch.Tensor]]:
+        """Build processed weight dicts for a special child module.
 
-    def add_skip_modules(self, value: list[str]) -> None:
-        self._skip_modules.extend(value)
+        Used only when `self.does_require_special_handling()` is True, derived classes
+        implement this function to process raw `weights` before passing them into
+        the `module.load_weights()`.
 
-    @property
-    def model(self) -> nn.Module | DecoderModelForCausalLM:
-        if self._model is None:
-            raise RuntimeError("Weight mapper is not initialized")
-        return self._model
-
-    @property
-    def config(self) -> ModelConfig:
-        if self._config is None:
-            raise RuntimeError("Weight mapper is not initialized")
-        return self._config
-
-    @property
-    def mapping(self) -> dict[str, list[str]]:
-        """Return the mapping for modules that need special weight loading.
-
-        It maps module names to the corresponding source names in the checkpoint, e.g.
-        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        'gate_up_proj': ['gate_proj', 'up_proj']
-        Those two modules fuse several GEMM weights together for a single GEMM call.
-
-        Returns the mapping as dict[str, list[str]]
-        """
-        return self._mapping
-
-    @property
-    def skip_modules(self) -> list[str]:
-        return self._skip_modules
-
-    @property
-    def _head_dim(self) -> int:
-        model = self.model
-        head_dim = model.config.head_dim if hasattr(
-            model.config, 'head_dim'
-        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
-        return head_dim
-
-    def preprocess_weights(
-            self, weights: Mapping[str,
-                                   torch.Tensor]) -> Mapping[str, torch.Tensor]:
-        """Rewrite a full checkpoint weight dict before module walking starts.
-
-        If simple string renaming rules used in `rename_by_params_map` does not satisfy the
-        need, call this function for a more custom rewrite of the checkpoint weight dict.
+        Example special module: qkv_proj that combines q_proj, k_proj and v_proj.
 
         Args
-        - weights: Mapping[str, torch.Tensor], full checkpoint/state-dict weight
-          tensors keyed by checkpoint name.
+        - module: nn.Module, must have `module.load_weights()` to receive the
+          returned weight dicts.
+        - module_name: str, final component of the child module name, such as
+          `qkv_proj` or `gate_up_proj`.
+        - module_names_breakdown: list[str], parent module path split on `.`,
+          needed for finding weights for this child module.
+        - weights: Mapping[str, torch.Tensor], full checkpoint weight dict.
 
         Returns
-        - weights: Mapping[str, torch.Tensor], preprocessed weight dict to pass to
-          the child-module loader.
+        - module_weights: list[Mapping[str, torch.Tensor]], list of weight dicts
+          to pass to `module.load_weights()`.
         """
-        ...
 
     def rename_by_params_map(
             self, params_map: dict[str, str],
@@ -206,9 +176,46 @@ class BaseWeightMapper(ABC):
             return ConsumableWeightsDict(renamed_weights)
         return renamed_weights
 
-    def should_skip_module(self, module_name: str) -> bool:
-        return any(skip_module in module_name
-                   for skip_module in self._skip_modules)
+    def preprocess_weights(
+            self, weights: Mapping[str,
+                                   torch.Tensor]) -> Mapping[str, torch.Tensor]:
+        """Rewrite a full checkpoint weight dict before module walking starts.
+
+        If simple string renaming rules used in `rename_by_params_map` does not satisfy the
+        need, call this function for a more custom rewrite of the checkpoint weight dict.
+
+        Args
+        - weights: Mapping[str, torch.Tensor], full checkpoint/state-dict weight
+          tensors keyed by checkpoint name.
+
+        Returns
+        - weights: Mapping[str, torch.Tensor], preprocessed weight dict to pass to
+          the child-module loader.
+        """
+        ...
+
+    def handle_manual_copy(self,
+                           module_name: str,
+                           module_weights: Mapping[str, torch.Tensor],
+                           n: str,
+                           p: nn.Parameter,
+                           allow_partial_loading: bool = False) -> None:
+        """Copy one parameter for a module that has no `load_weights` method.
+
+        Args
+        - module_name: str, final component of the child module name.
+        - module_weights: Mapping[str, torch.Tensor], tensors for this child module
+          with the module prefix removed.
+        - n: str, parameter name inside the child module, such as `weight` or
+          `bias`.
+        - p: nn.Parameter, destination parameter to update.
+        - allow_partial_loading: bool, if `True`, skip missing parameters; if
+          `False`, assert that `n` exists in `module_weights`.
+        """
+        if not allow_partial_loading:
+            assert n in module_weights
+        if n in module_weights:
+            p.data.copy_(module_weights[n][:])
 
     def does_require_special_handling(self, module_name: str) -> bool:
         """
@@ -216,34 +223,6 @@ class BaseWeightMapper(ABC):
         Examples include module 'qkv_proj' fuses weights 'q_proj', 'k_proj' and 'v_proj'.
         """
         return module_name in self.mapping
-
-    @abstractmethod
-    def apply_callbacks(
-            self, module: nn.Module, module_name: str,
-            module_names_breakdown: list[str],
-            weights: Mapping[str,
-                             torch.Tensor]) -> list[dict[str, torch.Tensor]]:
-        """Build processed weight dicts for a special child module.
-
-        Used only when `self.does_require_special_handling()` is True, derived classes
-        implement this function to process raw `weights` before passing them into
-        the `module.load_weights()`.
-
-        Example special module: qkv_proj that combines q_proj, k_proj and v_proj.
-
-        Args
-        - module: nn.Module, must have `module.load_weights()` to receive the
-          returned weight dicts.
-        - module_name: str, final component of the child module name, such as
-          `qkv_proj` or `gate_up_proj`.
-        - module_names_breakdown: list[str], parent module path split on `.`,
-          needed for finding weights for this child module.
-        - weights: Mapping[str, torch.Tensor], full checkpoint weight dict.
-
-        Returns
-        - module_weights: list[Mapping[str, torch.Tensor]], list of weight dicts
-          to pass to `module.load_weights()`.
-        """
 
     def is_special_instance_module(self, module: nn.Module) -> bool:
         """If the module is special enough for a complete custom weight handling hook.
@@ -276,28 +255,16 @@ class BaseWeightMapper(ABC):
         """
         raise NotImplementedError()
 
-    def handle_manual_copy(self,
-                           module_name: str,
-                           module_weights: Mapping[str, torch.Tensor],
-                           n: str,
-                           p: nn.Parameter,
-                           allow_partial_loading: bool = False) -> None:
-        """Copy one parameter for a module that has no `load_weights` method.
+    @property
+    def skip_modules(self) -> list[str]:
+        return self._skip_modules
 
-        Args
-        - module_name: str, final component of the child module name.
-        - module_weights: Mapping[str, torch.Tensor], tensors for this child module
-          with the module prefix removed.
-        - n: str, parameter name inside the child module, such as `weight` or
-          `bias`.
-        - p: nn.Parameter, destination parameter to update.
-        - allow_partial_loading: bool, if `True`, skip missing parameters; if
-          `False`, assert that `n` exists in `module_weights`.
-        """
-        if not allow_partial_loading:
-            assert n in module_weights
-        if n in module_weights:
-            p.data.copy_(module_weights[n][:])
+    def add_skip_modules(self, value: list[str]) -> None:
+        self._skip_modules.extend(value)
+
+    def should_skip_module(self, module_name: str) -> bool:
+        return any(skip_module in module_name
+                   for skip_module in self._skip_modules)
 
     def filter_weights(
             self, prefix: str,
@@ -311,3 +278,36 @@ class BaseWeightMapper(ABC):
                 new_k = k[len(prefix) + 1:]
                 result[new_k] = v
         return result
+
+    @property
+    def mapping(self) -> dict[str, list[str]]:
+        """Return the mapping for modules that need special weight loading.
+
+        It maps module names to the corresponding source names in the checkpoint, e.g.
+        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+        'gate_up_proj': ['gate_proj', 'up_proj']
+        Those two modules fuse several GEMM weights together for a single GEMM call.
+
+        Returns the mapping as dict[str, list[str]]
+        """
+        return self._mapping
+
+    @property
+    def config(self) -> ModelConfig:
+        if self._config is None:
+            raise RuntimeError("Weight mapper is not initialized")
+        return self._config
+
+    @property
+    def model(self) -> nn.Module | DecoderModelForCausalLM:
+        if self._model is None:
+            raise RuntimeError("Weight mapper is not initialized")
+        return self._model
+
+    @property
+    def _head_dim(self) -> int:
+        model = self.model
+        head_dim = model.config.head_dim if hasattr(
+            model.config, 'head_dim'
+        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
+        return head_dim
