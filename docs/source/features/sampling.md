@@ -143,6 +143,20 @@ Parameter Configuration:
 - `n`: Controls the number of output sequences returned (can be less than `best_of`)
 - If `best_of` is omitted, the number of beams processed defaults to `n`
 - `max_beam_width` in the `LLM` class must equal `best_of` in `SamplingParams`
+- `length_penalty`: Controls how beams of different lengths are compared. Candidate beams are
+  ranked by `cum_log_prob / length**length_penalty`, where `length` is the number of generated
+  tokens. The default (`0.0`) ranks beams by their raw cumulative log-probability, which favors
+  shorter sequences; values above `0.0` favor longer sequences. The `cumulative_logprob` values
+  returned with the outputs remain unnormalized.
+- `beam_search_diversity_rate`: Encourages beams to diverge from each other. During beam
+  expansion, `diversity_rate * source_beam_index` is added to each candidate's ranking score,
+  boosting candidates that expand from lower-ranked beams so that the selected beams do not all
+  descend from the single strongest beam. The default (`0.0`) disables the adjustment.
+- `early_stopping`: Controls when beam search stops. With the default (`1`), generation ends as
+  soon as `best_of` finished candidates exist. The exhaustive modes (`0`, and other values for
+  intermediate heuristics) keep searching while an unfinished beam could still outscore the
+  finished candidates; these modes are only supported by the C++ `TRTLLMSampler` — the default
+  `TorchSampler` rejects them.
 
 The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:
 

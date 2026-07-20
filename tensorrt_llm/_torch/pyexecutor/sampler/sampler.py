@@ -491,6 +491,10 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
     use_beam_search = _get_max_beam_width(request) > 1
+    length_penalty = _unwrap_singleton(cast(Optional[list[float]], sampling_config.length_penalty))
+    beam_search_diversity_rate = _unwrap_singleton(
+        cast(Optional[list[float]], sampling_config.beam_search_diversity_rate)
+    )
 
     return UtilsSamplingParams(
         temperature=temperature,
@@ -502,6 +506,8 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         top_p_decay=top_p_decay,
         top_p_min=top_p_min,
         top_p_reset_ids=top_p_reset_ids,
+        length_penalty=length_penalty,
+        beam_search_diversity_rate=beam_search_diversity_rate,
     )
 
 
@@ -2239,6 +2245,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: (max_beam_width,), dtype int32
            Usage: Cached `arange(max_beam_width)` used as the scatter source in the
            per-step ``cache_indirection.scatter_``."""
+        beam_gen_lengths: torch.Tensor
+        """Shape: batch_size, beam_width
+           Usage: Number of generated tokens per beam (frozen once a beam finishes).
+           Only maintained for requests with a non-zero beam-search length_penalty."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2386,6 +2396,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 * self.max_beam_width
             )
             beam_idx_arange = torch.arange(self.max_beam_width, device="cuda", dtype=torch.int32)
+            beam_gen_lengths = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
             beam_search_store = self.BeamSearchStore(
                 cache_indirection=cache_indirection,
                 cache_indirection_buffer=cache_indirection_buffer,
@@ -2395,6 +2406,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 first_finish_reasons=first_finish_reasons,
                 seq_offsets=seq_offsets,
                 beam_idx_arange=beam_idx_arange,
+                beam_gen_lengths=beam_gen_lengths,
             )
         # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
         # sampler instances; only slots in self._top_p_decay_slots are ever read.
@@ -3077,6 +3089,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     raise ValueError(
                         "Beam search only supports returning the sampled logprob per token"
                     )
+            early_stopping = _unwrap_singleton(
+                cast(Optional[list[int]], request.sampling_config.early_stopping)
+            )
+            # TorchSampler stops once all beam slots hold finished beams, which
+            # is equivalent to early_stopping == 1 (stop as soon as beam_width
+            # finished candidates exist). The exhaustive modes (0 = search until
+            # no active beam can improve on the finished set, and the
+            # intermediate heuristics) require a separate finished-candidate
+            # pool and are not implemented.
+            if early_stopping is not None and early_stopping != 1:
+                raise ValueError(
+                    f"TorchSampler only supports early_stopping=1 for beam search "
+                    f"(got {early_stopping}); use the TRTLLMSampler for other modes"
+                )
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -3280,6 +3306,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             0, seq_slots_long, FinishReason.NOT_FINISHED.value
         )
         beam_search_store.original_tokens.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.beam_gen_lengths.index_fill_(0, seq_slots_long, 0)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -3778,6 +3805,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     predecessor_beams=beam_search_store.predecessor_beams,
                     seq_offsets=beam_search_store.seq_offsets,
                     beam_idx_arange=beam_search_store.beam_idx_arange,
+                    beam_gen_lengths=beam_search_store.beam_gen_lengths,
                 )
             elif metadata_type is TopPDecayMetadata:
                 metadata = self._build_top_p_decay_metadata(

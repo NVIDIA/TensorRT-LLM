@@ -74,6 +74,28 @@ SeedOrTensor = Union[int, torch.Tensor]
 
 
 @_compiler_disable
+def topk_op(
+    values: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-k over the last dim of a 2D tensor.
+
+    Drop-in for ``torch.topk(values, k, dim=-1, sorted=True)``: returns
+    ``(values, indices)`` with values descending and int64 indices; like
+    torch.topk, the index order among equal values is unspecified.
+
+    Dispatches on row width: flashinfer's radix-select kernel is O(n) and
+    much faster than torch.topk on large rows (e.g. vocab-sized logits),
+    while torch.topk wins on small rows where the radix kernel's fixed
+    per-call cost dominates. The 10k crossover follows flashinfer's own
+    guidance (``flashinfer.top_k`` docstring).
+    """
+    if values.size(-1) > 10000:
+        return flashinfer.top_k(values, k, sorted=True)
+    return torch.topk(values, k=k, dim=-1, sorted=True)
+
+
+@_compiler_disable
 def top_k_top_p_sampling_from_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,

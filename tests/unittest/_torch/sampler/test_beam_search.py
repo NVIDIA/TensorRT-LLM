@@ -707,6 +707,8 @@ def test_beam_search_sampling_batch_basic():
         predecessor_beams=predecessor_beams_result,
         seq_offsets=seq_offsets,
         beam_idx_arange=beam_idx_arange,
+        beam_gen_lengths=torch.zeros((max_batch_size, beam_width),
+                                     dtype=torch.int32),
     )
 
     # Run beam search sampling
@@ -812,6 +814,282 @@ def test_beam_search_sampling_batch_basic():
                 torch.tensor(predecessor_beam, dtype=torch.int32))
 
 
+@pytest.mark.parametrize("penalty_as_tensor", [False, True])
+def test_beam_search_sampling_batch_length_penalty(penalty_as_tensor):
+    """Length penalty must flip the ranking between a short finished beam and a
+    longer active beam with a better per-token score, while stored
+    cum_log_probs stay raw (unnormalized)."""
+
+    batch_size = 1
+    beam_width = 2
+    vocab_size = 4
+    max_batch_size = 3
+    seq_len = 8
+
+    seq_slots = torch.arange(batch_size, dtype=torch.int64) + 1
+    slot = seq_slots[0]
+    seq_offsets = torch.arange(max_batch_size, dtype=torch.int64) * beam_width
+    beam_idx_arange = torch.arange(beam_width, dtype=torch.int32)
+
+    def make_metadata() -> BeamSearchMetadata:
+        cum_log_probs = torch.zeros((max_batch_size, beam_width),
+                                    dtype=torch.float32)
+        # beam 0: finished after 2 generated tokens, frozen cum logprob -1.0
+        # beam 1: active with 4 generated tokens, cum logprob -2.0
+        cum_log_probs[slot] = torch.tensor([-1.0, -2.0])
+        finished_beams = torch.zeros((max_batch_size, beam_width),
+                                     dtype=torch.int32)
+        finished_beams[slot, 0] = FinishReason.END_ID.value
+        beam_gen_lengths = torch.zeros((max_batch_size, beam_width),
+                                       dtype=torch.int32)
+        beam_gen_lengths[slot] = torch.tensor([2, 4], dtype=torch.int32)
+        return BeamSearchMetadata(
+            cache_indirection=torch.zeros(
+                (max_batch_size, beam_width, seq_len + 1), dtype=torch.int32),
+            cache_indirection_buffer=torch.full(
+                (max_batch_size, beam_width, seq_len + 1),
+                -1,
+                dtype=torch.int32),
+            cum_log_probs=cum_log_probs,
+            seq_slots=seq_slots,
+            seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
+            finished_beams=finished_beams,
+            new_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            predecessor_beams=torch.zeros((max_batch_size, beam_width),
+                                          dtype=torch.int32),
+            seq_offsets=seq_offsets,
+            beam_idx_arange=beam_idx_arange,
+            beam_gen_lengths=beam_gen_lengths,
+        )
+
+    # The active beam (row 1) strongly prefers token 1: logprob ~ -6e-5, so its
+    # best candidate has raw cum logprob ~ -2.0 vs the finished beam's -1.0.
+    logits = torch.zeros((batch_size * beam_width, vocab_size),
+                         dtype=torch.float32)
+    logits[1, 1] = 10.0
+
+    def run(length_penalty):
+        metadata = make_metadata()
+        next_tokens, _ = beam_search_sampling_batch(
+            logits=logits,
+            beam_width_in=beam_width,
+            beam_width_out=beam_width,
+            beam_search_args=metadata,
+            temperature=1.0,
+            length_penalty=length_penalty,
+            return_probs=False,
+        )
+        return next_tokens, metadata
+
+    # Without penalty: raw scores -1.0 (finished) > ~-2.0 (active) => finished
+    # beam ranks first and emits a pad token.
+    tokens_np, meta_np = run(0.0 if not penalty_as_tensor else None)
+    assert tokens_np[0, 0] == BEAM_SEARCH_PAD_TOKEN
+    assert tokens_np[0, 1] == 1
+    torch.testing.assert_close(meta_np.cum_log_probs[slot, 0],
+                               torch.tensor(-1.0))
+
+    # With penalty 1.0: normalized scores -1.0/2 = -0.5 (finished) vs
+    # ~-2.0/5 = -0.4 (active) => the longer active beam ranks first.
+    penalty = (torch.ones(batch_size, dtype=torch.float32)
+               if penalty_as_tensor else 1.0)
+    tokens_lp, meta_lp = run(penalty)
+    assert tokens_lp[0, 0] == 1
+    assert tokens_lp[0, 1] == BEAM_SEARCH_PAD_TOKEN
+
+    # Stored cum_log_probs must remain raw, only the ranking key is normalized.
+    torch.testing.assert_close(meta_lp.cum_log_probs[slot, 0],
+                               torch.tensor(-2.0),
+                               atol=1e-3,
+                               rtol=1e-3)
+    torch.testing.assert_close(meta_lp.cum_log_probs[slot, 1],
+                               torch.tensor(-1.0))
+    # Generated lengths: active successor grew to 5, finished stays frozen at 2.
+    assert meta_lp.beam_gen_lengths[slot].tolist() == [5, 2]
+    # Finished flag must follow the beam swap.
+    assert meta_lp.finished_beams[slot].tolist() == [
+        FinishReason.NOT_FINISHED.value, FinishReason.END_ID.value
+    ]
+
+
+@pytest.mark.parametrize("params_as_tensors", [False, True])
+@pytest.mark.parametrize(
+    "length_penalty,diversity_rate",
+    [(0.5, 0.0), (2.0, 2.0), (0.0, 0.5)],
+)
+def test_beam_candidate_topk_equivalence(length_penalty, diversity_rate,
+                                         params_as_tensors):
+    """The two-stage op must match naive full-matrix adjustment + flat topk
+    for length penalty, diversity, and their combination."""
+    from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
+        beam_candidate_topk
+
+    torch.manual_seed(7)
+    batch_size, beam_width_in, beam_width_out, vocab_size = 5, 4, 4, 1000
+    logprobs = -torch.rand((batch_size, beam_width_in, vocab_size)) * 20.0
+    # emulate a finished beam row: -inf everywhere except a frozen entry
+    logprobs[0, 1, :] = float("-inf")
+    logprobs[0, 1, 0] = -1.5
+    cand_gen_lengths = torch.randint(1,
+                                     30, (batch_size, beam_width_in),
+                                     dtype=torch.int32)
+
+    def as_param(value):
+        if value == 0.0:
+            return None
+        if params_as_tensors:
+            return torch.full((batch_size, ), value)
+        return value
+
+    sorted_logprobs, predecessor_beams, tokens = beam_candidate_topk(
+        logprobs,
+        beam_width_out=beam_width_out,
+        length_penalty=as_param(length_penalty),
+        cand_gen_lengths=cand_gen_lengths if length_penalty else None,
+        diversity_rate=as_param(diversity_rate),
+    )
+
+    # Naive reference: adjust the full candidate matrix, flat topk.
+    adjusted = logprobs
+    if diversity_rate:
+        adjusted = adjusted + diversity_rate * torch.arange(
+            beam_width_in, dtype=logprobs.dtype).view(1, -1, 1)
+    if length_penalty:
+        factor = cand_gen_lengths.float().pow(length_penalty)
+        adjusted = adjusted / factor.unsqueeze(-1)
+    _, ref_indices = torch.topk(adjusted.view(batch_size, -1),
+                                k=beam_width_out,
+                                sorted=True,
+                                dim=-1)
+    ref_logprobs = logprobs.view(batch_size, -1).gather(1, ref_indices)
+
+    torch.testing.assert_close(sorted_logprobs, ref_logprobs)
+    torch.testing.assert_close(predecessor_beams,
+                               (ref_indices // vocab_size).to(torch.int32))
+    torch.testing.assert_close(tokens,
+                               (ref_indices % vocab_size).to(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_topk_op_beam_parity():
+    """The flashinfer path of topk_op must match torch.topk on beam-search-shaped
+    inputs, including -inf-dominated rows (finished beams)."""
+    from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import topk_op
+    from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
+        beam_candidate_topk
+
+    torch.manual_seed(11)
+    bs, bw, vocab, k = 8, 4, 152064, 4
+    logprobs = -torch.rand((bs * bw, vocab), device="cuda") * 20.0
+    # finished-beam rows: all -inf except a single frozen entry at index 0
+    logprobs[3, :] = float("-inf")
+    logprobs[3, 0] = -1.5
+    logprobs[17, :] = float("-inf")
+    logprobs[17, 0] = -0.25
+
+    ref_v, ref_i = torch.topk(logprobs, k, dim=-1, sorted=True)
+    fi_v, fi_i = topk_op(logprobs, k)
+    assert fi_i.dtype == torch.int64
+    torch.testing.assert_close(fi_v, ref_v)
+    # indices may differ only where values are -inf ties; finite entries must match
+    finite = torch.isfinite(ref_v)
+    assert torch.equal(fi_i[finite], ref_i[finite])
+
+    # end-to-end through the two-stage op: torch vs flashinfer stage-1
+    lens = torch.randint(1, 30, (bs, bw), device="cuda", dtype=torch.int32)
+    lp3 = logprobs.view(bs, bw, vocab)
+    v_t, p_t, t_t = beam_candidate_topk(lp3,
+                                        beam_width_out=k,
+                                        cand_gen_lengths=lens,
+                                        length_penalty=1.0)
+    v_f, p_f, t_f = beam_candidate_topk(lp3,
+                                        beam_width_out=k,
+                                        cand_gen_lengths=lens,
+                                        length_penalty=1.0,
+                                        topk_fn=topk_op)
+    torch.testing.assert_close(v_f, v_t)
+    finite = torch.isfinite(v_t)
+    assert torch.equal(p_f[finite], p_t[finite])
+    assert torch.equal(t_f[finite], t_t[finite])
+
+
+def test_beam_search_sampling_batch_diversity_rate():
+    """diversity_rate wired through beam_search_sampling_batch changes beam
+    selection while stored cum_log_probs stay raw."""
+
+    batch_size = 1
+    beam_width = 2
+    vocab_size = 8
+    max_batch_size = 2
+    seq_len = 6
+
+    seq_slots = torch.arange(batch_size, dtype=torch.int64)
+    slot = seq_slots[0]
+
+    def make_metadata() -> BeamSearchMetadata:
+        return BeamSearchMetadata(
+            cache_indirection=torch.zeros(
+                (max_batch_size, beam_width, seq_len + 1), dtype=torch.int32),
+            cache_indirection_buffer=torch.full(
+                (max_batch_size, beam_width, seq_len + 1),
+                -1,
+                dtype=torch.int32),
+            cum_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            seq_slots=seq_slots,
+            seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
+            finished_beams=torch.zeros((max_batch_size, beam_width),
+                                       dtype=torch.int32),
+            new_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            predecessor_beams=torch.zeros((max_batch_size, beam_width),
+                                          dtype=torch.int32),
+            seq_offsets=torch.arange(max_batch_size, dtype=torch.int64) *
+            beam_width,
+            beam_idx_arange=torch.arange(beam_width, dtype=torch.int32),
+            beam_gen_lengths=torch.zeros((max_batch_size, beam_width),
+                                         dtype=torch.int32),
+        )
+
+    logits = torch.full((batch_size * beam_width, vocab_size), -20.0)
+    logits[0, 1] = 10.0  # beam0 top: token1 (logprob ~0)
+    logits[0, 2] = 8.0  # beam0 second: token2 (logprob ~ -2)
+    logits[1, 3] = 30.0  # beam1 top: token3, but cum handicap below
+
+    def run(diversity_rate):
+        metadata = make_metadata()
+        metadata.cum_log_probs[slot] = torch.tensor([0.0, -2.5])
+        tokens, _ = beam_search_sampling_batch(
+            logits=logits,
+            beam_width_in=beam_width,
+            beam_width_out=beam_width,
+            beam_search_args=metadata,
+            temperature=1.0,
+            diversity_rate=diversity_rate,
+            return_probs=False,
+        )
+        return tokens, metadata
+
+    # No diversity: beam0 contributes both winners (0.0 > -2.0 > -2.5).
+    tokens, meta = run(0.0)
+    assert meta.predecessor_beams[slot].tolist() == [0, 0]
+    assert tokens[0].tolist() == [1, 2]
+
+    # rate=1.0: beam1's candidate gets +1.0 => -1.5 beats beam0's -2.0.
+    tokens, meta = run(1.0)
+    assert meta.predecessor_beams[slot].tolist() == [0, 1]
+    assert tokens[0].tolist() == [1, 3]
+    # Stored cum_log_probs are the raw scores, not diversity-adjusted: beam 1's
+    # winner keeps its raw ~-2.5 (with the +1.0 adjustment it would be ~-1.5).
+    expected_b0 = torch.log_softmax(logits[0], dim=-1)[1]
+    torch.testing.assert_close(meta.cum_log_probs[slot, 0], expected_b0)
+    torch.testing.assert_close(meta.cum_log_probs[slot, 1],
+                               torch.tensor(-2.5),
+                               atol=1e-3,
+                               rtol=1e-3)
+
+
 def test_beam_search_sampling_batch_disagg_handoff():
     """Test context-first disagg beam handoff seeds gen-side beam scores."""
 
@@ -849,6 +1127,8 @@ def test_beam_search_sampling_batch_disagg_handoff():
                                           dtype=torch.int32),
             seq_offsets=seq_offsets,
             beam_idx_arange=beam_idx_arange,
+            beam_gen_lengths=torch.zeros((max_batch_size, beam_width),
+                                         dtype=torch.int32),
         )
 
     torch.manual_seed(43)

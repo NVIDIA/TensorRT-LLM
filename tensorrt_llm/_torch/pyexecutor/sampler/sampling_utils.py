@@ -86,7 +86,7 @@ TopK: TypeAlias = tuple[Literal["top_k"], int, float]
 TopP: TypeAlias = tuple[Literal["top_p"], float, float]
 TopKTopP: TypeAlias = tuple[Literal["top_k_top_p"], int, float, float]
 Greedy: TypeAlias = tuple[Literal["greedy"], None]
-BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, int, float]
+BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, int, float, float, float]
 GREEDY: Greedy = ("greedy", None)
 
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
@@ -110,6 +110,10 @@ class UtilsSamplingParams:
         top_p_min: Lower bound for the decayed runtime top-p.
         top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
             its initial value. A value < 0 never matches a token.
+        length_penalty: Beam-search length penalty exponent; scores are
+            normalized as cum_log_prob / length**length_penalty. 0 disables.
+        beam_search_diversity_rate: Beam-search diversity adjustment; adds
+            rate * source_beam_index to the candidate ranking score. 0 disables.
     """
 
     temperature: Optional[float]
@@ -121,6 +125,8 @@ class UtilsSamplingParams:
     top_p_decay: Optional[float] = None
     top_p_min: Optional[float] = None
     top_p_reset_ids: Optional[int] = None
+    length_penalty: Optional[float] = None
+    beam_search_diversity_rate: Optional[float] = None
 
 
 @dataclass(kw_only=True)
@@ -181,7 +187,14 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
         assert params.beam_width_in is not None and params.beam_width_out is not None, (
             "beam_width_in and beam_width_out must be specified for beam search"
         )
-        return ("beam_search", params.beam_width_in, params.beam_width_out, temperature)
+        return (
+            "beam_search",
+            params.beam_width_in,
+            params.beam_width_out,
+            temperature,
+            params.length_penalty or 0.0,
+            params.beam_search_diversity_rate or 0.0,
+        )
 
     # NB: not greedy, hence top_p != 0 if specified
     top_p = top_p or 1.0
@@ -248,7 +261,14 @@ def sample(
         case ("greedy", None):
             tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
             temperature = None
-        case ("beam_search", beam_width_in, beam_width_out, temperature):
+        case (
+            "beam_search",
+            beam_width_in,
+            beam_width_out,
+            temperature,
+            length_penalty,
+            beam_search_diversity_rate,
+        ):
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
             )
@@ -258,6 +278,8 @@ def sample(
                 beam_width_out=cast(int, beam_width_out),
                 beam_search_args=group_metadata,
                 temperature=cast(float, temperature),
+                length_penalty=cast(float, length_penalty),
+                diversity_rate=cast(float, beam_search_diversity_rate),
                 return_probs=return_probs,
             )
     return tokens, softmax, cast(float, temperature)
@@ -745,10 +767,19 @@ class _StrategyImpls:
             return new_tokens, None
 
     class BeamSearchMixin(StrategyImpl):
-        def __init__(self, beam_width_in: int, beam_width_out: int, temperature: torch.Tensor):
+        def __init__(
+            self,
+            beam_width_in: int,
+            beam_width_out: int,
+            temperature: torch.Tensor,
+            length_penalty: Optional[torch.Tensor],
+            diversity_rate: Optional[torch.Tensor],
+        ):
             self._beam_width_in = beam_width_in
             self._beam_width_out = beam_width_out
             self._temperature = temperature
+            self._length_penalty = length_penalty
+            self._diversity_rate = diversity_rate
 
         @override
         @classmethod
@@ -762,7 +793,15 @@ class _StrategyImpls:
             temperature = cls._make_tensor(
                 [strat[3] or 1.0 for strat in narrowed_strats], torch.float32, cuda_device
             )
-            return cls(beam_width_in, beam_width_out, temperature)
+            length_penalties = [strat[4] or 0.0 for strat in narrowed_strats]
+            length_penalty: Optional[torch.Tensor] = None
+            if any(lp != 0.0 for lp in length_penalties):
+                length_penalty = cls._make_tensor(length_penalties, torch.float32, cuda_device)
+            diversity_rates = [strat[5] or 0.0 for strat in narrowed_strats]
+            diversity_rate: Optional[torch.Tensor] = None
+            if any(dr != 0.0 for dr in diversity_rates):
+                diversity_rate = cls._make_tensor(diversity_rates, torch.float32, cuda_device)
+            return cls(beam_width_in, beam_width_out, temperature, length_penalty, diversity_rate)
 
         @override
         def sample(
@@ -782,6 +821,12 @@ class _StrategyImpls:
                 beam_width_out=self._beam_width_out,
                 beam_search_args=group_metadata,
                 temperature=None,
+                length_penalty=self._length_penalty,
+                diversity_rate=self._diversity_rate,
+                # TorchSampler hard-depends on flashinfer (enforced in its
+                # constructor); topk_op picks flashinfer's radix top-k for
+                # vocab-sized rows (~5x faster than torch.topk).
+                topk_fn=flashinfer.topk_op,
                 return_probs=self.computes_probs(),
             )
 
@@ -818,7 +863,7 @@ class FlashInferGroupedStrategySampler:
                 | ("greedy", None)
             ):
                 return cast(_STRATEGY_KEY_TYPE, strategy[0])
-            case ("beam_search", beam_width_in, beam_width_out, _):
+            case ("beam_search", beam_width_in, beam_width_out, _, _, _):
                 return cast(_STRATEGY_KEY_TYPE, (strategy[0], beam_width_in, beam_width_out))
             case _:
                 raise NotImplementedError("Unsupported strategy encountered")
