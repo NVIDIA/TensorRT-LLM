@@ -409,6 +409,61 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    def _require_mapped(self) -> None:
+        if not self.mnnvl_mem.mapped:
+            raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
+
+    def checkpoint_prepare(self) -> None:
+        """Collectively detach handles after the caller globally quiesces all owners.
+
+        The local phase and watchdog checks are defense-in-depth only; they do
+        not prove that every wrapper sharing this workspace is quiescent.
+        """
+        if self._dispatch_state.get("phase") != "idle":
+            raise RuntimeError("Cannot checkpoint during an active MoE All-to-All phase")
+        if self._alltoall_watchdog is not None:
+            raise RuntimeError(
+                "Checkpointing native MoE All-to-All with the watchdog enabled is not supported"
+            )
+        self.mnnvl_mem.checkpoint_prepare()
+
+    def checkpoint_restore(self, comm) -> None:
+        """Collectively restore handles after caller-proven global quiescence.
+
+        The low-level remap is idempotent, so every shared owner may call this
+        method to reset its own protocol state.
+        """
+        self.mnnvl_mem.checkpoint_restore(comm)
+        refreshed_metainfo = torch.ops.trtllm.moe_a2a_initialize(
+            self.workspace,
+            self.ep_rank,
+            self.ep_size,
+            self.max_num_tokens_per_rank,
+            self.eplb_stats_num_experts,
+        )
+        if not torch.equal(refreshed_metainfo, self.moe_a2a_metainfo):
+            raise RuntimeError(
+                "MoE All-to-All metainfo changed during MNNVL restore; "
+                "captured CUDA graphs cannot be replayed safely"
+            )
+        self.moe_a2a_metainfo = refreshed_metainfo
+        self._workspace_state["metainfo"] = refreshed_metainfo
+        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
+            workspace_state=self._workspace_state,
+            workspace=self.workspace,
+            metainfo=refreshed_metainfo,
+            metainfo_index={
+                "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
+                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
+                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
+            },
+            ep_rank=self.ep_rank,
+            health=self.ep_group_health,
+        )
+        torch.cuda.synchronize()
+        comm.barrier()
+        self._dispatch_state = {"phase": "idle"}
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -439,6 +494,7 @@ class NVLinkOneSided(Communication):
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
             Each tensor has shape [ep_size, max_tokens_per_rank, ...]
         """
+        self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
@@ -569,6 +625,7 @@ class NVLinkOneSided(Communication):
             Combined output tensor [local_num_tokens, hidden_size]
 
         """
+        self._require_mapped()
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
         reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
