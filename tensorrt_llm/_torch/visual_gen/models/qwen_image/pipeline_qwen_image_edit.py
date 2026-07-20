@@ -11,7 +11,7 @@ with extra image-conditioning paths from Diffusers
 import math
 import time
 from io import BytesIO
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -37,7 +37,7 @@ _CONDITION_IMAGE_SIZE = 384 * 384
 _VAE_IMAGE_SIZE = 1024 * 1024
 
 
-def _calculate_dimensions(target_area: int, ratio: float) -> Tuple[int, int]:
+def _calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
     """Match Diffusers Qwen-Image-Edit area-preserving 32px rounding."""
     width = math.sqrt(target_area * ratio)
     height = width / ratio
@@ -48,7 +48,7 @@ def _calculate_dimensions(target_area: int, ratio: float) -> Tuple[int, int]:
 
 def _retrieve_latents(
     encoder_output: torch.Tensor,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
     sample_mode: str = "sample",
 ) -> torch.Tensor:
     """Return latent tensor from a Diffusers VAE encoder output."""
@@ -73,10 +73,7 @@ _EDIT_DEFAULT_GENERATION_PARAMS = {
 
 @register_pipeline(
     "QwenImageEditPlusPipeline",
-    hf_ids=[
-        "Qwen/Qwen-Image-Edit-2509",
-        "Qwen/Qwen-Image-Edit-2511",
-    ],
+    hf_ids=["Qwen/Qwen-Image-Edit-2511"],
     doc="Qwen-Image-Edit image editing pipeline.",
 )
 class QwenImageEditPlusPipeline(QwenImagePipeline):
@@ -95,7 +92,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         self,
         checkpoint_dir: str,
         device: torch.device,
-        skip_components: Optional[list] = None,
+        skip_components: list | None = None,
     ) -> None:
         super().load_standard_components(checkpoint_dir, device, skip_components)
         skip_components = skip_components or []
@@ -130,10 +127,10 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         return dict(_EDIT_DEFAULT_GENERATION_PARAMS)
 
     @property
-    def default_warmup_resolutions(self) -> List[Tuple[int, int]]:
+    def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(1024, 1024)]
 
-    def warmup_cache_key(self, height: Optional[int], width: Optional[int], **kwargs) -> tuple:
+    def warmup_cache_key(self, height: int | None, width: int | None, **kwargs) -> tuple:
         return (height, width)
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
@@ -152,7 +149,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
             )
 
     @staticmethod
-    def _load_edit_images(image: Union[str, bytes, Any, List[Union[str, bytes, Any]]]) -> List[Any]:
+    def _load_edit_images(image: Any) -> list[Any]:
         if image is None:
             raise ValueError("Qwen-Image-Edit requires params.image.")
         images = image if isinstance(image, list) else [image]
@@ -168,8 +165,8 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     def _preprocess_edit_images(
         self,
-        pil_images: List[Any],
-    ) -> Tuple[List[Any], List[torch.Tensor], List[Tuple[int, int]]]:
+        pil_images: list[Any],
+    ) -> tuple[list[Any], list[torch.Tensor], list[tuple[int, int]]]:
         condition_images = []
         vae_images = []
         vae_image_sizes = []
@@ -189,11 +186,11 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     def _get_qwen_edit_prompt_embeds(
         self,
-        prompt: List[str],
-        image: Optional[List[Any]],
+        prompt: list[str],
+        image: list[Any] | None,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
         if isinstance(image, list):
             base_img_prompt = "".join(
@@ -237,12 +234,12 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     def _encode_edit_prompt(
         self,
-        prompt: List[str],
-        image: List[Any],
+        prompt: list[str],
+        image: list[Any],
         device: torch.device,
         max_sequence_length: int,
         num_images_per_prompt: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = len(prompt)
         prompt_embeds, prompt_embeds_mask = self._get_qwen_edit_prompt_embeds(
             prompt,
@@ -265,7 +262,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     def _encode_vae_image(
         self,
         image: torch.Tensor,
-        generator: Optional[torch.Generator],
+        generator: torch.Generator | None,
     ) -> torch.Tensor:
         image_latents = _retrieve_latents(
             self.vae.encode(image),
@@ -286,15 +283,15 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
 
     def _prepare_edit_latents(
         self,
-        images: List[torch.Tensor],
+        images: list[torch.Tensor],
         batch_size: int,
         num_channels_latents: int,
         height: int,
         width: int,
         dtype: torch.dtype,
         device: torch.device,
-        generator: Optional[torch.Generator],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         latents = self._prepare_latents(
             batch_size,
             num_channels_latents,
@@ -335,11 +332,14 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
             all_image_latents.append(image_latents)
         return latents, torch.cat(all_image_latents, dim=1)
 
-    def infer(self, req):
+    def infer(self, req: Any) -> PipelineOutput:
         params = req.params
-        prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
         num_per = params.num_images_per_prompt or 1
-        prompts = [p for p in prompts for _ in range(num_per)]
+        if num_per > 1:
+            raise ValueError(
+                "QwenImageEditPlusPipeline currently supports num_images_per_prompt=1 only."
+            )
+        prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
         pil_images = self._load_edit_images(params.image)
         height = params.height
         width = params.width
@@ -367,16 +367,16 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     @torch.inference_mode()
     def forward(
         self,
-        image: Union[str, bytes, Any, List[Union[str, bytes, Any]]],
-        prompt: Union[str, List[str]],
-        negative_prompt: Optional[Union[str, List[str]]] = " ",
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        image: Any,
+        prompt: str | list[str],
+        negative_prompt: str | list[str] | None = " ",
+        height: int | None = None,
+        width: int | None = None,
         num_inference_steps: int = 50,
         true_cfg_scale: float = 4.0,
         seed: int = 42,
         max_sequence_length: int = 512,
-        sigmas: Optional[list] = None,
+        sigmas: list | None = None,
     ) -> PipelineOutput:
         """Image editing generation matching Diffusers QwenImageEditPlusPipeline."""
         pipeline_start = time.time()
@@ -532,6 +532,14 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                 noise_pred = noise_pred[:, : latents.size(1)]
 
                 if do_true_cfg:
+                    pipeline_config = getattr(self, "pipeline_config", None)
+                    cuda_graph_enabled = getattr(
+                        getattr(pipeline_config, "cuda_graph", None), "enable", False
+                    )
+                    if cuda_graph_enabled:
+                        # CUDA graph outputs are graph-owned buffers; the negative CFG
+                        # replay may overwrite this positive prediction before guidance.
+                        noise_pred = noise_pred.clone()
                     neg_noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep / 1000,

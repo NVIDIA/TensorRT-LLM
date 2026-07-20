@@ -4,7 +4,9 @@
 """Pipeline-level configuration tests for Qwen-Image."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -24,7 +26,7 @@ from tensorrt_llm.visual_gen.args import (
 )
 
 
-def _write_minimal_qwen_checkpoint(tmp_path):
+def _write_minimal_qwen_checkpoint(tmp_path: Path) -> Path:
     """Create the minimum diffusers layout needed by PipelineLoader config code."""
     (tmp_path / "model_index.json").write_text(
         json.dumps(
@@ -228,7 +230,7 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
     assert attention.attn.__class__.__name__ != not_wrapped_as
 
 
-def _qwen_image_edit_pipeline_for_cfg_compile_test(cfg_size: int):
+def _qwen_image_edit_pipeline_for_cfg_compile_test(cfg_size: int) -> Any:
     from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImageEditPlusPipeline
 
     pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
@@ -238,12 +240,12 @@ def _qwen_image_edit_pipeline_for_cfg_compile_test(cfg_size: int):
     return pipeline
 
 
-def test_qwen_image_edit_cfg_parallel_keeps_torch_compile(monkeypatch):
+def test_qwen_image_edit_cfg_parallel_keeps_torch_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
     called = False
 
-    def record_call(self):
+    def record_call(self: object) -> None:
         nonlocal called
         called = True
 
@@ -255,12 +257,12 @@ def test_qwen_image_edit_cfg_parallel_keeps_torch_compile(monkeypatch):
     assert called
 
 
-def test_qwen_image_edit_cfg1_keeps_torch_compile(monkeypatch):
+def test_qwen_image_edit_cfg1_keeps_torch_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
     called = False
 
-    def record_call(self):
+    def record_call(self: object) -> None:
         nonlocal called
         called = True
 
@@ -270,3 +272,16 @@ def test_qwen_image_edit_cfg1_keeps_torch_compile(monkeypatch):
     pipeline.torch_compile()
 
     assert called
+
+
+def test_qwen_image_edit_rejects_multiple_images_per_prompt() -> None:
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImageEditPlusPipeline
+
+    pipeline = QwenImageEditPlusPipeline.__new__(QwenImageEditPlusPipeline)
+    req = SimpleNamespace(
+        prompt="edit prompt",
+        params=SimpleNamespace(num_images_per_prompt=2),
+    )
+
+    with pytest.raises(ValueError, match="num_images_per_prompt=1 only"):
+        pipeline.infer(req)

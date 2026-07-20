@@ -9,6 +9,7 @@ registry detection.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -81,14 +82,14 @@ def test_auto_pipeline_detects_qwen_image_class_name(tmp_path):
     assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImagePipeline"
 
 
-def test_qwen_image_edit_plus_pipeline_is_registered():
+def test_qwen_image_edit_plus_pipeline_is_registered() -> None:
     """Qwen-Image-Edit checkpoints should route to the edit-plus pipeline."""
     assert "QwenImageEditPlusPipeline" in PIPELINE_REGISTRY
     assert PIPELINE_REGISTRY["QwenImageEditPlusPipeline"].pipeline_cls is QwenImageEditPlusPipeline
     assert "Qwen/Qwen-Image-Edit-2511" in PIPELINE_REGISTRY["QwenImageEditPlusPipeline"].hf_ids
 
 
-def test_auto_pipeline_detects_qwen_image_edit_plus_class_name(tmp_path):
+def test_auto_pipeline_detects_qwen_image_edit_plus_class_name(tmp_path: Path) -> None:
     """model_index.json with _class_name=QwenImageEditPlusPipeline resolves."""
     (tmp_path / "model_index.json").write_text(
         json.dumps({"_class_name": "QwenImageEditPlusPipeline"})

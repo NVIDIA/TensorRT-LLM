@@ -27,6 +27,7 @@ import sys
 import time
 import urllib.request
 import zipfile
+from typing import Any
 
 import pytest
 import torch
@@ -1843,7 +1844,7 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
 
 
-def test_qwen_image_edit_example(_visual_gen_deps, llm_root, llm_venv):
+def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv: Any) -> None:
     """Run examples/visual_gen/models/qwen_image_edit.py end-to-end.
 
     Validates that the Qwen-Image-Edit example script and

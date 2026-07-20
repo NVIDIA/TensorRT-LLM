@@ -977,8 +977,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     if param is not None and param_name in module_weights:
                         param.data.copy_(module_weights[param_name].to(param.dtype))
 
-    def register_cuda_graph_extra_key_fns(self, runner) -> None:
-        def img_shapes_key(*args, **kwargs):
+    def register_cuda_graph_extra_key_fns(self, runner: Any) -> None:
+        super().register_cuda_graph_extra_key_fns(runner)
+
+        def img_shapes_key(*args: Any, **kwargs: Any) -> tuple | None:
             img_shapes = kwargs.get("img_shapes")
             if img_shapes is None:
                 return None
