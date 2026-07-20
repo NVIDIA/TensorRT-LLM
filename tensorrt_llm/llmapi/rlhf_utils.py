@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import base64
 import gc
 from typing import Optional
@@ -52,6 +55,7 @@ class WorkerExtension:
         """
         try:
             if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
+                self.engine.model_engine.model_loader.begin_update_weights()
                 for module in self.engine.model_engine.model.modules():
                     if hasattr(module, "pre_reload_weights") and not getattr(
                         module, "_weights_removed", False
@@ -127,6 +131,7 @@ class WorkerExtension:
                 torch.cuda.ipc_collect()
             else:
                 logger.info("Finalize update weights")
+                self.engine.model_engine.model_loader.finalize_update_weights()
                 for module in self.engine.model_engine.model.modules():
                     if hasattr(module, "process_weights_after_loading") and not getattr(
                         module, "_weights_removed", False
@@ -152,6 +157,9 @@ class WorkerExtension:
                 torch.cuda.empty_cache()
 
         except Exception as e:
+            self.engine.model_engine.model_loader.abort_update_weights()
+            if hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
+                delattr(self.engine.model_engine.model, "first_pre_reload_weights")
             logger.error("Encountered an error in update_weights")
             raise e
 

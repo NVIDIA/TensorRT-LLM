@@ -1,7 +1,7 @@
 import base64
-import gc
 import importlib.util
 import multiprocessing
+import os
 import pickle
 import re
 import subprocess
@@ -17,7 +17,12 @@ from _torch.ray_orchestrator.single_gpu.test_llm_update_weights import (
     run_generate,
 )
 from torch.multiprocessing.reductions import reduce_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Qwen3_5MoeForConditionalGeneration,
+)
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
@@ -50,6 +55,115 @@ def release_shared_cuda_memory():
     torch.cuda.empty_cache()
 
 
+def _decoder_weight_group(name: str) -> str:
+    """Group the same parameter across repeated decoder layers."""
+    return re.sub(r"^model\.layers\.\d+\.", "", name)
+
+
+def _run_multi_gpu_update_weights(
+    *,
+    model_dir: str,
+    hf_model: RefHFModelWithIPCHandles,
+    device_ids: List[int],
+    llm_kwargs: dict,
+    sampling_params: SamplingParams,
+    partial: bool,
+    weight_group: Callable[[str], str] = _decoder_weight_group,
+    prompts_texts: Optional[List[str]] = None,
+    tokenizer_dir: Optional[str] = None,
+    warm_before_update: bool = False,
+    generate_fn: Callable = run_generate,
+) -> None:
+    """Run the shared warm/update/finalize/reference-comparison workflow."""
+    if prompts_texts is None:
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir or model_dir)
+    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+    del tokenizer
+
+    with LLM(
+        model=model_dir,
+        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+        tensor_parallel_size=len(device_ids),
+        load_format="dummy",
+        pipeline_parallel_size=1,
+        **llm_kwargs,
+    ) as llm:
+        if warm_before_update:
+            llm.generate(prompts, sampling_params)
+
+        if partial:
+            groups = sorted(
+                {
+                    weight_group(name)
+                    for name, _ in hf_model.all_weights[hf_model.device_id]
+                }
+            )
+            for group in groups:
+                ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                    device_ids,
+                    weight_filter=lambda name, group=group: (
+                        weight_group(name) == group
+                    ),
+                )
+                llm._collective_rpc("update_weights", (ipc_handles,))
+        else:
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(device_ids)
+            llm._collective_rpc("update_weights", (ipc_handles,))
+
+        llm._collective_rpc("update_weights", (None,))
+        llm_logits, ref_logits = generate_fn(
+            llm, hf_model, prompts, sampling_params
+        )
+        compare_logits(llm_logits, ref_logits)
+
+
+def _run_fp8_update_weights(
+    model_dir: str, fp8_model_dir: str, partial: bool
+) -> None:
+    model_dir = str(llm_models_root() / model_dir)
+    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
+    num_hidden_layers = 1
+    hf_model = RefHFModelWithIPCHandles(
+        fp8_model_dir, num_hidden_layers=num_hidden_layers
+    )
+
+    llm_kwargs = {
+        "kv_cache_config": KvCacheConfig(
+            enable_block_reuse=True, free_gpu_memory_fraction=0.1
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": num_hidden_layers,
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
+        },
+    }
+    if "Qwen3/Qwen3-30B-A3B" in model_dir:
+        llm_kwargs["moe_config"] = {"backend": "DEEPGEMM"}
+
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=[0, 1],
+        llm_kwargs=llm_kwargs,
+        sampling_params=SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        ),
+        partial=partial,
+        tokenizer_dir=fp8_model_dir,
+    )
+
+
 @pytest.mark.part0
 @skip_pre_blackwell
 @pytest.mark.parametrize(
@@ -60,63 +174,7 @@ def release_shared_cuda_memory():
     ],
 )
 def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
-    model_dir = str(llm_models_root() / model_dir)
-    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
-    additional_kwargs = {}
-    if "Qwen3/Qwen3-30B-A3B" in model_dir:
-        additional_kwargs["moe_config"] = {
-            "backend": "DEEPGEMM",
-        }
-        # moe_intermediate_size is 768, and FP8 block scaling needs each
-        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
-        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
-        additional_kwargs["moe_tensor_parallel_size"] = 2
-        additional_kwargs["moe_expert_parallel_size"] = 2
-    num_hidden_layers = 1
-    hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
-    tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    with LLM(
-        model=model_dir,
-        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
-        load_format="dummy",
-        pipeline_parallel_size=1,
-        kv_cache_config=kv_cache_config,
-        model_kwargs={
-            "num_hidden_layers": num_hidden_layers,
-            "quantization_config": {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            },
-        },
-        **additional_kwargs,
-    ) as llm:
-        # Generate texts from the prompts.
-        prompts_texts = [
-            "Hello, my name is",
-            "The president of the United States is",
-            "The capital of France is",
-            "The future of AI is",
-        ]
-        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-        del tokenizer
-        sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
-        )
-
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
-
-        llm._collective_rpc("update_weights", (ipc_handles,))
-        # Finalize the update weights
-        llm._collective_rpc("update_weights", (None,))
-
-        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
-
-    del hf_model
+    _run_fp8_update_weights(model_dir, fp8_model_dir, partial=False)
 
 
 @pytest.mark.part1
@@ -129,82 +187,201 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
     ],
 )
 def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
-    model_dir = str(llm_models_root() / model_dir)
-    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
-    additional_kwargs = {}
-    if "Qwen3/Qwen3-30B-A3B" in model_dir:
-        additional_kwargs["moe_config"] = {
-            "backend": "DEEPGEMM",
-        }
-        # moe_intermediate_size is 768, and FP8 block scaling needs each
-        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
-        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
-        additional_kwargs["moe_tensor_parallel_size"] = 2
-        additional_kwargs["moe_expert_parallel_size"] = 2
-    num_hidden_layers = 1
-    hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
-    tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    with LLM(
-        model=model_dir,
-        ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
-        load_format="dummy",
-        pipeline_parallel_size=1,
-        kv_cache_config=kv_cache_config,
-        model_kwargs={
-            "num_hidden_layers": num_hidden_layers,
-            "quantization_config": {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            },
-        },
-        **additional_kwargs,
-    ) as llm:
-        # Generate texts from the prompts.
-        prompts_texts = [
-            "Hello, my name is",
-            "The president of the United States is",
-            "The capital of France is",
-            "The future of AI is",
-        ]
-        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-        del tokenizer
+    _run_fp8_update_weights(model_dir, fp8_model_dir, partial=True)
 
-        sampling_params = SamplingParams(
-            temperature=0, return_generation_logits=True, max_tokens=1024
+
+# The real Qwen3.5-397B architecture repeats three Gated DeltaNet layers and
+# one full-attention layer. Four layers are therefore the smallest prefix that
+# exercises every decoder-layer type without changing the production ordering.
+_QWEN35_397B_REDUCED_LAYERS = 4
+_QWEN35_397B_LAYER_TYPES = [
+    "linear_attention",
+    "linear_attention",
+    "linear_attention",
+    "full_attention",
+]
+_QWEN35_397B_TP_SIZE = 4
+
+
+def _qwen35_397b_bf16_model_dir() -> str:
+    """Resolve the real BF16 checkpoint, with a local override for bring-up."""
+    model_dir = os.environ.get("QWEN35_397B_BF16_MODEL_DIR")
+    if model_dir:
+        return model_dir
+    return str(llm_models_root() / "Qwen3.5-397B-A17B")
+
+
+def _qwen35_397b_reduced_config(model_dir: str):
+    """Preserve 397B tensor shapes while dropping repeated model depth."""
+    config = AutoConfig.from_pretrained(model_dir)
+    text_config = config.text_config
+    text_config.num_hidden_layers = _QWEN35_397B_REDUCED_LAYERS
+    text_config.layer_types = list(_QWEN35_397B_LAYER_TYPES)
+
+    # MTP refit is independent of the rollout-model refit under test and costs
+    # roughly one additional 397B decoder layer.
+    if hasattr(text_config, "mtp_num_hidden_layers"):
+        text_config.mtp_num_hidden_layers = 0
+
+    # Text-only generation still constructs the VLM wrapper. One vision block
+    # covers its partial-loading path without retaining all 27 repeated blocks.
+    config.vision_config.depth = 1
+    return config
+
+
+def _qwen35_397b_model_kwargs() -> dict:
+    """Apply the same nested reductions to TRT-LLM's composite config."""
+    return {
+        "text_config": {
+            "num_hidden_layers": _QWEN35_397B_REDUCED_LAYERS,
+            "layer_types": list(_QWEN35_397B_LAYER_TYPES),
+            "mtp_num_hidden_layers": 0,
+        },
+        "vision_config": {"depth": 1},
+    }
+
+
+class RefQwen35_397BModelWithIPCHandles(RefHFModelWithIPCHandles):
+    """Reduced-depth, exact-width BF16 397B reference model.
+
+    Unlike the generic helper, the source-device IPC entries alias the HF
+    parameters instead of cloning them. update_weights only reads these
+    allocations, so this saves one complete reduced-model copy on cuda:0 while
+    keeping the reference model available for logits comparison.
+    """
+
+    def __init__(
+        self,
+        model_dir: str,
+        device_id: int = 0,
+        device_ids: Optional[List[int]] = None,
+    ):
+        self.device_id = device_id
+        config = _qwen35_397b_reduced_config(model_dir)
+        self.model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+            model_dir,
+            config=config,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
+        ).eval().to(f"cuda:{device_id}")
+        self.all_weights = {}
+        self.device_uuid = [
+            get_device_uuid(i) for i in range(torch.cuda.device_count())
+        ]
+        self._replicate_weights_to_devices(
+            list(range(torch.cuda.device_count()))
+            if device_ids is None
+            else device_ids
         )
 
-        def common_filter(filter_name: str) -> Callable[[str], bool]:
-            def filter_fn(name: str) -> bool:
-                return name.endswith(filter_name)
+    def _replicate_weights_to_devices(self, device_ids: List[int]) -> None:
+        source_weights = [
+            (name, parameter.detach())
+            for name, parameter in self.model.named_parameters()
+        ]
+        self.all_weights[self.device_id] = source_weights
+        for device_id in device_ids:
+            if device_id == self.device_id:
+                continue
+            self.all_weights[device_id] = [
+                (name, parameter.to(f"cuda:{device_id}"))
+                for name, parameter in source_weights
+            ]
 
-            return filter_fn
 
-        # Generate filter_list from model weight keys by removing layer prefix
-        # e.g., "model.layers.41.input_layernorm.weight" -> "input_layernorm.weight"
-        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
-        filter_set = set()
-        for name, _ in hf_model.all_weights[hf_model.device_id]:
-            suffix = layer_prefix_pattern.sub("", name)
-            filter_set.add(suffix)
-        filter_list = list(filter_set)
+def _qwen35_397b_weight_group(name: str) -> str:
+    """Group repeated layers/experts while separating projection families.
 
-        for filter_name in filter_list:
-            weight_filter = common_filter(filter_name=filter_name)
-            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1, 2, 3], weight_filter=weight_filter
-            )
-            llm._collective_rpc("update_weights", (ipc_handles,))
-        # Finalize the update weights
-        llm._collective_rpc("update_weights", (None,))
+    This produces a practical number of update RPCs and deliberately places
+    QKV, Z, B, A, gate-up, and down projections in separate invocations. It
+    therefore exercises mapper state across incremental calls rather than
+    relying on checkpoint or dictionary order to keep fusion groups together.
+    """
+    name = re.sub(r"(\.layers\.)\d+\.", r"\1*.", name)
+    name = re.sub(r"(\.blocks\.)\d+\.", r"\1*.", name)
+    name = re.sub(r"(\.experts\.)\d+\.", r"\1*.", name)
+    return name
 
-        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
 
-    del hf_model
+def _run_generate_qwen35_397b(llm, hf_model, prompts, sampling_params):
+    """Compare short generations without allocating 2K-token 248K-vocab logits."""
+    llm_responses = []
+    llm_logits = []
+    for output in llm.generate(prompts, sampling_params):
+        llm_logits.append(output.outputs[0].generation_logits)
+        llm_responses.append(output.outputs[0].token_ids)
+
+    prompt_max_len = max(len(prompt) for prompt in prompts)
+    response_max_len = max(len(response) for response in llm_responses)
+    input_ids, attention_mask, position_ids = RefHFModel.pad_data(
+        prompts,
+        llm_responses,
+        prompt_max_len=prompt_max_len,
+        response_max_len=response_max_len,
+    )
+    ref_logits = hf_model.generate_batch_with_padding(
+        input_ids,
+        attention_mask,
+        position_ids,
+        llm_responses,
+        prompt_max_len=prompt_max_len,
+        micro_batch_size=1,
+        return_logits=True,
+    )
+    return llm_logits, ref_logits
+
+
+def _run_qwen35_397b_bf16_update(partial: bool) -> None:
+    model_dir = _qwen35_397b_bf16_model_dir()
+    if not os.path.isdir(model_dir):
+        pytest.skip(f"Model directory {model_dir} does not exist")
+
+    device_ids = list(range(_QWEN35_397B_TP_SIZE))
+    hf_model = RefQwen35_397BModelWithIPCHandles(
+        model_dir, device_ids=device_ids
+    )
+    _run_multi_gpu_update_weights(
+        model_dir=model_dir,
+        hf_model=hf_model,
+        device_ids=device_ids,
+        llm_kwargs={
+            "max_batch_size": 2,
+            "max_seq_len": 256,
+            "max_num_tokens": 256,
+            "kv_cache_config": KvCacheConfig(
+                enable_block_reuse=True, free_gpu_memory_fraction=0.05
+            ),
+            "model_kwargs": _qwen35_397b_model_kwargs(),
+            "moe_config": MoeConfig(backend="TRTLLM"),
+        },
+        sampling_params=SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=8
+        ),
+        partial=partial,
+        weight_group=_qwen35_397b_weight_group,
+        prompts_texts=["Hello, my name is", "The future of AI is"],
+        warm_before_update=True,
+        generate_fn=_run_generate_qwen35_397b,
+    )
+
+
+@pytest.mark.part0
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_update_weights_qwen35_397b_bf16():
+    """One-shot BF16 refit of a reduced-depth, exact-shape 397B model."""
+    _run_qwen35_397b_bf16_update(partial=False)
+
+
+@pytest.mark.part1
+@pytest.mark.gpu4
+@pytest.mark.high_cuda_memory
+@skip_pre_blackwell
+def test_llm_partial_update_weights_qwen35_397b_bf16():
+    """Incremental BF16 refit with GDN and MoE fusion groups split across RPCs."""
+    _run_qwen35_397b_bf16_update(partial=True)
 
 
 class RefNVFP4ModelWithIPCHandles(RefHFModel):
@@ -358,11 +535,10 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
         assert not fusion_buffer, f"Incomplete fusion groups: {list(fusion_buffer.keys())}"
 
-        # Only populate the owning device. Extra replicas are materialized
-        # lazily by ``get_weight_ipc_handles_serialized`` so that GPUs never
-        # asked for via IPC don't hold NVFP4 quantized tensors that persist
-        # across parametrize IDs.
         self.all_weights[self.device_id] = model_weights
+        for i in range(torch.cuda.device_count()):
+            if i != self.device_id:
+                self.all_weights[i] = [(n, p.to(f"cuda:{i}")) for n, p in model_weights]
 
         with torch.no_grad():
             param_dict = dict(self.model.named_parameters())
@@ -464,10 +640,6 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         device_list = list(range(torch.cuda.device_count())) if device_ids is None else device_ids
 
         for device in device_list:
-            if device not in self.all_weights:
-                src = self.all_weights[self.device_id]
-                self.all_weights[device] = [(n, p.to(f"cuda:{device}")) for n, p in src]
-
             all_handles = []
             for item in self.all_weights[device]:
                 name, p = item
@@ -509,7 +681,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
+        tensor_parallel_size=2,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -534,15 +706,13 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
         llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
-
-    del hf_model
 
 
 @pytest.mark.part3
@@ -572,7 +742,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=4,
+        tensor_parallel_size=2,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -615,7 +785,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1, 2, 3], weight_filter=weight_filter
+                [0, 1], weight_filter=weight_filter
             )
             llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
@@ -623,8 +793,6 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         # Use a looser threshold because NVFP4 logits are compared against a BF16 reference.
         compare_logits(llm_logits, ref_logits, threshold=0.8)
-
-    del hf_model
 
 
 @pytest.fixture
@@ -762,8 +930,6 @@ def _nemotron_h_body():
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
-
-    del hf_model
 
 
 def _nemotron_h_subprocess_entry(result_queue):
