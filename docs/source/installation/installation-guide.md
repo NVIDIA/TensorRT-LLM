@@ -68,7 +68,7 @@ Before installing the latest version, uninstall any previous CUTLASS DSL install
 [CUTLASS DSL installation guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html#installation):
 
 ```bash
-pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
+pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13 nvidia-cutlass-dsl-libs-cu12
 ```
 
 ```bash
