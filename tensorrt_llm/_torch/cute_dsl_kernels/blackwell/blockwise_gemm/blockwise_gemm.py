@@ -3140,6 +3140,13 @@ class Sm100BlockwiseGemmKernel:
             b_sf_ptr,
             layout=cute.make_ordered_layout((sf_n, sf_k, batch_size), order=(1, 0, 2)),
         )
+        output_tensor = cute.make_tensor(
+            c_tensor.iterator,
+            cute.make_layout(
+                (m, n, batch_size),
+                stride=(batch_size * n, 1, n),
+            ),
+        )
         # Carry the scale address through CuTe's tensor ABI.
         if cutlass.const_expr(sf_out_ptr is not None):
             sf_out_tensor_arg = cute.make_tensor(sf_out_ptr, cute.make_layout(1))
@@ -3149,7 +3156,7 @@ class Sm100BlockwiseGemmKernel:
         self(
             a_tensor,
             b_tensor,
-            c_tensor,
+            output_tensor,
             sfa_tensor,
             sfb_tensor,
             max_active_clusters,

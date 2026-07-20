@@ -3973,15 +3973,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
     def _prepare_dsv4_ob_tuning_inputs(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Restore the packed activation-scale layout after M-bucket expansion."""
-        a, sfa, b, sfb, partials = inputs
+        a, sfa, b, sfb, output = inputs
         m, packed_k = sfa.shape
         aligned_m = pad_up(m, 4)
-        sfa_storage = torch.empty(aligned_m * packed_k,
-                                  dtype=sfa.dtype,
-                                  device=sfa.device)
-        packed_sfa = torch.as_strided(sfa_storage, (m, packed_k),
-                                      (1, aligned_m))
-        return [a, packed_sfa, b, sfb, partials]
+        packed_sfa = torch.empty_strided((m, packed_k), (1, aligned_m),
+                                         dtype=sfa.dtype,
+                                         device=sfa.device)
+        return [a, packed_sfa, b, sfb, output]
 
     def _make_dsv4_ob_tuning_config(num_splits: int) -> TuningConfig:
         buckets = _DSV4_OB_TUNING_BUCKETS[num_splits]
@@ -3996,7 +3994,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             ), ),
             constraint_specs=(
                 ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
-                ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
+                ConstraintSpec(4, 0, lambda shapes: num_splits * shapes[0][0]),
             ),
             inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
             exclude_from_cache=True,
@@ -4137,10 +4135,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tactic=-1,
             num_splits: int,
         ) -> None:
-            a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, partials = inputs
+            a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, output = inputs
             m, k = a_tensor.shape
             n = b_tensor.shape[0]
-            c_tmp = partials.permute(1, 2, 0)
 
             device_key = a_tensor.device
             if tactic == -1:
@@ -4206,8 +4203,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
-            c_cute_tensor = cute.runtime.from_dlpack(c_tmp).mark_layout_dynamic(
-                leading_dim=1)
+            c_cute_tensor = cute.runtime.from_dlpack(
+                output).mark_layout_dynamic(leading_dim=1)
             alpha = self.__class__.alpha_cache.get(device_key)
             if alpha is None:
                 alpha = torch.ones((1, ),
@@ -4268,7 +4265,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     kernel_b.data_ptr(),
                     kernel_sfa.data_ptr(),
                     kernel_sfb.data_ptr(),
-                    c_tmp,
+                    output,
                     alpha,
                 )
             else:
@@ -4346,7 +4343,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              dtype=torch.bfloat16)
         if m == 0:
             return output
-        partials = output.view(num_splits, m, n)
         runner = CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True)
         tuner = AutoTuner.get()
 
@@ -4375,10 +4371,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             for tuning_split, tuning_m in tuning_splits:
                 if tuning_split == num_splits and tuning_m == m:
-                    tuning_inputs = [a, sfa, b, sfb, partials]
+                    tuning_inputs = [a, sfa, b, sfb, output]
                 else:
                     tuning_output = torch.empty(
-                        (tuning_split, tuning_m, n),
+                        (tuning_split * tuning_m, n),
                         device=a.device,
                         dtype=torch.bfloat16,
                     )
@@ -4393,15 +4389,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 if tuning_split == num_splits and tuning_m == m:
                     best_tactic = tuning_tactic
         else:
-            _, best_tactic = choose_tactic([a, sfa, b, sfb, partials],
-                                           num_splits)
+            _, best_tactic = choose_tactic([a, sfa, b, sfb, output], num_splits)
 
         if best_tactic is None:
             raise RuntimeError(
                 f"DSV4 O_b autotuner did not select a split-{num_splits} tactic"
             )
         runner(
-            [a, sfa, b, sfb, partials],
+            [a, sfa, b, sfb, output],
             tactic=best_tactic,
             num_splits=num_splits,
         )
@@ -4714,9 +4709,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"{name} must have dtype {dtype}, got {tensor.dtype}")
 
             if any(t.dim() != 3
-                   for t in (a, b, a_sf, b_sf, output)) or sf_out.dim() != 2:
+                   for t in (a, b, a_sf,
+                             b_sf)) or output.dim() != 2 or sf_out.dim() != 2:
                 raise ValueError(
-                    "FP8-output BMM inputs must have ranks [3, 3, 3, 3, 3, 2]")
+                    "FP8-output BMM inputs must have ranks [3, 3, 3, 3, 2, 2]")
 
             batch_size, m, k = a.shape
             if min(batch_size, m, k) <= 0:
@@ -4740,7 +4736,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ("weight", b, (batch_size, n, k)),
                 ("input_scale", a_sf, (batch_size, sf_k, sf_m)),
                 ("weight_scale", b_sf, (batch_size, sf_n, sf_k)),
-                ("output_fp8", output, (m, batch_size, n)),
+                ("output_fp8", output, (m, batch_size * n)),
                 ("sf_out", sf_out, (m, packed_sf_n)),
             )
             for name, tensor, shape in expected_shapes:
@@ -4795,7 +4791,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_fp8_smem_epilogue = m <= 32
             fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
 
-            c_tmp = c_tensor.permute(0, 2, 1)
             cache_key = (
                 "fp8out",
                 use_2cta_instrs,
@@ -4823,7 +4818,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
                 c_cute_tensor = cute.runtime.from_dlpack(
-                    c_tmp).mark_layout_dynamic(leading_dim=1)
+                    c_tensor).mark_layout_dynamic(leading_dim=1)
                 sf_out_ptr = make_ptr(cutlass.Int32,
                                       sf_out_tensor.data_ptr(),
                                       cute.AddressSpace.gmem,
@@ -4879,7 +4874,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_tensor.data_ptr(),
                 a_sf_tensor.data_ptr(),
                 b_sf_tensor.data_ptr(),
-                c_tmp,
+                c_tensor,
                 sf_out_tensor.data_ptr(),
                 aligned_m,
                 sf_n,
@@ -4951,7 +4946,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_fp8: torch.Tensor,
         sf_out: torch.Tensor,
     ) -> None:
-        """Write [M,L,N] FP8 output and MN-major packed scales."""
+        """Write flattened [M,L*N] FP8 output and MN-major packed scales."""
         if not is_sm_100f():
             raise ValueError(
                 f"cute_dsl_fp8_bmm_blackwell_fp8out requires SM100 family, got {get_sm_version()}"

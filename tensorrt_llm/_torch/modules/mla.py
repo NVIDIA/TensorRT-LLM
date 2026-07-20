@@ -1262,7 +1262,7 @@ class MLA(nn.Module):
         n_tiles = (o_lora_rank + _DSV4_OB_SCALE_BLOCK_K - 1) // _DSV4_OB_SCALE_BLOCK_K
         packed_k = (num_groups * n_tiles + _UE8M0_SCALES_PER_WORD - 1) // _UE8M0_SCALES_PER_WORD
         o_lora_fp8 = torch.empty(
-            [num_tokens, num_groups, o_lora_rank],
+            [num_tokens, num_groups * o_lora_rank],
             device=attn_fp8.device,
             dtype=torch.float8_e4m3fn,
         )
@@ -1282,7 +1282,7 @@ class MLA(nn.Module):
             o_lora_fp8,
             sf_out,
         )
-        return self._fused_ob_gemm(o_lora_fp8.flatten(1), sf_out, num_tokens)
+        return self._fused_ob_gemm(o_lora_fp8, sf_out, num_tokens)
 
     def _fused_ob_gemm(
         self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor, num_tokens: int
