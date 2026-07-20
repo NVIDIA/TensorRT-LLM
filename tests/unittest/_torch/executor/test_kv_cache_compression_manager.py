@@ -267,23 +267,17 @@ class TestFactory:
     def test_raises_when_no_algorithm_registered(self, fake_kv_cache_manager):
         # A config whose algorithm has no registered manager is a developer
         # error (config subclass added without a factory branch): fail loudly
-        # instead of silently running without compression.
+        # instead of silently running without compression. The draft-manager
+        # kwarg does not change the dispatch, so both forms raise identically.
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
         with pytest.raises(ValueError, match="no registered compression manager"):
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
-
-    def test_unregistered_algorithm_raises_with_draft_manager_too(self):
-        cfg = MagicMock()
-        cfg.algorithm = "made_up_method"
-        target = _v2_manager(is_draft=False)
-        draft = _v2_manager(is_draft=True)
-
         with pytest.raises(ValueError, match="no registered compression manager"):
             create_kv_cache_compression_manager(
                 cfg,
-                target,
-                draft_kv_cache_manager=draft,
+                fake_kv_cache_manager,
+                draft_kv_cache_manager=_v2_manager(is_draft=True),
             )
 
     def test_eviction_method_predicate_defaults_false(self):

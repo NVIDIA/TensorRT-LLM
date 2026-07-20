@@ -13,13 +13,16 @@ speculative admission gates, the published compressed-token invariant, and
 prepared-compaction cache invalidation.
 """
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import make_fake_v2 as _make_fake_v2
+from conftest import make_request as _make_request
+from conftest import make_triattention as _make_triattention
+from conftest import mocked_eviction_internals as _mocked_eviction_internals
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
     BatchedKVCacheCompaction,
@@ -30,60 +33,6 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _PreparedEviction,
     _RequestCompressionState,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-
-
-def _make_fake_v2(*, is_draft=False):
-    """Build an unallocated V2 double with TriAttention's production contract."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-
-    fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    fake_v2.enable_block_reuse = False
-    fake_v2.is_draft = is_draft
-    fake_v2.kv_compression_manages_history = False
-    fake_v2.kv_factor = 2
-    fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
-    fake_v2.is_disagg = False
-    fake_v2.max_beam_width = 1
-    fake_v2.max_batch_size = 8
-    fake_v2.num_extra_kv_tokens = 0
-    fake_v2.max_draft_len = 0
-    fake_v2.max_total_draft_tokens = 0
-    fake_v2._kv_reserve_draft_tokens = 0
-    fake_v2.max_seq_len = 65536
-    fake_v2.tokens_per_block = 64
-    fake_v2.max_blocks_per_seq = 1028
-    fake_v2.get_num_available_tokens = lambda *, token_num_upper_bound, **_: token_num_upper_bound
-    fake_v2.max_attention_window_vec = []
-    fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
-    fake_v2.impl = object()
-    fake_v2.kv_cache_map = {}
-    fake_v2.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
-    fake_v2.pp_layers = []
-    fake_v2.layer_offsets = {}
-    fake_v2.layer_to_pool_mapping_dict = {}
-    return fake_v2
-
-
-def _make_triattention(**overrides):
-    options = {"top_B": 8, "model_path": "/models/test"}
-    options.update(overrides)
-    return TriAttention(_make_fake_v2(), **options)
-
-
-def _make_request(request_id, **overrides):
-    fields = {
-        "py_request_id": request_id,
-        "py_prompt_len": 0,
-        "py_max_new_tokens": 65536,
-        "py_draft_tokens": [],
-        "py_num_accepted_draft_tokens": 0,
-        "py_num_compressed_tokens": 0,
-        "is_dummy": False,
-        "state": LlmRequestState.GENERATION_IN_PROGRESS,
-    }
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
 
 
 def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
@@ -344,35 +293,6 @@ def test_draft_admission_gates_raise(gate, match):
         manager._validate_v2_compatibility()
 
 
-@contextmanager
-def _mocked_eviction_internals(manager):
-    """Run the real ``_evict_requests`` body around mocked GPU launches."""
-    score_staging = SimpleNamespace(
-        launch_prepared_score=mock.Mock(return_value=torch.zeros(1)),
-        mark_page_tables_consumed=mock.Mock(),
-    )
-    keep_set_selector = SimpleNamespace(
-        select_requests=mock.Mock(),
-        refresh_row_prompt_offsets=mock.Mock(),
-    )
-    resources = SimpleNamespace(
-        score_staging=score_staging,
-        keep_set_selector=keep_set_selector,
-    )
-    batched_compaction = SimpleNamespace(compact=mock.Mock())
-    with (
-        mock.patch.object(manager, "_runtime_kv_layout", return_value=SimpleNamespace()),
-        mock.patch.object(manager, "_eager_resources_for", return_value=resources),
-        mock.patch.object(
-            manager,
-            "_batched_compaction_for",
-            return_value=batched_compaction,
-        ),
-        mock.patch.object(manager, "_attach_page_ids"),
-    ):
-        yield score_staging
-
-
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager = _make_triattention(top_B=4, beta=4)
     manager._calibrated = True
@@ -403,7 +323,8 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     cache.capacity = confirmed
     previous_published = 0
     eviction_rounds = 0
-    with _mocked_eviction_internals(manager) as score_staging:
+    with _mocked_eviction_internals(manager) as internals:
+        score_staging = internals.score_staging
         for _ in range(6):
             uncompressed += 2
             confirmed += 2
@@ -505,7 +426,7 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
             return_value=keep_set_selector,
         ),
     ):
-        resources = manager._eager_resources_for(layout, prepared)
+        resources = manager._fixed_resources_for(layout, prepared)
 
         # The buffers follow the executor limits, not this one-request cohort.
         assert resources.score_staging is score_staging
@@ -519,14 +440,14 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
         # keeps the cached compaction launches.
         cached_compaction = object()
         manager._batched_compaction = cached_compaction
-        assert manager._eager_resources_for(layout, prepared) is resources
+        assert manager._fixed_resources_for(layout, prepared) is resources
         assert score_cls.call_count == 1
         assert manager._batched_compaction is cached_compaction
 
         # A pool change invalidates both the buffers and the compaction
         # launches that alias them.
         layout.pool_view_fingerprint = (("moved",),)
-        rebuilt = manager._eager_resources_for(layout, prepared)
+        rebuilt = manager._fixed_resources_for(layout, prepared)
         assert rebuilt is not resources
         assert score_cls.call_count == 2
         assert manager._batched_compaction is None

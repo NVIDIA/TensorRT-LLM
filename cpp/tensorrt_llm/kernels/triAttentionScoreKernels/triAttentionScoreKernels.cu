@@ -35,11 +35,12 @@
 // chunks of 8 frequencies when the pool layout allows it, otherwise a fully
 // strided scalar path runs the same math.
 //
-// The kernel reassociates the frequency reduction relative to the Triton
-// reference (sequential chunks instead of a block-wide tree), so results are
-// tolerance-equal, not bit-equal. The valid-width side store IS replicated
-// bit-exactly: first tile, first head, first segment of each request, thread
-// 0, before any early-out.
+// The kernel accumulates the frequency reduction in sequential chunks (not a
+// block-wide tree), so results are tolerance-equal, not bit-equal, against
+// the unit tests' PyTorch oracle (the in-tree reference; the original Triton
+// score kernel has been deleted). The valid-width side store IS exact: first
+// tile, first head, first segment of each request, thread 0, before any
+// early-out.
 //
 // This file must NOT be compiled with --use_fast_math: the fold kernel's
 // cosf/sinf and the scalar-path precision are part of the accuracy contract.
@@ -65,10 +66,11 @@ namespace kernels::tri_attention_score
 namespace
 {
 
-// |K| uses the hardware approximate square root (one MUFU op). This matches
-// the Triton reference's tl.sqrt lowering and is gated by the unit suite's
-// tolerance comparison. Define TRTLLM_TRI_ATTENTION_IEEE_SQRT to restore the
-// IEEE sqrtf sequence if a future geometry needs the extra bits.
+// |K| uses the hardware approximate square root (one MUFU op), gated by the
+// unit suite's tolerance comparison against the PyTorch oracle (this matched
+// the deleted Triton score kernel's tl.sqrt lowering). Define
+// TRTLLM_TRI_ATTENTION_IEEE_SQRT to restore the IEEE sqrtf sequence if a
+// future geometry needs the extra bits.
 __device__ __forceinline__ float triSqrtApprox(float x)
 {
 #ifdef TRTLLM_TRI_ATTENTION_IEEE_SQRT
@@ -264,9 +266,8 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
     int const reqId = a.segRequestIds[seg];
     int const seqLen = a.requestSeqLens[reqId];
     int const tokenStart = a.requestTokenStarts[reqId];
-    // Valid-width side store: same predicate as the Triton reference, before
-    // any early-out, so it fires exactly once per request even when the
-    // decode region is empty.
+    // Valid-width side store: evaluated before any early-out, so it fires
+    // exactly once per request even when the decode region is empty.
     if (blockIdx.x == 0 && blockIdx.z == 0 && (seg % a.numLayers) == 0 && threadIdx.x == 0)
     {
         a.validWidthOut[reqId] = seqLen - tokenStart;
@@ -616,6 +617,33 @@ void launchScalar(FoldedScoreParams const& params, dim3 grid, bool useMax, cudaS
     }
 }
 
+// Launch flavor for bf16/fp16 pools, the only element types owning both load
+// paths (the vectorized 16-byte chunk kernel and the strided scalar kernel).
+template <typename T>
+void launchVectorizedOrScalar(
+    FoldedScoreParams const& params, int32_t groupSize, dim3 grid, bool useVectorized, bool useMax, cudaStream_t stream)
+{
+    if (useVectorized)
+    {
+        launchVectorized<T>(params, groupSize, grid, useMax, stream);
+    }
+    else
+    {
+        launchScalar<T>(params, grid, useMax, stream);
+    }
+}
+
+// Quantized pools are functional-only: no vectorized instantiation exists for
+// them by design (their dequant scale is folded into the coefficients, so
+// only the scalar load path knows how to read them).
+template <typename T>
+void launchQuantizedScalar(
+    FoldedScoreParams const& params, dim3 grid, bool useVectorized, bool useMax, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(!useVectorized, "tri_attention_score: quantized pools must use the scalar path");
+    launchScalar<T>(params, grid, useMax, stream);
+}
+
 } // namespace
 
 void foldScoreCoefficientsLaunch(float const* qReal, float const* qImag, float const* mlrCoef, float const* freqScaleSq,
@@ -653,24 +681,10 @@ void foldedScoreLaunch(FoldedScoreParams const& params, PoolElementType poolType
     switch (poolType)
     {
     case PoolElementType::kBFloat16:
-        if (useVectorized)
-        {
-            launchVectorized<__nv_bfloat16>(params, groupSize, grid, useMax, stream);
-        }
-        else
-        {
-            launchScalar<__nv_bfloat16>(params, grid, useMax, stream);
-        }
+        launchVectorizedOrScalar<__nv_bfloat16>(params, groupSize, grid, useVectorized, useMax, stream);
         break;
     case PoolElementType::kHalf:
-        if (useVectorized)
-        {
-            launchVectorized<half>(params, groupSize, grid, useMax, stream);
-        }
-        else
-        {
-            launchScalar<half>(params, grid, useMax, stream);
-        }
+        launchVectorizedOrScalar<half>(params, groupSize, grid, useVectorized, useMax, stream);
         break;
     case PoolElementType::kFloat32:
         // fp32 pools have 32-byte 8-frequency rows; the 16-byte chunk path
@@ -679,16 +693,9 @@ void foldedScoreLaunch(FoldedScoreParams const& params, PoolElementType poolType
         launchScalar<float>(params, grid, useMax, stream);
         break;
     case PoolElementType::kFloat8E4M3:
-        // Quantized pools are functional-only: no vectorized instantiation
-        // exists for them by design (their dequant scale is folded into the
-        // coefficients, so only the scalar load path knows how to read them).
-        TLLM_CHECK_WITH_INFO(!useVectorized, "tri_attention_score: quantized pools must use the scalar path");
-        launchScalar<__nv_fp8_e4m3>(params, grid, useMax, stream);
+        launchQuantizedScalar<__nv_fp8_e4m3>(params, grid, useVectorized, useMax, stream);
         break;
-    case PoolElementType::kInt8:
-        TLLM_CHECK_WITH_INFO(!useVectorized, "tri_attention_score: quantized pools must use the scalar path");
-        launchScalar<int8_t>(params, grid, useMax, stream);
-        break;
+    case PoolElementType::kInt8: launchQuantizedScalar<int8_t>(params, grid, useVectorized, useMax, stream); break;
     }
     TLLM_CUDA_CHECK(cudaGetLastError());
 }

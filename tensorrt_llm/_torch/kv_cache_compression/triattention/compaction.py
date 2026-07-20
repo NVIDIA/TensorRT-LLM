@@ -17,9 +17,11 @@
 
 Given each request's kept-token ordinals, its valid sequence length, and the
 staged V2 block offsets, this module packs per-request move indices with one
-Triton launch and then moves the surviving KV in place with batched
-C++ compact launches. Inputs are plain tensors, so any eviction method that
-produces a kept-token set per request can drive it.
+Triton launch per compacted cache (one launch covers the target's dense and
+SWA families; a co-compressed draft adds a second) and then moves the
+surviving KV in place with batched C++ compact launches. Inputs are plain
+tensors, so any eviction method that produces a kept-token set per request
+can drive it.
 """
 
 from collections import OrderedDict
@@ -76,16 +78,6 @@ class _SingleCacheCompaction(NamedTuple):
             group.compact(
                 self.move_source_indices, self.move_source_offsets, self.destination_bases
             )
-
-
-def _cuda_int32_contiguous(tensors: Tuple[torch.Tensor, ...], device: torch.device) -> bool:
-    return all(
-        tensor.is_cuda
-        and tensor.dtype == torch.int32
-        and tensor.device == device
-        and tensor.is_contiguous()
-        for tensor in tensors
-    )
 
 
 def _validated_kv_head_count(
@@ -304,8 +296,7 @@ def _move_index_pack_launcher(
         swa_offsets_arg,
         swa_indices_arg,
     )
-    # Ordered to match the kernel's constexpr parameter declaration: the
-    # ordered to match the kernel constexpr declaration.
+    # Ordered to match the kernel's constexpr parameter declaration.
     constexpr_values = dict(
         DENSE_TOTAL=int(move_source_indices.shape[-1]),
         SWA_TOTAL=swa_total,
@@ -355,9 +346,10 @@ class BatchedKVCacheCompaction:
             slot must share one block-offset table.
         `protected_tail_capacity`: widest per-request protected tail this
             object must support. A protected tail covers KV positions past
-            the valid length reserved for a forward already in flight; the
-            actual per-round lengths are loaded via `set_protected_tails`
-            and move with the kept tokens.
+            the valid length reserved for a forward already in flight; each
+            round's actual lengths arrive through the per-family move-offset
+            rows staged with the round metadata (`set_protected_tails` fills
+            the same rows for standalone use) and move with the kept tokens.
         `draft_*`: co-compressed draft-cache layout (union mode only); the
             draft reuses the target keep set and pins the same prompt.
     """
@@ -378,8 +370,8 @@ class BatchedKVCacheCompaction:
         prompt_offsets: torch.Tensor,
         decode_keep_count: int,
         swa_window: Optional[int],
+        layer_pool_keys: List[object],
         protected_tail_capacity: int = 0,
-        layer_pool_keys: Optional[List[object]] = None,
         draft_layer_pools: Optional[List[torch.Tensor]] = None,
         draft_layers: Optional[List[int]] = None,
         draft_layer_group_representative: Optional[Dict[int, int]] = None,
@@ -428,8 +420,6 @@ class BatchedKVCacheCompaction:
         self.protected_tail_capacity = int(protected_tail_capacity)
         self.dense_layers = tuple(int(layer) for layer in dense_layers)
         self.swa_layers = tuple(int(layer) for layer in swa_layers)
-        if layer_pool_keys is None:
-            layer_pool_keys = [("layer", layer) for layer in range(len(layer_pools))]
         if len(layer_pool_keys) != len(layer_pools):
             raise ValueError("pool keys must match the layer-pool count")
         self.layer_pool_keys = tuple(layer_pool_keys)

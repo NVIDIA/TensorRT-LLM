@@ -25,12 +25,17 @@ selection, page-table staging, bounded request chunks, and request lifecycle.
 Model-level correctness is covered by separate end-to-end tests.
 """
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
+from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import make_fake_v2 as _make_fake_v2
+from conftest import make_request as _make_request
+from conftest import make_triattention as _make_triattention
+from conftest import mocked_eviction_internals as _mocked_eviction_internals
+from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
 from pydantic import ValidationError
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
@@ -48,27 +53,9 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
 _TORCH_TOPK_ORACLE = torch.topk
-
-
-def _encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
-    """Build the native V2 [pool, request, K/V, block] layout."""
-    if page_ids.ndim == 2:
-        page_ids = page_ids.unsqueeze(0)
-    encoded = torch.empty(
-        page_ids.shape[0],
-        page_ids.shape[1],
-        2,
-        page_ids.shape[2],
-        dtype=torch.int32,
-        device=page_ids.device,
-    )
-    encoded[:, :, 0] = page_ids.to(torch.int32) * 2
-    encoded[:, :, 1] = encoded[:, :, 0] + 1
-    return encoded
 
 
 def _set_request_state(
@@ -168,134 +155,10 @@ def flat_calibration_pt(tmp_path):
     return str(path)
 
 
-def _make_fake_v2(enable_block_reuse=False, *, is_draft=False):
-    """Build an unallocated V2 double with TriAttention's production contract."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-
-    fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
-    fake_v2.enable_block_reuse = enable_block_reuse
-    fake_v2.is_draft = is_draft
-    fake_v2.kv_compression_manages_history = False
-    fake_v2.kv_factor = 2
-    fake_v2.mapping = SimpleNamespace(enable_attention_dp=False)
-    fake_v2.is_disagg = False
-    fake_v2.max_beam_width = 1
-    fake_v2.max_batch_size = 8
-    fake_v2.num_extra_kv_tokens = 0
-    fake_v2.max_draft_len = 0
-    fake_v2.max_total_draft_tokens = 0
-    fake_v2._kv_reserve_draft_tokens = 0
-    fake_v2.max_seq_len = 65536
-    fake_v2.tokens_per_block = 64
-    fake_v2.max_blocks_per_seq = 1028
-    fake_v2.get_num_available_tokens = lambda *, token_num_upper_bound, **_: token_num_upper_bound
-    fake_v2.max_attention_window_vec = []
-    fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
-    fake_v2.impl = object()
-    fake_v2.kv_cache_map = {}
-    fake_v2.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
-    fake_v2.pp_layers = []
-    fake_v2.layer_offsets = {}
-    fake_v2.layer_to_pool_mapping_dict = {}
-    return fake_v2
-
-
-def _make_triattention(**overrides):
-    """Construct a fully initialized manager for method-level unit tests."""
-    options = {"top_B": 8, "model_path": "/models/test"}
-    options.update(overrides)
-    return TriAttention(_make_fake_v2(), **options)
-
-
-def _make_request(request_id, **overrides):
-    """Build the explicit request fields consumed by TriAttention."""
-    fields = {
-        "py_request_id": request_id,
-        "py_prompt_len": 0,
-        "py_max_new_tokens": 65536,
-        "py_draft_tokens": [],
-        "py_num_accepted_draft_tokens": 0,
-        "py_num_compressed_tokens": 0,
-        "is_dummy": False,
-        "state": LlmRequestState.GENERATION_IN_PROGRESS,
-    }
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
 def _make_hf_config(**values):
     """Expose the normalized Hugging Face text-config contract."""
     text_config = SimpleNamespace(to_dict=lambda: dict(values))
     return SimpleNamespace(get_text_config=lambda: text_config)
-
-
-def _torch_tri_score_oracle(
-    layer_pools,
-    page_ids,
-    seq_lens,
-    round_starts,
-    q_real,
-    q_imag,
-    mlr_coef,
-    freq_scale_sq,
-    omega,
-    offsets,
-    layer_indices,
-    aggregation,
-):
-    """Independent Torch implementation of the paged TriAttention score."""
-    scores = []
-    num_q_heads = int(q_real.shape[1])
-    for request, seq_len in enumerate(seq_lens):
-        phase = (round_starts[request] + offsets[:, None]) * omega[None, :]
-        mean_cos = torch.cos(phase).mean(dim=0)
-        mean_sin = torch.sin(phase).mean(dim=0)
-        for layer in layer_indices:
-            pool = layer_pools[layer]
-            request_page_ids = (
-                page_ids[layer][request] if isinstance(page_ids, dict) else page_ids[request]
-            )
-            keys = (
-                pool.index_select(0, request_page_ids)[:, 0]
-                .permute(1, 0, 2, 3)
-                .reshape(pool.shape[2], -1, pool.shape[4])[:, :seq_len]
-                .float()
-            )
-            num_kv_heads = int(keys.shape[0])
-            group_size = num_q_heads // num_kv_heads
-            head_scores = []
-            for head in range(num_q_heads):
-                key = keys[head // group_size]
-                num_freqs = int(key.shape[-1]) // 2
-                key_real = key[:, :num_freqs]
-                key_imag = key[:, num_freqs:]
-                product_real = q_real[layer, head] * key_real + q_imag[layer, head] * key_imag
-                product_imag = q_imag[layer, head] * key_real - q_real[layer, head] * key_imag
-                if aggregation == "mean":
-                    position = (
-                        freq_scale_sq * (product_real * mean_cos - product_imag * mean_sin)
-                    ).sum(dim=-1)
-                else:
-                    position = (
-                        (
-                            freq_scale_sq[None, None, :]
-                            * (
-                                product_real[None] * torch.cos(phase)[:, None, :]
-                                - product_imag[None] * torch.sin(phase)[:, None, :]
-                            )
-                        )
-                        .sum(dim=-1)
-                        .max(dim=0)
-                        .values
-                    )
-                mlr = (
-                    torch.sqrt(key_real.square() + key_imag.square())
-                    * mlr_coef[layer, head]
-                    * freq_scale_sq
-                ).sum(dim=-1)
-                head_scores.append(position + mlr)
-            scores.append(torch.stack(head_scores))
-    return scores
 
 
 class TestKvCacheCompressionConfig:
@@ -432,39 +295,6 @@ class TestCompressedTokenPublication:
         # the first eviction publishes a count.
         assert request.py_num_compressed_tokens == 0
 
-    @contextmanager
-    def _mocked_eviction_internals(self, manager):
-        """Run the real ``_evict_requests`` body around mocked GPU launches."""
-        score_staging = SimpleNamespace(
-            launch_prepared_score=mock.Mock(return_value=torch.zeros(1)),
-            mark_page_tables_consumed=mock.Mock(),
-        )
-        keep_set_selector = SimpleNamespace(
-            select_requests=mock.Mock(),
-            refresh_row_prompt_offsets=mock.Mock(),
-        )
-        resources = SimpleNamespace(
-            score_staging=score_staging,
-            keep_set_selector=keep_set_selector,
-        )
-        batched_compaction = SimpleNamespace(compact=mock.Mock())
-        with (
-            mock.patch.object(manager, "_runtime_kv_layout", return_value=SimpleNamespace()),
-            mock.patch.object(manager, "_eager_resources_for", return_value=resources),
-            mock.patch.object(
-                manager,
-                "_batched_compaction_for",
-                return_value=batched_compaction,
-            ),
-            mock.patch.object(manager, "_attach_page_ids") as attach,
-        ):
-            yield SimpleNamespace(
-                score_staging=score_staging,
-                keep_set_selector=keep_set_selector,
-                batched_compaction=batched_compaction,
-                attach=attach,
-            )
-
     def test_eviction_bookkeeping_publishes_cumulative_count(self):
         # The eviction bookkeeping writes the cumulative evicted count on the
         # request in the same step that compacts the cache; this is the
@@ -474,7 +304,7 @@ class TestCompressedTokenPublication:
         request = _make_request(7, py_prompt_len=2)
         _set_request_state(manager, 7, confirmed_kv_length=10)
 
-        with self._mocked_eviction_internals(manager) as internals:
+        with _mocked_eviction_internals(manager) as internals:
             first = manager._evict_requests([(request, 7)], 2)
 
         assert first == [(7, 6)]
@@ -488,7 +318,7 @@ class TestCompressedTokenPublication:
 
         # Round two: 6 retained + 8 newly confirmed decode tokens.
         manager._request_states[7].confirmed_kv_length = 14
-        with self._mocked_eviction_internals(manager) as internals:
+        with _mocked_eviction_internals(manager) as internals:
             second = manager._evict_requests([(request, 7)], 2)
 
         assert second == [(7, 6)]
@@ -506,12 +336,12 @@ class TestCompressedTokenPublication:
         # one token; seq_len == prompt + budget must never publish.
         _set_request_state(manager, 7, confirmed_kv_length=6)
 
-        with self._mocked_eviction_internals(manager):
+        with _mocked_eviction_internals(manager):
             assert manager._evict_requests([(request, 7)], 2) == []
         assert request.py_num_compressed_tokens == 0
 
 
-class TestStepEndHookRefactor:
+class TestEvictionLifecycle:
     def test_triattention_prepare_only_snapshots_and_update_uses_final_hook(self):
         assert "prepare_resources" in TriAttention.__dict__
         assert "update_resources" not in TriAttention.__dict__
@@ -534,10 +364,9 @@ class TestStepEndHookRefactor:
 
         periodic_evict.assert_called_once_with(batch)
 
-    @pytest.mark.parametrize("top_B", [511, 512])
-    def test_non_v2_manager_is_always_rejected(self, top_B):
+    def test_non_v2_manager_is_always_rejected(self):
         with pytest.raises(TypeError, match="requires KVCacheManagerV2"):
-            TriAttention(SimpleNamespace(), top_B=top_B)
+            TriAttention(SimpleNamespace(), top_B=8)
 
     @staticmethod
     def _make_due_decode_request(seq_len):
@@ -567,8 +396,6 @@ class TestStepEndHookRefactor:
         _set_request_state(mgr, 7, generation_steps=127)
         mgr.beta = 128
         mgr.top_B = 4096
-        mgr.pin_prefill = True
-        mgr.count_prompt_tokens = False
         return mgr, request, batch
 
     def test_identity_gate_preserves_real_eviction_round(self):
@@ -1002,7 +829,7 @@ class TestTopKRouting:
             input_scores=scores,
             normalize_scores=False,
         )
-        selector.select_requests(scores, normalize_scores=False)
+        selector.select_prepared_requests()
         selected = selector.keep.cpu()
 
         for actual, expected_keep in zip(selected, expected):
@@ -1012,7 +839,7 @@ class TestTopKRouting:
 class TestFixedScoreMetadata:
     @pytest.mark.parametrize("normalize_scores", [False, True])
     @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-    def test_eager_buffers_bind_score_after_selection(self, eviction_mode, normalize_scores):
+    def test_fixed_buffers_bind_score_after_selection(self, eviction_mode, normalize_scores):
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
         manager = _make_triattention(
@@ -1070,7 +897,7 @@ class TestFixedScoreMetadata:
                 return_value=keep_set_selector,
             ) as build_selection,
         ):
-            resources = manager._eager_resources_for(layout, prepared)
+            resources = manager._fixed_resources_for(layout, prepared)
 
         score_staging.bind_score_launcher.assert_called_once_with(
             keep_set_selector.valid_widths,
@@ -1823,30 +1650,21 @@ class TestKernelMaskedSwa:
 
 
 class TestFactory:
-    def test_returns_triattention_instance_with_v2(self):
+    def test_returns_triattention_instance_and_propagates_config_fields(self):
         # A plain V2 manager (block reuse off) yields a TriAttention instance.
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
         cfg = TriAttentionKvCacheCompressionConfig(
-            top_B=32, beta=16, model_path="/models/test", calibration_path="/calib/test.pt"
+            top_B=32,
+            beta=16,
+            eviction_mode="per_head",
+            model_path="/models/test",
+            calibration_path="/calib/test.pt",
         )
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.top_B == 32
         assert mgr.beta == 16
-        assert mgr.kv_cache_manager is fake_v2
-
-    def test_factory_propagates_eviction_mode(self):
-        cfg = TriAttentionKvCacheCompressionConfig(
-            top_B=64,
-            beta=8,
-            eviction_mode="per_head",
-            model_path="/models/test",
-            calibration_path="/calib/test.pt",
-        )
-        mgr = create_kv_cache_compression_manager(
-            cfg, kv_cache_manager=_make_fake_v2(enable_block_reuse=False)
-        )
-        assert isinstance(mgr, TriAttention)
         assert mgr.eviction_mode == "per_head"
+        assert mgr.kv_cache_manager is fake_v2

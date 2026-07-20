@@ -12,8 +12,8 @@ Selection and compaction live in their respective runtime modules.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
-  * int64 for every page/stride offset that can exceed 2^31 (paged-pool reads).
-  * mask seq tails not divisible by ``tokens_per_block`` (and freq/dim tails).
+  * int64 for every flat buffer offset that can exceed 2^31.
+  * mask ragged valid-width tails (and frequency tails) in every load and store.
   * the kernels are vendored in this module (no lazy-load hub).
 """
 
@@ -248,14 +248,11 @@ class _FixedScoreGroup:
         freq_scale_sq: torch.Tensor,
         omega: torch.Tensor,
         offsets: torch.Tensor,
-        output_width: int | None = None,
+        output_width: int,
         kv_scales: torch.Tensor | None = None,
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
-        # Default: the whole sequence capacity is scorable.
-        if output_width is None:
-            output_width = int(seq_len)
         if output_width <= 0 or output_width > seq_len:
             raise ValueError("fixed score group requires a decode width within its capacity")
         if len(page_table_slots) != len(layer_indices):

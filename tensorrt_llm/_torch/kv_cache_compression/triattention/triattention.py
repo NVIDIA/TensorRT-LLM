@@ -94,7 +94,7 @@ class _FixedScoreStreamMismatch(RuntimeError):
 
 
 class _CrossRequestSelectionPlan(NamedTuple):
-    """Selection dimensions used to allocate reusable eager buffers."""
+    """Selection dimensions used to allocate reusable fixed buffers."""
 
     eviction_mode: str
     dense_layers: Tuple[int, ...]
@@ -154,7 +154,6 @@ class _BatchedKeepSetSelectorBase:
         self.num_kv_heads = int(num_kv_heads)
         self.width = int(width)
         self.keep_count = int(keep_count)
-        self.dtype = dtype
         self.device = device
         self.max_requests = int(max_requests)
         self.valid_widths = torch.full(
@@ -187,14 +186,6 @@ class _BatchedKeepSetSelectorBase:
                 dtype=torch.int32,
                 device=self.device,
             )
-
-    def set_prompt_offsets(self, prompt_lens: torch.Tensor) -> None:
-        """Refresh the per-request prompt offsets for the coming round."""
-        count = int(prompt_lens.numel())
-        if count > self.max_requests:
-            raise ValueError("prompt offsets exceed the selector's request capacity")
-        self.prompt_offsets[:count].copy_(prompt_lens, non_blocking=True)
-        self.refresh_row_prompt_offsets()
 
     def refresh_row_prompt_offsets(self) -> None:
         """Re-expand the per-request prompt offsets into their row-major view.
@@ -285,7 +276,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             device=device,
             max_requests=max_requests,
         )
-        self.rows = rows
         if input_scores is None:
             raise ValueError("union selection requires its fixed score input")
 
@@ -319,17 +309,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             normalize_scores=self.normalize_scores,
         )
         self._select_top_tokens()
-
-    def select_requests(
-        self,
-        scores: torch.Tensor,
-        *,
-        normalize_scores: bool,
-    ) -> None:
-        """Select from the score tensor bound to this fixed selector."""
-        if scores is not self.input_scores or bool(normalize_scores) != self.normalize_scores:
-            raise ValueError("union scores do not match this selector's bound input")
-        self.select_prepared_requests()
 
 
 class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
@@ -372,7 +351,6 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
             max_requests=max_requests,
         )
         self.num_layers = len(self.dense_layers)
-        self.rows = self.num_layers * self.num_query_heads
         self.selection_rows = selection_rows
 
         score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
@@ -762,7 +740,7 @@ class _FixedScoreStagingBuffers:
         swa_move_offsets: Optional[List[int]] = None,
         draft_move_offsets: Optional[List[int]] = None,
     ) -> bool:
-        """Copy one eager eviction cohort into reusable device buffers.
+        """Copy one eviction cohort into reusable device buffers.
 
         ``token_starts`` carries each request's pinned prompt length; the
         score kernel starts that request's decode window there, so the cohort
@@ -940,7 +918,7 @@ class _FixedScoreStagingBuffers:
 
 @dataclass(frozen=True, kw_only=True, slots=True)
 class _PreparedEviction:
-    """Request metadata validated before eager score, select, and compact."""
+    """Request metadata validated before score, select, and compact."""
 
     request: "LlmRequest"
     request_id: int
@@ -970,7 +948,7 @@ class _PreparedGenerationBatch:
 
 @dataclass(kw_only=True, slots=True)
 class _EvictionBuffers:
-    """Reusable eager score and selection buffers for one runtime shape."""
+    """Reusable fixed score and selection buffers for one runtime shape."""
 
     score_staging: _FixedScoreStagingBuffers
     keep_set_selector: Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector]
@@ -1009,16 +987,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         self.beta = beta
         if self.top_B <= 0 or self.beta <= 0:
             raise ValueError("TriAttention top_B and beta must both be positive")
-        # Which token set each eviction round keeps (all reproduce the upstream
-        # selection: z-normalize scores, pin the prompt tokens, no recency window):
-        #   union              -- union of every KV head's top-B, re-ranked by the
-        #                         per-token max score. Default; matches the official
-        #                         base setting (per-head and per-layer-per-head
-        #                         pruning both off).
-        #   per_head           -- each KV head keeps its own set, shared across
-        #                         layers (mean of per-layer max).
-        #   per_layer_perhead  -- each (layer, KV head) keeps its own set, fully
-        #                         independent per layer.
+        # Which token set each eviction round keeps. The user-facing meaning of
+        # each mode is documented on TriAttentionKvCacheCompressionConfig
+        # (llm_args); implementation notes live above the selection helpers.
         self.eviction_mode = eviction_mode
         if self.eviction_mode not in ("union", "per_head", "per_layer_perhead"):
             raise ValueError(
@@ -1418,12 +1389,11 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         With a decode-only budget, pinned prompt tokens do not consume ``top_B``.
         Selection therefore keeps every token until the cache exceeds
-        ``prompt_len + top_B``.
+        ``prompt_len + top_B``. The constructor guarantees the decode-only
+        budget (``pin_prefill=True``, ``count_prompt_tokens=False``).
         """
-        if self.pin_prefill and not self.count_prompt_tokens:
-            prompt_len = min(int(request.py_prompt_len), seq_len)
-            return prompt_len + self.top_B
-        return self.top_B
+        prompt_len = min(int(request.py_prompt_len), seq_len)
+        return prompt_len + self.top_B
 
     def _local_score_calibration(
         self,
@@ -1642,7 +1612,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         return result
 
     def _runtime_kv_layout(self, num_layers: int) -> _RuntimeKVLayout:
-        """Return stable V2 pool views and layer groups for eager eviction.
+        """Return stable V2 pool views and layer groups for eviction.
 
         KVCacheManagerV2 keeps GPU virtual addresses and layer geometry stable,
         while opt-in pool rebalance can change the page dimension. Cache all
@@ -1819,7 +1789,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             for pool in pools
         )
 
-    def _eager_resources_for(
+    def _fixed_resources_for(
         self,
         layout: _RuntimeKVLayout,
         prepared: Sequence[_PreparedEviction],
@@ -1831,8 +1801,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         eviction bound (compaction keeps the scored decode region near
         ``top_B`` plus one period of growth), so one set of buffers serves
         every round. They are rebuilt only when the pool views change or a
-        round outgrows them (prompt-counting budgets score the prompt, whose
-        length is workload-defined).
+        round outgrows them.
         """
         if not prepared:
             raise ValueError("TriAttention eviction requires at least one request")
@@ -1969,7 +1938,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         score_staging: _FixedScoreStagingBuffers,
         keep_set_selector: Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector],
     ):
-        """Build or reuse the eager C++ compaction launches for one cohort."""
+        """Build or reuse the C++ compaction launches for one cohort."""
         from .compaction import BatchedKVCacheCompaction
 
         if layout.swa_layers and layout.swa_window:
@@ -2143,9 +2112,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                 # Restore the uncompressed confirmed logical position from the
                 # physical prefix and cumulative eviction count.
                 round_start = seq_len + request_state.evicted_tokens
-                if seq_len <= self._minimum_evictable_length(request, seq_len):
+                minimum_evictable_length = self._minimum_evictable_length(request, seq_len)
+                if seq_len <= minimum_evictable_length:
                     continue
-                expected_keep_count = self._minimum_evictable_length(request, seq_len)
+                expected_keep_count = minimum_evictable_length
                 protected_tail = int(protected_tail_lengths.get(rid, 0))
                 if protected_tail < 0 or protected_tail > protected_tail_capacity:
                     raise RuntimeError(
@@ -2166,7 +2136,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not prepared:
             return []
         with nvtx_range_debug("triattention.staging_lookup", color="blue"):
-            resources = self._eager_resources_for(layout, prepared)
+            resources = self._fixed_resources_for(layout, prepared)
             score_staging = resources.score_staging
             keep_set_selector = resources.keep_set_selector
             batched_compaction = self._batched_compaction_for(
@@ -2300,11 +2270,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         (the official file does not store them). transformers' rope-init handles
         plain and scaled RoPE; plain RoPE has attention_factor 1 so freq_scale_sq
         is all ones. Falls back to the analytic inv_freq if rope-init is absent."""
-        if self.model_path is None:
-            raise ValueError(
-                "TriAttention needs `model_path` to derive the RoPE tables "
-                "(omega / freq_scale_sq) when converting the official calibration."
-            )
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True).get_text_config()

@@ -8,15 +8,13 @@ from typing import Optional
 class KvCacheCompressionMode(IntEnum):
     """Algorithm-level traits of a KV-cache compression method.
 
-    Configs map their ``algorithm`` string to a member here; callers read the
-    ``is_*`` predicates instead of comparing strings.
+    Configs map their ``algorithm`` string to a member here; feature gates
+    read the ``is_*`` trait predicates (algorithm dispatch itself matches the
+    config's ``algorithm`` string).
     """
 
     TRIATTENTION = auto()
     NONE = auto()
-
-    def is_triattention(self):
-        return self == KvCacheCompressionMode.TRIATTENTION
 
     def is_eviction_method(self):
         """Whether this method physically evicts cached tokens."""

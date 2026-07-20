@@ -15,7 +15,6 @@
  */
 
 #include "tensorrt_llm/kernels/triAttentionScoreKernels/triAttentionScoreKernels.h"
-#include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -31,22 +30,12 @@ namespace tk = tensorrt_llm::kernels::tri_attention_score;
 namespace
 {
 
-void checkContiguousCudaFloat(torch::Tensor const& tensor, char const* name)
+// One dtype-parameterized operand validator; dtypeName keeps the message
+// spelling (fp32 / int32 / int64) for each expected scalar type.
+void checkContiguousCuda(torch::Tensor const& tensor, at::ScalarType dtype, char const* dtypeName, char const* name)
 {
-    TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.scalar_type() == at::kFloat, name,
-        " must be a contiguous fp32 CUDA tensor");
-}
-
-void checkContiguousCudaInt(torch::Tensor const& tensor, char const* name)
-{
-    TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.scalar_type() == at::kInt, name,
-        " must be a contiguous int32 CUDA tensor");
-}
-
-void checkContiguousCudaLong(torch::Tensor const& tensor, char const* name)
-{
-    TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.scalar_type() == at::kLong, name,
-        " must be a contiguous int64 CUDA tensor");
+    TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous() && tensor.scalar_type() == dtype, name,
+        " must be a contiguous ", dtypeName, " CUDA tensor");
 }
 
 // Validate the optional per-layer dequantization scales for quantized
@@ -65,7 +54,7 @@ float const* checkKvScales(
     {
         return nullptr;
     }
-    checkContiguousCudaFloat(*kv_scales, "kv_scales");
+    checkContiguousCuda(*kv_scales, at::kFloat, "fp32", "kv_scales");
     TORCH_CHECK(kv_scales->numel() >= num_calibrated_layers, op_name,
         ": kv_scales must carry one scale per calibrated layer (absolute layer id indexed)");
     TORCH_CHECK(kv_scales->min().item<float>() > 0.0f, op_name,
@@ -88,13 +77,13 @@ void triAttentionFoldScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im,
     int64_t num_calibrated_layers, int64_t num_query_heads, int64_t num_freqs, int64_t num_offsets, bool use_max,
     std::optional<torch::Tensor> kv_scales)
 {
-    checkContiguousCudaFloat(c_re, "c_re");
-    checkContiguousCudaFloat(c_im, "c_im");
-    checkContiguousCudaFloat(c_mlr, "c_mlr");
-    checkContiguousCudaFloat(q_real, "q_real");
-    checkContiguousCudaFloat(q_imag, "q_imag");
-    checkContiguousCudaFloat(mlr_coef, "mlr_coef");
-    checkContiguousCudaFloat(freq_scale_sq, "freq_scale_sq");
+    checkContiguousCuda(c_re, at::kFloat, "fp32", "c_re");
+    checkContiguousCuda(c_im, at::kFloat, "fp32", "c_im");
+    checkContiguousCuda(c_mlr, at::kFloat, "fp32", "c_mlr");
+    checkContiguousCuda(q_real, at::kFloat, "fp32", "q_real");
+    checkContiguousCuda(q_imag, at::kFloat, "fp32", "q_imag");
+    checkContiguousCuda(mlr_coef, at::kFloat, "fp32", "mlr_coef");
+    checkContiguousCuda(freq_scale_sq, at::kFloat, "fp32", "freq_scale_sq");
     TORCH_CHECK(num_requests > 0 && num_calibrated_layers > 0 && num_query_heads > 0 && num_freqs > 0,
         "tri_attention_fold_score_coefficients: fold extents must be positive");
     TORCH_CHECK(num_offsets >= 1 && num_offsets <= tk::kMaxScoreOffsets,
@@ -118,9 +107,9 @@ void triAttentionFoldScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im,
     {
         TORCH_CHECK(omega.has_value() && offsets.has_value() && round_starts.has_value(),
             "tri_attention_fold_score_coefficients: max aggregation requires omega, offsets, and round_starts");
-        checkContiguousCudaFloat(*omega, "omega");
-        checkContiguousCudaFloat(*offsets, "offsets");
-        checkContiguousCudaInt(*round_starts, "round_starts");
+        checkContiguousCuda(*omega, at::kFloat, "fp32", "omega");
+        checkContiguousCuda(*offsets, at::kFloat, "fp32", "offsets");
+        checkContiguousCuda(*round_starts, at::kInt, "int32", "round_starts");
         TORCH_CHECK(
             omega->numel() >= num_freqs && offsets->numel() >= num_offsets && round_starts->numel() >= num_requests,
             "tri_attention_fold_score_coefficients: max-path inputs are undersized for the folded request count");
@@ -132,8 +121,8 @@ void triAttentionFoldScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im,
     {
         TORCH_CHECK(mean_cos.has_value() && mean_sin.has_value(),
             "tri_attention_fold_score_coefficients: mean aggregation requires mean_cos and mean_sin");
-        checkContiguousCudaFloat(*mean_cos, "mean_cos");
-        checkContiguousCudaFloat(*mean_sin, "mean_sin");
+        checkContiguousCuda(*mean_cos, at::kFloat, "fp32", "mean_cos");
+        checkContiguousCuda(*mean_sin, at::kFloat, "fp32", "mean_sin");
         TORCH_CHECK(mean_cos->numel() >= num_requests * num_freqs && mean_sin->numel() >= num_requests * num_freqs,
             "tri_attention_fold_score_coefficients: mean_cos/mean_sin are undersized (the fold iterates one row per "
             "folded request)");
@@ -167,18 +156,18 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
 {
     TORCH_CHECK(use_max || num_offsets == 1,
         "tri_attention_paged_score: mean aggregation consumes exactly one folded coefficient plane");
-    checkContiguousCudaLong(layer_base_addrs, "layer_base_addrs");
-    checkContiguousCudaInt(block_offsets, "block_offsets");
-    checkContiguousCudaLong(seg_page_offsets, "seg_page_offsets");
-    checkContiguousCudaInt(seg_request_ids, "seg_request_ids");
-    checkContiguousCudaInt(seg_layer_ids, "seg_layer_ids");
-    checkContiguousCudaInt(request_seq_lens, "request_seq_lens");
-    checkContiguousCudaInt(valid_widths, "valid_widths");
-    checkContiguousCudaInt(request_token_starts, "request_token_starts");
-    checkContiguousCudaFloat(c_re, "c_re");
-    checkContiguousCudaFloat(c_im, "c_im");
-    checkContiguousCudaFloat(c_mlr, "c_mlr");
-    checkContiguousCudaFloat(out, "out");
+    checkContiguousCuda(layer_base_addrs, at::kLong, "int64", "layer_base_addrs");
+    checkContiguousCuda(block_offsets, at::kInt, "int32", "block_offsets");
+    checkContiguousCuda(seg_page_offsets, at::kLong, "int64", "seg_page_offsets");
+    checkContiguousCuda(seg_request_ids, at::kInt, "int32", "seg_request_ids");
+    checkContiguousCuda(seg_layer_ids, at::kInt, "int32", "seg_layer_ids");
+    checkContiguousCuda(request_seq_lens, at::kInt, "int32", "request_seq_lens");
+    checkContiguousCuda(valid_widths, at::kInt, "int32", "valid_widths");
+    checkContiguousCuda(request_token_starts, at::kInt, "int32", "request_token_starts");
+    checkContiguousCuda(c_re, at::kFloat, "fp32", "c_re");
+    checkContiguousCuda(c_im, at::kFloat, "fp32", "c_im");
+    checkContiguousCuda(c_mlr, at::kFloat, "fp32", "c_mlr");
+    checkContiguousCuda(out, at::kFloat, "fp32", "out");
     TORCH_CHECK(pool_anchor.is_cuda(), "tri_attention_paged_score: pool anchor must be a CUDA tensor");
 
     TORCH_CHECK(num_segments > 0 && num_segments <= 65535,
@@ -188,8 +177,10 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
         "tri_attention_paged_score: geometry extents must be positive");
     TORCH_CHECK(num_kv_heads > 0 && num_query_heads % num_kv_heads == 0,
         "tri_attention_paged_score: query heads must be divisible by KV heads");
-    // Production configurations use 4 score offsets; 8 is the per-thread
-    // accumulator budget baked into the kernels.
+    // kMaxScoreOffsets is the per-thread accumulator budget baked into the
+    // kernels. It only constrains the "max" path (one coefficient plane per
+    // offset); the "mean" path always folds every offset into one plane, so
+    // the default geometric offset table (which is larger) still passes here.
     TORCH_CHECK(num_offsets >= 1 && num_offsets <= tk::kMaxScoreOffsets,
         "tri_attention_paged_score: num_offsets must be in [1, ", tk::kMaxScoreOffsets, "], got ", num_offsets);
     TORCH_CHECK(seg_page_offsets.numel() >= num_segments && seg_request_ids.numel() >= num_segments

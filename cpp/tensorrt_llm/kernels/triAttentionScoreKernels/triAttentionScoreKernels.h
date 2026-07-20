@@ -51,8 +51,11 @@ enum class PoolElementType : int32_t
 };
 
 // Upper bound on per-offset accumulators held by one score thread on the
-// "max" aggregation path. Production configurations use 4 offsets; 8 leaves
-// headroom without bloating the per-thread register budget.
+// "max" aggregation path. The production "mean" path folds every offset into
+// ONE coefficient plane, so this bound never constrains it; "max" needs one
+// plane per offset, and the default geometric offset table exceeds 8, so a
+// "max" run trips the fold op's TORCH_CHECK unless the offset budget is
+// reduced. 8 keeps headroom without bloating the per-thread register budget.
 inline constexpr int32_t kMaxScoreOffsets = 8;
 
 // Threads per score CTA; one thread scores one cached token.

@@ -16,6 +16,7 @@ instantiation.
 import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _FixedScoreGroup,
@@ -30,80 +31,6 @@ def _require_score_ops() -> None:
     assert hasattr(torch.ops.trtllm, "tri_attention_paged_score"), (
         "TriAttention paged score op is not loaded"
     )
-
-
-# Copied verbatim from test_triattention_pipeline.py (_torch_tri_score_oracle)
-# so this module stays runnable standalone: an independent pure-PyTorch
-# implementation of the paged TriAttention score, covering both aggregations
-# (mean and max), GQA head mapping via head // group_size, and the
-# position-independent MLR term.
-def _torch_tri_score_oracle(
-    layer_pools,
-    page_ids,
-    seq_lens,
-    round_starts,
-    q_real,
-    q_imag,
-    mlr_coef,
-    freq_scale_sq,
-    omega,
-    offsets,
-    layer_indices,
-    aggregation,
-):
-    """Independent Torch implementation of the paged TriAttention score."""
-    scores = []
-    num_q_heads = int(q_real.shape[1])
-    for request, seq_len in enumerate(seq_lens):
-        phase = (round_starts[request] + offsets[:, None]) * omega[None, :]
-        mean_cos = torch.cos(phase).mean(dim=0)
-        mean_sin = torch.sin(phase).mean(dim=0)
-        for layer in layer_indices:
-            pool = layer_pools[layer]
-            request_page_ids = (
-                page_ids[layer][request] if isinstance(page_ids, dict) else page_ids[request]
-            )
-            keys = (
-                pool.index_select(0, request_page_ids)[:, 0]
-                .permute(1, 0, 2, 3)
-                .reshape(pool.shape[2], -1, pool.shape[4])[:, :seq_len]
-                .float()
-            )
-            num_kv_heads = int(keys.shape[0])
-            group_size = num_q_heads // num_kv_heads
-            head_scores = []
-            for head in range(num_q_heads):
-                key = keys[head // group_size]
-                num_freqs = int(key.shape[-1]) // 2
-                key_real = key[:, :num_freqs]
-                key_imag = key[:, num_freqs:]
-                product_real = q_real[layer, head] * key_real + q_imag[layer, head] * key_imag
-                product_imag = q_imag[layer, head] * key_real - q_real[layer, head] * key_imag
-                if aggregation == "mean":
-                    position = (
-                        freq_scale_sq * (product_real * mean_cos - product_imag * mean_sin)
-                    ).sum(dim=-1)
-                else:
-                    position = (
-                        (
-                            freq_scale_sq[None, None, :]
-                            * (
-                                product_real[None] * torch.cos(phase)[:, None, :]
-                                - product_imag[None] * torch.sin(phase)[:, None, :]
-                            )
-                        )
-                        .sum(dim=-1)
-                        .max(dim=0)
-                        .values
-                    )
-                mlr = (
-                    torch.sqrt(key_real.square() + key_imag.square())
-                    * mlr_coef[layer, head]
-                    * freq_scale_sq
-                ).sum(dim=-1)
-                head_scores.append(position + mlr)
-            scores.append(torch.stack(head_scores))
-    return scores
 
 
 def _oracle_reference(

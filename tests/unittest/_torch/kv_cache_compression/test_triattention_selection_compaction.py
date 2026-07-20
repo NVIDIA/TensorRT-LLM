@@ -241,9 +241,12 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         normalize_scores=False,
     )
     selector.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
-    selector.set_prompt_offsets(
+    # Write the shared per-request prompt lengths the way production staging
+    # does: fill the bound buffer, then re-expand the row-major view.
+    selector.prompt_offsets[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
+    selector.refresh_row_prompt_offsets()
     selector.select_prepared_requests()
     actual = selector.keep.cpu()
 
@@ -1008,11 +1011,11 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         )
 
 
-def test_workbench_families_read_the_staged_move_offsets_rows():
+def test_cache_families_read_the_staged_move_offsets_rows():
     """Every cache family must consume the caller-staged offsets row.
 
     A family that silently falls back to its construction-time offsets
-    compacts workbench slots that are not in the staged cohort; on
+    compacts request slots that are not in the staged cohort; on
     sliding-window models the padded slots then produce negative source
     ordinals and an illegal memory access. Binding the staged row by
     reference is part of the constructor contract.
