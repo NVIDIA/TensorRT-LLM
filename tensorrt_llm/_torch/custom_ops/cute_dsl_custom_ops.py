@@ -6546,11 +6546,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         pressure forces both to single-CTA, where select single beats filter
         single); at small batch filter's cluster is better, so keep filter.
         """
+        # Large batch (num_rows > num_sms) forces the filter path to single-CTA
+        # (auto_cluster_size -> cs=1), which beats the radix-SELECT cluster runner
+        # here; only prefer select while the batch still fits within one SM wave.
+        num_sms = _get_num_sms()
         if dtype == torch.bfloat16:
-            return num_tokens <= 16384 or (num_tokens == 32768
-                                           and num_rows >= 74)
+            return num_rows <= num_sms and (num_tokens <= 16384 or
+                                            (num_tokens == 32768
+                                             and num_rows >= 74))
         if dtype == torch.float16:
-            return num_tokens <= 16384
+            return num_rows <= num_sms and num_tokens <= 16384
         return False
 
     @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
