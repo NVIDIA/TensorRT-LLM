@@ -1,4 +1,4 @@
-# Torch Compile & Piecewise CUDA Graph
+# Torch Compile & Prefill CUDA Graph
 
 In this guide, we show how to enable torch.compile and Piecewise CUDA Graph in TensorRT LLM. TensorRT LLM uses torch.compile for lightweight vertical fusion and Piecewise CUDA Graph.
 
@@ -41,11 +41,28 @@ To enable torch.compile and Piecewise CUDA Graph, add the following configuratio
 
 ```yaml
 ... # Other extra config
+prefill_cuda_graph_backend: piecewise
+prefill_capture_num_tokens: '${capture_num_tokens}' # e.g. [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]
 torch_compile_config:
-  capture_num_tokens: '${capture_num_tokens}' # List of num tokens to capture. e.g., [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, ..., 3072]
   enable_userbuffers: false
-  enable_piecewise_cuda_graph: true
 ```
+
+`TorchCompileConfig.enable_piecewise_cuda_graph` and
+`TorchCompileConfig.capture_num_tokens` are deprecated aliases for these
+prefill-specific options.
+
+The experimental breakable implementation can capture the model body without
+torch.compile:
+
+```yaml
+prefill_cuda_graph_backend: breakable
+prefill_capture_num_tokens: [128, 256, 512]
+```
+
+The first version of the breakable backend supports BF16 Qwen3.5 on one GPU for
+context-only, tensor/pipeline parallelism and mixed context/decode batches with KV cache. Speculative
+decoding, LoRA, multimodal inputs, and context
+logits fall back to eager execution or are rejected during initialization.
 
 ## Tips for Piecewise CUDA Graph
 
@@ -59,9 +76,10 @@ cuda_graph_config:
   max_batch_size: 1024 # Specify max capture batch size for generation only cuda graph. By default, TensorRT LLM will generate a capture list based on it.
 
 torch_compile_config:
-  capture_num_tokens: '${capture_num_tokens}' # Specify capture_num_tokens for piecewise cuda graph
   enable_userbuffers: false
-  enable_piecewise_cuda_graph: true
+
+prefill_cuda_graph_backend: piecewise
+prefill_capture_num_tokens: '${capture_num_tokens}'
 ```
 
 ### Piecewise CUDA Graph Padding

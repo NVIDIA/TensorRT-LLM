@@ -1140,6 +1140,24 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prefill_capture_num_tokens"
+    },
+    {
+      "allowed_values": [
+        "disabled",
+        "piecewise",
+        "breakable"
+      ],
+      "annotation": "<enum 'PrefillCudaGraphBackend'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "prefill_cuda_graph_backend"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",

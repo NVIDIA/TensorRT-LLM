@@ -45,7 +45,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
-                                          PeftCacheConfig, PybindMirror,
+                                          PeftCacheConfig,
+                                          PrefillCudaGraphBackend, PybindMirror,
                                           RayPlacementConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
@@ -1574,6 +1575,86 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
     _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
         range(256, 3073, 256))
+
+    def test_prefill_capture_num_tokens_uses_plain_int_list(self):
+        annotation = TorchLlmArgs.model_fields[
+            "prefill_capture_num_tokens"].annotation
+        list_annotation = get_args(annotation)[0]
+        assert get_origin(list_annotation) is list
+        assert get_args(list_annotation) == (int, )
+
+    def test_breakable_uses_default_capture_buckets(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE)
+        assert args.prefill_capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
+        assert args.torch_compile_config is None
+
+    def test_piecewise_new_config_enables_default_torch_compile(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+            prefill_capture_num_tokens=[512, 128, 512])
+        assert args.torch_compile_config == TorchCompileConfig()
+        assert args.prefill_capture_num_tokens == [512, 128, 512]
+
+    def test_legacy_piecewise_config_maps_to_new_fields(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            torch_compile_config=TorchCompileConfig(
+                                enable_piecewise_cuda_graph=True,
+                                capture_num_tokens=[128, 256]))
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        assert args.prefill_capture_num_tokens == [256, 128]
+
+    def test_explicit_legacy_and_new_config_conflicts(self):
+        with pytest.raises(ValueError, match="conflicts"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                torch_compile_config=TorchCompileConfig(
+                    enable_piecewise_cuda_graph=True))
+
+        with pytest.raises(ValueError, match="conflicts"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                prefill_capture_num_tokens=[128],
+                torch_compile_config=TorchCompileConfig(
+                    enable_piecewise_cuda_graph=True, capture_num_tokens=[256]))
+
+    def test_breakable_rejects_explicit_torch_compile(self):
+        with pytest.raises(ValueError, match="does not support"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                torch_compile_config=TorchCompileConfig())
+
+    def test_prefill_filter_sorts_dedupes_and_drops_nonpositive(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_prefill_capture_num_tokens
+
+        kept, unrecordable = _filter_prefill_capture_num_tokens(
+            [256, 0, -1, 128, 256],
+            max_num_tokens=512,
+            max_batch_size=1,
+            max_seq_len=513,
+        )
+        assert kept == [128, 256, 512]
+        assert unrecordable == []
+
+    @pytest.mark.parametrize("backend", [
+        PrefillCudaGraphBackend.PIECEWISE,
+        PrefillCudaGraphBackend.BREAKABLE,
+    ])
+    def test_piecewise_and_breakable_use_identical_padding(self, backend):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.enable_attention_dp = False
+        engine.prefill_cuda_graph_backend = backend
+        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
+        assert engine._get_padding_params(129, 1, None) == (256, True, None)
 
     def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
             self):

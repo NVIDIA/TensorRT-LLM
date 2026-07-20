@@ -32,6 +32,7 @@ from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
+                                          PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
@@ -72,6 +73,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
+from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
@@ -117,14 +119,14 @@ class ModelEngine(ABC):
         return
 
 
-def _filter_piecewise_capture_num_tokens(
+def _filter_prefill_capture_num_tokens(
     candidate_num_tokens: list[int],
     max_num_tokens: int,
     max_batch_size: int,
     max_seq_len: int,
     num_extra_decoding_steps: int = 0,
 ) -> Tuple[list[int], list[int]]:
-    """Cap piecewise CUDA graph capture candidates at the engine's reachable
+    """Cap prefill CUDA graph capture candidates at the engine's reachable
     `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
     clamping user-requested sizes above it down to the ceiling.
 
@@ -147,10 +149,10 @@ def _filter_piecewise_capture_num_tokens(
     """
     max_capturable_num_tokens = max(
         0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
-    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
-    if piecewise_capacity_limit > 0:
+    prefill_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
+    if prefill_capacity_limit > 0:
         kept = sorted({
-            min(i, piecewise_capacity_limit)
+            min(i, prefill_capacity_limit)
             for i in candidate_num_tokens if 0 < i <= max_num_tokens
         })
     else:
@@ -495,15 +497,14 @@ class PyTorchModelEngine(ModelEngine):
                 f"512], max_seq_len=128, enable_padding=True).")
 
         self.torch_compile_config = self.llm_args.torch_compile_config
+        self.prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
         torch_compile_enabled = bool(self.torch_compile_config is not None)
         torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
         torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
-        torch_compile_piecewise_cuda_graph = self.torch_compile_config.enable_piecewise_cuda_graph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'enable_piecewise_cuda_graph'].default
-        torch_compile_piecewise_cuda_graph_num_tokens = self.torch_compile_config.capture_num_tokens if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'capture_num_tokens'].default
+        torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
+                                              PrefillCudaGraphBackend.PIECEWISE)
         torch_compile_enable_userbuffers = self.torch_compile_config.enable_userbuffers if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_userbuffers'].default
         torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
@@ -512,14 +513,14 @@ class PyTorchModelEngine(ModelEngine):
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
 
-        piecewise_cuda_graph_num_tokens = (
-            torch_compile_piecewise_cuda_graph_num_tokens
-            or cuda_graph_batch_sizes or [])
+        prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
+        if prefill_cuda_graph_num_tokens is None:
+            prefill_cuda_graph_num_tokens = cuda_graph_batch_sizes or []
 
         num_extra_decoding_steps = self._get_num_extra_decoding_steps()
-        self._piecewise_cuda_graph_num_tokens, unrecordable = (
-            _filter_piecewise_capture_num_tokens(
-                piecewise_cuda_graph_num_tokens,
+        self._prefill_cuda_graph_num_tokens, unrecordable = (
+            _filter_prefill_capture_num_tokens(
+                prefill_cuda_graph_num_tokens,
                 max_num_tokens=self.max_num_tokens,
                 max_batch_size=self.batch_size,
                 max_seq_len=self.max_seq_len,
@@ -527,7 +528,7 @@ class PyTorchModelEngine(ModelEngine):
             ))
         if unrecordable:
             logger.warning(
-                f"Skipping piecewise CUDA graph capture for num_tokens="
+                f"Skipping prefill CUDA graph capture for num_tokens="
                 f"{unrecordable}: exceeds reachable ceiling "
                 f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
                 f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
@@ -552,7 +553,7 @@ class PyTorchModelEngine(ModelEngine):
                     enable_userbuffers=use_ub,
                     enable_piecewise_cuda_graph=self.
                     _torch_compile_piecewise_cuda_graph,
-                    capture_num_tokens=self._piecewise_cuda_graph_num_tokens,
+                    capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
                     mapping=self.mapping)
                 apply_llm_torch_compile = getattr(self.model,
@@ -770,6 +771,21 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
+        self.breakable_cuda_graph_runner = None
+        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
+            if self.spec_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support speculative decoding"
+                )
+            decoder_model = (self.model if isinstance(
+                self.model, DecoderModelForCausalLM) else getattr(
+                    self.model, "llm", None))
+            if not isinstance(decoder_model, DecoderModelForCausalLM):
+                raise ValueError(
+                    "breakable prefill CUDA graph requires a decoder model body"
+                )
+            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
+                decoder_model.model, decoder_model.logits_processor)
 
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
@@ -1757,14 +1773,15 @@ class PyTorchModelEngine(ModelEngine):
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
         if not (self.cuda_graph_runner.enabled
-                or self._torch_compile_piecewise_cuda_graph):
+                or self.prefill_cuda_graph_backend
+                != PrefillCudaGraphBackend.DISABLED):
             return
 
         self._capture_generation_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
         if not self.cuda_graph_runner.is_warmup_only:
-            self._capture_piecewise_cuda_graphs(resource_manager)
+            self._capture_prefill_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self,
                                         resource_manager: ResourceManager):
@@ -1953,18 +1970,24 @@ class PyTorchModelEngine(ModelEngine):
         if self.spec_metadata is not None:
             self.spec_metadata.is_all_greedy_sample = True
 
-    def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
-        """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
-        if not (self._torch_compile_piecewise_cuda_graph
-                and self._torch_compile_enabled):
+    def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager):
+        """Capture configured CUDA graphs for context/prefill steps."""
+        if (self.prefill_cuda_graph_backend
+                == PrefillCudaGraphBackend.DISABLED
+                or (self.prefill_cuda_graph_backend
+                    == PrefillCudaGraphBackend.PIECEWISE
+                    and not self._torch_compile_enabled)):
             return
 
-        logger.info("Running piecewise CUDA graph warmup...")
-        piecewise_cuda_graph_num_tokens = sorted(
-            self._piecewise_cuda_graph_num_tokens, reverse=True)
+        logger.info("Running prefill CUDA graph warmup...")
+        prefill_cuda_graph_num_tokens = sorted(
+            self._prefill_cuda_graph_num_tokens, reverse=True)
 
-        with capture_piecewise_cuda_graph(True), self.no_cuda_graph():
-            for num_tokens in piecewise_cuda_graph_num_tokens:
+        capture_context = (capture_piecewise_cuda_graph(True)
+                           if self._torch_compile_piecewise_cuda_graph else
+                           contextlib.nullcontext())
+        with capture_context, self.no_cuda_graph():
+            for num_tokens in prefill_cuda_graph_num_tokens:
                 warmup_request = self._create_warmup_request(
                     resource_manager, num_tokens, 0)
                 with self._release_batch_context(warmup_request,
@@ -1973,26 +1996,29 @@ class PyTorchModelEngine(ModelEngine):
                         continue
 
                     logger.info(
-                        f"Run piecewise CUDA graph warmup for num tokens={num_tokens}"
+                        f"Run prefill CUDA graph capture for num tokens={num_tokens}"
                     )
-                    # Run a few times to ensure capture
-                    for _ in range(3):
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                    if self.breakable_cuda_graph_runner is not None:
+                        self.breakable_cuda_graph_runner.capture(
+                            num_tokens, lambda: self.forward(
+                                batch,
+                                new_tensors_device=None,
+                                resource_manager=resource_manager))
+                    else:
+                        # Run a few times to ensure torch.compile capture.
+                        for _ in range(4):
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
 
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # When using piecewise cuda graph, the logits may suffer severe memory fragmentation problem.
-        # As the number of requests grows, the blocks allocated by torch cannot be reused.
-        # So after piecewise cuda graph capture, a request with most requests is triggered to make
-        # sure that large enough blocks are allocated and can be correctly reused.
-        for num_tokens in piecewise_cuda_graph_num_tokens:
+        # The logits allocations grow with the number of requests and are not
+        # part of the captured model body. Warm up the largest request count so
+        # those allocations can be reused during stable inference.
+        for num_tokens in prefill_cuda_graph_num_tokens:
             warmup_request = self._create_warmup_request(resource_manager,
                                                          num_tokens,
                                                          0,
@@ -2002,11 +2028,20 @@ class PyTorchModelEngine(ModelEngine):
                 if batch is None:
                     continue
                 logger.info(
-                    f"Run piecewise CUDA graph warmup for num tokens={num_tokens} with most requests"
+                    f"Run prefill CUDA graph warmup for num tokens={num_tokens} with most requests"
                 )
-                self.forward(batch,
-                             new_tensors_device=None,
-                             resource_manager=resource_manager)
+                if self.breakable_cuda_graph_runner is not None:
+                    with self.no_cuda_graph():
+                        self.breakable_cuda_graph_runner.warmup(
+                            lambda: self.forward(
+                                batch,
+                                new_tensors_device=None,
+                                resource_manager=resource_manager),
+                            steps=1)
+                else:
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
     ### Helper methods promoted from the original warmup method ###
@@ -2737,6 +2772,9 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
             self.cuda_graph_runner.clear()
+        if (hasattr(self, 'breakable_cuda_graph_runner')
+                and self.breakable_cuda_graph_runner is not None):
+            self.breakable_cuda_graph_runner.clear()
         if hasattr(self, 'encoder_cuda_graph_runner'
                    ) and self.encoder_cuda_graph_runner is not None:
             self.encoder_cuda_graph_runner.clear()
@@ -2920,45 +2958,41 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
 
     def _get_padding_params(
-        self, total_num_tokens: int, num_ctx_requests: int,
-        attn_all_rank_num_tokens: Optional[List[int]]
+        self,
+        total_num_tokens: int,
+        num_ctx_requests: int,
+        attn_all_rank_num_tokens: Optional[List[int]],
     ) -> Tuple[int, bool, Optional[List[int]]]:
         """
         Get the padding parameters for tensor padding.
         Return:
             padded_num_tokens: the padded number of tokens
-            can_run_piecewise_cuda_graph: whether the piecewise cuda graph can be run
+            can_run_prefill_cuda_graph: whether a prefill CUDA graph can run
             attn_all_rank_num_tokens: the number of tokens for each rank
         """
-        padded_num_tokens = total_num_tokens
-
         all_rank_ctx_requests = self._get_all_rank_ctx_requests(
             num_ctx_requests)
 
-        def get_padded_piecewise_tokens(tokens):
-            captured_num_tokens = self._torch_compile_backend.capture_num_tokens
-            return captured_num_tokens[bisect.bisect_left(
-                captured_num_tokens, tokens)]
+        def get_padded_prefill_tokens(tokens: int) -> int:
+            return self._prefill_cuda_graph_num_tokens[bisect.bisect_left(
+                self._prefill_cuda_graph_num_tokens, tokens)]
 
-        if (self._torch_compile_backend is not None
-                and self._torch_compile_piecewise_cuda_graph
-                and self._torch_compile_backend.capture_num_tokens):
-            max_captured_num_tokens = self._torch_compile_backend.capture_num_tokens[
-                -1]
-            # Torch piecewise cuda graph is enabled.
+        if (self.prefill_cuda_graph_backend
+                != PrefillCudaGraphBackend.DISABLED
+                and self._prefill_cuda_graph_num_tokens):
+            max_captured_num_tokens = self._prefill_cuda_graph_num_tokens[-1]
             if attn_all_rank_num_tokens is not None:
-                # Any rank has context requests, we enable piecewise cuda graph.
                 has_ctx_requests = num_ctx_requests != 0 or (
                     all_rank_ctx_requests is not None
                     and any(ctx_requests != 0
                             for ctx_requests in all_rank_ctx_requests))
-                can_run_piecewise_cuda_graph = (has_ctx_requests and
-                                                max(attn_all_rank_num_tokens)
-                                                <= max_captured_num_tokens)
-                all_ranks_can_run_piecewise_cuda_graph = list(
-                    self.dist.tp_allgather(can_run_piecewise_cuda_graph))
-                if all(all_ranks_can_run_piecewise_cuda_graph):
-                    padded_num_tokens = get_padded_piecewise_tokens(
+                can_run_prefill_cuda_graph = (has_ctx_requests
+                                              and max(attn_all_rank_num_tokens)
+                                              <= max_captured_num_tokens)
+                all_ranks_can_run_prefill_cuda_graph = list(
+                    self.dist.tp_allgather(can_run_prefill_cuda_graph))
+                if all(all_ranks_can_run_prefill_cuda_graph):
+                    padded_num_tokens = get_padded_prefill_tokens(
                         max(attn_all_rank_num_tokens))
                     logger.debug(
                         f"Pad tensor with {total_num_tokens} tokens to {padded_num_tokens} tokens"
@@ -2968,19 +3002,18 @@ class PyTorchModelEngine(ModelEngine):
                     ] * len(attn_all_rank_num_tokens)
                 else:
                     logger.debug(
-                        "Not all ranks can run piecewise cuda graph, disable piecewise cuda graph"
+                        "Not all ranks can run prefill CUDA graph, disable prefill CUDA graph"
                     )
                     return total_num_tokens, False, attn_all_rank_num_tokens
             elif num_ctx_requests != 0 and total_num_tokens <= max_captured_num_tokens:
-                padded_num_tokens = get_padded_piecewise_tokens(
-                    total_num_tokens)
+                padded_num_tokens = get_padded_prefill_tokens(total_num_tokens)
                 logger.debug(
                     f"Pad tensor with {total_num_tokens} tokens to {padded_num_tokens} tokens"
                 )
                 return padded_num_tokens, True, None
             else:
                 logger.debug(
-                    f"Piecewise CUDA graph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
+                    f"Prefill CUDA graph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
                 )
                 return total_num_tokens, False, None
 
@@ -4791,10 +4824,22 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
 
+        has_multimodal_input = any(
+            param.multimodal_data and any(
+                key != 'mrope_config' for key in param.multimodal_data)
+            for param in multimodal_params_list)
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
-        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
-            total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
-        set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
+        if (self.prefill_cuda_graph_backend
+                == PrefillCudaGraphBackend.BREAKABLE
+                and (bool(lora_params) or has_multimodal_input)):
+            padded_num_tokens = total_num_tokens
+            can_run_prefill_cuda_graph = False
+        else:
+            padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+                total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
+        set_per_request_piecewise_cuda_graph_flag(
+            can_run_prefill_cuda_graph and self.prefill_cuda_graph_backend
+            == PrefillCudaGraphBackend.PIECEWISE)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != total_num_tokens else None
 
         virtual_num_tokens = total_num_tokens
@@ -5055,9 +5100,11 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
-        padded_num_tokens, can_run_piecewise_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
+        padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
             num_tokens, attn_metadata.num_contexts, attn_all_rank_num_tokens)
-        set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
+        set_per_request_piecewise_cuda_graph_flag(
+            can_run_prefill_cuda_graph and self.prefill_cuda_graph_backend
+            == PrefillCudaGraphBackend.PIECEWISE)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
         if self.enable_attention_dp:
@@ -6075,7 +6122,6 @@ class PyTorchModelEngine(ModelEngine):
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
-
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata,
@@ -6151,14 +6197,42 @@ class PyTorchModelEngine(ModelEngine):
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
 
+            breakable_runner = self.breakable_cuda_graph_runner
+            has_multimodal_input = any(
+                param.multimodal_data and any(
+                    key != 'mrope_config' for key in param.multimodal_data)
+                for param in inputs.get('multimodal_params', ()))
+            breakable_request_eligible = (
+                breakable_runner is not None
+                and scheduled_requests.num_context_requests > 0
+                and spec_metadata is None and not gather_context_logits
+                and not inputs.get('lora_params')
+                and not has_multimodal_input)
+
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
-                if not can_run_graph:
-                    # Fallback to eager execution if graph was not used
+
+                def forward_step():
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = self._forward_step(
+                        return self._forward_step(
                             inputs,
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
+                if not can_run_graph:
+                    if (breakable_runner is not None
+                            and breakable_runner.is_capturing):
+                        return breakable_runner.capture_model_body(
+                            forward_step)
+
+                    num_tokens = inputs['input_ids'].shape[0]
+                    can_run_breakable_graph = (
+                        breakable_request_eligible
+                        and breakable_runner.has_graph(num_tokens))
+                    if can_run_breakable_graph and not breakable_runner.is_warming_up:
+                        outputs = breakable_runner.execute(
+                            num_tokens, forward_step)
+                    else:
+                        # PCG or real eager
+                        outputs = forward_step()
                 else:
                     needs_capture = self.cuda_graph_runner.needs_capture(key)
                     if needs_capture:
