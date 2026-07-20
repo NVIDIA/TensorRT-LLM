@@ -1021,19 +1021,27 @@ token을 함께 사용한다. Override가 없는 모델에는 base mixin의 lega
 
 다음은 첫 runtime-enforcement change의 landing에 필수는 아니다.
 
-1. Eager mode에 어떤 resident-output byte limit과 eviction policy를 써야 하는가? GPU-to-host offload는
-   현재 작업에서 계획하지 않는다.
+1. ~~Eager mode에 어떤 resident-output byte limit과 eviction policy를 써야 하는가?~~ 단일 예산
+   저장소로 해결: `encoder_cache_max_bytes`가 두 정책 모두의 residency를 bound하고 zero-ref LRU로
+   evict한다. GPU-to-host offload는 여전히 계획 없음.
 2. MM prefetch와 overlap scheduler가 item ownership 및 execution ordering을 어떻게 조정해야 하는가?
-3. 어떤 production benchmark 기준을 만족할 때 해당 workload에 eager 정책을 활성화해야 하는가?
-4. Production trace 이후에도 strict FCFS waiting admission이 좋은가, 아니면 bounded bypass/best-fit을 넣어야
+   부분 계획됨: 아래 저장소 단일화가 prefetch를 같은 byte 예산 아래로 넣는다.
+3. **저장소/manifest 단일화 계획 ([TRTLLM-14477](https://jirasw.nvidia.com/browse/TRTLLM-14477); 코드에 TODO 마커):** (a) full-request 소비자(prefetch,
+   `mm_encoder_only`/disagg, 비-item 모델)를 `MultimodalEncoderCacheManager`로 이전 —
+   `_get_multimodal_encoder_cache()`의 TODO 참조; (b) miss만 item-slicing 기계로 인코딩해 partial hit
+   조립 — 전 소비자에 대해 TRTLLM-13996 종결; (c) legacy clone 캐시 제거; (d) 프롬프트 순서 manifest
+   단일화(`item_refs` vs `MultimodalParams.mm_item_order`) — `MultimodalEncoderItemMetadata`의 TODO
+   참조.
+4. 어떤 production benchmark 기준을 만족할 때 해당 workload에 eager 정책을 활성화해야 하는가?
+5. Production trace 이후에도 strict FCFS waiting admission이 좋은가, 아니면 bounded bypass/best-fit을 넣어야
    하는가?
-5. 어느 model family가 semantically equivalent item-internal chunking을 증명할 수 있는가?
-6. Cross-request cache가 DP/disaggregated deployment에서 ownership을 어떻게 조정해야 하는가?
-7. Encoder/tower LoRA 지원 시 adapter residency가 batching/cache key와 어떻게 상호작용해야 하는가?
-8. MM encoder execution을 PP stage 0으로 옮기고 embedding을 broadcast해야 하는가, 아니면 모든 stage의
+6. 어느 model family가 semantically equivalent item-internal chunking을 증명할 수 있는가?
+7. Cross-request cache가 DP/disaggregated deployment에서 ownership을 어떻게 조정해야 하는가?
+8. Encoder/tower LoRA 지원 시 adapter residency가 batching/cache key와 어떻게 상호작용해야 하는가?
+9. MM encoder execution을 PP stage 0으로 옮기고 embedding을 broadcast해야 하는가, 아니면 모든 stage의
    duplicated execution을 supported ownership model로 유지해야 하는가?
-9. Request-lifecycle counter가 completion, cancellation, error path의 fragile bookkeeping 없이 text-only
-   iteration을 constant-time으로 만들 수 있는가?
+10. Request-lifecycle counter가 completion, cancellation, error path의 fragile bookkeeping 없이 text-only
+    iteration을 constant-time으로 만들 수 있는가?
 
 ## Reference implementation map
 
