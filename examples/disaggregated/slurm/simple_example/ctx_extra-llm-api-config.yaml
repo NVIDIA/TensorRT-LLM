@@ -1,5 +1,12 @@
-# The overlap scheduler for context servers is currently disabled, as it is
-# not yet supported in disaggregated context server architectures.
+# The overlap scheduler IS supported on the disaggregated context server
+# (the executor's `_executor_loop_overlap` already defers the KV-cache send
+# until the sampled result is resolved). It is disabled by default because it
+# is not beneficial when the context server is not host-bound: the overlap loop
+# defers each request's first-token + KV handoff to the generation server by one
+# iteration, which lands on the TTFT critical path, while hiding little host CPU
+# (the dominant context-side costs -- schedule / fetch bookkeeping and KV-transfer
+# stalls -- are not the kind the overlap scheduler can hide). Set to False to
+# enable it for host-bound context regimes.
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: UCX
