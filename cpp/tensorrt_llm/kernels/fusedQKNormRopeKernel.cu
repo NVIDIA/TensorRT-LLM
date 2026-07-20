@@ -157,11 +157,24 @@ __global__ void fusedQKNormRopeKernel(
         // Compute RMS normalization factor
         float rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
 
+        // Coalesced load: each thread pulls its numElemsPerThread contiguous bf16
+        // weights with a single vec_T load (uint2 for head_dim=128) instead of
+        // numElemsPerThread scalar strided 2-byte loads. Across the warp this is
+        // one aligned 256-byte request per warp — matches the qkv-load pattern.
+        __nv_bfloat16 const* w_base = isQ ? q_weight : k_weight;
+        vec_T w_vec = *reinterpret_cast<vec_T const*>(&w_base[laneId * numElemsPerThread]);
+        float weights_f[numElemsPerThread];
+        for (int i = 0; i < vecSize; i++)
+        {
+            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&w_vec) + i));
+            weights_f[2 * i] = vals.x;
+            weights_f[2 * i + 1] = vals.y;
+        }
+
         // Normalize elements
         for (int i = 0; i < numElemsPerThread; i++)
         {
-            int dim = laneId * numElemsPerThread + i;
-            float weight = isQ ? __bfloat162float(q_weight[dim]) : __bfloat162float(k_weight[dim]);
+            float weight = weights_f[i];
             // Gemma RMSNorm scales by (1 + weight); standard RMSNorm scales by weight.
             elements[i] *= rms_rcp * (use_gemma ? (1.0f + weight) : weight);
         }
@@ -180,6 +193,11 @@ __global__ void fusedQKNormRopeKernel(
     // one per (thread, iter). Uses the fast __log2f intrinsic (a few ULPs of
     // error, absorbed by bf16 downcast at store time).
     float const neg2_log2base_over_rd = -2.0f * __log2f(base) / static_cast<float>(rotary_dim);
+    // rotary_dim is even by contract; when it's also a power of 2 (always in
+    // practice — 64/128/256) '% rotary_dim' becomes '& (rotary_dim - 1)'.
+    // The bool is warp-uniform → predicated select, no branch divergence.
+    int const rd_mask = rotary_dim - 1;
+    bool const rd_is_pow2 = ((rotary_dim & rd_mask) == 0);
     // TODO: cos sin calculation could be halved.
     if constexpr (interleave)
     {
@@ -238,7 +256,7 @@ __global__ void fusedQKNormRopeKernel(
             }
 
             int dim_idx = laneId * numElemsPerThread + i;
-            dim_idx = (dim_idx * 2) % rotary_dim;
+            dim_idx = rd_is_pow2 ? ((dim_idx * 2) & rd_mask) : ((dim_idx * 2) % rotary_dim);
             int half_dim = dim_idx / 2;
             float freq = exp2f(static_cast<float>(half_dim) * neg2_log2base_over_rd);
 
