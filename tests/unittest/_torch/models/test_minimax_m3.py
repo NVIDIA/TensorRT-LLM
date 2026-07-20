@@ -965,6 +965,83 @@ def test_minimax_m3_routing_method_default_scale_is_identity():
 
 
 @pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="fused MiniMax-M3 routing requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 64, 8192])
+def test_minimax_m3_fused_routing_matches_reference(num_tokens, monkeypatch):
+    num_experts = 128
+    top_k = 4
+    routed_scaling_factor = 2.0
+    logits = torch.full((num_tokens, num_experts), -4.0, device="cuda", dtype=torch.float32)
+    token_offsets = torch.arange(num_tokens, device="cuda", dtype=torch.int64).unsqueeze(1)
+    expert_offsets = torch.arange(top_k, device="cuda", dtype=torch.int64).unsqueeze(0)
+    selected_experts = (token_offsets + expert_offsets) % num_experts
+    selected_logits = torch.tensor([4.0, 3.0, 2.0, 1.0], device="cuda").expand(num_tokens, -1)
+    logits.scatter_(1, selected_experts, selected_logits)
+    bias = torch.linspace(-0.01, 0.01, num_experts, device="cuda", dtype=torch.float32)
+
+    fused = MiniMaxM3MoeRoutingMethod(
+        top_k=top_k,
+        num_experts=num_experts,
+        callable_e_score_correction_bias=lambda: bias,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+    scores = torch.sigmoid(logits)
+    _, reference_idx = torch.topk(scores + bias, k=top_k, dim=-1, sorted=False)
+    reference_weights = scores.gather(1, reference_idx)
+    reference_idx = reference_idx.to(torch.int32)
+    reference_weights = (
+        reference_weights / (reference_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    ) * routed_scaling_factor
+
+    monkeypatch.setattr(
+        MiniMaxM2MoeRoutingMethod,
+        "apply",
+        lambda *_args, **_kwargs: pytest.fail("production FP32 routing used the PyTorch fallback"),
+    )
+    fused_idx, fused_weights = fused.apply(logits)
+
+    reference_order = reference_idx.argsort(dim=-1)
+    fused_order = fused_idx.argsort(dim=-1)
+    reference_idx = reference_idx.gather(1, reference_order)
+    reference_weights = reference_weights.gather(1, reference_order)
+    fused_idx = fused_idx.gather(1, fused_order)
+    fused_weights = fused_weights.gather(1, fused_order)
+
+    torch.testing.assert_close(fused_idx, reference_idx, rtol=0, atol=0)
+    torch.testing.assert_close(fused_weights, reference_weights, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="fused MiniMax-M3 routing requires CUDA")
+def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs():
+    num_tokens = 64
+    num_experts = 128
+    torch.manual_seed(1)
+    logits = torch.empty(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+    bias = torch.randn(num_experts, device="cuda", dtype=torch.float32) * 0.1
+    routing = MiniMaxM3MoeRoutingMethod(
+        top_k=4,
+        num_experts=num_experts,
+        callable_e_score_correction_bias=lambda: bias,
+        routed_scaling_factor=2.0,
+    )
+
+    logits.normal_()
+    routing.apply(logits)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_idx, graph_weights = routing.apply(logits)
+
+    logits.normal_(mean=1.0, std=2.0)
+    reference_idx, reference_weights = routing.apply(logits.clone())
+    graph.replay()
+
+    torch.testing.assert_close(graph_idx, reference_idx, rtol=0, atol=0)
+    torch.testing.assert_close(graph_weights, reference_weights, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
 def test_text_norm_weights_real_loader_smoke():
     """real ``_load_weights_impl`` populates norm parameters.
