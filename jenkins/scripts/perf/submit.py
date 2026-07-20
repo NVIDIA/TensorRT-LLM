@@ -21,8 +21,20 @@ import argparse
 import math
 import os
 import re
+import sys
 
 import yaml
+
+
+def _import_precheck_config(llm_src):
+    """Import the pure-stdlib precheck config module from the repo tree
+    (single owner of the gate's enable policy and timeout formulas)."""
+    path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import precheck_config
+
+    return precheck_config
 
 AGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
 DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
@@ -611,43 +623,21 @@ def main():
         # servers with the same instance topology, and reuses the exact
         # $ucx_tls_cmd / $CTX_WORKER_ENV_VARS / $GEN_WORKER_ENV_VARS strings
         # of the worker steps so the UCX environment matches by construction.
-        # On by default. Disabled per-yaml (cache_transceiver_precheck.
-        # enabled: false); TRTLLM_DISAGG_CT_PRECHECK=0/1 at generation time
-        # overrides the yaml either way (global kill switch).
-        precheck_cfg = config.get("cache_transceiver_precheck", {}) or {}
-        precheck_env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
-        if precheck_env is not None:
-            precheck_enabled = precheck_env == "1"
-        else:
-            precheck_enabled = bool(precheck_cfg.get("enabled", True))
-        config_yaml_node = f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}"
-        precheck_cmd = (
-            "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
-            f"run_precheck.py --config {config_yaml_node} "
-            "--work-dir $testOutputDir/cache_transceiver_precheck "
-            f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
-        )
-        # The external step timeout must cover the driver's first-rep NIXL
-        # wire-up allowance (precheck_config: min(1800, 150 * max world)).
-        max_world = max(
-            hardware_config["gpus_per_ctx_server"], hardware_config["gpus_per_gen_server"]
-        )
-        default_step_timeout = 900 + min(1800, 150 * max_world)
+        # Enable/kill-switch policy and timeouts live in precheck_config
+        # (single owner, shared with the local flow).
+        pcfg = _import_precheck_config(args.llm_src)
         script_prefix_lines.extend(
-            [
-                f"export ctPrecheckEnabled={1 if precheck_enabled else 0}",
-                f"export ctPrecheckTimeout="
-                f"{int(precheck_cfg.get('step_timeout_s', default_step_timeout))}",
-                # Suite name for the synthetic junit xml the launch script
-                # writes when the precheck fails.
-                f'export stageName="{args.stage_name}"',
-                "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
-                "disaggregated/slurm_precheck_run.sh",
-                f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS'
-                f' {precheck_cmd} --role ctx"',
-                f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS'
-                f' {precheck_cmd} --role gen"',
-            ]
+            pcfg.precheck_prefix_lines(
+                config,
+                benchmark_mode,
+                config_path_expr=f"$llmSrcNode/{os.path.relpath(config_yaml, args.llm_src)}",
+                ucx_tls_cmd=ucx_tls_cmd,
+                max_world=max(
+                    hardware_config["gpus_per_ctx_server"],
+                    hardware_config["gpus_per_gen_server"],
+                ),
+                stage_name=args.stage_name,
+            )
         )
         srun_args_lines.extend(
             [

@@ -25,6 +25,21 @@ ct_first_errors() {
         "$1" 2>/dev/null || true
 }
 
+# Shared verdict predicate + failing-log excerpt, so the console summary and
+# the junit xml cannot drift apart.
+ct_step_passed() {
+    local statusFile="$precheckDir/status/$1.status"
+    [ -f "$statusFile" ] && grep -q "^PASS" "$statusFile"
+}
+
+ct_step_excerpt() {
+    local stepLog="$precheckDir/logs/$1.log"
+    echo "First error lines (line-numbered):"
+    ct_first_errors "$stepLog"
+    echo "Log tail ($stepLog):"
+    tail -n 60 "$stepLog" 2>/dev/null || true
+}
+
 # Console summary for a failed precheck: per-instance verdicts, first error
 # lines + tail of each failing step log, and UCX red-flag lines.
 # Uses: precheckDir, precheckNames.
@@ -37,16 +52,9 @@ ct_print_failure_summary() {
     echo ""
     echo "Failing step logs:"
     for k in "${!precheckNames[@]}"; do
-        statusFile="$precheckDir/status/${precheckNames[$k]}.status"
-        if [ -f "$statusFile" ] && grep -q "^PASS" "$statusFile"; then
-            continue
-        fi
-        stepLog="$precheckDir/logs/${precheckNames[$k]}.log"
-        echo "----- ${precheckNames[$k]} ($stepLog) -----"
-        echo "First error lines (line-numbered):"
-        ct_first_errors "$stepLog"
-        echo "Tail:"
-        tail -n 60 "$stepLog" 2>/dev/null || true
+        ct_step_passed "${precheckNames[$k]}" && continue
+        echo "----- ${precheckNames[$k]} -----"
+        ct_step_excerpt "${precheckNames[$k]}"
     done
     echo ""
     echo "UCX red flags (host-staged tcp fallback / UCX errors), if any:"
@@ -65,20 +73,17 @@ ct_write_junit_xml() {
     suiteName="$(printf '%s' "${stageName:-${SLURM_JOB_NAME:-disagg_perf_sanity}}" | ct_xml_escape)"
     local junitFailures=0
     local junitCases=""
-    local name statusFile stepLog verdict detail
+    local name verdict detail
     for k in "${!precheckNames[@]}"; do
         name="${precheckNames[$k]}"
-        statusFile="$precheckDir/status/$name.status"
-        if [ -f "$statusFile" ] && grep -q "^PASS" "$statusFile"; then
+        if ct_step_passed "$name"; then
             junitCases+="<testcase name=\"cache_transceiver_precheck[$name]\" classname=\"$suiteName\" time=\"0\"/>"$'\n'
             continue
         fi
         junitFailures=$((junitFailures + 1))
-        verdict="$( (head -n 1 "$statusFile" 2>/dev/null \
+        verdict="$( (head -n 1 "$precheckDir/status/$name.status" 2>/dev/null \
             || echo "NO_STATUS: step died before writing a verdict (see log)") | ct_xml_escape)"
-        stepLog="$precheckDir/logs/$name.log"
-        detail="$( { echo "First error lines:"; ct_first_errors "$stepLog"; echo ""; \
-                     echo "Log tail ($stepLog):"; tail -n 60 "$stepLog" 2>/dev/null; } | ct_xml_escape)"
+        detail="$(ct_step_excerpt "$name" | ct_xml_escape)"
         junitCases+="<testcase name=\"cache_transceiver_precheck[$name]\" classname=\"$suiteName\" time=\"0\">"
         junitCases+="<failure message=\"$verdict\">$detail</failure></testcase>"$'\n'
     done
@@ -115,36 +120,30 @@ run_cache_transceiver_precheck() {
         "$precheckDir"/status/*.json 2>/dev/null || true
     precheckPids=()
     precheckNames=()
-    local i gen_world_size ctx_world_size
-    for i in $(seq 0 $((numGenServers - 1))); do
-        gen_world_size=$((nodesPerGenServer * gpusPerNodePerGenServer))
-        export DISAGG_SERVING_TYPE="GEN_PRECHECK_$i"
-        export pytestCommand="$pytestCommandGENPrecheck --server-idx $i"
+    # ct_launch_step <role> <idx> <nodes> <gpusPerNode> <nodeList> <pytestCmd>
+    ct_launch_step() {
+        local role=$1 i=$2 nodes=$3 gpusPerNode=$4 nodeList=$5 pytestCmd=$6
+        export DISAGG_SERVING_TYPE="${role^^}_PRECHECK_$i"
+        export pytestCommand="$pytestCmd --server-idx $i"
         timeout -k 60 "${ctPrecheckTimeout:-900}" \
             srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
-            -N $nodesPerGenServer \
-            -w "${genNodeLists[$i]}" \
-            --ntasks=$gen_world_size \
-            --ntasks-per-node=$gpusPerNodePerGenServer \
-            bash $precheckRunScript &> "$precheckDir/logs/gen_$i.log" &
+            -N "$nodes" \
+            -w "$nodeList" \
+            --ntasks=$((nodes * gpusPerNode)) \
+            --ntasks-per-node="$gpusPerNode" \
+            bash $precheckRunScript &> "$precheckDir/logs/${role}_$i.log" &
         precheckPids+=($!)
-        precheckNames+=("gen_$i")
+        precheckNames+=("${role}_$i")
         sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
+    }
+    local i
+    for i in $(seq 0 $((numGenServers - 1))); do
+        ct_launch_step gen "$i" "$nodesPerGenServer" "$gpusPerNodePerGenServer" \
+            "${genNodeLists[$i]}" "$pytestCommandGENPrecheck"
     done
     for i in $(seq 0 $((numCtxServers - 1))); do
-        ctx_world_size=$((nodesPerCtxServer * gpusPerNodePerCtxServer))
-        export DISAGG_SERVING_TYPE="CTX_PRECHECK_$i"
-        export pytestCommand="$pytestCommandCTXPrecheck --server-idx $i"
-        timeout -k 60 "${ctPrecheckTimeout:-900}" \
-            srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
-            -N $nodesPerCtxServer \
-            -w "${ctxNodeLists[$i]}" \
-            --ntasks=$ctx_world_size \
-            --ntasks-per-node=$gpusPerNodePerCtxServer \
-            bash $precheckRunScript &> "$precheckDir/logs/ctx_$i.log" &
-        precheckPids+=($!)
-        precheckNames+=("ctx_$i")
-        sleep 5  # Wait for pyxis container namespace initialization to avoid race condition
+        ct_launch_step ctx "$i" "$nodesPerCtxServer" "$gpusPerNodePerCtxServer" \
+            "${ctxNodeLists[$i]}" "$pytestCommandCTXPrecheck"
     done
 
     local precheckFailed=0 k rc

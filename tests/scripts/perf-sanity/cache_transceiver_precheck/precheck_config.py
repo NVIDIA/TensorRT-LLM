@@ -104,6 +104,59 @@ def _spec_nextn(side):
     return 0
 
 
+def wireup_timeout_s(max_world):
+    """First-rep NIXL agent wire-up allowance (see PRECHECK_DEFAULTS)."""
+    return min(1800, 150 * int(max_world))
+
+
+def default_step_timeout_s(max_world):
+    """External (srun-level) timeout covering one precheck instance,
+    including the first-rep wire-up. Imported by the launch tooling
+    (jenkins/scripts/perf/{,local/}submit.py) so the outer timeout can
+    never drift below the driver's internal budget."""
+    return 900 + wireup_timeout_s(max_world)
+
+
+def precheck_prefix_lines(cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world,
+                          stage_name=""):
+    """Launch-script export lines wiring the precheck gate.
+
+    Single owner of the enable/kill-switch policy, the step-timeout default,
+    and the export names the gate consumes — shared by
+    jenkins/scripts/perf/submit.py and jenkins/scripts/perf/local/submit.py.
+    `config_path_expr` and the env-var references are launch-script-side
+    expressions ($llmSrcNode etc.), expanded at sbatch runtime.
+    """
+    knobs = cfg.get("cache_transceiver_precheck", {}) or {}
+    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
+    # On by default; yaml opts out per test; the env var (when set) overrides
+    # the yaml either way (global kill switch).
+    enabled = env == "1" if env is not None else bool(knobs.get("enabled", True))
+    cmd = (
+        "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
+        f"run_precheck.py --config {config_path_expr} "
+        "--work-dir $testOutputDir/cache_transceiver_precheck "
+        f"--benchmark-mode {benchmark_mode} --llm-src $llmSrcNode"
+    )
+    lines = [
+        f"export ctPrecheckEnabled={int(enabled)}",
+        # The external srun timeout must cover the driver's first-rep NIXL
+        # wire-up allowance; the default derives from the same formula the
+        # driver budgets with (default_step_timeout_s).
+        f"export ctPrecheckTimeout="
+        f"{int(knobs.get('step_timeout_s', default_step_timeout_s(max_world)))}",
+        "export precheckRunScript=$llmSrcNode/jenkins/scripts/perf/"
+        "disaggregated/slurm_precheck_run.sh",
+        f'export pytestCommandCTXPrecheck="{ucx_tls_cmd} $CTX_WORKER_ENV_VARS {cmd} --role ctx"',
+        f'export pytestCommandGENPrecheck="{ucx_tls_cmd} $GEN_WORKER_ENV_VARS {cmd} --role gen"',
+    ]
+    if stage_name:
+        # Suite name for the synthetic junit xml the gate writes on failure
+        # (absent -> the gate falls back to $SLURM_JOB_NAME).
+        lines.append(f'export stageName="{stage_name}"')
+    return lines
+
+
 def resolve_plan(cfg, benchmark_mode="e2e"):
     """Build the shared precheck plan both roles must agree on.
 
@@ -145,9 +198,6 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
             f"{ctx_xcvr.get('backend')} vs {gen_xcvr.get('backend')}"
         )
 
-    ctx_nextn = _spec_nextn(ctx_side)
-    gen_nextn = _spec_nextn(gen_side)
-
     knobs = dict(PRECHECK_DEFAULTS)
     knobs.update(cfg.get("cache_transceiver_precheck", {}) or {})
 
@@ -179,22 +229,6 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         "gpus_per_node": gpus_per_node,
         "ctx": ctx,
         "gen": gen,
-        "ctx_cache_transceiver_config": ctx_xcvr,
-        "gen_cache_transceiver_config": gen_xcvr,
-        "ctx_num_nextn_predict_layers": ctx_nextn,
-        "gen_num_nextn_predict_layers": gen_nextn,
-        "ctx_kv_dtype": str((ctx_side.get("kv_cache_config") or {}).get("dtype", "auto")),
-        "gen_kv_dtype": str((gen_side.get("kv_cache_config") or {}).get("dtype", "auto")),
-        # Tri-state, matching KvCacheConfig's pydantic default: explicit
-        # True/False from the yaml wins; absent means "auto", which the
-        # driver resolves against the model class's get_model_defaults() at
-        # runtime — exactly like serving (_resolve_kv_cache_manager_v2_auto).
-        "ctx_use_kv_cache_manager_v2": (ctx_side.get("kv_cache_config") or {}).get(
-            "use_kv_cache_manager_v2", "auto"
-        ),
-        "gen_use_kv_cache_manager_v2": (gen_side.get("kv_cache_config") or {}).get(
-            "use_kv_cache_manager_v2", "auto"
-        ),
         "tokens_per_block": tokens_per_block,
         "request_lengths": req_lens,
         "num_requests": int(knobs["num_requests"]),
@@ -205,11 +239,21 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         "wireup_timeout_s": int(
             knobs["wireup_timeout_s"]
             if knobs["wireup_timeout_s"] is not None
-            else min(1800, 150 * max(ctx["world_size"], gen["world_size"]))
+            else wireup_timeout_s(max(ctx["world_size"], gen["world_size"]))
         ),
         "rendezvous_timeout_s": int(knobs["rendezvous_timeout_s"]),
         "verify_data": bool(knobs["verify_data"]),
     }
+    for role, side, xcvr in (("ctx", ctx_side, ctx_xcvr), ("gen", gen_side, gen_xcvr)):
+        kv_cfg = side.get("kv_cache_config") or {}
+        plan[f"{role}_cache_transceiver_config"] = xcvr
+        plan[f"{role}_num_nextn_predict_layers"] = _spec_nextn(side)
+        plan[f"{role}_kv_dtype"] = str(kv_cfg.get("dtype", "auto"))
+        # Tri-state, matching KvCacheConfig's pydantic default: explicit
+        # True/False from the yaml wins; absent means "auto", which the
+        # driver resolves against the model class's get_model_defaults() at
+        # runtime — exactly like serving (_resolve_kv_cache_manager_v2_auto).
+        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan
 
@@ -237,11 +281,9 @@ def plan_fingerprint(plan):
 
 def side_plan(plan, role):
     """Per-role view: this role's parallelism + transceiver/kv config."""
-    other = "gen" if role == "ctx" else "ctx"
     return {
         "role": role,
         "parallel": plan[role],
-        "peer_parallel": plan[other],
         "cache_transceiver_config": plan[f"{role}_cache_transceiver_config"],
         "kv_dtype": plan[f"{role}_kv_dtype"],
         "num_nextn_predict_layers": plan[f"{role}_num_nextn_predict_layers"],
