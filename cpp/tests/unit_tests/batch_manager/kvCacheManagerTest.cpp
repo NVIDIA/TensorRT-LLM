@@ -10999,7 +10999,8 @@ TEST_F(KVCacheManagerTest, HybridDisaggUsesAttentionPoolDtype)
         /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
         CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
-        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
+        /*indexerKCacheUseFp4=*/false, /*indexerKCacheLayerMask=*/std::nullopt, linearAttentionMetadata,
+        poolConfigurations);
     kvCacheManager->allocatePools(/*useUvm=*/false);
 
     CacheTransBufferManager cacheTransBufferManager(kvCacheManager.get(), /*maxNumTokens=*/tokensPerBlock);

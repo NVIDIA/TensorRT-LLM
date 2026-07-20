@@ -1896,16 +1896,29 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     @classmethod
-    def get_preferred_transceiver_runtime(cls,
-                                          pretrained_config: Any = None
-                                          ) -> Optional[Literal["PYTHON"]]:
-        """``DeepseekV3ForCausalLM``, ``DeepseekV32ForCausalLM``, and ``GlmMoeDsaForCausalLM`` all prefer the Python (v2) KV-cache transceiver.
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Preferred KV-cache transceiver runtime, differentiated per checkpoint.
 
-        All three use MLA attention (``DeepseekV3Attention`` and ``DeepseekV32Attention`` both
-        extend ``MLA``), which transfers a large latent KV that the Python transceiver handles
-        better in disaggregated serving. Applied only when ``transceiver_runtime`` is 'auto'
-        and the backend is NIXL.
+        ``DeepseekV3ForCausalLM`` / ``DeepseekV32ForCausalLM`` use MLA attention, which transfers
+        a large latent KV that the Python (v2) transceiver handles better in disaggregated
+        serving, so they prefer the Python transceiver. GLM 5.2 (``GlmMoeDsaForCausalLM`` /
+        ``glm_moe_dsa``) uses a per-layer masked DSA indexer k-cache pool (cross-layer indexer
+        sharing) that the Python transceiver does not support, so GLM checkpoints must use the
+        C++ transceiver, which handles both the masked pool and dense indexer layouts. Applied
+        only when ``cache_transceiver_config.transceiver_runtime`` is 'auto'; an explicit runtime
+        is always respected.
         """
+        if pretrained_config is not None:
+            architectures = getattr(pretrained_config, 'architectures',
+                                    None) or []
+            # model_type is checked as a fallback: it is 'glm_moe_dsa' on GLM
+            # checkpoints until __init__ rewrites it to 'deepseek_v32'.
+            if ("GlmMoeDsaForCausalLM" in architectures or getattr(
+                    pretrained_config, 'model_type', None) == 'glm_moe_dsa'):
+                return "CPP"
         return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
