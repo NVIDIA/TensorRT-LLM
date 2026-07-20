@@ -29,8 +29,6 @@
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
-#include <cstdlib>
-#include <cstring>
 #include <type_traits>
 
 using namespace tensorrt_llm::common;
@@ -2466,15 +2464,14 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
 #ifdef ENABLE_BF16
     if constexpr (std::is_same_v<T, __nv_bfloat16>)
     {
-        // REMOVE-BEFORE-PR: A/B knob. TLLM_SPARSE_KV_COMPACT_FAST=0 forces the
-        // register-staging path below on the same inputs; unset or any other
-        // value selects the pipelined fast path. Read on every launch rather
-        // than cached in a static: compaction runs once per eviction round
-        // (~10/s), so the getenv is free, and tests can flip the knob within
-        // one process through os.environ.
-        char const* const fastKnob = std::getenv("TLLM_SPARSE_KV_COMPACT_FAST");
-        bool const fastEnabled = fastKnob == nullptr || std::strcmp(fastKnob, "0") != 0;
-        if (fastEnabled && (headDim == 64 || headDim == 128) && (tokensPerBlock == 32 || tokensPerBlock == 128))
+        // Production path for bf16 pools with head size 64/128 and 32/128-token
+        // pages: the pipelined kernels won the A/B comparison against the
+        // register-staging kernel everywhere (verified 2026-07-20: 1.47x at
+        // batch 1, 1.09-1.30x at batch 32, 1.09-1.13x at batch 256, with
+        // byte-identical outputs), so they dispatch unconditionally here. The
+        // register-staging path below remains only as the fallback for other
+        // dtypes and geometries.
+        if ((headDim == 64 || headDim == 128) && (tokensPerBlock == 32 || tokensPerBlock == 128))
         {
             SparseKvCacheCompactV2Bf16Params fastParams{};
             fastParams.poolPointers = poolPointers;

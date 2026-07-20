@@ -17,21 +17,13 @@ _MAX_PAGES_PER_SEQUENCE = 3
 _NUM_PAGES = _BATCH_SIZE * _MAX_PAGES_PER_SEQUENCE
 _PAGE_INDEX_DIVISOR = 2
 
-_FAST_KNOB_ENV = "TLLM_SPARSE_KV_COMPACT_FAST"
-
-
-@pytest.fixture(autouse=True, params=["0", "1"], ids=["existing_kernel", "fast_kernel"])
-def sparse_compact_kernel_knob(request, monkeypatch):
-    """Run every test in this module under both kernel selections.
-
-    The C++ dispatcher re-reads TLLM_SPARSE_KV_COMPACT_FAST on every launch
-    (temporary A/B knob), so flipping the process environment per test is
-    enough; no re-import or subprocess is needed. Cases outside the fast-path
-    gate (dtype, head_dim, or page size not covered) take the existing kernel
-    under both values and simply run twice.
-    """
-    monkeypatch.setenv(_FAST_KNOB_ENV, request.param)
-    return request.param
+# Kernel-name substrings for the profiler probes below: the pipelined bf16
+# kernel dispatches unconditionally on eligible geometry, the register-staging
+# kernel covers everything else. The byte-compare tests would pass no matter
+# which kernel ran, so the probes pin down that the dispatch gate routes each
+# case to the intended kernel.
+_FAST_KERNEL_NAME = "sparseKvCacheCompactV2Bf16PipelineKernel"
+_EXISTING_KERNEL_NAME = "updateSparseKvCacheAfterFmha"
 
 
 def _encode_k_block_offsets(
@@ -439,8 +431,7 @@ def _make_fast_geometry_case(
     ]
     pools = [pool.cuda() for pool in pools_cpu]
 
-    # Deterministic per-geometry inputs: the cross-kernel test rebuilds the
-    # identical case for each knob value.
+    # Deterministic per-geometry inputs so any failure reproduces exactly.
     generator = torch.Generator().manual_seed(20260720 + head_dim * 1000 + tokens_per_block)
     raw_page_table = (
         torch.randperm(num_pages, generator=generator)
@@ -524,8 +515,8 @@ _FAST_GEOMETRY_MATRIX = [(64, 32), (128, 32), (64, 128), (128, 128)]
 
 @pytest.mark.parametrize("head_dim,tokens_per_block", _FAST_GEOMETRY_MATRIX)
 def test_sparse_kv_cache_compact_layers_fast_geometry(head_dim, tokens_per_block):
-    # The autouse knob fixture runs this both through the pipelined fast path
-    # and through the existing register-staging kernel.
+    # Eligible geometry always dispatches the pipelined kernel; the
+    # byte-compare against the CPU reference is the correctness net.
     case = _make_fast_geometry_case(head_dim, tokens_per_block)
     expected = _run_fast_geometry_case(case)
     for actual, reference in zip(case.pools, expected):
@@ -548,48 +539,30 @@ def test_sparse_kv_cache_compact_layers_fast_geometry_per_layer_source():
     ],
 )
 def test_sparse_kv_cache_compact_layers_fast_gate_fallback(dtype, head_dim, tokens_per_block):
-    # Near-miss geometries must fall back to the existing kernel and stay
-    # byte-correct under both knob values.
+    # Near-miss geometries must fall back to the register-staging kernel and
+    # stay byte-correct. The profiler probe proves the gate actually rejected
+    # the case: a gate widened by accident would hand the pipelined kernel a
+    # geometry it was never built for.
     case = _make_fast_geometry_case(head_dim, tokens_per_block, dtype=dtype)
-    expected = _run_fast_geometry_case(case)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
+        expected = _run_fast_geometry_case(case)
+    names = [event.name for event in profiler.events()]
+    assert any(_EXISTING_KERNEL_NAME in name for name in names)
+    assert not any(_FAST_KERNEL_NAME in name for name in names)
     for actual, reference in zip(case.pools, expected):
         assert torch.equal(actual.cpu(), reference)
 
 
 @pytest.mark.parametrize("head_dim,tokens_per_block", _FAST_GEOMETRY_MATRIX)
-def test_sparse_kv_cache_compact_layers_fast_path_actually_runs(
-    head_dim, tokens_per_block, sparse_compact_kernel_knob
-):
+def test_sparse_kv_cache_compact_layers_fast_path_actually_runs(head_dim, tokens_per_block):
     # Guard against the fast-path gate silently never firing: every
     # byte-equality test in this module would still pass if the dispatcher
-    # fell through to the existing kernel under both knob values. Assert via
-    # the profiler that the selected kernel is the one that actually ran,
-    # for each of the four static geometry dispatch branches.
+    # fell through to the register-staging kernel. Assert via the profiler
+    # that the pipelined kernel ran (and the fallback did not) for each of
+    # the four static geometry dispatch branches.
     case = _make_fast_geometry_case(head_dim, tokens_per_block)
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
         _run_fast_geometry_case(case)
     names = [event.name for event in profiler.events()]
-    fast_fired = any("sparseKvCacheCompactV2Bf16PipelineKernel" in name for name in names)
-    existing_fired = any("updateSparseKvCacheAfterFmha" in name for name in names)
-    if sparse_compact_kernel_knob == "1":
-        assert fast_fired and not existing_fired
-    else:
-        assert existing_fired and not fast_fired
-
-
-@pytest.mark.parametrize("head_dim,tokens_per_block", [(64, 32), (128, 128)])
-def test_sparse_kv_cache_compact_layers_fast_matches_existing_kernel(
-    head_dim, tokens_per_block, monkeypatch
-):
-    # The same inputs through both kernel selections must produce
-    # byte-identical pools, and both must match the reference.
-    outputs = {}
-    expected = None
-    for knob in ("0", "1"):
-        monkeypatch.setenv(_FAST_KNOB_ENV, knob)
-        case = _make_fast_geometry_case(head_dim, tokens_per_block)
-        expected = _run_fast_geometry_case(case)
-        outputs[knob] = [pool.cpu() for pool in case.pools]
-    for existing_pool, fast_pool, reference in zip(outputs["0"], outputs["1"], expected):
-        assert torch.equal(fast_pool, existing_pool)
-        assert torch.equal(fast_pool, reference)
+    assert any(_FAST_KERNEL_NAME in name for name in names)
+    assert not any(_EXISTING_KERNEL_NAME in name for name in names)
