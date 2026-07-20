@@ -17,6 +17,7 @@ needed.
 
 from __future__ import annotations
 
+import inspect
 import threading
 
 import cuda.bindings.driver as cuda
@@ -28,6 +29,24 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
+
+
+def _cute_sqrt_supports_approx_ftz() -> bool:
+    """Probe whether this CuTe DSL's ``cute.math.sqrt`` takes ``approx``/``ftz``.
+
+    Older DSL releases expose a plain one-argument ``sqrt``; passing the
+    keywords there raises TypeError at trace time (inside ``cute.compile``,
+    where it cannot be caught), so the capability is probed once at import
+    time via signature inspection and folded into a trace-time constant.
+    """
+    try:
+        parameters = inspect.signature(cute.math.sqrt).parameters
+    except (TypeError, ValueError):
+        return False
+    return "approx" in parameters and "ftz" in parameters
+
+
+_CUTE_SQRT_HAS_APPROX_FTZ = _cute_sqrt_supports_approx_ftz()
 
 CTA_M = 64
 K = 96
@@ -887,11 +906,19 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         real = staged_real[prefetch_index]
                         imag = staged_imag[prefetch_index]
                         norm2 = real * real + imag * imag
-                        magnitude = cute.math.sqrt(
-                            norm2,
-                            approx=self.sqrt_mode == "approx",
-                            ftz=self.magnitude_sqrt_ftz,
-                        )
+                        if cutlass.const_expr(_CUTE_SQRT_HAS_APPROX_FTZ):
+                            magnitude = cute.math.sqrt(
+                                norm2,
+                                approx=self.sqrt_mode == "approx",
+                                ftz=self.magnitude_sqrt_ftz,
+                            )
+                        else:
+                            # DSLs without the keywords get the plain (IEEE)
+                            # sqrt, which is strictly MORE accurate than the
+                            # measured approx+ftz choice above; the unit
+                            # test's 5e-3 oracle tolerance absorbs the
+                            # difference.
+                            magnitude = cute.math.sqrt(norm2)
                         magnitude_fp16_0 = cutlass.Float16(magnitude)
                         magnitude_fp16_1 = cutlass.Float16(
                             magnitude - cutlass.Float32(magnitude_fp16_0)

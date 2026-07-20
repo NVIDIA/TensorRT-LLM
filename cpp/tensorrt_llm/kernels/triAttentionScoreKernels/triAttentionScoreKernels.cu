@@ -166,13 +166,17 @@ __device__ __forceinline__ void scoreLoadChunk(char const* row, bool valid, int 
 
 // Accumulate one 8-frequency chunk into this thread's per-head accumulators.
 // coff0 = flat index of (request, layer, first head of this block, chunk
-// frequency 0) in the c_re/c_im tables; mlrOff0 = the matching index in the
-// static request-independent [layer, head, freq] c_mlr table. All coefficient
-// reads are lane-uniform 16-byte loads. |K| is computed once per
+// frequency 0) in the c_re/c_im tables; cMlr = the matching chunk pointer
+// into the static request-independent [layer, head, freq] c_mlr table,
+// pre-offset by the caller. Passing the resolved pointer (instead of a
+// second flat offset) keeps this loop's live set at the tuned ~72-register
+// baseline: one pointer register replaces the base + request-strided offset
+// pair the c_mlr reads consumed before the table went static. All
+// coefficient reads are lane-uniform 16-byte loads. |K| is computed once per
 // (token, frequency) BEFORE the head loop so the GROUP heads share it from
 // registers.
 template <typename T, int GROUP, bool USE_MAX>
-__device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, int64_t coff0, int64_t mlrOff0,
+__device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, int64_t coff0, float const* cMlr,
     int64_t planeStride, uint4 re4, uint4 im4, float* accMean, float* accMlr, float* accPos)
 {
     float kRe[8], kIm[8], kMag[8];
@@ -187,7 +191,7 @@ __device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, in
     for (int hg = 0; hg < GROUP; ++hg)
     {
         int64_t const coff = coff0 + static_cast<int64_t>(hg) * a.numFreqs;
-        float const* cmp = a.cMlr + mlrOff0 + static_cast<int64_t>(hg) * a.numFreqs;
+        float const* cmp = cMlr + static_cast<int64_t>(hg) * a.numFreqs;
         float4 const cm0 = __ldg(reinterpret_cast<float4 const*>(cmp));
         float4 const cm1 = __ldg(reinterpret_cast<float4 const*>(cmp + 4));
         float const cml[8] = {cm0.x, cm0.y, cm0.z, cm0.w, cm1.x, cm1.y, cm1.z, cm1.w};
@@ -321,8 +325,10 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
     int64_t const coff0 = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
         + static_cast<int64_t>(headBase) * a.numFreqs;
     // The MLR coefficient is position independent, so its table is folded once
-    // at initialization without a request axis: [layer, head, freq].
-    int64_t const mlrOff0 = (static_cast<int64_t>(layerId) * a.numQueryHeads + headBase) * a.numFreqs;
+    // at initialization without a request axis: [layer, head, freq]. Hoist the
+    // row pointer here (no request stride) so the fully unrolled chunk loop
+    // sees a single pre-offset pointer, not an extra live flat offset.
+    float const* const cMlrRow = a.cMlr + (static_cast<int64_t>(layerId) * a.numQueryHeads + headBase) * a.numFreqs;
     int64_t const planeStride = static_cast<int64_t>(a.numRequests) * a.numCalibratedLayers * a.numQueryHeads
         * static_cast<int64_t>(a.numFreqs);
 
@@ -356,7 +362,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
             uint4 re4, im4;
             scoreLoadChunk<T>(row, valid, a.numFreqs, c, re4, im4);
             scoreComputeChunk<T, GROUP, USE_MAX>(
-                a, coff0 + c * 8, mlrOff0 + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
+                a, coff0 + c * 8, cMlrRow + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
         }
     }
     else
@@ -367,7 +373,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
             uint4 re4, im4;
             scoreLoadChunk<T>(row, valid, a.numFreqs, c, re4, im4);
             scoreComputeChunk<T, GROUP, USE_MAX>(
-                a, coff0 + c * 8, mlrOff0 + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
+                a, coff0 + c * 8, cMlrRow + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
         }
     }
 
@@ -443,6 +449,11 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
 
     int64_t const planeStride = static_cast<int64_t>(a.numRequests) * a.numCalibratedLayers * a.numQueryHeads
         * static_cast<int64_t>(a.numFreqs);
+    // The static request-independent [layer, head, freq] c_mlr table: hoist
+    // this block's first-head row pointer once (no request stride), mirroring
+    // the vectorized kernel; the head loop advances it by numFreqs per head.
+    float const* const cMlrRow
+        = a.cMlr + (static_cast<int64_t>(layerId) * a.numQueryHeads + kvHead * groupSize) * a.numFreqs;
     int const tDec = absT - tokenStart;
     bool const store = tDec >= 0 && absT < seqLen;
 
@@ -452,8 +463,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
         int64_t const coff
             = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
             + static_cast<int64_t>(h) * a.numFreqs;
-        // Static request-independent [layer, head, freq] MLR table index.
-        int64_t const mlrOff = (static_cast<int64_t>(layerId) * a.numQueryHeads + h) * a.numFreqs;
+        float const* const cml = cMlrRow + static_cast<int64_t>(hg) * a.numFreqs;
         float acc = 0.0f;
         float accMlr = 0.0f;
         float accPos[kMaxScoreOffsets];
@@ -474,7 +484,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
             float const kMag = triSqrtApprox(kRe * kRe + kIm * kIm);
             if constexpr (USE_MAX)
             {
-                accMlr = fmaf(kMag, a.cMlr[mlrOff + f], accMlr);
+                accMlr = fmaf(kMag, cml[f], accMlr);
 #pragma unroll
                 for (int o = 0; o < kMaxScoreOffsets; ++o)
                 {
@@ -487,7 +497,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
             }
             else
             {
-                acc = fmaf(kRe, a.cRe[coff + f], fmaf(kIm, a.cIm[coff + f], fmaf(kMag, a.cMlr[mlrOff + f], acc)));
+                acc = fmaf(kRe, a.cRe[coff + f], fmaf(kIm, a.cIm[coff + f], fmaf(kMag, cml[f], acc)));
             }
         }
         if (store)
