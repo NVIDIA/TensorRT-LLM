@@ -298,7 +298,7 @@ class MTPWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,
