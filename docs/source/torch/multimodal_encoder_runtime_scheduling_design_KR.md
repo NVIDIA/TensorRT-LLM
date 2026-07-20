@@ -7,6 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 
 > **리뷰용 설계 노트 — 머지 전에 제거 예정.**
 >
+> **상태 갱신 (2026-07-20)**: encoder 출력이 이제 예산이 걸린
+> `MultimodalEncoderCacheManager` **단일 저장소**에만 산다 (pin/adopt 의미론).
+> item 선택은 allocate-before-compute + head-of-line 예약으로 byte 예산을
+> 강제하고, KV estimation이 manager 예산을 reserve하므로 encoder-output GPU
+> residency가 bounded + profiled 된다 ("Memory ownership: 단일 예산 저장소" 참조).
+>
 > **상태 갱신 (2026-07-16): 이 문서 작성 이후의 as-built 변경사항.**
 > 아래 본문은 원래 설계이며, 다음 변경들이 해당 섹션을 대체합니다 (현재 diff에 반영됨):
 >
@@ -40,7 +46,7 @@ SPDX-License-Identifier: Apache-2.0
 | 선행 작업 | [PR #13503: encoder sizing controls](https://github.com/NVIDIA/TensorRT-LLM/pull/13503) |
 | 구현 PR | [PR #16051](https://github.com/NVIDIA/TensorRT-LLM/pull/16051) |
 | 영문 문서 | [Multimodal Encoder Runtime Scheduling](multimodal_encoder_runtime_scheduling_design.md) |
-| 마지막 갱신 | 2026-07-15 |
+| 마지막 갱신 | 2026-07-20 |
 
 ## 요약
 
@@ -328,15 +334,16 @@ Declared-versus-runtime cost assertion은 향후 hardening 항목이다.
 
 ## Mutable request-local state
 
-Python request는 fixed-size item slot, 하나의 연속 output buffer, 미리 계산된 offset을 소유한다.
+Python request는 fixed-size item slot과 declared embedding length를 소유한다. 자체 저장소는
+없다: record된 slot은 전부 engine 소유 `MultimodalEncoderCacheManager` entry의 alias이며, request가
+prefill 소비 시점까지 pin한다.
 
 ```python
 py_mm_encoder_state: Optional[MultimodalEncoderRequestState]
-#   .outputs: list[Optional[torch.Tensor]]   # 슬롯; buffer의 view
-#   .output_buffer: Optional[torch.Tensor]   # fill()이 lazy 할당
-#   .output_offsets: list[int]
-#   .fill(item_idx, output)                  # 단일 writer (encode + cache attach)
-#   .finalize_into(multimodal_data)          # embedding 발행 + raw strip
+#   .outputs: list[Optional[torch.Tensor]]   # 슬롯; pinned manager entry의 alias
+#   .embedding_lengths: list[int]            # declared row 수; record()가 검증
+#   .record(item_idx, output_view)           # 단일 writer (encode adopt + attach hit)
+#   .finalize_into(multimodal_data)          # item-view 리스트 발행 + raw strip
 #   .progress / .pending_item_indices()
 ```
 
@@ -353,14 +360,18 @@ Item은 두 persistent state 중 하나다.
 둘 다 별도로 저장하는 두 번째 state가 아니며 C++ `LlmRequestState`도 변경하지 않는다. MM request는 `CONTEXT_INIT`을 유지하므로 같은 iteration의
 encoder-to-LLM 실행이 보존된다.
 
-Selection은 request state를 변경하지 않는다. 현재 executor는 같은 item을 다시 선택할 수 있는 다음 schedule
-result를 만들기 전에 이전 result 하나를 소비한다. Selection을 scheduler output에만 두면 result cancel/discard
-시 누수될 수 있는 reservation이 생기지 않는다.
+Selection은 request slot을 변경하지 않는다. 현재 executor는 같은 item을 다시 선택할 수 있는 다음 schedule
+result를 만들기 전에 이전 result 하나를 소비하며, selection이 수행하는 byte 예산 체크
+(allocate-before-compute)는 pass마다 새로 계산되고 저장되지 않으므로 result cancel/discard 시 누수될
+reservation이 없다.
 
-첫 item 성공 시 declared item별 embedding length로 하나의 연속 최종 output buffer를 할당한다. 완료된 item은
-canonical slice에 직접 복사하고, output slot은 별도 allocation이 아니라 이 buffer의 view를 보관한다. 모든
-slot이 ready가 되면 같은 buffer가 final `torch.cat` allocation 없이 `multimodal_embedding`이 된다. Request
-cancel, validation failure, execution error 시 buffer와 slot은 request와 함께 해제된다.
+Encoder 출력은 복사 없이 `MultimodalEncoderCacheManager`에 adopt되고 slot은 반환된 alias를
+record한다. 전 slot이 record되면 `finalize_into()`가 prompt 순서의 item-view 리스트를
+`multimodal_embedding`으로 발행한다. Request 단위 연속 embedding은 prefill forward 안에서 lazy하게
+구체화되므로(`get_multimodal_embeddings`가 리스트를 이미 concat), encode와 prefill 사이의 GPU
+residency는 manager의 예산 잡힌 entry뿐이다. Pin 해제는 단일 teardown 깔때기 — post-prefill strip과
+`_do_terminate_request`(cancel/error/disagg timeout) 둘 다 멱등 `unpin_request`로 수렴 — 를 지나므로
+pin이 request보다 오래 살 수 없다.
 
 ## End-to-end request workflow
 
@@ -803,41 +814,42 @@ Cancellation은 request를 waiting/active collection에서 제거하고 request-
 Selection은 request에 in-flight reservation을 만들지 않으므로 schedule result discard 시 rollback할 reservation도
 없다. Execution 시 selected request가 `active_requests`에 없으면 명시적 scheduler lifecycle error로 취급한다.
 
-## Memory ownership과 embeddings cache 통합
+## Memory ownership: 단일 예산 저장소
 
-초기 구현에는 누적 request-local output의 별도 byte/item limit가 없다. 첫 correctness/performance 평가에는
-허용할 수 있지만, 이미 active인 request가 현재 iteration의 LLM capacity에서 반복적으로 탈락하는 동안
-encoding을 끝낼 수 있는 eager mode에서는 특히 위험하다.
+Item-scheduling 모델의 encoder 출력은 engine 소유 `MultimodalEncoderCacheManager`에만 산다
+(vLLM `EncoderCacheManager` 구조를 이 executor에 맞게 이식): request는 content key로 entry를 참조하고
+pin하며, manager의 byte 예산이 encoder-output GPU residency 총량을 bound한다. Cross-request 재사용은
+저장소가 content-addressed라는 것의 부수효과이지 별도 캐시가 아니다. 이로써 이전 두-풀 설계
+(request 소유 buffer + clone 캐시)의 encode-ahead residency 구멍 — prefill 대기 중인 request들이 든
+buffer가 unbounded·unprofiled여서 높은 `free_gpu_memory_fraction`에서 OOM — 이 닫힌다.
 
-Eager mode를 supported default로 만들기 전에 다음 후속 작업이 필요하다.
-
-1. Resident MM output embedding을 item/byte로 추적한다.
-2. Item forward 뒤가 아니라 scheduling 전에 resident capacity를 reserve한다.
-3. Resident budget이 고갈되면 eager selection을 멈춘다.
-4. LLM consumption, cancellation, validation failure, executor error에서 capacity를 해제한다.
-5. 완료 output을 GPU에 둘지, pinned CPU로 옮길지, evict할지 정의한다.
-6. DP replica별 ownership과 distributed accounting을 정의한다.
-7. Waiting-request accumulation과 cancellation storm stress test를 추가한다.
-
-Cross-request embeddings cache(#15734의 `TensorLRUCache`)는 위 원칙 그대로, scheduler identity를 바꾸지
-않고 이제 통합되어 있다.
-
+- **예산**: `multimodal_config.encoder_cache_max_bytes`를 한 prefill iteration의 embedding
+  (`max_num_tokens × embedding_row_bytes`) 아래로는 내려가지 않게 클램프한다 — executor가 그만큼의
+  동시 상주를 반드시 필요로 하기 때문. `embedding_row_bytes`는 모델이 선언하는
+  `embedding_dim`/`embedding_dtype`에서 온다 (Qwen3-VL은 deepstack map을 row에 접어 넣어 text hidden의
+  4배); 미구현 모델은 embedding layer weight → config hidden size로 폴백.
+- **Allocate-before-compute**: `_select_items`가 pending item마다 `can_allocate()`를 체크하고(같은
+  pass에서 먼저 선택된 바이트 포함), 이번 pass에서 미완으로 남는 첫 request의 잔여 바이트를 예약한다
+  (head-of-line 예약). 이 예약이 없으면 부분 저장된 request 여럿이 예산 조각을 pin한 채 서로를
+  기다리는 교착이 가능하다. 예산에 영원히 못 들어가는 request는 명확한 에러로 fail-fast.
 - **Read**: `PyExecutor._attach_mm_encoder_cache_hits()`가 `_schedule()`에서 item 선택 전에 실행된다.
-  Hit는 `MultimodalEncoderRequestState.fill()`로 request-local slot에 채워지며 encoder item/token
-  budget을 소비하지 않는다. 전 item이 attach된 request는 encoder 작업 없이 `READY`가 되고, 일부만
-  attach된 request는 item 경로에서 miss만 재계산한다.
-- **Write**: `forward_multimodal_encoder_items()`가 새로 encode된 item마다 `cache.put()`으로
-  write-through한다 (put이 clone하므로 entry가 request buffer를 alias하거나 pin하지 않음).
+  Hit는 `get_and_pin()`으로 pin되어 slot에 record되며 encoder item/token 예산을 소비하지 않는다.
+- **Write**: `forward_multimodal_encoder_items()`가 fresh output을 `adopt()`한다 — clone 없음, 중복
+  key는 이미 상주하는 tensor로 collapse (iteration 내 중복 인코딩 dedup도 이걸로 해결).
 - **Key**: item별 `(modality, item_hash, embedding_length, mm_processor_kwargs_hash)` —
-  `_encoder_cache_item_key()` 단일 출처라 item 경로와 full-request 소비자(prefetch, `mm_encoder_only`)가
-  서로의 entry를 hit한다. Per-item modality는 `item_refs`에서 오므로 이 경로에선 mixed-modality도 keyable.
-- **Guard**: `ModelEngine.get_mm_encoder_cache_and_keys()` — 모델 capability, cache 활성, item metadata,
-  hash/kwargs-hash 존재·개수 일치. 하나라도 실패하면 그 request는 cache 없을 때와 완전히 동일하게 동작한다.
-- **Lifetime**: request가 commit된 copy를 소유하므로 eviction은 progress를 절대 되돌리지 못한다. Cache
-  byte는 `encoder_cache_max_bytes`로 bounded되고 #15734의 memory estimation에 반영된다.
+  `_encoder_cache_item_key()` 단일 출처. 안정적인 key를 못 만드는 request
+  (`get_mm_encoder_item_keys()`가 `None`)는 request-scoped 임시 key로 저장: 공유 불가, pin 해제 후 회수.
+- **Lifetime과 liveness**: pinned entry는 절대 evict되지 않으므로 record된 slot은 되돌아갈 수 없다.
+  zero-ref entry는 재사용을 위해 LRU 순서로 상주하다가 할당 압력 시 회수된다. Pin은 단일 teardown
+  깔때기(post-prefill strip + `_do_terminate_request`)로 해제되고, min-clamp + head-of-line 예약이
+  전진(부분 할당 교착 없음)을 보장한다.
+- **Profiling 보증**: KV estimation이 boundary encoder batch를 마지막 출력을 잡아둔 채 LLM dummy
+  forward와 함께 프로파일하고 manager 예산을 추가로 reserve하므로, 런타임(bounded transient +
+  bounded residency)이 추정 peak을 넘을 수 없다. 실증: 두-풀 설계를 OOM으로 죽였던
+  `free_gpu_memory_fraction=0.98` burst(7×1024px/req, conc 32)가 main과 throughput 동률로 완주.
 
-남은 후속: iteration 내 key dedup(동시 중복 item은 아직 각각 encode됨), admission 시점 probe-only 체크,
-나머지 full-request 소비자를 위한 partial-hit 조립(TRTLLM-13996).
+남은 후속: admission 시점 probe-only 체크, 나머지 full-request 소비자(prefetch, `mm_encoder_only` —
+TRTLLM-13996)를 위한 partial-hit 조립 — 이들은 아직 legacy `TensorLRUCache` clone 캐시를 쓴다.
 
 ## Correctness 요구사항
 
