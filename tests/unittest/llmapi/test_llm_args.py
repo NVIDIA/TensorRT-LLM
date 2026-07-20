@@ -461,6 +461,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    assert (KvCacheConfig(block_reuse_policy="per_conversation").
+            block_reuse_policy == "per_conversation")
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
 
