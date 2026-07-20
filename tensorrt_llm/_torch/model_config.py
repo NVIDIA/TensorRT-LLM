@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 import errno
 import json
@@ -36,8 +51,9 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
-                                              SparseAttentionConfig,
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                              KvCacheCompressionConfig,
+                                              LoraConfig, SparseAttentionConfig,
                                               SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
@@ -51,30 +67,14 @@ _MINIMAX_M3_ARCHITECTURES = {
 }
 
 
-def _unified_kv_pool_includes_mamba(
-        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
-    """Whether the KV cache pool will include mamba layers for a hybrid model.
-
-    True for the default Python ``MambaHybridCacheManager`` route, where
-    mamba state is allocated alongside attention KV inside one pool (with
-    zero KV heads on mamba layers). False for the V1-route managers used
-    when:
-
-      * disaggregated serving forces the C++ mamba manager
-        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
-      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
-        (agg-mode override), or
-      * one-model speculative decoding splits mamba and attention into
-        separate caches.
-
-    Single source of truth for the binding-side layer-counting decision; do
-    not duplicate the predicate at call sites.
-    """
-    use_split_pool = is_disagg \
-        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    use_spec = spec_config is not None
-    return not (use_split_pool or use_spec)
+def _is_lock_infra_error(exc: BaseException) -> bool:
+    """Whether exc indicates broken lock infrastructure (not mere contention)."""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
+                             errno.ESTALE)
+    return False
 
 
 @contextlib.contextmanager
@@ -88,47 +88,44 @@ def config_file_lock(timeout: int = 10):
     Args:
         timeout: Maximum time to wait for lock acquisition in seconds
     """
-    # Use a single global lock file in HF cache directory
-    # This serializes all model loading operations to prevent race conditions
+    # Use a single global lock file in HF cache directory to serialize loads.
     lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
-
-    # Create and acquire the lock
     lock = filelock.FileLock(str(lock_path), timeout=timeout)
 
+    # Guard only acquisition so caller-body exceptions propagate (single-yield).
     try:
-        with lock:
-            yield
-    except (PermissionError, OSError, filelock.Timeout) as e:
-        # Fallback to tempdir when primary lock path is unusable (e.g.,
-        # NFS locking failures like ENOLCK/ESTALE, permission issues,
-        # or lock acquisition timeouts)
-        if isinstance(e,
-                      OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                   errno.ENOLCK, errno.ESTALE):
+        lock.acquire(timeout=timeout)
+    except filelock.Timeout:
+        # Contention, not broken infra: a tempdir lock can't serialize against
+        # the holder, so degrade to no lock instead of crashing the process.
+        logger.warning(
+            f"could not acquire config lock within {timeout}s, proceeding without lock"
+        )
+        yield
+    except (PermissionError, OSError) as e:
+        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock_path = tmp_dir / "_remote_code.lock"
-        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
+        tmp_lock = filelock.FileLock(str(tmp_dir / "_remote_code.lock"),
+                                     timeout=timeout)
         try:
-            with tmp_lock:
+            tmp_lock.acquire(timeout=timeout)
+        except (PermissionError, OSError, filelock.Timeout):
+            logger.warning(
+                "tempdir config lock unavailable, proceeding without lock")
+            yield
+        else:
+            try:
                 yield
-        except filelock.Timeout:
-            logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
+            finally:
+                tmp_lock.release()
+    else:
+        try:
             yield
-        except (PermissionError, OSError) as e:
-            if isinstance(
-                    e, OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                    errno.ENOLCK, errno.ESTALE):
-                raise
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
-            )
-            # proceed without lock
-            yield
+        finally:
+            lock.release()
 
 
 @dataclass(kw_only=True)
@@ -145,8 +142,14 @@ class ModelConfig(Generic[TConfig]):
     skip_create_weights_in_init: bool = False
 
     spec_config: Optional["DecodingBaseConfig"] = None
+    # When False, the column-parallel LM head keeps its vocab-sharded output
+    # instead of all-gathering to full vocab. Used for one-model speculative
+    # draft models so greedy draft sampling can do a lighter TP gather. Defaults
+    # to True to preserve behavior for every non-draft model.
+    lm_head_gather_output: bool = True
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
+    kv_cache_compression_config: Optional["KvCacheCompressionConfig"] = None
 
     is_generation: bool = True
     is_encoder_decoder: bool = False
@@ -193,6 +196,13 @@ class ModelConfig(Generic[TConfig]):
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
+
+    # If true, the multimodal encoder of a multimodal checkpoint is NOT
+    # instantiated/loaded and the model serves text-only requests. This is
+    # opt-in per model: each model implementation must honor this flag when
+    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
+    # model that does not check it simply ignores the flag (no-op).
+    disable_mm_encoder: bool = False
 
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None
@@ -313,7 +323,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -429,6 +440,7 @@ class ModelConfig(Generic[TConfig]):
                 'group_size', quant_config.group_size)
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
+
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
@@ -946,9 +958,14 @@ class ModelConfig(Generic[TConfig]):
                         pretrained_config, 'compress_ratios', None)
                     num_base_layers = pretrained_config.num_hidden_layers
                     spec_config = kwargs.get('spec_config', None)
-                    if (spec_config is not None
-                            and getattr(spec_config, 'num_nextn_predict_layers',
-                                        None) is None):
+                    # ``num_nextn_predict_layers`` is MTP-specific (only read on
+                    # the is_mtp_one_model path). Only set it on configs that
+                    # actually declare the field; other DeepSeek-V4 spec modes
+                    # (e.g. DSpark, which carries its own draft stage count) do
+                    # not, and a blind setattr would fail pydantic validation.
+                    if (spec_config is not None and 'num_nextn_predict_layers'
+                            in type(spec_config).model_fields
+                            and spec_config.num_nextn_predict_layers is None):
                         spec_config.num_nextn_predict_layers = getattr(
                             pretrained_config, 'num_nextn_predict_layers', 1)
                     mtp_enabled = (spec_config is not None and
@@ -979,6 +996,22 @@ class ModelConfig(Generic[TConfig]):
                         window_size = checkpoint_window_size
                     if window_size is None:
                         window_size = pretrained_config.sliding_window
+
+                    # DeepSeek-V4 needs explicit per-layer compress ratios. They
+                    # must come from the checkpoint config or a user override; we
+                    # intentionally do not synthesize a default list (it would
+                    # silently change sparse-attention semantics). Fail fast with
+                    # an actionable message instead of letting the normalization
+                    # below raise an opaque TypeError on None.
+                    if compress_ratios is None:
+                        raise ValueError(
+                            "DeepSeek-V4 requires per-layer `compress_ratios`, "
+                            "but none were found in the checkpoint config and "
+                            "none were provided via `sparse_attention_config`. "
+                            "Set `compress_ratios` in the model's config.json, or "
+                            "pass `sparse_attention_config="
+                            "DeepSeekV4SparseAttentionConfig(compress_ratios=[...])`"
+                            " in --extra_llm_api_options.")
 
                     # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
                     # to 1 internally so cache allocation math works. The

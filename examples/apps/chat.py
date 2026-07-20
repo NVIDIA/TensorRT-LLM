@@ -5,8 +5,8 @@ import click
 import colorama
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 
 
 class LlmConsole(code.InteractiveConsole):
@@ -72,10 +72,6 @@ def main(model: str, tokenizer: str, tp_size: int):
         free_gpu_memory_fraction=0.8)
     kv_cache_config.enable_block_reuse = True
 
-    build_config = BuildConfig(max_batch_size=1,
-                               max_input_len=6000,
-                               max_num_tokens=10240)
-
     sampling_params = SamplingParams(max_tokens=100,
                                      temperature=0.5,
                                      top_p=0.95,
@@ -83,7 +79,9 @@ def main(model: str, tokenizer: str, tp_size: int):
 
     llm = LLM(model,
               tokenizer,
-              build_config=build_config,
+              max_batch_size=1,
+              max_input_len=6000,
+              max_num_tokens=10240,
               kv_cache_config=kv_cache_config,
               tensor_parallel_size=tp_size)
 

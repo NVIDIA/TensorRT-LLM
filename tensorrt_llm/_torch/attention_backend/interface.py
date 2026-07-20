@@ -27,7 +27,7 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .sparse.params import SparseMetadataParams
+from .sparse.params import SkipSoftmaxKernelParams, SparseMetadataParams
 
 try:
     # Transformers v5
@@ -411,10 +411,14 @@ class AttentionMetadata:
         return cuda_graph_metadata
 
     def prepare_for_spec_dec(self, *fields) -> None:
-        assert len(self._saved_tensors) == 0
+        assert len(self._saved_tensors) == 0, (
+            "prepare_for_spec_dec called while fields "
+            f"{list(self._saved_tensors)} are still saved; a previous "
+            "forward likely raised between prepare_for_spec_dec and "
+            "restore_from_spec_dec")
         for f in fields:
             v = getattr(self, f)
-            assert isinstance(v, torch.Tensor)
+            assert isinstance(v, torch.Tensor), f"{f} is not a torch.Tensor"
             self._saved_tensors[f] = v
             setattr(self, f, v.clone())
 
@@ -422,6 +426,11 @@ class AttentionMetadata:
         for f, v in self._saved_tensors.items():
             setattr(self, f, v)
         self._saved_tensors.clear()
+
+    @property
+    def has_spec_dec_saved_state(self) -> bool:
+        """True when prepare_for_spec_dec state has not been restored yet."""
+        return bool(self._saved_tensors)
 
     def update_spec_dec_param(
             self,
@@ -943,6 +952,9 @@ class AttentionForwardArgs:
     # `quantizeCopyInputToFp8Kernel`.
     quant_scale_qkv: Optional[torch.Tensor] = None
 
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    enable_dsv4_epilogue_fusion: bool = False
+
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
@@ -957,6 +969,8 @@ class AttentionForwardArgs:
 
     sparse_prediction: SparsePrediction = field(
         default_factory=SparsePrediction)
+    skip_softmax_kernel_params: SkipSoftmaxKernelParams = field(
+        default_factory=SkipSoftmaxKernelParams)
 
     @property
     def mask_type(self) -> int:

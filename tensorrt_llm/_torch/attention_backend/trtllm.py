@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention_backend.fmha import (
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -586,24 +587,47 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # kv block offsets
         assert self.request_ids is not None
         if self.kv_cache_manager is not None:
-            self.kv_cache_manager.copy_batch_block_offsets(
-                self.kv_cache_block_offsets, self.request_ids, self.beam_width,
-                self.num_contexts, self.num_seqs)
-
-            error_message = (
-                f"The max KV cache length of input sequences ({self.kv_lens[:self.num_seqs].max()}) "
+            max_kv_len = int(self.kv_lens[:self.num_seqs].max())
+            assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+                f"The max KV cache length of input sequences ({max_kv_len}) "
                 f"exceeds the KV cache manager's maximum supported length "
                 f"({self.kv_cache_manager.max_seq_len}).")
 
-            assert self.kv_lens[:self.num_seqs].max(
-            ) <= self.kv_cache_manager.max_seq_len, error_message
+            # On the non-speculative path the host kv_lens snapshot bounds
+            # every block-table access, so the staged/H2D width can be capped
+            # at the batch's maximum instead of max_seq_len's worth of
+            # columns. Speculative decoding must stage the full width:
+            # draft/tree sub-steps and the overlap scheduler advance
+            # kv_lens_cuda on device past the host snapshot, and their
+            # kernels dereference block columns a host-derived cap would
+            # leave unstaged (uninitialized in this buffer).
+            spec_active = (self.draft_kv_cache_manager is not None
+                           or self.is_spec_decoding_enabled
+                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
+                           (self.runtime_features is not None and
+                            self.runtime_features.has_speculative_draft_tokens))
+            max_blocks = None
+            if not spec_active and self.kv_cache_manager.tokens_per_block:
+                max_blocks = ceil_div(max_kv_len,
+                                      self.kv_cache_manager.tokens_per_block)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets,
+                self.request_ids,
+                self.beam_width,
+                self.num_contexts,
+                self.num_seqs,
+                max_blocks=max_blocks)
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
                 # Use the wrapper method which works for both V1 and V2
                 self.draft_kv_cache_manager.copy_batch_block_offsets(
-                    self.draft_kv_cache_block_offsets, self.request_ids,
-                    self.beam_width, self.num_contexts, self.num_seqs)
+                    self.draft_kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    self.num_seqs,
+                    max_blocks=max_blocks)
 
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
@@ -1312,11 +1336,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
-        # This is a workaround for https://nvbugs/5624818
-        # Paged context FMHA is forced on SM90 for correctness
-        if get_sm_version() == 90:
-            use_paged_context_fmha = True
-
         return self._is_nvfp4_output_kernel_available(
             tokens_per_block=metadata.tokens_per_block,
             attention_mask=attention_mask,
@@ -1487,11 +1506,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        # SM90 forces `use_paged_context_fmha` on for correctness
-        # (https://nvbugs/5624818).
-        if get_sm_version() == 90:
-            metadata.use_paged_context_fmha = True
-
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
         # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
         if (self.sparse_params is not None and getattr(
@@ -1501,6 +1515,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.is_mla_enable:
             # Context MLA uses separate qkv instead of paged_context_fmha
             metadata.use_paged_context_fmha = False
+
+        if (forward_args.enable_dsv4_epilogue_fusion and
+            (forward_args.output is None or forward_args.output_sf is None)):
+            raise ValueError(
+                "DSv4 epilogue fusion requires caller-provided output and "
+                "output_sf buffers.")
 
         if forward_args.output is None:
             is_gen_only = (forward_args.attention_input_type ==
@@ -1712,7 +1732,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # populated by `create_output` in `forward` above, so the
         # decision is correct only here, not at the modules/attention.py
         # call site where `output_sf` is always `None`.
-        if forward_args.output_sf is not None and forward_args.out_scale_sf is not None:
+        if (not forward_args.enable_dsv4_epilogue_fusion
+                and forward_args.output_sf is not None
+                and forward_args.out_scale_sf is not None):
             forward_args.out_scale = forward_args.out_scale_sf
 
         # Default `forward_args.kv_scale_*` to the layer-level mirrors when
@@ -1725,6 +1747,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.kv_scale_orig_quant = self.kv_scale_orig_quant
         if forward_args.kv_scale_quant_orig is None:
             forward_args.kv_scale_quant_orig = self.kv_scale_quant_orig
+
+        sparse_params = self.sparse_params
+        if isinstance(sparse_params, SkipSoftmaxParams):
+            forward_args.skip_softmax_kernel_params = (
+                sparse_params.scheduler.get_kernel_params(
+                    timestep=forward_args.timestep))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:

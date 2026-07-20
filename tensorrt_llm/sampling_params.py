@@ -318,6 +318,12 @@ class SamplingParams:
     return_perf_metrics: bool = False
     additional_model_outputs: Optional[List[str]] = None
 
+    # Decoder tokens moved from generated output into the input prefix. The
+    # result layer restores them to the user-visible output.
+    _decoder_output_token_prefix: Tuple[int, ...] = field(
+        default_factory=tuple, init=False, repr=False
+    )
+
     # Used in logprobs calculation in TRT flow to drop logits early if user did not explicitly request them.
     # Can be deprecated after migration to PyTorch backend.
     _context_logits_auto_enabled: bool = False

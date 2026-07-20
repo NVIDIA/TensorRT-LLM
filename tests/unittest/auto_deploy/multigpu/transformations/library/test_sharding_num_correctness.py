@@ -32,7 +32,7 @@ source only). See ``_apply_sharding_to_gm`` for the branch.
 Usage:
 
   pytest tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py \
-      --sharding-ir-modeling-file tensorrt_llm/_torch/auto_deploy/models/custom/modeling_qwen3.py
+      --sharding-ir-modeling-file modeling_qwen3
 
 The test is skipped (not failed) when ``--sharding-ir-modeling-file`` is
 absent. No filename pattern is assumed -- works for the canonical
@@ -367,7 +367,7 @@ def _run_equivalence_job_impl(
     the all-reduce inserted by sharding.
     """
     # Imports are deferred until inside the worker so spawn() picks up any
-    # parent-side sys.path / env-var setup before tensorrt_llm is loaded.
+    # parent-side sys.path / env-var setup before AutoDeploy is loaded.
     import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
     import tensorrt_llm._torch.auto_deploy.models.custom  # noqa: F401 -- registers IR classes
     import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
@@ -723,8 +723,13 @@ def test_sharding_num_correctness(
         _preflight_spec = spec_from_modeling_file(sharding_ir_modeling_file)
         _ = build_ir_model(_preflight_spec, device=torch.device("cpu"), dtype=FORWARD_DTYPE)
     except RuntimeError as e:
+        from tensorrt_llm._torch.auto_deploy._compat import TRTLLM_AVAILABLE
+
         msg = str(e)
-        if "Could not resolve config class" in msg or "ForCausalLM' class registered" in msg:
+        known_native_setup_error = (
+            "Could not resolve config class" in msg or "ForCausalLM' class registered" in msg
+        )
+        if TRTLLM_AVAILABLE and known_native_setup_error:
             pytest.skip(f"Modeling file not set up for IR equivalence harness: {e}")
         raise
     except (TypeError, AttributeError, KeyError, ValueError, AssertionError) as e:

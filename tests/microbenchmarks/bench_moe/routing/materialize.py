@@ -55,14 +55,21 @@ def _flatten_plan_slots_for_rank(
     experts_per_rank: int,
     moe_ep_size: int,
 ) -> List[int]:
-    """Flatten one plan row into expert ids while preserving slot counts."""
-    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    """Flatten one plan row into expert ids while preserving slot counts.
+
+    ``local_num_tokens`` is derived from the dispatch-matrix row sum rather
+    than from ``per_rank_num_tokens[src_rank]``.  In MoE-TP + attention-DP
+    layouts (DTP / CUSTOM-DP) the dispatch matrix is EP-axis indexed while
+    ``per_rank_num_tokens`` is world-rank indexed; the row sum is always the
+    correct EP-axis aggregate (``source_tokens[src_rank] * top_k``).
+    """
     row = list(plan.dispatch_matrix[src_rank])
-    if sum(row) != local_num_tokens * top_k:
+    row_sum = sum(row)
+    if top_k > 0 and row_sum % top_k != 0:
         raise ValueError(
-            f"dispatch_matrix row sum ({sum(row)}) must equal local_num_tokens*top_k "
-            f"({local_num_tokens * top_k}) for rank {src_rank}"
+            f"dispatch_matrix row {src_rank} sum ({row_sum}) is not divisible by top_k ({top_k})"
         )
+    local_num_tokens = row_sum // top_k if top_k > 0 else 0
 
     flat: List[int] = []
     for dst in range(moe_ep_size):
@@ -174,7 +181,13 @@ def _materialize_selected_experts_for_rank(
       4. Run a small repair pass that swaps duplicated expert ids between
          rows until each token has ``top_k`` distinct experts.
     """
-    local_num_tokens = int(plan.per_rank_num_tokens[src_rank])
+    # Derive the effective token count from the dispatch-matrix row sum so that
+    # MoE-TP + attention-DP layouts (DTP / CUSTOM-DP) are handled correctly.
+    # In those layouts the row sum equals the aggregated source tokens for the
+    # EP rank, while per_rank_num_tokens[src_rank] would only reflect one DP
+    # shard's contribution.
+    row_sum = sum(plan.dispatch_matrix[src_rank])
+    local_num_tokens = row_sum // max(top_k, 1)
     if local_num_tokens == 0:
         ids = torch.zeros((0, top_k), dtype=torch.int32, device=device)
         scales = torch.zeros((0, top_k), dtype=scale_dtype, device=device)

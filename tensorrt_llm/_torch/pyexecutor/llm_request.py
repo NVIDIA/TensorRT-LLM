@@ -47,7 +47,7 @@ REQUEST_TYPE_MAPPING = {
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 if TYPE_CHECKING:
-    from .sampling_utils import Strategy
+    from .sampler.sampling_utils import Strategy
 
 
 @dataclass(slots=True)
@@ -677,6 +677,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
@@ -730,12 +731,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
+        # Tokens physically evicted by KV-cache compression; deducted in the engine.
+        self.py_num_compressed_tokens = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_context_chunk = (None, None)
         self.py_draft_logits = None
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
+        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        self.py_needs_onehot_draft_probs = False
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
@@ -1178,6 +1185,7 @@ def executor_request_to_llm_request(
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
+        py_mm_item_order=getattr(executor_request, "py_mm_item_order", None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,
         logprobs_mode=getattr(executor_request, "py_logprobs_mode",
@@ -1185,6 +1193,13 @@ def executor_request_to_llm_request(
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
     )
+
+    # Bad-words list for the TorchSampler path, kept in its native
+    # list[list[int]] form (single- and multi-token words). This is the
+    # TorchSampler's own input and is independent of any other sampler.
+    llm_request.py_bad_words = [
+        list(word) for word in executor_request.bad_words
+    ] if executor_request.bad_words else None
 
     llm_request.py_original_end_id = getattr(executor_request,
                                              "py_original_end_id",

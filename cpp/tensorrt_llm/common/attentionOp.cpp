@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/sageQuant.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cascadeAttentionKernel.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
@@ -758,8 +759,8 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
     return partialStatsSize + partialOSize;
 }
 
-size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
-    int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
+size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int32_t max_num_seq,
+    int32_t input_seq_length, int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -911,7 +912,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     return context_workspace_size;
 }
 
-size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t max_num_seq,
+size_t AttentionOp::getWorkspaceSizeForGeneration(tensorrt_llm::DataType type, int32_t max_num_seq,
     int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept
 {
     if (max_num_tokens == 0)
@@ -1130,6 +1131,12 @@ int AttentionOp::mlaGeneration(
 
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
+        if (params.dsv4_epilogue_fusion.enabled)
+        {
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = true;
+            tllmRunnerParams.mDsv4EpilogueFusion.cosSinCache = params.dsv4_epilogue_fusion.cos_sin_cache;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleBufM = params.dsv4_epilogue_fusion.scale_buf_m;
+        }
 
         // softmax stats if needed
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
@@ -2018,6 +2025,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Only use [totalLength, h / cpSize, Dh].
         fmhaParams.outputPtr = mCpSize > 1 ? workspaceViews.gatherOutBuffer : params.context_buf;
         fmhaParams.outputSfPtr = params.context_buf_sf;
+        if (params.mla_param != nullptr && params.mla_param->dsv4_epilogue_fusion.enabled)
+        {
+            fmhaParams.dsv4EpilogueFusion.enabled = true;
+            fmhaParams.dsv4EpilogueFusion.cosSinCache = params.mla_param->dsv4_epilogue_fusion.cos_sin_cache;
+            fmhaParams.dsv4EpilogueFusion.scaleBufM = params.mla_param->dsv4_epilogue_fusion.scale_buf_m;
+        }
         fmhaParams.attentionSinksPtr = params.attention_sinks;
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
@@ -2806,7 +2819,7 @@ int AttentionOp::initialize() noexcept
     if (mEnableContextFMHA)
     {
         mEnableContextFMHA = false;
-        if (!(mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16))
+        if (!(mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16))
         {
             TLLM_LOG_WARNING("Fall back to unfused MHA because of unsupported data type.");
         }
@@ -2851,7 +2864,7 @@ int AttentionOp::initialize() noexcept
         "mFP8ContextFMHA must enable if FP4 KV cache is enabled");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
-    TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != nvinfer1::DataType::kBF16),
+    TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != tensorrt_llm::DataType::kBF16),
         "Unsupported data type, pre SM 80 GPUs do not support bfloat16");
 
     // Pre-check whether the head size is supported by MMHA.
@@ -2903,11 +2916,11 @@ int AttentionOp::initialize() noexcept
 
         // Pre-checked during constructing.
         Data_type data_type, data_type_kv;
-        if (mType == nvinfer1::DataType::kHALF)
+        if (mType == tensorrt_llm::DataType::kHALF)
         {
             data_type = DATA_TYPE_FP16;
         }
-        else if (mType == nvinfer1::DataType::kBF16)
+        else if (mType == tensorrt_llm::DataType::kBF16)
         {
             data_type = DATA_TYPE_BF16;
         }
@@ -2965,6 +2978,10 @@ int AttentionOp::initialize() noexcept
         {
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
+        }
+        if (mFusesDsv4InvRopeFp8Quant)
+        {
+            fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
         }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
@@ -3040,6 +3057,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = useSparseMLA();
         fmhaParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
+        fmhaParams.fusesDsv4InvRopeFp8Quant = mFusesDsv4InvRopeFp8Quant;
 
         // SageAttention: set block sizes for sage quantization.
         if (useSageAttn)
@@ -3062,13 +3080,13 @@ int AttentionOp::initialize() noexcept
                 Data_type kvDataType = DATA_TYPE_FP32;
                 Data_type outputDataType = DATA_TYPE_FP32;
 
-                if (mType == nvinfer1::DataType::kHALF)
+                if (mType == tensorrt_llm::DataType::kHALF)
                 {
                     qDataType = DATA_TYPE_FP16;
                     kvDataType = DATA_TYPE_FP16;
                     outputDataType = DATA_TYPE_FP16;
                 }
-                else if (mType == nvinfer1::DataType::kBF16)
+                else if (mType == tensorrt_llm::DataType::kBF16)
                 {
                     qDataType = DATA_TYPE_BF16;
                     kvDataType = DATA_TYPE_BF16;
@@ -3084,9 +3102,14 @@ int AttentionOp::initialize() noexcept
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
                 }
+                if (mFusesDsv4InvRopeFp8Quant)
+                {
+                    outputDataType = DATA_TYPE_E4M3;
+                }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
-                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, kvDataType, outputDataType));
+                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+                    qDataType, kvDataType, kvDataType, outputDataType, 0, 0, 0, 0, mFusesDsv4InvRopeFp8Quant));
             }
             else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {
@@ -3153,7 +3176,7 @@ int AttentionOp::initialize() noexcept
     }
 
     mEnableXQA = (mEnableXQA || mIsSpecDecodingEnabled)
-        && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16) && mUseKVCache;
+        && (mType == tensorrt_llm::DataType::kHALF || mType == tensorrt_llm::DataType::kBF16) && mUseKVCache;
 
     if (mEnableXQA)
     {
@@ -3163,12 +3186,12 @@ int AttentionOp::initialize() noexcept
         fixedParams.isMLA = mIsGenerationMLA;
         // TODO: support more combinations.
         // Update Q and O dtype.
-        if (mType == nvinfer1::DataType::kHALF)
+        if (mType == tensorrt_llm::DataType::kHALF)
         {
             fixedParams.inputDataType = DATA_TYPE_FP16;
             fixedParams.outputDataType = DATA_TYPE_FP16;
         }
-        else if (mType == nvinfer1::DataType::kBF16)
+        else if (mType == tensorrt_llm::DataType::kBF16)
         {
             fixedParams.inputDataType = DATA_TYPE_BF16;
             fixedParams.outputDataType = DATA_TYPE_BF16;
@@ -3236,10 +3259,6 @@ int AttentionOp::initialize() noexcept
         reserveSemaphoreArray(mNbMultiBlockSemaphores);
     }
 
-    if (isBuilding())
-    {
-        return 0;
-    }
 #if ENABLE_MULTI_DEVICE
     if (mCpSize > 1 && COMM_SESSION.getSize() > 1)
     {

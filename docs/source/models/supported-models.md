@@ -48,6 +48,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen2ForProcessRewardModel`         | Qwen2-based                        | `Qwen/Qwen2.5-Math-PRM-7B`                   |
 | `Qwen2ForRewardModel`                | Qwen2-based                        | `Qwen/Qwen2.5-Math-RM-72B`                   |
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |
+| `Qwen3ForTextEmbedding`              | Qwen3-Embedding                    | `Qwen/Qwen3-Embedding-8B`                    |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 | `Qwen3_5MoeForCausalLM`              | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
@@ -79,8 +80,8 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | Yes | No               | No                | No     | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No  | No               | No                | No     | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
 
-[^1]: Chunked Prefill for MLA can only be enabled on SM100/SM103.
-[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.
+[^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.
+[^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.
 [^3]: Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
 [^5]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD Configs](../../../examples/auto_deploy/model_registry/configs).
 [^6]: Also supports text-only inference via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend.
@@ -114,6 +115,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested         | Untested       | Untested              | Untested                  | L + I     |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | Untested         | No             | Untested              | Untested                  | L + I + V |
 | `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Untested              | Untested                  | L + I + V |
+| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
 
 Note:
@@ -121,6 +123,26 @@ Note:
 - I: Image
 - V: Video
 - A: Audio
+
+## Multimodal Encoder Optimizations
+
+The following optimizations are available to models that implement
+`MultimodalModelMixin`. Currently, only `Mistral3ForConditionalGeneration` supports them.
+
+| Model Architecture | Multimodal Encoder Side Stream | Multimodal Embeddings Cache |
+| ------------------ | ------------------------------ | --------------------------- |
+| `Mistral3ForConditionalGeneration` | Yes | Yes |
+
+- **Multimodal encoder side stream** prefetches encoder work for pending requests on a separate
+  CUDA stream, allowing it to overlap with work on the main stream. Set
+  `multimodal_config.encoder_side_stream_max_ahead` to a positive value to enable it; the value
+  limits the number of prefetched requests that can be ahead of admission. This option is mutually
+  exclusive with `multimodal_config.encoder_cuda_graph` and can increase peak GPU memory use.
+- **Multimodal embeddings cache** is a per-model, cross-request LRU cache of encoder embeddings.
+  Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
+  `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
+  only when all of its items hit the cache. At present, only single-modality requests are cacheable;
+  mixed-modality requests bypass the cache.
 
 # Visual Generation Models
 
