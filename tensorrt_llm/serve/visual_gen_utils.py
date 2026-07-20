@@ -3,7 +3,7 @@ import base64
 import os
 from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes, is_image_bytes
+from tensorrt_llm.inputs.media_io import decode_video_frames_from_bytes, is_decodable_image_bytes
 from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
@@ -165,7 +165,7 @@ def parse_visual_gen_params(
 
             # Classify by decoding the bytes in memory — nothing touches disk
             # until the modality is known and validated.
-            if is_image_bytes(payload):
+            if is_decodable_image_bytes(payload):
                 # I2V: the stored image file is the cross-model contract —
                 # every I2V pipeline reads ``params.image`` as a path. One
                 # write, straight to the final name; the id is unique per
