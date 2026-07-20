@@ -93,7 +93,7 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
-    "tensor": (torch.Tensor,), # Decoded media payloads (e.g. a V2V reference as a uint8 [T, H, W, C]
+    "tensor": (torch.Tensor,),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
@@ -175,6 +175,16 @@ def validate_visual_gen_params(
                     f"got {type(value).__name__}: {value!r}"
                 )
                 continue  # skip range check if type is wrong
+            # Validator (enums, bounds, tensor shapes) declared on
+            # the spec so deterministic client errors 400 at preflight
+            # instead of failing deep in the worker.
+            validator = getattr(spec, "validator", None)
+            if validator is not None:
+                try:
+                    validator(value)
+                except ValueError as exc:
+                    messages.append(f"extra_params['{key}']: {exc}")
+                    continue
             # Range check (numeric only)
             if spec.range is not None and isinstance(value, (int, float)):
                 lo, hi = spec.range

@@ -33,6 +33,10 @@ class ExtraParamSchema(StrictBaseModel):
     range: Optional[tuple] = Field(
         default=None, description="Optional (min, max) range for numeric params."
     )
+    validator: Optional[Callable[[Any], Any]] = Field(
+        default=None,
+        description="Optional value validator; raises ValueError on invalid values.",
+    )
 
 
 def _parse_profile_range():
