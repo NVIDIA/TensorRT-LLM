@@ -62,11 +62,17 @@ from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4ForConditionalGeneration,
     Gemma4MultimodalEmbedder,
 )
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin  # noqa: E402
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     find_input_mm_embeds,
     get_multimodal_embeddings,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData  # noqa: E402
+from tensorrt_llm.inputs.multimodal import (  # noqa: E402
+    MultimodalInput,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig  # noqa: E402
 from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -123,6 +129,59 @@ SMALL_TEXT_CONFIG = {
         "full_attention": {"rope_type": "default", "rope_theta": 10000.0},
     },
 }
+
+
+class _Gemma4EncoderCacheHarness(MultimodalModelMixin):
+    """Lightweight Gemma4 encoder-cache harness without model weights."""
+
+    supports_encoder_cache = True
+    encode_multimodal_inputs = Gemma4ForConditionalGeneration.encode_multimodal_inputs
+
+    def __init__(self, embedding_dim: int = 12) -> None:
+        self.model_config = ModelConfig(
+            multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+        )
+        self._embedding_dim = embedding_dim
+        self.encoder_calls = 0
+        self.audio_tower = None
+
+    @property
+    def embedding_dim(self) -> int:
+        return self._embedding_dim
+
+    @property
+    def embedding_dtype(self) -> torch.dtype:
+        return torch.float32
+
+    def _get_image_features(self, pixel_values: torch.Tensor, **kwargs) -> torch.Tensor:
+        del kwargs
+        self.encoder_calls += 1
+        return torch.full(
+            (pixel_values.shape[0] * 2, self.embedding_dim),
+            float(self.encoder_calls),
+            dtype=self.embedding_dtype,
+        )
+
+
+def _make_keyed_image_param() -> MultimodalParams:
+    embedding_lengths = [2]
+    return MultimodalParams(
+        multimodal_input=MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[0],
+            multimodal_lengths=embedding_lengths,
+        ),
+        multimodal_data={
+            "image": {"pixel_values": torch.empty(1, 1, 1)},
+            "multimodal_embedding_lengths": embedding_lengths,
+            "mm_processor_kwargs_hash": "kwargs-a",
+        },
+        multimodal_runtime=MultimodalRuntimeData(
+            embed_mask_cumsum=torch.arange(1, 3, dtype=torch.int64),
+            past_seen_token_num=0,
+            chunk_end_pos=2,
+        ),
+    )
 
 
 # Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
@@ -702,6 +761,19 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         # TRT-LLM class, not ``transformers.AutoModel`` output.
         self.assertIsInstance(model.vision_tower, Gemma4VisionModel)
 
+    def test_encoder_cache_reuses_image_embedding_across_requests(self):
+        """Persistent cache reuse applies to the shared dense/MoE Gemma4 wrapper."""
+        self.assertTrue(issubclass(Gemma4ForConditionalGeneration, MultimodalModelMixin))
+        self.assertTrue(Gemma4ForConditionalGeneration.supports_encoder_cache)
+
+        model = _Gemma4EncoderCacheHarness()
+        first = model._get_or_encode_multimodal_embeddings([_make_keyed_image_param()])
+        second = model._get_or_encode_multimodal_embeddings([_make_keyed_image_param()])
+
+        self.assertEqual(model.encoder_calls, 1)
+        torch.testing.assert_close(second, first)
+        self.assertEqual(len(model._multimodal_encoder_cache), 1)
+
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""
         model = self._make_model()
@@ -724,7 +796,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             model, "_get_image_features", return_value=expected_embeddings
         ) as image_encoder:
             all_embeddings = get_multimodal_embeddings(
-                model._forward_multimodal_encoder, [multimodal_param]
+                model.encode_multimodal_inputs, [multimodal_param]
             )
             first_chunk = find_input_mm_embeds(all_embeddings, [multimodal_param])
 
@@ -734,7 +806,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 embed_mask_cumsum=embed_mask_cumsum,
             )
             all_embeddings = get_multimodal_embeddings(
-                model._forward_multimodal_encoder, [multimodal_param]
+                model.encode_multimodal_inputs, [multimodal_param]
             )
             second_chunk = find_input_mm_embeds(all_embeddings, [multimodal_param])
 
@@ -752,8 +824,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 embed_mask_cumsum=torch.tensor([0, 0, 1, 2], dtype=torch.int64),
             ),
         )
-        self.assertFalse(
-            Gemma4ForConditionalGeneration._has_active_multimodal_tokens(multimodal_param)
+        self.assertEqual(
+            Gemma4ForConditionalGeneration.select_multimodal_params(None, [multimodal_param], 1),
+            [],
         )
 
     def test_mixed_modality_batch_preserves_request_order(self):
@@ -791,7 +864,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             "_get_image_features",
             side_effect=lambda pixel_values, **_: pixel_values[:, 0],
         ):
-            embeddings = get_multimodal_embeddings(model._forward_multimodal_encoder, params)
+            embeddings = get_multimodal_embeddings(model.encode_multimodal_inputs, params)
 
         expected = torch.tensor([[2.0], [1.0], [3.0]])
         torch.testing.assert_close(embeddings[0], expected)
@@ -815,7 +888,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             "_get_image_features",
             side_effect=lambda pixel_values, **_: pixel_values[:, 0],
         ):
-            embeddings = model._forward_multimodal_encoder([multimodal_param])
+            embeddings = model.encode_multimodal_inputs([multimodal_param])
 
         torch.testing.assert_close(embeddings, torch.tensor([[1.0], [2.0]]))
 

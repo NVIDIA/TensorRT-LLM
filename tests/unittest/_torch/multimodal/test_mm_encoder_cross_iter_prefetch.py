@@ -38,10 +38,12 @@ class _StubModel(MultimodalModelMixin):
         self._tokens_per_image = tokens_per_image
         self.encoder_call_count = 0
         self.encoder_call_stream_id = None
+        self.encoder_mm_item_order = None
 
     def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> torch.Tensor:
         self.encoder_call_count += 1
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
+        self.encoder_mm_item_order = multimodal_params[0].mm_item_order
         pv = multimodal_params[0].multimodal_data["image"]["pixel_values"]
         assert pv.device.type == "cuda", (
             "pixel_values should be on CUDA after to_device in the helper."
@@ -229,12 +231,18 @@ def test_cross_iter_prefetch_materializes_on_side_stream(monkeypatch):
 
     model = _StubModel(hidden_size=8, tokens_per_image=4)
     req = _make_request(request_id=0, num_tokens=4)
+    expected_item_order = [
+        {"modality": "image", "index": 0},
+        {"modality": "video", "index": 0},
+    ]
+    req.py_mm_item_order = expected_item_order
 
     n = maybe_prefetch_mm_encoder_for_next_iter(model, [req], max_prefetch_ahead=max_prefetch_ahead)
 
     assert n == 1
     assert model.encoder_call_count == 1
     assert model.encoder_call_stream_id == aux_stream.cuda_stream
+    assert model.encoder_mm_item_order == expected_item_order
     embedding = req.py_multimodal_data.get("multimodal_embedding")
     assert isinstance(embedding, torch.Tensor)
     assert embedding.shape == (4, 8)

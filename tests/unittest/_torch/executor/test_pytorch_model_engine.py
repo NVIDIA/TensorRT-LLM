@@ -74,6 +74,18 @@ class DummyModel(torch.nn.Module):
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
 
 
+class DummyMultimodalIndexModel(torch.nn.Module):
+
+    class Config:
+        vocab_size = 100
+
+    config = Config()
+
+    @property
+    def multimodal_token_ids(self) -> torch.Tensor:
+        return torch.tensor([90, 91], dtype=torch.int32)
+
+
 class DummyModelEngine(PyTorchModelEngine):
 
     def __init__(self, llm_args: TorchLlmArgs, dtype: torch.dtype) -> None:
@@ -149,6 +161,16 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
+
+    def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyMultimodalIndexModel()
+
+        text_indices, multimodal_indices = engine._prepare_multimodal_indices(
+            [1, 90, 2, 91, 3])
+
+        torch.testing.assert_close(text_indices, torch.tensor([0, 2, 4]))
+        torch.testing.assert_close(multimodal_indices, torch.tensor([1, 3]))
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
             self) -> None:
