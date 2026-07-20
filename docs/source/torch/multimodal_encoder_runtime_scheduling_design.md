@@ -849,7 +849,8 @@ to roll back when a schedule result is discarded. A selected request that is no 
 ## Memory ownership: single budgeted storage
 
 Encoder outputs for item-scheduling models live exclusively in the engine-owned
-`MultimodalEncoderCacheManager` (the vLLM `EncoderCacheManager` shape adapted to this executor):
+`MultimodalEncoderCacheManager`, a `BaseResourceManager` registered with the executor's
+resource managers (teardown flows through the standard `free_resources` funnel):
 requests reference entries by content key and hold them, and the manager's byte budget therefore
 bounds total encoder-output GPU residency. Cross-request reuse is a side effect of the storage
 being content-addressed, not a separate cache. This closes the encode-ahead residency hole of the
@@ -878,8 +879,8 @@ awaiting prefill were unbounded and unprofiled, and could OOM at high `free_gpu_
   never shared, reclaimed once the request's holds are released.
 - **Lifetime and liveness**: held entries are never evicted, so a recorded slot cannot regress;
   zero-reference entries stay resident in LRU order for reuse and are reclaimed on allocation
-  pressure. Holds release through the single teardown funnel (post-prefill strip and
-  `_do_terminate_request`), and the min-clamp plus head-of-line reservation guarantee forward
+  pressure. Holds release through the registered resource manager's `free_resources` (plus the early
+  post-prefill call), and the min-clamp plus head-of-line reservation guarantee forward
   progress (no partial-allocation deadlock).
 - **Profiling guarantee**: KV estimation profiles boundary encoder batches with the last output
   held across the LLM dummy forward and additionally reserves the manager budget, so runtime
