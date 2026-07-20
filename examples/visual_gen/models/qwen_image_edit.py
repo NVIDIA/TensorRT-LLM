@@ -15,7 +15,7 @@
 """Qwen-Image-Edit-2511 image editing.
 
 Usage:
-    python qwen_image_edit.py --image input.png
+    python qwen_image_edit.py --image input.png --prompt "Make the image look like a watercolor painting"
     python qwen_image_edit.py \
         --visual_gen_args ../configs/qwen-image-edit-2511-bf16-1gpu.yaml \
         --image input.png
@@ -51,26 +51,6 @@ def parse_args() -> argparse.Namespace:
         help="Text edit instruction.",
     )
     parser.add_argument(
-        "--negative_prompt",
-        default=" ",
-        help="Negative prompt. A single space enables true CFG.",
-    )
-    parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=40,
-        help="Number of denoising steps.",
-    )
-    parser.add_argument(
-        "--guidance_scale",
-        type=float,
-        default=4.0,
-        help="True classifier-free guidance scale.",
-    )
-    parser.add_argument("--height", type=int, help="Optional output height override.")
-    parser.add_argument("--width", type=int, help="Optional output width override.")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
-    parser.add_argument(
         "--output_path",
         default="qwen_image_edit_output.png",
         help="Edited image output path.",
@@ -84,15 +64,6 @@ def main() -> None:
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
     params.image = args.image if len(args.image) > 1 else args.image[0]
-    params.negative_prompt = args.negative_prompt
-    params.num_inference_steps = args.num_inference_steps
-    params.guidance_scale = args.guidance_scale
-    params.seed = args.seed
-    if args.height is not None:
-        params.height = args.height
-    if args.width is not None:
-        params.width = args.width
-
     output = visual_gen.generate(inputs=args.prompt, params=params)
     saved = output.save(args.output_path)
     print(f"Saved edited image to {saved}")
