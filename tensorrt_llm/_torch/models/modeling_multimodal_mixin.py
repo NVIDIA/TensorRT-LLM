@@ -147,6 +147,20 @@ def _reorder_embeds_by_manifest(
             req_counts[m] = req_counts.get(m, 0) + 1
         for m, c in req_counts.items():
             per_modality_cursor[m] += c
+    if not slices:
+        # No items resolved for any request. This happens on the executor's
+        # KV-cache profiling pass: `_encode_dummy_inputs` runs the encoder on a
+        # worst-case dummy batch that carries the encoder tensors but no
+        # `multimodal_embedding_lengths`, so the per-modality lengths (and thus
+        # the sliced `per_modality_embeds`) come back empty. The encoder forward
+        # still ran (its activation is what peak-memory profiling captures), so
+        # return a correctly-typed empty embedding tensor instead of crashing on
+        # `torch.cat([])`. `per_modality_embeds` values are already zero-row
+        # slices of the encoder output, so their concat preserves dtype/device
+        # and the hidden dim.
+        if per_modality_embeds:
+            return torch.cat(list(per_modality_embeds.values()), dim=0)
+        return torch.empty(0)
     return torch.cat(slices, dim=0)
 
 
