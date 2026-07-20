@@ -271,6 +271,7 @@ class GvrTopKKernel:
         p4_warp_redundant: bool = True,
         p2_warp_redundant: bool = True,
         enable_block_skip: bool = False,
+        use_ext_counts: bool = False,
     ):
         # Redundant-warp sync reduction: every warp replays the block
         # reduce + decision from the same staged SMEM partials in the
@@ -539,6 +540,19 @@ class GvrTopKKernel:
             self.M_thr = self.M_qf + 1
         # need[m] = ceil(q_m * K) prev-topK values >= rung m.
         self.qneeds = tuple(max(1, int(math.ceil(q * self.top_k))) for q in self.r0_qfracs)
+        # use_ext_counts (waterfall L1 admission): thresholds AND their
+        # exact counts arrive from the indexer epilogue (interface v2) —
+        # P1b and the M-ary count pass are skipped; an in-band rung is
+        # re-measured ONCE through the seeded refine (per-thread hand-off)
+        # and accepted; a miss seeds log-falsi with the external brackets.
+        self.use_ext_counts = bool(use_ext_counts) and bool(enable_r0)
+        if self.use_ext_counts:
+            if not self.fb_fix:
+                raise ValueError("use_ext_counts requires fb_fix")
+            if self.M_thr != 3:
+                raise ValueError("use_ext_counts expects exactly 3 seed rungs")
+            if cluster_size != 1:
+                raise ValueError("use_ext_counts is single-CTA (cs==1) only")
         # R1 inline shot aim in log2-count space: geometric center of the
         # [K, kC] acceptance window.
         self.log2_r1aim = math.log2(math.sqrt(self.top_k * self.kC)) if self.r0_qfracs else 0.0
@@ -4103,6 +4117,8 @@ class GvrTopKKernel:
         output_indices: cute.Tensor,  # [numRows, top_k] int32
         order_row: cute.Tensor,  # [batch_size] int32 (or None when seqlen_sorted=False)
         block_max: cute.Tensor,  # [numRows, nb_pad*4] fp32 (or None: no block-skip)
+        seed_thr: cute.Tensor,  # [numRows, 3] fp32 (or None: no ext counts)
+        seed_counts: cute.Tensor,  # [numRows, 3] int32 (or None)
     ):
         """Thin entry: bidx → row_idx → run_one_row.
 
@@ -4155,6 +4171,8 @@ class GvrTopKKernel:
             output_values,
             output_indices,
             block_max=block_max,
+            seed_thr=seed_thr,
+            seed_counts=seed_counts,
         )
 
     @cute.jit
@@ -4167,6 +4185,8 @@ class GvrTopKKernel:
         output_values: cute.Tensor,  # [numRows, top_k] dtype, optional
         output_indices: cute.Tensor,  # [numRows, top_k] int32
         block_max: cute.Tensor = None,  # [numRows, nb_pad*4] fp32
+        seed_thr: cute.Tensor = None,  # [numRows, 3] fp32 (ext counts)
+        seed_counts: cute.Tensor = None,  # [numRows, 3] int32 (ext counts)
     ):
         """Dispatch: compute per-row slice + cluster sync mode, call _run_phases.
 
@@ -4227,6 +4247,14 @@ class GvrTopKKernel:
             block_max_row = block_max[row_idx, None]
         else:
             block_max_row = None
+        if cutlass.const_expr(
+            self.use_ext_counts and seed_thr is not None and seed_counts is not None
+        ):
+            seed_thr_row = seed_thr[row_idx, None]
+            seed_counts_row = seed_counts[row_idx, None]
+        else:
+            seed_thr_row = None
+            seed_counts_row = None
         # When return_output_values=False, ``output_values`` is None at
         # launch and the gated writes below are compiled out; slicing into
         # None would crash so we keep the view None as well.
@@ -4523,6 +4551,8 @@ class GvrTopKKernel:
                         warp_id,
                         lane,
                         block_max_row=block_max_row,
+                        seed_thr_row=seed_thr_row,
+                        seed_counts_row=seed_counts_row,
                         smem_active=smem_active,
                         s_active_cnt=s_active_cnt,
                     )
@@ -4567,6 +4597,8 @@ class GvrTopKKernel:
                             warp_id,
                             lane,
                             block_max_row=block_max_row,
+                            seed_thr_row=seed_thr_row,
+                            seed_counts_row=seed_counts_row,
                             smem_active=smem_active,
                             s_active_cnt=s_active_cnt,
                         )
@@ -4608,6 +4640,8 @@ class GvrTopKKernel:
                     warp_id,
                     lane,
                     block_max_row=block_max_row,
+                    seed_thr_row=seed_thr_row,
+                    seed_counts_row=seed_counts_row,
                     smem_active=smem_active,
                     s_active_cnt=s_active_cnt,
                 )
@@ -4652,6 +4686,8 @@ class GvrTopKKernel:
         warp_id,
         lane,
         block_max_row=None,  # block-skip: this row's per-32-position bounds
+        seed_thr_row=None,  # ext counts: this row's 3 seed thresholds (fp32)
+        seed_counts_row=None,  # ext counts: this row's 3 exact counts (int32)
         smem_active=None,
         s_active_cnt=None,
     ):
@@ -4751,85 +4787,107 @@ class GvrTopKKernel:
                 # CTA scans its slice and block_count_ge_multi cluster-merges
                 # the rung counts (phase1b rungs are per-CTA identical since
                 # preIdx stats are full-row).
-                if cutlass.const_expr(self.p1b_cache):
-                    # rungs from the SMEM gather-cache P1 stashed (no 2nd
-                    # GMEM gather); 16-bit only.
-                    self.phase1b_hspace_rungs_cached(
-                        pre_idx_count, smem_gath, smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane
-                    )
-                else:
-                    self.phase1b_hspace_rungs(
+                if cutlass.const_expr(self.use_ext_counts):
+                    # ---- Waterfall L1 admission (ext counts) ----
+                    # Rung thresholds AND exact counts arrive from the
+                    # indexer epilogue: skip P1b + the M-ary count pass.
+                    # Route through the seeded refine (s_r0col = -1): an
+                    # in-band rung is re-measured once (builds the
+                    # per-thread hand-off Phase 3 requires) and accepted;
+                    # a full miss seeds log-falsi from the ext brackets.
+                    if tidx == cutlass.Int32(0):
+                        for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                            s_mt_thr[m] = seed_thr_row[m]
+                            s_mt_cnt[m] = cutlass.Int32(seed_counts_row[m])
+                        s_r0col[0] = cutlass.Int32(-1)
+                if cutlass.const_expr(not self.use_ext_counts):
+                    if cutlass.const_expr(self.p1b_cache):
+                        # rungs from the SMEM gather-cache P1 stashed (no 2nd
+                        # GMEM gather); 16-bit only.
+                        self.phase1b_hspace_rungs_cached(
+                            pre_idx_count,
+                            smem_gath,
+                            smem_hist,
+                            s_thr,
+                            s_mt_thr,
+                            tidx,
+                            warp_id,
+                            lane,
+                        )
+                    else:
+                        self.phase1b_hspace_rungs(
+                            input_row,
+                            N,
+                            pre_idx_row,
+                            pre_idx_count,
+                            pre_idx_offset,
+                            smem_hist,
+                            s_thr,
+                            s_mt_thr,
+                            tidx,
+                            warp_id,
+                            lane,
+                        )
+                    self.block_count_ge_multi(
                         input_row,
-                        N,
-                        pre_idx_row,
-                        pre_idx_count,
-                        pre_idx_offset,
-                        smem_hist,
-                        s_thr,
+                        slice_start,
+                        slice_end,
                         s_mt_thr,
+                        smem_ptcnt_multi,
+                        smem_wcnt_multi,
+                        s_mt_cnt,
+                        s_cluster_partial_m,
+                        do_cluster_sync,
                         tidx,
                         warp_id,
                         lane,
+                        smem_ptcnt=smem_ptcnt,
+                        block_max_row=block_max_row,
+                        smem_active=smem_active,
+                        s_active_cnt=s_active_cnt,
                     )
-                self.block_count_ge_multi(
-                    input_row,
-                    slice_start,
-                    slice_end,
-                    s_mt_thr,
-                    smem_ptcnt_multi,
-                    smem_wcnt_multi,
-                    s_mt_cnt,
-                    s_cluster_partial_m,
-                    do_cluster_sync,
-                    tidx,
-                    warp_id,
-                    lane,
-                    smem_ptcnt=smem_ptcnt,
-                    block_max_row=block_max_row,
-                    smem_active=smem_active,
-                    s_active_cnt=s_active_cnt,
-                )
-                cute.arch.barrier()
-                if tidx == 0:
-                    # tightest admissible rung = SMALLEST count in [K, kC].
-                    # (Explicit argmin: with r0_vseed the pmean column is not
-                    # sorted into the rung order; for sorted rungs this is
-                    # equivalent to the old "last m in window" rule.)
-                    # Dropped rungs (block-skip rung tightening) hold PARTIAL
-                    # counts — never admissible.
-                    dmask_c = cutlass.Int32(0)
-                    if cutlass.const_expr(self.enable_block_skip):
-                        dmask_c = s_active_cnt[2]
-                    best_m = cutlass.Int32(-1)
-                    best_c = cutlass.Int32(2147483647)
-                    for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                        cm = s_mt_cnt[m]
-                        if (
-                            cm >= cutlass.Int32(self.top_k)
-                            and cm <= cutlass.Int32(self.kC)
-                            and cm < best_c
-                            and (dmask_c & (cutlass.Int32(1) << cutlass.Int32(m)))
-                            == cutlass.Int32(0)
-                        ):
-                            best_m = cutlass.Int32(m)
-                            best_c = cm
-                    s_r0col[0] = best_m
-                    if best_m >= cutlass.Int32(0):
-                        s_thr[0] = s_mt_thr[best_m]
-                        s_iscalars[0] = s_mt_cnt[best_m]
-                        # done=1: the threshold is admitted, so Phase 3 must
-                        # SKIP its retry-shrink and honor s_thr[0]. (block_count
-                        # _ge / secant leave done via their own path; the R0
-                        # admission must set it explicitly or Phase 3 re-searches
-                        # and the cluster collect diverges -> wrong output.)
-                        s_iscalars[1] = cutlass.Int32(1)
-                        # Snapshot this CTA's LOCAL slice count for the chosen
-                        # rung into s_iscalars[5] — the per-CTA cand_count that
-                        # Phase 3/4's cluster gather consumes (block_count_ge
-                        # sets it too; the R0 admission must match). Without it
-                        # the cluster collect under-counts -> wrong output.
-                        if cutlass.const_expr(cluster_size > 1):
-                            s_iscalars[5] = s_cluster_partial_m[best_m]
+                    cute.arch.barrier()
+                    if tidx == 0:
+                        # tightest admissible rung = SMALLEST count in [K, kC].
+                        # (Explicit argmin: with r0_vseed the pmean column is not
+                        # sorted into the rung order; for sorted rungs this is
+                        # equivalent to the old "last m in window" rule.)
+                        # Dropped rungs (block-skip rung tightening) hold PARTIAL
+                        # counts — never admissible.
+                        dmask_c = cutlass.Int32(0)
+                        if cutlass.const_expr(self.enable_block_skip):
+                            dmask_c = s_active_cnt[2]
+                        best_m = cutlass.Int32(-1)
+                        best_c = cutlass.Int32(2147483647)
+                        for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                            cm = s_mt_cnt[m]
+                            if (
+                                cm >= cutlass.Int32(self.top_k)
+                                and cm <= cutlass.Int32(self.kC)
+                                and cm < best_c
+                                and (dmask_c & (cutlass.Int32(1) << cutlass.Int32(m)))
+                                == cutlass.Int32(0)
+                            ):
+                                best_m = cutlass.Int32(m)
+                                best_c = cm
+                        s_r0col[0] = best_m
+                        if best_m >= cutlass.Int32(0):
+                            s_thr[0] = s_mt_thr[best_m]
+                            s_iscalars[0] = s_mt_cnt[best_m]
+                            # done=1: the threshold is admitted, so Phase 3 must
+                            # SKIP its retry-shrink and honor s_thr[0]. (block_count
+                            # _ge / secant leave done via their own path; the R0
+                            # admission must set it explicitly or Phase 3 re-searches
+                            # and the cluster collect diverges -> wrong output.)
+                            s_iscalars[1] = cutlass.Int32(1)
+                            # Snapshot this CTA's LOCAL slice count for the chosen
+                            # rung into s_iscalars[5] — the per-CTA cand_count that
+                            # Phase 3/4's cluster gather consumes (block_count_ge
+                            # sets it too; the R0 admission must match). Without it
+                            # the cluster collect under-counts -> wrong output.
+                            if cutlass.const_expr(cluster_size > 1):
+                                s_iscalars[5] = s_cluster_partial_m[best_m]
+
                 cute.arch.barrier()
                 bc = s_r0col[0]
                 if bc >= cutlass.Int32(0) and bc < cutlass.Int32(self.M_qf):
@@ -4902,6 +4960,19 @@ class GvrTopKKernel:
                                 cand = bhi
                             elif clo < cutlass.Int32(0):
                                 cand = blo
+                            if cutlass.const_expr(self.use_ext_counts):
+                                # tightest ext rung already in [K, kC]:
+                                # measure exactly it (accepts in one pass).
+                                cbe = cutlass.Int32(2147483647)
+                                for m in cutlass.range_constexpr(M):
+                                    cm4 = s_mt_cnt[m]
+                                    if (
+                                        cm4 >= cutlass.Int32(self.top_k)
+                                        and cm4 <= cutlass.Int32(self.kC)
+                                        and cm4 < cbe
+                                    ):
+                                        cbe = cm4
+                                        cand = s_mt_thr[m]
                             s_thr[0] = cand
                         cute.arch.barrier()
                         rs = cutlass.Int32(0)
@@ -5207,6 +5278,8 @@ class GvrTopKKernel:
         order_row: cute.Tensor,  # or None when seqlen_sorted=False
         stream,
         block_max: cute.Tensor = None,  # block-skip bounds; None = disabled
+        seed_thr: cute.Tensor = None,  # [num_rows, 3] fp32 (ext counts)
+        seed_counts: cute.Tensor = None,  # [num_rows, 3] int32 (ext counts)
     ):
         num_rows = input_data.shape[0]
         cluster_size = cutlass.const_expr(self.cluster_size)
@@ -5229,6 +5302,8 @@ class GvrTopKKernel:
             output_indices,
             order_row,
             block_max,
+            seed_thr,
+            seed_counts,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),

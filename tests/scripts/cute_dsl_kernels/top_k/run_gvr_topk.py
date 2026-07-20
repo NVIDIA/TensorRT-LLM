@@ -65,6 +65,7 @@ def _compile(
     p4_warp_redundant: bool = True,
     p2_warp_redundant: bool = True,
     enable_block_skip: bool = False,
+    use_ext_counts: bool = False,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -133,6 +134,20 @@ def _compile(
         if enable_block_skip
         else None
     )
+    seed_thr_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (n_rows, 3), stride_order=(1, 0), assumed_align=4
+        )
+        if use_ext_counts
+        else None
+    )
+    seed_counts_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_rows, 3), stride_order=(1, 0), assumed_align=4
+        )
+        if use_ext_counts
+        else None
+    )
     fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel = GvrTopKKernel(
         dtype=cute_dtype,
@@ -152,6 +167,11 @@ def _compile(
         p4_warp_redundant=p4_warp_redundant,
         p2_warp_redundant=p2_warp_redundant,
         enable_block_skip=enable_block_skip,
+        use_ext_counts=use_ext_counts,
+        # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
+        # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
+        # the slot count matters.
+        r0_qfracs=(0.85, 0.35) if use_ext_counts else None,
     )
     return cute.compile(
         kernel,
@@ -163,6 +183,8 @@ def _compile(
         order_row_fake,
         stream=fake_stream,
         block_max=block_max_fake,
+        seed_thr=seed_thr_fake,
+        seed_counts=seed_counts_fake,
         options="--enable-tvm-ffi",
     )
 
@@ -415,6 +437,8 @@ def gvr_topk_decode(
     p2_warp_redundant: bool = True,
     block_max: Optional[torch.Tensor] = None,
     skip_min_n: Optional[int] = 200_000,
+    seed_thr: Optional[torch.Tensor] = None,
+    seed_counts: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -497,6 +521,20 @@ def gvr_topk_decode(
     # cs1/cs8 vs stock cs8 19.7us) -> keep the stock path.
     if block_max is not None and num_rows < 8 and top_k > 512:
         block_max = None
+    use_ext_counts = seed_thr is not None and seed_counts is not None
+    if use_ext_counts:
+        assert (
+            seed_thr.dtype == torch.float32
+            and seed_thr.is_cuda
+            and seed_thr.is_contiguous()
+            and seed_thr.shape == (num_rows, 3)
+        ), "seed_thr must be contiguous CUDA fp32 [num_rows, 3]"
+        assert (
+            seed_counts.dtype == torch.int32
+            and seed_counts.is_cuda
+            and seed_counts.is_contiguous()
+            and seed_counts.shape == (num_rows, 3)
+        ), "seed_counts must be contiguous CUDA int32 [num_rows, 3]"
     enable_block_skip = block_max is not None
     if enable_block_skip:
         assert (
@@ -575,6 +613,7 @@ def gvr_topk_decode(
         p4_warp_redundant,
         p2_warp_redundant,
         enable_block_skip,
+        use_ext_counts,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.
@@ -588,6 +627,8 @@ def gvr_topk_decode(
         out_indices,
         order_row if seqlen_sorted else None,
         block_max if enable_block_skip else None,
+        seed_thr if use_ext_counts else None,
+        seed_counts if use_ext_counts else None,
     )
     if return_output_values:
         return out_values, out_indices
