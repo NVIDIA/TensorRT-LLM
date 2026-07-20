@@ -445,6 +445,9 @@ def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
     PYTHON transceiver: check_gen_transfer_status(None) blocks for all. C++:
     the int API can return before THIS request completes on a cold link, so
     poll for a terminal state (bounded by signal.alarm + hang detector).
+    Logs periodic progress so a stalled transfer shows WHICH request is stuck
+    in WHICH state (the difference between "requests never matched" and
+    "RDMA write never completed").
     """
     if runtime == "PYTHON":
         xcvr.check_gen_transfer_status(None)
@@ -453,10 +456,20 @@ def _wait_gen_complete(xcvr, req, runtime, llm_request_state):
         llm_request_state.DISAGG_GENERATION_TRANS_COMPLETE,
         llm_request_state.DISAGG_TRANS_ERROR,
     )
+    t0 = time.monotonic()
+    next_report = t0 + 15.0
     while req.state not in terminal:
         xcvr.check_gen_transfer_status(1)
         if req.state in terminal:
             break
+        now = time.monotonic()
+        if now >= next_report:
+            print(
+                f"[precheck] rid={req.py_request_id} recv still waiting: "
+                f"state={req.state} elapsed={now - t0:.0f}s",
+                flush=True,
+            )
+            next_report = now + 15.0
         time.sleep(0.001)
 
 
@@ -766,6 +779,9 @@ class PrecheckRunner:
 
     def ctx_finish_chunk(self, reqs):
         """Wait for all in-flight sends of this chunk, then free."""
+        import tensorrt_llm
+
+        t0 = time.monotonic()
         local_err = None
         try:
             self.xcvr.check_context_transfer_status(None)  # block-all
@@ -778,6 +794,11 @@ class PrecheckRunner:
             local_err = e
         finally:
             self._free_all(reqs)
+        states = {p: str(r.state) for p, r in reqs.items()}
+        tensorrt_llm.logger.info(
+            f"[ctx{self.server_idx} r{self.rank}] chunk sends finished in "
+            f"{time.monotonic() - t0:.1f}s states={states}"
+        )
         reason = self._consensus_error(local_err)
         if reason is not None:
             raise _TransferError(f"ctx transfer failed: {reason}")
@@ -810,9 +831,15 @@ class PrecheckRunner:
             raise _TransferError(f"gen receive setup failed: {reason}")
 
         mismatch = ""
+        t0 = time.monotonic()
         try:
             for pair, req in reqs.items():
                 _wait_gen_complete(self.xcvr, req, self.runtime, self.llm_request_state)
+            if reqs:
+                tensorrt_llm.logger.info(
+                    f"[gen{self.server_idx} r{self.rank}] chunk recvs finished in "
+                    f"{time.monotonic() - t0:.1f}s"
+                )
             torch.cuda.synchronize()  # receive may land on a side stream
             bad = [
                 p for p, r in reqs.items() if r.state == self.llm_request_state.DISAGG_TRANS_ERROR
@@ -1090,6 +1117,13 @@ def main(argv=None):
     # failure summary uses to spot host-staged tcp fallbacks.
     os.environ.setdefault("UCX_PROTO_INFO", "used")
 
+    # PRECHECK_DEBUG=1: verbose C++/Python transceiver logs for stall
+    # debugging. Must be set before importing tensorrt_llm (the C++ logger
+    # reads TLLM_LOG_LEVEL at init).
+    debug = os.environ.get("PRECHECK_DEBUG") == "1"
+    if debug:
+        os.environ.setdefault("TLLM_LOG_LEVEL", "DEBUG")
+
     import torch
     from mpi4py import MPI
 
@@ -1106,7 +1140,7 @@ def main(argv=None):
             f"{args.role} server step."
         )
     torch.cuda.set_device(rank % torch.cuda.device_count())
-    tensorrt_llm.logger.set_level("info")
+    tensorrt_llm.logger.set_level("debug" if debug else "info")
 
     ucx_env = " ".join(f"{k}={v}" for k, v in sorted(os.environ.items()) if k.startswith("UCX_"))
     print(
