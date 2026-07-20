@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/executor/version.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
 
@@ -50,9 +51,11 @@ namespace tensorrt_llm::executor
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 /// @brief Version of TRT-LLM
-char const* version() noexcept;
+inline char const* version() noexcept
+{
+    return kTensorRtLlmVersion;
+}
 
-class Model;
 class Serialization;
 class DataTransceiverState;
 
@@ -1260,6 +1263,11 @@ private:
     SizeType32 mDebugTensorsMaxIterations;
 };
 
+/// @brief Configuration for the orchestrator communication mode.
+/// @deprecated Orchestrator mode is non-functional: the worker binary it spawned
+/// (executorWorker) was removed together with the TensorRT backend. This class is
+/// retained only for serialization and Python-binding compatibility and is a
+/// candidate for removal in a follow-up (needs API-stability review).
 class OrchestratorConfig
 {
 public:
@@ -1862,7 +1870,13 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 struct KVCacheEvent
 {
     KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
-        std::optional<SizeType32> attentionDpRank = std::nullopt);
+        std::optional<SizeType32> attentionDpRank = std::nullopt)
+        : eventId{eventId}
+        , data{std::move(data)}
+        , windowSize{windowSize}
+        , attentionDpRank{attentionDpRank}
+    {
+    }
 
     /// @brief The unique id of this event
     IdType eventId;
@@ -1888,119 +1902,6 @@ public:
 
 private:
     std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager> kvCacheManager;
-};
-
-/// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
-class Executor
-{
-
-public:
-    /// @brief
-    /// @param modelPath Path to the folder that defines the model to run
-    /// @param modelType The type of model
-    /// @param executorConfig The configuration for the executor
-    Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig);
-
-    Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
-        ModelType modelType, ExecutorConfig const& executorConfig);
-
-    Executor(BufferView const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
-        ExecutorConfig const& executorConfig,
-        std::optional<std::map<std::string, Tensor>> const& managedWeights = std::nullopt);
-
-    Executor(BufferView const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
-        BufferView const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
-        ExecutorConfig const& executorConfig);
-
-    Executor(std::shared_ptr<Model> model, ExecutorConfig const& executorConfig);
-
-    Executor(
-        std::shared_ptr<Model> encoderModel, std::shared_ptr<Model> decoderModel, ExecutorConfig const& executorConfig);
-
-    ~Executor();
-    Executor(Executor const& executor) = delete;
-    Executor& operator=(Executor const& executor) = delete;
-    Executor(Executor&&) = default;
-    Executor& operator=(Executor&&) = default;
-
-    /// @brief Enqueue a new request
-    /// @param request The LLM request which contains input tokens and request parameters
-    /// @return A unique id that identifies the request
-    [[nodiscard]] IdType enqueueRequest(Request const& request);
-
-    /// @brief Enqueue a batch of request
-    [[nodiscard]] std::vector<IdType> enqueueRequests(std::vector<Request> const& requests);
-
-    /// @brief Await for ready responses
-    ///
-    ///        This overload awaits for any ready responses. In particular, if several requests
-    ///        have been enqueued, this method will provide any ready responses without order guarantees.
-    /// @param timeout The maximum time to wait for new responses
-    /// @return A vector of responses
-    [[nodiscard]] std::vector<Response> awaitResponses(
-        std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
-
-    /// @brief Await for ready responses
-    /// @param id A request id
-    /// @param timeout The maximum time to wait for new responses
-    /// @return A vector of responses
-    [[nodiscard]] std::vector<Response> awaitResponses(
-        IdType const& requestId, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
-
-    /// @brief Await for multiple ready responses
-    ///
-    ///        A multiple ID request behaves as if awaitResponses(IdType, timeout)
-    ///        were invoked on all IDs. The returned vector contains
-    ///        a vector of responses per ID in the same order specified by the requestIds.
-    ///        The same behaviour as awaitResponses(IdType, timeout) applies:
-    ///        * Responses may be empty.
-    ///        * If all responses have already been given for one of the requestIds,
-    ///          then this method will hang unless a timeout is specified.
-    /// @param requestIds Ids requested
-    /// @param timeout The maximum time to wait for new responses
-    /// @return A vector of vector of responses
-    [[nodiscard]] std::vector<std::vector<Response>> awaitResponses(
-        std::vector<IdType> const& requestIds, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
-
-    /// @brief Get the number of ready responses
-    /// @param requestId An optional request id
-    /// @return The number of ready responses
-    [[nodiscard]] SizeType32 getNumResponsesReady(std::optional<IdType> const& requestId = std::nullopt) const;
-
-    /// @brief Cancel the request with provided request id
-    /// @param id The request id for which to cancel the response
-    void cancelRequest(IdType requestId);
-
-    /// @brief   Signals the server to shutdown.
-    /// @details This call is blocking. Only returns when all requests have terminated or timeout has been reached
-    void shutdown();
-
-    /// @brief  Returns the per-iterations statistics computed since last call to getLatestIterationStats.
-    ///         Contains at most iterStatsMaxIterations iterations, or all iterations when set to -1.
-    /// @return Iteration stats
-    std::deque<IterationStats> getLatestIterationStats();
-
-    /// @brief  Returns the request stats of each iteration computed since last call to getLatestRequestStats.
-    ///         Contains at most requestStatsMaxIterations iterations, or all iterations when set to -1.
-    /// @return Request stats grouped by iterations
-    std::deque<RequestStatsPerIteration> getLatestRequestStats();
-
-    /// @brief  Returns the debug tensors of each iteration computed since last call to getLatestDebugTensors.
-    ///         Contains at most debugTensorsMaxIterations iterations.
-    /// @return Request debug tensors grouped by iterations
-    std::deque<DebugTensorsPerIteration> getLatestDebugTensors();
-
-    /// @brief  Indicates if the current process is allowed to enqueueRequests
-    [[nodiscard]] bool canEnqueueRequests() const;
-
-    /// @brief  Indicates if the current process participates in this executor instance
-    [[nodiscard]] bool isParticipant() const;
-
-    std::optional<std::shared_ptr<KVCacheEventManager>> getKVCacheEventManager() const;
-
-private:
-    class Impl;
-    std::unique_ptr<Impl> mImpl;
 };
 
 /// @brief Class with utility functions to serialize statistics to json string

@@ -654,6 +654,31 @@ def test_collect_llm_api_config_captures_sampler_type_categorical():
     assert meta["capture_succeeded"] is True
 
 
+def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
+    """transceiver_runtime is a single Optional[Literal] categorical.
+
+    Regression: a two-branch Literal union (Optional[Literal['CPP','PYTHON']]
+    | Literal['auto']) would not unwrap to a top-level Literal, degrading the
+    manifest kind to 'value' and making the sanitizer reject all three
+    strings. Every allowed value plus None must be captured, not excluded.
+    """
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+    for runtime in ("CPP", "PYTHON", "auto", None):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime=runtime
+            ),
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["cache_transceiver_config.transceiver_runtime"] == runtime
+        assert meta["capture_succeeded"] is True
+
+
 def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():
     """An out-of-allowlist value on a categorical bare-str field is dropped.
 

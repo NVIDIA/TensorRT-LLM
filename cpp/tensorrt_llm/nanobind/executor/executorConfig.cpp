@@ -182,6 +182,9 @@ void initConfigBindings(nb::module_& m)
         .def("__getstate__", kvCacheConfigGetstate)
         .def("__setstate__", kvCacheConfigSetstate);
 
+    // Deprecated: orchestrator mode is non-functional (its executorWorker binary was
+    // removed with the TensorRT backend); binding kept for compatibility, removal is a
+    // follow-up pending API-stability review.
     nb::class_<tle::OrchestratorConfig>(m, "OrchestratorConfig")
         .def(nb::init<bool, std::string, std::shared_ptr<mpi::MpiComm>, bool>(), nb::arg("is_orchestrator") = true,
             nb::arg("worker_executable_path") = "", nb::arg("orch_leader_comm").none() = nullptr,

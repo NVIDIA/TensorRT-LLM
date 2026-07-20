@@ -24,7 +24,7 @@ import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     greedy_search_sampling_batch,
-    top_k_sampling_batch,
+    top_k_top_p_sampling_batch,
 )
 from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.executor.request import GenerationRequest
@@ -312,7 +312,7 @@ class DemoEngine(ADEngine):
         logits_shape = logits.shape
         logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
         if isinstance(sampling_params.top_k, int) and sampling_params.top_k > 1:
-            idx_next, probs = top_k_sampling_batch(
+            idx_next, probs = top_k_top_p_sampling_batch(
                 logits, top_k=sampling_params.top_k, temperature=1.0
             )
         else:
