@@ -6078,7 +6078,7 @@ class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
 
-    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.skip_less_device_memory(90000)
     def test_bf16_dflash(self):
         self._run_dflash_accuracy(self.MODEL_PATH, self.DFLASH_MODEL_PATH)
 
