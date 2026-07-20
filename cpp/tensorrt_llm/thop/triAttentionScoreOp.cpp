@@ -21,11 +21,11 @@
 
 namespace tk = tensorrt_llm::kernels::tri_attention_score;
 
-// Two ops rather than one fused op, matching the file-level granularity of
-// sibling kernel wrappers (one op per kernel launch): the coefficient fold
-// runs once per eviction round into persistent buffers whose plane count
-// depends on the aggregation mode, while the score launch consumes those
-// buffers; callers time and re-plan them independently.
+// One op per kernel launch, matching the file-level granularity of sibling
+// kernel wrappers: the per-round coefficient preparation (the rotation op on
+// the mean path, the trigonometric fold on the max path) writes persistent
+// buffers whose plane count depends on the aggregation mode, while the score
+// launch consumes those buffers; callers time and re-plan them independently.
 
 namespace
 {
@@ -69,7 +69,10 @@ float const* checkKvScales(
 // writes one c_re/c_im plane per offset. kv_scales (quantized pools only)
 // folds the per-layer dequantization scale into every coefficient table; the
 // paired score op then reads raw quantized elements. This op cannot see the
-// pool dtype, so presence-iff-quantized is enforced by the score op.
+// pool dtype, so presence-iff-quantized is enforced by the score op. The
+// production mean path prepares its coefficients through the rotation op
+// below instead; this fold remains the max-aggregation path (and keeps its
+// mean branch for that kernel's documented contract).
 void triAttentionFoldScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im, torch::Tensor c_mlr,
     torch::Tensor q_real, torch::Tensor q_imag, torch::Tensor mlr_coef, torch::Tensor freq_scale_sq,
     std::optional<torch::Tensor> mean_cos, std::optional<torch::Tensor> mean_sin, std::optional<torch::Tensor> omega,
@@ -139,6 +142,57 @@ void triAttentionFoldScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im,
         static_cast<int32_t>(num_freqs), static_cast<int32_t>(num_offsets), use_max, stream);
 }
 
+// Per-round mean-path coefficient rotation: gather each request's row of the
+// initialization-time phase tables (freq_scale_sq, the offset mean, and — via
+// the pre-scaled calibration query — the per-layer KV dequantization scale
+// are already baked in) and rotate the query by it, writing the same
+// c_re/c_im planes the mean fold produced, with zero trigonometry per round.
+// c_mlr has no position term, so on this path it is folded once at
+// initialization and this op never touches it. Round starts index the phase
+// tables directly, so a start at or past max_position (the tabulated position
+// count) must fail loudly here rather than gather out of range; like the
+// kv_scales positivity check above, the bounds reduction costs one small
+// host sync per eviction round. Design: Fanrong Li (torch-graph review,
+// 2026-07-20).
+void triAttentionRotateMeanScoreCoefficientsOp(torch::Tensor c_re, torch::Tensor c_im, torch::Tensor q_real_scaled,
+    torch::Tensor q_imag_scaled, torch::Tensor phase_cos, torch::Tensor phase_sin, torch::Tensor round_starts,
+    int64_t num_requests, int64_t num_calibrated_layers, int64_t num_query_heads, int64_t num_freqs,
+    int64_t max_position)
+{
+    checkContiguousCuda(c_re, at::kFloat, "fp32", "c_re");
+    checkContiguousCuda(c_im, at::kFloat, "fp32", "c_im");
+    checkContiguousCuda(q_real_scaled, at::kFloat, "fp32", "q_real_scaled");
+    checkContiguousCuda(q_imag_scaled, at::kFloat, "fp32", "q_imag_scaled");
+    checkContiguousCuda(phase_cos, at::kFloat, "fp32", "phase_cos");
+    checkContiguousCuda(phase_sin, at::kFloat, "fp32", "phase_sin");
+    checkContiguousCuda(round_starts, at::kInt, "int32", "round_starts");
+    TORCH_CHECK(
+        num_requests > 0 && num_calibrated_layers > 0 && num_query_heads > 0 && num_freqs > 0 && max_position > 0,
+        "tri_attention_rotate_mean_score_coefficients: rotation extents must be positive");
+    int64_t const total = num_requests * num_calibrated_layers * num_query_heads * num_freqs;
+    int64_t const calibration = num_calibrated_layers * num_query_heads * num_freqs;
+    TORCH_CHECK(c_re.numel() >= total && c_im.numel() >= total,
+        "tri_attention_rotate_mean_score_coefficients: coefficient buffers are undersized");
+    TORCH_CHECK(q_real_scaled.numel() >= calibration && q_imag_scaled.numel() >= calibration,
+        "tri_attention_rotate_mean_score_coefficients: scaled calibration tensors are undersized");
+    TORCH_CHECK(phase_cos.numel() >= max_position * num_freqs && phase_sin.numel() >= max_position * num_freqs,
+        "tri_attention_rotate_mean_score_coefficients: phase tables do not cover max_position rows");
+    TORCH_CHECK(round_starts.numel() >= num_requests,
+        "tri_attention_rotate_mean_score_coefficients: round_starts are undersized");
+    auto const [minStart, maxStart] = round_starts.narrow(0, 0, num_requests).aminmax();
+    TORCH_CHECK(minStart.item<int32_t>() >= 0 && maxStart.item<int32_t>() < max_position,
+        "tri_attention_rotate_mean_score_coefficients: a round start lies outside the tabulated position range "
+        "[0, ",
+        max_position, ")");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+    tk::rotateMeanScoreCoefficientsLaunch(q_real_scaled.data_ptr<float>(), q_imag_scaled.data_ptr<float>(),
+        phase_cos.data_ptr<float>(), phase_sin.data_ptr<float>(), round_starts.data_ptr<int32_t>(),
+        c_re.data_ptr<float>(), c_im.data_ptr<float>(), static_cast<int32_t>(num_requests),
+        static_cast<int32_t>(num_calibrated_layers), static_cast<int32_t>(num_query_heads),
+        static_cast<int32_t>(num_freqs), stream);
+}
+
 // Score every cached decode token of every (request, layer) segment against
 // the folded coefficient tables, writing fp32 [segment, head, token] rows and
 // each request's decode width. pool_anchor is one of the scored layer pools:
@@ -190,7 +244,11 @@ void triAttentionPagedScoreOp(torch::Tensor pool_anchor, torch::Tensor layer_bas
             && request_token_starts.numel() >= num_requests,
         "tri_attention_paged_score: per-request metadata is undersized");
     int64_t const total = num_requests * num_calibrated_layers * num_query_heads * num_freqs;
-    TORCH_CHECK(c_re.numel() >= num_offsets * total && c_im.numel() >= num_offsets * total && c_mlr.numel() >= total,
+    // c_mlr is request independent: the score kernels index it as one static
+    // [layer, head, freq] table, so only the calibration extent is required.
+    int64_t const calibration = num_calibrated_layers * num_query_heads * num_freqs;
+    TORCH_CHECK(
+        c_re.numel() >= num_offsets * total && c_im.numel() >= num_offsets * total && c_mlr.numel() >= calibration,
         "tri_attention_paged_score: folded coefficient buffers are undersized");
     TORCH_CHECK(out.numel() >= num_segments * num_query_heads * output_width,
         "tri_attention_paged_score: score output buffer is undersized");
@@ -295,6 +353,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int num_offsets, bool use_max, Tensor? kv_scales=None) -> ()");
 
     m.def(
+        "tri_attention_rotate_mean_score_coefficients("
+        "Tensor(a!) c_re, Tensor(b!) c_im, "
+        "Tensor q_real_scaled, Tensor q_imag_scaled, "
+        "Tensor phase_cos, Tensor phase_sin, Tensor round_starts, "
+        "int num_requests, int num_calibrated_layers, "
+        "int num_query_heads, int num_freqs, int max_position) -> ()");
+
+    m.def(
         "tri_attention_paged_score("
         "Tensor pool_anchor, Tensor layer_base_addrs, Tensor block_offsets, "
         "Tensor seg_page_offsets, Tensor seg_request_ids, Tensor seg_layer_ids, "
@@ -310,5 +376,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("tri_attention_fold_score_coefficients", &triAttentionFoldScoreCoefficientsOp);
+    m.impl("tri_attention_rotate_mean_score_coefficients", &triAttentionRotateMeanScoreCoefficientsOp);
     m.impl("tri_attention_paged_score", &triAttentionPagedScoreOp);
 }

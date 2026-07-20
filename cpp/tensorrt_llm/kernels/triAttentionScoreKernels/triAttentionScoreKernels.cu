@@ -166,12 +166,14 @@ __device__ __forceinline__ void scoreLoadChunk(char const* row, bool valid, int 
 
 // Accumulate one 8-frequency chunk into this thread's per-head accumulators.
 // coff0 = flat index of (request, layer, first head of this block, chunk
-// frequency 0) in the coefficient tables; all coefficient reads are
-// lane-uniform 16-byte loads. |K| is computed once per (token, frequency)
-// BEFORE the head loop so the GROUP heads share it from registers.
+// frequency 0) in the c_re/c_im tables; mlrOff0 = the matching index in the
+// static request-independent [layer, head, freq] c_mlr table. All coefficient
+// reads are lane-uniform 16-byte loads. |K| is computed once per
+// (token, frequency) BEFORE the head loop so the GROUP heads share it from
+// registers.
 template <typename T, int GROUP, bool USE_MAX>
-__device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, int64_t coff0, int64_t planeStride,
-    uint4 re4, uint4 im4, float* accMean, float* accMlr, float* accPos)
+__device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, int64_t coff0, int64_t mlrOff0,
+    int64_t planeStride, uint4 re4, uint4 im4, float* accMean, float* accMlr, float* accPos)
 {
     float kRe[8], kIm[8], kMag[8];
     unpackChunk8<T>(re4, kRe);
@@ -185,7 +187,7 @@ __device__ __forceinline__ void scoreComputeChunk(FoldedScoreParams const& a, in
     for (int hg = 0; hg < GROUP; ++hg)
     {
         int64_t const coff = coff0 + static_cast<int64_t>(hg) * a.numFreqs;
-        float const* cmp = a.cMlr + coff;
+        float const* cmp = a.cMlr + mlrOff0 + static_cast<int64_t>(hg) * a.numFreqs;
         float4 const cm0 = __ldg(reinterpret_cast<float4 const*>(cmp));
         float4 const cm1 = __ldg(reinterpret_cast<float4 const*>(cmp + 4));
         float const cml[8] = {cm0.x, cm0.y, cm0.z, cm0.w, cm1.x, cm1.y, cm1.z, cm1.w};
@@ -318,6 +320,9 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
 
     int64_t const coff0 = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
         + static_cast<int64_t>(headBase) * a.numFreqs;
+    // The MLR coefficient is position independent, so its table is folded once
+    // at initialization without a request axis: [layer, head, freq].
+    int64_t const mlrOff0 = (static_cast<int64_t>(layerId) * a.numQueryHeads + headBase) * a.numFreqs;
     int64_t const planeStride = static_cast<int64_t>(a.numRequests) * a.numCalibratedLayers * a.numQueryHeads
         * static_cast<int64_t>(a.numFreqs);
 
@@ -350,7 +355,8 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
         {
             uint4 re4, im4;
             scoreLoadChunk<T>(row, valid, a.numFreqs, c, re4, im4);
-            scoreComputeChunk<T, GROUP, USE_MAX>(a, coff0 + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
+            scoreComputeChunk<T, GROUP, USE_MAX>(
+                a, coff0 + c * 8, mlrOff0 + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
         }
     }
     else
@@ -360,7 +366,8 @@ __global__ void __launch_bounds__(kScoreBlockThreads, 7) triScoreVectorizedKerne
         {
             uint4 re4, im4;
             scoreLoadChunk<T>(row, valid, a.numFreqs, c, re4, im4);
-            scoreComputeChunk<T, GROUP, USE_MAX>(a, coff0 + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
+            scoreComputeChunk<T, GROUP, USE_MAX>(
+                a, coff0 + c * 8, mlrOff0 + c * 8, planeStride, re4, im4, accMean, accMlr, accPos);
         }
     }
 
@@ -445,6 +452,8 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
         int64_t const coff
             = (static_cast<int64_t>(reqId) * a.numCalibratedLayers + layerId) * a.numQueryHeads * a.numFreqs
             + static_cast<int64_t>(h) * a.numFreqs;
+        // Static request-independent [layer, head, freq] MLR table index.
+        int64_t const mlrOff = (static_cast<int64_t>(layerId) * a.numQueryHeads + h) * a.numFreqs;
         float acc = 0.0f;
         float accMlr = 0.0f;
         float accPos[kMaxScoreOffsets];
@@ -465,7 +474,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
             float const kMag = triSqrtApprox(kRe * kRe + kIm * kIm);
             if constexpr (USE_MAX)
             {
-                accMlr = fmaf(kMag, a.cMlr[coff + f], accMlr);
+                accMlr = fmaf(kMag, a.cMlr[mlrOff + f], accMlr);
 #pragma unroll
                 for (int o = 0; o < kMaxScoreOffsets; ++o)
                 {
@@ -478,7 +487,7 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
             }
             else
             {
-                acc = fmaf(kRe, a.cRe[coff + f], fmaf(kIm, a.cIm[coff + f], fmaf(kMag, a.cMlr[coff + f], acc)));
+                acc = fmaf(kRe, a.cRe[coff + f], fmaf(kIm, a.cIm[coff + f], fmaf(kMag, a.cMlr[mlrOff + f], acc)));
             }
         }
         if (store)
@@ -508,7 +517,10 @@ __global__ void __launch_bounds__(kScoreBlockThreads) triScoreScalarKernel(Folde
 
 // Per-round coefficient fold: one thread per (request, layer, head, freq)
 // element. On the max path each thread additionally writes one c_re/c_im
-// value per offset plane (planes are `total` elements apart).
+// value per offset plane (planes are `total` elements apart). The production
+// mean path no longer runs this kernel (see the rotation kernel below); the
+// c_mlr rows written here are request-identical, and the score kernels read
+// only the leading [layer, head, freq] block of that buffer.
 __global__ void triFoldScoreCoefficientsKernel(float const* __restrict__ qReal, float const* __restrict__ qImag,
     float const* __restrict__ mlrCoef, float const* __restrict__ freqScaleSq, float const* __restrict__ meanCos,
     float const* __restrict__ meanSin, float const* __restrict__ omega, float const* __restrict__ offsets,
@@ -564,6 +576,50 @@ __global__ void triFoldScoreCoefficientsKernel(float const* __restrict__ qReal, 
             cIm[o * total + idx] = s * (qim * cp + qre * sp);
         }
     }
+}
+
+// Per-round mean-path replacement for the fold above: all trigonometry is
+// tabulated once at initialization (RoPE-style position tables), so the round
+// reduces to one table-row gather per request plus four multiplies and two
+// adds per element. With
+//     phaseCos[pos, f] = freq_scale_sq[f] * (1/O) * sum_o cos((pos + offset_o) * omega_f)
+//     phaseSin[pos, f] = freq_scale_sq[f] * (1/O) * sum_o sin((pos + offset_o) * omega_f)
+//     qRealScaled / qImagScaled = kv_scale_l * q   (identity for float pools)
+// the rotation
+//     c_re = qRealScaled * phaseCos[rs] - qImagScaled * phaseSin[rs]
+//     c_im = qImagScaled * phaseCos[rs] + qRealScaled * phaseSin[rs]
+// equals the mean fold's freq_scale_sq * kv_scale_l * (q rotated by the
+// offset-mean phase at round start rs), because both scale factors distribute
+// over the complex product. The position-independent c_mlr fold is fully
+// static (folded once at initialization, request axis removed), so this
+// kernel never writes it. Grid mirrors the fold kernel: one thread per
+// (request, layer, head, freq) element. The host wrapper guarantees every
+// round start indexes inside the tables.
+// Design: Fanrong Li (torch-graph review, 2026-07-20).
+__global__ void triRotateMeanScoreCoefficientsKernel(float const* __restrict__ qRealScaled,
+    float const* __restrict__ qImagScaled, float const* __restrict__ phaseCos, float const* __restrict__ phaseSin,
+    int32_t const* __restrict__ roundStarts, float* __restrict__ cRe, float* __restrict__ cIm,
+    int32_t numCalibratedLayers, int32_t numQueryHeads, int32_t numFreqs, int64_t total)
+{
+    int64_t const idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total)
+    {
+        return;
+    }
+    auto const f = static_cast<int32_t>(idx % numFreqs);
+    int64_t const rest = idx / numFreqs;
+    int64_t const calibrationRows = static_cast<int64_t>(numCalibratedLayers) * numQueryHeads;
+    auto const req = static_cast<int32_t>(rest / calibrationRows);
+    // Calibration tables are per (layer, head, freq); the request-major flat
+    // index reduces onto them modulo the calibration extent.
+    int64_t const cIdx = (rest % calibrationRows) * numFreqs + f;
+    int64_t const phaseIdx = static_cast<int64_t>(roundStarts[req]) * numFreqs + f;
+    float const pc = phaseCos[phaseIdx];
+    float const ps = phaseSin[phaseIdx];
+    float const qre = qRealScaled[cIdx];
+    float const qim = qImagScaled[cIdx];
+    cRe[idx] = qre * pc - qim * ps;
+    cIm[idx] = qim * pc + qre * ps;
 }
 
 template <typename T>
@@ -660,6 +716,18 @@ void foldScoreCoefficientsLaunch(float const* qReal, float const* qImag, float c
     triFoldScoreCoefficientsKernel<<<blocks, threads, 0, stream>>>(qReal, qImag, mlrCoef, freqScaleSq, meanCos, meanSin,
         omega, offsets, roundStarts, kvScales, cRe, cIm, cMlr, numCalibratedLayers, numQueryHeads, numFreqs, numOffsets,
         useMax, total);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void rotateMeanScoreCoefficientsLaunch(float const* qRealScaled, float const* qImagScaled, float const* phaseCos,
+    float const* phaseSin, int32_t const* roundStarts, float* cRe, float* cIm, int32_t numRequests,
+    int32_t numCalibratedLayers, int32_t numQueryHeads, int32_t numFreqs, cudaStream_t stream)
+{
+    int64_t const total = static_cast<int64_t>(numRequests) * numCalibratedLayers * numQueryHeads * numFreqs;
+    int32_t const threads = 256;
+    auto const blocks = static_cast<uint32_t>((total + threads - 1) / threads);
+    triRotateMeanScoreCoefficientsKernel<<<blocks, threads, 0, stream>>>(qRealScaled, qImagScaled, phaseCos, phaseSin,
+        roundStarts, cRe, cIm, numCalibratedLayers, numQueryHeads, numFreqs, total);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 

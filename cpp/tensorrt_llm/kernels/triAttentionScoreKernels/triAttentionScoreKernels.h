@@ -79,6 +79,13 @@ inline constexpr int32_t kScoreBlockThreads = 128;
 // plane included) lets the score kernel consume raw quantized elements. The
 // |K| term relies on |scale * K_q| == scale * |K_q|, which only holds for
 // scale > 0 — the host wrapper validates positivity before launch.
+//
+// The c_mlr rows this kernel writes are request-identical (the request axis
+// only enters through the phase terms), and the score kernels consume c_mlr
+// through a request-independent [L_cal, HQ, F] index, i.e. only the leading
+// calibration block of the buffer. The production mean path skips this fold
+// entirely (see rotateMeanScoreCoefficientsLaunch below); this launch remains
+// the "max" aggregation path.
 void foldScoreCoefficientsLaunch(float const* qReal, // [L_cal * HQ * F]
     float const* qImag,                              // [L_cal * HQ * F]
     float const* mlrCoef,                            // [L_cal * HQ * F]
@@ -95,6 +102,33 @@ void foldScoreCoefficientsLaunch(float const* qReal, // [L_cal * HQ * F]
     int32_t numRequests, int32_t numCalibratedLayers, int32_t numQueryHeads, int32_t numFreqs, int32_t numOffsets,
     bool useMax, cudaStream_t stream);
 
+// Mean-aggregation replacement for the per-round fold above: rotate the
+// pre-scaled calibration query by tabulated phases instead of computing any
+// trigonometry per round. phaseCos/phaseSin hold, for every possible round
+// start position (built once at initialization, float64 accumulation),
+//     phaseCos[pos, f] = freq_scale_sq[f] * (1/O) * sum_o cos((pos + offset_o) * omega_f)
+//     phaseSin[pos, f] = freq_scale_sq[f] * (1/O) * sum_o sin((pos + offset_o) * omega_f)
+// and qRealScaled/qImagScaled carry the per-layer KV dequantization scale
+// (identity for float pools). Each thread gathers its request's table row and
+// writes
+//     c_re = q_re_s * phaseCos[rs] - q_im_s * phaseSin[rs]
+//     c_im = q_im_s * phaseCos[rs] + q_re_s * phaseSin[rs]
+// into the same [numRequests, L_cal, HQ, F] planes the fold produces, because
+// freq_scale_sq and kv_scale distribute over the complex rotation. c_mlr has
+// no position term, so on this path it is folded once at initialization into
+// a static [L_cal, HQ, F] table and never rewritten per round. The "max"
+// aggregation keeps foldScoreCoefficientsLaunch unchanged. Every round start
+// must lie in [0, maxPosition); the host wrapper enforces that loudly before
+// launch. Design: Fanrong Li (torch-graph review, 2026-07-20).
+void rotateMeanScoreCoefficientsLaunch(float const* qRealScaled, // [L_cal * HQ * F]
+    float const* qImagScaled,                                    // [L_cal * HQ * F]
+    float const* phaseCos,                                       // [maxPosition * F]
+    float const* phaseSin,                                       // [maxPosition * F]
+    int32_t const* roundStarts,                                  // [numRequests], each in [0, maxPosition)
+    float* cRe,                                                  // [numRequests, L_cal, HQ, F]
+    float* cIm,                                                  // [numRequests, L_cal, HQ, F]
+    int32_t numRequests, int32_t numCalibratedLayers, int32_t numQueryHeads, int32_t numFreqs, cudaStream_t stream);
+
 // Everything one folded-score launch needs. One "segment" is one
 // (request, scored layer) pair; segments are request-major so
 // seg % numLayers == 0 identifies each request's first segment.
@@ -108,9 +142,9 @@ struct FoldedScoreParams
     int32_t const* requestSeqLens;     // [numRequests]
     int32_t* validWidthOut;            // [numRequests] side-store: seqLen - tokenStart, once per request
     int32_t const* requestTokenStarts; // [numRequests] pinned prompt length = decode-region origin
-    float const* cRe;                  // fold output (see foldScoreCoefficientsLaunch)
+    float const* cRe;  // per-round output (see foldScoreCoefficientsLaunch / rotateMeanScoreCoefficientsLaunch)
     float const* cIm;
-    float const* cMlr;
+    float const* cMlr; // static, request-independent [L_cal, HQ, F] MLR table
     float* out;        // [segment, numQueryHeads, outputWidth] fp32 decode-only scores
     int32_t outputWidth;
     int32_t numLayers; // scored layers per request (the segment period)

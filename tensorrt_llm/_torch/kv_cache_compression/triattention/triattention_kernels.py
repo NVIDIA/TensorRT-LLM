@@ -5,8 +5,10 @@
 The production path uses one fixed-shape trig-score launch across all dense
 layers, CuTE-DSL TopK selection, and grouped C++ compaction. This module owns
 the score launcher and its persistent metadata; scoring itself runs through
-the compiled ``trtllm`` CUDA ops (coefficient fold + folded paged score) for
-every supported geometry. The original Triton score kernel has been deleted;
+the compiled ``trtllm`` CUDA ops (per-round coefficient rotation over
+init-time phase tables on the mean path, trigonometric coefficient fold on
+the max path, then the folded paged score) for every supported geometry. The
+original Triton score kernel has been deleted;
 the unit tests validate the CUDA ops against an independent PyTorch oracle.
 Selection and compaction live in their respective runtime modules. An
 optional SM100 CuTe-DSL specialization (``triattention_cute_score.py``,
@@ -114,12 +116,10 @@ def _launch_tri_score_perhead(
     valid_widths: torch.Tensor,
     round_starts_device: torch.Tensor,
     token_starts_device: torch.Tensor,
-    mean_cos: torch.Tensor,
-    mean_sin: torch.Tensor,
     *,
     score_aggregation: str,
 ) -> None:
-    """Fold the per-round coefficients, then score paged KV via the C++ ops.
+    """Prepare the per-round coefficients, then score paged KV via the C++ ops.
 
     The compiled ``trtllm`` score ops are THE implementation for every
     geometry this launcher accepts; unsupported inputs fail loudly inside the
@@ -130,6 +130,7 @@ def _launch_tri_score_perhead(
         raise ValueError(f"unsupported score aggregation: {score_aggregation}")
     if not (
         hasattr(torch.ops.trtllm, "tri_attention_fold_score_coefficients")
+        and hasattr(torch.ops.trtllm, "tri_attention_rotate_mean_score_coefficients")
         and hasattr(torch.ops.trtllm, "tri_attention_paged_score")
     ):
         raise RuntimeError(
@@ -150,37 +151,59 @@ def _launch_tri_score_perhead(
         s_slot,
         s_dim,
     ) = group.geometry_args
-    # Mean aggregation collapses all offsets into mean_cos/mean_sin (one
-    # coefficient plane); max keeps one c_re/c_im plane per offset because
-    # max does not commute through the frequency sum.
+    # Mean aggregation collapses all offsets into one coefficient plane; max
+    # keeps one c_re/c_im plane per offset because max does not commute
+    # through the frequency sum.
     offset_planes = num_offsets if use_max else 1
-    c_re, c_im, c_mlr = group._fold_coefficient_buffers(offset_planes)
-    q_real, q_imag, mlr_coef = group.pointer_middle
-    freq_scale_sq, omega, offsets = group.pointer_tail
-    torch.ops.trtllm.tri_attention_fold_score_coefficients(
-        c_re,
-        c_im,
-        c_mlr,
-        q_real,
-        q_imag,
-        mlr_coef,
-        freq_scale_sq,
-        None if use_max else mean_cos.view(-1),
-        None if use_max else mean_sin.view(-1),
-        omega if use_max else None,
-        offsets if use_max else None,
-        round_starts_device if use_max else None,
-        request_count,
-        group._num_calibrated_layers,
-        num_q_heads,
-        num_freqs,
-        offset_planes,
-        use_max,
-        # Per-layer dequant scales (quantized pools only, else None): the fold
-        # multiplies them into the coefficient tables so the score op below
-        # reads raw quantized elements at zero hot-loop cost.
-        group._kv_scales,
-    )
+    c_re, c_im, c_mlr = group._fold_coefficient_buffers(offset_planes, with_mlr=use_max)
+    if use_max:
+        q_real, q_imag, mlr_coef = group.pointer_middle
+        freq_scale_sq, omega, offsets = group.pointer_tail
+        torch.ops.trtllm.tri_attention_fold_score_coefficients(
+            c_re,
+            c_im,
+            c_mlr,
+            q_real,
+            q_imag,
+            mlr_coef,
+            freq_scale_sq,
+            None,
+            None,
+            omega,
+            offsets,
+            round_starts_device,
+            request_count,
+            group._num_calibrated_layers,
+            num_q_heads,
+            num_freqs,
+            offset_planes,
+            True,
+            # Per-layer dequant scales (quantized pools only, else None): the
+            # fold multiplies them into the coefficient tables so the score op
+            # below reads raw quantized elements at zero hot-loop cost.
+            group._kv_scales,
+        )
+    else:
+        # Mean aggregation rotates the pre-scaled calibration query by the
+        # tabulated offset-mean phase of each request's round start (tables
+        # built once at group construction; design: Fanrong Li, torch-graph
+        # review 2026-07-20). c_mlr is the static init-time table, so the
+        # round writes only c_re/c_im and runs zero trigonometry.
+        c_mlr = group._mlr_fold
+        torch.ops.trtllm.tri_attention_rotate_mean_score_coefficients(
+            c_re,
+            c_im,
+            group._q_real_scaled,
+            group._q_imag_scaled,
+            group._phase_cos,
+            group._phase_sin,
+            round_starts_device,
+            request_count,
+            group._num_calibrated_layers,
+            num_q_heads,
+            num_freqs,
+            group._max_position,
+        )
     pool_anchor, layer_base_addrs, block_offsets, seg_page_off, seg_req, seg_layer = (
         group.pointer_prefix
     )
@@ -215,8 +238,9 @@ def _launch_tri_score_perhead(
         num_segments,
         use_max,
         group._use_vectorized,
-        # Validation-only here (presence must match the pool dtype; the fold
-        # op above already consumed the values).
+        # Validation-only here (presence must match the pool dtype; the max
+        # fold above or the init-time pre-scaled mean tables already consumed
+        # the values).
         group._kv_scales,
     )
 
@@ -348,6 +372,66 @@ class _FixedScoreGroup:
         # be range-checked; validate the extent once here, loudly.
         if min(layer_indices) < 0 or max(layer_indices) >= self._num_calibrated_layers:
             raise ValueError("scored layer index exceeds the calibrated layer extent")
+        # Init-once tables for the mean-aggregation coefficient rotation
+        # (design: Fanrong Li, torch-graph review 2026-07-20). The
+        # offset-averaged phase of every possible round-start position is
+        # tabulated once, RoPE-style (float64 accumulation, stored fp32):
+        #   phase_cos[pos, f] = freq_scale_sq[f] * mean_o cos((pos + offset_o) * omega_f)
+        #   phase_sin[pos, f] = freq_scale_sq[f] * mean_o sin((pos + offset_o) * omega_f)
+        # and the per-layer KV dequantization scale is pre-multiplied into
+        # the calibration query (identity for float pools). The MLR
+        # coefficient has no position term, so its fold
+        # (kv_scale * freq_scale_sq * mlr) is fully static: the request axis
+        # disappears and nothing about it is recomputed per round. Every
+        # eviction round then gathers one table row per request and rotates
+        # the static query by it -- zero trigonometry at runtime.
+        #
+        # Positions can legitimately reach the full sequence capacity, so the
+        # table covers [0, seq_len] inclusive. The 64-row floor keeps tiny
+        # synthetic unit-test geometries (whose logical round starts exceed
+        # their physical bucket) inside the table at negligible cost; every
+        # row is exact for its position, and production buckets (the
+        # manager's max sequence length) always exceed the floor.
+        self._max_position = max(int(seq_len), 63) + 1
+        omega64 = omega.view(-1)[: self.num_freqs].to(torch.float64)
+        freq_scale_sq64 = freq_scale_sq.view(-1)[: self.num_freqs].to(torch.float64)
+        positions = torch.arange(self._max_position, dtype=torch.float64, device=device)
+        cos_acc = torch.zeros(
+            self._max_position, self.num_freqs, dtype=torch.float64, device=device
+        )
+        sin_acc = torch.zeros_like(cos_acc)
+        for offset in offsets.to(torch.float64).tolist():
+            angle = (positions + offset).unsqueeze(1) * omega64.unsqueeze(0)
+            cos_acc += torch.cos(angle)
+            sin_acc += torch.sin(angle)
+        phase_scale = freq_scale_sq64.unsqueeze(0) / float(offsets.numel())
+        self._phase_cos = (cos_acc * phase_scale).to(torch.float32).contiguous()
+        self._phase_sin = (sin_acc * phase_scale).to(torch.float32).contiguous()
+        calibration_shape = (self._num_calibrated_layers, int(num_q_heads), self.num_freqs)
+        mlr_fold64 = mlr_coef_LHF.view(calibration_shape).to(torch.float64) * freq_scale_sq64
+        if self._kv_scales is None:
+            # kv_scale is 1.0 for float pools: the pre-scaled query IS the
+            # calibration query (aliased, not copied).
+            self._q_real_scaled = q_real_LHF.view(-1)
+            self._q_imag_scaled = q_imag_LHF.view(-1)
+        else:
+            layer_scales64 = (
+                self._kv_scales[: self._num_calibrated_layers].to(torch.float64).view(-1, 1, 1)
+            )
+            self._q_real_scaled = (
+                (q_real_LHF.view(calibration_shape).to(torch.float64) * layer_scales64)
+                .to(torch.float32)
+                .contiguous()
+                .view(-1)
+            )
+            self._q_imag_scaled = (
+                (q_imag_LHF.view(calibration_shape).to(torch.float64) * layer_scales64)
+                .to(torch.float32)
+                .contiguous()
+                .view(-1)
+            )
+            mlr_fold64 = mlr_fold64 * layer_scales64
+        self._mlr_fold = mlr_fold64.to(torch.float32).contiguous().view(-1)
         # Folded per-round coefficient tables, allocated on first launch and
         # keyed by plane count so switching aggregation (mean: one plane;
         # max: one plane per offset) re-shapes without churn.
@@ -514,15 +598,18 @@ class _FixedScoreGroup:
             )
 
     def _fold_coefficient_buffers(
-        self, offset_planes: int
-    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
-        """Return (c_re, c_im, c_mlr) fold tables for one plane count.
+        self, offset_planes: int, with_mlr: bool
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]":
+        """Return (c_re, c_im, c_mlr) per-round scratch for one plane count.
 
         Sized on ``max_requests`` so any launch's active ``request_count``
-        fits without reallocation (each launch folds only its active rows);
-        c_mlr is offset independent so it never grows planes.
+        fits without reallocation (each launch prepares only its active
+        rows). Only the max aggregation still writes a per-round c_mlr; the
+        mean path reads the static init-time MLR table instead (request axis
+        removed), so its scratch skips c_mlr entirely.
         """
-        buffers = self._fold_buffers.get(offset_planes)
+        key = (offset_planes, with_mlr)
+        buffers = self._fold_buffers.get(key)
         if buffers is None:
             elements = (
                 self.max_requests
@@ -533,9 +620,9 @@ class _FixedScoreGroup:
             device = self.output.device
             c_re = torch.empty(offset_planes * elements, dtype=torch.float32, device=device)
             c_im = torch.empty_like(c_re)
-            c_mlr = torch.empty(elements, dtype=torch.float32, device=device)
+            c_mlr = torch.empty(elements, dtype=torch.float32, device=device) if with_mlr else None
             buffers = (c_re, c_im, c_mlr)
-            self._fold_buffers[offset_planes] = buffers
+            self._fold_buffers[key] = buffers
         return buffers
 
     def launch(
@@ -611,8 +698,6 @@ class _FixedScoreGroup:
             valid_widths,
             round_starts_device,
             token_starts_device,
-            mean_cos,
-            mean_sin,
             score_aggregation=score_aggregation,
         )
         return output

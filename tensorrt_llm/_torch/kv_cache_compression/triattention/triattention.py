@@ -712,7 +712,12 @@ class _FixedScoreStagingBuffers:
             raise _FixedScoreStreamMismatch(
                 "TriAttention score launches must stay on the staging CUDA stream"
             )
-        if self._score_aggregation == "mean":
+        if self._score_aggregation == "mean" and self.fused_group._cute_score_runner is not None:
+            # mean_cos/mean_sin feed ONLY the opt-in CuTe score runner, whose
+            # compiled kernel captured their device pointers, so they must be
+            # refreshed before it launches. The default C++ mean path rotates
+            # init-time phase tables inside its coefficient op instead, so
+            # production rounds launch zero phase kernels.
             prepare_mean_phase(
                 self.round_starts_device,
                 self.offsets,
