@@ -343,6 +343,7 @@ def gvr_topk_decode(
     p4_warp_redundant: bool = True,
     p2_warp_redundant: bool = True,
     block_max: Optional[torch.Tensor] = None,
+    skip_min_n: Optional[int] = 200_000,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
 
@@ -412,6 +413,13 @@ def gvr_topk_decode(
     cute_dtype = _DTYPE_TORCH_TO_CUTE[logits.dtype]
 
     num_rows = logits.shape[0]
+    # Host dispatch gate: the compact walk only wins when the per-row
+    # compressed length is large (protocol: >= 2x at N=262k, 4-14% LOSS at
+    # N <= 131k). Below skip_min_n (compressed-index space, shape-based so
+    # no device sync) drop block_max and run the dense arms. None disables
+    # the gate (A/B probes).
+    if block_max is not None and skip_min_n is not None and logits.shape[1] < skip_min_n:
+        block_max = None
     enable_block_skip = block_max is not None
     if enable_block_skip:
         assert (
