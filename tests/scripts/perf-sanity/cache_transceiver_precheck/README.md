@@ -23,22 +23,24 @@ the KV-head axis, so the receiver regenerates its expected slice locally under
 any TP/PP resharding. KV shape (layers/heads/head_dim, MLA vs GQA, MTP nextn
 layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`.
 
-## Enabling
+## Enabling / disabling
 
-Off by default. Either:
+**On by default** for every disaggregated perf-sanity test. To opt out:
 
-- per test yaml (recommended for gradual rollout):
+- per test yaml:
 
   ```yaml
   cache_transceiver_precheck:
-    enabled: true
+    enabled: false
     # optional overrides (defaults in precheck_config.PRECHECK_DEFAULTS):
     # request_lengths: [1024, 8192]
     # num_requests: 2
     # step_timeout_s: 900
   ```
 
-- or globally at launch-script generation time: `TRTLLM_DISAGG_CT_PRECHECK=1`.
+- or globally at launch-script generation time: `TRTLLM_DISAGG_CT_PRECHECK=0`
+  (kill switch; `=1` force-enables). The env var, when set, overrides the yaml
+  either way.
 
 ## Failure output
 
