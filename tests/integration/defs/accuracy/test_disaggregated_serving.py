@@ -1210,7 +1210,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
             },
         }
@@ -1230,7 +1230,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
             },
             "enable_attention_dp": enable_attention_dp,
@@ -1800,7 +1800,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
             },
             "enable_chunked_prefill": True,
@@ -1811,7 +1811,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 4096
             },
             "max_batch_size": max_batch_size,
@@ -1872,7 +1872,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "tokens_per_block": 32,
         }
         cache_transceiver_config = {
-            "backend": "UCX",
+            "backend": "DEFAULT",
             "max_tokens_in_buffer": 8192,
         }
         ctx_server_config = {

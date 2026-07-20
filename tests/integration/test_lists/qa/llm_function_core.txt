@@ -851,7 +851,6 @@ disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Ch
 disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
 disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving[llama-3.1-8b-instruct]
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
