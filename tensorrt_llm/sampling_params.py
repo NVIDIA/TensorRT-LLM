@@ -430,13 +430,19 @@ class SamplingParams:
         top_p: Optional[float],
         top_k: Optional[int],
         use_beam_search: bool | None,
+        min_p: Optional[float] = None,
     ):
-        return (not use_beam_search) and (
-            (temperature is None and top_p is None and top_k is None)
-            or top_k == 1
-            or top_p == 0.0
-            or temperature == 0
-        )
+        if use_beam_search:
+            return False
+        # Explicit greedy triggers collapse sampling to a single token,
+        # regardless of min_p.
+        if top_k == 1 or top_p == 0.0 or temperature == 0:
+            return True
+        # Otherwise sampling is greedy only when no sampling knob is set. A
+        # positive min_p on its own still selects among multiple tokens.
+        params_unset = temperature is None and top_p is None and top_k is None
+        min_p_set = min_p is not None and min_p > 0.0
+        return params_unset and not min_p_set
 
     @property
     def _greedy_decoding(self) -> bool:
@@ -445,6 +451,7 @@ class SamplingParams:
             top_p=self.top_p,
             top_k=self.top_k,
             use_beam_search=self.use_beam_search,
+            min_p=self.min_p,
         )
 
     @property

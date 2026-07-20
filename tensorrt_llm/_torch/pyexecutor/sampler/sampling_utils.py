@@ -31,9 +31,11 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
 # These op wrappers are safe to import without flashinfer installed; they are
 # only called on the flashinfer sampler / speculative-worker paths.
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
+    min_p_sampling_from_probs_op,
     sampling_from_probs_op,
     softmax_op,
     top_k_mask_logits_op,
+    top_k_renorm_probs_op,
     top_k_sampling_from_probs_op,
     top_k_top_p_sampling_from_logits_op,
     top_p_renorm_probs_op,
@@ -47,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     beam_search_sampling_batch,
     get_rejected_indices,
     greedy_search_sampling_batch,
+    min_p_renorm_probs,
     sample_rejected,
     top_k_top_p_sampling_batch,
 )
@@ -85,11 +88,13 @@ TemperatureOnly: TypeAlias = tuple[Literal["temperature"], float]
 TopK: TypeAlias = tuple[Literal["top_k"], int, float]
 TopP: TypeAlias = tuple[Literal["top_p"], float, float]
 TopKTopP: TypeAlias = tuple[Literal["top_k_top_p"], int, float, float]
+# (tag, top_k, top_p, min_p, temperature)
+MinP: TypeAlias = tuple[Literal["min_p"], int, float, float, float]
 Greedy: TypeAlias = tuple[Literal["greedy"], None]
 BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, int, float]
 GREEDY: Greedy = ("greedy", None)
 
-Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
+Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | MinP | BeamSearch
 
 # Re-exported from the beam-search op implementation (single source of truth).
 BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
@@ -103,6 +108,7 @@ class UtilsSamplingParams:
         temperature: The temperature to use for sampling.
         top_p: The top-p to use for sampling.
         top_k: The top-k to use for sampling.
+        min_p: The min-p to use for sampling.
         use_beam_search: Whether to use beam search.
         beam_width_in: The beam_width of a request before the sampling step.
         beam_width_out: The beam_width of a request after the sampling step.
@@ -112,6 +118,7 @@ class UtilsSamplingParams:
     top_p: Optional[float]
     top_k: Optional[int]
     use_beam_search: Optional[bool]
+    min_p: Optional[float] = None
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
 
@@ -123,12 +130,14 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     temperature = params.temperature
     top_p = params.top_p
     top_k = params.top_k
+    min_p = params.min_p
 
     if SamplingParams.params_imply_greedy_decoding(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         use_beam_search=use_beam_search,
+        min_p=min_p,
     ):
         return GREEDY
 
@@ -136,7 +145,7 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     # NB: not greedy, hence temperature != 0 if specified
     temperature = temperature or 1.0
 
-    # Beam search does not rely on top_p or top_k, so we can return the strategy here
+    # Beam search does not rely on top_p, top_k or min_p, so we can return the strategy here
     if use_beam_search:
         assert params.beam_width_in is not None and params.beam_width_out is not None, (
             "beam_width_in and beam_width_out must be specified for beam search"
@@ -153,6 +162,12 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
     need_top_p = top_p < 1
+
+    # Disabled top_k is 0 ("keep all"), not vocab_size, which can be the
+    # fast-greedy probe (2**31) and overflow the int32 tensor; _compute_probs
+    # sanitizes it.
+    if min_p is not None and min_p > 0.0:
+        return ("min_p", top_k if need_top_k else 0, top_p, min_p, temperature)
 
     if need_top_p:
         if need_top_k:
@@ -199,6 +214,15 @@ def sample(
         case ("temperature", temperature):
             tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
+                temperature=cast(float, temperature),
+                generator=generator,
+            )
+        case ("min_p", top_k, top_p, min_p, temperature):
+            tokens, softmax = top_k_top_p_sampling_batch(
+                logits,
+                top_k=cast(int, top_k),
+                top_p=cast(float, top_p),
+                min_p=cast(float, min_p),
                 temperature=cast(float, temperature),
                 generator=generator,
             )
@@ -321,6 +345,31 @@ class _StrategyImpls:
             return tokens, probs
 
         @classmethod
+        def _compute_probs(
+            cls,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor],
+            top_k: Optional[torch.Tensor],
+            top_p: Optional[torch.Tensor],
+            min_p: Optional[torch.Tensor],
+            temperature: torch.Tensor,
+        ) -> torch.Tensor:
+            """Temperature + softmax + optional top-k / top-p / min-p renorm."""
+            probs = cls._prepare_probs_with_temperature(logits, group_logit_indices, temperature)
+            if top_k is not None:
+                top_k = sanitize_top_k(top_k, probs.shape[-1])
+                probs = top_k_renorm_probs_op(probs, top_k)
+
+            if top_p is not None:
+                probs = top_p_renorm_probs_op(probs, top_p)
+
+            if min_p is not None:
+                probs = min_p_renorm_probs(probs, min_p)
+
+            return probs
+
+        @classmethod
         def _sample_with_probs(
             cls,
             logits: torch.Tensor,
@@ -328,21 +377,18 @@ class _StrategyImpls:
             group_logit_indices: Optional[torch.Tensor],
             top_k: Optional[torch.Tensor],
             top_p: Optional[torch.Tensor],
+            min_p: Optional[torch.Tensor],
             temperature: torch.Tensor,
             generator: Optional[torch.Generator],
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-            if top_k is not None:
-                logits = cls._prepare_logits_with_temperature(
-                    logits, group_logit_indices, temperature
-                )
-                logits = top_k_mask_logits_op(logits, top_k)
-                probs = cls._prepare_probs_with_temperature(logits, None, None)
-            else:
-                probs = cls._prepare_probs_with_temperature(
-                    logits, group_logit_indices, temperature
-                )
-            if top_p is not None:
-                probs = top_p_renorm_probs_op(probs, top_p)
+            probs = cls._compute_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                temperature=temperature,
+            )
             new_tokens = cls._sample_from_probs(probs, generator=generator)
             return new_tokens, probs
 
@@ -405,6 +451,7 @@ class _StrategyImpls:
                 group_logit_indices=group_logit_indices,
                 top_k=self._top_k,
                 top_p=self._top_p,
+                min_p=None,
                 temperature=self._temperature,
                 generator=generator,
             )
@@ -438,6 +485,7 @@ class _StrategyImpls:
                 group_logit_indices=group_logit_indices,
                 top_k=self._top_k,
                 top_p=None,
+                min_p=None,
                 temperature=self._temperature,
                 generator=generator,
             )
@@ -471,6 +519,7 @@ class _StrategyImpls:
                 group_logit_indices=group_logit_indices,
                 top_k=None,
                 top_p=self._top_p,
+                min_p=None,
                 temperature=self._temperature,
                 generator=generator,
             )
@@ -500,6 +549,51 @@ class _StrategyImpls:
                 group_logit_indices=group_logit_indices,
                 top_k=None,
                 top_p=None,
+                min_p=None,
+                temperature=self._temperature,
+                generator=generator,
+            )
+
+    class MinPWithProbs(StrategyImplWithProbs):
+        def __init__(
+            self,
+            top_k: torch.Tensor,
+            top_p: torch.Tensor,
+            min_p: torch.Tensor,
+            temperature: torch.Tensor,
+        ):
+            self._top_k = top_k
+            self._top_p = top_p
+            self._min_p = min_p
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.MinPWithProbs":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.int32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[3] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[4] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            return self._sample_with_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=self._top_k,
+                top_p=self._top_p,
+                min_p=self._min_p,
                 temperature=self._temperature,
                 generator=generator,
             )
@@ -664,10 +758,61 @@ class _StrategyImpls:
                 group_logit_indices=group_logit_indices,
                 top_k=None,
                 top_p=None,
+                min_p=None,
                 temperature=self._temperature,
                 generator=generator,
             )
             return new_tokens, None
+
+    class MinPSampleOnly(StrategyImplSampleOnly):
+        def __init__(
+            self,
+            top_k: torch.Tensor,
+            top_p: torch.Tensor,
+            min_p: torch.Tensor,
+            temperature: torch.Tensor,
+        ):
+            self._top_k = top_k
+            self._top_p = top_p
+            self._min_p = min_p
+            self._temperature = temperature
+
+        @override
+        @classmethod
+        def from_strategies(
+            cls, strategies: list[Any], cuda_device: torch.device
+        ) -> "_StrategyImpls.MinPSampleOnly":
+            return cls(
+                cls._make_tensor([s[1] for s in strategies], torch.int32, cuda_device),
+                cls._make_tensor([s[2] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[3] for s in strategies], torch.float32, cuda_device),
+                cls._make_tensor([s[4] for s in strategies], torch.float32, cuda_device),
+            )
+
+        @override
+        def sample(
+            self,
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            group_metadata: Optional[StrategyMetadata] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            # min_p=None here: the fused kernel below does the min-p filter + sample.
+            probs = self._compute_probs(
+                logits,
+                group_logit_indices=group_logit_indices,
+                top_k=self._top_k,
+                top_p=self._top_p,
+                min_p=None,
+                temperature=self._temperature,
+            )
+            return min_p_sampling_from_probs_op(
+                probs,
+                self._min_p,
+                generator=generator,
+                check_nan=self._flashinfer_check_nans(probs),
+            ), None
 
     class BeamSearchMixin(StrategyImpl):
         def __init__(self, beam_width_in: int, beam_width_out: int, temperature: torch.Tensor):
@@ -722,6 +867,7 @@ _STRATEGY_KEY_TYPE: TypeAlias = (
     | Literal["top_k"]
     | Literal["top_p"]
     | Literal["top_k_top_p"]
+    | Literal["min_p"]
     | Literal["greedy"]
     | tuple[Literal["beam_search"], int, int]
 )
@@ -740,6 +886,7 @@ class FlashInferGroupedStrategySampler:
                 | ("top_p", _, _)
                 | ("top_k_top_p", _, _, _)
                 | ("temperature", _)
+                | ("min_p", _, _, _, _)
                 | ("greedy", None)
             ):
                 return cast(_STRATEGY_KEY_TYPE, strategy[0])
@@ -788,6 +935,8 @@ class FlashInferGroupedStrategySampler:
                     strategy_impl_cls = _StrategyImpls.TopKTopPWithProbs
                 case "temperature":
                     strategy_impl_cls = _StrategyImpls.TemperatureOnlyWithProbs
+                case "min_p":
+                    strategy_impl_cls = _StrategyImpls.MinPWithProbs
                 case "greedy":
                     strategy_impl_cls = _StrategyImpls.GreedyWithProbs
                 case ("beam_search", beam_width_in_key, _):
@@ -805,6 +954,8 @@ class FlashInferGroupedStrategySampler:
                     strategy_impl_cls = _StrategyImpls.TopKTopPSampleOnly
                 case "temperature":
                     strategy_impl_cls = _StrategyImpls.TemperatureOnlySampleOnly
+                case "min_p":
+                    strategy_impl_cls = _StrategyImpls.MinPSampleOnly
                 case "greedy":
                     strategy_impl_cls = _StrategyImpls.GreedySampleOnly
                 case ("beam_search", beam_width_in_key, _):

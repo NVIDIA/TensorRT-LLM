@@ -478,6 +478,7 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
     top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
     top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
+    min_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.min_p))
     beam_width_out = _get_beam_width_out(request)
     beam_width_in = _get_beam_width_in(request)
     use_beam_search = _get_max_beam_width(request) > 1
@@ -486,6 +487,7 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        min_p=min_p,
         beam_width_in=beam_width_in,
         beam_width_out=beam_width_out,
         use_beam_search=use_beam_search,
@@ -4971,6 +4973,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         temperature = params.temperature
         top_p = params.top_p
         top_k = params.top_k
+        min_p = params.min_p
 
         # Do not request draft probs when sampling is greedy.
         return not SamplingParams.params_imply_greedy_decoding(
@@ -4978,6 +4981,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             top_p=top_p,
             top_k=top_k,
             use_beam_search=self._use_beam_search,
+            min_p=min_p,
         )
 
 

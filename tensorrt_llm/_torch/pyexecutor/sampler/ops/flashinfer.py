@@ -162,6 +162,35 @@ def top_p_sampling_from_probs_op(
     return tokens
 
 
+def min_p_sampling_from_probs_op(
+    probs: torch.Tensor,
+    min_p: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    """Min-p filtered sampling from probabilities.
+
+    Keeps tokens whose probability is at least ``min_p`` times the max
+    probability, renormalizes, and samples. ``min_p`` is a per-request tensor.
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
+    tokens: torch.Tensor = flashinfer.sampling.min_p_sampling_from_probs(
+        probs,
+        min_p,
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
+    )
+
+    return tokens
+
+
 # The three ops below wrap the mask -> softmax -> renorm pipeline stages 1:1.
 # The wrappers exist so callers stay importable without flashinfer installed
 # (the flashinfer import above is guarded); softmax_op additionally centralizes
@@ -184,6 +213,14 @@ def top_k_mask_logits_op(
 ) -> torch.Tensor:
     masked: torch.Tensor = flashinfer.sampling.top_k_mask_logits(logits, top_k)
     return masked
+
+
+def top_k_renorm_probs_op(
+    probs: torch.Tensor,
+    top_k: torch.Tensor,
+) -> torch.Tensor:
+    renormed: torch.Tensor = flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+    return renormed
 
 
 def top_p_renorm_probs_op(

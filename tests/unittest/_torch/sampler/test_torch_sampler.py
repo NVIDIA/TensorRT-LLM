@@ -47,11 +47,13 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     GREEDY,
     BeamSearch,
     FlashInferGroupedStrategySampler,
     Greedy,
+    MinP,
     Strategy,
     StrategyMetadata,
     TemperatureOnly,
@@ -348,6 +350,79 @@ class TestStrategySelection:
         assert strat[1] == 42
         assert strat[2] == pytest.approx(0.7)
         assert strat[3] == pytest.approx(0.9)
+
+    # --- min_p ---
+    # A min_p strategy is ("min_p", top_k, top_p, min_p, temperature). top_k /
+    # top_p carry their disabled sentinels (vocab_size / 1.0) when unset, so
+    # min_p composes with any subset of temperature/top_k/top_p.
+
+    @pytest.mark.parametrize(
+        "trivial_temperature, trivial_top_p, trivial_top_k",
+        [
+            pytest.param(temperature, top_p, top_k)
+            for (temperature, top_k, top_p) in product(
+                TEMPERATURE_NEUTRAL_VALS, TOP_K_NEUTRAL_VALS, TOP_P_NEUTRAL_VALS
+            )
+        ],
+    )
+    def test_min_p_only(
+        self,
+        trivial_temperature: Optional[float],
+        trivial_top_p: Optional[float],
+        trivial_top_k: Optional[int],
+    ):
+        params = SamplingParams(
+            min_p=0.1, temperature=trivial_temperature, top_p=trivial_top_p, top_k=trivial_top_k
+        )
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert len(strat) == 5
+        assert strat[0] == "min_p"
+        assert strat[1] == self.VOCAB_SIZE  # top_k disabled sentinel
+        assert strat[2] == pytest.approx(1.0)  # top_p disabled sentinel
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(1.0)  # temperature default
+
+    def test_min_p_with_temperature(self):
+        params = SamplingParams(min_p=0.1, temperature=0.8)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert strat[0] == "min_p"
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(0.8)
+
+    def test_min_p_with_top_k_top_p(self):
+        params = SamplingParams(min_p=0.1, top_k=42, top_p=0.7, temperature=0.8)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert len(strat) == 5
+        assert strat[0] == "min_p"
+        assert strat[1] == 42
+        assert strat[2] == pytest.approx(0.7)
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(0.8)
+
+    def test_min_p_0_not_selected(self):
+        # min_p == 0 disables min_p; a plain temperature strategy is chosen.
+        params = SamplingParams(min_p=0.0, temperature=0.7)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert strat[0] == "temperature"
+
+    @pytest.mark.parametrize(
+        "greedy_kwargs",
+        [
+            pytest.param({"top_k": 1}, id="top_k_1"),
+            pytest.param({"temperature": 0}, id="temperature_0"),
+        ],
+    )
+    def test_min_p_greedy_triggers_win(self, greedy_kwargs: dict[str, Any]):
+        # An explicit greedy trigger collapses to a single token even with min_p.
+        params = SamplingParams(min_p=0.1, **greedy_kwargs)
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        assert _request_strategy(request, vocab_size=self.VOCAB_SIZE) is GREEDY
 
     def test_param_validation(self):
         with pytest.raises(ValueError, match="require temperature >= 0, got temperature=-1"):
@@ -1112,6 +1187,43 @@ class TestFinishReasons:
         run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
 
 
+@pytest.mark.parametrize("min_p", [0.0, 0.1, 0.5, 0.9])
+def test_min_p_renorm_probs(min_p: float):
+    """min_p_renorm_probs keeps tokens with p >= min_p * max and renormalizes."""
+    torch.manual_seed(0)
+    probs = torch.softmax(torch.randn(4, 16), dim=-1)
+
+    got = min_p_renorm_probs(probs.clone(), min_p)
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    kept = probs >= (min_p * max_probs)
+    expected = torch.where(kept, probs, torch.zeros_like(probs))
+    expected = expected / expected.sum(dim=-1, keepdim=True)
+
+    torch.testing.assert_close(got, expected)
+    # every row still sums to 1 and the argmax token always survives
+    torch.testing.assert_close(got.sum(dim=-1), torch.ones(probs.size(0)))
+    assert (got.gather(1, probs.argmax(dim=-1, keepdim=True)) > 0).all()
+
+
+def test_min_p_renorm_probs_per_request_tensor():
+    """A per-request min_p tensor applies a distinct threshold per row."""
+    torch.manual_seed(1)
+    probs = torch.softmax(torch.randn(3, 16), dim=-1)
+    min_p = torch.tensor([0.0, 0.3, 0.95])
+
+    got = min_p_renorm_probs(probs.clone(), min_p)
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    kept = probs >= (min_p.reshape(-1, 1) * max_probs)
+    expected = torch.where(kept, probs, torch.zeros_like(probs))
+    expected = expected / expected.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(got, expected)
+    # row 0 (min_p=0) keeps everything; row 2 (min_p=0.95) prunes more aggressively
+    assert (got[0] > 0).all()
+    assert (got[2] > 0).sum() <= (got[0] > 0).sum()
+
+
 class TestBatchedSampling:
     """Validate batched/mixed sampling.
 
@@ -1142,6 +1254,7 @@ class TestBatchedSampling:
             TopP: SamplingParams(top_p=0.42, temperature=0.2),
             TopK: SamplingParams(top_k=27, temperature=0.5),
             TopKTopP: SamplingParams(top_k=27, top_p=0.6, temperature=0.5),
+            MinP: SamplingParams(min_p=0.05, temperature=1.0),
         }
 
         # Check that all relevant strategies are covered
@@ -1553,6 +1666,7 @@ class TestBatchedSampling:
                     TopP,
                     TopK,
                     TopKTopP,
+                    MinP,
                 ]
             }
 
@@ -1616,7 +1730,8 @@ class TestBatchedSampling:
                     torch.testing.assert_close(probs, expected_probs_after_temperature)
                 else:
                     if strategy[0] not in [
-                        strategy_tags[strategy_type] for strategy_type in [TopP, TopK, TopKTopP]
+                        strategy_tags[strategy_type]
+                        for strategy_type in [TopP, TopK, TopKTopP, MinP]
                     ]:
                         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -1681,6 +1796,16 @@ class TestBatchedSampling:
                             - probs_sorted_pre_norm_nz.amin(dim=-1),
                             cast(float, top_p),
                         ).all()
+
+                    if strategy[0] == strategy_tags[MinP]:
+                        # min_p keeps tokens with temp-prob >= min_p * max (ratio
+                        # preserved by renorm; base case has top_k/top_p disabled).
+                        min_p_val = cast(float, strategy[3])
+                        max_temp = expected_probs_after_temperature.amax(dim=-1, keepdim=True)
+                        ratio = expected_probs_after_temperature / max_temp
+                        kept = probs != 0.0
+                        assert torch.all((ratio >= min_p_val - 1e-6)[kept])
+                        assert torch.all((ratio < min_p_val + 1e-6)[~kept])
 
                     # All indices not selected must have logits less or equal
                     # to the smallest selected logit.
@@ -1862,6 +1987,7 @@ class TestBatchedSampling:
         temperature: Optional[torch.Tensor]
         top_p: Optional[torch.Tensor]
         top_k: Optional[torch.Tensor]
+        min_p: Optional[torch.Tensor] = None
 
     @dataclass(frozen=True, kw_only=True)
     class _MockSamplingLogEntry:
@@ -2021,6 +2147,40 @@ class TestBatchedSampling:
 
         patch_ctx.setattr(flashinfer.sampling, "top_p_sampling_from_probs", _mock_flashinfer_top_p)
 
+        def _mock_flashinfer_min_p(
+            probs: torch.Tensor,
+            min_p: torch.Tensor,
+            *,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
+        ) -> torch.Tensor:
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=None,
+                        top_p=None,
+                        temperature=None,
+                        min_p=min_p[row_idx],
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(flashinfer.sampling, "min_p_sampling_from_probs", _mock_flashinfer_min_p)
+
         def _mock_flashinfer_from_probs(
             probs: torch.Tensor,
             *,
@@ -2105,6 +2265,10 @@ class TestBatchedSampling:
             log_entry.sampling_params.top_k is not None
             and log_entry.sampling_params.top_k.item() != vocab_size
         )
+        req_has_min_p = (
+            log_entry.sampling_params.min_p is not None
+            and log_entry.sampling_params.min_p.item() != 0
+        )
         if req_has_top_k:
             assert req_params.top_k is not None
             assert log_entry.sampling_params.top_k is not None
@@ -2113,7 +2277,12 @@ class TestBatchedSampling:
             assert req_params.top_p is not None
             assert log_entry.sampling_params.top_p is not None
             assert np.allclose(req_params.top_p, log_entry.sampling_params.top_p.item())
-        if req_has_top_k or req_has_top_p:
+        if req_has_min_p:
+            assert req_params.min_p is not None
+            assert log_entry.sampling_params.min_p is not None
+            assert np.allclose(req_params.min_p, log_entry.sampling_params.min_p.item())
+        # min_p also filters to a top-prefix subset, so it reuses the validation below.
+        if req_has_top_k or req_has_top_p or req_has_min_p:
             # for top-k and/or top-p _sampling_, probs contains only the top probs,
             # whereas log_entry.probs contains all probs passed to the sampling code.
 

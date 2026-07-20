@@ -50,19 +50,37 @@ class BeamSearchMetadata(StrategyMetadata):
     beam_idx_arange: torch.Tensor
 
 
+def min_p_renorm_probs(
+    probs: torch.Tensor,
+    min_p: torch.Tensor | float,
+) -> torch.Tensor:
+    """Keep tokens with prob >= ``min_p`` times the per-row max, then renormalize.
+
+    ``min_p`` is a scalar or a per-request tensor.
+    """
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    if isinstance(min_p, torch.Tensor):
+        min_p = min_p.reshape(-1, 1)
+    thresholds = min_p * max_probs
+    probs = torch.where(probs < thresholds, torch.zeros_like(probs), probs)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    return probs
+
+
 def top_k_top_p_sampling_batch(
     logits: torch.Tensor,
     *,
     temperature: float,
     top_k: Optional[int] = None,
     top_p: float = 1.0,
+    min_p: float = 0.0,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Temperature + optional top-k / top-p filtering + multinomial sampling.
+    """Temperature + optional top-k / top-p / min-p filtering + multinomial sampling.
 
     ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
-    disables top-p filtering. With both disabled this is plain temperature
-    sampling.
+    disables top-p filtering; ``min_p=0`` disables min-p filtering. With all
+    disabled this is plain temperature sampling.
     """
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
@@ -116,6 +134,9 @@ def top_k_top_p_sampling_batch(
         del logits
     else:
         probs = torch.softmax(logits, dim=-1)
+
+    if min_p > 0:
+        probs = min_p_renorm_probs(probs, min_p)
 
     next_tokens = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
     return next_tokens, probs
