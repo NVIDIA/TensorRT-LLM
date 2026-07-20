@@ -857,6 +857,9 @@ class TestDisaggTransferAdmissionPP:
         assert fitting == []
         assert num_fitting == 0
         assert wait_for_progress
+        executor.kv_cache_transceiver.activate_context_requests_for_schedule.assert_called_once_with(
+            []
+        )
 
     def test_pp_schedule_restores_propagated_gate_decision(self):
         executor = object.__new__(PyExecutor)
@@ -869,6 +872,7 @@ class TestDisaggTransferAdmissionPP:
             cp_size=1,
         )
         executor.enable_attention_dp = False
+        executor.kv_cache_transceiver = None
         executor.active_requests = [
             _make_disagg_transfer_request(1, 32, in_progress=True),
             _make_disagg_transfer_request(2, 32),
