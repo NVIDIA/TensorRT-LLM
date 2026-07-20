@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
@@ -807,6 +807,11 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[])
     mgr.prepare_expect_snapshot_points([request])
     assert request.expect_snapshot_points == [64, 128]
+    # The shared interval must not make this attention-only rank consult its
+    # nonexistent recurrent-state pool and report zero KV capacity.
+    attention_capacity = KVCacheManager.get_num_available_tokens(mgr, 128)
+    assert attention_capacity > 0
+    assert mgr.get_num_available_tokens(128) == attention_capacity
 
     # Guards on the three mamba-only methods must turn them into no-ops
     # instead of crashing on the missing state above.

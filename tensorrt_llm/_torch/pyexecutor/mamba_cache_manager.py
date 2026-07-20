@@ -1841,7 +1841,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # request, so no additional capping is required here.
         interval = (self.linear_attention_metadata.states_snapshot_interval
                     if self.linear_attention_metadata is not None else 0)
-        if interval and interval > 0:
+        # Attention-only PP ranks keep the interval so every rank publishes
+        # identical scheduling boundaries, but they have no recurrent-state
+        # pool whose capacity should constrain their attention KV cache.
+        if self.local_num_mamba_layers > 0 and interval and interval > 0:
             stats = self.impl.get_kv_cache_stats()
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
