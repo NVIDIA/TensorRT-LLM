@@ -534,6 +534,17 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
+        # The Responses API store is per-process in-memory: with several
+        # frontends behind one SO_REUSEPORT port, a follow-up request may
+        # land on a sibling that has no record of the previous response.
+        # Disable storage group-wide (OpenAIServer.enable_store).
+        if not os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE"):
+            logger.warning(
+                "num_serve_frontends > 1: stateful Responses API storage "
+                "(store/previous_response_id) is disabled; the per-frontend "
+                "in-memory store cannot be shared across frontends.")
+        os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)

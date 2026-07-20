@@ -2180,6 +2180,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     "Request.background is not supported yet, will fallback to foreground processing."
                 )
 
+            # Reject rather than silently ignore: with storage disabled
+            # (TRTLLM_RESPONSES_API_DISABLE_STORE, postproc workers, or
+            # multi-frontend serving) the previous response can never be
+            # resolved.
+            if request.previous_response_id is not None and not self.enable_store:
+                return self.create_error_response(
+                    err_type="InvalidRequestError",
+                    message=("'previous_response_id' requires response "
+                             "storage, which is disabled on this server."),
+                )
+
             # Get prev response
             prev_response = None
             if self.enable_store:
