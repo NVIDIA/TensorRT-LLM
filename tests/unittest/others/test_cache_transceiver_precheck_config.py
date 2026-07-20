@@ -214,3 +214,45 @@ def test_side_plan_views():
     assert ctx_view["peer_parallel"]["world_size"] == 16
     assert ctx_view["num_peers"] == 1 and gen_view["num_peers"] == 1
     assert gen_view["cache_transceiver_config"]["max_tokens_in_buffer"] == 16384
+
+
+class TestControlWireFormat:
+    """run_precheck's HMAC-JSON control frames (importable without torch)."""
+
+    def _rp(self):
+        import run_precheck as rp
+
+        return rp
+
+    def test_roundtrip(self):
+        rp = self._rp()
+        key = b"\x01" * 32
+        msg = ["go", {"li": 0, "rep": 1, "chunk": 2}]
+        assert rp.unpack_msg(rp.pack_msg(msg, key), key) == msg
+
+    def test_tampered_frame_rejected(self):
+        rp = self._rp()
+        key = b"\x01" * 32
+        raw = rp.pack_msg(["hello", {}], key)
+        bad = raw[:-1] + bytes([raw[-1] ^ 0xFF])
+        with pytest.raises(rp._TransferError):
+            rp.unpack_msg(bad, key)
+
+    def test_wrong_key_rejected(self):
+        rp = self._rp()
+        raw = rp.pack_msg(["hello", {}], b"\x01" * 32)
+        with pytest.raises(rp._TransferError):
+            rp.unpack_msg(raw, b"\x02" * 32)
+
+    def test_short_frame_rejected(self):
+        rp = self._rp()
+        with pytest.raises(rp._TransferError):
+            rp.unpack_msg(b"tiny", b"\x01" * 32)
+
+    def test_addr_file_owner_only(self, tmp_path):
+        rp = self._rp()
+        path = str(tmp_path / "rendezvous" / "ctx0_gen0.addr")
+        rp.write_addr(path, {"host": "h", "port": 1, "key": "aa"})
+        assert (os.stat(path).st_mode & 0o777) == 0o600
+        with open(path) as f:
+            assert json.load(f)["key"] == "aa"
