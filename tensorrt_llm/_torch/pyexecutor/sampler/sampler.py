@@ -5213,15 +5213,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Apply repetition/presence/frequency penalties in place (before the greedy fast
-        # path, so both greedy and grouped-sampling logits are penalized).
-        self._penalty_handler.apply(
-            logits_cuda,
-            sampling_requests,
-            new_tokens=new_tokens_cuda,
-            seq_slots=seq_slots_cuda,
-            request_offsets=sampling_requests_metadata.req_offsets,
-            request_num_steps=sampling_requests_metadata.req_num_steps,
-        )
+        # path, so both greedy and grouped-sampling logits are penalized). Draft batches
+        # share this sampler but draw py_seq_slot from a separate numbering space that
+        # collides with target slots, so penalizing them would read/write an unrelated
+        # target request's occurrence state; skip them like the pending-steps tracking.
+        if sampling_requests and not self._is_draft_batch(sampling_requests):
+            self._penalty_handler.apply(
+                logits_cuda,
+                sampling_requests,
+                new_tokens=new_tokens_cuda,
+                seq_slots=seq_slots_cuda,
+                request_offsets=sampling_requests_metadata.req_offsets,
+                request_num_steps=sampling_requests_metadata.req_num_steps,
+            )
 
         if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
             stale_by_one: list[bool] | None = None
