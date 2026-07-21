@@ -103,6 +103,7 @@ class CUDAGraphRunnerConfig:
     original_max_draft_len: int
     original_max_total_draft_tokens: int
     is_draft_model: bool
+    is_gemma4_assistant: bool
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
@@ -247,11 +248,20 @@ class CUDAGraphRunner:
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
-            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
-            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
-            draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode, is_all_greedy_sample)
+            if self.config.is_gemma4_assistant:
+                # Gemma4 captures the whole assistant drafting loop in one
+                # graph, but its external input always contains one query per
+                # request. The resource manager's first-draft flag is internal
+                # loop state and must not select a different graph at runtime.
+                draft_len = 0
+                is_first_draft = False
+            else:
+                # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
+                # Because we will pad the input to 'max_draft_len' length for the first draft layer.
+                draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
+                is_first_draft = spec_resource_manager.is_first_draft
+            key = (batch_size, draft_len, is_first_draft, short_seq_len_mode,
+                   is_all_greedy_sample)
         else:
             # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
             # so we need to get the draft length from the batch instead of using enable_spec_decode.

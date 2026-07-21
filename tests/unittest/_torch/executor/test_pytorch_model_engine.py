@@ -3,6 +3,7 @@
 
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -12,7 +13,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
-    _restore_spec_decode_capture_state, _save_spec_decode_capture_state)
+    CUDAGraphRunner, _restore_spec_decode_capture_state,
+    _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input)
@@ -28,6 +30,7 @@ from utils.util import skip_ray
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig, SamplingParams
 from tensorrt_llm.mapping import CpType, Mapping
@@ -187,6 +190,33 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             self.assertEqual(attn_metadata.kv_lens_cuda.tolist(), [4095])
 
         self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
+
+    def test_gemma4_assistant_graph_key_ignores_first_draft_state(self) -> None:
+        runner = object.__new__(CUDAGraphRunner)
+        runner.config = SimpleNamespace(
+            is_draft_model=True,
+            is_gemma4_assistant=True,
+            original_max_draft_len=2,
+        )
+        runner.sparse_config = None
+        runner.graphs = {}
+        runner.graph_outputs = {}
+        runner.graph_metadata = {}
+        runner.padding_dummy_requests = {}
+        runner.memory_pool = None
+        batch = SimpleNamespace(batch_size=1)
+        resource_manager = object.__new__(Eagle3ResourceManager)
+
+        resource_manager.is_first_draft = False
+        capture_key = runner.get_graph_key(
+            batch, spec_resource_manager=resource_manager)
+
+        resource_manager.is_first_draft = True
+        runtime_key = runner.get_graph_key(
+            batch, spec_resource_manager=resource_manager)
+
+        self.assertEqual(capture_key, (1, 0, False, False, True))
+        self.assertEqual(runtime_key, capture_key)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()

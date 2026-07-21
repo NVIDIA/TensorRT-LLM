@@ -771,6 +771,9 @@ class PyTorchModelEngine(ModelEngine):
             original_max_total_draft_tokens=self.
             original_max_total_draft_tokens,
             is_draft_model=self.is_draft_model,
+            is_gemma4_assistant=(self.is_draft_model and self.model_is_wrapped
+                                 and self.model.config.model_type
+                                 == "gemma4_assistant"),
             enable_attention_dp=self.enable_attention_dp,
             is_encoder_decoder=self._is_encoder_decoder_model(),
             batch_size=self.batch_size,
