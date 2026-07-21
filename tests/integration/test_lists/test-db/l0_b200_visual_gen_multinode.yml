@@ -30,4 +30,4 @@ l0_b200_visual_gen_multinode:
       stage: post_merge
       backend: pytorch
   tests:
-  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multinode_slurm[cfg2_attn2d_2x2_ulysses2] TIMEOUT (90)
+  - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multinode_slurm TIMEOUT (90)
