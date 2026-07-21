@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """
 This module contains capturable drafting loops for speculative decoding.
 
@@ -200,6 +202,47 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
                     device=spec_metadata.hidden_states_write_indices.device))
 
         return new_position_ids
+
+
+class Gemma4AssistantDraftingLoopWrapper(LinearDraftingLoopWrapper):
+    """Draft tokens without advancing the target KV cache or position."""
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
+                attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
+                **kwargs) -> dict[str, torch.Tensor]:
+        logits = self.draft_model.forward(input_ids=input_ids,
+                                          position_ids=position_ids,
+                                          attn_metadata=attn_metadata,
+                                          spec_metadata=spec_metadata,
+                                          return_context_logits=True)
+        logits = logits[spec_metadata.gather_ids]
+
+        new_draft_tokens = [self.sample(logits)]
+        draft_logits = [logits]
+        if self.max_draft_len > 1:
+            if not isinstance(spec_metadata, Eagle3SpecMetadata):
+                raise TypeError("Gemma4 assistant requires Eagle3 metadata")
+            batch_size = attn_metadata.num_seqs
+            spec_metadata.hidden_states_read_indices[:batch_size].copy_(
+                spec_metadata.hidden_states_write_indices[:batch_size])
+            for _ in range(self.max_draft_len - 1):
+                logits = self.draft_model.forward(
+                    input_ids=new_draft_tokens[-1],
+                    position_ids=position_ids,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata)
+                new_draft_tokens.append(self.sample(logits))
+                draft_logits.append(logits)
+
+        return {
+            "new_draft_tokens": torch.stack(new_draft_tokens),
+            "draft_logits": torch.stack(draft_logits),
+        }
+
+    def prepare_for_generation(self, attn_metadata: AttentionMetadata,
+                               spec_metadata: SpecMetadata,
+                               position_ids: torch.Tensor) -> torch.Tensor:
+        return position_ids
 
 
 class StaticTreeDraftingLoopWrapper(BaseDraftingLoopWrapper):

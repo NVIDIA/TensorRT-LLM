@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import traceback
@@ -93,6 +96,10 @@ class ModelDrafter(Drafter):
         self.guided_decoder = guided_decoder
 
         self.use_static_draft_loop = draft_model_engine.model_is_wrapped
+        draft_model = (draft_model_engine.model.draft_model if
+                       self.use_static_draft_loop else draft_model_engine.model)
+        self.is_gemma4_assistant = getattr(draft_model.config, "model_type",
+                                           None) == "gemma4_assistant"
         if self.use_static_draft_loop:
             # TODO: enable sampling/guided decoding on static draft loop
             assert guided_decoder is None
@@ -163,6 +170,27 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         return new_request
 
+    def _create_gemma4_assistant_request(self, request: LlmRequest,
+                                         input_tokens: List[int],
+                                         is_first_draft: bool) -> LlmRequest:
+        """Create a one-token query over the target model's existing KV cache."""
+        new_request = self._create_generation_request(request, input_tokens)
+        if self.spec_resource_manager is None or not hasattr(
+                self.spec_resource_manager, "draft_hidden_state_offsets"):
+            raise RuntimeError(
+                "Gemma4 assistant requires an Eagle3 resource manager")
+        if is_first_draft:
+            slot_id = self.spec_resource_manager.slot_manager.get_slot(
+                request.py_request_id)
+            hidden_state_offset = self.spec_resource_manager.seq_lens[
+                slot_id] - 1
+        else:
+            hidden_state_offset = request.py_num_accepted_draft_tokens
+
+        self.spec_resource_manager.draft_hidden_state_offsets[
+            request.py_request_id] = hidden_state_offset
+        return new_request
+
     def _create_accepted_tokens_request(self, request: LlmRequest,
                                         input_tokens: Any,
                                         num_accepted_tokens: int) -> LlmRequest:
@@ -223,6 +251,14 @@ class ModelDrafter(Drafter):
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
 
+        # First time seeing this request - context request
+        num_overlap_tokens = 0 if self.disable_overlap_scheduler else 1
+        is_first_draft = (request.max_beam_num_tokens - 1 +
+                          num_overlap_tokens == request.py_prompt_len)
+        if self.is_gemma4_assistant:
+            return self._create_gemma4_assistant_request(
+                request, list(request.get_tokens(0)), is_first_draft)
+
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
                                               request,
                                               self.disable_overlap_scheduler)
@@ -230,9 +266,7 @@ class ModelDrafter(Drafter):
         is_eagle_style = self.spec_config.spec_dec_mode.is_eagle3(
         ) or self.spec_config.spec_dec_mode.is_mtp_eagle()
 
-        # First time seeing this request - context request
-        num_overlap_tokens = 0 if self.disable_overlap_scheduler else 1
-        if request.max_beam_num_tokens - 1 + num_overlap_tokens == request.py_prompt_len:
+        if is_first_draft:
             # This is the first time the draft model is seeing this request.
             # Prepare a context request. We discard the first token and take
             # the newly decoded one - this is the convention for EAGLE 2 and 3.
@@ -300,6 +334,10 @@ class ModelDrafter(Drafter):
 
             for request in scheduled_requests.context_requests:
                 if request.py_disable_speculative_decoding:
+                    continue
+                if self.is_gemma4_assistant:
+                    # The assistant has no private KV cache to populate during
+                    # chunked prefill. Drafting starts after target prefill.
                     continue
                 if request.is_first_context_chunk:
                     # Ignore requests which still need to be processed by the target model.
