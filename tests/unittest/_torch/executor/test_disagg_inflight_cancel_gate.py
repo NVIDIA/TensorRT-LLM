@@ -44,6 +44,7 @@ def _reset_inflight_cancel_env_cache(monkeypatch):
 def _make_timeout_request(request_id=7, in_progress=False):
     return SimpleNamespace(
         is_attention_dp_dummy=False,
+        is_generation_only_request=Mock(return_value=True),
         py_kv_transfer_timed_out=True,
         py_request_id=request_id,
         is_disagg_generation_transmission_in_progress=in_progress,
@@ -58,7 +59,11 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     executor.kv_cache_transceiver = Mock()
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor.kv_cache_transceiver.generation_cancellation_reports_terminal_status.return_value = (
+        False
+    )
     executor._disagg_ctx_cancel_requested_ids = set()
+    executor._disagg_gen_cancel_requested_ids = set()
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor._pending_timed_out_requests = []
     executor.enable_attention_dp = True
@@ -76,6 +81,28 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     return executor
 
 
+def _make_generation_timeout_driver(request, cancel_results, tp_size=1):
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [request]
+    executor.canceled_req_ids = []
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.kv_transfer_timeout_ms = 100
+    executor.kv_cache_transceiver.cancel_request.side_effect = cancel_results
+    executor._disagg_gen_cancel_requested_ids = set()
+    executor._disagg_timed_out_gen_cancelled_ids = set()
+    executor.dist = SimpleNamespace(tp_size=tp_size)
+    return executor
+
+
+def _make_generation_transfer_request(request_id=7):
+    return SimpleNamespace(
+        py_request_id=request_id,
+        py_kv_transfer_start_time=0.0,
+        py_kv_transfer_timed_out=False,
+        is_disagg_generation_transmission_in_progress=True,
+    )
+
+
 def test_flag_unset_short_circuits_before_capability_query(monkeypatch):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
@@ -84,6 +111,13 @@ def test_flag_unset_short_circuits_before_capability_query(monkeypatch):
 
     assert not PyExecutor._is_disagg_inflight_cancel_active(executor)
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.assert_not_called()
+
+
+def test_cpp_cancellation_is_finalized_by_status_consensus():
+    transceiver = object.__new__(BindKvCacheTransceiver)
+
+    assert transceiver.context_cancellation_reports_terminal_status()
+    assert transceiver.generation_cancellation_reports_terminal_status()
 
 
 def test_unsupported_transceiver_warns_once(monkeypatch):
@@ -162,6 +196,40 @@ def test_flag_unset_generation_timeout_keeps_uncancellable_request_active():
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
 
 
+def test_default_off_cpp_generation_timeout_waits_for_natural_terminal_status():
+    request = _make_timeout_request(in_progress=True)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    executor = _make_response_handler_stub([request], [False, False])
+    executor.kv_cache_transceiver.generation_cancellation_reports_terminal_status.return_value = (
+        True
+    )
+
+    PyExecutor._handle_responses(executor)
+
+    assert executor.active_requests == [request]
+    assert executor._pending_timed_out_requests == []
+    assert executor._disagg_gen_cancel_requested_ids == set()
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+
+    # Default-off C++ cancellation is observe-only. Repeated cleanup passes
+    # must continue to preserve the transfer and its KV allocation.
+    PyExecutor._handle_responses(executor)
+
+    assert executor.active_requests == [request]
+    assert executor._pending_timed_out_requests == []
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+
+    # check_gen_transfer_status changes every rank only after its internal
+    # consensus. Python can now move the terminal request to error cleanup.
+    request.is_disagg_generation_transmission_in_progress = False
+    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+    PyExecutor._handle_responses(executor)
+
+    assert executor.active_requests == []
+    assert executor._pending_timed_out_requests == [request]
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+
+
 def test_enabled_generation_timeout_waits_for_inflight_terminal_state(monkeypatch):
     request = _make_timeout_request(in_progress=True)
     request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -173,6 +241,53 @@ def test_enabled_generation_timeout_waits_for_inflight_terminal_state(monkeypatc
     assert executor.active_requests == [request]
     assert executor._pending_timed_out_requests == []
     executor.kv_cache_transceiver.cancel_request.assert_not_called()
+
+
+def test_timed_out_generation_cancel_is_recorded_and_not_resubmitted(monkeypatch):
+    request = _make_generation_transfer_request()
+    executor = _make_generation_timeout_driver(request, [True])
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: 1.0)
+
+    PyExecutor._cancel_timed_out_gen_transfers(executor)
+    PyExecutor._cancel_timed_out_gen_transfers(executor)
+
+    assert request.py_kv_transfer_timed_out
+    assert executor._disagg_gen_cancel_requested_ids == {7}
+    assert executor._disagg_timed_out_gen_cancelled_ids == {7}
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+
+
+def test_timed_out_generation_retries_rejected_cancel(monkeypatch):
+    request = _make_generation_transfer_request()
+    executor = _make_generation_timeout_driver(request, [False, True])
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: 1.0)
+
+    PyExecutor._cancel_timed_out_gen_transfers(executor)
+
+    assert executor._disagg_gen_cancel_requested_ids == set()
+    assert executor._disagg_timed_out_gen_cancelled_ids == set()
+
+    PyExecutor._cancel_timed_out_gen_transfers(executor)
+
+    assert executor._disagg_gen_cancel_requested_ids == {7}
+    assert executor._disagg_timed_out_gen_cancelled_ids == {7}
+    assert executor.kv_cache_transceiver.cancel_request.call_count == 2
+
+
+def test_peer_timeout_is_mirrored_before_local_generation_cancel(monkeypatch):
+    request = _make_generation_transfer_request()
+    executor = _make_generation_timeout_driver(request, [True], tp_size=2)
+    executor.dist.tp_allreduce = Mock(return_value=1)
+    executor.dist.tp_allgather = Mock(return_value=[[], [7]])
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: 0.01)
+
+    PyExecutor._cancel_timed_out_gen_transfers(executor)
+
+    assert request.py_kv_transfer_timed_out
+    assert executor._disagg_gen_cancel_requested_ids == {7}
+    assert executor._disagg_timed_out_gen_cancelled_ids == {7}
+    executor.dist.tp_allgather.assert_called_once_with([])
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
 
 
 def test_enabled_generation_timeout_fails_transfer_that_completed_late(monkeypatch):
@@ -240,7 +355,13 @@ def test_cpp_context_timeout_waits_for_rank_consistent_terminal_status():
 
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
     assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-    assert request.py_request_id in executor._disagg_ctx_cancel_requested_ids
+    assert executor._disagg_ctx_cancel_requested_ids == {request.py_request_id}
+    executor._end_transfer_and_maybe_terminate.assert_not_called()
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+    assert executor._disagg_ctx_cancel_requested_ids == {request.py_request_id}
     executor._end_transfer_and_maybe_terminate.assert_not_called()
 
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = (
@@ -265,6 +386,7 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor.kv_cache_transceiver.context_cancellation_reports_terminal_status.return_value = True
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.requests_in_transfer.return_value = {
         request.py_request_id: request
@@ -368,6 +490,7 @@ def test_early_request_termination_preserves_transceiver_poll_ownership():
     executor._prefetched_request_ids = set()
     executor._async_context_transceiver_request_ids = {request.py_request_id}
     executor._disagg_ctx_cancel_requested_ids = set()
+    executor._disagg_gen_cancel_requested_ids = {request.py_request_id}
     executor._disagg_timed_out_gen_cancelled_ids = set()
     executor.gather_all_responses = False
     executor.dist = SimpleNamespace(rank=0)
@@ -376,6 +499,7 @@ def test_early_request_termination_preserves_transceiver_poll_ownership():
     PyExecutor._do_terminate_request(executor, request)
 
     assert executor._async_context_transceiver_request_ids == {request.py_request_id}
+    assert executor._disagg_gen_cancel_requested_ids == set()
 
 
 def test_context_transfer_error_cleanup_waits_for_async_owners():
@@ -426,6 +550,128 @@ def test_user_cancelled_cpp_context_waits_for_status_before_terminalizing():
     executor.async_transfer_manager.requests_in_transfer.return_value = {}
     request.state = LlmRequestState.DISAGG_TRANS_ERROR
     assert PyExecutor._try_cancel_request(executor, request) is True
+
+
+def test_opt_in_user_cancelled_cpp_context_waits_for_status_before_terminalizing(
+    monkeypatch,
+):
+    request = SimpleNamespace(
+        state=LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS,
+        py_request_id=7,
+        is_context_only_request=True,
+    )
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.context_cancellation_reports_terminal_status.return_value = True
+    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor.kv_cache_transceiver.cancel_request.return_value = True
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.requests_in_transfer.return_value = {7: request}
+    executor._disagg_ctx_cancel_requested_ids = set()
+    executor._disagg_inflight_cancel_unsupported_logged = False
+    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+    assert executor._disagg_ctx_cancel_requested_ids == {7}
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+
+    executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+    assert PyExecutor._try_cancel_request(executor, request) is True
+
+
+def test_default_off_user_cancelled_cpp_generation_waits_for_natural_terminal_status():
+    request = SimpleNamespace(
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        py_request_id=7,
+        is_context_only_request=False,
+        is_generation_only_request=Mock(return_value=True),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.generation_cancellation_reports_terminal_status.return_value = (
+        True
+    )
+    executor.kv_cache_transceiver.cancel_request.return_value = True
+    executor.async_transfer_manager = Mock()
+    executor._disagg_gen_cancel_requested_ids = set()
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+    assert executor._disagg_gen_cancel_requested_ids == set()
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+
+    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+    assert PyExecutor._try_cancel_request(executor, request) is True
+
+
+def test_opt_in_user_cancelled_cpp_generation_waits_for_status_before_terminalizing(
+    monkeypatch,
+):
+    request = SimpleNamespace(
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        py_request_id=7,
+        is_context_only_request=False,
+        is_generation_only_request=Mock(return_value=True),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.generation_cancellation_reports_terminal_status.return_value = (
+        True
+    )
+    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor.kv_cache_transceiver.cancel_request.return_value = True
+    executor.async_transfer_manager = Mock()
+    executor._disagg_gen_cancel_requested_ids = set()
+    executor._disagg_inflight_cancel_unsupported_logged = False
+    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+    assert executor._disagg_gen_cancel_requested_ids == {7}
+
+    # Once C++ accepts cancellation, Python retains ownership and does not
+    # submit it again while waiting for rank-consistent terminal status.
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+
+    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+    assert PyExecutor._try_cancel_request(executor, request) is True
+
+
+def test_opt_in_cpp_generation_retries_unaccepted_cancellation(monkeypatch):
+    request = SimpleNamespace(
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        py_request_id=7,
+        is_context_only_request=False,
+        is_generation_only_request=Mock(return_value=True),
+    )
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.generation_cancellation_reports_terminal_status.return_value = (
+        True
+    )
+    executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
+    executor.kv_cache_transceiver.cancel_request.side_effect = [False, True]
+    executor.async_transfer_manager = Mock()
+    executor._disagg_gen_cancel_requested_ids = set()
+    executor._disagg_inflight_cancel_unsupported_logged = False
+    monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    assert executor._disagg_gen_cancel_requested_ids == set()
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    assert executor._disagg_gen_cancel_requested_ids == {7}
+    assert executor.kv_cache_transceiver.cancel_request.call_count == 2
+
+    assert PyExecutor._try_cancel_request(executor, request) is False
+    assert executor.kv_cache_transceiver.cancel_request.call_count == 2
 
 
 def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):

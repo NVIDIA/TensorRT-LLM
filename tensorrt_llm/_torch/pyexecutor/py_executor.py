@@ -828,6 +828,7 @@ class PyExecutor:
         # sender futures even when no transfer timeout is configured.
         self._async_context_transceiver_request_ids: set[int] = set()
         self._disagg_ctx_cancel_requested_ids: set[int] = set()
+        self._disagg_gen_cancel_requested_ids: set[int] = set()
         self._disagg_timed_out_gen_cancelled_ids: set[int] = set()
         self._disagg_inflight_cancel_unsupported_logged = False
         self.max_batch_size = max_batch_size
@@ -5609,6 +5610,14 @@ class PyExecutor:
         )
         return callable(reports_status) and reports_status() is True
 
+    def _generation_cancellation_reports_terminal_status(self) -> bool:
+        reports_status = getattr(
+            self.kv_cache_transceiver,
+            "generation_cancellation_reports_terminal_status",
+            None,
+        )
+        return callable(reports_status) and reports_status() is True
+
     def _request_kv_transfer_cancellation(self, request: LlmRequest) -> bool:
         """Best-effort cancellation that leaves ownership intact on errors."""
         try:
@@ -5687,6 +5696,7 @@ class PyExecutor:
 
             is_cancelled = self._request_kv_transfer_cancellation(request)
             if is_cancelled:
+                self._disagg_gen_cancel_requested_ids.add(request_id)
                 self._disagg_timed_out_gen_cancelled_ids.add(request_id)
                 logger.warning(
                     f"Cancelled timed-out generation KV transfer for request "
@@ -6721,6 +6731,7 @@ class PyExecutor:
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
+        self._disagg_gen_cancel_requested_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
         if self.gather_all_responses or self.dist.rank == 0:
@@ -6757,6 +6768,21 @@ class PyExecutor:
 
         if not self._is_request_in_transmission(request):
             return True
+
+        if (request.is_generation_only_request()
+                and self._generation_cancellation_reports_terminal_status()):
+            request_id = request.py_request_id
+            # With default-off cancellation, one model-parallel rank may still
+            # be queued while another has entered the ready-signal handshake.
+            # Cancelling only the queued rank would prevent it from ever
+            # sending RequestInfo and strand the already-connected peers.
+            # The opt-in path can cancel every rank and finalizes through the
+            # C++ status consensus.
+            if (self._is_disagg_inflight_cancel_active()
+                    and request_id not in self._disagg_gen_cancel_requested_ids
+                    and self._request_kv_transfer_cancellation(request)):
+                self._disagg_gen_cancel_requested_ids.add(request_id)
+            return False
 
         if self._is_disagg_inflight_cancel_active():
             self._request_kv_transfer_cancellation(request)
@@ -7039,6 +7065,20 @@ class PyExecutor:
 
             # Check if a generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
+                if (request.is_generation_only_request() and
+                        self._generation_cancellation_reports_terminal_status()
+                    ):
+                    if request.is_disagg_generation_transmission_in_progress:
+                        # Default-off timeout handling is observe-only. Do not
+                        # cancel a queued receiver rank-locally: another rank
+                        # may already be in the handshake. The opt-in timeout
+                        # driver requests cancellation separately and also waits
+                        # for C++ GEN status consensus.
+                        new_active_requests.append(request)
+                    else:
+                        timed_out_requests.append(request)
+                    continue
+
                 if self._is_disagg_inflight_cancel_active():
                     if (request.is_disagg_generation_transmission_in_progress
                             or request.state

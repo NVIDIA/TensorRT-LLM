@@ -545,12 +545,18 @@ public:
         bool isCurrentRequest = false;
         std::optional<Response> cancelledResponse;
         {
-            std::scoped_lock lock(mSenderMutex);
+            // Serialize the sender queue and transfer-session lookup. This
+            // makes pre-handshake cancellation atomic with publication of the
+            // first peer RequestInfo: default-off cancellation may win before
+            // any session exists, but must drain once any peer has arrived.
+            std::scoped_lock lock(mSenderMutex, mMtxForMap);
             auto it = mReadyResponses.find(llmRequest.mRequestId);
             if (it != mReadyResponses.end())
             {
                 isCurrentRequest = mCurrentRequest.has_value() && mCurrentRequest.value() == llmRequest.mRequestId;
-                if (!isCurrentRequest)
+                bool const hasTransferSession
+                    = mRequestToSession.find(llmRequest.mRequestId) != mRequestToSession.end();
+                if (!isCurrentRequest && (inflightCancelEnabled || !hasTransferSession))
                 {
                     // Release a response that has not entered the ready-signal handshake immediately. Retain only
                     // the request ID so a late peer receives ready=false without retaining the request or its future.
@@ -1308,6 +1314,12 @@ public:
 
     bool cancelRequest(LlmRequest const& llmRequest)
     {
+        if (!common::getEnvDisaggEnableInflightCancel())
+        {
+            TLLM_LOG_WARNING(
+                "Cannot cancel generation request %zu while in-flight cancellation is disabled", llmRequest.mRequestId);
+            return false;
+        }
 
         std::string processInfo = kDefaultProcessInfo;
         if (common::getEnvRequestKVCacheConcurrent())
