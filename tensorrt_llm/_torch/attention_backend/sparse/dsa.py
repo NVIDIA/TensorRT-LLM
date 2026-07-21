@@ -23,8 +23,8 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.modules.multi_stream_utils import \
-    maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import (
+    do_multi_stream, maybe_execute_in_parallel)
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
@@ -1750,6 +1750,11 @@ class Indexer(nn.Module):
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # Fork/join pair for the aux-stream heuristic prev_topk write-back:
+        # [0] orders the copy after the top-k kernel, [1] is waited on by
+        # maybe_join_prev_topk_copy() in the owning MLA layer.
+        self.prev_topk_copy_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = (sparse_params.use_cute_dsl_topk
                                   and IS_CUTLASS_DSL_AVAILABLE)
         self.use_cute_dsl_paged_mqa_logits = (
@@ -2819,14 +2824,51 @@ class Indexer(nn.Module):
                 decode_topk = topk_indices_buffer[
                     num_ctx_tokens:num_ctx_tokens + num_gen_tokens]
                 last_mtp_topk = decode_topk[next_n - 1::next_n]
-                metadata.heuristic_prev_topk[
-                    local_layer, :num_generations].copy_(last_mtp_topk)
+                prev_topk_dst = metadata.heuristic_prev_topk[
+                    local_layer, :num_generations]
+                if do_multi_stream() and self.aux_stream is not None:
+                    # Fork the write-back onto the aux stream so the strided
+                    # gather copy overlaps with this layer's core sparse
+                    # attention instead of sitting on the critical path.
+                    # Nothing in this step reads it back — the next consumer
+                    # is the next decode step's pre_idx for this same layer.
+                    # Source and destination are persistent stable-address
+                    # buffers, so no record_stream bookkeeping is needed. The
+                    # fork MUST be joined within this layer's forward via
+                    # maybe_join_prev_topk_copy(): that both keeps CUDA graph
+                    # capture free of unjoined forks (cudaStreamEndCapture
+                    # rejects them) and restores ordering before the next
+                    # layer overwrites the shared topk_indices_buffer rows
+                    # this copy reads.
+                    self.prev_topk_copy_events[0].record()
+                    with torch.cuda.stream(self.aux_stream):
+                        self.prev_topk_copy_events[0].wait()
+                        prev_topk_dst.copy_(last_mtp_topk)
+                        self.prev_topk_copy_events[1].record()
+                    self._prev_topk_copy_pending = True
+                else:
+                    prev_topk_dst.copy_(last_mtp_topk)
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[num_ctx_tokens:num_tokens, :] = \
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
         return topk_indices_buffer
+
+    def maybe_join_prev_topk_copy(self) -> None:
+        """Join the aux-stream heuristic prev_topk write-back, if forked.
+
+        Called by the owning MLA layer after this layer's core sparse
+        attention has been enqueued, so the copy forked in
+        sparse_attn_indexer overlaps with it. Joining within the same
+        layer's forward keeps every fork matched with a join inside a
+        single captured region (CUDA graph capture rejects unjoined
+        forks) and orders the copy's read of topk_indices_buffer before
+        the next layer's indexer overwrites those rows.
+        """
+        if self._prev_topk_copy_pending:
+            self.prev_topk_copy_events[1].wait()
+            self._prev_topk_copy_pending = False
 
     def _weight_scale(self, weights: torch.Tensor,
                       q_scale: torch.Tensor) -> torch.Tensor:
