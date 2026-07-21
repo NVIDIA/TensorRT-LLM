@@ -104,9 +104,6 @@ if TYPE_CHECKING:
 class BasePipeline(nn.Module):
     """Base class for diffusion pipelines."""
 
-    # Pipelines with image-conditioned target-size defaults override this.
-    derive_output_size_from_reference = False
-
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
