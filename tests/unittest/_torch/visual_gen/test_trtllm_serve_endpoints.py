@@ -452,52 +452,12 @@ class TestImageGeneration:
         assert params.guidance_scale == 7.5
         assert params.negative_prompt == "blurry"
 
-    def test_image_generation_with_single_reference(self, image_client):
-        encoded_reference = _b64_white_png_1x1()
+    def test_image_generation_rejects_reference_extension(self, image_client):
         resp = image_client.post(
             "/v1/images/generations",
             json={
-                "prompt": "Turn this into a watercolor painting",
-                "response_format": "b64_json",
-                "input_reference": encoded_reference,
-            },
-        )
-        assert resp.status_code == 200
-        assert image_client.mock_gen.last_params.image == base64.b64decode(encoded_reference)
-
-    def test_image_generation_with_multiple_references(self, image_client):
-        encoded_references = [_b64_white_png_1x1(), _b64_white_png_1x1()]
-        resp = image_client.post(
-            "/v1/images/generations",
-            json={
-                "prompt": "Combine the subject and style references",
-                "response_format": "b64_json",
-                "input_reference": encoded_references,
-            },
-        )
-        assert resp.status_code == 200
-        assert image_client.mock_gen.last_params.image == [
-            base64.b64decode(reference) for reference in encoded_references
-        ]
-
-    def test_image_generation_rejects_invalid_reference_base64(self, image_client):
-        resp = image_client.post(
-            "/v1/images/generations",
-            json={
-                "prompt": "Invalid reference",
-                "input_reference": "not-base64",
-            },
-        )
-        assert resp.status_code == 400
-        _assert_llm_envelope(resp.json(), code=400, message_contains="input_reference[0]")
-
-    @pytest.mark.parametrize("input_reference", [[], [_b64_white_png_1x1()] * 11])
-    def test_image_generation_rejects_invalid_reference_count(self, image_client, input_reference):
-        resp = image_client.post(
-            "/v1/images/generations",
-            json={
-                "prompt": "Invalid reference count",
-                "input_reference": input_reference,
+                "prompt": "Reference-conditioned request",
+                "input_reference": _b64_white_png_1x1(),
             },
         )
         assert resp.status_code == 422
@@ -733,37 +693,69 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+    """Multipart reference images are forwarded through the edits endpoint."""
 
-    Reference-image conditioning uses ``/v1/images/generations``. This route
-    remains reserved for mask-based editing until an edit-capable pipeline
-    lands.
-    """
-
-    def test_image_edit_returns_not_implemented(self, image_client):
-        """Valid request body short-circuits to 501 NotImplemented."""
-        b64_img = _b64_white_png_1x1()
+    def test_image_edit_forwards_single_image(self, image_client):
+        reference = base64.b64decode(_b64_white_png_1x1())
         resp = image_client.post(
             "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Make it blue",
+            files={"image": ("reference.png", reference, "image/png")},
+            data={
+                "prompt": "Turn this into a watercolor painting",
                 "num_inference_steps": 10,
+                "output_format": "png",
             },
         )
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
-        assert "not supported" in body.get("message", "").lower()
+        assert resp.status_code == 200
+        assert image_client.mock_gen.last_inputs == "Turn this into a watercolor painting"
+        assert image_client.mock_gen.last_params.image == reference
+        assert image_client.mock_gen.last_params.num_inference_steps == 10
 
-    def test_image_edit_no_body_returns_not_implemented(self, image_client):
-        """The route doesn't parse a typed body; any incoming request still
-        gets 501, including ones that would have failed schema validation
-        before. Restore typed-body coverage when an edit pipeline lands."""
-        resp = image_client.post("/v1/images/edits", json={"prompt": "Edit without image"})
-        assert resp.status_code == 501
-        body = resp.json()
-        assert body.get("type") == "NotImplementedError"
+    @pytest.mark.parametrize("field_name", ["image", "image[]"])
+    def test_image_edit_forwards_multiple_images(self, image_client, field_name):
+        references = [
+            base64.b64decode(_b64_white_png_1x1()),
+            base64.b64decode(_b64_white_png_1x1()),
+        ]
+        resp = image_client.post(
+            "/v1/images/edits",
+            files=[
+                (field_name, (f"reference-{index}.png", reference, "image/png"))
+                for index, reference in enumerate(references)
+            ],
+            data={"prompt": "Combine the subject and style references"},
+        )
+        assert resp.status_code == 200
+        assert image_client.mock_gen.last_params.image == references
+
+    def test_image_edit_requires_multipart(self, image_client):
+        resp = image_client.post(
+            "/v1/images/edits",
+            json={"prompt": "Edit without multipart"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="multipart/form-data")
+
+    def test_image_edit_requires_image(self, image_client):
+        resp = image_client.post(
+            "/v1/images/edits",
+            files={"unused": (None, "value")},
+            data={"prompt": "Edit without image"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="Field 'image'")
+
+    def test_image_edit_rejects_too_many_images(self, image_client):
+        reference = base64.b64decode(_b64_white_png_1x1())
+        resp = image_client.post(
+            "/v1/images/edits",
+            files=[
+                ("image", (f"reference-{index}.png", reference, "image/png")) for index in range(11)
+            ],
+            data={"prompt": "Too many references"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="At most 10")
 
 
 # =========================================================================
