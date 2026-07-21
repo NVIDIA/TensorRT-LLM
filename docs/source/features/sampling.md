@@ -129,6 +129,49 @@ Moreover, Torch Sampler internally batches requests with compatible sampling par
 can greatly reduce the overall latency of the sampling step when request batches are comprised
 of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).
 
+## Advanced sampling mode (speculative decoding)
+
+For one-model speculative decoding (e.g. MTP-Eagle one-model), the per-request
+advanced sampler applies a `top_k` mask, a temperature softmax, and a `top_p`
+filter before sampling each draft/target token. When a deployment fixes its
+sampling configuration such that a filter is always disabled (`top_k = 0` /
+`top_k = vocab_size`, or `top_p = 1`), that filter's kernel is pure overhead.
+
+`advanced_sampling_mode` (on `DecodingBaseConfig`, so it is available to any
+speculative config) lets you skip those redundant kernels for a fixed deploy
+config. The output is identical to `FULL` whenever the skipped filter is already
+disabled, so this is a lossless throughput optimization for advanced use cases:
+
+| Mode | `top_k` kernel | `top_p` kernel |
+|---|---|---|
+| `full` (default) | applied | applied |
+| `no_topk` | **skipped** | applied |
+| `no_topp` | applied | **skipped** |
+| `no_topk_no_topp` | **skipped** | **skipped** |
+
+Notes:
+
+* `full` is the default and always safe; the specialization is opt-in.
+* `advanced_sampling_mode` and `use_rejection_sampling` are independent: every mode
+  works with rejection sampling on or off; the flag no longer gates the mode choice.
+* `no_topp` and `no_topk_no_topp` disable `top_p`, switching the sampler from the
+  fused `top_p_sampling_from_probs` to the cheaper `sampling_from_probs`; `no_topk`
+  keeps `top_p`.
+* Greedy requests are handled natively (via a sentinel temperature that makes the
+  softmax collapse to a one-hot argmax), so any mode supports mixed greedy +
+  sampling batches without a special case.
+* `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
+  graph key, so it adds no extra warmup graphs.
+
+```python
+from tensorrt_llm.llmapi import MTPDecodingConfig
+
+spec_config = MTPDecodingConfig(
+    max_draft_len=3,
+    advanced_sampling_mode="no_topk_no_topp",  # temperature-only deploy config
+)
+```
+
 ## Beam search
 
 Beam search is a decoding strategy that maintains multiple candidate sequences (beams) during text generation, exploring different possible continuations to find higher quality outputs. Unlike greedy decoding or sampling, beam search considers multiple hypotheses simultaneously.

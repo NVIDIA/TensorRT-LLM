@@ -22,7 +22,7 @@ import abc
 import sys
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Type, TypeAlias, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -52,6 +52,9 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 # Ops imported above are re-exported for dependent modules (sampler, drafting
 # loops, tests). mypy runs in strict mode (no implicit re-export), so they must
@@ -927,84 +930,69 @@ def compute_probs_from_logits(
     temperatures: torch.Tensor,
     top_k: Optional[torch.Tensor],
     top_p: Optional[torch.Tensor],
-    advanced_sampling_mode: str = "full",
 ) -> torch.Tensor:
     """Compute filtered+normalized probs via flashinfer (hard dependency).
 
     ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching the
-    spec-decoding call site in interface.py.
-
-    advanced_sampling_mode skips the disabled filter's kernel (a no-op when
-    already disabled, so probs are unchanged): no_topk -> top_k, no_topp ->
-    top_p, no_topk_no_topp -> both.
+    spec-decoding call site in interface.py. A ``None`` top_k / top_p skips that
+    filter's kernel.
     """
-    if advanced_sampling_mode in ("no_topk", "no_topk_no_topp"):
-        top_k = None
-    if advanced_sampling_mode in ("no_topp", "no_topk_no_topp"):
-        top_p = None
     if top_k is not None:
         top_k = sanitize_top_k(top_k, logits.shape[-1])
-
     return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
 
 
+def resolve_advanced_sampling_filters(
+    advanced_sampling_mode: "AdvancedSamplingMode",
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Resolve advanced_sampling_mode to effective (top_k, top_p) tensors.
+
+    A filter the mode disables (via ``skips_top_k`` / ``skips_top_p``), or one already
+    None, becomes None so the downstream op skips that kernel; kept filters pass through
+    unchanged (the op sanitizes top_k internally).
+    """
+    eff_top_k = None if advanced_sampling_mode.skips_top_k or top_k is None else top_k
+    eff_top_p = None if advanced_sampling_mode.skips_top_p or top_p is None else top_p
+    return eff_top_k, eff_top_p
+
+
 @torch.compile(options={"max-autotune": True})
-def sampling_batch_spec_dec_one_model(
+def sample_from_logits_op(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
+    top_k: Optional[torch.Tensor] = None,
+    top_p: Optional[torch.Tensor] = None,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
-    advanced_sampling_mode: str = "full",
 ) -> torch.Tensor:
-    """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens.
+    """CUDA-graph compatible one-model sampler; returns sampled tokens.
 
-    advanced_sampling_mode: "full" (per-row tensor top_k/top_p) or "no_topk" (skip top_k,
-    honor top_p -> softmax + top_p_sampling_from_probs, matching "full").
+    ``top_k`` / ``top_p`` are None when the caller's advanced_sampling_mode disables that
+    filter.
     """
-    top_k = sanitize_top_k(top_k, logits.shape[-1])
-    if advanced_sampling_mode in ("no_topk", "no_topk_no_topp"):
-        # top_k disabled; this mode does not consider greedy requests (a runtime guard in
-        # _scan_one_model_sampling rejects greedy requests in a mixed no_topk batch). We keep
-        # the same softmax -> top_p_sampling_from_probs kernels as "full" (the top_k mask is a
-        # no-op at k=vocab) so tokens match "full" bit-for-bit, avoiding any RNG discrepancy.
-        logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-        probs = torch.softmax(logits, dim=-1)
+    if top_k is not None:
+        top_k = sanitize_top_k(top_k, logits.shape[-1])
+        logits = top_k_mask_logits_op(logits, top_k)
+    probs = softmax_op(logits, temperatures)
+    if top_p is not None:
         return top_p_sampling_from_probs_op(probs, top_p, seed=seed, offset=offset)
-    # Greedy rows (temperature <= threshold) must return the argmax token, not a
-    # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; safely_apply_temperature_inplace then guards the division
-    # against the greedy sentinel, and torch.where restores the greedy rows below.
-    # All ops are branch-free (no data-dependent control flow), so this stays
-    # CUDA-graph safe.
-    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
-    greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-    sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
-        logits, top_k, top_p, seed=seed, offset=offset
-    )
-    # argmax yields int64; cast so torch.where preserves the sampler's dtype
-    # (flashinfer returns int32) instead of promoting the result to int64.
-    return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
+    return sampling_from_probs_op(probs, seed=seed, offset=offset)
 
 
 @torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model_for_rejection(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
+    top_k: Optional[torch.Tensor],
+    top_p: Optional[torch.Tensor],
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
-    advanced_sampling_mode: str = "full",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
     # Rejection sampling relies on flashinfer's seed/offset support for
-    # determinism and cross-rank consistency. advanced_sampling_mode="no_topk"
-    # skips the (no-op) top_k mask kernel; the returned probs are unchanged.
-    probs = compute_probs_from_logits(
-        logits, temperatures, top_k, top_p, advanced_sampling_mode=advanced_sampling_mode
-    )
+    # determinism and cross-rank consistency.
+    probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
     tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
     return tokens, probs

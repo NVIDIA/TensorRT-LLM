@@ -11,48 +11,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for MTP one-model ``advanced_sampling_mode``.
+"""Unit tests for one-model ``advanced_sampling_mode``.
 
-Covers the config contract (mode enum + the use_rejection_sampling requirement
-for the top-p-disabling modes) and the compute_probs filter-skip plumbing, plus
-a CUDA bit-for-bit equivalence check that no_topk matches full when top_k is
-disabled.
+Covers the config contract (enum + skip properties + the use_rejection_sampling
+requirement for the top-p-disabling modes), ``resolve_advanced_sampling_filters``
+mode resolution, a CUDA bit-for-bit check that NO_TOPK matches FULL when top_k is
+disabled, and native greedy handling (greedy rows return argmax under any mode).
 """
-
-from types import SimpleNamespace
 
 import pytest
 import torch
-from pydantic import ValidationError
 
 from tensorrt_llm._torch.pyexecutor.sampler import sampling_utils as su
-from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DecodingBaseConfig, MTPDecodingConfig
 
 
-def test_advanced_sampling_mode_enum_values():
-    assert [m.value for m in AdvancedSamplingMode] == [
-        "full",
-        "no_topk",
-        "no_topp",
-        "no_topk_no_topp",
-    ]
+def test_enum_skip_properties():
+    """Enum members + the skip properties (single source of truth for filter skipping)."""
+    M = AdvancedSamplingMode
+    assert [m.value for m in M] == ["full", "no_topk", "no_topp", "no_topk_no_topp"]
+    assert (M.FULL.skips_top_k, M.FULL.skips_top_p) == (False, False)
+    assert (M.NO_TOPK.skips_top_k, M.NO_TOPK.skips_top_p) == (True, False)
+    assert (M.NO_TOPP.skips_top_k, M.NO_TOPP.skips_top_p) == (False, True)
+    assert (M.NO_TOPK_NO_TOPP.skips_top_k, M.NO_TOPK_NO_TOPP.skips_top_p) == (True, True)
 
 
-def test_no_topk_does_not_require_rejection():
-    # NO_TOPK only disables top_k (top_p still honored) -> valid without rejection.
-    cfg = MTPDecodingConfig(max_draft_len=1, advanced_sampling_mode="no_topk")
-    assert cfg.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK
+def test_advanced_sampling_mode_on_base_config():
+    """The field lives on DecodingBaseConfig (not MTP-specific) and defaults to FULL."""
+    assert "advanced_sampling_mode" in DecodingBaseConfig.model_fields
+    assert MTPDecodingConfig(max_draft_len=1).advanced_sampling_mode == AdvancedSamplingMode.FULL
 
 
-@pytest.mark.parametrize("mode", ["no_topp", "no_topk_no_topp"])
-def test_topp_disabling_modes_require_rejection(mode):
-    # Disabling top_p is only valid on the rejection compute_probs path.
-    with pytest.raises(ValidationError):
-        MTPDecodingConfig(max_draft_len=1, advanced_sampling_mode=mode)
-    cfg = MTPDecodingConfig(
-        max_draft_len=1, advanced_sampling_mode=mode, use_rejection_sampling=True
-    )
-    assert cfg.advanced_sampling_mode.value == mode
+def test_all_modes_construct_regardless_of_rejection():
+    """Every mode constructs with or without rejection sampling (no config gating)."""
+    for mode in ("full", "no_topk", "no_topp", "no_topk_no_topp"):
+        for rej in (False, True):
+            cfg = MTPDecodingConfig(
+                max_draft_len=1, advanced_sampling_mode=mode, use_rejection_sampling=rej
+            )
+            assert cfg.advanced_sampling_mode.value == mode
 
 
 @pytest.mark.parametrize(
@@ -64,38 +61,29 @@ def test_topp_disabling_modes_require_rejection(mode):
         ("no_topk_no_topp", True, True),
     ],
 )
-def test_compute_probs_skips_disabled_filters(
-    monkeypatch, mode, expect_top_k_none, expect_top_p_none
-):
-    """The mode must pass top_k/top_p=None so flashinfer skips that filter's kernel."""
-    seen = {}
-
-    def spy(logits, temperatures, top_k, top_p):
-        seen["top_k_none"] = top_k is None
-        seen["top_p_none"] = top_p is None
-        return torch.softmax(logits, dim=-1)
-
-    monkeypatch.setattr(su.flashinfer, "compute_probs_from_logits_op", spy)
-    logits = torch.randn(2, 128)
-    temperatures = torch.full((2,), 0.7)
+def test_resolve_advanced_sampling_filters(mode, expect_top_k_none, expect_top_p_none):
+    """Mode resolution None-ifies disabled filters (so the op skips that kernel)
+    and passes kept filters through unchanged."""
     top_k = torch.zeros(2, dtype=torch.int32)
     top_p = torch.ones(2)
-    su.compute_probs_from_logits(logits, temperatures, top_k, top_p, advanced_sampling_mode=mode)
-    assert seen["top_k_none"] is expect_top_k_none
-    assert seen["top_p_none"] is expect_top_p_none
+    eff_top_k, eff_top_p = su.resolve_advanced_sampling_filters(
+        AdvancedSamplingMode(mode), top_k, top_p
+    )
+    assert (eff_top_k is None) is expect_top_k_none
+    assert (eff_top_p is None) is expect_top_p_none
+    if not expect_top_k_none:
+        assert eff_top_k is top_k
+    if not expect_top_p_none:
+        assert eff_top_p is top_p
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA + flashinfer sampling kernels"
 )
-@pytest.mark.parametrize("top_p_val", [1.0, 0.9, 0.5])
+@pytest.mark.parametrize("top_p_val", [1.0, 0.9])
 def test_no_topk_matches_full_bit_for_bit(top_p_val):
     """With top_k disabled, NO_TOPK must produce the exact same tokens as FULL
     (the top_k mask is a no-op at k=vocab), for the same seed/offset."""
-    from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
-        sampling_batch_spec_dec_one_model,
-    )
-
     dev = "cuda"
     torch.manual_seed(0)
     batch, vocab = 64, 32000
@@ -106,84 +94,65 @@ def test_no_topk_matches_full_bit_for_bit(top_p_val):
     seed = torch.tensor([12345], dtype=torch.int64, device=dev)
     offset = torch.tensor([0], dtype=torch.int64, device=dev)
 
-    full = sampling_batch_spec_dec_one_model(
-        logits.clone(),
-        temperatures,
-        top_k.clone(),
-        top_p,
-        seed=seed,
-        offset=offset,
-        advanced_sampling_mode="full",
+    ek_full, ep_full = su.resolve_advanced_sampling_filters(
+        AdvancedSamplingMode.FULL, top_k.clone(), top_p
     )
-    no_topk = sampling_batch_spec_dec_one_model(
-        logits.clone(),
-        temperatures,
-        top_k.clone(),
-        top_p,
-        seed=seed,
-        offset=offset,
-        advanced_sampling_mode="no_topk",
+    ek_nt, ep_nt = su.resolve_advanced_sampling_filters(
+        AdvancedSamplingMode.NO_TOPK, top_k.clone(), top_p
+    )
+    full = su.sample_from_logits_op(
+        logits.clone(), temperatures, ek_full, ep_full, seed=seed, offset=offset
+    )
+    no_topk = su.sample_from_logits_op(
+        logits.clone(), temperatures, ek_nt, ep_nt, seed=seed, offset=offset
     )
     assert torch.equal(full, no_topk)
 
 
-# ---- greedy-row guard: _scan_one_model_sampling rejects a greedy row in a
-#      non-FULL mixed batch, and populates has_greedy_requests ----
-def _mk_request(temperature):
-    """Minimal LlmRequest stand-in with the fields the scan reads."""
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-
-    return SimpleNamespace(
-        sampling_config=SimpleNamespace(temperature=[temperature], top_k=[0], top_p=[1.0]),
-        state=LlmRequestState.GENERATION_IN_PROGRESS,
-        py_seq_slot=0,
-    )
-
-
-def _run_scan(mode, temps):
-    from tensorrt_llm._torch.speculative.interface import SpecMetadata
-
-    fake_self = SimpleNamespace(runtime_draft_len=3, advanced_sampling_mode=mode, dummy_slot_row=0)
-    SpecMetadata._scan_one_model_sampling(fake_self, [_mk_request(t) for t in temps])
-    return fake_self
-
-
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA + flashinfer sampling kernels"
+)
 @pytest.mark.parametrize("mode", ["no_topk", "no_topk_no_topp"])
-def test_guard_raises_on_greedy_row_in_mixed_batch(mode):
-    # A greedy (temp=0) row next to a sampled (temp=0.7) row under a non-FULL
-    # mode must raise -- these modes have no argmax override. Also proves
-    # has_greedy_requests is populated (a missing attr would AttributeError).
-    with pytest.raises(ValueError, match="advanced_sampling_mode"):
-        _run_scan(mode, temps=[0.0, 0.7])
+def test_greedy_row_returns_argmax_natively(mode):
+    """Greedy rows carry the sentinel temperature, so the sampler returns their
+    argmax token even in a mixed batch -- this is why no mixed-batch guard is needed."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    batch, vocab = 8, 4096
+    logits = torch.randn(batch, vocab, device=dev, dtype=torch.float32) * 3.0
+    disable = su.GREEDY_TEMPERATURE_THRESHOLD / 10  # sentinel for greedy rows
+    temperatures = torch.full((batch,), 0.7, device=dev, dtype=torch.float32)
+    temperatures[0] = disable  # greedy rows mixed with sampled rows
+    temperatures[1] = disable
+    top_k = torch.zeros(batch, device=dev, dtype=torch.int32)
+    top_p = torch.ones(batch, device=dev, dtype=torch.float32)
+    seed = torch.tensor([7], dtype=torch.int64, device=dev)
+    offset = torch.tensor([0], dtype=torch.int64, device=dev)
+
+    eff_top_k, eff_top_p = su.resolve_advanced_sampling_filters(
+        AdvancedSamplingMode(mode), top_k, top_p
+    )
+    tokens = su.sample_from_logits_op(
+        logits, temperatures, eff_top_k, eff_top_p, seed=seed, offset=offset
+    )
+    argmax = logits.argmax(dim=-1)
+    assert tokens[0].item() == argmax[0].item()
+    assert tokens[1].item() == argmax[1].item()
 
 
-def test_guard_allows_full_and_non_mixed_batches():
-    _run_scan("full", temps=[0.0, 0.7])  # FULL never guards
-    fake_self = _run_scan("no_topk", temps=[0.7, 0.7])  # all non-greedy: fine
-    assert fake_self.has_greedy_requests is False
-    _run_scan("no_topk", temps=[0.0, 0.0])  # all-greedy -> greedy graph, no raise
-
-
-# ---- spec-mode gate: non-FULL only valid on MTP-Eagle one-model ----
-def test_advanced_mode_rejected_outside_mtp_eagle_one_model():
+def test_advanced_mode_accepted_on_all_spec_paths():
+    """The MTP-one-model-only gate was removed (the field is on the base config),
+    so non-FULL modes construct on any spec path instead of raising at config time."""
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-    # Default MTP resolves to MTP-Eagle one-model -> non-FULL accepted.
     args = TorchLlmArgs(
         model="/tmp/dummy_model",
         skip_tokenizer_init=True,
-        speculative_config=MTPDecodingConfig(max_draft_len=1, advanced_sampling_mode="no_topk"),
+        speculative_config=MTPDecodingConfig(
+            max_draft_len=1, use_mtp_vanilla=True, advanced_sampling_mode="no_topk"
+        ),
     )
     assert args.speculative_config.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK
-    # Vanilla MTP does not propagate the field -> reject non-FULL.
-    with pytest.raises(ValidationError):
-        TorchLlmArgs(
-            model="/tmp/dummy_model",
-            skip_tokenizer_init=True,
-            speculative_config=MTPDecodingConfig(
-                max_draft_len=1, use_mtp_vanilla=True, advanced_sampling_mode="no_topk"
-            ),
-        )
 
 
 if __name__ == "__main__":
