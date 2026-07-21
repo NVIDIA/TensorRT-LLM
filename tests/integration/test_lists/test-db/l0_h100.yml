@@ -108,7 +108,10 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
-  - perf/test_disagg_server_config.py
+  - perf/test_disagg_server_config.py::TestBuildDisaggServerConfig::test_no_extra_preserves_baseline_config
+  - perf/test_disagg_server_config.py::TestBuildDisaggServerConfig::test_applies_schedule_style_from_server_config_extra
+  - perf/test_disagg_server_config.py::TestBuildDisaggServerConfig::test_rejects_unknown_or_reserved_extra_keys
+  - perf/test_disagg_server_config.py::TestBuildDisaggServerConfig::test_rejects_invalid_schedule_style
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
