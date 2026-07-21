@@ -674,7 +674,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
-        self.use_cute_dsl_topk = sparse_metadata_params.use_cute_dsl_topk
+        self.use_cute_dsl_topk = (sparse_metadata_params.use_cute_dsl_topk
+                                  and IS_CUTLASS_DSL_AVAILABLE)
         self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
