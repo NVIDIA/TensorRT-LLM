@@ -13,7 +13,11 @@ import pytest
 
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm.visual_gen.args import VisualGenArgs
-from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient, _detect_external_launch
+from tensorrt_llm.visual_gen.visual_gen import (
+    DiffusionRemoteClient,
+    VisualGen,
+    _detect_external_launch,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -251,3 +255,132 @@ class TestSingleNodeSpawnLocalRank:
                 f"Worker {i}: expected local_rank={i}, got {kwargs['local_rank']}. "
                 f"With LOCAL_RANK=0 in env, all workers would get device_id=0."
             )
+
+
+# =============================================================================
+# VisualGen.__init__ — external launch branch
+# =============================================================================
+
+
+class TestVisualGenExternalLaunchInit:
+    """VisualGen.__init__ external-launch handling — no GPU required.
+
+    Covers the branch where torchrun/srun launched the process: world-size
+    validation and the rank != 0 pure-worker path. Neither is reachable from
+    single-node tests, and the 2-node E2E only runs post-merge.
+    """
+
+    def test_world_size_mismatch_raises(self):
+        """Launcher task count must match parallel_config.n_workers."""
+        args = VisualGenArgs(model="/tmp/model", parallel_config={"ulysses_size": 4})
+
+        with patch(
+            "tensorrt_llm.visual_gen.visual_gen._detect_external_launch",
+            return_value=(0, 0, 8, "node0", 29500),
+        ):
+            with pytest.raises(ValueError, match="does not match"):
+                VisualGen(model="/tmp/model", args=args)
+
+    def test_nonzero_rank_runs_worker_then_exits(self):
+        """Rank != 0 must run the worker loop and exit — never reach user code."""
+        args = VisualGenArgs(model="/tmp/model", parallel_config={"ulysses_size": 4})
+        mock_worker = MagicMock()
+
+        with (
+            patch(
+                "tensorrt_llm.visual_gen.visual_gen._detect_external_launch",
+                return_value=(2, 2, 4, "node0", 29500),
+            ),
+            patch("tensorrt_llm.visual_gen.visual_gen.run_diffusion_worker", mock_worker),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                VisualGen(model="/tmp/model", args=args)
+
+        assert exc_info.value.code == 0
+        mock_worker.assert_called_once()
+        kwargs = mock_worker.call_args.kwargs
+        assert kwargs["rank"] == 2
+        assert kwargs["local_rank"] == 2
+        assert kwargs["world_size"] == 4
+        assert kwargs["master_addr"] == "node0"
+        assert kwargs["master_port"] == 29500
+        # Non-zero ranks receive requests via dist broadcast, not ZMQ
+        assert kwargs["request_queue_addr"] is None
+        assert kwargs["response_queue_addr"] is None
+
+
+# =============================================================================
+# DiffusionRemoteClient — external launch wiring (rank 0 coordinator)
+# =============================================================================
+
+
+class TestExternalLaunchClientWiring:
+    """Rank-0 coordinator wiring in external-launch mode — no GPU required.
+
+    Regression target: the ZMQ connect addresses handed to workers must use
+    the launcher's master_addr, not 127.0.0.1 / local host IP. Getting this
+    wrong keeps every single-node test green while remote-node workers can
+    never connect — only a real 2-node run would catch it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for var in ["RANK", "WORLD_SIZE", "LOCAL_RANK", "SLURM_PROCID", "SLURM_NTASKS"]:
+            monkeypatch.delenv(var, raising=False)
+
+    def test_rank0_uses_master_addr_and_thread_worker(self):
+        args = VisualGenArgs(model="/tmp/model", parallel_config={"ulysses_size": 4})
+
+        mock_ctx = MagicMock()
+        original_event = threading.Event
+
+        def pre_set_event():
+            e = original_event()
+            e.set()
+            return e
+
+        with (
+            patch(
+                "tensorrt_llm._torch.visual_gen.executor._detect_external_launch",
+                return_value=(0, 0, 4, "node0", 29500),
+            ),
+            patch("tensorrt_llm._torch.visual_gen.executor.mp.get_context", return_value=mock_ctx),
+            patch("tensorrt_llm._torch.visual_gen.executor.threading.Thread") as mock_thread_cls,
+            patch(
+                "tensorrt_llm._torch.visual_gen.executor.threading.Event", side_effect=pre_set_event
+            ),
+            patch.object(DiffusionRemoteClient, "_wait_ready"),
+        ):
+            mock_thread_cls.return_value = MagicMock()
+            client = DiffusionRemoteClient(args=args)
+
+        # Distributed rendezvous comes from the launcher, not a local port
+        assert client.master_addr == "node0"
+        assert client.master_port == 29500
+
+        # Remote-node workers connect to rank 0 via master_addr
+        assert client.req_addr_connect.startswith("tcp://node0:")
+        assert client.resp_addr_connect.startswith("tcp://node0:")
+
+        # No local mp.Process spawn — other ranks were launched externally
+        mock_ctx.Process.assert_not_called()
+        assert client.worker_processes == []
+
+        # Rank 0's own worker runs in a daemon thread inside the client process
+        worker_calls = [
+            c
+            for c in mock_thread_cls.call_args_list
+            if "in_client_process" in c.kwargs.get("kwargs", {})
+        ]
+        assert len(worker_calls) == 1, "Expected exactly one external-launch worker thread"
+        thread_call = worker_calls[0]
+        assert thread_call.kwargs["daemon"] is True
+        worker_kwargs = thread_call.kwargs["kwargs"]
+        assert worker_kwargs["in_client_process"] is True
+        assert worker_kwargs["rank"] == 0
+        assert worker_kwargs["local_rank"] == 0
+        assert worker_kwargs["world_size"] == 4
+        assert worker_kwargs["master_addr"] == "node0"
+        assert worker_kwargs["master_port"] == 29500
+        assert worker_kwargs["request_queue_addr"] == client.req_addr_connect
+        assert worker_kwargs["response_queue_addr"] == client.resp_addr_connect
