@@ -763,12 +763,9 @@ class TestPublishAsSource:
 
     def test_serialized_identity_ignores_local_checkpoint_path(self):
         donor_identity = _identity()
-        receiver_identity = SourceIdentity(
-            **{
-                **donor_identity.to_dict(),
-                "model_name": "/tmp/no-shards/TinyLlama",
-            }
-        )
+        receiver_payload = donor_identity.to_dict()
+        receiver_payload["model_name"] = "/tmp/no-shards/TinyLlama"
+        receiver_identity = SourceIdentity.from_dict(receiver_payload)
 
         assert donor_identity.model_name != receiver_identity.model_name
         assert _serialize_source_identity(donor_identity) == _serialize_source_identity(
