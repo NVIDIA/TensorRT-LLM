@@ -73,7 +73,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
 
-[^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B. Its transformer, VAE, and text encoder are identical to Wan2.2-5B; only the sampling loop changes: 3 denoising steps with fixed timesteps, no CFG, and a distribution-matching-distillation (DMD) noise update. It runs through the `WanDMDPipeline` and currently supports text-to-video only. Because there is no CFG path, CFG parallelism does not apply; and with only 3 steps, step caching (TeaCache / Cache-DiT) gives no benefit. VSA is not enabled in this full-attention checkpoint.
+[^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
 ## Quick Start
 
