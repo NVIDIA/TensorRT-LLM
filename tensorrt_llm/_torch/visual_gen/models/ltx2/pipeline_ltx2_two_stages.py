@@ -53,8 +53,8 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
 class _TwoStagePhaseTimer(CudaPhaseTimer):
-    """CudaPhaseTimer + the two-stage extras: the stage1→stage2 gap and the
-    stage-2 refinement loop.
+    """CudaPhaseTimer + the two-stage extras: the stage-2 refinement loop and
+    the decode section.
 
     Inherited marks keep their contract (``denoise`` = the whole stage-1
     forward; stage 2 folds into ``post_denoise`` on ``PipelineOutput``).
@@ -69,9 +69,12 @@ class _TwoStagePhaseTimer(CudaPhaseTimer):
     def __init__(self) -> None:
         super().__init__()
         self._stage2_marked = 0
+        self._decode_marked = 0
         if self._enabled:
             self._stage2_start = torch.cuda.Event(enable_timing=True)
             self._stage2_end = torch.cuda.Event(enable_timing=True)
+            self._decode_start = torch.cuda.Event(enable_timing=True)
+            self._decode_end = torch.cuda.Event(enable_timing=True)
 
     def mark_stage2_start(self) -> None:
         if self._enabled:
@@ -89,6 +92,23 @@ class _TwoStagePhaseTimer(CudaPhaseTimer):
             return None
         self._stage2_end.synchronize()
         return self._stage2_start.elapsed_time(self._stage2_end) / 1000.0
+
+    def mark_decode_start(self) -> None:
+        if self._enabled:
+            self._decode_start.record()
+            self._decode_marked = 1
+
+    def mark_decode_end(self) -> None:
+        if self._enabled and self._decode_marked == 1:
+            self._decode_end.record()
+            self._decode_marked = 2
+
+    def decode_time(self) -> Optional[float]:
+        """Decode-only seconds; None if the decode bracket never completed."""
+        if not self._enabled or self._decode_marked != 2:
+            return None
+        self._decode_end.synchronize()
+        return self._decode_start.elapsed_time(self._decode_end) / 1000.0
 
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -1459,7 +1479,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 )
             )
 
-        decode_start = time.time()
+        # Event bracket: a host wall clock started here would absorb the queued
+        # stage-2 GPU tail (the graphed loop leaves the host far ahead).
+        timer.mark_decode_start()
         vgm = self.pipeline_config.visual_gen_mapping
         if self._parallel_vae_enabled and self.rank in vgm.vae_ranks:
             # Parallel Stage 2 left identical refined latents on every rank;
@@ -1496,12 +1518,15 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             audio_latents = audio_latents.to(self.dtype)
             audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
 
+        timer.mark_decode_end()
         if self.rank == 0:
             logger.info(f"Stage 1 denoising time: {out.denoise:.2f}s")
             stage2_s = timer.stage2_denoise_time()
             if stage2_s is not None:
                 logger.info(f"Stage 2 denoising time: {stage2_s:.2f}s")
-            logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")
+            decode_s = timer.decode_time()
+            if decode_s is not None:
+                logger.info(f"Decoding completed in {decode_s:.2f}s")
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
         timer.mark_end()
         return timer.fill(
