@@ -9,26 +9,30 @@ Usage (from anywhere; the repo is located from this file's path):
     examples/kimi_k3/run_kimi.py gsm8k           # 16-GPU GSM8K eval (~3 hr)
 
 Any extra args are forwarded to sbatch (e.g. --time=01:00:00).
+--dry-run resolves paths and prints the sbatch command without submitting.
 
-Path resolution — everything defaults to a "workspace" directory expected to
-contain the model weights, the exisiting_optimization_work checkout, and the
-container image, laid out as siblings of this repo checkout:
+Configuration — job inputs are read from ~/.config/kimi-bringup.ini
+(override the location with KIMI_BRINGUP_CONFIG). To set it up:
 
-    <workspace>/
-      tekit-golden-prairie/               <- this repo (any name works)
-      goldenprairie-final-weights_vv1/    <- KIMI_K3_MODEL_DIR
-      exisiting_optimization_work/        <- KIMI_K3_OPT_WORK_DIR
-      *.sqsh                              <- IMAGE (must be exactly one match)
+    cp examples/kimi_k3/kimi-bringup.ini.example ~/.config/kimi-bringup.ini
+    $EDITOR ~/.config/kimi-bringup.ini    # point `workspace` at your dir
 
-Every path can be overridden individually via the environment:
-    KIMI_K3_WORKSPACE      workspace root      (default: parent of this repo)
-    KIMI_K3_MODEL_DIR      HF checkpoint       (default: <workspace>/goldenprairie-final-weights_vv1)
-    KIMI_K3_OPT_WORK_DIR   optimization work   (default: <workspace>/exisiting_optimization_work)
-    KIMI_K3_CACHE_DIR      JIT/HF cache        (default: <repo>/.kimi_k3_cache)
-    IMAGE                  container .sqsh     (default: sole *.sqsh in <workspace>)
+The minimal config is a single `workspace` path containing the three inputs
+under their standard names; see the example file for per-input overrides.
+Resolution order for each input:
+
+    environment variable  >  config file key  >  derived from `workspace`
+
+    input          env var               config key    workspace default
+    ------------   -------------------   -----------   -----------------------------------
+    checkpoint     KIMI_K3_MODEL_DIR     model_dir     <ws>/goldenprairie-final-weights_vv1
+    opt work       KIMI_K3_OPT_WORK_DIR  opt_work_dir  <ws>/exisiting_optimization_work
+    container      IMAGE                 image         sole *.sqsh in <ws>
+    JIT/HF cache   KIMI_K3_CACHE_DIR     cache_dir     <repo>/.kimi_k3_cache
 """
 
 import argparse
+import configparser
 import os
 import re
 import subprocess
@@ -36,6 +40,22 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
+CONFIG_PATH = Path(
+    os.environ.get("KIMI_BRINGUP_CONFIG", "~/.config/kimi-bringup.ini")
+).expanduser()
+
+SETUP_HINT = f"""\
+No usable Kimi K3 configuration found.
+
+Set up the config file (one-time):
+
+    cp {REPO}/examples/kimi_k3/kimi-bringup.ini.example {CONFIG_PATH}
+    $EDITOR {CONFIG_PATH}    # point `workspace` at your directory
+
+The workspace directory must contain the HF checkpoint
+(goldenprairie-final-weights_vv1/), the exisiting_optimization_work checkout,
+and the container image (*.sqsh); see the example file for per-input
+overrides and run_kimi.py --help for the full resolution rules."""
 
 MODES = {
     "sanity": {
@@ -62,16 +82,61 @@ MODES = {
 }
 
 
-def resolve_image(workspace: Path) -> str:
-    """Default IMAGE to the sole .sqsh in the workspace, else demand one."""
+def load_config() -> dict:
+    """Return the [paths] section of the config file as a dict ('' if absent)."""
+    if not CONFIG_PATH.is_file():
+        return {}
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_PATH)
+    except configparser.Error as e:
+        sys.exit(f"error: cannot parse {CONFIG_PATH}: {e}")
+    return dict(parser["paths"]) if parser.has_section("paths") else {}
+
+
+def infer_image(workspace: Path) -> str | None:
     candidates = sorted(workspace.glob("*.sqsh"))
     if len(candidates) == 1:
         return str(candidates[0])
-    reason = ("no .sqsh found" if not candidates else
-              f"{len(candidates)} .sqsh files found: "
-              + ", ".join(p.name for p in candidates))
-    sys.exit(f"error: cannot infer container image in {workspace} ({reason}); "
-             "set IMAGE explicitly")
+    if candidates:
+        print(f"error: {len(candidates)} .sqsh files in {workspace} "
+              f"({', '.join(p.name for p in candidates)}); set `image` in "
+              f"{CONFIG_PATH} or IMAGE in the environment", file=sys.stderr)
+        sys.exit(1)
+    return None
+
+
+def resolve_inputs() -> dict:
+    """Resolve all job inputs: env var > config key > workspace-derived."""
+    config = load_config()
+    workspace = os.environ.get("KIMI_K3_WORKSPACE") or config.get("workspace")
+    ws = Path(workspace).expanduser() if workspace else None
+
+    def pick(env_var, config_key, derive):
+        value = os.environ.get(env_var) or config.get(config_key)
+        if not value and ws is not None:
+            value = derive(ws)
+        return str(Path(value).expanduser()) if value else None
+
+    inputs = {
+        "KIMI_K3_MODEL_DIR": pick(
+            "KIMI_K3_MODEL_DIR", "model_dir",
+            lambda w: w / "goldenprairie-final-weights_vv1"),
+        "KIMI_K3_OPT_WORK_DIR": pick(
+            "KIMI_K3_OPT_WORK_DIR", "opt_work_dir",
+            lambda w: w / "exisiting_optimization_work"),
+        "IMAGE": pick("IMAGE", "image", infer_image),
+        "KIMI_K3_CACHE_DIR": pick(
+            "KIMI_K3_CACHE_DIR", "cache_dir", lambda w: None)
+            or str(REPO / ".kimi_k3_cache"),
+    }
+
+    missing = [k for k, v in inputs.items() if not v]
+    if missing:
+        print(f"error: unresolved input(s): {', '.join(missing)}\n\n"
+              f"{SETUP_HINT}", file=sys.stderr)
+        sys.exit(1)
+    return inputs
 
 
 def main() -> int:
@@ -89,23 +154,20 @@ def main() -> int:
     args = parser.parse_args()
     mode = MODES[args.mode]
 
+    inputs = resolve_inputs()
     env = os.environ.copy()
-    workspace = Path(env.get("KIMI_K3_WORKSPACE", REPO.parent))
-    env.setdefault("KIMI_K3_MODEL_DIR",
-                   str(workspace / "goldenprairie-final-weights_vv1"))
-    env.setdefault("KIMI_K3_OPT_WORK_DIR",
-                   str(workspace / "exisiting_optimization_work"))
-    env.setdefault("KIMI_K3_CACHE_DIR", str(REPO / ".kimi_k3_cache"))
-    if "IMAGE" not in env:
-        env["IMAGE"] = resolve_image(workspace)
+    env.update(inputs)
     env.update(mode["env"])
     env["REPO"] = str(REPO)
 
     # Preflight: every input path must exist before we burn queue time.
+    ok = True
     for key in ("KIMI_K3_OPT_WORK_DIR", "KIMI_K3_MODEL_DIR", "IMAGE"):
         if not Path(env[key]).exists():
             print(f"error: {key}={env[key]} does not exist", file=sys.stderr)
-            return 1
+            ok = False
+    if not ok:
+        return 1
     snapshot_data = Path(env["KIMI_K3_OPT_WORK_DIR"]) / "trtllmgen_MOE/flashinfer/data/csrc"
     if not snapshot_data.exists():
         print(f"error: {snapshot_data} missing — set up the flashinfer snapshot "
@@ -117,9 +179,8 @@ def main() -> int:
     cmd = ["sbatch", "--export=ALL", *mode["sbatch_args"], *args.sbatch_args,
            str(REPO / "examples" / "kimi_k3" / mode["script"])]
     print(f"[{args.mode}] {mode['help']}")
-    for key in ("KIMI_K3_MODEL_DIR", "KIMI_K3_OPT_WORK_DIR",
-                "KIMI_K3_CACHE_DIR", "IMAGE"):
-        print(f"  {key}={env[key]}")
+    for key, value in inputs.items():
+        print(f"  {key}={value}")
     print(f"  submitting: {' '.join(cmd)}")
     if args.dry_run:
         print("  (dry run — not submitted)")

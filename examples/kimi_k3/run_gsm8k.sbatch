@@ -4,8 +4,9 @@
 #
 # Kimi K3 ("golden prairie") GSM8K eval on 16 GPUs (4x GB300 trays).
 #
-# Submit from the repo root (paths default to brnguyen's workspace; override
-# KIMI_K3_* / IMAGE via the environment for other checkouts):
+# Preferred: submit via examples/kimi_k3/run_kimi.py, which resolves all
+# inputs from ~/.config/kimi-bringup.ini (see kimi-bringup.ini.example).
+# Direct sbatch use requires exporting the inputs yourself:
 #
 #   KIMI_K3_OPT_WORK_DIR=/path/to/exisiting_optimization_work \
 #   KIMI_K3_MODEL_DIR=/path/to/goldenprairie-final-weights_vv1 \
@@ -27,12 +28,12 @@
 
 set -euo pipefail
 
-# Paths — defaults point at brnguyen's golden-prairie workspace; override via
-# the environment for other checkouts.
-KIMI_K3_OPT_WORK_DIR=${KIMI_K3_OPT_WORK_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/goldenprairie/exisiting_optimization_work}
-KIMI_K3_MODEL_DIR=${KIMI_K3_MODEL_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/goldenprairie/goldenprairie-final-weights_vv1}
+# Required inputs — no defaults; submit via examples/kimi_k3/run_kimi.py
+# (reads ~/.config/kimi-bringup.ini) or export these before sbatch.
+: "${KIMI_K3_OPT_WORK_DIR:?set via run_kimi.py or export (exisiting_optimization_work checkout)}"
+: "${KIMI_K3_MODEL_DIR:?set via run_kimi.py or export (goldenprairie-final-weights_vv1 checkpoint)}"
+: "${IMAGE:?set via run_kimi.py or export (path to the 26.05 sbsa .sqsh)}"
 KIMI_K3_CACHE_DIR=${KIMI_K3_CACHE_DIR:-$SLURM_SUBMIT_DIR/.kimi_k3_cache}
-IMAGE=${IMAGE:-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/goldenprairie/sw-tensorrt-docker+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194.sqsh}
 export KIMI_K3_OPT_WORK_DIR KIMI_K3_MODEL_DIR KIMI_K3_CACHE_DIR
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
