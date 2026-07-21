@@ -22,7 +22,10 @@ import time
 import psutil
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-only")
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_PDEATHSIG is Linux-only"),
+]
 
 
 def _alive(pid: int) -> bool:
