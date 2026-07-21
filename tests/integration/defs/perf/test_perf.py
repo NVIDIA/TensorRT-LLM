@@ -205,9 +205,11 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
+    # AutoDeploy builds its KVCacheManager from the same shared C++ class (see
+    # tensorrt_llm/_torch/auto_deploy/shim/interface.py), so its post-resize
+    # capacity also logs this line (max() below picks that final value).
     PerfMetricType.KV_CACHE_SIZE:
-    re.compile(r".*(?:Allocated ([\d\.]+) GiB for max tokens in paged KV cache|"
-               r"Final KV cache size after resize: ([\d\.]+) GiB).*"),
+    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
     PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
     re.compile(
         r"Per User Output Throughput \[w\/ ctx\] \(tps\/user\):\s+([\d\.]+)"),
@@ -248,6 +250,9 @@ AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_INFERENCE_TIME:
     re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
+    # Printed by the shared C++ KVCacheManager on server startup, same as trtllm-bench.
+    PerfMetricType.KV_CACHE_SIZE:
+    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
 }
 
 # (Relative threshold, Absolute threshold) for all metric types
@@ -1679,22 +1684,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if result_state != "valid":
                 errors.append(self.get_error())
 
-        if self._config.runtime == 'serve':
-            print_info("Starting serve server")
-            outputs = self.run_ex(commands=commands,
-                                  cmd_idx=self._current_cmd_idx,
-                                  full_test_name="start_server",
-                                  metric_type=None,
-                                  venv=llm_venv,
-                                  gpu_clock_lock=gpu_clock_lock,
-                                  session_data_writer=session_data_writer,
-                                  output_dir=output_dir,
-                                  outputs=outputs,
-                                  original_test_name="start_server")
-            result_state = self.get_result_state()
-            result_states[self._current_cmd_idx] = result_state
-            if result_state != "valid":
-                errors.append(self.get_error())
+        # Note: unlike 'bench', 'serve' has no separate setup step here. The
+        # server is started as part of processing the first metric below
+        # (KV_CACHE_SIZE, cmd_idx=0) so that its startup log is captured and
+        # can be parsed, instead of being discarded as a setup command.
 
         try:
             for metric in metrics:
@@ -1786,7 +1779,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             cmd_idx = 0
 
         if self._config.runtime == "serve":
-            builder_metrics = []
+            # No engine build step, but the server start command (cmd_idx=0)
+            # still emits the KV cache size, so collect it like trtllm-bench does.
+            builder_metrics = [PerfMetricType.KV_CACHE_SIZE]
             print_info(
                 f"Skip building process for {self._config.model_name} as serve handles model loading"
             )
