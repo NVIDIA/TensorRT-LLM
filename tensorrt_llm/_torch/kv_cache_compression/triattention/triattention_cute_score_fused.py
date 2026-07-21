@@ -134,7 +134,6 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         *,
         num_layers: int,
         seq_len: int,
-        score_start: int,
         num_q_heads: int,
         num_kv_heads: int,
         num_freqs: int,
@@ -157,12 +156,9 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             raise ValueError("TriAttention CuTe score requires 32- or 128-token pages")
         if num_q_heads % num_kv_heads or num_q_heads // num_kv_heads not in (4, 8):
             raise ValueError("TriAttention CuTe score requires GQA group 4 or 8")
-        if not 0 <= score_start < seq_len:
-            raise ValueError("TriAttention CuTe score_start is out of range")
         if page_shards not in _SUPPORTED_PAGE_SHARDS:
             raise ValueError("TriAttention CuTe score has unsupported page shards")
 
-        self.score_start = score_start
         self.seq_len = seq_len
         self.num_layers = num_layers
         self.num_q_heads = num_q_heads
@@ -236,6 +232,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         seg_layer_id: cute.Tensor,
         seg_seq_len: cute.Tensor,
         seg_out_offset: cute.Tensor,
+        token_starts: cute.Tensor,
         q_real: cute.Tensor,
         q_imag: cute.Tensor,
         mlr_coef: cute.Tensor,
@@ -539,6 +536,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             seg_layer_id,
             seg_seq_len,
             seg_out_offset,
+            token_starts,
             q_real,
             q_imag,
             mlr_coef,
@@ -581,6 +579,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         seg_layer_id: cute.Tensor,
         seg_seq_len: cute.Tensor,
         seg_out_offset: cute.Tensor,
+        token_starts: cute.Tensor,
         q_real: cute.Tensor,
         q_imag: cute.Tensor,
         mlr_coef: cute.Tensor,
@@ -616,6 +615,12 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         valid_seq_len = seg_seq_len[segment]
         page_off = seg_page_off[segment]
         out_base = seg_out_offset[segment]
+        # Per-request score window start (the request's pinned prompt
+        # length), loaded like the other per-segment metadata: each CTA
+        # owns one segment, so its whole schedule derives from one start.
+        # Scratch writes stay absolute; only the scoring/stats domain and
+        # the first scored page move per request.
+        score_start = cutlass.Int32(token_starts[req_id])
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -732,7 +737,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             swizzle=raw_bf16_b_smem_layout.inner,
         )
 
-        page_index = self.score_start // self.tile_tokens + page_shard
+        page_index = score_start // self.tile_tokens + page_shard
         page_start = page_index * self.tile_tokens
         shard_first_page_start = page_start
         pages_processed = cutlass.Int32(0)
@@ -754,8 +759,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             )
             physical_page_fragments = cute.make_rmem_tensor((self.pages_per_tile,), cutlass.Int32)
             prefetched_page_fragments = cute.make_rmem_tensor((self.pages_per_tile,), cutlass.Int32)
-        shard_has_page = valid_seq_len > self.score_start and page_start < valid_seq_len
-        empty_shard = valid_seq_len <= self.score_start or page_start >= valid_seq_len
+        shard_has_page = valid_seq_len > score_start and page_start < valid_seq_len
+        empty_shard = valid_seq_len <= score_start or page_start >= valid_seq_len
         if cutlass.dynamic_expr(shard_has_page):
             if warp_idx == self.producer_warp_id:
                 if lane_idx == 0:
@@ -966,7 +971,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         )
                     raw_tma_producer_state.advance()
         while (
-            valid_seq_len > self.score_start
+            valid_seq_len > score_start
             and page_start < valid_seq_len
             and pages_processed < self.max_tiles
         ):
@@ -1424,16 +1429,12 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             tTR_rAcc,
                         )
                         tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
-                        if cutlass.const_expr(
-                            self.score_start % CTA_M == 0 and self.seq_len % CTA_M == 0
-                        ):
-                            cute.copy(
-                                simt_atom,
-                                tTR_rC,
-                                tTR_gC[(None, None, None, subtile_idx)],
-                            )
-                        elif cutlass.dynamic_expr(
-                            page_start >= self.score_start and page_start + CTA_M <= self.seq_len
+                        # The window start is a per-request runtime value, so
+                        # the tile-interior fast path is a dynamic predicate;
+                        # only the straddling first tile takes the per-token
+                        # branch.
+                        if cutlass.dynamic_expr(
+                            page_start >= score_start and page_start + CTA_M <= self.seq_len
                         ):
                             cute.copy(
                                 simt_atom,
@@ -1443,7 +1444,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         else:
                             output_token = page_start + epilogue_tidx
                             if cutlass.dynamic_expr(
-                                output_token >= self.score_start and output_token < self.seq_len
+                                output_token >= score_start and output_token < self.seq_len
                             ):
                                 cute.copy(
                                     simt_atom,
@@ -1484,7 +1485,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     stats_token = page_start + tidx
                     if tidx < EPILOGUE_THREADS:
                         if cutlass.dynamic_expr(
-                            stats_token >= self.score_start and stats_token < valid_seq_len
+                            stats_token >= score_start and stats_token < valid_seq_len
                         ):
                             for stats_head in cutlass.range_constexpr(N):
                                 stats_delta = (
@@ -1531,7 +1532,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         stats_square_sum = stats_square_sum + sStats[stats_scratch_base + 1]
                     stats_count_i32 = pages_processed * self.tile_tokens
                     if pages_processed > 0:
-                        stats_invalid_prefix = self.score_start - shard_first_page_start
+                        stats_invalid_prefix = score_start - shard_first_page_start
                         if cutlass.dynamic_expr(stats_invalid_prefix > 0):
                             stats_count_i32 = stats_count_i32 - stats_invalid_prefix
                         stats_last_page = page_start - self.tile_tokens * self.page_shards
@@ -1669,7 +1670,6 @@ class TriAttentionCuteScoreRunner:
         max_requests: int,
         num_layers: int,
         seq_len: int,
-        score_start: int,
         num_q_heads: int,
         num_kv_heads: int,
         num_freqs: int,
@@ -1680,6 +1680,7 @@ class TriAttentionCuteScoreRunner:
         seg_layer_id: torch.Tensor,
         seg_seq_len: torch.Tensor,
         seg_out_offset: torch.Tensor,
+        token_starts: torch.Tensor,
         q_real: torch.Tensor,
         q_imag: torch.Tensor,
         mlr_coef: torch.Tensor,
@@ -1692,7 +1693,10 @@ class TriAttentionCuteScoreRunner:
     ) -> None:
         self.max_requests = int(max_requests)
         self.num_layers = int(num_layers)
-        self.width = int(seq_len - score_start)
+        # The score window start is a per-request runtime input
+        # (``token_starts``), so the widest window — the whole bucket —
+        # sizes every start-dependent buffer.
+        self.width = int(seq_len)
         self.num_q_heads = int(num_q_heads)
         self.num_kv_heads = int(num_kv_heads)
         self.sm_count = int(torch.cuda.get_device_properties(output.device).multi_processor_count)
@@ -1720,6 +1724,7 @@ class TriAttentionCuteScoreRunner:
             seg_layer_id,
             seg_seq_len,
             seg_out_offset,
+            token_starts,
             q_real,
             q_imag,
             mlr_coef,
@@ -1753,12 +1758,12 @@ class TriAttentionCuteScoreRunner:
             _to_cute(output),
             _to_cute(seg_seq_len),
             _to_cute(seg_out_offset),
+            _to_cute(token_starts),
         )
         static_geometry = (
             max_requests,
             num_layers,
             seq_len,
-            score_start,
             num_q_heads,
             num_kv_heads,
             num_freqs,
@@ -1792,7 +1797,6 @@ class TriAttentionCuteScoreRunner:
                     kernel = _TriAttentionScoreKernel(
                         num_layers=num_layers,
                         seq_len=seq_len,
-                        score_start=score_start,
                         num_q_heads=num_q_heads,
                         num_kv_heads=num_kv_heads,
                         num_freqs=num_freqs,
@@ -1833,7 +1837,6 @@ class TriAttentionCuteScoreRunner:
                         stats_kernel = _TriAttentionScoreKernel(
                             num_layers=num_layers,
                             seq_len=seq_len,
-                            score_start=score_start,
                             num_q_heads=num_q_heads,
                             num_kv_heads=num_kv_heads,
                             num_freqs=num_freqs,
@@ -1912,7 +1915,6 @@ class TriAttentionCuteScoreRunner:
                             kernel = _TriAttentionNormalizeUnionKernel(
                                 num_layers=num_layers,
                                 seq_len=seq_len,
-                                score_start=score_start,
                                 num_q_heads=num_q_heads,
                                 # The score scratch pads each KV head's group
                                 # of head planes to the MMA tile N=8; the

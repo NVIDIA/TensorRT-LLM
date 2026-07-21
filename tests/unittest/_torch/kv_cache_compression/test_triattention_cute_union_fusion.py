@@ -15,15 +15,17 @@ def _check_union_fusion_matches_split_pipeline(
     tokens_per_block: int,
     num_freqs: int,
     num_q_heads: int,
-    score_start: int,
+    score_starts: "int | list",
     valid_lens: "list | None",
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The fused pipeline must reproduce the split score->stats->union rows.
 
-    The reference runs the production split path: the score launch gathers
-    each request's decode window, then ``prepare_union_scores`` normalizes
-    rows and takes the cross-row union maximum.
+    ``score_starts`` is either one uniform window start or a per-request
+    list (the fused kernels read the start per request at runtime). The
+    reference runs the production split path: the score launch gathers each
+    request's decode window, then ``prepare_union_scores`` normalizes rows
+    and takes the cross-row union maximum.
     """
     pytest.importorskip("cutlass")
     monkeypatch.setenv("TRTLLM_TRIATTENTION_CUTE_UNION_FUSION", "1")
@@ -83,10 +85,13 @@ def _check_union_fusion_matches_split_pipeline(
         valid_lens = [seq_len, seq_len]
     valid_seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=device)
     request_count = 2
+    if isinstance(score_starts, int):
+        score_starts = [score_starts] * request_count
+    assert len(score_starts) == request_count
 
     # Reference: the split pipeline over the same decode windows.
     split_widths = torch.empty(request_count, dtype=torch.int32, device=device)
-    token_starts = torch.full((request_count,), score_start, dtype=torch.int32, device=device)
+    token_starts = torch.tensor(score_starts, dtype=torch.int32, device=device)
     per_head = group.launch(
         request_count,
         valid_seq_lens,
@@ -119,7 +124,6 @@ def _check_union_fusion_matches_split_pipeline(
         valid_seq_lens,
         fused_widths,
         token_starts,
-        score_start,
         mean_cos,
         mean_sin,
         fused_out,
@@ -127,7 +131,7 @@ def _check_union_fusion_matches_split_pipeline(
     assert launched, "fused union pipeline must engage on its contract geometry"
     assert torch.equal(fused_widths, split_widths)
     for request in range(request_count):
-        width = int(valid_lens[request]) - score_start
+        width = int(valid_lens[request]) - int(score_starts[request])
         torch.testing.assert_close(
             fused_out[request, :width],
             expected[request, :width],
@@ -135,26 +139,14 @@ def _check_union_fusion_matches_split_pipeline(
             atol=5.0e-3,
         )
 
-    # A cohort without one uniform prompt start must decline, not launch.
-    assert not group.launch_cute_union_fusion(
-        request_count,
-        valid_seq_lens,
-        fused_widths,
-        token_starts,
-        None,
-        mean_cos,
-        mean_sin,
-        fused_out,
-    )
-
 
 @_SM100_ONLY
 @pytest.mark.parametrize(
-    "tokens_per_block,num_freqs,num_q_heads,score_start,valid_lens",
+    "tokens_per_block,num_freqs,num_q_heads,score_starts,valid_lens",
     [
         # The originally validated geometry: 32 frequencies (64-element K
         # rows), GQA group 8, across full-range, non-page-aligned ragged,
-        # and page-aligned score starts.
+        # and page-aligned uniform window starts.
         (32, 32, 8, 0, None),
         (32, 32, 8, 37, [250, 198]),
         (32, 32, 8, 128, [250, 230]),
@@ -167,18 +159,25 @@ def _check_union_fusion_matches_split_pipeline(
         (32, 64, 4, 37, [250, 198]),
         (128, 64, 4, 0, None),
         (128, 64, 4, 128, [250, 230]),
+        # Mixed-prompt cohorts: each request scores its own window (one
+        # start mid-tile, one page-aligned) — the case the fused pipeline
+        # previously declined.
+        (32, 32, 8, [37, 128], [250, 198]),
+        (128, 32, 8, [37, 128], None),
+        (32, 64, 4, [37, 128], None),
+        (128, 64, 4, [37, 128], [250, 230]),
     ],
 )
 def test_union_fusion_matches_split_pipeline(
     tokens_per_block: int,
     num_freqs: int,
     num_q_heads: int,
-    score_start: int,
+    score_starts: "int | list",
     valid_lens: "list | None",
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _check_union_fusion_matches_split_pipeline(
-        tokens_per_block, num_freqs, num_q_heads, score_start, valid_lens, monkeypatch
+        tokens_per_block, num_freqs, num_q_heads, score_starts, valid_lens, monkeypatch
     )
 
 
@@ -206,7 +205,6 @@ def test_union_fusion_rejects_unsupported_frequency_count() -> None:
         _TriAttentionScoreKernel(
             num_layers=1,
             seq_len=256,
-            score_start=0,
             num_q_heads=8,
             num_kv_heads=1,
             num_freqs=16,

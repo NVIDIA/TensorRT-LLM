@@ -121,7 +121,6 @@ class _TriAttentionNormalizeUnionKernel:
         *,
         num_layers: int,
         seq_len: int,
-        score_start: int,
         num_q_heads: int,
         num_kv_heads: int | None = None,
         page_shards: int,
@@ -131,8 +130,6 @@ class _TriAttentionNormalizeUnionKernel:
     ) -> None:
         if min(num_layers, seq_len, num_q_heads) <= 0:
             raise ValueError("TriAttention stats/union reduction requires positive geometry")
-        if not 0 <= score_start < seq_len:
-            raise ValueError("TriAttention stats/union score_start is out of range")
         if page_shards not in _SUPPORTED_PAGE_SHARDS:
             raise ValueError("TriAttention stats/union has unsupported page shards")
         # ``num_kv_heads`` declares that the score scratch pads each KV
@@ -161,8 +158,10 @@ class _TriAttentionNormalizeUnionKernel:
             raise ValueError("TriAttention stats/union has unsupported row cluster")
         self.num_layers = num_layers
         self.seq_len = seq_len
-        self.score_start = score_start
-        self.width = seq_len - score_start
+        # The score window start is per-request runtime metadata
+        # (``token_starts``); the widest window — the whole bucket —
+        # sizes the output rows and the token-tile grid.
+        self.width = seq_len
         self.num_q_heads = num_q_heads
         self.num_rows = num_layers * num_q_heads
         self.page_shards = page_shards
@@ -182,6 +181,7 @@ class _TriAttentionNormalizeUnionKernel:
         scores: cute.Tensor,
         seg_seq_len: cute.Tensor,
         seg_out_offset: cute.Tensor,
+        token_starts: cute.Tensor,
         union_scores: cute.Tensor,
         request_count: cutlass.Int32,
         stream: cuda.CUstream,
@@ -191,6 +191,7 @@ class _TriAttentionNormalizeUnionKernel:
             scores,
             seg_seq_len,
             seg_out_offset,
+            token_starts,
             union_scores,
             request_count,
         )
@@ -219,6 +220,7 @@ class _TriAttentionNormalizeUnionKernel:
         scores: cute.Tensor,
         seg_seq_len: cute.Tensor,
         seg_out_offset: cute.Tensor,
+        token_starts: cute.Tensor,
         union_scores: cute.Tensor,
         request_count: cutlass.Int32,
     ):
@@ -237,7 +239,10 @@ class _TriAttentionNormalizeUnionKernel:
         lane_idx = tidx % _WARP_SIZE
         first_token = token_tile_idx * self.token_tile + lane_idx * self.tokens_per_lane
         first_segment = request_idx * self.num_layers
-        valid_width = seg_seq_len[first_segment] - self.score_start
+        # Per-request score window start: the normalization domain and the
+        # union output row both cover [0, valid - start) for this request.
+        score_start = cutlass.Int32(token_starts[request_idx])
+        valid_width = seg_seq_len[first_segment] - score_start
         warp_max_ptr = cute.arch.alloc_smem(
             cutlass.Float32,
             self.reduce_threads * self.tokens_per_lane * self.token_subtiles,
@@ -359,14 +364,17 @@ class _TriAttentionNormalizeUnionKernel:
                 score_index = (
                     cutlass.Int64(score_plane) * request_count * self.num_layers * self.seq_len
                     + seg_out_offset[segment]
-                    + self.score_start
+                    + score_start
                     + subtile_first_token
                 )
+                # The vectorized load also needs the runtime start aligned to
+                # the lane width (subtile_first_token and the segment stride
+                # are aligned whenever seq_len is).
                 if cutlass.const_expr(
-                    self.score_start % self.tokens_per_lane == 0
-                    and self.seq_len % self.tokens_per_lane == 0
+                    self.seq_len % self.tokens_per_lane == 0
                 ) and cutlass.dynamic_expr(
-                    subtile_first_token + self.tokens_per_lane <= valid_width
+                    score_start % self.tokens_per_lane == 0
+                    and subtile_first_token + self.tokens_per_lane <= valid_width
                 ):
                     score_tile = cute.make_tensor(
                         cute.make_ptr(
@@ -450,29 +458,33 @@ class _TriAttentionNormalizeUnionKernel:
                             )
                         reduced_values[token_slot] = union_value
                     subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-                    if cutlass.const_expr(self.width % self.tokens_per_lane == 0):
-                        if cutlass.dynamic_expr(
-                            subtile_first_token + self.tokens_per_lane <= self.width
-                        ):
-                            union_index = request_idx * self.width + subtile_first_token
-                            union_tile = cute.make_tensor(
-                                cute.make_ptr(
-                                    cutlass.Float32,
-                                    (union_scores.iterator + union_index).toint(),
-                                    AddressSpace.gmem,
-                                    assumed_align=self.tokens_per_lane * 4,
-                                ),
-                                cute.make_layout(self.tokens_per_lane),
-                            )
-                            cute.copy(
-                                score_copy_atom,
-                                cute.coalesce(reduced_values),
-                                cute.coalesce(union_tile),
-                            )
+                    # The output row covers this request's own window,
+                    # [0, valid - start); the straddling subtile falls back
+                    # to the per-token stores.
+                    if cutlass.const_expr(
+                        self.width % self.tokens_per_lane == 0
+                    ) and cutlass.dynamic_expr(
+                        subtile_first_token + self.tokens_per_lane <= valid_width
+                    ):
+                        union_index = request_idx * self.width + subtile_first_token
+                        union_tile = cute.make_tensor(
+                            cute.make_ptr(
+                                cutlass.Float32,
+                                (union_scores.iterator + union_index).toint(),
+                                AddressSpace.gmem,
+                                assumed_align=self.tokens_per_lane * 4,
+                            ),
+                            cute.make_layout(self.tokens_per_lane),
+                        )
+                        cute.copy(
+                            score_copy_atom,
+                            cute.coalesce(reduced_values),
+                            cute.coalesce(union_tile),
+                        )
                     else:
                         for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                             token = subtile_first_token + token_slot
-                            if cutlass.dynamic_expr(token < self.width):
+                            if cutlass.dynamic_expr(token < valid_width):
                                 union_scores[request_idx * self.width + token] = reduced_values[
                                     token_slot
                                 ]
@@ -513,29 +525,31 @@ class _TriAttentionNormalizeUnionKernel:
                             )
                         reduced_values[token_slot] = union_value
                     subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-                    if cutlass.const_expr(self.width % self.tokens_per_lane == 0):
-                        if cutlass.dynamic_expr(
-                            subtile_first_token + self.tokens_per_lane <= self.width
-                        ):
-                            union_index = request_idx * self.width + subtile_first_token
-                            union_tile = cute.make_tensor(
-                                cute.make_ptr(
-                                    cutlass.Float32,
-                                    (union_scores.iterator + union_index).toint(),
-                                    AddressSpace.gmem,
-                                    assumed_align=self.tokens_per_lane * 4,
-                                ),
-                                cute.make_layout(self.tokens_per_lane),
-                            )
-                            cute.copy(
-                                score_copy_atom,
-                                cute.coalesce(reduced_values),
-                                cute.coalesce(union_tile),
-                            )
+                    # Same per-request output domain as the single-CTA path.
+                    if cutlass.const_expr(
+                        self.width % self.tokens_per_lane == 0
+                    ) and cutlass.dynamic_expr(
+                        subtile_first_token + self.tokens_per_lane <= valid_width
+                    ):
+                        union_index = request_idx * self.width + subtile_first_token
+                        union_tile = cute.make_tensor(
+                            cute.make_ptr(
+                                cutlass.Float32,
+                                (union_scores.iterator + union_index).toint(),
+                                AddressSpace.gmem,
+                                assumed_align=self.tokens_per_lane * 4,
+                            ),
+                            cute.make_layout(self.tokens_per_lane),
+                        )
+                        cute.copy(
+                            score_copy_atom,
+                            cute.coalesce(reduced_values),
+                            cute.coalesce(union_tile),
+                        )
                     else:
                         for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                             token = subtile_first_token + token_slot
-                            if cutlass.dynamic_expr(token < self.width):
+                            if cutlass.dynamic_expr(token < valid_width):
                                 union_scores[request_idx * self.width + token] = reduced_values[
                                     token_slot
                                 ]

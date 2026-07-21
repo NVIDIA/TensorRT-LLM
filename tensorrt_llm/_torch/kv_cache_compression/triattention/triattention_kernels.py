@@ -431,12 +431,13 @@ class _FixedScoreGroup:
         self._cute_seg_seq_len = seg_seq_len
         self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
         # Opt-in fused score+stats+union pipeline (Fanrong Li's two-kernel
-        # scheme). Runners are built lazily per uniform score start because
-        # the start is a compile-time constant of the fused kernel.
+        # scheme). ONE runner serves every cohort: the score window start is
+        # per-request runtime metadata, not a compile-time constant.
         self._cute_union_fusion_enabled = (
             os.environ.get("TRTLLM_TRIATTENTION_CUTE_UNION_FUSION", "0") == "1"
         )
-        self._union_fusion_runners = {}
+        self._union_fusion_runner_built = False
+        self._union_fusion_runner_entry = None
         from tensorrt_llm.logger import logger
 
         logger.info(
@@ -545,20 +546,17 @@ class _FixedScoreGroup:
         )
         return output
 
-    def _union_fusion_runner_for(
-        self, score_start: int, mean_cos: torch.Tensor, mean_sin: torch.Tensor
-    ):
-        """Build (or reuse) the fused score/stats/union runner for one start.
+    def _union_fusion_runner(self, mean_cos: torch.Tensor, mean_sin: torch.Tensor):
+        """Build (or reuse) the ONE fused score/stats/union runner.
 
-        The fused kernel bakes ``score_start`` at compile time, so one runner
-        exists per distinct uniform prompt length; the cache is capped so a
-        prompt-length churn cannot trigger unbounded recompiles. ``None``
-        entries record geometries the fused pipeline rejected.
+        The score window start is per-request runtime metadata staged into a
+        persistent device buffer, so a single compiled runner serves every
+        cohort. A ``None`` entry records that the fused pipeline rejected the
+        geometry.
         """
-        if score_start in self._union_fusion_runners:
-            return self._union_fusion_runners[score_start]
-        if len(self._union_fusion_runners) >= 4 or not 0 <= score_start < self.seq_len:
-            return None
+        if self._union_fusion_runner_built:
+            return self._union_fusion_runner_entry
+        self._union_fusion_runner_built = True
         num_q_heads, num_kv_heads, num_freqs, tokens_per_block, _ = self.geometry_args
         entry = None
         try:
@@ -571,18 +569,22 @@ class _FixedScoreGroup:
                 torch.arange(self.max_requests * self.num_layers, dtype=torch.int64, device=device)
                 * self.seq_len
             ).to(torch.int32)
+            # The union output rows are sized by the whole bucket (the widest
+            # possible window); consumers mask by the per-request widths.
             union_rows = torch.empty(
-                (self.max_requests, self.seq_len - score_start),
+                (self.max_requests, self.seq_len),
                 dtype=torch.float32,
                 device=device,
             )
+            # Per-request score window starts, staged before each launch; the
+            # compiled kernels capture this buffer's device pointer.
+            token_starts = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
             runner = _FusedUnionScoreRunner(
                 layer_pools=self._cute_layer_pools,
                 layer_indices=self._cute_layer_indices,
                 max_requests=self.max_requests,
                 num_layers=self.num_layers,
                 seq_len=self.seq_len,
-                score_start=score_start,
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
                 num_freqs=num_freqs,
@@ -593,6 +595,7 @@ class _FixedScoreGroup:
                 seg_layer_id=self.pointer_prefix[5],
                 seg_seq_len=self._cute_seg_seq_len,
                 seg_out_offset=seg_out_offset,
+                token_starts=token_starts,
                 q_real=self.pointer_middle[0],
                 q_imag=self.pointer_middle[1],
                 mlr_coef=self.pointer_middle[2],
@@ -602,12 +605,12 @@ class _FixedScoreGroup:
                 output=self._cute_scratch,
                 enable_partial_stats=True,
             )
-            entry = (runner, union_rows)
+            entry = (runner, union_rows, token_starts)
         except (ImportError, RuntimeError, ValueError, AssertionError) as error:
             import warnings
 
             warnings.warn(f"TriAttention CuTe union fusion unavailable: {error}")
-        self._union_fusion_runners[score_start] = entry
+        self._union_fusion_runner_entry = entry
         return entry
 
     def launch_cute_union_fusion(
@@ -616,27 +619,27 @@ class _FixedScoreGroup:
         valid_seq_lens: torch.Tensor,
         valid_widths: torch.Tensor,
         token_starts_device: torch.Tensor,
-        score_start: Optional[int],
         mean_cos: torch.Tensor,
         mean_sin: torch.Tensor,
         union_out: torch.Tensor,
     ) -> bool:
         """Run the fused score+stats+normalized-union pipeline when possible.
 
-        Returns False (without launching) whenever the opt-in is off, the
-        cohort's prompt lengths are not uniform, or the geometry has no fused
-        specialization — the caller then falls back to the split score,
-        row-stats, and union path.
+        Each request scores its own window (``token_starts_device`` carries
+        the per-request pinned prompt lengths), so mixed-prompt cohorts are
+        served directly. Returns False (without launching) only when the
+        opt-in is off or the geometry has no fused specialization — the
+        caller then falls back to the split score, row-stats, and union path.
         """
         self.prepare_cute_score(mean_cos, mean_sin)
-        if not self._cute_union_fusion_enabled or score_start is None:
+        if not self._cute_union_fusion_enabled:
             return False
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds fixed score capacity")
-        entry = self._union_fusion_runner_for(int(score_start), mean_cos, mean_sin)
+        entry = self._union_fusion_runner(mean_cos, mean_sin)
         if entry is None:
             return False
-        runner, union_rows = entry
+        runner, union_rows, staged_token_starts = entry
         if not runner.supports_union_fusion(request_count):
             return False
         num_segments = request_count * self.num_layers
@@ -651,6 +654,7 @@ class _FixedScoreGroup:
             self.pointer_prefix[4][:num_segments],
             out=self._cute_seg_seq_len[:num_segments],
         )
+        staged_token_starts[:request_count].copy_(token_starts_device[:request_count])
         runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_rows[:request_count])
         columns = min(union_rows.shape[1], union_out.shape[1])
         union_out[:request_count, :columns].copy_(union_rows[:request_count, :columns])

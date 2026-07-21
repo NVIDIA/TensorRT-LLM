@@ -778,7 +778,6 @@ class _FixedScoreStagingBuffers:
         self.stream = None
         self._score_valid_widths: Optional[torch.Tensor] = None
         self._score_launcher_bound = False
-        self.staged_uniform_token_start: Optional[int] = None
 
     def bind_score_launcher(self, valid_widths: torch.Tensor, aggregation: str) -> None:
         """Bind the per-row score widths for these buffers (mean-only)."""
@@ -822,7 +821,6 @@ class _FixedScoreStagingBuffers:
             self.valid_seq_lens_device,
             self._score_valid_widths,
             self.token_starts_device,
-            getattr(self, "staged_uniform_token_start", None),
             self.mean_cos,
             self.mean_sin,
             union_out,
@@ -921,13 +919,6 @@ class _FixedScoreStagingBuffers:
         # integers: a stale-capacity gather is an out-of-bounds index_select
         # on the device.
         self.mean_phase_table.ensure(int(max(round_starts)) + 1)
-        # The fused score+stats+union kernel bakes one global score start at
-        # compile time, so it only serves cohorts whose pinned prompt lengths
-        # agree; padded rows are inert (zero valid length) regardless.
-        first_start = token_starts[0]
-        self.staged_uniform_token_start = (
-            int(first_start) if all(start == first_start for start in token_starts) else None
-        )
         if not self._stage_page_tables_bulk(
             manager,
             request_ids,
