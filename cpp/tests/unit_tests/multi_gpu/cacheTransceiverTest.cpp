@@ -193,7 +193,7 @@ protected:
         return mWorldSize;
     }
 
-    void setUpCacheManager()
+    void setUpCacheManager(bool enableBlockReuse = false)
     {
         auto constexpr numLayers = 4;
         auto constexpr numHeads = 2;
@@ -215,7 +215,6 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr enableBlockReuse = false;
         auto constexpr dataType = nvinfer1::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -329,6 +328,23 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
+    // Build a generation-only request for an arbitrary (llmRequest-agnostic) transfer:
+    // its DataTransceiverState carries the provenance marker that states exported via
+    // getSerializedDataTransceiverState have, so the sender serves it from its reuse
+    // tree instead of waiting for a context request that will never arrive.
+    auto makeArbitraryLlmRequest(SizeType32 length, LlmRequest::RequestIdType arbitraryId)
+    {
+        constexpr SizeType32 maxNewTokens{1};
+        texec::Request request{VecTokens(length, length), maxNewTokens};
+        auto state = std::make_unique<texec::DataTransceiverState>();
+        state->setCommState(*mContextCommState);
+        state->setCacheState(*mCacheState);
+        state->setIsArbitraryTransferState(true);
+        auto stats = texec::ContextPhaseParams({}, arbitraryId, state.release(), std::nullopt);
+        request.setContextPhaseParams(std::move(stats));
+        return std::make_unique<LlmRequest>(arbitraryId, std::move(request));
+    }
+
     void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
     {
         auto constexpr beamIdx{0};
@@ -424,6 +440,79 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     {
         future.get();
     }
+}
+
+TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
+{
+    auto worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager(/*enableBlockReuse=*/true);
+    setUpCacheTransceiver();
+
+    // 3 full blocks (tokensPerBlock = 8) so every requested chunk fully matches a stored block.
+    constexpr SizeType32 promptLen = 24;
+    constexpr SizeType32 missPromptLen = 40;
+    constexpr LlmRequest::RequestIdType arbitraryId = 4242;
+    auto constexpr beamIdx{0};
+    auto constexpr beamWidth{1};
+
+    if (isSender)
+    {
+        // Populate the sender's reuse tree: run a request, fill its blocks with a known
+        // pattern, then store the blocks for reuse. No LlmRequest exists on the sender for
+        // the arbitrary transfers below; the response thread serves them from the tree.
+        auto request = makeLlmRequest(promptLen);
+        mManager->addSequenceBatch(
+            {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
+        for (auto const& windowSize : blockRange.getWindowSizes())
+        {
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+            {
+                TLLM_CUDA_CHECK(cudaMemset(it->data(), request->getPromptLen(), it->getSizeInBytes()));
+            }
+        }
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        mManager->removeSequence(request->mRequestId, request);
+    }
+    else
+    {
+        // Hit: the requested tokens are stored in the sender's reuse tree.
+        std::shared_ptr<LlmRequest> request = makeArbitraryLlmRequest(promptLen, arbitraryId);
+        mManager->addSequenceBatch(
+            {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
+        auto future = mRequester->receiveAsync(request);
+        future.get();
+        TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+        EXPECT_NE(request->getState(), LlmRequestState::kDISAGG_TRANS_ERROR);
+        auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
+        for (auto const& windowSize : blockRange.getWindowSizes())
+        {
+            auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+            for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
+            {
+                std::vector<uint8_t> bytes(it->getSizeInBytes());
+                TLLM_CUDA_CHECK(cudaMemcpy(bytes.data(), it->data(), it->getSizeInBytes(), cudaMemcpyDeviceToHost));
+                EXPECT_TRUE(std::all_of(bytes.begin(), bytes.end(), [](uint8_t i) { return i == (promptLen & 0xff); }));
+            }
+        }
+
+        // Miss: tokens never stored on the sender must fail fast with an error state
+        // (isReady=false from the sender) instead of waiting for a context request.
+        std::shared_ptr<LlmRequest> missRequest = makeArbitraryLlmRequest(missPromptLen, arbitraryId + 1);
+        mManager->addSequenceBatch(
+            {{{missRequest->mRequestId, missRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*missRequest)});
+        auto missFuture = mRequester->receiveAsync(missRequest);
+        missFuture.get();
+        EXPECT_EQ(missRequest->getState(), LlmRequestState::kDISAGG_TRANS_ERROR);
+    }
+    // The receiver only reaches this point after validating (or failing) both transfers,
+    // so the sender cannot tear down its transceiver while a send is still in flight.
+    tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 
 #if ENABLE_MULTI_DEVICE
