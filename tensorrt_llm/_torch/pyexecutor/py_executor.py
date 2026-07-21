@@ -2545,6 +2545,10 @@ class PyExecutor:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
+                    if hasattr(self.kv_cache_manager,
+                               "prepare_expect_snapshot_points"):
+                        self.kv_cache_manager.prepare_expect_snapshot_points(
+                            self.active_requests)
                     local_scheduler_output = self.scheduler.schedule_request(
                         self.active_requests, self.inflight_req_ids)
                     if self.kv_cache_transceiver:
@@ -5226,6 +5230,10 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
+            self.kv_cache_manager.prepare_expect_snapshot_points(
+                self.active_requests)
+
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
