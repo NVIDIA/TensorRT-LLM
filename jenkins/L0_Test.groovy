@@ -1950,14 +1950,19 @@ echo "=== [Prepare Container] STAGE END: \$(date '+%Y-%m-%d %H:%M:%S') cpu_build
             }
 
             stage("[${stageName}] Prepare Container") {
-                // Submit the CPU fat-sqsh builder job (if configured) and record its
-                // SLURM job ID so Run Pytest can add --dependency to the GPU test job.
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(remote, scriptPreparePathNode),
-                    numRetries: 3
-                )
+                // Submit the CPU fat-sqsh builder job (if configured) and poll until
+                // it completes. Non-fatal: any failure here lets the GPU job fall back
+                // to base sqsh + full pip install.
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                        numRetries: 3
+                    )
+                } catch (Exception e) {
+                    echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
+                }
             }
 
             stage("[${stageName}] Run Pytest") {
