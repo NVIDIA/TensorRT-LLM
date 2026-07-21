@@ -257,9 +257,6 @@ def _ensure_slurm_external_launch_env():
 
 
 def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
-
     rank_env = _slurm_rank_env()
     if rank_env is None:
         pytest.skip("This VisualGen multi-node case must run under SLURM rank env")
@@ -524,7 +521,7 @@ def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_n
     WAN22_LPIPS_MULTINODE_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_MULTINODE_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_multinode_slurm(tmp_path, variant_name, parallel):
+def test_wan22_t2v_lpips_against_golden_multinode_slurm(request, tmp_path, variant_name, parallel):
     if _slurm_rank_env() is not None:
         _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel)
         return
@@ -532,4 +529,9 @@ def test_wan22_t2v_lpips_against_golden_multinode_slurm(tmp_path, variant_name, 
     if os.environ.get(_MULTINODE_SLURM_CHILD_ENV):
         pytest.skip("VisualGen SLURM child was not launched with SLURM rank env")
 
+    # Media deps (av / ffmpeg) are installed parent-side only: rank 0 shares
+    # node 0's venv with the parent, remote-node workers never touch media,
+    # and the bare child pytest invocation has no llm_venv harness to run
+    # the fixture (16 ranks racing pip/apt would be unsafe anyway).
+    request.getfixturevalue("_visual_gen_deps")
     _run_wan22_multinode_slurm_parent(variant_name)
