@@ -46,6 +46,7 @@ from .utils import (EngineDeadError, ErrorResponse, RequestError,
                     get_spawn_proxy_process_env, is_llm_response,
                     print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
+from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
 __all__ = [
     "GenerationExecutorProxy",
@@ -176,6 +177,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
+        self._worker_process_monitor = WorkerProcessMonitor()
         self._start_executor_workers(worker_kwargs)
 
         # Create RPC client after workers are started (worker starts RPC server)
@@ -224,6 +226,19 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return True
         return False
 
+    def _check_mpi_workers(self) -> bool:
+        """Check OS process handles and MPI futures for worker death."""
+        dead_worker = self._worker_process_monitor.find_dead_worker()
+        if dead_worker is not None:
+            self._set_fatal_error(
+                RuntimeError("MPI worker rank "
+                             f"{dead_worker.rank} (pid {dead_worker.pid}) "
+                             "exited unexpectedly"))
+            if not self.doing_shutdown:
+                self.pre_shutdown()
+            return True
+        return self._check_mpi_futures()
+
     def _drain_error_queue(self) -> bool:
         """Drain all queued errors, skipping per-request errors.
 
@@ -266,7 +281,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._drain_error_queue():
             return self._fatal_error is None and not self.doing_shutdown
 
-        if self._check_mpi_futures():
+        if self._check_mpi_workers():
             return False
 
         return True
@@ -343,9 +358,10 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _error_monitor_loop(self) -> None:
         """Background thread that reaps a dead engine and drives pre_shutdown.
 
-        Checks MPI worker futures, remote-session worker-death notifications,
-        and the error queue using the shared ``_check_mpi_futures()``,
-        ``_check_remote_worker_death()`` and ``_drain_error_queue()`` helpers.
+        Checks local MPI worker process handles and futures, remote-session
+        worker-death notifications, and the error queue using the shared
+        ``_check_mpi_workers()``, ``_check_remote_worker_death()`` and
+        ``_drain_error_queue()`` helpers.
 
         Propagation to pending requests is event-driven via
         ``_handle_worker_death`` (the MPI future done-callback) where futures
@@ -355,7 +371,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
-                if self._check_mpi_futures():
+                if self._check_mpi_workers():
                     logger.error("Error monitor: MPI worker crash detected, "
                                  "shutting down")
                     return
@@ -537,7 +553,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         while True:
             if self.worker_init_status_queue.poll(1):
-                ready_signal, error_trace = self.worker_init_status_queue.get()
+                status = self.worker_init_status_queue.get()
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
                 logger.info("get signal from executor worker")
@@ -547,6 +563,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
+        ready_signal, error_trace = status[:2]
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
             # Only abort a session this proxy created; an externally owned
@@ -555,6 +572,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
+
+        if isinstance(self.mpi_session, MpiPoolSession) and len(status) == 3:
+            worker_process_identities: List[WorkerProcessIdentity] = status[2]
+            self._worker_process_monitor.register(worker_process_identities)
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.
@@ -570,6 +591,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         else:
             self.doing_shutdown = True
+
+        self._worker_process_monitor.close()
 
         # Wake the error monitor thread immediately so it exits cleanly
         if hasattr(self, '_shutdown_event'):

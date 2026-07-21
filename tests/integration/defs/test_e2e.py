@@ -1976,28 +1976,33 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
         f"Testing quickstart {model_path} with tp_size={tp_size}, pp_size={pp_size}."
     )
 
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+
+    model_dir = f"{llm_models_root()}/{model_path}"
     prompt = "Explain why New York is great city to live in, in 1 short paragraph"
-    run_cmd = [
-        "python3",
-        str(example_root / "quickstart_advanced.py"),
-        f"--model_dir={llm_models_root()}/{model_path}",
-        f"--tp_size={tp_size}",
-        f"--pp_size={pp_size}",
-        "--max_num_tokens=4096",
-        "--max_batch_size=1",
-        "--use_cuda_graph",
-        f"--kv_cache_fraction={_MEM_FRACTION_50}",
-        "--prompt",
-        prompt,
-    ]
 
-    if ("Llama-4" in model_path or "Qwen3" in model_path) and tp_size > 1:
-        run_cmd.append(f"--moe_ep_size={tp_size}")
+    moe_ep_size = tp_size if ("Llama-4" in model_path
+                              or "Qwen3" in model_path) and tp_size > 1 else -1
 
-    output = check_output(run_cmd, env=llm_venv._new_env)
-    print(output)
-    assert "Generated text:" in output, output[-4000:]
+    with LLM(
+            model=model_dir,
+            backend='pytorch',
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            max_num_tokens=4096,
+            max_batch_size=1,
+            cuda_graph_config=CudaGraphConfig(),
+            kv_cache_config=KvCacheConfig(
+                free_gpu_memory_fraction=_MEM_FRACTION_50),
+            moe_expert_parallel_size=moe_ep_size,
+    ) as llm:
+        outputs = llm.generate([prompt], SamplingParams(max_tokens=64))
+
+    for output in outputs:
+        generated_text = output.outputs[0].text
+        print(f"Generated text: {generated_text}")
+        assert generated_text, f"No text generated for {model_path}"
 
 
 @pytest.mark.skip_less_device(4)
