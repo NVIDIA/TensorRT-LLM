@@ -1127,21 +1127,78 @@ class TestArenaPoolGroup(unittest.TestCase):
             self.assertEqual(adopted.base_block, rng_a.base_block)
             self.assertEqual(adopted._alias_span_key, (key, 2))
 
-            # Spill the registry: pins drop, lookups miss, aliases keep bytes.
+            # Refcount-gated spill (P3): rng_b and the adopted range both still
+            # alias this span, so pressure must NOT spill it -- dropping the pin
+            # would free nothing (the aliases keep the handles resident) and
+            # evict a still-usable prefix from the reuse lookup. It stays
+            # discoverable and the bytes stay valid through the live aliases.
             torch.cuda.synchronize()
-            self.assertEqual(group.spill_canonical_spans(1 << 62), 3)
-            self.assertIsNone(group.lookup_canonical_span(canon[0], canon))
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 0)
+            self.assertEqual(group.spilled_spans, 0)
+            self.assertIsNotNone(group.lookup_canonical_span(canon[0], canon))
             tb2 = TestSparseVirtMem._tensor_at(int(addr_b), n)
             self.assertTrue(bool((tb2 == 11.5).all().item()))
 
+            # Free every live range and reclaim; unmapping the parked aliaser
+            # ranges returns the span's chunks to the registry pin alone, so it
+            # finally spills and leaves the lookup.
             for base, rng in list(group._ranges.items()):
                 if not rng._freed:
                     group.free_sequence(rng, CachedCudaEvent.NULL)
             group.drain_reclaim(CachedCudaEvent.NULL)
             torch.cuda.synchronize()
             group.spill_retained(1 << 62)
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 3)
+            self.assertIsNone(group.lookup_canonical_span(canon[0], canon))
             self.assertEqual(self.budget.used_pages, 0)
             self.assertEqual(group.mapped_pages, 0)
+        finally:
+            group.destroy()
+
+    def test_spill_skips_span_with_live_alias(self) -> None:
+        """A span a live sequence still aliases is never spilled (P3).
+
+        It stays in the reuse lookup and becomes spillable only once its last
+        aliaser frees: spilling it would free no physical pages (the alias
+        keeps the handles resident) and would only force a later re-copy.
+        """
+        group = self._group()
+        group._prefix_aliasing = True
+        try:
+            # Owner A registers a 2-block (3-page) span, then closes: the span
+            # is registry-charged with no live alias (refcount == registry pin).
+            rng_a = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng_a, 4), 6)
+            canon = [self._FakeCanonicalPage(), self._FakeCanonicalPage()]
+            group.register_canonical_span(rng_a, canon, CachedCudaEvent.NULL)
+            group.free_sequence(rng_a, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            group.spill_retained(1 << 62)  # unmap A's parked range
+            torch.cuda.synchronize()
+
+            # Admission B aliases the whole span into a fresh range.
+            hit = group.lookup_canonical_span(canon[0], canon)
+            self.assertIsNotNone(hit)
+            rng_b = group.reserve_sequence(4)
+            self.assertEqual(group.alias_span_into_range(rng_b, hit[0], hit[1], hit[2]), 3)
+
+            # Now the span has a live alias: pressure must skip it. It stays
+            # charged and in the reuse lookup, and spills nothing.
+            self.assertEqual(group.canonical_span_pages, 3)
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 0)
+            self.assertEqual(group.spilled_spans, 0)
+            self.assertIsNotNone(group.lookup_canonical_span(canon[0], canon))
+
+            # B frees: its alias ref drops, the span returns to the registry
+            # pin alone and is spillable again.
+            group.free_sequence(rng_b, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            torch.cuda.synchronize()
+            group.spill_retained(1 << 62)  # unmap B's parked range -> drop ref
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 3)
+            self.assertEqual(group.spilled_spans, 1)
+            self.assertIsNone(group.lookup_canonical_span(canon[0], canon))
+            self.assertEqual(self.budget.used_pages, 0)
         finally:
             group.destroy()
 

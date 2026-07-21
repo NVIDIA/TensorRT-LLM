@@ -129,6 +129,21 @@ class _CanonicalSpan:
                     return False
         return True
 
+    def has_live_aliases(self) -> bool:
+        """Whether any pinned handle is still referenced beyond the registry's
+        own pin -- i.e. a live sequence currently aliases the span. Spilling
+        such a span frees no physical pages (the aliases keep the handles
+        resident) and only drops it from the reuse lookup, forcing later
+        same-prefix admissions to re-copy pages that are still on the GPU; the
+        pressure path therefore skips it (P3 refcount-gated spill). Meaningful
+        only for registry-charged spans (``owner_base`` < 0), where the sole
+        non-alias reference is the registry pin."""
+        for shared in self.shared_per_pool:
+            for s in shared:
+                if s.num_refs > 1:
+                    return True
+        return False
+
     num_pages: int
     ready_event: CachedCudaEvent
 
@@ -1547,16 +1562,20 @@ class ArenaPoolGroup(PoolGroupBase):
 
     def spill_canonical_spans(self, min_pages: int) -> int:
         """Drop canonical-span pins (insertion order ≈ LRU) until at least
-        ``min_pages`` budget pages are freed. Live aliases keep their handles
-        (refcounts); future admissions fall back to host-copy reuse.
-        OWNER-LIVE spans are skipped: they hold no registry charge, so
-        dropping the pin would forfeit future aliasing and free nothing."""
+        ``min_pages`` budget pages are freed, and remove each spilled span
+        from the reuse lookup. Only spans with NO live aliases are spilled:
+        a span a live sequence still aliases (positive external refcount)
+        frees no physical pages if dropped -- the aliases keep the handles
+        resident -- and unpinning it merely evicts a still-usable prefix from
+        the reuse lookup, so it is left in place until its last aliaser frees
+        (P3 refcount-gated spill). OWNER-LIVE spans are likewise skipped: they
+        hold no registry charge, so dropping the pin frees nothing."""
         freed = 0
         for key in list(self._canonical_spans):
             if freed >= min_pages:
                 break
             span = self._canonical_spans[key]
-            if span.owner_base >= 0:
+            if span.owner_base >= 0 or span.has_live_aliases():
                 continue
             del self._canonical_spans[key]
             self._unpin_span(span)
