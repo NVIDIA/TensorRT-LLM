@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -1233,6 +1234,18 @@ public:
         mEstimatedReusableTokens = estimatedReusableTokens;
     }
 
+    //! Get the absolute context positions at which recurrent-state snapshots are expected.
+    [[nodiscard]] std::vector<SizeType32> const& getExpectedSnapshotPoints() const noexcept
+    {
+        return mExpectedSnapshotPoints;
+    }
+
+    //! Set the absolute context positions at which recurrent-state snapshots are expected.
+    void setExpectedSnapshotPoints(std::vector<SizeType32> expectedSnapshotPoints)
+    {
+        mExpectedSnapshotPoints = std::move(expectedSnapshotPoints);
+    }
+
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
     {
         mDraftTokens = draftTokens;
@@ -1312,7 +1325,7 @@ public:
         mEncoderOutput = std::move(encoderOutput);
     }
 
-    void allocEncoderOutputHost(SizeType32 encoderHiddenSize, nvinfer1::DataType dataType)
+    void allocEncoderOutputHost(SizeType32 encoderHiddenSize, tensorrt_llm::DataType dataType)
     {
         mEncoderOutputHost = runtime::BufferManager::pinned(
             runtime::ITensor::makeShape({getEncoderOutputLen(), encoderHiddenSize}), dataType);
@@ -1328,13 +1341,13 @@ public:
         return mEncoderHiddenStates;
     }
 
-    void allocEncoderOutput(runtime::BufferManager const& manager, nvinfer1::DataType dataType)
+    void allocEncoderOutput(runtime::BufferManager const& manager, tensorrt_llm::DataType dataType)
     {
         // unique_ptr --> shared_ptr ownership move
         mEncoderOutput = std::move(manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
     }
 
-    void allocEncoderHiddenStates(runtime::BufferManager const& manager, nvinfer1::DataType dataType)
+    void allocEncoderHiddenStates(runtime::BufferManager const& manager, tensorrt_llm::DataType dataType)
     {
         // unique_ptr --> shared_ptr ownership move
         mEncoderHiddenStates = std::move(manager.emptyTensor(runtime::MemoryType::kGPU, dataType));
@@ -1452,7 +1465,7 @@ public:
         mContextLogitsHost = std::move(contextLogitsHost);
     }
 
-    void allocContextLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocContextLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
     {
         mContextLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({mPromptLen, vocabSizePadded}), logitsDataType);
@@ -1471,7 +1484,7 @@ public:
         mGenerationLogitsHost = std::move(generationLogitsHost);
     }
 
-    void allocGenerationLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocGenerationLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
     {
         if (mIsStreaming)
         {
@@ -1490,7 +1503,7 @@ public:
         }
     }
 
-    void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, nvinfer1::DataType logitsDataType)
+    void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
     {
         mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
             runtime::ITensor::makeShape({1, getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
@@ -2096,6 +2109,9 @@ protected:
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
 
+    // Absolute context positions at which recurrent-state snapshots are expected.
+    std::vector<SizeType32> mExpectedSnapshotPoints;
+
     SizeType32 mMaxSentTokenLen;
 
     std::optional<TensorPtr> mEmbeddingBias{std::nullopt};
@@ -2356,7 +2372,7 @@ private:
 
         auto const numWords = static_cast<SizeType32>(words.size());
         auto const shape = runtime::ITensor::makeShape({2, numWords});
-        auto tensor = runtime::BufferManager::pinnedPool(shape, nvinfer1::DataType::kINT32);
+        auto tensor = runtime::BufferManager::pinnedPool(shape, tensorrt_llm::DataType::kINT32);
         auto* data = runtime::bufferCast<int32_t>(*tensor);
         std::memcpy(data, words.data(), numWords * sizeof(int32_t));
         std::memcpy(data + numWords, offsets.data(), numWords * sizeof(int32_t));

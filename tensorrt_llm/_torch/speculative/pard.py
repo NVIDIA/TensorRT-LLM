@@ -91,6 +91,12 @@ class PARDWorker(SpecWorkerBase):
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if getattr(spec_config, "sa_config", None) is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
+        # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
+        # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
+        self._kv_rewind_pending = False
+        self._kv_rewind_amount = None
+        self._kv_rewind_nc = None
+        self._kv_rewind_bs = None
         logger.info(
             f"PARDWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
@@ -144,6 +150,7 @@ class PARDWorker(SpecWorkerBase):
 
             if batch_size > num_contexts:
                 attn_metadata.kv_lens_cuda[num_contexts:batch_size] += 1
+            self._kv_rewind_pending = True
 
             attn_metadata.update_for_spec_dec()
 
@@ -155,17 +162,32 @@ class PARDWorker(SpecWorkerBase):
         by prepare_for_spec_dec) to avoid cumulative shrinkage.  Applied during
         capture and normal inference.
         """
+        self._kv_rewind_pending = False
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
         if is_warmup:
+            # kv_lens_cuda was saved by prepare_for_spec_dec in this mode and
+            # is restored wholesale, so no rewind is needed.
             return
 
-        if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
+        if self._kv_rewind_amount is not None and hasattr(attn_metadata, "kv_lens_cuda"):
             nc = self._kv_rewind_nc
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
-    def forward(
+    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
+        # Restore first (in warmup mode kv_lens_cuda was saved and comes back
+        # wholesale), then apply any pending rewind for the other modes so a
+        # failed draft forward does not leave kv_lens_cuda incremented.
+        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
+        if (
+            getattr(self, "_kv_rewind_pending", False)
+            and attn_metadata is not None
+            and spec_metadata is not None
+        ):
+            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+
+    def _forward_impl(
         self,
         input_ids,
         position_ids,
