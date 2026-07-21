@@ -49,8 +49,9 @@
 namespace MARLIN_NAMESPACE_NAME
 {
 
-// Empty kernel stub for non-Hopper device passes; see marlin.cuh.
-#if defined(__CUDA_ARCH__) && !(__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000)
+// Empty kernel stub outside the architectures supported by dense Marlin.
+#if defined(__CUDA_ARCH__)                                                                                             \
+    && !((__CUDA_ARCH__ >= 900 && __CUDA_ARCH__ < 1000) || (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300))
 
 template <typename scalar_t,   // compute dtype, nv_bfloat16
     int const threads,         // number of threads in a threadblock

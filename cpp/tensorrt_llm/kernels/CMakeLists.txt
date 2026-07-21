@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -61,7 +61,7 @@ list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
-# Marlin is built as its own Hopper-only OBJECT library below.
+# Marlin is built as its own architecture-scoped OBJECT library below.
 list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
 
@@ -82,8 +82,8 @@ if(FAST_BUILD)
     STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
-# Marlin NVFP4: Hopper-only OBJECT library. Pinned to sm_90 so the global
-# CMAKE_CUDA_ARCHITECTURES doesn't propagate.
+# Marlin NVFP4: build the existing Hopper kernels and the dense W4A16/repack
+# kernels used on SM12x. Unsupported device passes emit empty kernel stubs.
 file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
 if(MARLIN_SRC)
   add_library(marlin_src OBJECT ${MARLIN_SRC})
@@ -95,7 +95,7 @@ if(MARLIN_SRC)
       $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   )
   target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
-  set_cuda_architectures(marlin_src 90)
+  set_cuda_architectures(marlin_src 90 120f)
 endif()
 
 add_library(

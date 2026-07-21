@@ -24,7 +24,7 @@ from itertools import product
 
 import torch
 from parameterized import parameterized
-from utils.util import skip_non_hopper_unittest, unittest_name_func
+from utils.util import getSMVersion, unittest_name_func
 
 import tensorrt_llm  # noqa: F401  # registers torch.ops.tensorrt_llm / torch.ops.trtllm ops
 
@@ -65,7 +65,10 @@ class TestNvfp4MarlinGemm(unittest.TestCase):
         list(product([1024, 2048], [1024, 2048], [1, 8, 128], [16], [1.0, 2.0], ["nvfp4", "bf16"])),
         name_func=unittest_name_func,
     )
-    @skip_non_hopper_unittest
+    @unittest.skipUnless(
+        getSMVersion() == 90 or 120 <= getSMVersion() < 130,
+        "Marlin NVFP4 GEMM requires SM90 or SM12x",
+    )
     def test_nvfp4_marlin_gemm(
         self, input_dim, output_dim, batch_size, sf_vec_size, alpha, act_dtype
     ):

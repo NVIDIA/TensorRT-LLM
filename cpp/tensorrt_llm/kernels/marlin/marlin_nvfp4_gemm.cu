@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -327,8 +327,8 @@ void marlinNvfp4Gemm(void const* act_bf16, void const* weight, void* output, voi
     bool use_fp32_reduce, cudaStream_t stream)
 {
     int const sm = tensorrt_llm::common::getSMVersion();
-    TLLM_CHECK_WITH_INFO(
-        sm >= 90 && sm < 100, "Marlin NVFP4 GEMM is only supported on Hopper (SM 9.x); current SM = %d", sm);
+    TLLM_CHECK_WITH_INFO((sm >= 90 && sm < 100) || (sm >= 120 && sm < 130),
+        "Marlin NVFP4 GEMM is only supported on SM 9.x and SM 12.x; current SM = %d", sm);
 
     int dev;
     cudaGetDevice(&dev);

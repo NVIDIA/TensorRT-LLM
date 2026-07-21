@@ -6270,19 +6270,20 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
     def test_nvfp4(self, moe_backend, mocker):
-        # Qwen3.6-35B-A3B NVFP4 MoE checkpoint. The TRTLLM-Gen / CuteDSL NVFP4
-        # MoE backends only support the SM100 family (B200/B300); RTX 6000
-        # (SM120) uses a different MoE path, so restrict this test to SM100/103.
-        if get_sm_version() not in (100, 103):
-            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version not in (100, 103):
+            pytest.skip("TRTLLM NVFP4 MoE supports SM100/103 only")
+        if moe_backend == "CUTEDSL" and sm_version not in (100, 103, 120, 121):
+            pytest.skip("CuteDSL NVFP4 MoE supports SM100/103/120/121 only")
 
         if not os.path.exists(self.MODEL_PATH):
             pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
 
+        max_batch_size = 32 if sm_version in (120, 121) else 128
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
-                                            max_batch_size=128)
+                                            max_batch_size=max_batch_size)
         moe_config = MoeConfig(backend=moe_backend)
 
         with LLM(self.MODEL_PATH,
@@ -6290,7 +6291,7 @@ class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=1,
                  moe_expert_parallel_size=1,
                  max_seq_len=4096,
-                 max_batch_size=128,
+                 max_batch_size=max_batch_size,
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
                  moe_config=moe_config) as llm:
