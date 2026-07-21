@@ -10,6 +10,7 @@ import torch
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="TriAttention CuTe kernels require SM100",
 )
+@pytest.mark.parametrize("tokens_per_block", [32, 128])
 @pytest.mark.parametrize(
     "score_start,valid_lens",
     [
@@ -22,16 +23,18 @@ import torch
     ],
 )
 def test_union_fusion_matches_split_pipeline(
+    tokens_per_block: int,
     score_start: int,
     valid_lens: "list | None",
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The fused pipeline must reproduce the split score->stats->union rows.
 
-    Geometry is the fused kernel's contract (128-token pages, GQA group 8,
-    32 frequencies). The reference runs the production split path: the score
-    launch gathers each request's decode window, then ``prepare_union_scores``
-    normalizes rows and takes the cross-row union maximum.
+    Geometry is the fused kernel's contract (32- or 128-token pages, GQA
+    group 8, 32 frequencies). The reference runs the production split path:
+    the score launch gathers each request's decode window, then
+    ``prepare_union_scores`` normalizes rows and takes the cross-row union
+    maximum.
     """
     pytest.importorskip("cutlass")
     monkeypatch.setenv("TRTLLM_TRIATTENTION_CUTE_UNION_FUSION", "1")
@@ -44,10 +47,15 @@ def test_union_fusion_matches_split_pipeline(
     torch.manual_seed(20260721)
     device = torch.device("cuda")
     seq_len = 256
-    tokens_per_block = 128
     num_freqs = 32
     num_q_heads = 8
     num_pages = seq_len // tokens_per_block
+    # 32-token pages: one 128-token compute tile spans four pages, so a
+    # shuffled physical-page table catches any fragment/page mix-up. The
+    # ragged valid lengths above land mid-tile, exercising the clamped
+    # tail fragments.
+    page_permutation = {128: [0, 1], 32: [3, 1, 4, 7, 5, 0, 2, 6]}[tokens_per_block]
+    assert sorted(page_permutation) == list(range(num_pages))
     pool = (
         0.125 * torch.randn(num_pages, 2, 1, tokens_per_block, 2 * num_freqs, device=device)
     ).to(torch.bfloat16)
@@ -62,8 +70,8 @@ def test_union_fusion_matches_split_pipeline(
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
-    k_plane = [2 * page for page in range(num_pages)]
-    v_plane = [2 * page + 1 for page in range(num_pages)]
+    k_plane = [2 * page for page in page_permutation]
+    v_plane = [2 * page + 1 for page in page_permutation]
     block_offsets = torch.tensor(
         [[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device
     )
@@ -160,7 +168,12 @@ def test_union_fusion_matches_split_pipeline(
 def test_union_fusion_declines_off_contract_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """32-token pages sit outside the fused contract: decline, do not fault."""
+    """GQA group 4 sits outside the fused contract: decline, do not fault.
+
+    The split score path pads group-4 head columns up to the MMA tile, but
+    the fused stats epilogue requires the full GQA group 8, so the runner
+    must warn and fall back instead of engaging.
+    """
     pytest.importorskip("cutlass")
     monkeypatch.setenv("TRTLLM_TRIATTENTION_CUTE_UNION_FUSION", "1")
 
@@ -171,9 +184,9 @@ def test_union_fusion_declines_off_contract_geometry(
     torch.manual_seed(20260721)
     device = torch.device("cuda")
     seq_len = 256
-    tokens_per_block = 32
+    tokens_per_block = 128
     num_freqs = 32
-    num_q_heads = 8
+    num_q_heads = 4
     num_pages = seq_len // tokens_per_block
     pool = (
         0.125 * torch.randn(num_pages, 2, 1, tokens_per_block, 2 * num_freqs, device=device)
