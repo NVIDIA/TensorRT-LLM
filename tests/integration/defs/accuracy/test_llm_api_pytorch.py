@@ -3452,6 +3452,9 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             "host_cache_offload", "host_cache_offload_mtp1",
             "host_cache_offload_mtp3_no_adp"
         ])
+    # Executor warmup runs close to H200 capacity; use a fresh worker pool so
+    # allocations retained by earlier tests cannot consume its memory headroom.
+    @pytest.mark.private_mpi_session
     def test_dsa_host_cache_offload(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     overlap_scheduler, max_batch_size,
                                     host_cache_size_gb, attention_dp):
