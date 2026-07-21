@@ -2768,7 +2768,9 @@ class GvrTopKKernel:
                                     if ts > cutlass.Int32(fbins - 1):
                                         ts = cutlass.Int32(fbins - 1)
                                     if ts == sb_star:
-                                        to = atomicAdd(s_iscalars.iterator + cutlass.Int32(0), cutlass.Int32(1))
+                                        to = atomicAdd(
+                                            s_iscalars.iterator + cutlass.Int32(0), cutlass.Int32(1)
+                                        )
                                         if to < cutlass.Int32(128):
                                             smem_hist[to + to] = float_as_int32(tv)
                                             smem_hist[to + to + cutlass.Int32(1)] = smem_vals[itc]
@@ -2809,7 +2811,9 @@ class GvrTopKKernel:
                                     pos = rank_above_fine + tj
                                     if cutlass.const_expr(self.return_output_values):
                                         output_values_row[pos] = self.dtype(tbv)
-                                    output_indices_row[pos] = smem_hist[tbi + tbi + cutlass.Int32(1)]
+                                    output_indices_row[pos] = smem_hist[
+                                        tbi + tbi + cutlass.Int32(1)
+                                    ]
                                     smem_hist[tbi + tbi + cutlass.Int32(1)] = cutlass.Int32(-1)
                                     tj = tj + cutlass.Int32(1)
                             cute.arch.barrier()
@@ -2855,7 +2859,9 @@ class GvrTopKKernel:
                                                 ):
                                                     pmatch = cutlass.Int32(0)
                                             if pmatch == cutlass.Int32(1):
-                                                dg = (uk >> cutlass.Int32(shift)) & cutlass.Int32(0xFF)
+                                                dg = (uk >> cutlass.Int32(shift)) & cutlass.Int32(
+                                                    0xFF
+                                                )
                                                 atomicAdd(smem_hist.iterator + dg, cutlass.Int32(1))
                                     it2 = it2 + cutlass.Int32(num_threads)
                                 cute.arch.barrier()
@@ -2965,7 +2971,9 @@ class GvrTopKKernel:
                                             if q2 < need_eq:
                                                 pos = rank_above_fine + cnt_ab + q2
                                                 if pos < cutlass.Int32(kK):
-                                                    if cutlass.const_expr(self.return_output_values):
+                                                    if cutlass.const_expr(
+                                                        self.return_output_values
+                                                    ):
                                                         output_values_row[pos] = self.dtype(vr)
                                                     output_indices_row[pos] = smem_vals[ir2]
                                 ir2 = ir2 + cutlass.Int32(num_threads)
@@ -3177,7 +3185,6 @@ class GvrTopKKernel:
                     output_values_row[i11] = self.dtype(self.NEG_FLT_MAX)
                 output_indices_row[i11] = cutlass.Int32(-1)
                 i11 = i11 + cutlass.Int32(num_threads)
-
 
     # ------------------------------------------------------------------
     # Phase 4: Histogram-based k-th selection + two-pass writeback
