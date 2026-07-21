@@ -533,7 +533,11 @@ class StatusRecorder:
             os.makedirs(status_dir, exist_ok=True)
         self.json_path = os.path.join(status_dir, f"{role}_{server_idx}.json")
         self.text_path = os.path.join(status_dir, f"{role}_{server_idx}.status")
-        env_keys = ("UCX_", "NIXL_", "TRTLLM_", "TLLM_")
+        # NIXL_* is deliberately absent: the only such variable seen in
+        # practice is NIXL_VERSION, a stale marker from the NGC base image's
+        # bundled NIXL (not the library TRT-LLM links from
+        # /opt/nvidia/nvda_nixl), which misstates the transport version.
+        env_keys = ("UCX_", "TRTLLM_", "TLLM_")
         self.env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(env_keys)}
 
     def record(self, peer, req_len, status, reason=""):
