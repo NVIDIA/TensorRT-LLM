@@ -22,7 +22,7 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import triton
@@ -33,75 +33,130 @@ import triton.language as tl
 # --------------------------------------------------------------------------- #
 
 
+# Positions past this row count are no longer exactly representable in fp32,
+# so a larger table would silently degrade every downstream phase.
+_MEAN_PHASE_MAX_ROWS = 1 << 24
+
+
 @triton.jit
-def _prepare_mean_phase_kernel(
+def _gather_mean_phase_kernel(
+    table,
     round_starts,
-    offsets,
-    omega,
-    mean_cos,
-    mean_sin,
+    mean_phases,
+    table_rows,
+    table_plane_stride,
+    output_plane_stride,
     NUM_FREQS: tl.constexpr,
-    NUM_OFFSETS: tl.constexpr,
     F_BLOCK: tl.constexpr,
 ):
-    """Collapse all offset phases for one request into reusable frequency means."""
+    """Copy one request's cos/sin table row into the stacked mean planes."""
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
     frequency_mask = frequency < NUM_FREQS
-    round_start = tl.load(round_starts + request)
-    angular_frequency = tl.load(omega + frequency, mask=frequency_mask, other=0.0)
-    cos_sum = tl.zeros((F_BLOCK,), tl.float32)
-    sin_sum = tl.zeros((F_BLOCK,), tl.float32)
-    for offset_index in tl.static_range(0, NUM_OFFSETS):
-        offset = tl.load(offsets + offset_index)
-        phase = (round_start + offset) * angular_frequency
-        cos_sum += tl.cos(phase)
-        sin_sum += tl.sin(phase)
-    output_offset = request * NUM_FREQS + frequency
-    scale = 1.0 / NUM_OFFSETS
-    tl.store(mean_cos + output_offset, cos_sum * scale, mask=frequency_mask)
-    tl.store(mean_sin + output_offset, sin_sum * scale, mask=frequency_mask)
+    row = tl.load(round_starts + request).to(tl.int64)
+    # Clamp instead of trusting the staged values: a stale-capacity row
+    # must degrade to a wrong phase, never to an out-of-bounds access.
+    row = tl.minimum(tl.maximum(row, 0), table_rows - 1)
+    source_offset = row * NUM_FREQS + frequency
+    mean_cos = tl.load(table + source_offset, mask=frequency_mask, other=0.0)
+    mean_sin = tl.load(table + table_plane_stride + source_offset, mask=frequency_mask, other=0.0)
+    output_offset = request.to(tl.int64) * NUM_FREQS + frequency
+    tl.store(mean_phases + output_offset, mean_cos, mask=frequency_mask)
+    tl.store(mean_phases + output_plane_stride + output_offset, mean_sin, mask=frequency_mask)
 
 
-def prepare_mean_phase(
-    round_starts: torch.Tensor,
-    offsets: torch.Tensor,
-    omega: torch.Tensor,
-    mean_cos: torch.Tensor,
-    mean_sin: torch.Tensor,
-    request_count: int,
-) -> None:
-    """Prepare mean score phases in one launch without intermediate tensors."""
-    request_count = int(request_count)
-    if request_count <= 0 or request_count > round_starts.numel():
-        raise ValueError("phase preparation request count is outside its fixed buffers")
-    num_freqs = int(omega.numel())
-    num_offsets = int(offsets.numel())
-    if (
-        num_freqs <= 0
-        or num_offsets <= 0
-        or mean_cos.ndim != 2
-        or mean_cos.shape[0] < request_count
-        or mean_cos.shape[1] != num_freqs
-        or mean_sin.shape != mean_cos.shape
-        or any(
-            tensor.device != round_starts.device for tensor in (offsets, omega, mean_cos, mean_sin)
+class MeanPhaseTable:
+    """RoPE-style position table of mean trig phases, gathered per round.
+
+    The ``(2, rows, num_freqs)`` table stacks a cosine and a sine plane;
+    row ``p`` holds ``mean_o(trig((p + offset_o) * omega_f))`` over the
+    calibration offsets for every frequency, so refreshing a round's
+    stacked ``mean_cos``/``mean_sin`` planes is ONE vendored Triton gather
+    over the staged round starts instead of a per-round trig kernel. The
+    gather writes in place because the compiled CuTe score launch captured
+    the destination planes' device pointers. Eviction never runs under
+    CUDA graph capture, so the table itself may regrow; callers must
+    ``ensure`` capacity while the round starts are still host integers --
+    the gather clamps a stale-capacity row to the last table row, which
+    cannot fault but yields that request a wrong phase.
+    """
+
+    def __init__(self, offsets: torch.Tensor, omega: torch.Tensor, initial_rows: int) -> None:
+        if (
+            offsets.numel() <= 0
+            or omega.numel() <= 0
+            or offsets.dtype != torch.float32
+            or omega.dtype != torch.float32
+            or offsets.device != omega.device
+            or omega.device.type != "cuda"
+        ):
+            raise ValueError("mean-phase tables require FP32 CUDA offsets and frequencies")
+        self.offsets = offsets.contiguous()
+        self.omega = omega.contiguous()
+        self._offset_values: List[float] = self.offsets.tolist()
+        self._table: Optional[torch.Tensor] = None
+        self._rows = 0
+        self.ensure(max(int(initial_rows), 1))
+
+    @property
+    def rows(self) -> int:
+        return self._rows
+
+    def ensure(self, rows: int) -> None:
+        """Cover positions ``[0, rows)``, rebuilding the table if it must grow."""
+        rows = int(rows)
+        if rows <= self._rows:
+            return
+        if rows > _MEAN_PHASE_MAX_ROWS:
+            raise ValueError(f"a {rows}-row mean-phase table exceeds the exact-FP32 position range")
+        target = 1
+        while target < rows:
+            target *= 2
+        target = min(max(target, 2 * self._rows), _MEAN_PHASE_MAX_ROWS)
+        positions = torch.arange(target, device=self.omega.device, dtype=torch.float32)
+        table = torch.zeros(
+            (2, target, self.omega.numel()), dtype=torch.float32, device=self.omega.device
         )
-        or round_starts.dtype != torch.int32
-        or any(tensor.dtype != torch.float32 for tensor in (offsets, omega, mean_cos, mean_sin))
-    ):
-        raise ValueError("phase preparation tensors do not share one valid FP32 geometry")
-    _prepare_mean_phase_kernel[(request_count,)](
-        round_starts,
-        offsets,
-        omega,
-        mean_cos,
-        mean_sin,
-        NUM_FREQS=num_freqs,
-        NUM_OFFSETS=num_offsets,
-        F_BLOCK=triton.next_power_of_2(num_freqs),
-        num_warps=1,
-    )
+        # Accumulate offset-by-offset in fp32, mirroring the retired
+        # per-round Triton kernel's summation order.
+        for offset in self._offset_values:
+            phase = torch.outer(positions + offset, self.omega)
+            table[0] += torch.cos(phase)
+            table[1] += torch.sin(phase)
+        self._table = table.mul_(1.0 / len(self._offset_values))
+        self._rows = target
+
+    def gather(
+        self,
+        round_starts: torch.Tensor,
+        mean_phases: torch.Tensor,
+        request_count: int,
+    ) -> None:
+        """Refresh the stacked cos/sin mean planes in place in one gather."""
+        request_count = int(request_count)
+        if request_count <= 0 or request_count > round_starts.numel():
+            raise ValueError("phase gather request count is outside its fixed buffers")
+        num_freqs = self.omega.numel()
+        if (
+            mean_phases.shape != (2, request_count, num_freqs)
+            or not mean_phases.is_contiguous()
+            or mean_phases.dtype != torch.float32
+            or round_starts.dtype != torch.int32
+            or round_starts.device != self.omega.device
+            or mean_phases.device != self.omega.device
+        ):
+            raise ValueError("phase gather tensors do not share one valid FP32 geometry")
+        _gather_mean_phase_kernel[(request_count,)](
+            self._table,
+            round_starts,
+            mean_phases,
+            self._rows,
+            self._rows * num_freqs,
+            request_count * num_freqs,
+            NUM_FREQS=num_freqs,
+            F_BLOCK=triton.next_power_of_2(num_freqs),
+            num_warps=1,
+        )
 
 
 class _FixedScoreGroup:
@@ -753,78 +808,6 @@ def prepare_per_head_scores(
 
 
 @triton.jit
-def _pack_compaction_sources_kernel(
-    selected_indices,
-    valid_seq_lens,
-    dense_offsets,
-    dense_indices,
-    swa_offsets,
-    swa_indices,
-    DENSE_TOTAL: tl.constexpr,
-    SWA_TOTAL: tl.constexpr,
-    SELECTION_ROWS: tl.constexpr,
-    SELECTION_STRIDE: tl.constexpr,
-    KEEP_COUNT: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    SWA_WINDOW: tl.constexpr,
-    UNION: tl.constexpr,
-    PER_LAYER: tl.constexpr,
-    HAS_SWA: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Pack selected decode ordinals and protected tails for the C++ updater."""
-    request = tl.program_id(0)
-    domain = tl.program_id(1)
-    move = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
-
-    dense_begin = tl.load(dense_offsets + request)
-    dense_end = tl.load(dense_offsets + request + 1)
-    dense_count = dense_end - dense_begin
-    seq_len = tl.load(valid_seq_lens + request)
-
-    if UNION:
-        selection_domain = 0
-    else:
-        selection_domain = domain
-    # Selection rows carry decode-only kept ordinals (already absolute), so
-    # rows are prompt-length independent and one cohort may mix prompt sizes.
-    selection_row = request * SELECTION_ROWS + selection_domain
-    selected = tl.load(
-        selected_indices + selection_row.to(tl.int64) * SELECTION_STRIDE + move,
-        mask=move < KEEP_COUNT,
-        other=0,
-    )
-    dense_source = tl.where(move < KEEP_COUNT, selected, seq_len + move - KEEP_COUNT)
-    dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
-    tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
-
-    if HAS_SWA:
-        # Per-layer selection has one dense domain per (layer, head). SWA uses
-        # one shared source row per head, so only the first layer writes it.
-        if PER_LAYER:
-            write_swa = domain < NUM_KV_HEADS
-        else:
-            write_swa = move >= 0
-        swa_begin = tl.load(swa_offsets + request)
-        swa_end = tl.load(swa_offsets + request + 1)
-        swa_count = swa_end - swa_begin
-        head = domain % NUM_KV_HEADS
-        swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
-        swa_source = seq_len - SWA_WINDOW + move
-        tl.store(
-            swa_indices + swa_output,
-            swa_source,
-            mask=write_swa & (move < swa_count),
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Fused finalize: settle the top-k ties and pack the move indices in one      #
-# launch (fusion suggested by Fanrong Li, torch-graph review 2026-07-20).     #
-# --------------------------------------------------------------------------- #
-
-
-@triton.jit
 def _settle_ties_and_pack_compaction_sources_kernel(
     scores,
     seq_lens,
@@ -848,6 +831,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     UNION: tl.constexpr,
     PER_LAYER: tl.constexpr,
     HAS_SWA: tl.constexpr,
+    HAS_SETTLE: tl.constexpr,
     HAS_PACK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -864,9 +848,13 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     same conditions as the standalone kernel. Union selection has one row per
     request feeding every KV head's packed row, so that single program writes
     all of them. ``HAS_PACK=False`` compiles the second half away, leaving
-    exactly the settle stage (its pre-fusion standalone copy lives in the
-    fused-kernel unit test as the bit-equality reference). Fusing the two launches was suggested by
-    Fanrong Li (torch-graph review 2026-07-20).
+    exactly the settle stage; ``HAS_SETTLE=False`` compiles the first half
+    away instead, packing pre-settled ordinals read from
+    ``output_indices`` -- the draft co-compaction flow, whose keep set is
+    the target's and needs no settling. The pre-fusion standalone copies
+    live in the fused-kernel unit test as the bit-equality references.
+    Fusing the launches was suggested by Fanrong Li (torch-graph review
+    2026-07-20).
     """
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
@@ -874,70 +862,72 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     row_scores = scores + row * WIDTH
     row_selected = provisional_indices + row * KEEP_COUNT
     row_output = output_indices + row * OUTPUT_WIDTH
-    # Scores are decode-relative; this row's pinned prompt length rebases the
-    # emitted ordinals to absolute positions (per row, so one launch may mix
-    # prompt lengths).
-    prompt_len = tl.load(prompt_offsets + row)
+    if HAS_SETTLE:
+        # Scores are decode-relative; this row's pinned prompt length rebases
+        # the emitted ordinals to absolute positions (per row, so one launch
+        # may mix prompt lengths).
+        prompt_len = tl.load(prompt_offsets + row)
 
-    threshold = float("inf")
-    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
-        selected_offset = start + tl.arange(0, BLOCK)
-        selected_mask = selected_offset < KEEP_COUNT
-        token_index = tl.load(
-            row_selected + selected_offset,
-            mask=selected_mask,
-            other=0,
-        )
-        selected_score = tl.load(
-            row_scores + token_index,
-            mask=selected_mask,
-            other=float("inf"),
-        ).to(tl.float32)
-        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
+        threshold = float("inf")
+        for start in tl.static_range(0, KEEP_COUNT, BLOCK):
+            selected_offset = start + tl.arange(0, BLOCK)
+            selected_mask = selected_offset < KEEP_COUNT
+            token_index = tl.load(
+                row_selected + selected_offset,
+                mask=selected_mask,
+                other=0,
+            )
+            selected_score = tl.load(
+                row_scores + token_index,
+                mask=selected_mask,
+                other=float("inf"),
+            ).to(tl.float32)
+            threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
 
-    seq_len = tl.load(seq_lens + row)
-    greater_count = 0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
-        score = tl.load(
-            row_scores + token_index,
-            mask=valid,
-            other=float("-inf"),
-        ).to(tl.float32)
-        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
+        seq_len = tl.load(seq_lens + row)
+        greater_count = 0
+        for start in tl.static_range(0, WIDTH, BLOCK):
+            token_index = start + tl.arange(0, BLOCK)
+            valid = (token_index < WIDTH) & (token_index < seq_len)
+            score = tl.load(
+                row_scores + token_index,
+                mask=valid,
+                other=float("-inf"),
+            ).to(tl.float32)
+            greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
 
-    tie_quota = KEEP_COUNT - greater_count
-    output_count = 0
-    ties_seen = 0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
-        score = tl.load(
-            row_scores + token_index,
-            mask=valid,
-            other=float("-inf"),
-        ).to(tl.float32)
-        greater = valid & (score > threshold)
-        tied = valid & (score == threshold)
-        tied_i32 = tied.to(tl.int32)
-        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
-        selected = greater | (tied & (tie_rank < tie_quota))
-        selected_i32 = selected.to(tl.int32)
-        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
-        tl.store(
-            row_output + write_offset,
-            token_index + prompt_len,
-            mask=selected,
-        )
-        output_count += tl.sum(selected_i32)
-        ties_seen += tl.sum(tied_i32)
+        tie_quota = KEEP_COUNT - greater_count
+        output_count = 0
+        ties_seen = 0
+        for start in tl.static_range(0, WIDTH, BLOCK):
+            token_index = start + tl.arange(0, BLOCK)
+            valid = (token_index < WIDTH) & (token_index < seq_len)
+            score = tl.load(
+                row_scores + token_index,
+                mask=valid,
+                other=float("-inf"),
+            ).to(tl.float32)
+            greater = valid & (score > threshold)
+            tied = valid & (score == threshold)
+            tied_i32 = tied.to(tl.int32)
+            tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
+            selected = greater | (tied & (tie_rank < tie_quota))
+            selected_i32 = selected.to(tl.int32)
+            write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
+            tl.store(
+                row_output + write_offset,
+                token_index + prompt_len,
+                mask=selected,
+            )
+            output_count += tl.sum(selected_i32)
+            ties_seen += tl.sum(tied_i32)
 
     if HAS_PACK:
-        # The emission above scatters through other lanes of this program;
-        # make those global stores visible to every lane before the pack
-        # half reads the row back.
-        tl.debug_barrier()
+        if HAS_SETTLE:
+            # The emission above scatters through other lanes of this
+            # program; make those global stores visible to every lane
+            # before the pack half reads the row back.
+            tl.debug_barrier()
         dense_begin = tl.load(dense_offsets + request)
         dense_end = tl.load(dense_offsets + request + 1)
         dense_count = dense_end - dense_begin

@@ -69,6 +69,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        MeanPhaseTable,
+    )
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
@@ -312,6 +315,7 @@ class _BatchedKeepSetSelectorBase:
             OUTPUT_WIDTH=self.keep_count,
             SELECTION_ROWS=self.selection_rows_per_request,
             **pack_shape,
+            HAS_SETTLE=True,
             BLOCK=256,
             num_warps=4,
         )
@@ -541,6 +545,7 @@ class _FixedScoreStagingBuffers:
         freq_scale_sq: torch.Tensor,
         offsets: torch.Tensor,
         omega: torch.Tensor,
+        mean_phase_table: Optional["MeanPhaseTable"] = None,
         page_table_keys: Optional[List[object]] = None,
         num_page_table_slots: Optional[int] = None,
         decode_width: Optional[int] = None,
@@ -551,7 +556,7 @@ class _FixedScoreStagingBuffers:
         draft_num_page_table_slots: Optional[int] = None,
         draft_page_table_token_capacity: Optional[int] = None,
     ) -> None:
-        from .triattention_kernels import _FixedScoreGroup
+        from .triattention_kernels import MeanPhaseTable, _FixedScoreGroup
 
         if not dense_groups or not dense_layers or not page_representatives or max_requests <= 0:
             raise ValueError("fixed score metadata requires non-empty positive geometry")
@@ -703,7 +708,9 @@ class _FixedScoreStagingBuffers:
                 dtype=torch.int32,
                 device=self.device,
             )
-        self.request_metadata_device = torch.empty(
+        # Zero-filled so an unstaged cohort gathers the phase table's row 0
+        # instead of indexing it with uninitialized round starts.
+        self.request_metadata_device = torch.zeros(
             (6, max_requests + 1), dtype=torch.int32, device=self.device
         )
         self.round_starts_device = self.request_metadata_device[0, :max_requests]
@@ -716,12 +723,19 @@ class _FixedScoreStagingBuffers:
         self.dense_move_offsets = self.request_metadata_device[3]
         self.swa_move_offsets = self.request_metadata_device[4]
         self.draft_move_offsets = self.request_metadata_device[5]
-        self.mean_cos = torch.empty(
-            (max_requests, num_freqs), dtype=torch.float32, device=self.device
+        # Stacked cos/sin planes: one index_select refreshes both, and each
+        # plane stays a contiguous tensor for the CuTe launch to capture.
+        self.mean_phases = torch.empty(
+            (2, max_requests, num_freqs), dtype=torch.float32, device=self.device
         )
-        self.mean_sin = torch.empty_like(self.mean_cos)
-        self.offsets = offsets
-        self.omega = omega
+        self.mean_cos = self.mean_phases[0]
+        self.mean_sin = self.mean_phases[1]
+        # The phase table depends only on the shared calibration, so the
+        # manager passes one instance to every staging bucket; standalone
+        # construction (tests) builds a private one.
+        if mean_phase_table is None:
+            mean_phase_table = MeanPhaseTable(offsets, omega, initial_rows=seq_len)
+        self.mean_phase_table = mean_phase_table
         # ONE fused group across ALL dense layers: segments carry their own
         # layer base address and page-table slot, so distinct per-layer
         # storages/block tables no longer force one launch per storage group.
@@ -774,9 +788,7 @@ class _FixedScoreStagingBuffers:
         self._score_launcher_bound = True
 
     def launch_prepared_score(self) -> torch.Tensor:
-        """Launch the phase and score kernels over these buffers."""
-        from .triattention_kernels import prepare_mean_phase
-
+        """Gather the phase means and launch the score kernel over these buffers."""
         if not self._score_launcher_bound:
             raise RuntimeError("TriAttention score launcher is not bound")
         stream = torch.cuda.current_stream(self.device)
@@ -790,14 +802,11 @@ class _FixedScoreStagingBuffers:
                 "TriAttention score launches must stay on the staging CUDA stream"
             )
         # mean_cos/mean_sin feed the CuTe score kernel, whose compiled launch
-        # captured their device pointers, so they must be refreshed from this
-        # round's staged round starts before it runs.
-        prepare_mean_phase(
+        # captured their device pointers, so they must be refreshed in place
+        # from this round's staged round starts before it runs.
+        self.mean_phase_table.gather(
             self.round_starts_device,
-            self.offsets,
-            self.omega,
-            self.mean_cos,
-            self.mean_sin,
+            self.mean_phases,
             self.max_requests,
         )
         return self.fused_group.launch(
@@ -864,6 +873,12 @@ class _FixedScoreStagingBuffers:
             )
         except (OverflowError, RuntimeError, TypeError, ValueError):
             return False
+        if min(round_starts) < 0:
+            return False
+        # Grow the phase table while this cohort's round starts are still host
+        # integers: the gather clamps stale-capacity rows instead of faulting,
+        # so skipping this would silently mis-phase the cohort.
+        self.mean_phase_table.ensure(int(max(round_starts)) + 1)
         if not self._stage_page_tables_bulk(
             manager,
             request_ids,
@@ -1109,6 +1124,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # Geometric integration offsets (built lazily on first eviction so the
         # device matches the cache pool).
         self._offsets: Optional[torch.Tensor] = None
+        self._mean_phase_table: Optional["MeanPhaseTable"] = None
 
         # Request presence records successful initialization. The record also
         # owns the counters and physical length cleared at request finish.
@@ -1952,6 +1968,16 @@ class TriAttention(BaseKVCacheCompressionManager):
         first_pool = layout.layer_pools[layout.dense_layers[0]]
         if self._offsets is None:
             self._offsets = _build_geometric_offsets(_OFFSET_MAX_LENGTH, first_pool.device)
+        if self._mean_phase_table is None:
+            from .triattention_kernels import MeanPhaseTable
+
+            self._mean_phase_table = MeanPhaseTable(
+                self._offsets,
+                self.calibration["omega"]
+                .to(device=first_pool.device, dtype=torch.float32)
+                .contiguous(),
+                initial_rows=seq_capacity,
+            )
         q_real, q_imag, mlr_coef = self._local_score_calibration(
             layout.num_layers, layout.global_layers
         )
@@ -1970,6 +1996,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             freq_scale_sq=self._freq_scale_sq,
             offsets=self._offsets,
             omega=self.calibration["omega"],
+            mean_phase_table=self._mean_phase_table,
             page_table_keys=self._page_table_pool_keys(representatives, layout.global_layers),
             num_page_table_slots=layout.manager.num_pools,
             decode_width=decode_width,

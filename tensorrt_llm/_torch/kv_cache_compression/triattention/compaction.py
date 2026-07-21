@@ -312,7 +312,7 @@ def _move_index_pack_launcher(
         swa_indices_arg = move_source_indices
         swa_total = 0
 
-    from .triattention_kernels import _pack_compaction_sources_kernel
+    from .triattention_kernels import _settle_ties_and_pack_compaction_sources_kernel
 
     max_move = decode_keep_count + max_protected_tail
     if swa_total:
@@ -336,39 +336,40 @@ def _move_index_pack_launcher(
         per_layer=per_layer,
         has_swa=swa_total > 0,
     )
-    packed_row_count = num_dense_layers * num_kv_heads if per_layer else num_kv_heads
-    grid = (
-        request_count,
-        packed_row_count,
-        (max_move + _PACK_BLOCK_TOKENS - 1) // _PACK_BLOCK_TOKENS,
-    )
-    bound_tensors = (
-        kept_token_ordinals,
-        valid_sequence_lengths,
-        move_source_offsets,
-        move_source_indices,
-        swa_offsets_arg,
-        swa_indices_arg,
-    )
-    # Ordered to match the kernel's constexpr parameter declaration.
-    constexpr_values = dict(
-        DENSE_TOTAL=pack_arguments.dense_total,
-        SWA_TOTAL=pack_arguments.swa_total,
-        SELECTION_ROWS=pack_arguments.selection_rows,
-        SELECTION_STRIDE=pack_arguments.keep_count,
-        KEEP_COUNT=pack_arguments.keep_count,
-        NUM_KV_HEADS=pack_arguments.num_kv_heads,
-        SWA_WINDOW=pack_arguments.swa_window,
-        UNION=pack_arguments.union,
-        PER_LAYER=pack_arguments.per_layer,
-        HAS_SWA=pack_arguments.has_swa,
-        BLOCK=_PACK_BLOCK_TOKENS,
-    )
+    # One program per (request, selection row); the settle half is compiled
+    # away because the ordinals arrive pre-settled (the draft flow reuses
+    # the target's keep set verbatim), so only the pack half runs. The
+    # settle-side pointer arguments are compiled away with it; any
+    # well-formed tensor stands in for them.
+    grid = (request_count, selection_rows)
 
     def launch_pack() -> None:
-        _pack_compaction_sources_kernel[grid](
-            *bound_tensors,
-            **constexpr_values,
+        _settle_ties_and_pack_compaction_sources_kernel[grid](
+            kept_token_ordinals,
+            valid_sequence_lengths,
+            move_source_offsets,
+            kept_token_ordinals,
+            kept_token_ordinals,
+            valid_sequence_lengths,
+            move_source_offsets,
+            move_source_indices,
+            swa_offsets_arg,
+            swa_indices_arg,
+            WIDTH=decode_keep_count,
+            KEEP_COUNT=decode_keep_count,
+            OUTPUT_WIDTH=decode_keep_count,
+            SELECTION_ROWS=selection_rows,
+            DENSE_TOTAL=pack_arguments.dense_total,
+            SWA_TOTAL=pack_arguments.swa_total,
+            MOVE_CAPACITY=pack_arguments.move_capacity,
+            NUM_KV_HEADS=pack_arguments.num_kv_heads,
+            SWA_WINDOW=pack_arguments.swa_window,
+            UNION=pack_arguments.union,
+            PER_LAYER=pack_arguments.per_layer,
+            HAS_SWA=pack_arguments.has_swa,
+            HAS_SETTLE=False,
+            HAS_PACK=True,
+            BLOCK=_PACK_BLOCK_TOKENS,
             num_warps=_PACK_NUM_WARPS,
         )
 

@@ -28,9 +28,80 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _BatchedUnionKeepSetSelector,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    _pack_compaction_sources_kernel,
     _settle_ties_and_pack_compaction_sources_kernel,
 )
+
+
+@triton.jit
+def _pack_compaction_sources_kernel(
+    selected_indices,
+    valid_seq_lens,
+    dense_offsets,
+    dense_indices,
+    swa_offsets,
+    swa_indices,
+    DENSE_TOTAL: tl.constexpr,
+    SWA_TOTAL: tl.constexpr,
+    SELECTION_ROWS: tl.constexpr,
+    SELECTION_STRIDE: tl.constexpr,
+    KEEP_COUNT: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    SWA_WINDOW: tl.constexpr,
+    UNION: tl.constexpr,
+    PER_LAYER: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Pack selected decode ordinals and protected tails for the C++ updater."""
+    request = tl.program_id(0)
+    domain = tl.program_id(1)
+    move = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+
+    dense_begin = tl.load(dense_offsets + request)
+    dense_end = tl.load(dense_offsets + request + 1)
+    dense_count = dense_end - dense_begin
+    seq_len = tl.load(valid_seq_lens + request)
+
+    if UNION:
+        selection_domain = 0
+    else:
+        selection_domain = domain
+    # Selection rows carry decode-only kept ordinals (already absolute), so
+    # rows are prompt-length independent and one cohort may mix prompt sizes.
+    selection_row = request * SELECTION_ROWS + selection_domain
+    selected = tl.load(
+        selected_indices + selection_row.to(tl.int64) * SELECTION_STRIDE + move,
+        mask=move < KEEP_COUNT,
+        other=0,
+    )
+    dense_source = tl.where(move < KEEP_COUNT, selected, seq_len + move - KEEP_COUNT)
+    dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
+    tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
+
+    if HAS_SWA:
+        # Per-layer selection has one dense domain per (layer, head). SWA uses
+        # one shared source row per head, so only the first layer writes it.
+        if PER_LAYER:
+            write_swa = domain < NUM_KV_HEADS
+        else:
+            write_swa = move >= 0
+        swa_begin = tl.load(swa_offsets + request)
+        swa_end = tl.load(swa_offsets + request + 1)
+        swa_count = swa_end - swa_begin
+        head = domain % NUM_KV_HEADS
+        swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
+        swa_source = seq_len - SWA_WINDOW + move
+        tl.store(
+            swa_indices + swa_output,
+            swa_source,
+            mask=write_swa & (move < swa_count),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Fused finalize: settle the top-k ties and pack the move indices in one      #
+# launch (fusion suggested by Fanrong Li, torch-graph review 2026-07-20).     #
+# --------------------------------------------------------------------------- #
 
 
 @triton.jit
@@ -270,6 +341,7 @@ def test_fused_settle_pack_matches_two_kernel_sequence(eviction_mode, has_swa, w
             UNION=union,
             PER_LAYER=per_layer,
             HAS_SWA=has_swa,
+            HAS_SETTLE=True,
             HAS_PACK=True,
             BLOCK=_BLOCK,
             num_warps=_NUM_WARPS,
@@ -338,6 +410,7 @@ def test_fused_kernel_without_pack_matches_standalone_settle():
         UNION=False,
         PER_LAYER=False,
         HAS_SWA=False,
+        HAS_SETTLE=True,
         HAS_PACK=False,
         BLOCK=_BLOCK,
         num_warps=_NUM_WARPS,
