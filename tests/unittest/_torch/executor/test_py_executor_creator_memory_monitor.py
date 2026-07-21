@@ -20,11 +20,14 @@ def test_startup_monitor_warns_about_visible_gpu_processes(monkeypatch) -> None:
     )
     warning = Mock()
     snapshot = Mock()
+    reset_history = Mock()
     monkeypatch.setattr(py_executor_creator.logger, "warning", warning)
     monkeypatch.setattr(py_executor_creator, "log_mem_snapshot", snapshot)
+    monkeypatch.setattr(py_executor_creator, "reset_mem_history", reset_history)
 
     py_executor_creator._ExecutorMemoryMonitor()
 
+    reset_history.assert_called_once_with()
     snapshot.assert_called_once_with("startup/baseline")
     message = warning.call_args.args[0]
     assert "50.00 GiB already used" in message
@@ -86,7 +89,9 @@ def test_startup_monitor_forces_snapshot_without_masking_oom(monkeypatch) -> Non
         ),
     )
     snapshot = Mock()
+    history = Mock()
     monkeypatch.setattr(py_executor_creator, "log_mem_snapshot", snapshot)
+    monkeypatch.setattr(py_executor_creator, "log_mem_history", history)
     monitor = py_executor_creator._ExecutorMemoryMonitor()
     oom = torch.OutOfMemoryError("CUDA out of memory")
 
@@ -99,3 +104,4 @@ def test_startup_monitor_forces_snapshot_without_masking_oom(monkeypatch) -> Non
         call("startup/baseline"),
         call("oom/model", force=True),
     ]
+    history.assert_called_once_with("oom/model")

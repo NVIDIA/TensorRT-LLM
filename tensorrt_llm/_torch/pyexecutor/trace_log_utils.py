@@ -9,19 +9,49 @@ can import freely without creating circular dependencies.
 """
 
 import os
+import time
+from collections import deque
 
 import torch
 
 from tensorrt_llm.logger import logger
 
 _GIB = 1 << 30
+_MEM_HISTORY_CAPACITY = 64
+_MEM_HISTORY: deque[tuple[int, str]] = deque(maxlen=_MEM_HISTORY_CAPACITY)
+
+
+def reset_mem_history() -> None:
+    """Clear snapshots left by a previous executor in this process."""
+    _MEM_HISTORY.clear()
+
+
+def log_mem_history(reason: str) -> None:
+    """Log bounded pre-failure snapshots from oldest to newest."""
+    try:
+        history = tuple(_MEM_HISTORY)
+        if not history:
+            return
+        now_ns = time.monotonic_ns()
+        for index, (timestamp_ns, snapshot) in enumerate(history):
+            age_ms = (now_ns - timestamp_ns) / 1_000_000
+            logger.warning(
+                f"[mem-history/{reason}] index={index} entries={len(history)} "
+                f"age_ms={age_ms:.2f} snapshot={snapshot}"
+            )
+    except Exception as error:
+        try:
+            logger.warning(f"[mem-history/{reason}] history unavailable: {type(error).__name__}")
+        except Exception:
+            pass
 
 
 def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
     """Log a compact snapshot of Torch and whole-device GPU memory.
 
-    Routine snapshots are gated by ``TLLM_LOG_MEM_PROFILE=1``. ``force=True``
-    bypasses the gate for failure-path diagnostics.
+    Routine snapshots are gated by ``TLLM_LOG_MEM_PROFILE=1`` and retained in
+    a bounded history. ``force=True`` bypasses the gate for one current
+    failure-path snapshot and is not retained.
 
     Prints these fields:
 
@@ -29,14 +59,15 @@ def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
     - ``torch_reserved``      = :func:`torch.cuda.memory_reserved`
     - ``torch_alloc_peak``    = :func:`torch.cuda.max_memory_allocated`
     - ``torch_reserved_peak`` = :func:`torch.cuda.max_memory_reserved`
-    - ``free``                = ``cuMemGetInfo().free``
-    - ``total``               = ``cuMemGetInfo().total``
+    - ``device_free``         = ``cuMemGetInfo().free``
+    - ``device_total``        = ``cuMemGetInfo().total``
 
     ``device_gap_estimate`` is the signed difference between whole-device used
     memory and this process's Torch reserved memory. It can include other
     processes and non-Torch allocations, so it is not an ownership ledger.
     """
-    if not force and os.environ.get("TLLM_LOG_MEM_PROFILE", "") != "1":
+    profile_enabled = os.environ.get("TLLM_LOG_MEM_PROFILE", "") == "1"
+    if not force and not profile_enabled:
         return
     try:
         device = torch.cuda.current_device()
@@ -59,6 +90,8 @@ def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
             f"device_total={total / _GIB:.2f}GiB "
             f"device_gap_estimate={device_gap_estimate / _GIB:.2f}GiB"
         )
+        if profile_enabled and not force:
+            _MEM_HISTORY.append((time.monotonic_ns(), message))
         if force:
             logger.warning(message)
         else:

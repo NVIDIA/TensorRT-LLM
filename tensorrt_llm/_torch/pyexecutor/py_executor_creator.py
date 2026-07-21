@@ -47,7 +47,8 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
-from .trace_log_utils import log_mem_snapshot
+from .trace_log_utils import (log_mem_history, log_mem_snapshot,
+                              reset_mem_history)
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
@@ -71,6 +72,7 @@ class _ExecutorMemoryMonitor:
         free_gpu_memory_bytes_post: int
 
     def __init__(self):
+        reset_mem_history()
         free_gpu_memory_bytes, self._total_gpu_memory_bytes = torch.cuda.mem_get_info(
         )
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
@@ -204,6 +206,7 @@ class _ExecutorMemoryMonitor:
             if explanation is None:
                 raise  # not an OOM
             log_mem_snapshot(f"oom/{current_stage.value}", force=True)
+            log_mem_history(f"oom/{current_stage.value}")
             raise RuntimeError(explanation) from e
         else:
             free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
