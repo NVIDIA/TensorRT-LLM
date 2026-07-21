@@ -69,11 +69,10 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        MeanPhaseTable,
-    )
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+
+    from .triattention_kernels import MeanPhaseTable
 
 
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
@@ -723,13 +722,10 @@ class _FixedScoreStagingBuffers:
         self.dense_move_offsets = self.request_metadata_device[3]
         self.swa_move_offsets = self.request_metadata_device[4]
         self.draft_move_offsets = self.request_metadata_device[5]
-        # Stacked cos/sin planes: one index_select refreshes both, and each
-        # plane stays a contiguous tensor for the CuTe launch to capture.
-        self.mean_phases = torch.empty(
-            (2, max_requests, num_freqs), dtype=torch.float32, device=self.device
+        self.mean_cos = torch.empty(
+            (max_requests, num_freqs), dtype=torch.float32, device=self.device
         )
-        self.mean_cos = self.mean_phases[0]
-        self.mean_sin = self.mean_phases[1]
+        self.mean_sin = torch.empty_like(self.mean_cos)
         # The phase table depends only on the shared calibration, so the
         # manager passes one instance to every staging bucket; standalone
         # construction (tests) builds a private one.
@@ -806,7 +802,8 @@ class _FixedScoreStagingBuffers:
         # from this round's staged round starts before it runs.
         self.mean_phase_table.gather(
             self.round_starts_device,
-            self.mean_phases,
+            self.mean_cos,
+            self.mean_sin,
             self.max_requests,
         )
         return self.fused_group.launch(
@@ -876,8 +873,8 @@ class _FixedScoreStagingBuffers:
         if min(round_starts) < 0:
             return False
         # Grow the phase table while this cohort's round starts are still host
-        # integers: the gather clamps stale-capacity rows instead of faulting,
-        # so skipping this would silently mis-phase the cohort.
+        # integers: a stale-capacity gather is an out-of-bounds index_select
+        # on the device.
         self.mean_phase_table.ensure(int(max(round_starts)) + 1)
         if not self._stage_page_tables_bulk(
             manager,

@@ -40,45 +40,45 @@ _MEAN_PHASE_MAX_ROWS = 1 << 24
 
 @triton.jit
 def _gather_mean_phase_kernel(
-    table,
     round_starts,
-    mean_phases,
+    table_cos,
+    table_sin,
+    mean_cos,
+    mean_sin,
     table_rows,
-    table_plane_stride,
-    output_plane_stride,
     NUM_FREQS: tl.constexpr,
     F_BLOCK: tl.constexpr,
 ):
-    """Copy one request's cos/sin table row into the stacked mean planes."""
+    """Copy each request's precomputed phase-table row into the fixed buffers."""
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
     frequency_mask = frequency < NUM_FREQS
-    row = tl.load(round_starts + request).to(tl.int64)
-    # Clamp instead of trusting the staged values: a stale-capacity row
-    # must degrade to a wrong phase, never to an out-of-bounds access.
-    row = tl.minimum(tl.maximum(row, 0), table_rows - 1)
-    source_offset = row * NUM_FREQS + frequency
-    mean_cos = tl.load(table + source_offset, mask=frequency_mask, other=0.0)
-    mean_sin = tl.load(table + table_plane_stride + source_offset, mask=frequency_mask, other=0.0)
-    output_offset = request.to(tl.int64) * NUM_FREQS + frequency
-    tl.store(mean_phases + output_offset, mean_cos, mask=frequency_mask)
-    tl.store(mean_phases + output_plane_stride + output_offset, mean_sin, mask=frequency_mask)
+    table_row = tl.load(round_starts + request).to(tl.int64)
+    # Clamp stale or padded round starts into the table instead of faulting;
+    # staged cohorts are host-validated, so live rows are never clamped.
+    table_row = tl.minimum(tl.maximum(table_row, 0), table_rows - 1)
+    source_offset = table_row * NUM_FREQS + frequency
+    output_offset = request * NUM_FREQS + frequency
+    row_cos = tl.load(table_cos + source_offset, mask=frequency_mask, other=0.0)
+    row_sin = tl.load(table_sin + source_offset, mask=frequency_mask, other=0.0)
+    tl.store(mean_cos + output_offset, row_cos, mask=frequency_mask)
+    tl.store(mean_sin + output_offset, row_sin, mask=frequency_mask)
 
 
 class MeanPhaseTable:
     """RoPE-style position table of mean trig phases, gathered per round.
 
-    The ``(2, rows, num_freqs)`` table stacks a cosine and a sine plane;
-    row ``p`` holds ``mean_o(trig((p + offset_o) * omega_f))`` over the
+    Row ``p`` holds ``mean_o(trig((p + offset_o) * omega_f))`` over the
     calibration offsets for every frequency, so refreshing a round's
-    stacked ``mean_cos``/``mean_sin`` planes is ONE vendored Triton gather
-    over the staged round starts instead of a per-round trig kernel. The
-    gather writes in place because the compiled CuTe score launch captured
-    the destination planes' device pointers. Eviction never runs under
-    CUDA graph capture, so the table itself may regrow; callers must
-    ``ensure`` capacity while the round starts are still host integers --
-    the gather clamps a stale-capacity row to the last table row, which
-    cannot fault but yields that request a wrong phase.
+    ``mean_cos``/``mean_sin`` is one pure-gather launch over the staged
+    round starts instead of a per-round trig kernel. The gather writes in
+    place because the compiled CuTe score launch captured the destination
+    buffers' device pointers. Eviction never runs under CUDA graph
+    capture, so the table itself may regrow; callers must ``ensure``
+    capacity while the round starts are still host integers (the gather
+    clamps stale rows into the table rather than faulting). Building the
+    table is plain torch and works on any device; gathering launches the
+    Triton kernel and is CUDA-only.
     """
 
     def __init__(self, offsets: torch.Tensor, omega: torch.Tensor, initial_rows: int) -> None:
@@ -88,13 +88,13 @@ class MeanPhaseTable:
             or offsets.dtype != torch.float32
             or omega.dtype != torch.float32
             or offsets.device != omega.device
-            or omega.device.type != "cuda"
         ):
-            raise ValueError("mean-phase tables require FP32 CUDA offsets and frequencies")
+            raise ValueError("mean-phase tables require same-device FP32 offsets and frequencies")
         self.offsets = offsets.contiguous()
         self.omega = omega.contiguous()
         self._offset_values: List[float] = self.offsets.tolist()
-        self._table: Optional[torch.Tensor] = None
+        self._cos: Optional[torch.Tensor] = None
+        self._sin: Optional[torch.Tensor] = None
         self._rows = 0
         self.ensure(max(int(initial_rows), 1))
 
@@ -114,45 +114,53 @@ class MeanPhaseTable:
             target *= 2
         target = min(max(target, 2 * self._rows), _MEAN_PHASE_MAX_ROWS)
         positions = torch.arange(target, device=self.omega.device, dtype=torch.float32)
-        table = torch.zeros(
-            (2, target, self.omega.numel()), dtype=torch.float32, device=self.omega.device
+        cos_table = torch.zeros(
+            (target, self.omega.numel()), dtype=torch.float32, device=self.omega.device
         )
+        sin_table = torch.zeros_like(cos_table)
         # Accumulate offset-by-offset in fp32, mirroring the retired
         # per-round Triton kernel's summation order.
         for offset in self._offset_values:
             phase = torch.outer(positions + offset, self.omega)
-            table[0] += torch.cos(phase)
-            table[1] += torch.sin(phase)
-        self._table = table.mul_(1.0 / len(self._offset_values))
+            cos_table += torch.cos(phase)
+            sin_table += torch.sin(phase)
+        scale = 1.0 / len(self._offset_values)
+        self._cos = cos_table.mul_(scale)
+        self._sin = sin_table.mul_(scale)
         self._rows = target
 
     def gather(
         self,
         round_starts: torch.Tensor,
-        mean_phases: torch.Tensor,
+        mean_cos: torch.Tensor,
+        mean_sin: torch.Tensor,
         request_count: int,
     ) -> None:
-        """Refresh the stacked cos/sin mean planes in place in one gather."""
+        """Refresh the fixed mean buffers in place from staged round starts."""
         request_count = int(request_count)
         if request_count <= 0 or request_count > round_starts.numel():
             raise ValueError("phase gather request count is outside its fixed buffers")
         num_freqs = self.omega.numel()
         if (
-            mean_phases.shape != (2, request_count, num_freqs)
-            or not mean_phases.is_contiguous()
-            or mean_phases.dtype != torch.float32
+            mean_cos.ndim != 2
+            or mean_cos.shape[0] < request_count
+            or mean_cos.shape[1] != num_freqs
+            or mean_sin.shape != mean_cos.shape
             or round_starts.dtype != torch.int32
-            or round_starts.device != self.omega.device
-            or mean_phases.device != self.omega.device
+            or self.omega.device.type != "cuda"
+            or any(
+                tensor.device != self.omega.device for tensor in (round_starts, mean_cos, mean_sin)
+            )
+            or any(tensor.dtype != torch.float32 for tensor in (mean_cos, mean_sin))
         ):
-            raise ValueError("phase gather tensors do not share one valid FP32 geometry")
+            raise ValueError("phase gather tensors do not share one valid FP32 CUDA geometry")
         _gather_mean_phase_kernel[(request_count,)](
-            self._table,
             round_starts,
-            mean_phases,
+            self._cos,
+            self._sin,
+            mean_cos,
+            mean_sin,
             self._rows,
-            self._rows * num_freqs,
-            request_count * num_freqs,
             NUM_FREQS=num_freqs,
             F_BLOCK=triton.next_power_of_2(num_freqs),
             num_warps=1,

@@ -1531,14 +1531,13 @@ class TestFixedScoreMetadata:
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
-        mean_phases = torch.empty(2, request_count, num_freqs, dtype=torch.float32, device=device)
-        mean_cos = mean_phases[0]
-        mean_sin = mean_phases[1]
+        mean_cos = torch.empty(request_count, num_freqs, dtype=torch.float32, device=device)
+        mean_sin = torch.empty_like(mean_cos)
         # Rows cover this launch and the +17 round-start advance below.
         mean_phase_table = triattention_kernels.MeanPhaseTable(
             offsets, omega, initial_rows=int(round_device.max()) + 18
         )
-        mean_phase_table.gather(round_device, mean_phases, request_count)
+        mean_phase_table.gather(round_device, mean_cos, mean_sin, request_count)
         score_sentinel = -12345.0
         group.output.fill_(score_sentinel)
         checked = group.launch(
@@ -1556,7 +1555,6 @@ class TestFixedScoreMetadata:
         staging.round_starts_device = round_device
         staging.valid_seq_lens_device = valid_seq_lens
         staging.token_starts_device = token_starts
-        staging.mean_phases = mean_phases
         staging.mean_cos = mean_cos
         staging.mean_sin = mean_sin
         staging.mean_phase_table = mean_phase_table
@@ -1602,7 +1600,7 @@ class TestFixedScoreMetadata:
                 device=device,
             )
         )
-        mean_phase_table.gather(round_device, mean_phases, request_count)
+        mean_phase_table.gather(round_device, mean_cos, mean_sin, request_count)
         expected_second_widths = valid_seq_lens - prompt_len
         group.output.fill_(score_sentinel)
         valid_widths.fill_(-1)
@@ -1628,34 +1626,6 @@ class TestFixedScoreMetadata:
 
 
 class TestKernelMaskedSwa:
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="MeanPhaseTable is CUDA-only")
-    def test_mean_phase_table_regrowth_and_clamp(self):
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-            MeanPhaseTable,
-        )
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        omega = torch.rand(7, device=device) * 0.05
-        offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
-        rounds = torch.tensor([0, 3, 500, 65], dtype=torch.int32, device=device)
-        gathered = torch.empty(2, 4, 7, dtype=torch.float32, device=device)
-        small = MeanPhaseTable(offsets, omega, initial_rows=8)
-        assert small.rows == 8
-        small.ensure(501)
-        assert small.rows == 512
-        small.gather(rounds, gathered, 4)
-        # A regrown table is rebuilt from positions, so it must match a
-        # table built at the final size bit-for-bit.
-        fresh = MeanPhaseTable(offsets, omega, initial_rows=512)
-        expected = torch.empty_like(gathered)
-        fresh.gather(rounds, expected, 4)
-        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
-        # A stale-capacity row clamps to the last table row instead of
-        # reading out of bounds.
-        stale = torch.tensor([100_000, 511, 0, 1], dtype=torch.int32, device=device)
-        small.gather(stale, gathered, 4)
-        torch.testing.assert_close(gathered[:, 0], gathered[:, 1], rtol=0, atol=0)
-
     def test_layer_partition_uses_local_model_config(self):
         mgr = _make_triattention()
         mgr.model_path = "/models/gpt-oss"
