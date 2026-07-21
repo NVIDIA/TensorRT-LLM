@@ -36,6 +36,7 @@ from utils.util import skip_ray
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -1114,6 +1115,33 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         spec_metadata.write_padding_onehot_draft_probs.assert_called_once_with(
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
+
+    def test_gemma4_assistant_graph_key_ignores_first_draft_state(self) -> None:
+        runner = object.__new__(CUDAGraphRunner)
+        runner.config = SimpleNamespace(
+            is_draft_model=True,
+            is_gemma4_assistant=True,
+            original_max_draft_len=2,
+        )
+        runner.sparse_config = None
+        runner.graphs = {}
+        runner.graph_outputs = {}
+        runner.graph_metadata = {}
+        runner.padding_dummy_requests = {}
+        runner.memory_pool = None
+        batch = SimpleNamespace(batch_size=1)
+        resource_manager = object.__new__(Eagle3ResourceManager)
+
+        resource_manager.is_first_draft = False
+        capture_key = runner.get_graph_key(
+            batch, spec_resource_manager=resource_manager)
+
+        resource_manager.is_first_draft = True
+        runtime_key = runner.get_graph_key(
+            batch, spec_resource_manager=resource_manager)
+
+        self.assertEqual(capture_key, (1, 0, False, False, True))
+        self.assertEqual(runtime_key, capture_key)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
