@@ -4763,6 +4763,22 @@ class GvrTopKKernel:
                 s_active_cnt[1] = cutlass.Int32(0)
                 s_active_cnt[2] = cutlass.Int32(0)  # dropped-rung mask
 
+        # ---- Per-row dynamic routing (ext counts) ----
+        # Use the epilogue rungs ONLY when the row is valid (finite t_0,
+        # xstate contract) AND some rung count already lies in [K, kC].
+        # A miss/invalid row runs the full stock path (P1 + P1b + vseed +
+        # count): real data shows stock beats ext-bracket refine on
+        # misses (pro-1M cold: stock-skip 21us vs ext-miss 51us). All
+        # threads read the same control words, so the predicate is
+        # CTA-uniform and the dynamic branches below stay convergent.
+        ext_row = cutlass.Int32(0)
+        if cutlass.const_expr(self.use_ext_counts):
+            if seed_thr_row[0] < cutlass.Float32(1e37):
+                for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                    cm_e = cutlass.Int32(seed_counts_row[m])
+                    if cm_e >= cutlass.Int32(self.top_k) and cm_e <= cutlass.Int32(self.kC):
+                        ext_row = cutlass.Int32(1)
+
         # ---- Phase 1: preIdx Min/Max/Mean ----
         # ext counts: P1's only surviving products are the [v_lo, v_hi]
         # outer bracket and the scalar state init — the ext rungs provide
@@ -4771,16 +4787,36 @@ class GvrTopKKernel:
         # target lies outside [t_0, t_2] recovers via the refine loop's
         # 8x bracket expansion (same fail-soft as the stock path).
         if cutlass.const_expr(self.use_ext_counts):
-            if tidx == cutlass.Int32(0):
-                s_thr[0] = seed_thr_row[1]
-                s_thr[1] = seed_thr_row[0]
-                s_thr[2] = seed_thr_row[2]
-                s_iscalars[0] = cutlass.Int32(0)  # cand_count
-                s_iscalars[1] = cutlass.Int32(0)  # done
-                s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb seeding owns)
-                s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
-                s_iscalars[4] = cutlass.Int32(0)  # out_count
-            cute.arch.barrier()
+            if ext_row == cutlass.Int32(1):
+                if tidx == cutlass.Int32(0):
+                    s_thr[0] = seed_thr_row[1]
+                    s_thr[1] = seed_thr_row[0]
+                    s_thr[2] = seed_thr_row[2]
+                    s_iscalars[0] = cutlass.Int32(0)  # cand_count
+                    s_iscalars[1] = cutlass.Int32(0)  # done
+                    s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo (fb seeding owns)
+                    s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi
+                    s_iscalars[4] = cutlass.Int32(0)  # out_count
+                cute.arch.barrier()
+            if ext_row == cutlass.Int32(0):
+                self.phase1_preidx_stats(
+                    input_row,
+                    N,
+                    pre_idx_row,
+                    pre_idx_count,
+                    pre_idx_offset,
+                    smem_wmin,
+                    smem_wmax,
+                    smem_wsum,
+                    smem_wcnt_p1,
+                    s_thr,
+                    s_iscalars,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
+                    s_mt_thr=s_mt_thr,  # r0_vseed: park pmean in the last rung column
+                )
         if cutlass.const_expr(not self.use_ext_counts):
             self.phase1_preidx_stats(
                 input_row,
@@ -4915,38 +4951,67 @@ class GvrTopKKernel:
                     # the rung counts (phase1b rungs are per-CTA identical since
                     # preIdx stats are full-row).
                     if cutlass.const_expr(self.use_ext_counts):
-                        # ---- Waterfall L1 admission (ext rungs, v2a) ----
-                        # Rung thresholds arrive from the indexer epilogue:
-                        # ONLY P1b is skipped. The stock M-ary count pass runs
-                        # on the ext rungs so the block-skip list build, rung
-                        # tightening, per-thread hand-off and classify all
-                        # compose unchanged (v1 routed through the dense
-                        # refine and forfeited the compact-walk win: flash 1M
-                        # ext 34.7us vs skipR0 15.6us cold).
-                        # v2b: when an ext count is already in [K, kC], park
-                        # THE ADMITTED THRESHOLD IN ALL RUNG SLOTS — the M-ary
-                        # pass degenerates to one compact single-threshold
-                        # count (+ list build at that threshold) and classify
-                        # admits it; a full miss keeps the 3 distinct rungs as
-                        # measured brackets for the seeded refine.
-                        if tidx == cutlass.Int32(0):
-                            bx_m = cutlass.Int32(-1)
-                            bx_c = cutlass.Int32(2147483647)
-                            for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                                cx = cutlass.Int32(seed_counts_row[m])
-                                if (
-                                    cx >= cutlass.Int32(self.top_k)
-                                    and cx <= cutlass.Int32(self.kC)
-                                    and cx < bx_c
-                                ):
-                                    bx_m = cutlass.Int32(m)
-                                    bx_c = cx
-                            for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
-                                if bx_m >= cutlass.Int32(0):
-                                    s_mt_thr[m] = seed_thr_row[bx_m]
-                                else:
-                                    s_mt_thr[m] = seed_thr_row[m]
-                        cute.arch.barrier()
+                        if ext_row == cutlass.Int32(1):
+                            # ---- Waterfall L1 admission (ext rungs, v2a) ----
+                            # Rung thresholds arrive from the indexer epilogue:
+                            # ONLY P1b is skipped. The stock M-ary count pass runs
+                            # on the ext rungs so the block-skip list build, rung
+                            # tightening, per-thread hand-off and classify all
+                            # compose unchanged (v1 routed through the dense
+                            # refine and forfeited the compact-walk win: flash 1M
+                            # ext 34.7us vs skipR0 15.6us cold).
+                            # v2b: when an ext count is already in [K, kC], park
+                            # THE ADMITTED THRESHOLD IN ALL RUNG SLOTS — the M-ary
+                            # pass degenerates to one compact single-threshold
+                            # count (+ list build at that threshold) and classify
+                            # admits it; a full miss keeps the 3 distinct rungs as
+                            # measured brackets for the seeded refine.
+                            if tidx == cutlass.Int32(0):
+                                bx_m = cutlass.Int32(-1)
+                                bx_c = cutlass.Int32(2147483647)
+                                for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                                    cx = cutlass.Int32(seed_counts_row[m])
+                                    if (
+                                        cx >= cutlass.Int32(self.top_k)
+                                        and cx <= cutlass.Int32(self.kC)
+                                        and cx < bx_c
+                                    ):
+                                        bx_m = cutlass.Int32(m)
+                                        bx_c = cx
+                                for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                                    if bx_m >= cutlass.Int32(0):
+                                        s_mt_thr[m] = seed_thr_row[bx_m]
+                                    else:
+                                        s_mt_thr[m] = seed_thr_row[m]
+                            cute.arch.barrier()
+                        if ext_row == cutlass.Int32(0):
+                            if cutlass.const_expr(self.p1b_cache):
+                                # rungs from the SMEM gather-cache P1 stashed (no 2nd
+                                # GMEM gather); 16-bit only.
+                                self.phase1b_hspace_rungs_cached(
+                                    pre_idx_count,
+                                    smem_gath,
+                                    smem_hist,
+                                    s_thr,
+                                    s_mt_thr,
+                                    tidx,
+                                    warp_id,
+                                    lane,
+                                )
+                            else:
+                                self.phase1b_hspace_rungs(
+                                    input_row,
+                                    N,
+                                    pre_idx_row,
+                                    pre_idx_count,
+                                    pre_idx_offset,
+                                    smem_hist,
+                                    s_thr,
+                                    s_mt_thr,
+                                    tidx,
+                                    warp_id,
+                                    lane,
+                                )
                     if cutlass.const_expr(not self.use_ext_counts):
                         if cutlass.const_expr(self.p1b_cache):
                             # rungs from the SMEM gather-cache P1 stashed (no 2nd
