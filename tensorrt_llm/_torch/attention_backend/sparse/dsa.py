@@ -867,11 +867,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         Writes ``argsort(gen_kv_lens, descending)`` into the stable buffer when
         the multi-wave threshold is met, otherwise leaves ``order_row`` None.
-        Called unconditionally from every ``prepare()`` (base and DeepSeek-V4)
-        so the GVR op sees a fresh valid permutation each step and never a
-        stale one left over from a prior decode step. Copies into the stable
-        buffer (not a fresh tensor) so the CUDA-Graph-captured op reads a valid
-        permutation on every replay.
+        Called from ``on_update_kv_lens()`` (both base and DeepSeek-V4 via
+        super()) unconditionally every forward step so the GVR op sees a fresh
+        valid permutation and never a stale one from a prior step.  Copies into
+        the stable buffer (not a fresh tensor) so the CUDA-Graph-captured op
+        reads a valid permutation on every replay.
         """
         # Gate on row count (num_generations * next_n) rather than request count
         # so the threshold aligns with the kernel-side tuning note that records
