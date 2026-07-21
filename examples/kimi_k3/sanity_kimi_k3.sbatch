@@ -4,7 +4,7 @@
 #
 # Kimi K3 ("golden prairie") e2e sanity — full model on 16 GPUs (4x GB300).
 #
-# Submit from the repo root (paths default to tali's workspace; override
+# Submit from the repo root (paths default to brnguyen's workspace; override
 # KIMI_K3_* / IMAGE via the environment for other checkouts):
 #
 #   KIMI_K3_OPT_WORK_DIR=/path/to/exisiting_optimization_work \
@@ -27,16 +27,18 @@
 
 set -euo pipefail
 
-# Paths — defaults point at tali's golden-prairie workspace; override via
+# Paths — defaults point at brnguyen's golden-prairie workspace; override via
 # the environment for other checkouts.
-KIMI_K3_OPT_WORK_DIR=${KIMI_K3_OPT_WORK_DIR:-/home/tali/tali/goldenprairie/exisiting_optimization_work}
-KIMI_K3_MODEL_DIR=${KIMI_K3_MODEL_DIR:-/home/tali/tali/goldenprairie/goldenprairie-final-weights_vv1}
-IMAGE=${IMAGE:-/home/tali/tali/trtllm-pytorch-26.05-py3-sbsa-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194.sqsh}
-export KIMI_K3_OPT_WORK_DIR KIMI_K3_MODEL_DIR
+KIMI_K3_OPT_WORK_DIR=${KIMI_K3_OPT_WORK_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/goldenprairie/exisiting_optimization_work}
+KIMI_K3_MODEL_DIR=${KIMI_K3_MODEL_DIR:-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/goldenprairie/goldenprairie-final-weights_vv1}
+KIMI_K3_CACHE_DIR=${KIMI_K3_CACHE_DIR:-$SLURM_SUBMIT_DIR/.kimi_k3_cache}
+IMAGE=${IMAGE:-/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/brnguyen/goldenprairie/sw-tensorrt-docker+tensorrt-llm+pytorch-26.05-py3-sbsa-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194.sqsh}
+export KIMI_K3_OPT_WORK_DIR KIMI_K3_MODEL_DIR KIMI_K3_CACHE_DIR
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
-MOUNTS="$REPO:$REPO:rw,$KIMI_K3_OPT_WORK_DIR:$KIMI_K3_OPT_WORK_DIR:rw"
+MOUNTS="$REPO:$REPO:rw,$KIMI_K3_OPT_WORK_DIR:$KIMI_K3_OPT_WORK_DIR:ro"
 MOUNTS+=",$KIMI_K3_MODEL_DIR:$KIMI_K3_MODEL_DIR:ro"
+MOUNTS+=",$KIMI_K3_CACHE_DIR:$KIMI_K3_CACHE_DIR:rw"
 
 srun --mpi=pmix \
     --container-image="$IMAGE" \
@@ -47,7 +49,7 @@ srun --mpi=pmix \
 
         # --- Kimi K3 runtime env (every rank, before any python import) ---
         SNAP=\$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE
-        CACHE=\$KIMI_K3_OPT_WORK_DIR/.kimi_k3_cache
+        CACHE=\$KIMI_K3_CACHE_DIR
         # Import paths: the repo itself (the editable install records the
         # build-time mount point) and the private flashinfer snapshot with
         # the SiTU MXFP4 MoE cubins (must shadow the stock flashinfer).
@@ -66,6 +68,6 @@ srun --mpi=pmix \
         export PATH='$REPO/.venv-3.12/bin':\$PATH
 
         export KIMI_K3_TP=${KIMI_K3_TP:-16}
-        exec trtllm-llmapi-launch python \
+        exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python \
             '$REPO/examples/kimi_k3/sanity_kimi_k3.py'
     "
