@@ -45,8 +45,7 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
                             GSM8KInferenceMax, JsonModeEval,
-                            LlmapiAccuracyTestHarness, LongBenchV1,
-                            LongBenchV2)
+                            LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -7656,6 +7655,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         sparse_attention_config = MiniMaxM3SparseAttentionConfig(
             implementation="msa" if use_msa else "triton")
         moe_config = MoeConfig(backend="CUTLASS")
+        # InferenceMAX evaluates a serving endpoint with client concurrency
+        # capped at 64 (EVAL_CONCURRENT_REQUESTS); match that batching regime.
+        batch_kwargs = {"max_batch_size": 64} if inferencemax else {}
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
@@ -7663,10 +7665,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
                  max_seq_len=16384 if inferencemax else 4096,
-                 # InferenceMAX evaluates a serving endpoint with client
-                 # concurrency capped at 64 (EVAL_CONCURRENT_REQUESTS); match
-                 # that batching regime.
-                 **({"max_batch_size": 64} if inferencemax else {}),
+                 **batch_kwargs,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if inferencemax:
@@ -7705,6 +7704,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # reference).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False)
+        # The fmha_sm100 decode planner caps total_q x num_qo_heads at 65536;
+        # with 1 + draft_len = 4 verify tokens per row that bounds the batch
+        # at 1024 / TP-sharded heads (256 unsharded under attention DP). The
+        # inferencemax cap of 64 matches the InferenceMAX eval regime (client
+        # concurrency 64) and keeps every decode iteration inside the
+        # captured graph range, as in real serving at that concurrency.
+        if inferencemax:
+            max_batch_size = 64
+        else:
+            max_batch_size = 256 if attention_dp else 512
         with LLM(
                 model_path,
                 tensor_parallel_size=tp_size,
@@ -7716,15 +7725,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # The InferenceMAX protocol needs room for thinking output
                 # (12288 generated tokens on a ~2k chat prompt).
                 max_seq_len=16384 if inferencemax else 4096,
-                # The fmha_sm100 decode planner caps total_q x num_qo_heads at
-                # 65536; with 1 + draft_len = 4 verify tokens per row that
-                # bounds the batch at 1024 / TP-sharded heads (256 unsharded
-                # under attention DP). The inferencemax cap of 64 matches the
-                # InferenceMAX eval regime (client concurrency 64) and keeps
-                # every decode iteration inside the captured graph range,
-                # as in real serving at that concurrency.
-                max_batch_size=64 if inferencemax else
-                (256 if attention_dp else 512),
+                max_batch_size=max_batch_size,
                 speculative_config=spec_config,
                 # Graphs + spec requires the MSA path: its verify batches
                 # are decode-shaped and capture-safe (the reference path

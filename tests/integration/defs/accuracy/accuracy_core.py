@@ -78,6 +78,9 @@ class HypothesisTestingParams:
     beta: float = 0.2
     sigma: float = 50.0
     higher_is_better: bool = True
+    # Free-text provenance for the reference row (e.g. an externally
+    # published score to compare against); printed in the report only.
+    reference_note: Optional[str] = None
     theta: float = field(init=False)
     threshold: float = field(init=False)
 
@@ -106,6 +109,10 @@ Higher is better: {self.higher_is_better}
 Theta (Minimum detectable effect): {self.theta:.3f}
 Reference {self.metric_name}: {self.ref_accuracy:.3f}
 Threshold: {self.threshold:.3f}
+==========================================================="""
+        if self.reference_note is not None:
+            report = f"""{report}
+External reference: {self.reference_note}
 ==========================================================="""
         if accuracy is not None:
             report = f"""{report}
@@ -190,7 +197,8 @@ class AccuracyTask:
             sigma=entry.get("sigma", self.SIGMA),
             num_samples=entry.get("num_samples", self.NUM_SAMPLES),
             higher_is_better=entry.get("higher_is_better",
-                                       self.HIGHER_IS_BETTER))
+                                       self.HIGHER_IS_BETTER),
+            reference_note=entry.get("reference_note"))
 
     def evaluate(self,
                  llm: Union[PyTorchLLM, AutoDeployLLM],

@@ -537,9 +537,10 @@ class LmEvalEvaluator(Evaluator):
                     }
                 else:
                     # NOTE: Few-shot random seed
-                    task_obj.set_fewshot_seed(seed=self.fewshot_random_seed
-                                              if self.fewshot_random_seed
-                                              is not None else random_seed)
+                    fewshot_seed = (self.fewshot_random_seed
+                                    if self.fewshot_random_seed is not None else
+                                    random_seed)
+                    task_obj.set_fewshot_seed(seed=fewshot_seed)
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset

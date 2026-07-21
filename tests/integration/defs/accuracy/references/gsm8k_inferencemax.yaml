@@ -9,13 +9,18 @@ nvidia/MiniMax-M3-NVFP4:
   # Matches the serve-based measurement of the same config exactly.
   - quant_algo: MIXED_PRECISION
     accuracy: 95.53
+    reference_note: "published vLLM B200 FP4 spec-off mean 95.46 [94.84-95.91]
+      n=13 (inferencex.semianalysis.com, 2026-07)"
   # MSA path (fmha_sm100), FP8 KV cache, no spec decoding.
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.68
+    reference_note: "published vLLM B200 FP4 spec-off mean 95.46 [94.84-95.91]
+      n=13 (inferencex.semianalysis.com, 2026-07)"
   # MSA path + one-model Eagle3 + CUDA graphs + overlap (mean of 3 runs:
-  # 95.53 / 95.53 / 95.00; serve-based repeats 95.38-95.60; published vLLM
-  # B200 FP4 Eagle3 mean 95.49).
+  # 95.53 / 95.53 / 95.00; serve-based repeats 95.38-95.60).
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: Eagle3
     accuracy: 95.35
+    reference_note: "published vLLM B200 FP4 Eagle3 mean 95.49 [95.15-96.06]
+      n=8 (inferencex.semianalysis.com, 2026-07)"
