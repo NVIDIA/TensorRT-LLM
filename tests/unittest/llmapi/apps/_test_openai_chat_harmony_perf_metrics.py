@@ -1,21 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for /perf_metrics population on the Harmony (GPT-OSS) chat path.
-
-Asserts two behaviors of the Harmony chat endpoint:
-  * The streaming generator stamps `server_first_token_time` and calls
-    `_extract_metrics(...)` after `data: [DONE]`, so the `/perf_metrics`
-    deque is populated for streaming chat requests.
-  * When `TRTLLM_KVCACHE_TIME_OUTPUT_PATH` is set, the per-request
-    `sampling_params.return_perf_metrics` flag is enabled so the engine
-    emits metrics for each request. Without it, the deque stays empty
-    even with `return_perf_metrics: True` at the LLM-args level.
-"""
+"""Tests JSONL performance metrics for the Harmony chat path."""
 
 import json
 import os
 import tempfile
-from urllib.request import urlopen
+import time
+from pathlib import Path
 
 import openai
 import pytest
@@ -46,15 +37,14 @@ def kv_cache_time_output_dir(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
-def extra_llm_api_options_file():
+def extra_llm_api_options_file(kv_cache_time_output_dir: str):
     fd, path = tempfile.mkstemp(suffix=".yaml", prefix="extra_llm_api_options_")
     os.close(fd)
     try:
         with open(path, "w") as f:
             yaml.dump(
                 {
-                    "return_perf_metrics": True,
-                    "perf_metrics_max_requests": 16,
+                    "perf_metrics_output_dir": kv_cache_time_output_dir,
                 },
                 f,
             )
@@ -92,17 +82,27 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
-def _drain_perf_metrics(server: RemoteOpenAIServer):
-    response = urlopen(f"{server.url_root}/perf_metrics")
-    assert response.status == 200
-    return json.loads(response.read())
+def _read_perf_metrics(output_dir: str):
+    records = []
+    for path in Path(output_dir).glob("perf_metrics-*.jsonl"):
+        records.extend(json.loads(line) for line in path.read_text().splitlines())
+    return records
+
+
+def _wait_for_new_metric(output_dir: str, previous_count: int):
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        records = _read_perf_metrics(output_dir)
+        if len(records) > previous_count:
+            return records[-1]
+        time.sleep(0.1)
+    raise AssertionError("timed out waiting for performance metrics JSONL")
 
 
 def _assert_perf_metrics_entry_well_formed(entry: dict):
     assert "request_id" in entry
-    assert "perf_metrics" in entry
-    pm = entry["perf_metrics"]
-    assert "first_iter" in pm and "last_iter" in pm
+    assert entry["status"] == "complete"
+    pm = entry["phases"]["server"]
     assert pm["first_iter"] <= pm["last_iter"]
 
     tm = pm["timing_metrics"]
@@ -115,10 +115,12 @@ def _assert_perf_metrics_entry_well_formed(entry: dict):
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_non_streaming_perf_metrics(
-    async_client: openai.AsyncOpenAI, server: RemoteOpenAIServer, model: str
+    async_client: openai.AsyncOpenAI,
+    server: RemoteOpenAIServer,
+    model: str,
+    kv_cache_time_output_dir: str,
 ):
-    # Drain anything from prior tests in this module session.
-    _drain_perf_metrics(server)
+    previous_count = len(_read_perf_metrics(kv_cache_time_output_dir))
     response = await async_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "Reply with exactly the single word: PONG."}],
@@ -126,20 +128,18 @@ async def test_non_streaming_perf_metrics(
     )
     assert response.choices[0].message.content is not None
 
-    entries = _drain_perf_metrics(server)
-    assert len(entries) == 1, (
-        "Expected exactly one /perf_metrics entry after a single non-streaming "
-        f"harmony chat completion, got {len(entries)}: {entries}"
-    )
-    _assert_perf_metrics_entry_well_formed(entries[0])
+    entry = _wait_for_new_metric(kv_cache_time_output_dir, previous_count)
+    _assert_perf_metrics_entry_well_formed(entry)
 
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_streaming_perf_metrics(
-    async_client: openai.AsyncOpenAI, server: RemoteOpenAIServer, model: str
+    async_client: openai.AsyncOpenAI,
+    server: RemoteOpenAIServer,
+    model: str,
+    kv_cache_time_output_dir: str,
 ):
-    # Drain anything from prior tests in this module session.
-    _drain_perf_metrics(server)
+    previous_count = len(_read_perf_metrics(kv_cache_time_output_dir))
     stream = await async_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "Explain transformers in one sentence."}],
@@ -153,10 +153,5 @@ async def test_streaming_perf_metrics(
         saw_done = True
     assert saw_done, "Streaming chat returned no chunks"
 
-    entries = _drain_perf_metrics(server)
-    assert len(entries) == 1, (
-        "Expected exactly one /perf_metrics entry after a single streaming "
-        f"harmony chat completion, got {len(entries)}: {entries}. "
-        "This usually means _extract_metrics did not run after [DONE]."
-    )
-    _assert_perf_metrics_entry_well_formed(entries[0])
+    entry = _wait_for_new_metric(kv_cache_time_output_dir, previous_count)
+    _assert_perf_metrics_entry_well_formed(entry)

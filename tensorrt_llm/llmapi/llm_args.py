@@ -4390,15 +4390,27 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
         telemetry=TelemetryField.categorical('pytorch', '_autodeploy'))
 
-    return_perf_metrics: bool = Field(default=False,
-                                      description="Return perf metrics.",
-                                      status="prototype")
+    return_perf_metrics: bool = Field(
+        default=False,
+        description=
+        "Allow serving responses to include per-request performance metrics when "
+        "the request sets X-TRTLLM-return-metrics: 1.",
+        status="prototype")
+
+    perf_metrics_output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory for per-process performance metrics JSONL "
+        "files. Setting this enables collection even when "
+        "return_perf_metrics is false.",
+        status="prototype",
+        telemetry=False)
 
     perf_metrics_max_requests: NonNegativeInt = Field(
         default=0,
         description=
-        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
-        status="prototype")
+        "Deprecated compatibility field. Completed per-request metrics are no "
+        "longer retained in memory.",
+        status="deprecated")
 
     prometheus_metrics_config: Optional[PrometheusMetricsConfig] = Field(
         default=None,

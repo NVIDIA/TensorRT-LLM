@@ -40,7 +40,8 @@ from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
                                wait_for_disagg_server_ready)
 from test_common.perf_metrics_utils import (get_timing_metrics,
-                                            validate_timing_metrics)
+                                            validate_timing_metrics,
+                                            wait_for_perf_metrics_jsonl)
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
@@ -654,6 +655,7 @@ def setup_disagg_cluster(
     save_log: bool = False,
     startup_callback=None,
     startup_tick: int = 30,
+    perf_metrics_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -670,6 +672,13 @@ def setup_disagg_cluster(
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+
+    if perf_metrics_output_dir is not None:
+        config["perf_metrics_output_dir"] = perf_metrics_output_dir
+        for servers in ("context_servers", "generation_servers"):
+            config.setdefault(
+                servers,
+                {})["perf_metrics_output_dir"] = perf_metrics_output_dir
 
     speculative_config = config.get("speculative_config")
     if isinstance(speculative_config, dict):
@@ -792,6 +801,8 @@ def setup_disagg_cluster(
             config.get("conditional_disagg_config", None),
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
+            "return_perf_metrics":
+            config.get("return_perf_metrics", False),
         }
         if schedule_style:
             server_config["schedule_style"] = schedule_style
@@ -915,7 +926,8 @@ def run_disaggregated_test(example_dir,
                            cwd=None,
                            disagg_schedule_style=None,
                            post_client_test=None,
-                           assert_gen_log_contains=None):
+                           assert_gen_log_contains=None,
+                           perf_metrics_output_dir=None):
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
@@ -935,7 +947,8 @@ def run_disaggregated_test(example_dir,
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              schedule_style=disagg_schedule_style,
-                             save_log=assert_gen_log_contains is not None)
+                             save_log=assert_gen_log_contains is not None,
+                             perf_metrics_output_dir=perf_metrics_output_dir)
 
     server_host = config.get("hostname", "localhost")
 
@@ -1062,28 +1075,13 @@ def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
                          indirect=True)
 def test_disaggregated_router(disaggregated_test_root,
                               disaggregated_example_root, llm_venv,
-                              llama_model_root, router_type, tmp_path):
+                              llama_model_root, router_type):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    metrics_file = tmp_path / f"perf_metrics_{router_type}.json"
-
-    def fetch_perf_metrics(server_url: str):
-        import json
-
-        import requests as http_requests
-        resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
-        assert resp.status_code == 200, \
-            f"Failed to fetch perf_metrics: {resp.status_code}"
-        metrics = resp.json()
-        metrics_file.write_text(json.dumps(metrics, indent=2))
-        logger.info(f"Router={router_type}: saved {len(metrics)} perf metrics "
-                    f"to {metrics_file}")
 
     run_disaggregated_test(disaggregated_example_root,
                            router_type,
                            env=llm_venv._new_env,
-                           extra_endpoints_test=fetch_perf_metrics,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
@@ -1503,12 +1501,14 @@ def test_disaggregated_python_transceiver_host_offload(
                          indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
-                                    llama_model_root):
+                                    llama_model_root, tmp_path):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
-    def extra_endpoints_test(server_url: str):
-        item = get_timing_metrics(server_url)
+    perf_metrics_output_dir = str(tmp_path / "perf_metrics")
+
+    def extra_endpoints_test(_server_url: str):
+        item = get_timing_metrics(perf_metrics_output_dir)
         # Use helper function to validate all timing metrics comprehensively
         validate_timing_metrics(item, "perf_metrics test")
 
@@ -1517,7 +1517,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                            env=llm_venv._new_env,
                            extra_endpoints_test=extra_endpoints_test,
                            model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           perf_metrics_output_dir=perf_metrics_output_dir)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -2103,45 +2104,29 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_conditional_v2(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root, tmp_path):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
-    # Conditional disagg handles short-prefill requests locally on the gen
-    # server (bypassing the ctx handoff + add_per_request_metrics), while routed
-    # requests are recorded in the disagg /perf_metrics. Verify ONCE after all
-    # client iterations via post_client_test (not per-iteration): routed-request
-    # metrics are recorded asynchronously (add_per_request_metrics via
-    # create_task on response completion) and surface only after the client
-    # traffic settles, so a per-iteration read races that lag; /perf_metrics is
-    # also consume-on-read, so query it exactly once at the end.
-    def _check_routed_recorded(server_url: str):
-        import requests as http_requests
-        metrics = []
-        deadline = time.time() + 60
-        while True:
-            resp = http_requests.get(f"{server_url}/perf_metrics", timeout=10)
-            assert resp.status_code == 200, \
-                f"perf_metrics fetch failed: {resp.status_code}"
-            metrics = resp.json()
-            if metrics or time.time() >= deadline:
-                break
-            time.sleep(2)
-        logger.info(f"conditional_v2 perf_metrics len={len(metrics)} "
-                    f"(routed requests recorded; bypassed ones absent)")
-        # With short prompts every prompt's first occurrence routes through the
-        # context server (match=0 -> need_ctx), so at least one routed request
-        # must be recorded; an empty result means conditional routing never
-        # engaged.
-        assert metrics, \
-            "no per-request metrics recorded after client runs; conditional routing may be misconfigured"
+    perf_metrics_output_dir = str(tmp_path / "perf_metrics")
+
+    def _check_routed_recorded(_server_url: str):
+        records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
+                                              expected_count=3,
+                                              timeout=60)
+        assert any(
+            record.get("worker", {}).get("server_kind") == "disagg"
+            and {"ctx", "gen"} <= record.get("phases", {}).keys()
+            for record in records
+        ), "new prompt did not produce routed context and generation metrics"
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional_v2",
                            env=llm_venv._new_env,
                            post_client_test=_check_routed_recorded,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           perf_metrics_output_dir=perf_metrics_output_dir)
 
 
 @skip_no_hopper

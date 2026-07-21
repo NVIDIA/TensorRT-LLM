@@ -35,6 +35,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      perf_metrics_output_dir:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
@@ -202,7 +206,7 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
-        status: prototype
+        status: deprecated
       prometheus_metrics_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
         default: null

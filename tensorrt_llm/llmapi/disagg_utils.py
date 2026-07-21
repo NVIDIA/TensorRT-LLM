@@ -92,6 +92,8 @@ class DisaggServerConfig():
     otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
+    return_perf_metrics: bool = False
+    perf_metrics_output_dir: Optional[str] = None
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
     node_id: int = uuid.getnode(
     ) % 256  # Assuming only one disagg-server is running on a machine, modulo 256.
@@ -189,6 +191,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        port: int = 8000,
                        max_retries: int = 1,
                        perf_metrics_max_requests: int = 0,
+                       return_perf_metrics: bool = False,
+                       perf_metrics_output_dir: Optional[str] = None,
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
@@ -207,10 +211,12 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
 
+    inherited_args = dict(kwargs)
+
     # If parameters are specified outside the context_severs and generation_servers sections,
     # make sure they match
     # Also inherit the values from the top-level
-    for key, value in kwargs.items():
+    for key, value in inherited_args.items():
         for server_type, servers in [("context_servers", context_servers),
                                      ("generation_servers", generation_servers)
                                      ]:
@@ -222,6 +228,14 @@ def extract_disagg_cfg(hostname: str = 'localhost',
             else:
                 # Inherit the value from the top-level
                 servers[key] = value
+
+    # Downstream ctx/gen servers must return internal metrics when either
+    # public response headers or fleet-worker file output is enabled. This is
+    # an implementation detail of response-carried joining, so it overrides a
+    # worker-level false value rather than creating a configuration conflict.
+    if return_perf_metrics or perf_metrics_output_dir is not None:
+        context_servers["return_perf_metrics"] = True
+        generation_servers["return_perf_metrics"] = True
 
     server_configs = []
     disagg_cluster_config = None
@@ -241,11 +255,19 @@ def extract_disagg_cfg(hostname: str = 'localhost',
 
     otlp_config = OtlpConfig(**otlp_config) if otlp_config else None
 
-    config = DisaggServerConfig(server_configs, hostname, port,
-                                ctx_router_config, gen_router_config,
-                                conditional_disagg_config, otlp_config,
-                                max_retries, perf_metrics_max_requests,
-                                disagg_cluster_config)
+    config = DisaggServerConfig(
+        server_configs=server_configs,
+        hostname=hostname,
+        port=port,
+        ctx_router_config=ctx_router_config,
+        gen_router_config=gen_router_config,
+        conditional_disagg_config=conditional_disagg_config,
+        otlp_config=otlp_config,
+        max_retries=max_retries,
+        perf_metrics_max_requests=perf_metrics_max_requests,
+        return_perf_metrics=return_perf_metrics,
+        perf_metrics_output_dir=perf_metrics_output_dir,
+        disagg_cluster_config=disagg_cluster_config)
     if node_id is not None:
         node_id_space = 1 << DISAGG_NODE_ID_BITS
         if not 0 <= node_id < node_id_space:

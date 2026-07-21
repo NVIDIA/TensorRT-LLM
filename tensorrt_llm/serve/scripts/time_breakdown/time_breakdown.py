@@ -14,12 +14,12 @@ Features:
 - Hover to show individual segment details
 
 Usage as CLI:
-    python time_breakdown.py <json_file> [options]
+    python time_breakdown.py <json_or_jsonl_file> [options]
 
 Usage as library:
     from time_breakdown import RequestTimeBreakdown
     analyzer = RequestTimeBreakdown()
-    timing_data = analyzer.parse_json_file("perf_metrics.json")
+    timing_data = analyzer.parse_json_file("perf_metrics.jsonl")
     analyzer.create_timing_diagram(timing_data, "output.html")
 """
 
@@ -183,6 +183,49 @@ class RequestDataParser:
 
     def parse_request(self, request_data: Dict,
                       request_index: int) -> Dict[str, Any]:
+        phases = request_data.get('phases')
+        if phases:
+            request_id = request_data.get('request_id', request_index)
+            disagg_phase = phases.get('disagg')
+            if disagg_phase is not None:
+                disagg_timing = disagg_phase.get('timing_metrics') or {}
+                ctx_phase = phases.get('ctx') or {}
+                gen_phase = phases.get('gen') or {}
+                request_data = {
+                    'request_id':
+                    request_id,
+                    'ctx_perf_metrics': {
+                        'request_id':
+                        request_id,
+                        'perf_metrics':
+                        ctx_phase,
+                        'time_breakdown_metrics':
+                        ctx_phase.get('time_breakdown_metrics'),
+                    },
+                    'gen_perf_metrics': {
+                        'request_id':
+                        request_id,
+                        'perf_metrics':
+                        gen_phase,
+                        'time_breakdown_metrics':
+                        gen_phase.get('time_breakdown_metrics'),
+                    },
+                    'disagg_server_arrival_time':
+                    disagg_timing.get('server_arrival_time'),
+                    'disagg_server_first_token_time':
+                    disagg_timing.get('server_first_token_time'),
+                }
+            else:
+                server_phase = phases.get('server') or {}
+                request_data = {
+                    'request_id':
+                    request_id,
+                    'perf_metrics':
+                    server_phase,
+                    'time_breakdown_metrics':
+                    server_phase.get('time_breakdown_metrics'),
+                }
+
         # Check if both ctx_perf_metrics and gen_perf_metrics exist and are not None
         ctx_perf = request_data.get('ctx_perf_metrics')
         gen_perf = request_data.get('gen_perf_metrics')
@@ -336,12 +379,30 @@ class RequestTimeBreakdown:
         """Parse JSON performance metrics file and extract timing information."""
         try:
             with open(json_file_path, 'r') as f:
-                data = json.load(f)
+                content = f.read()
         except FileNotFoundError:
             print(f"Error: File '{json_file_path}' not found.")
             sys.exit(1)
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON file '{json_file_path}': {e}")
+
+        try:
+            data = json.loads(content) if content.strip() else []
+        except json.JSONDecodeError:
+            try:
+                data = [
+                    json.loads(line) for line in content.splitlines()
+                    if line.strip()
+                ]
+            except json.JSONDecodeError as e:
+                print(
+                    f"Error parsing JSON or JSONL file '{json_file_path}': {e}")
+                sys.exit(1)
+
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            print(
+                f"Expected a JSON array, JSON object, or JSONL file: {json_file_path}"
+            )
             sys.exit(1)
 
         timing_data = []
@@ -2141,16 +2202,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python time_breakdown.py perf_metrics.json
-  python time_breakdown.py perf_metrics.json -o my_timing.html
-  python time_breakdown.py perf_metrics.json --stats-only
-  python time_breakdown.py perf_metrics.json --max-requests 50 --sort-by e2e
-  python time_breakdown.py perf_metrics.json --max-requests 100 --sort-by arrival
+  python time_breakdown.py perf_metrics.jsonl
+  python time_breakdown.py perf_metrics.jsonl -o my_timing.html
+  python time_breakdown.py perf_metrics.jsonl --stats-only
+  python time_breakdown.py perf_metrics.jsonl --max-requests 50 --sort-by e2e
+  python time_breakdown.py perf_metrics.jsonl --max-requests 100 --sort-by arrival
         """)
 
-    parser.add_argument('json_file',
-                        type=str,
-                        help='Path to JSON performance metrics file')
+    parser.add_argument(
+        'json_file',
+        type=str,
+        help='Path to a JSON or server-produced JSONL performance metrics file')
     parser.add_argument('-o',
                         '--output',
                         type=str,

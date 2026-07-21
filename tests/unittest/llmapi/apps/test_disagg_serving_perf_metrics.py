@@ -3,15 +3,25 @@ from typing import Tuple
 
 import openai
 import pytest
+import requests
 from test_common.http_utils import wait_for_endpoint_ready
 from test_common.perf_metrics_utils import (
     get_prometheus_metrics,
     get_timing_metrics,
     validate_timing_metrics,
+    wait_for_perf_metrics_jsonl,
 )
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm._utils import get_free_ports
-from tests.unittest.utils.llm_data import llm_models_root
+from tensorrt_llm.serve.perf_metrics import (
+    CTX_CHUNK_METRICS_HEADER,
+    RETURN_METRICS_HEADER,
+    SERVER_TIMING_HEADER,
+    SSE_METRICS_EVENT,
+    START_END_TIME_HEADER,
+    STEP_METRICS_HEADER,
+)
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -45,6 +55,11 @@ def model_name():
 
 
 @pytest.fixture
+def perf_metrics_output_dir(tmp_path):
+    return tmp_path / "perf_metrics"
+
+
+@pytest.fixture
 def disagg_cluster_config(disagg_port: int):
     return {
         "cluster_uri": f"http://localhost:{disagg_port}",
@@ -52,7 +67,7 @@ def disagg_cluster_config(disagg_port: int):
     }
 
 
-def worker_config(model_name: str, disagg_cluster_config: dict):
+def worker_config(model_name: str, disagg_cluster_config: dict, perf_metrics_output_dir):
     return {
         "model": model_name,
         "disagg_cluster": disagg_cluster_config,
@@ -66,14 +81,21 @@ def worker_config(model_name: str, disagg_cluster_config: dict):
         "disable_overlap_scheduler": True,
         "cuda_graph_config": None,
         "return_perf_metrics": True,
+        "perf_metrics_output_dir": str(perf_metrics_output_dir),
         "perf_metrics_max_requests": 1000,
     }
 
 
 @pytest.fixture
-def workers(model_name: str, disagg_cluster_config: dict, ctx_port: int, gen_port: int):
+def workers(
+    model_name: str,
+    disagg_cluster_config: dict,
+    ctx_port: int,
+    gen_port: int,
+    perf_metrics_output_dir,
+):
     model_path = get_model_path(model_name)
-    extra_config = worker_config(model_name, disagg_cluster_config)
+    extra_config = worker_config(model_name, disagg_cluster_config, perf_metrics_output_dir)
 
     def worker(server_role: str, port: int):
         return RemoteOpenAIServer(
@@ -92,12 +114,14 @@ def workers(model_name: str, disagg_cluster_config: dict, ctx_port: int, gen_por
 
 
 @pytest.fixture
-def disagg_server(disagg_cluster_config: dict, workers, disagg_port: int):
+def disagg_server(disagg_cluster_config: dict, workers, disagg_port: int, perf_metrics_output_dir):
     disagg_config = {
         "hostname": "localhost",
         "port": disagg_port,
         "disagg_cluster": disagg_cluster_config,
         "perf_metrics_max_requests": 1000,
+        "return_perf_metrics": True,
+        "perf_metrics_output_dir": str(perf_metrics_output_dir),
     }
     with RemoteDisaggOpenAIServer(
         ctx_servers=[],
@@ -149,6 +173,94 @@ def check_historgram(metrics_dict: dict, count: int, range: tuple[float, float])
     assert mean > range[0] and mean < range[1]
 
 
+@pytest.mark.timeout(300)
+def test_return_perf_metrics_and_jsonl_dump(
+    workers: Tuple[RemoteOpenAIServer, RemoteOpenAIServer],
+    disagg_server: RemoteDisaggOpenAIServer,
+    model_name: str,
+    perf_metrics_output_dir,
+):
+    assert len(workers) == 2
+    for worker in workers:
+        worker.wait_for_server(timeout=120)
+    wait_for_endpoint_ready(disagg_server.url_root + "/health")
+
+    response = requests.post(
+        f"{disagg_server.url_root}/v1/completions",
+        headers={RETURN_METRICS_HEADER: "1"},
+        json={
+            "model": model_name,
+            "prompt": "Reply with one token.",
+            "max_tokens": 1,
+            "temperature": 0.0,
+        },
+        timeout=120,
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] is not None
+    assert response.headers.get(SERVER_TIMING_HEADER)
+    assert response.headers.get(START_END_TIME_HEADER)
+    assert response.headers.get(STEP_METRICS_HEADER)
+    assert response.headers.get(CTX_CHUNK_METRICS_HEADER)
+
+    timing_metrics = get_timing_metrics(perf_metrics_output_dir)
+    validate_timing_metrics(timing_metrics, "test_return_perf_metrics_and_jsonl_dump")
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, expected_count=3)
+    expected_kinds = {"context", "generation", "disagg"}
+    records_by_kind = {
+        record["worker"]["server_kind"]: record
+        for record in records
+        if record["worker"]["server_kind"] in expected_kinds
+    }
+    assert expected_kinds <= records_by_kind.keys()
+
+    disagg_request_id = records_by_kind["disagg"]["disagg_request_id"]
+    for record in records_by_kind.values():
+        assert record["status"] == "complete"
+        assert record["streaming"] is False
+        assert record["disagg_request_id"] == disagg_request_id
+
+    disagg_record = records_by_kind["disagg"]
+    assert set(disagg_record["phases"]) == {"disagg", "ctx", "gen"}
+    for phase in ("ctx", "gen"):
+        phase_record = disagg_record["phases"][phase]
+        assert phase_record["timing_metrics"]["arrival_time"] > 0
+        assert (
+            phase_record["timing_metrics"]["arrival_time"]
+            <= phase_record["timing_metrics"]["last_token_time"]
+        )
+        assert SERVER_TIMING_HEADER in phase_record["metrics_headers"]
+        assert START_END_TIME_HEADER in phase_record["metrics_headers"]
+    assert CTX_CHUNK_METRICS_HEADER in disagg_record["phases"]["ctx"]["metrics_headers"]
+    assert STEP_METRICS_HEADER in disagg_record["phases"]["gen"]["metrics_headers"]
+
+    payload = {
+        "model": model_name,
+        "prompt": "Reply with one token.",
+        "max_tokens": 1,
+        "temperature": 0.0,
+    }
+    response = requests.post(
+        f"{disagg_server.url_root}/v1/completions",
+        json=payload,
+        timeout=120,
+    )
+    assert response.status_code == 200
+    assert not response.headers.get(SERVER_TIMING_HEADER)
+    assert not response.headers.get(START_END_TIME_HEADER)
+    assert not response.headers.get(STEP_METRICS_HEADER)
+    assert not response.headers.get(CTX_CHUNK_METRICS_HEADER)
+
+    response = requests.post(
+        f"{disagg_server.url_root}/v1/completions",
+        json={**payload, "stream": True},
+        timeout=120,
+    )
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    assert f"event: {SSE_METRICS_EVENT}" not in response.text
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(300)
 async def test_completion_metrics(
@@ -171,9 +283,6 @@ async def test_completion_metrics(
         max_token=max_token,
         model_name=model_name,
     )
-    timing_metrics = get_timing_metrics(disagg_server.url_root)
-    validate_timing_metrics(timing_metrics, "test_completion_metrics")
-
     metrics = get_prometheus_metrics(disagg_server.url_root)
     print(metrics)
 
@@ -183,7 +292,11 @@ async def test_completion_metrics(
         assert metrics[f"{role}_error_requests"] == 0
         assert f"{role}_retry_requests" in metrics
 
-    check_historgram(metrics["gen_first_token_latency_seconds"], total_requests, (0.0, 0.3))
+    check_historgram(
+        metrics["gen_first_token_latency_seconds"],
+        total_requests,
+        (0.0, 0.3),
+    )
     check_historgram(metrics["gen_complete_latency_seconds"], total_requests, (0.0, 0.6))
 
     assert metrics["total_requests"] == total_requests
@@ -219,5 +332,9 @@ async def test_completion_metrics(
     assert metrics["http_exceptions"] == 0
     assert metrics["internal_errors"] == 0
 
-    check_historgram(metrics["gen_complete_latency_seconds"], total_requests * 2, (0.0, 0.6))
+    check_historgram(
+        metrics["gen_complete_latency_seconds"],
+        total_requests * 2,
+        (0.0, 0.6),
+    )
     check_historgram(metrics["queue_latency_seconds"], total_requests * 2, (0.0, 0.03))

@@ -1,19 +1,79 @@
+import json
+import time
+from pathlib import Path
+
 import requests
 
 
-def get_timing_metrics(server_url: str):
-    response = requests.get(f"{server_url}/perf_metrics", timeout=10)
-    assert response.status_code == 200
-    perf_metrics = response.json()
-    assert len(perf_metrics) > 0
-    return perf_metrics[0]
+def read_perf_metrics_jsonl(output_dir):
+    records = []
+    for path in Path(output_dir).glob("perf_metrics-*.jsonl"):
+        for line in path.read_text().splitlines():
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def wait_for_perf_metrics_jsonl(output_dir, expected_count: int, timeout: float = 10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        records = read_perf_metrics_jsonl(output_dir)
+        if len(records) >= expected_count:
+            return records
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Timed out waiting for {expected_count} performance metrics JSONL records"
+    )
+
+
+def get_timing_metrics(output_dir, timeout: float = 10):
+    """Read and join one completed disaggregated request from JSONL files."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        records = read_perf_metrics_jsonl(output_dir)
+        by_request = {}
+        for record in records:
+            disagg_request_id = record.get("disagg_request_id")
+            server_kind = record.get("worker", {}).get("server_kind")
+            if disagg_request_id is not None and server_kind:
+                by_request.setdefault(disagg_request_id, {})[server_kind] = record
+
+        for records_by_kind in by_request.values():
+            if not {"context", "generation", "disagg"} <= records_by_kind.keys():
+                continue
+            ctx_record = records_by_kind["context"]
+            gen_record = records_by_kind["generation"]
+            disagg_record = records_by_kind["disagg"]
+            disagg_phase = disagg_record["phases"]["disagg"]
+            disagg_timing = disagg_phase["timing_metrics"]
+            return {
+                "ctx_server": disagg_phase["ctx_server"],
+                "gen_server": disagg_phase["gen_server"],
+                "ctx_perf_metrics": {
+                    "ctx_request_id": ctx_record["ctx_request_id"],
+                    "perf_metrics": ctx_record["phases"]["server"],
+                },
+                "gen_perf_metrics": {
+                    "ctx_request_id": gen_record["ctx_request_id"],
+                    "perf_metrics": gen_record["phases"]["server"],
+                },
+                "disagg_server_arrival_time": disagg_timing["server_arrival_time"],
+                "disagg_ctx_dispatch_time": disagg_timing["ctx_dispatch_time"],
+                "disagg_server_first_token_time": disagg_timing["server_first_token_time"],
+            }
+        time.sleep(0.1)
+    raise AssertionError("Timed out waiting for joined performance metrics JSONL records")
 
 
 def validate_timing_metrics(perf_metrics_item, request_context="", time_tolerance_seconds=0.005):
     """Helper function to validate timing metrics relationships.
 
     Args:
-        perf_metrics_item: A single performance metrics item from the /perf_metrics endpoint
+        perf_metrics_item: Joined context, generation, and disagg JSONL metrics
         request_context: String context for error messages (e.g., "request 1", "streaming")
     """
     # Validate basic structure
