@@ -431,6 +431,7 @@ unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_t
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[None] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_gqa_nemo_lora[cuda_graph_config0] SKIP (https://nvbugs/6162504)
 unittest/llmapi/test_llm_pytorch.py::test_llm_context_only_timed_out[None] SKIP (https://nvbugs/6484986)
+unittest/llmapi/test_llm_pytorch.py::test_llm_context_only_timed_out_kv_cache_exhausted[None-UCX-100] SKIP (https://nvbugs/6488811)
 unittest/llmapi/test_memory_profiling.py::test_profile_kvcache SKIP (https://nvbugs/5580781)
 unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6487836)
 unittest/tools/test_test_to_stage_mapping.py::test_cli_functionality[txt] SKIP (https://nvbugs/6482297)
