@@ -1,10 +1,11 @@
 # Cosmos3 Text(+Image)-to-Video(+Audio) generation
 
-Cosmos3 supports four generation modes from a single checkpoint:
+Cosmos3 supports the following generation modes from a single checkpoint:
 
 - **T2V** — text-to-video (`prompts/t2v.json`).
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
+- **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local frame directory or `.mp4`/`.avi` file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); `.mp4`/`.avi` decode uses OpenCV (see [Media I/O dependencies](#media-io-dependencies)).
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 
 ## Checkpoints
@@ -29,6 +30,11 @@ To run without guardrails (you are responsible for safe deployment):
 ```bash
 export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 ```
+
+## Media I/O dependencies
+
+- Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
+- Decoding `.mp4`/`.avi` reference videos (V2V) uses OpenCV — the same optional decoder as the multimodal video path. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install opencv-python-headless`. Frame directories work without it.
 
 ## Deployment configs
 
@@ -57,6 +63,15 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/i2v.json \
     --image_path https://example.com/frame.jpg \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# V2V: video-conditioned video (continues the first frames of --video_path).
+# Best results when the prompt describes the input video — e.g. continue a
+# T2V output reusing its original prompt. Output size is fixed (1280x720
+# default); inputs are center-cropped, not aspect-matched.
+python cosmos3.py --model /path/to/Cosmos3-Nano \
+    --prompt_file prompts/v2v.json \
+    --video_path /path/to/Cosmos3-Nano/assets/example_i2v_output.mp4 \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
 # T2AV: text-to-video with synchronized audio

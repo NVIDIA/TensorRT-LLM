@@ -760,6 +760,132 @@ class TestRequestValidation:
         req = self._make_request(extra_params={"stg_scale": 0.5})
         self._merge_and_validate(executor, req)  # should not raise
 
+    def test_spec_validator_runs_at_preflight(self):
+        """Per-param validators turn deterministic client errors into 400s at
+        the boundary instead of worker-side failures (Cosmos3 conditioning)."""
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def _validate(extras):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params=extras),
+                declared_defaults={},
+                extra_param_specs=COSMOS3_EXTRA_SPECS,
+            )
+
+        # Valid values pass.
+        _validate({"condition_video_latent_indexes": [0, 1], "condition_video_keep": "last"})
+        _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8)})
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _validate({"condition_video_latent_indexes": [0, -1]})
+        with pytest.raises(ValueError, match="must not be empty"):
+            _validate({"condition_video_latent_indexes": []})
+        with pytest.raises(ValueError, match="first or last"):
+            _validate({"condition_video_keep": "middle"})
+        # No silent float truncation; None elements are a 400, not a TypeError.
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [1.9]})
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [None]})
+        _validate({"condition_video_latent_indexes": [0, 1.0]})  # integral floats OK
+        with pytest.raises(ValueError, match="output_type"):
+            _validate({"output_type": "gif"})
+        _validate({"output_type": "image"})
+        with pytest.raises(ValueError, match=r"\[T, H, W, C\]"):
+            _validate({"video": torch.zeros(4, 4, 3, dtype=torch.uint8)})  # 3-D
+        with pytest.raises(ValueError, match="uint8"):
+            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.float32)})
+        with pytest.raises(ValueError, match="CPU tensor"):
+            _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8, device="meta")})
+
+    def test_validator_type_errors_become_client_errors(self):
+        """A validator raising TypeError (wrong-shaped value it didn't guard)
+        still folds into the 400 message list instead of escaping as a 500."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def touchy(value):
+            len(value)  # TypeError on ints
+
+        specs = {"knob": ExtraParamSchema(type="int", default=None, validator=touchy)}
+        with pytest.raises(ValueError, match="extra_params\\['knob'\\]"):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params={"knob": 3}),
+                declared_defaults={},
+                extra_param_specs=specs,
+            )
+
+    def test_spec_validators_survive_pickling(self):
+        """Specs travel worker -> coordinator in the READY handshake (pickled
+        over ZMQ); validators/reducers must be module-level functions so they
+        serialize by reference — a lambda/closure here would crash worker
+        startup."""
+        import pickle
+
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        specs = pickle.loads(pickle.dumps(COSMOS3_EXTRA_SPECS))
+        with pytest.raises(ValueError, match="first or last"):
+            specs["condition_video_keep"].validator("middle")
+        reduced = specs["video"].reducer(torch.zeros(20, 4, 4, 3, dtype=torch.uint8), {})
+        assert reduced.shape[0] == 5
+
+    def test_video_transport_reducer_crops_to_conditioning_window(self):
+        """The coordinator-side reducer ships only the conditioning window —
+        never the full clip — and the payload owns its storage (a bare slice
+        would pickle the entire original tensor)."""
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import _crop_video_frames
+
+        # Frame k is solid value k, so window position is observable.
+        full = torch.arange(189, dtype=torch.uint8).view(189, 1, 1, 1).expand(189, 4, 4, 3)
+        full = full.contiguous()
+
+        first = _crop_video_frames(full, {})
+        assert first.shape[0] == 5  # default indexes (0, 1) -> 1*4+1
+        assert int(first[0, 0, 0, 0]) == 0 and int(first[-1, 0, 0, 0]) == 4
+        # Owns its storage: pickling must carry the window, not the clip.
+        assert first.untyped_storage().size() < full.untyped_storage().size()
+
+        last = _crop_video_frames(full, {"condition_video_keep": "last"})
+        assert last.shape[0] == 5 and int(last[-1, 0, 0, 0]) == 188
+
+        wider = _crop_video_frames(full, {"condition_video_latent_indexes": [0, 2]})
+        assert wider.shape[0] == 9  # 2*4+1
+
+        # Short-enough inputs and invalid context pass through unchanged.
+        short = torch.zeros(3, 4, 4, 3, dtype=torch.uint8)
+        assert _crop_video_frames(short, {}) is short
+        assert _crop_video_frames(full, {"condition_video_latent_indexes": [-1]}) is full
+        assert _crop_video_frames("not a tensor", {}) == "not a tensor"
+
+    def test_reduce_visual_gen_params_is_non_mutating(self):
+        """generate_async reduces before the deep copy; the caller's params
+        object and tensor must be untouched."""
+        import torch
+
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+        from tensorrt_llm.visual_gen.params import VisualGenParams, reduce_visual_gen_params
+
+        full = torch.zeros(189, 4, 4, 3, dtype=torch.uint8)
+        params = VisualGenParams(extra_params={"video": full, "flow_shift": 10.0})
+        out = reduce_visual_gen_params(params, COSMOS3_EXTRA_SPECS)
+
+        assert out is not params
+        assert params.extra_params["video"] is full  # caller untouched
+        assert out.extra_params["video"].shape[0] == 5
+        assert out.extra_params["flow_shift"] == 10.0  # non-reduced keys intact
+
+        # Nothing to reduce -> same object back, zero copies.
+        plain = VisualGenParams(extra_params={"flow_shift": 10.0})
+        assert reduce_visual_gen_params(plain, COSMOS3_EXTRA_SPECS) is plain
+
     # --- unsupported universal fields ---
 
     def test_num_frames_on_image_pipeline_raises(self):

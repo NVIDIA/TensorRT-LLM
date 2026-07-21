@@ -14,6 +14,7 @@
 # limitations under the License.
 from typing import Any, Dict, List, Optional, Union
 
+import torch
 from pydantic import Field
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
@@ -72,7 +73,6 @@ class VisualGenParams(StrictBaseModel):
     image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
         default=None, description="Reference image(s) for I2V/I2I."
     )
-
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")
 
@@ -93,6 +93,7 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
+    "tensor": (torch.Tensor,),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
@@ -110,6 +111,39 @@ _GENERATION_CONFIG_FIELDS: tuple = (
     "num_frames",
     "frame_rate",
 )
+
+
+def reduce_visual_gen_params(
+    params: VisualGenParams,
+    extra_param_specs: Dict[str, Any],
+) -> VisualGenParams:
+    """Apply spec-declared transport reducers to ``extra_params`` values.
+
+    Runs once in the coordinator, before the request is deep-copied and
+    serialized, so oversized payloads (e.g. a full V2V reference when only
+    the conditioning window is consumed) shrink before they hit the copy /
+    ZMQ / per-rank broadcast path. Reducers are semantics-preserving by
+    contract — the worker behaves identically with or without them.
+
+    Never mutates ``params``: returns it unchanged when nothing reduces,
+    otherwise a shallow copy carrying a new ``extra_params`` dict.
+    """
+    if not params.extra_params:
+        return params
+    reduced: Dict[str, Any] = {}
+    for key, value in params.extra_params.items():
+        spec = extra_param_specs.get(key)
+        reducer = getattr(spec, "reducer", None) if spec is not None else None
+        if reducer is None or value is None:
+            continue
+        new_value = reducer(value, params.extra_params)
+        if new_value is not value:
+            reduced[key] = new_value
+    if not reduced:
+        return params
+    out = params.model_copy()
+    out.extra_params = {**params.extra_params, **reduced}
+    return out
 
 
 def validate_visual_gen_params(
@@ -174,6 +208,18 @@ def validate_visual_gen_params(
                     f"got {type(value).__name__}: {value!r}"
                 )
                 continue  # skip range check if type is wrong
+            # Validator (enums, bounds, tensor shapes) declared on
+            # the spec so deterministic client errors 400 at preflight
+            # instead of failing deep in the worker.
+            validator = getattr(spec, "validator", None)
+            if validator is not None:
+                try:
+                    validator(value)
+                except (TypeError, ValueError) as exc:
+                    # TypeError included: a validator tripping on a wrong-shaped
+                    # value is still a client error, not a server fault.
+                    messages.append(f"extra_params['{key}']: {exc}")
+                    continue
             # Range check (numeric only)
             if spec.range is not None and isinstance(value, (int, float)):
                 lo, hi = spec.range

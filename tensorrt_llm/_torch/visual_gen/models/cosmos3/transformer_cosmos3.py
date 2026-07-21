@@ -72,9 +72,6 @@ class TransformerOutput:
     audio: Optional[torch.Tensor] = None
     """[B, audio_dim, T_audio] audio velocity prediction, or None."""
 
-    action: Optional[torch.Tensor] = None
-    """[B, T_action, action_dim] action velocity prediction, or None."""
-
 
 def compute_mrope_position_ids_text(
     num_tokens: int,
@@ -102,6 +99,7 @@ def compute_mrope_position_ids_vision(
     base_fps: float = 24.0,
     temporal_compression_factor: int = 4,
     enable_fps_modulation: bool = False,
+    start_frame_offset: int = 0,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -121,15 +119,17 @@ def compute_mrope_position_ids_vision(
         base_tps = base_fps / temporal_compression_factor
         frame_indices = torch.arange(grid_t, dtype=torch.float32)
         t_index = (
-            (frame_indices / tps * base_tps + temporal_offset)
+            ((frame_indices + start_frame_offset) / tps * base_tps + temporal_offset)
             .view(-1, 1)
             .expand(-1, grid_h * grid_w)
             .flatten()
         )
     else:
-        t_index = torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(
-            -1, grid_h * grid_w
-        ).flatten() + int(temporal_offset)
+        t_index = (
+            torch.arange(grid_t, dtype=torch.long).view(-1, 1).expand(-1, grid_h * grid_w).flatten()
+            + int(temporal_offset)
+            + start_frame_offset
+        )
 
     h_index = (
         torch.arange(grid_h, dtype=torch.long).view(1, -1, 1).expand(grid_t, -1, grid_w).flatten()
@@ -704,7 +704,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         super().__init__(model_config)
         pretrained_config = model_config.pretrained_config
         self.audio_gen = getattr(pretrained_config, "sound_gen", False)
-        self.action_gen = getattr(pretrained_config, "action_gen", False)
 
         self.hidden_size = pretrained_config.hidden_size
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -1006,13 +1005,14 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         Returns:
             TransformerOutput with video (and image alias) always set.
             audio is set to the predicted audio velocity when audio_latents is
-            provided; otherwise None.  action is always None for now.
+            provided; otherwise None.
         """
         del kwargs  # Kept for diffusers API compatibility.
         if timestep is None:
             raise ValueError("Cosmos3VFMTransformer.forward requires normalized timestep.")
         if raw_timestep is None:
             raise ValueError("Cosmos3VFMTransformer.forward requires raw_timestep.")
+
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
@@ -1075,7 +1075,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             else:
                 self.cached_kv = cached_kv_full
 
-        # --- Audio token injection -------------------------------------------------
+        # --- Extra modality token injection (audio) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
         T_audio = 0
         if audio_latents is not None and self.audio_gen:
@@ -1090,7 +1090,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 hidden_states.device,
                 hidden_gen.dtype,
             )
-            # [B, T_vid+T_audio, hidden_size]
             hidden_gen = torch.cat([hidden_gen, hidden_audio], dim=1)
             cos_v, sin_v = self.cached_freqs_gen
             freqs_gen_combined = (
@@ -1137,13 +1136,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         # --- Decode video velocity ------------------------------------------------
         video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, :T_vid_tokens]), T, H, W)
 
-        # --- Decode audio velocity (if requested) ---------------------------------
+        # --- Decode extra-modality velocity (audio; follows video) ---
+        extra_start = T_vid_tokens
         audio_vel = None
         if T_audio > 0 and audio_latents is not None and self.audio_gen:
-            # hidden_gen[:, T_vid_tokens:] → [B, T_audio, hidden_size]
-            # → llm2audio → [B, T_audio, audio_dim] → unpack → [B, audio_dim, T_audio]
             audio_vel = self.unpack_audio_latents(
-                self.llm2audio(hidden_gen[:, T_vid_tokens : T_vid_tokens + T_audio])
+                self.llm2audio(hidden_gen[:, extra_start : extra_start + T_audio])
             )
 
         return TransformerOutput(video=video_vel, image=video_vel, audio=audio_vel)
@@ -1156,10 +1154,12 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         Maps UND vs GEN blocks into this module's layout (causal self-attn vs cross-attn + MLPs).
         """
         remapped = {}
+        # The Cosmos3 checkpoint ships action modules (action_gen=true), but this
+        # transformer no longer builds them — skip their weights explicitly so the
+        # load stays quiet instead of warning on each as an unknown key.
         skip_prefixes = (
             "lm_head.",
-            "action_modality_embed",
-            "action_proj_",
+            "action_",
         )
 
         for key, value in weights.items():

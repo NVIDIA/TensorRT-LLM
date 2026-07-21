@@ -37,8 +37,9 @@ class PipelineOutput:
     """Internal per-pipeline output.
 
     Each pipeline ``infer()`` populates the media tensor it produces plus
-    the metadata it owns (``frame_rate``, ``audio_sample_rate``) and the
-    three CUDA-event-measured timing phases that decompose ``pipeline.infer()``.
+    the metadata it owns (``frame_rate``, ``audio_sample_rate``)
+    and the three CUDA-event-measured timing phases that decompose
+    ``pipeline.infer()``.
 
     Attributes:
         image: Generated image as ``torch.Tensor`` shape ``(B, H, W, C)``,
