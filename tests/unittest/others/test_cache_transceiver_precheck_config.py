@@ -494,3 +494,15 @@ class TestMultiPeerOrchestration:
         assert ("gen_0", "_TransferError") in failures
         # ctx_0 served its full schedule and got the deferred done
         assert [c["status"] for c in ctxs[0].recorder.cases] == ["PASS"]
+
+
+def test_status_env_snapshot_excludes_nixl(tmp_path, monkeypatch):
+    """NIXL_* is not captured: the only such variable seen in practice is
+    NIXL_VERSION, a stale NGC-base-image marker that misstates the version of
+    the actually-linked library."""
+    monkeypatch.setenv("NIXL_VERSION", "1.0.0")
+    monkeypatch.setenv("NIXL_PLUGIN_DIR", "/opt/x")
+    monkeypatch.setenv("UCX_TLS", "rc,cuda_copy")
+    rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
+    assert not any(k.startswith("NIXL_") for k in rec.env)
+    assert rec.env["UCX_TLS"] == "rc,cuda_copy"  # behavioral vars still captured
