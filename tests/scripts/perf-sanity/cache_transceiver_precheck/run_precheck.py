@@ -611,6 +611,30 @@ def parse_bandwidth_gbps(csv_dir, rank, tag="recv"):
         return None
 
 
+def parse_python_bandwidth_gbps(csv_dir):
+    """Median KV-send throughput in GB/s from the Python transceiver's perf
+    CSVs (perf_logger.py). Enabled via TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
+    + TLLM_KV_TRANSFER_PERF_LOG_FILE=<base>, which writes
+    <base>_<instance>_<rank>.csv. throughput_mbs (MB/s) is on the SENDER
+    (ctx) side, task_type=KVSendTask; receiver rows have no throughput.
+    Best-effort -- returns None when no perf CSV exists.
+    """
+    import csv as csv_mod
+    import glob
+    import statistics
+
+    vals = []
+    for path in glob.glob(os.path.join(csv_dir, "perf_*_*.csv")):
+        try:
+            with open(path) as f:
+                for r in csv_mod.DictReader(f):
+                    if r.get("task_type") == "KVSendTask" and r.get("throughput_mbs"):
+                        vals.append(float(r["throughput_mbs"]) / 1024.0)  # MB/s -> GB/s
+        except (OSError, ValueError):
+            continue
+    return statistics.median(vals) if vals else None
+
+
 # --------------------------------------------------------------------------- #
 # Chunk execution
 # --------------------------------------------------------------------------- #
@@ -672,14 +696,26 @@ class PrecheckRunner:
             enable_attention_dp=par["enable_attention_dp"],
         )
         os.makedirs(self.csv_dir, exist_ok=True)
+        # C++ transceiver bandwidth CSV (per-rank recv).
         os.environ["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = self.csv_dir
+        # Python transceiver bandwidth CSV (perf_logger.py): writes
+        # {base}_{instance}_{rank}.csv with KVSendTask throughput on the ctx
+        # side. Harmless to set unconditionally -- the C++ path ignores it.
+        os.environ["TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO"] = "1"
+        os.environ["TLLM_KV_TRANSFER_PERF_LOG_FILE"] = os.path.join(self.csv_dir, "perf")
 
         # Built VERBATIM from the disagg yaml's cache_transceiver_config so
         # backend/max_tokens_in_buffer/timeouts match the real test exactly.
         cache_cfg = CacheTransceiverConfig(**self.side["cache_transceiver_config"])
         # Yaml-absent settings resolve against the model's preferences, like
-        # serving does (kv manager version + transceiver runtime).
+        # serving does (kv manager version + transceiver runtime) -- this holds
+        # even for the simplified stand-in pool: only the KV SHAPE is generic;
+        # the V1/V2 manager version and the transceiver runtime must still
+        # match what the real model runs (e.g. V4 -> V2 + Python).
         self.use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), self.side, cache_cfg)
+        if kv_shape.get("simplified") and self.is_leader:
+            print(f"[precheck {self.role}_{self.server_idx}] SIMPLIFIED: "
+                  f"{kv_shape['simplified']}", flush=True)
         # KVCacheManagerV2 only works with the Python transceiver (see
         # cache_transceiver_test/report.py); reject the pairing up front with
         # a clear INIT_ERROR instead of a C++ binding type error.
@@ -1349,8 +1385,15 @@ def main(argv=None):
         stop_watchdog()
 
     # --- teardown + result ------------------------------------------------------
+    # Bandwidth lives on different sides per transceiver: C++ records it on the
+    # receiver (gen recv CSVs), the Python transceiver on the sender (ctx perf
+    # CSVs). csv_dir is shared across the instance's ranks, so for the Python
+    # path the leader alone medians over all ranks' perf files.
     bw = None
-    if args.role == "gen":
+    if runner.runtime == "PYTHON":
+        if args.role == "ctx" and runner.is_leader:
+            bw = parse_python_bandwidth_gbps(runner.csv_dir)
+    elif args.role == "gen":
         local_bw = parse_bandwidth_gbps(runner.csv_dir, rank)
         bws = [b for b in comm.gather(local_bw, root=0) or [] if b]
         if runner.is_leader and bws:
