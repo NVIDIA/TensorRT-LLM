@@ -1782,9 +1782,11 @@ def _run_cute_dsl_topk_prefill_test(batch_size, index_topk, num_tokens, dtype, r
 
     logits = create_random_logits(row_starts, row_ends, dtype, 77)
 
-    # Run DSL kernel — returns LOCAL indices (0-indexed within [row_start, row_end)).
-    output_indices = torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
-        logits, row_starts, row_ends, index_topk, 256
+    # Run DSL kernel — writes LOCAL indices (0-indexed within [row_start, row_end))
+    # into the caller-provided output_indices buffer.
+    output_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+        logits, row_starts, row_ends, output_indices, index_topk, 256
     )
     torch.cuda.synchronize()
 

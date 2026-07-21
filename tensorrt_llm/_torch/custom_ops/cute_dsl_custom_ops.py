@@ -5728,18 +5728,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_indexer_topk_prefill_blackwell",
-        mutates_args=(),
+        mutates_args=("output_indices", ),
         device_types="cuda",
     )
     def cute_dsl_indexer_topk_prefill_blackwell(
         input_values: torch.Tensor,
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
+        output_indices: torch.Tensor,
         top_k: int,
         num_copy_bits: int = 256,
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
-    ) -> torch.Tensor:
+    ) -> None:
         """CuTE DSL radix-based top-k for prefill.
 
         Args:
@@ -5754,12 +5755,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache_smem_values: Cache ordered values in SMEM to avoid re-reading from
                                GMEM in refinement rounds (reduces S by 2x).
 
-        Returns:
-            indices: Int32 tensor of shape (num_rows, top_k) with LOCAL indices
-                     (0-indexed within [row_start, row_end) for each row).
-                     Padding positions are -1.
+            output_indices: Pre-allocated Int32 tensor of shape (num_rows, top_k),
+                            written in place with LOCAL indices (0-indexed within
+                            [row_start, row_end) for each row). Padding positions
+                            are -1.
         """
-        indices, _ = CuteDSLTopKPrefillSingleCTARunner.forward(
+        # Write into the caller-provided output_indices (mutates_args) rather than
+        # returning the runner's reusable pool buffer, matching the decode op and
+        # the CUDA indexer_topk_prefill contract (write into a caller buffer slice).
+        CuteDSLTopKPrefillSingleCTARunner.forward(
             input_values,
             row_starts,
             row_ends,
@@ -5768,8 +5772,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits=num_copy_bits,
             overflow_policy=overflow_policy,
             cache_smem_values=cache_smem_values,
+            output_indices=output_indices,
         )
-        return indices
 
     @torch.library.register_fake(
         "trtllm::cute_dsl_indexer_topk_prefill_blackwell")
@@ -5777,13 +5781,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_values: torch.Tensor,
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
+        output_indices: torch.Tensor,
         top_k: int,
         num_copy_bits: int = 256,
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
     ):
-        num_rows = input_values.shape[0]
-        return input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+        return None
 
     class CuteDSLTopKDecodeMultiCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (multi CTA version).
