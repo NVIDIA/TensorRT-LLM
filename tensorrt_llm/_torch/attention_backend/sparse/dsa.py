@@ -1760,16 +1760,10 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (sparse_params.enable_heuristic_topk
                                        and get_sm_version() >= 100)
 
-        if (self.use_cute_dsl_topk
-                or self.use_cute_dsl_paged_mqa_logits) and layer_idx == 0:
-            from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
-
-            if self.use_cute_dsl_topk:
-                # the dtype of topk input tensor, which is float32 now.
-                # Note, need to update it if the dtype of topk input tensor is changed.
-                cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
-                    dtype=torch.float32, top_k=self.index_topk)
-
+        # No explicit CuTe DSL top-k warmup needed: the ops are registered on
+        # import of custom_ops (guarded by IS_CUTLASS_DSL_AVAILABLE), and the
+        # CUDA-graph runner's WARMUP_STEPS run a full forward on each capture
+        # geometry before capture, which JIT-compiles the exact kernel variant.
         if self._enable_heuristic_topk and layer_idx == 0:
             # Populate static caches (sm_count, L2 cache size) inside the C++
             # Scheme X dispatcher before any CUDA Graph capture so the host
