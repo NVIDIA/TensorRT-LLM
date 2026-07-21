@@ -38,6 +38,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4MTP,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
+    _normalize_deepseek_v4_nvfp4_mixed_precision_config,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
@@ -447,12 +448,12 @@ def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
     assert ModelConfig.resolve_moe_backend("AUTO", "DeepseekV4ForCausalLM") == "TRTLLM"
 
 
-def test_deepseek_v4_mixed_precision_uses_fp8_base_config():
+def test_deepseek_v4_nvfp4_mixed_precision_config():
     config = DeepseekV4Config()
     config.quantization_config = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
-        "modules_to_not_convert": ["lm_head", "*eh_proj*"],
+        "modules_to_not_convert": ["lm_head"],
     }
     mixed_quant_config = QuantConfig(
         quant_algo=QuantAlgo.MIXED_PRECISION,
@@ -461,81 +462,31 @@ def test_deepseek_v4_mixed_precision_uses_fp8_base_config():
     )
     mixed_quant_config.mamba_ssm_cache_dtype = torch.bfloat16
     assert not mixed_quant_config.layer_quant_mode.has_fp8_block_scales()
-    normalized_config = ModelConfig._normalize_deepseek_v4_mixed_precision_base_quant_config(
-        config, mixed_quant_config
+    experts_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        quant_config=mixed_quant_config,
+        quant_config_dict={"model.layers.0.mlp.experts": experts_quant_config},
     )
+    model_config._frozen = True
 
-    assert normalized_config is not mixed_quant_config
+    normalized_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)
+
+    assert normalized_config is model_config
     assert mixed_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-    assert normalized_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-    assert normalized_config.layer_quant_mode.has_fp8_block_scales()
-    assert normalized_config.group_size == 128
-    assert normalized_config.mamba_ssm_cache_dtype == torch.bfloat16
-    assert normalized_config.exclude_modules == [
-        "lm_head",
-        "*eh_proj*",
-        "*kv_b_proj*",
-        "*k_b_proj*",
-    ]
-
-
-def test_deepseek_v4_model_config_resolves_mixed_precision_base(tmp_path, monkeypatch):
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=1,
-        compress_ratios=[1],
-    )
-    config.quantization_config = {
-        "quant_method": "fp8",
-        "weight_block_size": [128, 128],
-        "modules_to_not_convert": ["lm_head"],
-    }
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config",
-        lambda *args, **kwargs: config,
-    )
-    (tmp_path / "hf_quant_config.json").write_text(
-        json.dumps(
-            {
-                "producer": {
-                    "name": "modelopt",
-                    "version": "dsv4-nvfp4-experts",
-                },
-                "quantization": {
-                    "quant_algo": "MIXED_PRECISION",
-                    "group_size": 16,
-                    "exclude_modules": ["*.attn.*", "*.ffn.shared_experts.*"],
-                    "quantized_layers": {
-                        "layers.0.ffn.experts": {
-                            "quant_algo": "NVFP4",
-                            "group_size": 16,
-                        }
-                    },
-                },
-            }
-        )
-    )
-    tensor_name = "layers.0.ffn.experts.0.w1.weight"
-    shard_name = "model-00001-of-00001.safetensors"
-    _write_safetensors_header(tmp_path / shard_name, tensor_name, "U8", [2, 2])
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {tensor_name: shard_name}})
-    )
-
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path), attn_backend="TRTLLM", moe_backend="TRTLLM"
-    )
-
-    assert model_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
-    assert model_config.quant_config.group_size == 128
-    assert model_config.quant_config.exclude_modules == [
+    assert normalized_config.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert normalized_config.quant_config.layer_quant_mode.has_fp8_block_scales()
+    assert normalized_config.quant_config.group_size == 128
+    assert normalized_config.quant_config.mamba_ssm_cache_dtype == torch.bfloat16
+    assert normalized_config.quant_config.exclude_modules == [
         "lm_head",
         "*kv_b_proj*",
         "*k_b_proj*",
         "*eh_proj*",
     ]
     assert (
-        model_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo == QuantAlgo.NVFP4
+        normalized_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo
+        == QuantAlgo.NVFP4
     )
 
 

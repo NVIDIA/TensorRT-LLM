@@ -299,6 +299,43 @@ def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
     return bool(getattr(config, "enable_fused_hc", True))
 
 
+def _normalize_deepseek_v4_nvfp4_mixed_precision_config(
+    model_config: ModelConfig[PretrainedConfig],
+) -> ModelConfig[PretrainedConfig]:
+    """Resolve FP8 base layers in DeepSeek-V4 NVFP4 checkpoints."""
+    quant_config = model_config.quant_config
+    hf_quant_config = getattr(model_config.pretrained_config, "quantization_config", None)
+    layer_quant_configs = model_config.quant_config_dict or {}
+    has_nvfp4_experts = any(
+        name.endswith(".mlp.experts") and config.quant_algo == QuantAlgo.NVFP4
+        for name, config in layer_quant_configs.items()
+    )
+    if (
+        quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
+        or not has_nvfp4_experts
+        or not isinstance(hf_quant_config, dict)
+        or hf_quant_config.get("quant_method") != "fp8"
+        or tuple(hf_quant_config.get("weight_block_size", ())) != (128, 128)
+    ):
+        return model_config
+
+    default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj*"]
+    hf_exclude_modules = hf_quant_config.get("modules_to_not_convert") or []
+    exclude_modules = list(dict.fromkeys(list(hf_exclude_modules) + default_exclude))
+    fp8_quant_config = quant_config.model_copy(
+        deep=True,
+        update={
+            "quant_algo": QuantAlgo.FP8_BLOCK_SCALES,
+            "group_size": 128,
+            "exclude_modules": exclude_modules,
+        },
+    )
+    fp8_quant_config.__dict__.pop("quant_mode", None)
+    fp8_quant_config.__dict__.pop("layer_quant_mode", None)
+    model_config.quant_config = fp8_quant_config
+    return model_config
+
+
 def _copy_deepseek_v4_fused_a_weight_scale(
     module: Linear, fused_a: torch.Tensor, fused_a_scale: torch.Tensor
 ) -> None:
@@ -2487,13 +2524,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         }
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        # ModelConfig.from_pretrained resolves this before backend selection.
-        # Keep direct ModelConfig construction consistent with that path.
-        model_config.quant_config = (
-            ModelConfig._normalize_deepseek_v4_mixed_precision_base_quant_config(
-                model_config.pretrained_config, model_config.quant_config
-            )
-        )
+        model_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)
         self.mapping_with_cp = None
         # Note: Currently the usage of mapping is all over the place making its usage brittle
         # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
