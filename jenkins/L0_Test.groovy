@@ -254,10 +254,13 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
         "no CUDA-capable device is detected|CUDA_ERROR_UNKNOWN: 999|CUDA unknown error|" +
         "CUDA-capable device.s. is/are busy or unavailable"
     try {
+        // Wrap the body in `bash -c` so it is shell-agnostic: cluster login shells
+        // are often csh/tcsh, which can't parse this bash test/pipe/redirection
+        // syntax. The login shell only has to run `bash -c '<single-quoted body>'`.
         return Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(remote,
-                "\"if [ -f '${remoteLogPath}' ]; then grep -aioE '${deviceFaultRegex}' '${remoteLogPath}' 2>/dev/null | tail -n 1 | cut -c1-500; fi\""),
+                "\"bash -c 'if [ -f \\\"${remoteLogPath}\\\" ]; then grep -aioE \\\"${deviceFaultRegex}\\\" \\\"${remoteLogPath}\\\" 2>/dev/null | tail -n 1 | cut -c1-500; fi'\""),
             returnStdout: true,
             numRetries: 1,
         )?.trim()
