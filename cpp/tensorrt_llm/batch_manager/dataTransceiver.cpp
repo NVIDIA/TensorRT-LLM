@@ -711,6 +711,25 @@ private:
         }
     }
 
+    //! Release the reuse-tree blocks pinned for a response. Must not throw: it is called
+    //! from noexcept send/failure paths, and unpinBlocksById can throw on invalid ids.
+    void releasePinnedBlocks(Response& response) noexcept
+    {
+        if (response.mPinnedBlockIds.empty())
+        {
+            return;
+        }
+        try
+        {
+            mCacheTransferLayer.getCacheManager()->unpinBlocksById(response.mPinnedBlockIds);
+        }
+        catch (std::exception const& err)
+        {
+            TLLM_LOG_ERROR("Failed to unpin reuse-tree blocks: %s", err.what());
+        }
+        response.mPinnedBlockIds.clear();
+    }
+
     void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
         try
@@ -750,11 +769,9 @@ private:
             failResponse(resp, exception);
         }
         // Release any reuse-tree blocks we pinned for this transfer. Safe on every exit
-        // path; the LlmRequest-backed branch never populates mPinnedBlockIds.
-        if (!resp.mPinnedBlockIds.empty())
-        {
-            mCacheTransferLayer.getCacheManager()->unpinBlocksById(resp.mPinnedBlockIds);
-        }
+        // path: the LlmRequest-backed branch never populates mPinnedBlockIds, and the
+        // error paths above already released them via failResponse.
+        releasePinnedBlocks(resp);
     }
 
     void asyncSendAndRemoveResponse(RequestIdType id, Response resp) noexcept
@@ -1074,18 +1091,7 @@ private:
         }
         // Release any reuse-tree blocks pinned for this transfer so a failed or drained
         // response cannot leak pins; normal responses never populate mPinnedBlockIds.
-        if (!response.mPinnedBlockIds.empty())
-        {
-            try
-            {
-                mCacheTransferLayer.getCacheManager()->unpinBlocksById(response.mPinnedBlockIds);
-            }
-            catch (std::exception const& err)
-            {
-                TLLM_LOG_ERROR("Failed to unpin reuse-tree blocks: %s", err.what());
-            }
-            response.mPinnedBlockIds.clear();
-        }
+        releasePinnedBlocks(response);
     }
 
     void failPendingResponses(std::exception_ptr const& exception) noexcept
