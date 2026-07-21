@@ -28,6 +28,7 @@ import time
 import urllib.request
 import zipfile
 
+import numpy as np
 import pytest
 import torch
 import torch._inductor.config as inductor_config
@@ -116,6 +117,10 @@ COSMOS3_LPIPS_HEIGHT = 720
 COSMOS3_LPIPS_WIDTH = 1280
 COSMOS3_LPIPS_T2V_NUM_FRAMES = 189
 COSMOS3_LPIPS_T2I_NUM_FRAMES = 1
+# 9 frames = 3 latent frames: latents (0, 1) are pinned to the V2V reference,
+# latent 2 (pixel frames 5-8) is generated. Frame 8 is the golden-compared frame.
+COSMOS3_LPIPS_V2V_NUM_FRAMES = 9
+COSMOS3_LPIPS_V2V_FREE_FRAME_INDEX = 8
 COSMOS3_LPIPS_NUM_INFERENCE_STEPS = 35
 COSMOS3_LPIPS_GUIDANCE_SCALE = 6.0
 COSMOS3_LPIPS_SEED = 42
@@ -844,12 +849,13 @@ def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_grap
     save_image(generated_image, output_path)
 
 
-def _run_cosmos3_lpips_pipeline(num_frames):
+def _run_cosmos3_lpips_pipeline(num_frames, video=None):
     """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
 
     Returns the generated video tensor ``(B, T, H, W, C)`` (T == ``num_frames``),
     or ``None`` if generation produced no video.  ``num_frames=1`` yields the
-    single-frame text-to-image path.
+    single-frame text-to-image path; passing ``video`` (a uint8 [T, H, W, C]
+    conditioning-window tensor) yields the video-to-video path.
     """
     # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
     guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
@@ -886,6 +892,7 @@ def _run_cosmos3_lpips_pipeline(num_frames):
                     guidance_scale=COSMOS3_LPIPS_GUIDANCE_SCALE,
                     frame_rate=COSMOS3_LPIPS_FRAME_RATE,
                     use_guardrails=False,
+                    video=video,
                 )
             if result is None or result.video is None:
                 return None
@@ -905,6 +912,43 @@ def _generate_cosmos3_lpips_video(output_path):
     video = _run_cosmos3_lpips_pipeline(COSMOS3_LPIPS_T2V_NUM_FRAMES)
     assert video is not None, "Cosmos3-Nano T2V LPIPS run produced no video"
     _save_lpips_video_mp4(video, output_path, frame_rate=COSMOS3_LPIPS_FRAME_RATE)
+
+
+def _synthesize_cosmos3_v2v_lpips_reference():
+    """Deterministic 5-frame 720p conditioning window.
+
+    Five frames is the default window (``max(condition_video_latent_indexes)
+    * 4 + 1``). Built directly as a tensor — no codec round-trip — so it is
+    bit-identical on every machine and OpenCV build; a moving block gives the
+    conditioning a real structure signal.
+    """
+    frames = []
+    for i in range(5):
+        frame = np.full((COSMOS3_LPIPS_HEIGHT, COSMOS3_LPIPS_WIDTH, 3), 30, dtype=np.uint8)
+        x = 100 + i * 40
+        frame[200:520, x : x + 200] = (200, 120, 40)
+        frames.append(frame)
+    return torch.from_numpy(np.stack(frames))
+
+
+def _generate_cosmos3_v2v_lpips_frame(output_path):
+    """Generate the Cosmos3-Nano video-to-video LPIPS sample (free frame only).
+
+    The golden stores a single frame, not a video: frames 0-4 are pinned to the
+    reference's VAE round-trip (that contract is asserted semantically by the
+    V2V unit smokes), so the only content unique to this gate is what the model
+    generates *under* conditioning — the free latent, pixel frames 5-8. Frame 8
+    is compared. 9 frames keeps the run to seconds while still exercising the
+    pinned/free latent boundary.
+    """
+    from tensorrt_llm.media.encoding import save_image
+
+    video = _run_cosmos3_lpips_pipeline(
+        COSMOS3_LPIPS_V2V_NUM_FRAMES, video=_synthesize_cosmos3_v2v_lpips_reference()
+    )
+    assert video is not None, "Cosmos3-Nano V2V LPIPS run produced no video"
+    # video is (B, T, H, W, C); take the free frame -> (H, W, C) for save_image.
+    save_image(video[0, COSMOS3_LPIPS_V2V_FREE_FRAME_INDEX], output_path)
 
 
 def _generate_cosmos3_lpips_image(output_path):
@@ -1118,6 +1162,26 @@ def test_cosmos3_nano_t2v_lpips_against_golden(_visual_gen_deps, tmp_path):
         tmp_path,
         "cosmos3_nano_t2v",
         "video",
+        COSMOS3_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_nano_v2v_lpips_against_golden(_visual_gen_deps, tmp_path):
+    generated_path = tmp_path / "cosmos3_nano_v2v_generated_frame.png"
+    golden_path = _golden_media_path(
+        tmp_path,
+        "cosmos3_nano_v2v_lpips_golden_frame.png",
+        "Cosmos3-Nano V2V LPIPS golden frame",
+    )
+    _generate_cosmos3_v2v_lpips_frame(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_nano_v2v",
+        "image",
         COSMOS3_LPIPS_PROMPT,
         golden_path,
         generated_path,
