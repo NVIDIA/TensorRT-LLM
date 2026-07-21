@@ -40,12 +40,6 @@ ________________
 .. doxygenfile:: samplingConfig.h
    :project: TensorRT-LLM
 
-tllmLogger.h
-____________
-
-.. doxygenfile:: tllmLogger.h
-   :project: TensorRT-LLM
-
 lookaheadModule.h
 _________________
 
@@ -182,12 +176,6 @@ ipcNvlsMemory.h
 _______________
 
 .. doxygenfile:: ipcNvlsMemory.h
-   :project: TensorRT-LLM
-
-rawEngine.h
-___________
-
-.. doxygenfile:: rawEngine.h
    :project: TensorRT-LLM
 
 ipcUtils.h

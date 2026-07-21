@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc21" />
+  <meta name="docsearch:version" content="1.3.0rc22" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -461,6 +461,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
@@ -497,6 +498,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
@@ -1338,6 +1340,38 @@
 <li><p>V: Video</p></li>
 <li><p>A: Audio</p></li>
 </ul>
+<section id="multimodal-encoder-optimizations">
+<h2>Multimodal Encoder Optimizations<a class="headerlink" href="#multimodal-encoder-optimizations" title="Link to this heading">#</a></h2>
+<p>The following optimizations are available to models that implement
+<code class="docutils literal notranslate"><span class="pre">MultimodalModelMixin</span></code>. Currently, only <code class="docutils literal notranslate"><span class="pre">Mistral3ForConditionalGeneration</span></code> supports them.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model Architecture</p></th>
+<th class="head"><p>Multimodal Encoder Side Stream</p></th>
+<th class="head"><p>Multimodal Embeddings Cache</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Mistral3ForConditionalGeneration</span></code></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<ul class="simple">
+<li><p><strong>Multimodal encoder side stream</strong> prefetches encoder work for pending requests on a separate
+CUDA stream, allowing it to overlap with work on the main stream. Set
+<code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_side_stream_max_ahead</span></code> to a positive value to enable it; the value
+limits the number of prefetched requests that can be ahead of admission. This option is mutually
+exclusive with <code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_cuda_graph</span></code> and can increase peak GPU memory use.</p></li>
+<li><p><strong>Multimodal embeddings cache</strong> is a per-model, cross-request LRU cache of encoder embeddings.
+Set <code class="docutils literal notranslate"><span class="pre">multimodal_config.encoder_cache_max_bytes</span></code> to its capacity (for example, <code class="docutils literal notranslate"><span class="pre">&quot;512MiB&quot;</span></code>), or
+<code class="docutils literal notranslate"><span class="pre">0</span></code> to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
+only when all of its items hit the cache. At present, only single-modality requests are cacheable;
+mixed-modality requests bypass the cache.</p></li>
+</ul>
+</section>
 </section>
 <section id="visual-generation-models">
 <h1>Visual Generation Models<a class="headerlink" href="#visual-generation-models" title="Link to this heading">#</a></h1>
@@ -1526,12 +1560,12 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <aside class="footnote brackets" id="id27" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id21">1</a>,<a role="doc-backlink" href="#id44">2</a>,<a role="doc-backlink" href="#id45">3</a>)</span>
-<p>Chunked Prefill for MLA can only be enabled on SM100/SM103.</p>
+<p>Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.</p>
 </aside>
 <aside class="footnote brackets" id="id28" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id22">1</a>,<a role="doc-backlink" href="#id46">2</a>)</span>
-<p>KV cache reuse for MLA can only be enabled on SM90/SM100/SM103 and in BF16/FP8 KV cache dtype.</p>
+<p>KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.</p>
 </aside>
 <aside class="footnote brackets" id="id29" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id24">3</a><span class="fn-bracket">]</span></span>
@@ -1636,7 +1670,10 @@ For full documentation, see the <a class="reference internal" href="visual-gener
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-feature-support-matrix-key-models">Model-Feature Support Matrix (Key Models)</a></li>
 </ul>
 </li>
-<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a></li>
+<li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-encoder-optimizations">Multimodal Encoder Optimizations</a></li>
+</ul>
+</li>
 <li class="toc-h1 nav-item toc-entry"><a class="reference internal nav-link" href="#visual-generation-models">Visual Generation Models</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#id43">Supported Models</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-matrix">Feature Matrix</a></li>
@@ -1736,9 +1773,9 @@ For full documentation, see the <a class="reference internal" href="visual-gener
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2026.</p>
+  <p>Last updated on July 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
   
 </div></div>
       

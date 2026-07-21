@@ -70,7 +70,7 @@ MiniMax-M3 is deployed across 2 nodes (8x GB200 total) using Slurm with the pyxi
 The TensorRT LLM NVIDIA NGC image is used as the Slurm container:
 
 ```text
-nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21
+nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22
 ```
 
 Note:
@@ -111,7 +111,7 @@ export MODEL=/models/MiniMax-M3-MXFP8   # MXFP8 (recommended); use /models/MiniM
 srun -N 2 \
     --ntasks 8 --ntasks-per-node 4 \
     --mpi=pmix --gres=gpu:4 \
-    --container-image=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21 \
+    --container-image=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22 \
     --container-mounts=/models:/models,/workspace:/workspace,${TRTLLM_DIR}:${TRTLLM_DIR} \
     --container-workdir /workspace \
     bash -c "trtllm-llmapi-launch \

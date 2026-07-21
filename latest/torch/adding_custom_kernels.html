@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc21" />
+  <meta name="docsearch:version" content="1.3.0rc22" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -459,6 +459,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
@@ -495,6 +496,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
@@ -866,6 +868,42 @@
 <li><p><strong>JIT compile cache.</strong> Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). <code class="docutils literal notranslate"><span class="pre">argmax.py</span></code> and the <code class="docutils literal notranslate"><span class="pre">cute_dsl_custom_ops.py</span></code> runners are good references.</p></li>
 </ul>
 </section>
+<section id="pruning-autotuner-tactics-with-nvmatmulheuristics">
+<h3>4.5 Pruning autotuner tactics with nvMatmulHeuristics<a class="headerlink" href="#pruning-autotuner-tactics-with-nvmatmulheuristics" title="Link to this heading">#</a></h3>
+<p>A CuTe DSL runner that exposes many tactics (tile / cluster / swap / prefetch combinations) can be expensive to autotune, because the AutoTuner JIT-compiles and benchmarks every candidate returned by <code class="docutils literal notranslate"><span class="pre">get_valid_tactics</span></code>. A runner can therefore rank and prune its own candidate list with <a class="reference external" href="https://pypi.org/project/nvidia-matmul-heuristics/">nvMatmulHeuristics</a> <em>inside</em> <code class="docutils literal notranslate"><span class="pre">get_valid_tactics</span></code>, before the tactics ever reach the compile+benchmark loop — all shapes and inputs are already visible at that point, so no extra AutoTuner hook is needed. The pruning is a no-op by default and must degrade gracefully to the full list on any failure, so tuning never loses a valid candidate.</p>
+<p>Today this is wired up for the SM100/SM103 (Blackwell B200/B300) NVFP4 dense GEMM: <code class="docutils literal notranslate"><span class="pre">CuteDSLNVFP4BlackwellRunner.get_valid_tactics</span></code> builds the full sweep and then hands it to the private <code class="docutils literal notranslate"><span class="pre">_rank_prune_tactics</span></code> helper. The pruned set is a strict, re-validated subset of the full sweep — it never introduces a tactic the kernel validator rejected — so correctness is unchanged and only autotuner wall-time is affected. On a 4096³ NVFP4 GEMM this cuts a cold autotune from ~120 tactics to ~5 (roughly 7× less wall-time) while keeping the selected kernel within a few percent of the full-sweep best.</p>
+<p>The behavior is controlled entirely by environment variables (all read at tune time; the package must be installed, otherwise the path silently falls back to the full sweep):</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Environment variable</p></th>
+<th class="head"><p>Default</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_CUTEDSL_NVMMH_ENABLE</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
+<td><p>Master opt-in switch. Set to <code class="docutils literal notranslate"><span class="pre">1</span></code> to enable heuristic tactic pruning. When unset/<code class="docutils literal notranslate"><span class="pre">0</span></code>, or when <code class="docutils literal notranslate"><span class="pre">nvidia-matmul-heuristics</span></code> is not installed, the full tactic sweep runs unchanged.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_CUTEDSL_NVMMH_FIELDS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">tile,cluster</span></code></p></td>
+<td><p>Comma-separated list of the knobs nvMatmulHeuristics drives; any knob not listed is swept by the runner. Recognized tokens: <code class="docutils literal notranslate"><span class="pre">tile</span></code>, <code class="docutils literal notranslate"><span class="pre">cluster</span></code>, <code class="docutils literal notranslate"><span class="pre">swizzle</span></code>, <code class="docutils literal notranslate"><span class="pre">cta_order</span></code>. <code class="docutils literal notranslate"><span class="pre">tile</span></code> and <code class="docutils literal notranslate"><span class="pre">cluster</span></code> are a coupled pair (the 2-SM encoding maps the joint <code class="docutils literal notranslate"><span class="pre">(cta,</span> <span class="pre">cluster)</span></code>), so naming either drives both. Accepted aliases: <code class="docutils literal notranslate"><span class="pre">cta_tile</span></code> / <code class="docutils literal notranslate"><span class="pre">mma_tiler</span></code> → <code class="docutils literal notranslate"><span class="pre">tile</span></code>. Unknown tokens are warned once and ignored. <strong>Top-K tile/cluster pruning happens only when <code class="docutils literal notranslate"><span class="pre">tile</span></code>/<code class="docutils literal notranslate"><span class="pre">cluster</span></code> is selected; with scheduler-only fields (<code class="docutils literal notranslate"><span class="pre">swizzle</span></code> and/or <code class="docutils literal notranslate"><span class="pre">cta_order</span></code>) every valid tile/cluster is swept and merely annotated with the model’s scheduler knobs.</strong></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">5</span></code></p></td>
+<td><p>Top-K distinct <code class="docutils literal notranslate"><span class="pre">(tile,</span> <span class="pre">cluster,</span> <span class="pre">swap)</span></code> keys to keep from the model’s ranking (applies only when <code class="docutils literal notranslate"><span class="pre">tile</span></code>/<code class="docutils literal notranslate"><span class="pre">cluster</span></code> is in <code class="docutils literal notranslate"><span class="pre">FIELDS</span></code>). Both <code class="docutils literal notranslate"><span class="pre">use_prefetch</span></code> variants of a kept key are profiled on top (prefetch is not modeled), so the final tactic count can be up to ~2× this. Larger K = closer to the full-sweep best but slower autotune; smaller K = faster autotune with a larger potential perf gap.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Example (enable pruning, keep the top 8 tile/cluster candidates):</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_CUTEDSL_NVMMH_ENABLE</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_CUTEDSL_NVMMH_FIELDS</span><span class="o">=</span>tile,cluster
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS</span><span class="o">=</span><span class="m">8</span>
+</pre></div>
+</div>
+<p>The adapter and env helpers live in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py</span></code></a>; the <code class="docutils literal notranslate"><span class="pre">get_valid_tactics</span></code> / <code class="docutils literal notranslate"><span class="pre">_rank_prune_tactics</span></code> pruning is in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py"><code class="docutils literal notranslate"><span class="pre">cute_dsl_custom_ops.py</span></code></a>.</p>
+</section>
 </section>
 <hr class="docutils" />
 <section id="example-walkthrough-indexer-k-cache-scatter-op">
@@ -982,6 +1020,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kernel-skeleton">4.2 Kernel skeleton</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#wrapping-the-jit-kernel-as-a-torch-custom-op">4.3 Wrapping the JIT kernel as a Torch custom op</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-caveats">4.4 Runtime caveats</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pruning-autotuner-tactics-with-nvmatmulheuristics">4.5 Pruning autotuner tactics with nvMatmulHeuristics</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#example-walkthrough-indexer-k-cache-scatter-op">5. Example walkthrough: <code class="docutils literal notranslate"><span class="pre">indexer_k_cache_scatter_op</span></code></a></li>
@@ -1078,9 +1117,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2026.</p>
+  <p>Last updated on July 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
   
 </div></div>
       

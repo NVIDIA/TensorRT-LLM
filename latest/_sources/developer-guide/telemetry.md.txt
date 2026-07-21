@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-260 captured fields.
+265 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -55,7 +55,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
-| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON']]` | `categorical` |  | `CPP`, `PYTHON` |
+| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `cp_config.block_size` | `Optional[int]` | `value` |  |  |
 | `cp_config.cp_anchor_size` | `Optional[int]` | `value` |  |  |
@@ -71,6 +71,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cuda_graph_config.mode` | `Literal['decode']` | `categorical` |  | `decode`, `encode` |
 | `cuda_graph_config.num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
 | `cuda_graph_config.seq_lens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
+| `disable_mm_encoder` | `<class 'bool'>` | `value` |  |  |
 | `disable_overlap_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32` |
 | `dwdp_config.contention_opt` | `<class 'bool'>` | `value` |  |  |
@@ -156,6 +157,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `moe_config.use_low_precision_moe_combine` | `<class 'bool'>` | `value` |  |  |
 | `moe_expert_parallel_size` | `Optional[int]` | `value` |  |  |
 | `moe_tensor_parallel_size` | `Optional[int]` | `value` |  |  |
+| `multimodal_config.encoder_cache_max_bytes` | `<class 'int'>` | `value` |  |  |
 | `multimodal_config.encoder_side_stream_max_ahead` | `<class 'int'>` | `value` |  |  |
 | `multimodal_config.video_pruning_rate` | `Optional[float]` | `value` |  |  |
 | `mx_config.preshard_strategy` | `<class 'str'>` | `categorical` | allowlist | `per_module` |
@@ -238,7 +240,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.acceptance_rate_window_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
+| `speculative_config.block_size` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
+| `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `DSpark`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |
@@ -251,6 +254,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.is_keep_all` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.is_public_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.is_use_oldest` | `<class 'bool'>` | `value` |  |  |
+| `speculative_config.markov_head_type` | `Optional[Literal['vanilla', 'gated', 'rnn']]` | `categorical` |  | `vanilla`, `gated`, `rnn` |
+| `speculative_config.markov_rank` | `Optional[int]` | `value` |  |  |
 | `speculative_config.mask_token_id` | `Optional[int]` | `value` |  |  |
 | `speculative_config.max_concurrency` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `speculative_config.max_draft_len` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |

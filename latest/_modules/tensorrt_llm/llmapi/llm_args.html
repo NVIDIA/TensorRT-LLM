@@ -58,182 +58,17 @@
     <script src="../../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
     <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
-
-
 
 
 
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
-    defaultStyle.textContent = `pre.mermaid {
-    /* Same as .mermaid-container > pre */
-    display: block;
-    width: 100%;
-}
-
-pre.mermaid > svg {
-    /* Same as .mermaid-container > pre > svg */
-    height: 500px;
-    width: 100%;
-    max-width: 100% !important;
-}`;
+    defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
     document.head.appendChild(defaultStyle);
 
     const fullscreenStyle = document.createElement('style');
-    fullscreenStyle.textContent = `.mermaid-container {
-    display: flex;
-    flex-direction: row;
-    width: 100%;
-}
-
-.mermaid-container > pre {
-    display: block;
-    width: 100%;
-}
-
-.mermaid-container > pre > svg {
-    height: 500px;
-    width: 100%;
-    max-width: 100% !important;
-}
-
-.mermaid-fullscreen-btn {
-    width: 28px;
-    height: 28px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.3);
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-    font-size: 14px;
-    line-height: 1;
-    padding: 0;
-    color: #333;
-}
-
-.mermaid-fullscreen-btn:hover {
-    opacity: 100% !important;
-    background: rgba(255, 255, 255, 1);
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-btn.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-btn.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal {
-    display: none;
-    position: fixed !important;
-    top: 0 !important;
-    left: 0 !important;
-    width: 95vw;
-    height: 100vh;
-    background: rgba(255, 255, 255, 0.98);
-    z-index: 9999;
-    padding: 20px;
-    overflow: auto;
-}
-
-.mermaid-fullscreen-modal.dark-theme {
-    background: rgba(0, 0, 0, 0.98);
-}
-
-.mermaid-fullscreen-modal.active {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen {
-    position: relative;
-    width: 95vw;
-    height: 90vh;
-    max-width: 95vw;
-    max-height: 90vh;
-    background: white;
-    border-radius: 8px;
-    padding: 20px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
-    overflow: auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen.dark-theme {
-    background: #1a1a1a;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
-}
-
-.mermaid-container-fullscreen pre.mermaid {
-    width: 100%;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen .mermaid svg {
-    height: 100% !important;
-    width: 100% !important;
-    cursor: grab;
-}
-
-.mermaid-fullscreen-close {
-    position: fixed !important;
-    top: 20px !important;
-    right: 20px !important;
-    width: 40px;
-    height: 40px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.2);
-    border-radius: 50%;
-    cursor: pointer;
-    z-index: 10000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    transition: all 0.2s;
-    font-size: 24px;
-    line-height: 1;
-    color: #333;
-}
-
-.mermaid-fullscreen-close:hover {
-    background: white;
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-close.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-close.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
-    display: none !important;
-}`;
+    fullscreenStyle.textContent = ".mermaid-container {\n    position: relative;\n    display: flex;\n    flex-direction: row;\n    width: 100%;\n}\n\n.mermaid-container > pre {\n    display: block;\n    width: 100%;\n}\n\n.mermaid-container > pre > svg {\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}\n\n.mermaid-fullscreen-btn {\n    position: absolute;\n    width: 28px;\n    height: 28px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.3);\n    border-radius: 4px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);\n    font-size: 14px;\n    line-height: 1;\n    padding: 0;\n    color: #333;\n}\n\n.mermaid-fullscreen-btn:hover {\n    opacity: 100% !important;\n    background: rgba(255, 255, 255, 1);\n    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-btn.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.3);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-btn.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal {\n    display: none;\n    position: fixed !important;\n    top: 0 !important;\n    left: 0 !important;\n    width: 95vw;\n    height: 100vh;\n    background: rgba(255, 255, 255, 0.98);\n    z-index: 9999;\n    padding: 20px;\n    overflow: auto;\n}\n\n.mermaid-fullscreen-modal.dark-theme {\n    background: rgba(0, 0, 0, 0.98);\n}\n\n.mermaid-fullscreen-modal.active {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen {\n    position: relative;\n    width: 95vw;\n    height: 90vh;\n    max-width: 95vw;\n    max-height: 90vh;\n    background: white;\n    border-radius: 8px;\n    padding: 20px;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);\n    overflow: auto;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen.dark-theme {\n    background: #1a1a1a;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);\n}\n\n.mermaid-container-fullscreen pre.mermaid {\n    width: 100%;\n    height: 100%;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen .mermaid svg {\n    height: 100% !important;\n    width: 100% !important;\n    cursor: grab;\n}\n\n.mermaid-fullscreen-close {\n    position: fixed !important;\n    top: 20px !important;\n    right: 20px !important;\n    width: 40px;\n    height: 40px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.2);\n    border-radius: 50%;\n    cursor: pointer;\n    z-index: 10000;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);\n    transition: all 0.2s;\n    font-size: 24px;\n    line-height: 1;\n    color: #333;\n}\n\n.mermaid-fullscreen-close:hover {\n    background: white;\n    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-close.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.2);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-close.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal .mermaid-fullscreen-btn {\n    display: none !important;\n}";
     document.head.appendChild(fullscreenStyle);
 }
 
@@ -280,6 +115,13 @@ let modalContent = null;
 let previousScrollOffset = [window.scrollX, window.scrollY];
 let _lazyObserver = null;
 let _renderQueue = Promise.resolve();
+let closeModal = () => {};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal?.classList.contains('active')) {
+        closeModal();
+    }
+});
 
 // Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
 // so this is safe to call both for the initial batch and for diagrams that
@@ -376,8 +218,10 @@ const runMermaid = async (rerun) => {
                                     el.removeAttribute('data-mermaid-deferred');
                                     // Apply zoom to the now-rendered diagram, matching
                                     // the decoration visible diagrams receive.
-                                    if ("False" === "True") {
-                                        addZoomToSvgs(d3.selectAll(""));
+                                    if (false) {
+                                        addZoomToSvgs(d3.selectAll("").select(function() {
+                                            return this.querySelector("svg");
+                                        }));
                                     }
                                 } catch (e) {
                                     console.error("Mermaid deferred rendering failed:", e);
@@ -398,10 +242,12 @@ const runMermaid = async (rerun) => {
     const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
     const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
 
-    if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
+    if (false) {
+        const mermaids_to_add_zoom = 0 === -1 ? mermaids_active.length : 0;
         if(mermaids_to_add_zoom > 0) {
-            var svgs = d3.selectAll("");
+            var svgs = d3.selectAll("").select(function() {
+                return this.querySelector("svg");
+            });
             // Wait until every active (visible) diagram has rendered. Deferred
             // diagrams are excluded, so a fixed d3_node_count that counts a
             // hidden diagram no longer loops forever waiting for its SVG.
@@ -418,7 +264,7 @@ const runMermaid = async (rerun) => {
     }
 
     // Stop here if not adding fullscreen capability
-    if ("True" !== "True") return;
+    if (!true) return;
 
     if (modal !== null ) {
         // Destroy existing modal
@@ -441,7 +287,7 @@ const runMermaid = async (rerun) => {
     modalContent = modal.querySelector('.mermaid-container-fullscreen');
     const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
 
-    const closeModal = () => {
+    closeModal = () => {
         modal.classList.remove('active');
         modalContent.innerHTML = '';
         document.body.style.overflow = ''
@@ -452,12 +298,6 @@ const runMermaid = async (rerun) => {
     modal.addEventListener('click', (e) => {
         if (e.target === modal) closeModal();
     });
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            closeModal();
-        }
-    });
-
     document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
         if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
             mermaidDiv.closest('.mermaid-fullscreen-modal')) {
@@ -477,8 +317,8 @@ const runMermaid = async (rerun) => {
         const fullscreenBtn = document.createElement('button');
         fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
         fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
-        fullscreenBtn.textContent = '⛶';
-        fullscreenBtn.style.opacity = '50%';
+        fullscreenBtn.textContent = "\u26f6";
+        fullscreenBtn.style.opacity = "50%";
 
         // Calculate dynamic position based on diagram's margin and padding
         const diagramStyle = window.getComputedStyle(mermaidDiv);
@@ -490,7 +330,7 @@ const runMermaid = async (rerun) => {
         fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
 
         fullscreenBtn.addEventListener('click', () => {
-            previousScrollOffset = [window.scroll, window.scrollY];
+            previousScrollOffset = [window.scrollX, window.scrollY];
             const clone = mermaidDiv.cloneNode(true);
             modalContent.innerHTML = '';
             modalContent.appendChild(clone);
@@ -502,9 +342,9 @@ const runMermaid = async (rerun) => {
                 svg.style.width = '100%';
                 svg.style.height = 'auto';
                 svg.style.maxWidth = '100%';
-                svg.style.sdisplay = 'block';
+                svg.style.display = 'block';
 
-                if ("False" === "True") {
+                if (false) {
                     setTimeout(() => {
                         const g = svg.querySelector('g');
                         if (g) {
@@ -527,8 +367,11 @@ const runMermaid = async (rerun) => {
     });
 };
 
+
+
 const load = async () => {
     initStyles();
+
 
     await runMermaid(true);
 
@@ -538,10 +381,8 @@ const load = async () => {
             darkTheme = newDarkTheme;
             console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
             await mermaid.initialize(
-                {...JSON.parse(
-                    `{"startOnLoad": false}`
-                ),
-                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                {...{"startOnLoad": false},
+                ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
                 }
             );
             await runMermaid(true);
@@ -566,10 +407,8 @@ const load = async () => {
 
 console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
 mermaid.initialize(
-    {...JSON.parse(
-        `{"startOnLoad": false}`
-    ),
-    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    {...{"startOnLoad": false},
+    ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
     }
 );
 
@@ -579,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -593,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc21" />
+  <meta name="docsearch:version" content="1.3.0rc22" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -971,6 +810,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
@@ -1007,6 +847,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
@@ -1123,6 +964,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">types</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span>
@@ -1525,8 +1367,7 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@staticmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_generate_cuda_graph_seq_lens</span><span class="p">(</span><span class="n">max_seq_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
                                       <span class="n">enable_padding</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Generate a list of max per-request sequence lengths for encoder CUDA graphs.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Generate a list of max per-request sequence lengths for encoder CUDA graphs.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            max_seq_len: Maximum per-request sequence length to generate up to.</span>
@@ -1625,6 +1466,38 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span>
 
 
+<span class="n">_BYTE_STRING_PATTERN</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;^\s*(\d+)\s*([kmgt]i?b|b)?\s*$&quot;</span><span class="p">,</span>
+                                  <span class="n">re</span><span class="o">.</span><span class="n">IGNORECASE</span><span class="p">)</span>
+<span class="n">_BINARY_BYTE_UNITS</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="kc">None</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="s2">&quot;b&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span>
+    <span class="s2">&quot;kb&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="p">,</span>
+    <span class="s2">&quot;kib&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="p">,</span>
+    <span class="s2">&quot;mb&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="o">**</span><span class="mi">2</span><span class="p">,</span>
+    <span class="s2">&quot;mib&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="o">**</span><span class="mi">2</span><span class="p">,</span>
+    <span class="s2">&quot;gb&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="o">**</span><span class="mi">3</span><span class="p">,</span>
+    <span class="s2">&quot;gib&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="o">**</span><span class="mi">3</span><span class="p">,</span>
+    <span class="s2">&quot;tb&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="o">**</span><span class="mi">4</span><span class="p">,</span>
+    <span class="s2">&quot;tib&quot;</span><span class="p">:</span> <span class="mi">1024</span><span class="o">**</span><span class="mi">4</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_parse_binary_byte_string</span><span class="p">(</span><span class="n">value</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">value</span>
+
+    <span class="n">match</span> <span class="o">=</span> <span class="n">_BYTE_STRING_PATTERN</span><span class="o">.</span><span class="n">fullmatch</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">match</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="s2">&quot;Byte strings must be non-negative integers with optional &quot;</span>
+            <span class="s2">&quot;B/KB/MB/GB/TB or KiB/MiB/GiB/TiB suffix.&quot;</span><span class="p">)</span>
+
+    <span class="n">amount</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span>
+    <span class="n">unit</span> <span class="o">=</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="n">multiplier</span> <span class="o">=</span> <span class="n">_BINARY_BYTE_UNITS</span><span class="p">[</span><span class="n">unit</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="k">if</span> <span class="n">unit</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">amount</span> <span class="o">*</span> <span class="n">multiplier</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">MultimodalConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Multimodal model configuration.&quot;&quot;&quot;</span>
 
@@ -1644,7 +1517,22 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="p">(</span><span class="s2">&quot;Maximum number of pending multimodal requests whose encoder work can be prefetched &quot;</span>
          <span class="s2">&quot;on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. &quot;</span>
-         <span class="s2">&quot;Incompatible with encoder_cuda_graph because graph replay uses static buffers.&quot;</span>
+         <span class="s2">&quot;Incompatible with encoder_cuda_graph because graph replay uses static buffers. &quot;</span>
+         <span class="s2">&quot;For the time being, this is also incompatible with encoder_cache_max_bytes &gt; 0.&quot;</span>
+         <span class="p">),</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="n">encoder_cache_max_bytes</span><span class="p">:</span> <span class="n">NonNegativeInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">134_217_728</span><span class="p">,</span>  <span class="c1"># 128 MiB.</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="p">(</span><span class="s2">&quot;Maximum bytes for the per-model cross-request multimodal encoder embedding cache. &quot;</span>
+         <span class="s2">&quot;Set to 0 to disable. String values such as &#39;512MB&#39; and &#39;1GiB&#39; use binary units. &quot;</span>
+         <span class="s2">&quot;Cache entries are per multimodal item, but reuse is all-or-nothing for each request: &quot;</span>
+         <span class="s2">&quot;every item in the request must hit the cache before cached embeddings are reused. &quot;</span>
+         <span class="s2">&quot;Only single-modality requests are cacheable for the time being. &quot;</span>
+         <span class="s2">&quot;For the time being, this is incompatible with encoder_side_stream_max_ahead &gt; 0. &quot;</span>
+         <span class="s2">&quot;NOTE: This is only valid for child implementations of the `MultimodalModelMixin`.&quot;</span>
          <span class="p">),</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
@@ -1660,8 +1548,13 @@ window.runMermaid = runMermaid;</script>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;encoder_cache_max_bytes&#39;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">parse_encoder_cache_max_bytes</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">_parse_binary_byte_string</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">validate_side_stream_cuda_graph_exclusive</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;MultimodalConfig&#39;</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_encoder_optimization_compatibility</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;MultimodalConfig&#39;</span><span class="p">:</span>
         <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_cuda_graph</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
                 <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_side_stream_max_ahead</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">):</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
@@ -1669,6 +1562,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">&quot;multimodal_config.encoder_side_stream_max_ahead &gt; 0 are &quot;</span>
                 <span class="s2">&quot;mutually exclusive. Disable side-stream MM prefetch or &quot;</span>
                 <span class="s2">&quot;disable MM encoder CUDA graphs.&quot;</span><span class="p">)</span>
+        <span class="c1"># TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.</span>
+        <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">encoder_cache_max_bytes</span> <span class="o">&gt;</span> <span class="mi">0</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">encoder_side_stream_max_ahead</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;multimodal_config.encoder_cache_max_bytes &gt; 0 and &quot;</span>
+                <span class="s2">&quot;multimodal_config.encoder_side_stream_max_ahead &gt; 0 are &quot;</span>
+                <span class="s2">&quot;mutually exclusive. Disable side-stream MM prefetch or set &quot;</span>
+                <span class="s2">&quot;the MM encoder cache capacity to 0.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span>
 
 
@@ -2891,14 +2792,17 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_rejection_sampling_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Disable rejection sampling when SA-enhanced configurations are</span>
-<span class="sd">        active, since SA may override the proposed draft tokens. This is a</span>
-<span class="sd">        silent fallback so the new default (True) does not break sa_config</span>
-<span class="sd">        users.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Disable rejection sampling when SA-enhanced configurations are active.</span>
+
+<span class="sd">        Only silently disable a default-inherited value; an explicit</span>
+<span class="sd">        ``use_rejection_sampling=True`` is preserved so</span>
+<span class="sd">        ``TorchLlmArgs.validate_speculative_config`` can raise for the</span>
+<span class="sd">        unsupported SA combination.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;sa_config&#39;</span><span class="p">,</span>
                                                    <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">if</span> <span class="s2">&quot;use_rejection_sampling&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_fields_set</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="k">return</span> <span class="bp">self</span>
 
     <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
@@ -3872,6 +3776,100 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="DSparkDecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">DSparkDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for DSpark speculative decoding.</span>
+
+<span class="sd">    DSpark (DeepSeek) is a target-dependent, &quot;semi-parallel&quot; speculative</span>
+<span class="sd">    decoding method. Like DFlash it captures hidden states from several target</span>
+<span class="sd">    layers as cross-attention context and drafts a whole block in a single</span>
+<span class="sd">    backbone forward, but it additionally refines the per-position draft logits</span>
+<span class="sd">    with a lightweight sequential head (a low-rank Markov head, optionally an RNN</span>
+<span class="sd">    head) and predicts an acceptance-confidence per position to truncate the</span>
+<span class="sd">    proposed prefix.</span>
+
+<span class="sd">    Key features:</span>
+<span class="sd">    - Target-dependent: captures hidden states from ``target_layer_ids``.</span>
+<span class="sd">    - Semi-parallel: one block backbone forward + cheap sequential head refine.</span>
+<span class="sd">    - Confidence head: truncates the proposed draft length (NOT the accept rule;</span>
+<span class="sd">      acceptance stays standard target verification, preserving greedy parity).</span>
+
+<span class="sd">    Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">mask_token_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Token ID used as the mask/noise token for parallel draft prediction. &quot;</span>
+        <span class="s2">&quot;If None, read from the draft model config (dspark_noise_token_id).&quot;</span><span class="p">)</span>
+
+    <span class="n">target_layer_ids</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Target model layer indices whose hidden states are captured for &quot;</span>
+        <span class="s2">&quot;cross-attention in the draft model. If None, read from the draft model &quot;</span>
+        <span class="s2">&quot;config (dspark_target_layer_ids).&quot;</span><span class="p">)</span>
+
+    <span class="n">block_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PositiveInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Number of draft positions produced per block. If None, read from the &quot;</span>
+        <span class="s2">&quot;draft model config (dspark_block_size). Should equal max_draft_len.&quot;</span><span class="p">)</span>
+
+    <span class="n">markov_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Low-rank dimension of the Markov head logit-bias. If None, read from &quot;</span>
+        <span class="s2">&quot;the draft model config (dspark_markov_rank). 0 disables the head.&quot;</span><span class="p">)</span>
+
+    <span class="n">markov_head_type</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;vanilla&quot;</span><span class="p">,</span> <span class="s2">&quot;gated&quot;</span><span class="p">,</span> <span class="s2">&quot;rnn&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Type of the sequential refinement head used within a block. If None, &quot;</span>
+        <span class="s2">&quot;read from the draft model config (dspark_markov_head_type), &quot;</span>
+        <span class="s2">&quot;defaulting to </span><span class="se">\&quot;</span><span class="s2">vanilla</span><span class="se">\&quot;</span><span class="s2">.&quot;</span><span class="p">)</span>
+
+    <span class="c1"># NOTE: confidence-based dynamic drafting (the draft model&#39;s confidence head</span>
+    <span class="c1"># that truncates the proposed block) is NOT enabled in this PR. The user-facing</span>
+    <span class="c1"># ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally</span>
+    <span class="c1"># omitted and will be added when the feature is actually wired into the</span>
+    <span class="c1"># speculative scheduling/verification path. The confidence head module and its</span>
+    <span class="c1"># internal plumbing remain as scaffolding (see DSparkConfidenceHead /</span>
+    <span class="c1"># dspark_propose).</span>
+
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;DSpark&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;DSpark&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="DSparkDecodingConfig.set_max_total_draft_tokens">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.set_max_total_draft_tokens">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_max_total_draft_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens_per_gen_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;DSpark needs K+1 tokens per gen request (K drafts + 1 bonus).</span>
+
+<span class="sd">        The draft produces its own mask queries internally; passing mask</span>
+<span class="sd">        fillers through the target is pure wasted work at large batch size.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">+</span> <span class="mi">1</span>
+
+<div class="viewcode-block" id="DSparkDecodingConfig.supports_backend">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.supports_backend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+
+
+    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">spec_dec_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
+        <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">DSPARK</span></div>
+
+
+
 <div class="viewcode-block" id="AutoDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">AutoDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
@@ -4580,6 +4578,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">SaveHiddenStatesDecodingConfig</span><span class="p">,</span>
         <span class="n">PARDDecodingConfig</span><span class="p">,</span>
         <span class="n">DFlashDecodingConfig</span><span class="p">,</span>
+        <span class="n">DSparkDecodingConfig</span><span class="p">,</span>
         <span class="n">AutoDecodingConfig</span><span class="p">,</span>
     <span class="p">],</span>
     <span class="n">Field</span><span class="p">(</span><span class="n">discriminator</span><span class="o">=</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">),</span>
@@ -5049,6 +5048,17 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="c1"># Legacy env-var selectors for the &quot;DEFAULT&quot; cache-transceiver backend,</span>
+<span class="c1"># ordered by priority. Single source of truth shared with</span>
+<span class="c1"># _torch/pyexecutor/kv_cache_transceiver.py.</span>
+<span class="n">_CACHE_TRANSCEIVER_BACKEND_ENV_VARS</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="p">(</span><span class="s2">&quot;TRTLLM_USE_NIXL_KVCACHE&quot;</span><span class="p">,</span> <span class="s2">&quot;NIXL&quot;</span><span class="p">),</span>
+    <span class="p">(</span><span class="s2">&quot;TRTLLM_USE_UCX_KVCACHE&quot;</span><span class="p">,</span> <span class="s2">&quot;UCX&quot;</span><span class="p">),</span>
+    <span class="p">(</span><span class="s2">&quot;TRTLLM_USE_MOONCAKE_KVCACHE&quot;</span><span class="p">,</span> <span class="s2">&quot;MOONCAKE&quot;</span><span class="p">),</span>
+    <span class="p">(</span><span class="s2">&quot;TRTLLM_USE_MPI_KVCACHE&quot;</span><span class="p">,</span> <span class="s2">&quot;MPI&quot;</span><span class="p">),</span>
+<span class="p">)</span>
+
+
 <div class="viewcode-block" id="CacheTransceiverConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig">[docs]</a>
 <span class="nd">@PybindMirror</span><span class="o">.</span><span class="n">mirror_pybind_fields</span><span class="p">(</span><span class="n">_CacheTransceiverConfig</span><span class="p">)</span>
@@ -5061,11 +5071,16 @@ window.runMermaid = runMermaid;</script>
             <span class="n">description</span><span class="o">=</span>
             <span class="s2">&quot;The communication backend type to use for the cache transceiver.&quot;</span><span class="p">)</span>
 
-    <span class="n">transceiver_runtime</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;CPP&quot;</span><span class="p">,</span> <span class="s2">&quot;PYTHON&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+    <span class="n">transceiver_runtime</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;CPP&quot;</span><span class="p">,</span> <span class="s2">&quot;PYTHON&quot;</span><span class="p">,</span> <span class="s2">&quot;auto&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;The runtime implementation. &#39;CPP&#39; for C++ transceiver (default when not set), &#39;PYTHON&#39; for Python transceiver.&quot;</span>
-    <span class="p">)</span>
+        <span class="s2">&quot;The runtime implementation. &#39;auto&#39; (default) adopts the model&#39;s &quot;</span>
+        <span class="s2">&quot;preferred runtime when the effective backend supports it, and falls &quot;</span>
+        <span class="s2">&quot;back to the C++ transceiver otherwise. &#39;CPP&#39; selects the C++ &quot;</span>
+        <span class="s2">&quot;transceiver, &#39;PYTHON&#39; the Python transceiver. None is equivalent to &quot;</span>
+        <span class="s2">&quot;&#39;CPP&#39;. The model preference is only consulted on the PyTorch &quot;</span>
+        <span class="s2">&quot;backend&#39;s standard model-loading path; other paths (e.g. AutoDeploy) &quot;</span>
+        <span class="s2">&quot;fall back to the C++ transceiver under &#39;auto&#39;.&quot;</span><span class="p">)</span>
 
     <span class="n">max_tokens_in_buffer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -5095,6 +5110,20 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request&#39;s scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, &gt;0 enables bounce at that capacity. Only used by the Python (v2) transceiver.&quot;</span>
     <span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_resolve_default_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Effective backend after resolving &quot;DEFAULT&quot; against legacy env vars.</span>
+
+<span class="sd">        Returns (effective_backend, env_var) where env_var is the legacy</span>
+<span class="sd">        environment variable that determined the choice, or None when the</span>
+<span class="sd">        backend was explicit or no env var was set (NIXL fallback).</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">!=</span> <span class="s2">&quot;DEFAULT&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span> <span class="kc">None</span>
+        <span class="k">for</span> <span class="n">env_var</span><span class="p">,</span> <span class="n">backend</span> <span class="ow">in</span> <span class="n">_CACHE_TRANSCEIVER_BACKEND_ENV_VARS</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="n">env_var</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">backend</span><span class="p">,</span> <span class="n">env_var</span>
+        <span class="k">return</span> <span class="s2">&quot;NIXL&quot;</span><span class="p">,</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_CacheTransceiverConfig</span><span class="p">(</span>
@@ -5918,6 +5947,19 @@ window.runMermaid = runMermaid;</script>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Multimodal model configuration.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
+<div class="viewcode-block" id="TorchLlmArgs.init_multimodal_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.init_multimodal_config">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;multimodal_config&#39;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s1">&#39;before&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">init_multimodal_config</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
+        <span class="c1"># The field is non-Optional, but callers (e.g. the multimodal</span>
+        <span class="c1"># quickstart) pass None to mean &quot;unset&quot;. Coerce None back to the</span>
+        <span class="c1"># default so it does not fail type validation.</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">MultimodalConfig</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
     <span class="n">attention_dp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AttentionDpConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optimized load-balancing for the DP Attention scheduler.&quot;</span><span class="p">,</span>
@@ -6130,7 +6172,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">checkpoint_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;The format of the provided checkpoint. You may use a custom checkpoint format by subclassing &quot;</span>
+        <span class="s2">&quot;The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P &quot;</span>
+        <span class="s2">&quot;loading path and falls back to loading the provided Hugging Face checkpoint; it does not require &quot;</span>
+        <span class="s2">&quot;converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing &quot;</span>
         <span class="s2">&quot;`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.</span><span class="se">\n</span><span class="s2">&quot;</span>
         <span class="s2">&quot;If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF &quot;</span>
         <span class="s2">&quot;and the default HfCheckpointLoader will be used.</span><span class="se">\n</span><span class="s2">&quot;</span>
@@ -6160,6 +6204,18 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Only load/execute the vision encoder part of the full model. Defaults to False.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+
+    <span class="n">disable_mm_encoder</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Skip instantiating and loading the multimodal (e.g. vision) encoder &quot;</span>
+        <span class="s2">&quot;of a multimodal checkpoint and serve it text-only. Saves the &quot;</span>
+        <span class="s2">&quot;encoder&#39;s GPU memory (enlarging the KV cache pool) for workloads &quot;</span>
+        <span class="s2">&quot;that never send image/video/audio inputs; such requests are &quot;</span>
+        <span class="s2">&quot;rejected. Only takes effect for model implementations that support &quot;</span>
+        <span class="s2">&quot;it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. &quot;</span>
+        <span class="s2">&quot;Defaults to False.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="n">encode_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -6343,6 +6399,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="s2">&quot;Use encode_only=True for LLM.encode(), or use &quot;</span>
                 <span class="s2">&quot;MultimodalEncoder/mm_encoder_only for multimodal encoder &quot;</span>
                 <span class="s2">&quot;execution.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">disable_mm_encoder</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mm_encoder_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;disable_mm_encoder and mm_encoder_only are mutually &quot;</span>
+                <span class="s2">&quot;exclusive: one skips the multimodal encoder, the other runs &quot;</span>
+                <span class="s2">&quot;only the multimodal encoder.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
@@ -6381,17 +6442,129 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">exclude</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">})</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span><span class="o">**</span><span class="n">eagle_data</span><span class="p">)</span>
 
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span>
-                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">Eagle3DecodingConfig</span><span class="p">):</span>
-                <span class="c1"># Rejection sampling is only wired up for Eagle3 one-model paths.</span>
-                <span class="c1"># Silently fall back for other spec types so the new default</span>
-                <span class="c1"># (True) does not break them.</span>
-                <span class="c1"># TODO: extend rejection sampling to the remaining speculative</span>
-                <span class="c1"># decoding paths (MTP / DraftTarget / PARD / DFlash /</span>
-                <span class="c1"># SaveHiddenStates / SA) and unify the dispatch in SpecMetadata</span>
-                <span class="c1"># so new spec algorithms get rejection sampling for free; once</span>
-                <span class="c1"># all paths are covered this whitelist guard can be removed.</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_rejection_sampling</span><span class="p">:</span>
+                <span class="c1"># Supported paths: Eagle3 one-model, MTP-Eagle one-model,</span>
+                <span class="c1"># vanilla MTP, PARD, DFlash, DraftTarget one-model. Classify by</span>
+                <span class="c1"># spec-dec mode; MTP-Eagle one-model shares the Eagle3 one-model</span>
+                <span class="c1"># worker/metadata/sampler, so it rides the same unified</span>
+                <span class="c1"># production/acceptance path.</span>
+                <span class="c1">#</span>
+                <span class="c1"># Every supported path runs a neural draft head that yields a</span>
+                <span class="c1"># per-token proposal distribution q(x). Rejection sampling needs</span>
+                <span class="c1"># q to form min(1, p/q) and the (p - q)+ residual correction, so</span>
+                <span class="c1"># retrieval-based drafters that emit only token ids with no q are</span>
+                <span class="c1"># excluded: NGram is simply absent from this whitelist, and SA</span>
+                <span class="c1"># (sa_config) is rejected below via rs_sa_active.</span>
+                <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
+                    <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
+
+                <span class="n">spec_mode</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">spec_dec_mode</span>
+                <span class="n">is_supported</span> <span class="o">=</span> <span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                                           <span class="n">Eagle3DecodingConfig</span><span class="p">)</span>
+                                <span class="ow">or</span> <span class="n">spec_mode</span> <span class="o">==</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP</span>
+                                <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_mtp_eagle_one_model</span><span class="p">()</span>
+                                <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_pard</span><span class="p">()</span> <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_dflash</span><span class="p">()</span>
+                                <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_dspark</span><span class="p">()</span>
+                                <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_draft_target_one_model</span><span class="p">())</span>
+
+                <span class="c1"># Combinations that break the proposal-distribution invariant.</span>
+                <span class="c1"># SA is gated for every method; relaxed / parallel / guided gates</span>
+                <span class="c1"># apply only to the newly wired methods (vanilla MTP, PARD,</span>
+                <span class="c1"># DFlash, DraftTarget one-model).</span>
+                <span class="n">is_new_rejection_method</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="n">spec_mode</span> <span class="o">==</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP</span>
+                    <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_pard</span><span class="p">()</span> <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_dflash</span><span class="p">()</span>
+                    <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_dspark</span><span class="p">()</span>
+                    <span class="ow">or</span> <span class="n">spec_mode</span><span class="o">.</span><span class="n">is_draft_target_one_model</span><span class="p">())</span>
+                <span class="c1"># Plain tensor parallelism is supported (the draft path</span>
+                <span class="c1"># all-gathers vocab-sharded draft logits before rejection, see</span>
+                <span class="c1"># SpecWorkerBase.maybe_gather_sharded_draft_logits).</span>
+                <span class="c1"># attention-DP and context parallelism remain gated.</span>
+                <span class="n">rs_parallel_active</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
+                                      <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">enable_attention_dp</span><span class="p">)</span>
+                <span class="n">rs_guided_active</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="n">rs_sa_active</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="s2">&quot;sa_config&quot;</span><span class="p">,</span>
+                                       <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="n">rs_relaxed_active</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                    <span class="s2">&quot;use_relaxed_acceptance_for_thinking&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+                <span class="c1"># Eagle3 dynamic-tree rejection records at most kMaxTriedPerLevel</span>
+                <span class="c1"># (=32, cpp/.../speculativeDecoding/dynamicTreeKernels.cu) tried</span>
+                <span class="c1"># siblings per level; dynamic_tree_max_topK &gt; 32 yields a wrong</span>
+                <span class="c1"># correction distribution, so cap supported topK at 32.</span>
+                <span class="n">_DYNAMIC_TREE_REJECTION_MAX_TOPK</span> <span class="o">=</span> <span class="mi">32</span>
+                <span class="n">rs_dynamic_tree_active</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                                                 <span class="s2">&quot;use_dynamic_tree&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+                <span class="n">rs_dynamic_tree_topk_unsupported</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="n">rs_dynamic_tree_active</span>
+                    <span class="ow">and</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span>
+                         <span class="ow">or</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">_DYNAMIC_TREE_REJECTION_MAX_TOPK</span><span class="p">)</span>
+                <span class="n">mtp_unsupported_combo</span> <span class="o">=</span> <span class="p">(</span>
+                    <span class="n">rs_sa_active</span> <span class="ow">or</span> <span class="n">rs_dynamic_tree_topk_unsupported</span>
+                    <span class="ow">or</span> <span class="p">(</span><span class="n">is_new_rejection_method</span> <span class="ow">and</span>
+                        <span class="p">(</span><span class="n">rs_relaxed_active</span> <span class="ow">or</span> <span class="n">rs_parallel_active</span>
+                         <span class="ow">or</span> <span class="n">rs_guided_active</span><span class="p">)))</span>
+
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">is_supported</span> <span class="ow">or</span> <span class="n">mtp_unsupported_combo</span><span class="p">:</span>
+                    <span class="c1"># Explicit opt-in raises; a default-inherited value is</span>
+                    <span class="c1"># silently disabled for backward compatibility.</span>
+                    <span class="n">explicitly_set</span> <span class="o">=</span> <span class="s2">&quot;use_rejection_sampling&quot;</span> <span class="ow">in</span> \
+                        <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">model_fields_set</span>
+                    <span class="k">if</span> <span class="n">explicitly_set</span><span class="p">:</span>
+                        <span class="n">reasons</span> <span class="o">=</span> <span class="p">[]</span>
+                        <span class="k">if</span> <span class="ow">not</span> <span class="n">is_supported</span><span class="p">:</span>
+                            <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                                <span class="sa">f</span><span class="s2">&quot;spec mode </span><span class="si">{</span><span class="n">spec_mode</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> is not a supported &quot;</span>
+                                <span class="s2">&quot;rejection-sampling path (supported: the Eagle3 &quot;</span>
+                                <span class="s2">&quot;one-model path, vanilla MTP, PARD, DFlash, and &quot;</span>
+                                <span class="s2">&quot;DraftTarget one-model)&quot;</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">rs_sa_active</span><span class="p">:</span>
+                            <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;SA (sa_config) is active&quot;</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">rs_dynamic_tree_topk_unsupported</span><span class="p">:</span>
+                            <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                                <span class="s2">&quot;dynamic_tree_max_topK=&quot;</span>
+                                <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span><span class="si">}</span><span class="s2">&quot;</span>
+                                <span class="s2">&quot; exceeds the dynamic-tree rejection kernel limit &quot;</span>
+                                <span class="sa">f</span><span class="s2">&quot;of </span><span class="si">{</span><span class="n">_DYNAMIC_TREE_REJECTION_MAX_TOPK</span><span class="si">}</span><span class="s2"> tried &quot;</span>
+                                <span class="s2">&quot;siblings per level&quot;</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">is_new_rejection_method</span><span class="p">:</span>
+                            <span class="k">if</span> <span class="n">rs_relaxed_active</span><span class="p">:</span>
+                                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                                    <span class="s2">&quot;relaxed-thinking acceptance is enabled&quot;</span><span class="p">)</span>
+                            <span class="k">if</span> <span class="n">rs_parallel_active</span><span class="p">:</span>
+                                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                                    <span class="s2">&quot;tensor/context parallelism or attention-DP &quot;</span>
+                                    <span class="s2">&quot;is active (the draft path resolves only &quot;</span>
+                                    <span class="s2">&quot;the global argmax, not full distributions)&quot;</span>
+                                <span class="p">)</span>
+                            <span class="k">if</span> <span class="n">rs_guided_active</span><span class="p">:</span>
+                                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;guided decoding is enabled&quot;</span><span class="p">)</span>
+                        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                            <span class="s2">&quot;use_rejection_sampling=True is not supported for &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;this configuration: </span><span class="si">{</span><span class="s1">&#39;; &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">reasons</span><span class="p">)</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_rejection_sampling</span> <span class="o">=</span> <span class="kc">False</span>
+                <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">use_rejection_sampling</span><span class="p">:</span>
+                    <span class="c1"># The non-dynamic-tree one-model rejection path depends on</span>
+                    <span class="c1"># FlashInfer (sampling_from_probs /</span>
+                    <span class="c1"># chain_speculative_sampling); fail fast if it is missing.</span>
+                    <span class="c1"># The dynamic-tree path uses</span>
+                    <span class="c1"># verify_dynamic_tree_rejection_out /</span>
+                    <span class="c1"># compute_probs_from_logits (CUDA op with a PyTorch</span>
+                    <span class="c1"># fallback) and does not require FlashInfer.</span>
+                    <span class="n">rs_dynamic_tree_active</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
+                                                     <span class="s2">&quot;use_dynamic_tree&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="ow">not</span> <span class="n">rs_dynamic_tree_active</span><span class="p">:</span>
+                        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.flashinfer_utils</span><span class="w"> </span><span class="kn">import</span> \
+                            <span class="n">IS_FLASHINFER_AVAILABLE</span>
+                        <span class="k">if</span> <span class="ow">not</span> <span class="n">IS_FLASHINFER_AVAILABLE</span><span class="p">:</span>
+                            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                                <span class="s2">&quot;use_rejection_sampling=True requires FlashInfer, &quot;</span>
+                                <span class="s2">&quot;which is not available in this environment. &quot;</span>
+                                <span class="s2">&quot;Install flashinfer-python or set &quot;</span>
+                                <span class="s2">&quot;use_rejection_sampling=False.&quot;</span><span class="p">)</span>
+                <span class="c1"># The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,</span>
+                <span class="c1"># DraftTarget one-model) share the SpecMetadata slot-indexed</span>
+                <span class="c1"># dispatch.</span>
 
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">PARDDecodingConfig</span><span class="p">):</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;PARD max_draft_len must be &gt; 0&quot;</span>
@@ -6418,6 +6591,92 @@ window.runMermaid = runMermaid;</script>
                             <span class="n">mask_id</span> <span class="o">=</span> <span class="n">dflash_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;mask_token_id&quot;</span><span class="p">)</span>
                             <span class="k">if</span> <span class="n">mask_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                                 <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">mask_token_id</span> <span class="o">=</span> <span class="n">mask_id</span>
+
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">DSparkDecodingConfig</span><span class="p">):</span>
+                <span class="n">spec_cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span>
+                <span class="k">if</span> <span class="ow">not</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;DSpark max_draft_len must be &gt; 0; got &quot;</span>
+                                     <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">spec_cfg</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="c1"># The DSpark draft weights live in the ``mtp.*`` namespace of a</span>
+                <span class="c1"># local checkpoint directory; without ``speculative_model``</span>
+                <span class="c1"># neither the draft weights nor the ``dspark_*`` config</span>
+                <span class="c1"># defaults can be located, and engine construction would fail</span>
+                <span class="c1"># much later with an opaque error.</span>
+                <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="s2">&quot;DSpark requires speculative_config.speculative_model &quot;</span>
+                        <span class="s2">&quot;to point at the checkpoint directory containing the &quot;</span>
+                        <span class="s2">&quot;mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this &quot;</span>
+                        <span class="s2">&quot;is the target checkpoint directory itself).&quot;</span><span class="p">)</span>
+                <span class="c1"># Resolve target_layer_ids / mask_token_id / block_size /</span>
+                <span class="c1"># markov_rank from the draft (or main) model config if not set.</span>
+                <span class="c1"># DSpark ships these as top-level ``dspark_*`` keys in the</span>
+                <span class="c1"># DeepSeek-V4-Pro config.json; also accept a nested</span>
+                <span class="c1"># ``dspark_config`` dict for forward compatibility.</span>
+                <span class="n">draft_config_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">spec_cfg</span><span class="o">.</span><span class="n">speculative_model</span><span class="p">,</span>
+                                                 <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">draft_config_path</span><span class="p">):</span>
+                    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">draft_config_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                        <span class="n">draft_cfg</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+                    <span class="n">dspark_cfg</span> <span class="o">=</span> <span class="n">draft_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;dspark_config&quot;</span><span class="p">,</span> <span class="p">{})</span>
+
+                    <span class="k">def</span><span class="w"> </span><span class="nf">_dspark_get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">top_level_key</span><span class="p">):</span>
+                        <span class="n">value</span> <span class="o">=</span> <span class="n">dspark_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">value</span> <span class="o">=</span> <span class="n">draft_cfg</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">top_level_key</span><span class="p">)</span>
+                        <span class="k">return</span> <span class="n">value</span>
+
+                    <span class="c1"># The checkpoint&#39;s ``dspark_target_layer_ids`` is</span>
+                    <span class="c1"># authoritative: it fixes both which target hidden states</span>
+                    <span class="c1"># were captured during draft training and the input width of</span>
+                    <span class="c1"># ``main_proj`` (hidden_size * num_capture_layers). If the</span>
+                    <span class="c1"># user leaves ``target_layer_ids`` unset we copy it verbatim</span>
+                    <span class="c1"># (order preserved, since the projection columns are</span>
+                    <span class="c1"># order-dependent). An explicit override that does not match</span>
+                    <span class="c1"># the checkpoint list exactly would either mismatch the</span>
+                    <span class="c1"># projection shape at runtime (different count) or feed the</span>
+                    <span class="c1"># draft hidden states it was not trained on (same count,</span>
+                    <span class="c1"># different layers), so reject it during validation.</span>
+                    <span class="n">ckpt_layer_ids</span> <span class="o">=</span> <span class="n">_dspark_get</span><span class="p">(</span><span class="s2">&quot;target_layer_ids&quot;</span><span class="p">,</span>
+                                                 <span class="s2">&quot;dspark_target_layer_ids&quot;</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">target_layer_ids</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="k">if</span> <span class="n">ckpt_layer_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">spec_cfg</span><span class="o">.</span><span class="n">target_layer_ids</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">ckpt_layer_ids</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">ckpt_layer_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="nb">list</span><span class="p">(</span>
+                            <span class="n">spec_cfg</span><span class="o">.</span><span class="n">target_layer_ids</span><span class="p">)</span> <span class="o">!=</span> <span class="nb">list</span><span class="p">(</span><span class="n">ckpt_layer_ids</span><span class="p">):</span>
+                        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                            <span class="s2">&quot;DSpark target_layer_ids must match the checkpoint&#39;s &quot;</span>
+                            <span class="s2">&quot;dspark_target_layer_ids exactly (the draft &quot;</span>
+                            <span class="s2">&quot;projection weights are trained for that specific &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;layer set); got override </span><span class="si">{</span><span class="n">spec_cfg</span><span class="o">.</span><span class="n">target_layer_ids</span><span class="si">}</span><span class="s2"> &quot;</span>
+                            <span class="sa">f</span><span class="s2">&quot;but the checkpoint specifies </span><span class="si">{</span><span class="nb">list</span><span class="p">(</span><span class="n">ckpt_layer_ids</span><span class="p">)</span><span class="si">}</span><span class="s2">. &quot;</span>
+                            <span class="s2">&quot;Leave target_layer_ids unset to use the checkpoint &quot;</span>
+                            <span class="s2">&quot;value.&quot;</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">mask_token_id</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">mask_id</span> <span class="o">=</span> <span class="n">_dspark_get</span><span class="p">(</span><span class="s2">&quot;mask_token_id&quot;</span><span class="p">,</span>
+                                              <span class="s2">&quot;dspark_noise_token_id&quot;</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">mask_id</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">spec_cfg</span><span class="o">.</span><span class="n">mask_token_id</span> <span class="o">=</span> <span class="n">mask_id</span>
+                    <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">block_size</span> <span class="o">=</span> <span class="n">_dspark_get</span><span class="p">(</span><span class="s2">&quot;block_size&quot;</span><span class="p">,</span>
+                                                 <span class="s2">&quot;dspark_block_size&quot;</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">block_size</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">block_size</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">markov_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                        <span class="n">markov_rank</span> <span class="o">=</span> <span class="n">_dspark_get</span><span class="p">(</span><span class="s2">&quot;markov_rank&quot;</span><span class="p">,</span>
+                                                  <span class="s2">&quot;dspark_markov_rank&quot;</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="n">markov_rank</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                            <span class="n">spec_cfg</span><span class="o">.</span><span class="n">markov_rank</span> <span class="o">=</span> <span class="n">markov_rank</span>
+                <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">max_draft_len</span>
+                <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="s2">&quot;DSpark block_size must be greater than zero&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span> <span class="o">!=</span> <span class="n">spec_cfg</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="s2">&quot;DSpark block_size must equal max_draft_len; got &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;block_size=</span><span class="si">{</span><span class="n">spec_cfg</span><span class="o">.</span><span class="n">block_size</span><span class="si">}</span><span class="s2"> and &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;max_draft_len=</span><span class="si">{</span><span class="n">spec_cfg</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">SADecodingConfig</span><span class="p">):</span>
                 <span class="n">pool_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">global_pool_size</span>
@@ -7026,9 +7285,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2026.</p>
+  <p>Last updated on July 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
   
 </div></div>
       

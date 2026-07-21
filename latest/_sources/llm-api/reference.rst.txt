@@ -297,6 +297,14 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
+.. autoclass:: tensorrt_llm.llmapi.DSparkDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
 .. autoclass:: tensorrt_llm.llmapi.SADecodingConfig
     :members:
     :undoc-members:
@@ -352,7 +360,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: from_orm,json,model_construct,model_validate,model_config,copy,construct,model_extra,model_fields_set,dict,update_forward_refs,model_dump,model_post_init,model_rebuild,parse_file,parse_raw,model_fields,model_validate_json,model_copy,model_computed_fields,model_dump_json,schema_json,model_parametrized_name,schema,validate,model_json_schema,parse_obj,model_validate_strings
+    :exclude-members: model_validate,parse_file,update_forward_refs,model_fields_set,model_post_init,copy,parse_raw,dict,schema,model_validate_json,model_rebuild,model_validate_strings,parse_obj,model_config,model_parametrized_name,model_copy,model_computed_fields,schema_json,model_fields,model_dump,from_orm,validate,json,model_dump_json,model_extra,model_json_schema,model_construct,construct
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
