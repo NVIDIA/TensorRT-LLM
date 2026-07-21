@@ -47,8 +47,8 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
-                           is_hybrid_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid)
+                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -120,6 +120,19 @@ def get_kv_cache_manager_cls(
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
+
+        # Kimi K3 (KDA + MLA hybrid) is only supported with the Mixed
+        # manager (separate KV / recurrent-state pools) for now; the unified
+        # C++ pool path (block reuse) is untested for its MLA + KDA layout.
+        if is_kimi_linear(config):
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "Kimi K3 (kimi_linear) requires "
+                    "kv_cache_config.enable_block_reuse=False (block reuse "
+                    "is not supported with its KDA recurrent state).")
+            logger.info(
+                "Using MixedMambaHybridCacheManager for Kimi K3 hybrid model")
+            return MixedMambaHybridCacheManager
 
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
@@ -1839,7 +1852,68 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
 
-    if is_mla(config):
+    if is_kimi_linear(config):
+        # Kimi K3 hybrid: KDA (Kimi Delta Attention) recurrent/conv states on
+        # the mamba side of the hybrid manager, absorbed-MQA MLA latent cache
+        # (num_kv_heads=1, head_dim = kv_lora_rank + qk_rope_head_dim,
+        # SELFKONLY) on the paged-KV side. Must come before the is_mla(...)
+        # route: the kimi_linear config carries MLA fields, but only 24 of
+        # its 93 layers are MLA.
+        if max_beam_width > 1:
+            raise ValueError(
+                "MambaHybridCacheManager + beam search is not supported yet.")
+        if not estimating_kv_cache and kv_connector_manager is not None:
+            raise NotImplementedError(
+                "Connector manager is not supported for MambaHybridCacheManager."
+            )
+        mamba_params = extract_mamba_kv_cache_params(
+            config,
+            layer_mask=layer_mask,
+            spec_config=spec_config,
+            quant_config=quant_config,
+        )
+        # Kimi K3 runs EP-only parallelism: the KDA layers are fully
+        # replicated on every rank (no head sharding). The cache manager
+        # divides num_heads / n_groups / conv_dim by tp_size internally, so
+        # pre-scale them here to keep the per-rank state at full size.
+        kimi_state_tp = (mapping.tp_size
+                         if not mapping.enable_attention_dp else 1)
+        if kimi_state_tp > 1:
+            mamba_params.num_heads *= kimi_state_tp
+            mamba_params.n_groups *= kimi_state_tp
+        kv_cache_manager = kv_cache_manager_cls(
+            # mamba (KDA) cache parameters
+            mamba_params.state_size,
+            mamba_params.conv_kernel,
+            mamba_params.num_heads,
+            mamba_params.n_groups,
+            mamba_params.head_dim,
+            mamba_params.num_mamba_layers,
+            mamba_params.mamba_layer_mask,
+            mamba_params.dtype,
+            mamba_params.mamba_ssm_cache_dtype,
+            # kv cache parameters (MLA latent cache)
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+            num_layers=mamba_params.num_full_attention_layers,
+            layer_mask=mamba_params.full_attention_layer_mask,
+            num_kv_heads=1,
+            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            is_draft=is_draft,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+            spec_config=spec_config,
+            is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
+            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
+            # all three KDA sections have identical width.
+            model_type="qwen3_next",
+            **manager_extra_kwargs,
+        )
+    elif is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,

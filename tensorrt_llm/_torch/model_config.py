@@ -29,8 +29,8 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
+    is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -1361,6 +1361,8 @@ class ModelConfig(Generic[TConfig]):
             return cfg.hybrid_override_pattern.count("*")
         if is_qwen3_hybrid(cfg):
             return get_qwen3_hybrid_num_attention_layers(cfg)
+        if is_kimi_linear(cfg):
+            return get_kimi_linear_num_attention_layers(cfg)
         return cfg.num_hidden_layers
 
     def get_num_mamba_layers(self) -> int:
@@ -1370,6 +1372,9 @@ class ModelConfig(Generic[TConfig]):
             return cfg.hybrid_override_pattern.count("M")
         if is_qwen3_hybrid(cfg):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
+                cfg)
+        if is_kimi_linear(cfg):
+            return cfg.num_hidden_layers - get_kimi_linear_num_attention_layers(
                 cfg)
         return 0
 

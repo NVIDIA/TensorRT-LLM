@@ -1,0 +1,11 @@
+# Extra LLM-API options for Kimi K3 (golden prairie) runs, used by
+# trtllm-eval via --config. Kimi K3 runtime constraints: no overlap
+# scheduler, no CUDA graphs, no chunked prefill, no KV block reuse,
+# tokens_per_block=64 (MLA (576,512) trtllm-gen generation kernel).
+disable_overlap_scheduler: true
+cuda_graph_config: null
+enable_chunked_prefill: false
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64
