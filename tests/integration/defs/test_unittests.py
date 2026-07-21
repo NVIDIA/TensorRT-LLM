@@ -249,7 +249,6 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             "-s",
             f"--output-dir={inner_output_dir}",
             f"--s3-upload-path={inner_upload_path}",
-            "--s3-capture-mode=direct",
             "--s3-upload-mode=deferred",
         ]
         inline_output_max_bytes = request.config.getoption(
