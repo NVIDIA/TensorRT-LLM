@@ -640,6 +640,36 @@ class ModelConfig(Generic[TConfig]):
                 quantization_config.get('quantized_layers', None) is not None)
 
     @staticmethod
+    def _normalize_deepseek_v4_mixed_precision_base_quant_config(
+            pretrained_config: transformers.PretrainedConfig,
+            quant_config: QuantConfig) -> QuantConfig:
+        """Resolve FP8 base layers in DeepSeek-V4 mixed checkpoints."""
+        hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                  None)
+        if (quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
+                or not isinstance(hf_quant_config, dict)
+                or hf_quant_config.get("quant_method") != "fp8"
+                or tuple(hf_quant_config.get("weight_block_size",
+                                             ())) != (128, 128)):
+            return quant_config
+
+        default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj*"]
+        hf_exclude_modules = hf_quant_config.get("modules_to_not_convert") or []
+        exclude_modules = list(
+            dict.fromkeys(list(hf_exclude_modules) + default_exclude))
+        fp8_quant_config = quant_config.model_copy(
+            deep=True,
+            update={
+                "quant_algo": QuantAlgo.FP8_BLOCK_SCALES,
+                "group_size": 128,
+                "exclude_modules": exclude_modules,
+            },
+        )
+        fp8_quant_config.__dict__.pop("quant_mode", None)
+        fp8_quant_config.__dict__.pop("layer_quant_mode", None)
+        return fp8_quant_config
+
+    @staticmethod
     def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
                                                  checkpoint_dir: str,
                                                  moe_backend: str,
@@ -1174,6 +1204,10 @@ class ModelConfig(Generic[TConfig]):
         elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend_hint)
+
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            quant_config = cls._normalize_deepseek_v4_mixed_precision_base_quant_config(
+                pretrained_config, quant_config)
 
         kwargs['moe_backend'] = cls.resolve_moe_backend(
             requested_moe_backend,
