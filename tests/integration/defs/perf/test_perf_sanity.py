@@ -1174,6 +1174,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    internal_request_auth_key: str = ""
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1998,6 +1999,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )

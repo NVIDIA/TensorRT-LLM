@@ -180,7 +180,6 @@ def parse_disagg_config_file(yaml_config_file: str):
     with open(yaml_config_file, 'r') as file:
 
         config = yaml.safe_load(file)
-
         disagg_server_config = extract_disagg_cfg(**config)
 
         return disagg_server_config
@@ -262,9 +261,9 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
-    if internal_request_auth_key is not None and not isinstance(
-            internal_request_auth_key, str):
-        raise ValueError("internal_request_auth_key must be a string")
+    if internal_request_auth_key is not None and (not isinstance(
+            internal_request_auth_key, str) or not internal_request_auth_key):
+        raise ValueError("internal_request_auth_key must be a non-empty string")
     config.internal_request_auth_key = internal_request_auth_key
     return config
 

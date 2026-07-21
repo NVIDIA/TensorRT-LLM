@@ -144,6 +144,20 @@ def test_extract_disagg_cfg_internal_request_auth_key(sample_yaml_config):
         0].other_args
 
 
+def test_extract_disagg_cfg_rejects_invalid_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key="")
+
+
+def test_extract_disagg_cfg_rejects_non_string_internal_request_auth_key():
+    with pytest.raises(
+            ValueError,
+            match="internal_request_auth_key must be a non-empty string"):
+        extract_disagg_cfg(internal_request_auth_key=123)
+
+
 def test_extract_ctx_gen_cfgs():
     configs = extract_ctx_gen_cfgs(
         type="ctx",
