@@ -76,6 +76,10 @@ if TYPE_CHECKING:
 # Required keys for the calibration ``.pt`` consumed by TriAttention.
 _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_sq"})
 
+# Upper bound of the geometric integration offset ladder [1, 2, 4, ...]; no
+# caller ever tuned it, so it is a constant rather than a constructor knob.
+_OFFSET_MAX_LENGTH = 65536
+
 
 def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Tensor:
     """Upstream pruning_utils.build_geometric_offsets: [1, 2, 4, ... <=max]."""
@@ -1056,7 +1060,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         beta: int = 128,
         model_path: Optional[str] = None,
         calibration_path: Optional[str] = None,
-        offset_max_length: int = 65536,
         score_aggregation: str = "mean",
         eviction_mode: str = "union",
         normalize_scores: bool = True,
@@ -1110,7 +1113,6 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         # Geometric integration offsets (built lazily on first eviction so the
         # device matches the cache pool).
-        self._offset_max_length = offset_max_length
         self._offsets: Optional[torch.Tensor] = None
 
         # Request presence records successful initialization. The record also
@@ -1947,7 +1949,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         first_pool = layout.layer_pools[layout.dense_layers[0]]
         if self._offsets is None:
-            self._offsets = _build_geometric_offsets(self._offset_max_length, first_pool.device)
+            self._offsets = _build_geometric_offsets(_OFFSET_MAX_LENGTH, first_pool.device)
         q_real, q_imag, mlr_coef = self._local_score_calibration(
             layout.num_layers, layout.global_layers
         )
