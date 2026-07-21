@@ -41,9 +41,11 @@ class FluxJointAttention(Attention):
     - FLUX-style RoPE on concatenated text+image tokens
     - pre_only mode for single-stream blocks (no output projection)
 
-    When fuse_qk_norm_rope is enabled (default), the fused CUDA kernel handles
-    QK norm + RoPE in a single pass. When disabled, falls back to separate
-    F.rms_norm + apply_rotary_emb calls.
+    FLUX enables fuse_qk_norm_rope by default when TP=1: the fused CUDA
+    kernel handles QK norm + RoPE in a single pass. It falls back to separate
+    F.rms_norm + apply_rotary_emb calls when disabled, and is disabled under
+    tensor parallelism because the fused op currently requires TP=1
+    (apply_packed_qk_norm_rope asserts tp_size == 1).
     """
 
     def __init__(
@@ -59,6 +61,11 @@ class FluxJointAttention(Attention):
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
+        # Opt in to the fused DiT QK-norm + RoPE kernel (per-head template), but
+        # only when TP=1: the fused op asserts tp_size == 1
+        # (apply_packed_qk_norm_rope), so under TP>1 we fall back to the unfused
+        # F.rms_norm + apply_rotary_emb path. Mirrors WAN's gating.
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -69,6 +76,7 @@ class FluxJointAttention(Attention):
             eps=eps,
             bias=bias,
             interleave=True,
+            fuse_qk_norm_rope=(tp_size == 1),
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
@@ -101,6 +109,11 @@ class FluxJointAttention(Attention):
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                override_tp_sharding={
+                    "q": (self.local_q_dim_start, self.local_q_dim_end),
+                    "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                    "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+                },
             )
 
             # Need not pass any mapping info since this is intra-head normalization
@@ -130,6 +143,7 @@ class FluxJointAttention(Attention):
                 allreduce_strategy=config.allreduce_strategy,
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 reduce_output=True,
+                override_tp_sharding=(self.local_kv_dim_start, self.local_kv_dim_end),
             )
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -350,6 +364,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             config=config,
+            attn_shard=(self.local_q_dim_start, self.local_q_dim_end),
         )
 
     def _init_qkv_proj(self):
@@ -366,6 +381,11 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             mapping=self.mapping,
+            override_qkv_sharding={
+                "q": (self.local_q_dim_start, self.local_q_dim_end),
+                "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+            },
         )
 
     def _apply_norm_rope_unfused(

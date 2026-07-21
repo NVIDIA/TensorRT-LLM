@@ -14,7 +14,7 @@ dependencies = [
     "sentencepiece (>=0.1.99)",
     "tiktoken (>=0.13.0,<0.14.0)",
     "einops (>=0.8.2,<0.9.0)",
-    "torchvision (>=0.27.1,<0.28.0)"
+    "torchvision (>=0.28.0,<0.29.0)"
 ]
 
 

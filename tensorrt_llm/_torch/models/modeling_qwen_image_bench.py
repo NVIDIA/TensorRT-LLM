@@ -40,10 +40,16 @@ _QWEN_IMAGE_BENCH_PLACEHOLDERS = MultimodalPlaceholderMetadata(
 class _QwenImageBenchModelMixin:
     @property
     def multimodal_data_device_paths(self) -> List[str]:
+        # Keep the mrope_config entries in sync with `_Qwen3_5VLModel`
+        # (modeling_qwen3_5.py): the shared Qwen-VL mRoPE seq-slot cache path
+        # consumes `mrope_position_deltas` on the model device, so the engine
+        # must move them H2D along with the rest of the multimodal payload.
         return [
             "image.pixel_values",
             "video.pixel_values_videos",
             "multimodal_embedding",
+            "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas",
         ]
 
     @property

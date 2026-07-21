@@ -38,6 +38,7 @@ from typing import (
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
 )
@@ -87,16 +88,16 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.interface import SamplerConfig, resolve_sampling_backend
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
     BeamSearchMetadata,
+    FlashInferGroupedStrategySampler,
+    Fusions,
     GenericStrategyKeyType,
     Strategy,
     StrategyMetadata,
     UtilsSamplingParams,
-    _Fusions,
     get_rejected_indices,
     resolve_sampling_strategy,
     sample,
@@ -1113,8 +1114,6 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
-    use_host_stop_criteria: bool = False
-    """Whether update_requests should evaluate end-ID and length limits on the host."""
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -2323,7 +2322,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_beam_width: int
         max_total_draft_tokens: int
         disable_overlap_scheduler: bool = False
-        disable_flashinfer_sampling: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
 
@@ -2338,6 +2336,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if args.max_total_draft_tokens > 0 and args.max_beam_width > 1:
             raise ValueError("TorchSampler does not support beam search with speculative decoding")
         self.max_num_sequences = args.max_num_sequences
+        # With the overlap scheduler, sample_async for step i runs before
+        # update_requests for step i-1, so the host-side token lists lag the
+        # device state. Track, per seq slot, how many sampled steps have not
+        # been folded back into the request yet; bad-words handling uses this
+        # to decide whether the newest token must be read device-side.
+        self._track_pending_steps = not args.disable_overlap_scheduler
+        self._pending_steps = [0] * self.max_num_sequences
         self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences, self.max_beam_width)
         self.CACHE_INDIRECTION_SHAPE = (
             self.max_num_sequences,
@@ -2347,13 +2352,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        self._grouped_sampler_cls = resolve_sampling_backend(
-            is_cuda=True,
-            config=SamplerConfig(
-                # IS_FLASHINFER_AVAILABLE is checked inside resolve_sampling_backend.
-                use_flashinfer=not args.disable_flashinfer_sampling,
-            ),
-        )
+        # The Torch sampler hard-depends on flashinfer. Enforce it once here, at
+        # construction, so the check stays out of the CUDA-graph-captured
+        # sampling loop.
+        if not IS_FLASHINFER_AVAILABLE:
+            raise ImportError(
+                "flashinfer is not available, please install the version pinned "
+                "in requirements.txt."
+            )
+        self._grouped_sampler_cls = FlashInferGroupedStrategySampler
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -2406,6 +2413,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             None
         ] * self.max_num_sequences
 
+    @staticmethod
+    def _is_draft_batch(requests: list[LlmRequest]) -> bool:
+        """Whether this batch belongs to the draft model.
+
+        Batches are homogeneous by construction: ModelDrafter builds all-draft
+        batches for its sample_async/update_requests calls on this shared
+        sampler, and PyExecutor's batches are all-target. The pending-steps
+        accounting relies on this to skip draft batches wholesale; assert it so
+        a mixed batch fails loudly instead of silently corrupting the counters.
+        """
+        is_draft: bool = requests[0].py_is_draft
+        assert all(r.py_is_draft == is_draft for r in requests), (
+            "sampler batch must be homogeneous (all-draft or all-target)"
+        )
+        return is_draft
+
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
 
@@ -2453,21 +2476,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if req.py_return_log_probs:
                 return False
         return True
-
-    def _can_use_host_stop_criteria(self, requests: list[LlmRequest]) -> bool:
-        """Check whether stop criteria can be evaluated from the host token copy.
-
-        The non-speculative, single-beam path already copies sampled tokens to
-        the host. When no request has stop words, checking end IDs and length
-        limits on the host avoids the device finish-reason kernels and their
-        additional D2H copy.
-        """
-        return (
-            bool(requests)
-            and self.max_tokens == 1
-            and self.max_beam_width == 1
-            and all(not req.py_is_draft and not req.py_stop_words_list for req in requests)
-        )
 
     @staticmethod
     def _meet_max_token_stop_criteria(
@@ -2558,31 +2566,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
             return True
         return False
-
-    def _handle_finish_reasons(
-        self,
-        request: LlmRequest,
-        finish_reasons: torch.Tensor,
-        finish_reasons_list: list[list[list[int]]],
-    ) -> bool:
-        """Check if all beams of a request have finished and set the request state accordingly
-
-        Args:
-            request: LlmRequest. The request to check.
-            finish_reasons: torch.Tensor. Shape: (max_tokens, max_batch_size, max_beam_width)
-                            The finish reasons for each beam.
-            finish_reasons_list: list[list[list[int]]]. The finish reasons for each beam.
-        Returns:
-            True if all beams have finished, False otherwise.
-        """
-        assert request.py_seq_slot is not None
-        beam_width = request.py_beam_width
-        return self._handle_finish_reasons_impl(
-            request,
-            beam_width,
-            finish_reasons[DEFAULT_STEP_IDX, request.py_seq_slot],
-            finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX],
-        )
 
     def _handle_first_finish_reasons(
         self,
@@ -3214,8 +3197,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             pin_memory=pin_memory,
             dtype=torch.int32,
         )
-        logprobs_tensor = logprobs_tensor_full[:, :-preallocate_extra_steps, :]
-        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :-preallocate_extra_steps, :]
+        # NB: forward slicing, because [:, :-0, :] would yield an empty view
+        #     instead of the full history when preallocate_extra_steps == 0.
+        logprobs_tensor = logprobs_tensor_full[:, :num_generated_tokens, :]
+        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :num_generated_tokens, :]
         if logprobs_tensor.numel() > 0:
             logprobs_list = request.py_result.log_probs
             assert logprobs_list is not None
@@ -3662,6 +3647,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if not state.requests:
             return
 
+        if self._track_pending_steps and not self._is_draft_batch(state.requests):
+            for req in state.requests:
+                slot = req.py_seq_slot
+                if slot is not None and self._pending_steps[slot] > 0:
+                    self._pending_steps[slot] -= 1
+
         assert state.host is not None
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
@@ -3736,23 +3727,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
-                if state.use_host_stop_criteria:
-                    new_token = add_token(req, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
-                    self._handle_stop_criteria(
-                        req,
-                        new_token,
-                        max_seq_len=self.max_seq_len,
-                        beam_idx=DEFAULT_BEAM_IDX,
-                    )
-                    num_accepted = 0
-                else:
-                    num_accepted = self.process_draft_tokens(
-                        req,
-                        new_tokens_tensor=new_tokens,
-                        new_tokens_list=new_tokens_list,
-                        finish_reasons=finish_reasons,
-                        resource_manager=resource_manager,
-                    )
+                num_accepted = self.process_draft_tokens(
+                    req,
+                    new_tokens_tensor=new_tokens,
+                    new_tokens_list=new_tokens_list,
+                    finish_reasons=finish_reasons,
+                    resource_manager=resource_manager,
+                )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
                     req.py_rewind_len = actual_draft_len - num_accepted
@@ -3806,15 +3787,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 
+        if self._track_pending_steps:
+            # A context request claims a (possibly reused) slot: clear any
+            # counter leaked by a prior occupant that never got its final
+            # update_requests. Must happen before _process_requests, which
+            # reads the counters for bad-words staleness.
+            for r in scheduled_requests.context_requests:
+                if not r.py_is_draft:
+                    assert r.py_seq_slot is not None
+                    self._pending_steps[r.py_seq_slot] = 0
+
         # seq_slots_cuda / seq_lens_cuda are cast once inside
         # _process_requests and shared with the beam-search metadata builder.
         (
             requests,
             seq_slots_host,
+            seq_lens_host,
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
-            use_host_stop_criteria,
         ) = self._process_requests(
             scheduled_requests,
             model_outputs,
@@ -3822,14 +3813,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_context_logits_prefix_sum,
         )
 
+        if self._track_pending_steps and requests and not self._is_draft_batch(requests):
+            for r in requests:
+                assert r.py_seq_slot is not None
+                self._pending_steps[r.py_seq_slot] += 1
+
         finish_reasons_host: torch.Tensor | None = None
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
         # Forwarded to _record_sampler_event so SamplerEvent.synchronize
         # awaits any side-stream D2H copies host-side.
         side_stream_event: torch.cuda.Event | None = None
-        if requests and not use_host_stop_criteria:
-            assert seq_lens_cuda is not None
+        if requests:
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
             # Prepare stop word handling
@@ -3895,7 +3890,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
-            use_host_stop_criteria=use_host_stop_criteria,
         )
 
     @staticmethod
@@ -4244,7 +4238,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 logit_indices_for_raw_logprobs_cuda += batch_next_tokens_offset_start
                 # NB: Copy could be avoided by storing logit indices (and temperature) instead (cf. comment on
                 #     processed logprobs above).
-                _Fusions.gather_scatter(
+                Fusions.gather_scatter(
                     batch_logits_for_logprobs_cuda,
                     logit_indices_for_raw_logprobs_cuda,
                     group_logits_cuda,
@@ -4330,44 +4324,53 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _apply_min_length_penalty(
         logits: torch.Tensor,
         requests: list[LlmRequest],
-        num_steps: list[int],
-        num_beams: list[int],
-    ) -> torch.Tensor:
-        """Inplace apply min_length_penalty to logits.
+        num_steps_tensor: torch.Tensor,
+        num_beams_tensor: torch.Tensor,
+    ) -> None:
+        """Apply min_length_penalty to logits, mutating ``logits`` in place.
 
         Args:
             logits: The logits to apply min length penalty to
             requests: The requests to apply min length penalty to
-            num_steps: The number of steps per request
-
-        Returns:
-            The logits with min length penalty applied
+            num_steps_tensor: The number of steps per request (host tensor)
+            num_beams_tensor: The number of beams per request (host tensor)
         """
         if not any(
             r.py_min_length and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
             for r in requests
         ):
-            return logits
+            return
+
+        # Deferred host conversion: only needed on the (rare) penalty path.
+        num_steps = num_steps_tensor.tolist()
+        num_beams = num_beams_tensor.tolist()
 
         rows: list[int] = []
         cols: list[int] = []
         current_offset = 0
         for index, r in enumerate(requests):
-            if r.py_min_length:
-                # Use the original end_id (before ignore_eos override)
-                # so we suppress the real EOS token, not token -1.
-                end_id = getattr(r, "py_original_end_id", r.py_end_id)
-                if end_id is not None and end_id > -1:
-                    for beam_idx in range(num_beams[index]):
-                        for step in range(num_steps[index]):
-                            if (
-                                r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                            ) + step < r.py_min_length[0]:
-                                rows.append(current_offset + num_steps[index] * beam_idx + step)
-                                cols.append(end_id)
-                            else:
-                                break
+            # Advance the offset before any guard below can skip the request:
+            # every request occupies its logits rows, penalized or not.
+            req_offset = current_offset
             current_offset += num_steps[index] * num_beams[index]
+
+            if not r.py_min_length:
+                continue
+            # Use the original end_id (before ignore_eos override)
+            # so we suppress the real EOS token, not token -1.
+            end_id = getattr(r, "py_original_end_id", r.py_end_id)
+            if end_id is None or end_id <= -1:
+                continue
+
+            for beam_idx in range(num_beams[index]):
+                for step in range(num_steps[index]):
+                    if (r.get_num_tokens(beam_idx) - r.py_orig_prompt_len) + step < r.py_min_length[
+                        0
+                    ]:
+                        rows.append(req_offset + num_steps[index] * beam_idx + step)
+                        cols.append(end_id)
+                    else:
+                        break
 
         if rows:
             neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
@@ -4379,7 +4382,155 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
 
-        return logits
+    @staticmethod
+    @torch.inference_mode()
+    def _apply_bad_words(
+        logits: torch.Tensor,
+        requests: list[LlmRequest],
+        num_steps: list[int],
+        num_beams: list[int],
+        *,
+        new_tokens_cuda: torch.Tensor | None = None,
+        stale_by_one: list[bool] | None = None,
+    ) -> None:
+        """Inplace ban "bad words" by masking their final token's logit to -inf.
+
+        A single-token word is banned unconditionally; a multi-token word
+        ``[t0, ..., t_{k-1}]`` bans its final token ``t_{k-1}`` only when the
+        ``k-1`` most recently generated tokens exactly match the prefix
+        ``[t0, ..., t_{k-2}]``.
+
+        With the overlap scheduler, ``sample_async`` for step ``i`` runs before
+        ``update_requests`` for step ``i-1``, so ``r.get_tokens()`` is missing
+        exactly the previous step's token; that token still lives device-side in
+        ``new_tokens_cuda``. For requests flagged in ``stale_by_one``, the
+        prefix match is therefore split: the first ``k-2`` prefix tokens are
+        matched on the host against the (complete up to there) host context, and
+        the final prefix token is compared on the GPU against
+        ``new_tokens_cuda[0, seq_slot, 0]``, without any device-to-host
+        synchronization. This path only supports ``num_steps == 1`` and
+        ``num_beams == 1`` (no speculation, no beam search).
+
+        Args:
+            logits: Flattened ``[total_rows, vocab]`` logits; rows are packed per
+                request as ``num_steps * num_beams`` consecutive entries, in
+                beam-major / step-minor order (same layout as
+                ``_apply_min_length_penalty``). Modified in-place.
+            requests: The requests, aligned with the packed logits rows.
+            num_steps: Number of steps per request.
+            num_beams: Number of beams per request.
+            new_tokens_cuda: Device buffer holding the previous step's sampled
+                tokens, shape ``[max_tokens, max_num_sequences, max_beam_width]``.
+                Required when any entry of ``stale_by_one`` is True.
+            stale_by_one: Per-request flag; True when the host token list lags
+                the device state by exactly one token (overlap scheduler).
+        """
+        rows: list[int] = []
+        cols: list[int] = []
+        # Overlap path: bans whose last prefix token must be compared on-device.
+        cond_rows: list[int] = []
+        cond_cols: list[int] = []
+        cond_slots: list[int] = []
+        cond_expected: list[int] = []
+        current_offset = 0
+        for index, r in enumerate(requests):
+            request_offset = current_offset
+            # Advance to the next request's rows before any early continue.
+            current_offset += num_steps[index] * num_beams[index]
+
+            bad_words = getattr(r, "py_bad_words", None)
+            if not bad_words:
+                continue
+
+            if stale_by_one is not None and stale_by_one[index]:
+                assert num_steps[index] == 1 and num_beams[index] == 1, (
+                    "stale-host bad-words path only supports a single step and beam"
+                )
+                assert r.py_seq_slot is not None
+                # Host context is missing the previous step's token; the true
+                # sequence is context + [new_tokens_cuda[0, seq_slot, 0]].
+                context = r.get_tokens(0)
+                for word in bad_words:
+                    k = len(word)
+                    if k == 0:
+                        continue
+                    if k == 1:
+                        # Single-token word: banned unconditionally.
+                        rows.append(request_offset)
+                        cols.append(word[0])
+                        continue
+                    # True sequence length is len(context) + 1; need >= k - 1.
+                    if len(context) < k - 2:
+                        continue
+                    # Host part: all prefix tokens except the newest one.
+                    if k > 2 and context[-(k - 2) :] != word[: k - 2]:
+                        continue
+                    # Device part: the previous step's token must equal the
+                    # last prefix token; resolved on the GPU below.
+                    cond_rows.append(request_offset)
+                    cond_cols.append(word[-1])
+                    cond_slots.append(r.py_seq_slot)
+                    cond_expected.append(word[k - 2])
+                continue
+
+            for beam_idx in range(num_beams[index]):
+                # Full token sequence for this beam (prompt + generated), so a
+                # bad-word prefix ending inside the prompt is also matched.
+                context = r.get_tokens(beam_idx)
+                for word in bad_words:
+                    k = len(word)
+                    if k == 0:
+                        continue
+                    if k == 1:
+                        # Single-token word: banned unconditionally.
+                        col = word[0]
+                    elif len(context) >= k - 1 and context[-(k - 1) :] == word[:-1]:
+                        # Multi-token word: ban the final token only when the
+                        # generated suffix matches the word prefix.
+                        col = word[-1]
+                    else:
+                        continue
+                    # Apply to every step row of this beam.
+                    for step in range(num_steps[index]):
+                        rows.append(request_offset + num_steps[index] * beam_idx + step)
+                        cols.append(col)
+
+        if rows:
+            neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
+            row_idx = torch.tensor(rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                logits.device, non_blocking=True
+            )
+            col_idx = torch.tensor(cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                logits.device, non_blocking=True
+            )
+            logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
+
+        if cond_rows:
+            assert new_tokens_cuda is not None
+            device = logits.device
+            cond_row_idx = torch.tensor(cond_rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                device, non_blocking=True
+            )
+            cond_col_idx = torch.tensor(cond_cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                device, non_blocking=True
+            )
+            slot_idx = torch.tensor(cond_slots, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                device, non_blocking=True
+            )
+            expected = torch.tensor(
+                cond_expected, dtype=new_tokens_cuda.dtype, pin_memory=prefer_pinned()
+            ).to(device, non_blocking=True)
+            # Previous step's token per request (single step, single beam).
+            prev_tokens = new_tokens_cuda[0].index_select(0, slot_idx)[:, 0]
+            # -inf where the device-side prefix token matches, 0 otherwise.
+            # Additive update keeps the op shape-static (boolean-mask indexing
+            # would force a device-to-host sync).
+            penalty = torch.where(
+                prev_tokens == expected,
+                torch.full((), float("-inf"), dtype=logits.dtype, device=device),
+                torch.zeros((), dtype=logits.dtype, device=device),
+            )
+            logits.index_put_((cond_row_idx, cond_col_idx), penalty, accumulate=True)
 
     @staticmethod
     def _select_generated_logits(
@@ -4493,37 +4644,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         return sampling_requests, sampling_requests_metadata, logits_cuda
 
-    @staticmethod
-    def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
-        max_stop_word_len = 0
-        for req in requests:
-            assert req.py_stop_words_list is not None
-            _, cumsum = req.py_stop_words_list
-            if -1 in cumsum:
-                cumsum = cumsum[: cumsum.index(-1)]
-            request_max_stop_word_len = np.max(np.diff(cumsum, prepend=0), initial=0).item()
-            max_stop_word_len = max(max_stop_word_len, request_max_stop_word_len)
-        return max_stop_word_len
-
-    @staticmethod
-    def _requests_with_stop_words(requests: list[LlmRequest]) -> list[LlmRequest]:
-        return [
-            r
-            for r in requests
-            if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-        ]
-
-    def _request_indices_with_stop_words(self, requests: list[LlmRequest]) -> torch.Tensor:
-        return torch.tensor(
-            [
-                ridx
-                for ridx, r in enumerate(requests)
-                if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-            ],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        ).to(device="cuda", non_blocking=True)
-
     @nvtx_range("_process_logprobs")
     def _process_logprobs(
         self,
@@ -4590,7 +4710,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             # (batch_size, vocab_size)
-            group_logprobs_cuda = _Fusions.gather_log_softmax(
+            group_logprobs_cuda = Fusions.gather_log_softmax(
                 batched_sampling_result.batch_logits_for_logprobs_cuda, group_logits_indices_cuda
             )
 
@@ -4627,10 +4747,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampled_indices_cuda = group_next_tokens_cuda.squeeze(1)
 
             # sampled_rank_cuda contains the 0-based rank, it will be corrected to 1-based in handle_logprobs
-            # NB: Computation of sampled rank could be lowered into GroupedStrategySampler, s.t., e.g., for
+            # NB: Computation of sampled rank could be lowered into FlashInferGroupedStrategySampler, s.t., e.g., for
             #     greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
             #     computation is trivial in this case).
-            sampled_rank_cuda = _Fusions.determine_sampled_rank(
+            sampled_rank_cuda = Fusions.determine_sampled_rank(
                 group_logprobs_cuda, sampled_vals_cuda
             )
 
@@ -4679,12 +4799,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
     ) -> tuple[
-        list[LlmRequest],
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor,
-        bool,
+        list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         raw_logits_cuda = model_outputs["logits"]
 
@@ -4697,11 +4812,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._prepare_log_probs(sampling_requests)
 
-        use_fast_greedy_path = self._can_use_fast_greedy_path(sampling_requests)
-        use_host_stop_criteria = use_fast_greedy_path and self._can_use_host_stop_criteria(
-            sampling_requests
-        )
-
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
             dtype=torch.int32,
@@ -4709,57 +4819,76 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # necessary for beam search and max_length checks
-        seq_lens_host = (
-            None
-            if use_host_stop_criteria
-            else torch.tensor(
-                [r.max_beam_num_tokens for r in sampling_requests],
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-            )
+        seq_lens_host = torch.tensor(
+            [r.max_beam_num_tokens for r in sampling_requests],
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
         )
 
-        # Cast seq_slots / seq_lens to CUDA exactly once. The fast host stop-
-        # criteria path only needs seq_slots for scattering sampled tokens;
-        # all other paths also consume seq_lens in device-side finish handling
-        # or beam-search metadata.
+        # Cast seq_slots / seq_lens to CUDA exactly once; consumed by both
+        # the per-group beam-search metadata builder and the finish-reasons
+        # handler in sample_async. int64 is required for the index_*_ ops
+        # downstream.
         seq_slots_cuda = seq_slots_host.to(device="cuda", dtype=torch.int64, non_blocking=True)
-        seq_lens_cuda = (
-            None if seq_lens_host is None else seq_lens_host.to(device="cuda", non_blocking=True)
-        )
+        seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
         self._apply_embedding_bias(
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
         )
 
-        logits_cuda = self._apply_min_length_penalty(
+        self._apply_min_length_penalty(
             logits_cuda,
             sampling_requests,
-            sampling_requests_metadata.req_num_steps.tolist(),
-            sampling_requests_metadata.req_num_beams.tolist(),
+            sampling_requests_metadata.req_num_steps,
+            sampling_requests_metadata.req_num_beams,
         )
 
+        if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
+            stale_by_one: list[bool] | None = None
+            if self._track_pending_steps and not self._is_draft_batch(sampling_requests):
+                pending = [
+                    self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0
+                    for r in sampling_requests
+                ]
+                if any(pending):
+                    if self.max_tokens == 1 and self.max_beam_width == 1 and max(pending) == 1:
+                        stale_by_one = [p > 0 for p in pending]
+                    else:
+                        # Speculative decoding / beam search under overlap:
+                        # the missing host tokens cannot be reconstructed with
+                        # the single-token device-side check; multi-token bad
+                        # words may be applied one step late.
+                        logger.warning_once(
+                            "bad_words with the overlap scheduler and speculative "
+                            "decoding or beam search: multi-token bad words are "
+                            "matched against a host token history that lags the "
+                            "device state and may be enforced inexactly.",
+                            key="bad_words_stale_overlap",
+                        )
+            self._apply_bad_words(
+                logits_cuda,
+                sampling_requests,
+                sampling_requests_metadata.req_num_steps.tolist(),
+                sampling_requests_metadata.req_num_beams.tolist(),
+                new_tokens_cuda=new_tokens_cuda,
+                stale_by_one=stale_by_one,
+            )
+
         # Fast path for greedy sampling
-        if use_fast_greedy_path:
-            if use_host_stop_criteria:
-                # There is exactly one token and one beam per request, so the
-                # linearized destination indices are the sequence slots.
-                batch_dest_indices_cuda = seq_slots_cuda
-            else:
-                # Compute destination indices on CPU (same pattern as
-                # _unbatch_sampling_results).
-                batch_destination_indexer = _UnpackedStepIndexer(
-                    seq_slots=seq_slots_host,
-                    num_steps=sampling_requests_metadata.req_num_generated_tokens,
-                    steps_dim_size=new_tokens_cuda.size(0),
-                    slots_dim_size=new_tokens_cuda.size(1),
-                    dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
-                    index_dtype=torch.int64,
-                )
-                batch_dest_indices_cuda = batch_destination_indexer[:].to(
-                    new_tokens_cuda.device, non_blocking=True
-                )
+        if self._can_use_fast_greedy_path(sampling_requests):
+            # Compute destination indices on CPU (same pattern as _unbatch_sampling_results)
+            batch_destination_indexer = _UnpackedStepIndexer(
+                seq_slots=seq_slots_host,
+                num_steps=sampling_requests_metadata.req_num_generated_tokens,
+                steps_dim_size=new_tokens_cuda.size(0),
+                slots_dim_size=new_tokens_cuda.size(1),
+                dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
+                index_dtype=torch.int64,
+            )
+            batch_dest_indices_cuda = batch_destination_indexer[:].to(
+                new_tokens_cuda.device, non_blocking=True
+            )
 
             # Get d2t tensor if present
             d2t = model_outputs.get("d2t", None)
@@ -4777,10 +4906,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return (
                 sampling_requests,
                 seq_slots_host,
+                seq_lens_host,
                 seq_slots_cuda,
                 seq_lens_cuda,
                 new_tokens_host,
-                use_host_stop_criteria,
             )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
@@ -4793,8 +4922,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Perform sampling in batches
-        assert seq_lens_host is not None
-        assert seq_lens_cuda is not None
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             sampling_requests,
@@ -4832,10 +4959,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return (
             sampling_requests,
             seq_slots_host,
+            seq_lens_host,
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
-            use_host_stop_criteria,
         )
 
     @override
@@ -4899,6 +5026,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
         enable_async_worker: bool = False,
+        max_num_sequences: Optional[int] = None,
     ):
         assert model.config is not None
         vocab_size = model.config.vocab_size
@@ -4917,11 +5045,16 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         )
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
-        self.max_num_sequences = mapping.pp_size * max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = (
             mapping.pp_size if mapping.pp_size > 1 else (2 if self.is_trt_overlap else 1)
+        )
+        # Decoder state is indexed by sequence slot and must match the
+        # executor's SeqSlotManager. The fallback preserves the established
+        # sizing for direct callers outside the PyExecutor creator.
+        self.max_num_sequences = (
+            max_num_sequences if max_num_sequences is not None else mapping.pp_size * max_batch_size
         )
         self.micro_batch_idx = 0
 

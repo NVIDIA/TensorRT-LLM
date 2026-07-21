@@ -380,6 +380,14 @@ def parse_args() -> argparse.Namespace:
     timing_group.add_argument("--warmup", type=int, default=1, help="Warmup iterations per case.")
     timing_group.add_argument("--iters", type=int, default=12, help="Timed iterations per case.")
     timing_group.add_argument(
+        "--nsys",
+        action="store_true",
+        default=False,
+        help="Emit an NVTX range + cudaProfilerStart/Stop around the measured MoE forward "
+        "(after warmup) so `nsys profile -c cudaProfilerApi` captures only that region. "
+        "Disables CUPTI kernel breakdown (conflicts with nsys). Latency measurement is unchanged.",
+    )
+    timing_group.add_argument(
         "--fast_autotune",
         action="store_true",
         help="Use a short autotune pass for smoke tests; may reduce measurement quality.",

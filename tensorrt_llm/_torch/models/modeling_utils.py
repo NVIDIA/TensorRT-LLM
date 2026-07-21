@@ -1,10 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import inspect
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -390,8 +394,6 @@ class DecoderModelForCausalLM(nn.Module,
                 dtype=config.pretrained_config.torch_dtype,
             )
         else:
-            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-            # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
@@ -403,16 +405,41 @@ class DecoderModelForCausalLM(nn.Module,
                         self.has_custom_lm_head = True
                         vocab_size = lora_loader.vocab_size
 
+            # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
+            # checkpoints that quantize lm_head to NVFP4). Model-specific
+            # config normalizers opt in by keeping/synthesizing this entry;
+            # exclude_modules still wins.
+            lm_head_quant_config = None
+            if not self.has_custom_lm_head and config.quant_config_dict is not None:
+                lm_head_quant_config = config.quant_config_dict.get("lm_head")
+                if (lm_head_quant_config is not None
+                        and config.quant_config is not None
+                        and config.quant_config.
+                        is_module_excluded_from_quantization("lm_head")):
+                    lm_head_quant_config = None
+                if (lm_head_quant_config is not None
+                        and getattr(config.pretrained_config,
+                                    'tie_word_embeddings', False)):
+                    # Tied embeddings replace lm_head.weight with the dense
+                    # bf16 embedding weight below, which would silently clash
+                    # with a quantized (packed) weight and its quant method.
+                    logger.info(
+                        "Ignoring lm_head quant entry: tie_word_embeddings "
+                        "shares the dense embedding weight, so lm_head stays "
+                        "unquantized")
+                    lm_head_quant_config = None
+
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
+                gather_output=config.lm_head_gather_output,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
+                quant_config=lm_head_quant_config,
             )
 
             if self.has_custom_lm_head:
@@ -582,8 +609,40 @@ class DecoderModelForCausalLM(nn.Module,
 
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.
+
+        Note: ``cache_transceiver_config`` is rejected here (enforced at
+        load time) — the deep-merge could materialize or silently enable a
+        transceiver config the user did not turn on. Use
+        :meth:`get_preferred_transceiver_runtime` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Return the model's preferred KV-cache transceiver runtime.
+
+        Subclasses can override this to opt into a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted when the user
+        leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'. Return None to defer to the global default (C++).
+
+        Args:
+            pretrained_config: the loaded HF pretrained config (may be None
+                on paths where no config was loaded). Implementation classes
+                shared by several architectures can inspect e.g.
+                ``pretrained_config.architectures`` to differentiate per
+                checkpoint.
+
+        This preference is intentionally kept out of the generic
+        :meth:`get_model_defaults` deep-merge: it must not materialize a
+        ``cache_transceiver_config`` when disaggregated serving is disabled,
+        and it is only honored when the effective backend supports it (the
+        Python transceiver requires NIXL).
+        """
+        return None
 
     @property
     def config(self):
@@ -853,7 +912,7 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
     else:
-        raise RuntimeError(f"Model architecture is not provided.")
+        raise RuntimeError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]

@@ -502,6 +502,12 @@ models:
         default: null
         status: stable
         required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -891,6 +897,12 @@ models:
         type: Optional[List[int]]
         default: null
         status: stable
+        required: false
+      prompt_token_ids_b64:
+        kind: extension
+        type: Optional[str]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionResponseStreamChoice:

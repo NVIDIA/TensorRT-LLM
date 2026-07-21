@@ -461,6 +461,8 @@ class ADEngine(ModelEngine):
         self.llm_args.enable_iter_req_stats = reporting_info.enable_iter_req_stats
         self.llm_args.max_num_tokens = cache_seq_interface.info.max_num_tokens
         self.llm_args.max_seq_len = cache_seq_interface.info.max_seq_len
+        # AutoDeploy does not support the sleep/wakeup feature.
+        self.llm_args.sleep_config = None
         self.llm_args.multimodal_config = (
             ad_config.multimodal_config if ad_config else MultimodalConfig()
         )

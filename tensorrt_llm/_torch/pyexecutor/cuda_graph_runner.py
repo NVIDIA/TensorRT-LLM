@@ -39,6 +39,27 @@ ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
+def _save_spec_decode_capture_state(
+        attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
+    if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
+        return None
+    return attn_metadata.kv_lens_cuda[:attn_metadata.num_seqs].clone()
+
+
+def _restore_spec_decode_capture_state(
+        attn_metadata: Any, saved_kv_lens_cuda: Optional[torch.Tensor]) -> None:
+    if saved_kv_lens_cuda is None:
+        return
+    # Speculative decoding updates kv_lens_cuda in-place during every forward.
+    # CUDA graph warmup reuses one dummy request for multiple eager forwards, so
+    # letting those updates accumulate would make later warmups/capture advertise
+    # more KV tokens than the dummy request actually allocated. Restore the
+    # single-step input state outside the graph after each forward instead.
+    batch_size = saved_kv_lens_cuda.shape[0]
+    attn_metadata.kv_lens_cuda[:batch_size].copy_(saved_kv_lens_cuda)
+    attn_metadata.on_update_kv_lens()
+
+
 @dataclass
 class CUDAGraphRunnerConfig:
     """Configuration for the CUDAGraphRunner, passed from the ModelEngine."""
@@ -100,7 +121,7 @@ class CUDAGraphRunner:
     and low-level execution (capturing, resource management, replaying) for
     multiple graphs, keyed by (batch size, draft_len, is_first_draft).
     """
-    WARMUP_STEPS = 2
+    WARMUP_STEPS = 1
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -132,6 +153,7 @@ class CUDAGraphRunner:
         # tensor reallocation from invalidating addresses baked into existing
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
+        self.is_warmup_only = False
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -321,7 +343,7 @@ class CUDAGraphRunner:
         key = self.get_graph_key(batch, new_tensors_device,
                                  spec_resource_manager, spec_metadata)
 
-        if key in self.graphs:
+        if key in self.graph_metadata:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
 
@@ -378,8 +400,8 @@ class CUDAGraphRunner:
                 forward_fn: Callable,
                 initial_inputs: Dict[str, Any],
                 enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None):
-        """Captures the forward pass for a given batch size."""
+                postprocess_fn: Optional[Callable] = None) -> Any:
+        """Warm up and/or capture the forward pass for a graph key."""
         batch_size = key[0]
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -407,9 +429,12 @@ class CUDAGraphRunner:
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
+        attn_metadata = capture_inputs["attn_metadata"]
+        saved_kv_lens_cuda = _save_spec_decode_capture_state(
+            attn_metadata, enable_spec_decode)
 
         self.graph_metadata[key] = {
-            "attn_metadata": initial_inputs["attn_metadata"],
+            "attn_metadata": attn_metadata,
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
@@ -422,27 +447,38 @@ class CUDAGraphRunner:
                 capture_inputs['attn_metadata'].use_spec_decoding = True
             return forward_fn(capture_inputs)
 
-        # We have to do warm up runs to initialize PyTorch's
-        # internal states according to the docs:
-        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
-        # This also lets us initialize states in the attn_metadata.
-        graph = torch.cuda.CUDAGraph()
+        output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
+            # We have to do a warmup run to initialize PyTorch's internal
+            # states according to the docs:
+            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+            # This also lets us initialize states in the attn_metadata and
+            # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                _setup_spec_decoding_and_forward(key, forward_fn,
-                                                 capture_inputs)
+                output = _setup_spec_decoding_and_forward(
+                    key, forward_fn, capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
+                _restore_spec_decode_capture_state(attn_metadata,
+                                                   saved_kv_lens_cuda)
 
+            if self.is_warmup_only:
+                return output
+
+            graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
+            _restore_spec_decode_capture_state(attn_metadata,
+                                               saved_kv_lens_cuda)
 
         self.graphs[key] = graph
-        self.graph_outputs[key] = make_weak_ref(output)
+        graph_output = make_weak_ref(output)
+        self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
+        return graph_output
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -704,7 +740,7 @@ class EncoderCUDAGraphRunner:
     Restricted to `TrtllmAttentionMetadata` — FlashInfer's per-batch planner state is not compatible with CUDA graph capture/replay.
     """
 
-    WARMUP_STEPS = 2
+    WARMUP_STEPS = 1
 
     def __init__(self, config: EncoderCUDAGraphRunnerConfig):
         self.config = config
@@ -730,6 +766,7 @@ class EncoderCUDAGraphRunner:
         self.cuda_graph_meta_buffers = get_memory_buffers()
 
         self._capture_allowed = False
+        self.is_warmup_only = False
 
         # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
         # prefer_pinned() is false: pageable host buffers are preferred, so the
@@ -916,7 +953,7 @@ class EncoderCUDAGraphRunner:
                 or not is_padding_successful:
             return None, None
 
-        if key in self.graphs:
+        if key in self.graph_metadata:
             return self.graph_metadata[key]["attn_metadata"], key
 
         # New key not yet captured. Only create metadata if capture is
@@ -980,8 +1017,8 @@ class EncoderCUDAGraphRunner:
         key: EncoderKeyType,
         forward_fn: Callable[[Dict[str, Any]], Any],
         inputs: Dict[str, Any],
-    ) -> None:
-        """Capture a CUDA graph for the given key."""
+    ) -> Any:
+        """Warm up and/or capture the forward pass for a graph key."""
         _, padded_num_tokens, _ = key
 
         sliced_static_tensors = {
@@ -1003,17 +1040,21 @@ class EncoderCUDAGraphRunner:
 
         attn_md = capture_inputs["attn_metadata"]
 
-        self.graph_metadata[key] = {
-            "attn_metadata": attn_md,
-        }
+        self.graph_metadata[key] = {"attn_metadata": attn_md}
 
-        graph = torch.cuda.CUDAGraph()
-        # Warmup runs required by CUDA graph semantics. See
-        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+        output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
+            # Warmup runs required by CUDA graph semantics. See
+            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+            # Warmups initialize PyTorch and attention metadata state, and
+            # resize the shared attention workspace before any graph is captured.
             for _ in range(self.WARMUP_STEPS):
-                forward_fn(capture_inputs)
+                output = forward_fn(capture_inputs)
 
+            if self.is_warmup_only:
+                return output
+
+            graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 if self._capture_h2d_copy:
                     # H2D copies for captured inside the graph: at replay
@@ -1034,8 +1075,10 @@ class EncoderCUDAGraphRunner:
                 "Encoder CUDA graph does not support nested tensor outputs. "
                 "Disable encoder CUDA graphs for models with ragged outputs.")
         self.graphs[key] = graph
-        self.graph_outputs[key] = make_weak_ref(output)
+        graph_output = make_weak_ref(output)
+        self.graph_outputs[key] = graph_output
         self.memory_pool = graph.pool()
+        return graph_output
 
     def replay(
         self,
