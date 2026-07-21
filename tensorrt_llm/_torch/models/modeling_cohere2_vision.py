@@ -29,7 +29,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_cohere2 import Cohere2ForCausalLM
-from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
+from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -101,7 +101,7 @@ class Cohere2InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         return input_ids, pixel_values
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         inputs_ids, pixel_values = self._preprocess(inputs)
@@ -300,7 +300,17 @@ class Cohere2VisionModel(PreTrainedModel):
         llm_weights = self._rename_llm_weights("model.language_model", weights)
         self.llm.load_weights(llm_weights)
 
+        # In transformers>=5, the standalone SiglipVisionModel is flattened:
+        # `embeddings`/`encoder`/`post_layernorm`/`head` sit directly under
+        # `vision_tower` (the old `self.vision_model = SiglipVisionTransformer`
+        # wrapper is gone, `vision_model` survives only as `base_model_prefix`).
+        # Checkpoints saved with transformers<5 still carry the nested
+        # `vision_tower.vision_model.` layout. TRT-LLM's SiglipVisionModel
+        # nests everything under `self.vision_model`, so add the prefix only
+        # when the checkpoint uses the flattened layout.
         vit_weights = filter_weights("model.vision_tower", weights)
+        if not any(k.startswith("vision_model.") for k in vit_weights):
+            vit_weights = {f"vision_model.{k}": v for k, v in vit_weights.items()}
         self.siglip_tower.load_weights(vit_weights)
 
         multimodal_projector_weights = filter_weights("model.multi_modal_projector", weights)
@@ -339,7 +349,7 @@ class Cohere2VisionModel(PreTrainedModel):
             # Avoid all the image embeddings will be fused later;
             # Slice mm_embeds to only the mebeddings whose placeholder tokens
             # are in the current chunk / not cached
-            multimodal_embeds = find_input_mm_embeds(multimodal_embeds, multimodal_params)
+            # multimodal_embeds = find_input_mm_embeds(multimodal_embeds, multimodal_params)
 
             # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens
             multimodal_token_mask = torch.isin(input_ids, self.image_token_ids)
