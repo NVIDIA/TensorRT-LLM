@@ -809,6 +809,117 @@ class GSM8K(LmEvalEvaluator):
         GSM8K.command_harness(ctx, **kwargs)
 
 
+class GSM8KInferenceMax(LmEvalEvaluator):
+    """GSM8K under the InferenceMAX (SemiAnalysisAI/InferenceX) protocol.
+
+    Mirrors the public InferenceMAX accuracy eval (utils/evals/gsm8k.yaml +
+    ``run_lm_eval`` there): chat template applied with 5-shot multiturn
+    context, an explicit "#### [number]" answer-format instruction in
+    ``doc_to_text``, a generation budget large enough for thinking models
+    (``max_gen_toks: 12288``), and strict ``#### N`` extraction. Scores are
+    directly comparable to inferencex.semianalysis.com/evaluation, unlike the
+    completion-format ``gsm8k`` task whose scores run several points lower on
+    chat/thinking-tuned models.
+
+    Task yaml lives under ``tensorrt_llm/evaluate/lm_eval_tasks/
+    gsm8k_inferencemax/`` (upstream lm-eval ships no such variant).
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__("gsm8k_inferencemax", **kwargs)
+
+    @click.command("gsm8k_inferencemax")
+    @click.option("--dataset_path",
+                  type=str,
+                  default=None,
+                  help="The path to GSM8K dataset. "
+                  "If unspecified, the dataset is downloaded from HF hub.")
+    @click.option(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Number of samples to run the evaluation; None means full dataset."
+    )
+    @click.option("--random_seed",
+                  type=int,
+                  default=0,
+                  help="Random seed for dataset processing.")
+    @click.option("--apply_chat_template",
+                  type=click.BOOL,
+                  default=True,
+                  show_default=True,
+                  help="Whether to apply chat template. Default True — the "
+                  "InferenceMAX protocol always evaluates through the chat "
+                  "template.")
+    @click.option(
+        "--chat_template_kwargs",
+        type=str,
+        default=None,
+        callback=lambda ctx, param, value: json.loads(value) if value else None,
+        help='Chat template kwargs as JSON string. Default None keeps the '
+        'template defaults (e.g. adaptive thinking), matching InferenceMAX.')
+    @click.option("--fewshot_as_multiturn",
+                  type=click.BOOL,
+                  default=True,
+                  show_default=True,
+                  help="Apply fewshot as multiturn. Default True — lm-eval "
+                  "auto-enables multiturn fewshots under a chat template, and "
+                  "InferenceMAX inherits that default.")
+    @click.option("--system_prompt",
+                  type=str,
+                  default=None,
+                  help="System prompt.")
+    @click.option("--max_input_length",
+                  type=int,
+                  default=4096,
+                  help="Maximum prompt length.")
+    @click.option(
+        "--max_output_length",
+        type=int,
+        default=12288,
+        show_default=True,
+        help="Maximum generation length. Mirrors the task yaml "
+        "(``max_gen_toks: 12288``, the InferenceMAX budget of 16384 context "
+        "minus 4096 prompt); thinking models need the room.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling.")
+    @click.option("--log_samples",
+                  is_flag=True,
+                  default=False,
+                  help="Log sample outputs for debugging.")
+    @click.option("--output_path",
+                  type=str,
+                  default=None,
+                  help="Path to save evaluation results.")
+    @click.option("--output_dir",
+                  type=str,
+                  default=None,
+                  help="Directory to save the task infos.")
+    @click.pass_context
+    @staticmethod
+    def command(ctx, **kwargs) -> None:
+        if kwargs.get("fewshot_as_multiturn", False):
+            assert kwargs.get(
+                "apply_chat_template", False
+            ), "apply_chat_template must be True when fewshot_as_multiturn is True"
+        GSM8KInferenceMax.command_harness(ctx, **kwargs)
+
+
 class GPQADiamond(LmEvalEvaluator):
 
     def __init__(self, **kwargs):

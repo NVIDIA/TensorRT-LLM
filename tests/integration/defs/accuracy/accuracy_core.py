@@ -414,6 +414,36 @@ class GSM8K(AccuracyTask):
     EVALUATE_KWARGS = dict(scores_filter=None)
 
 
+class GSM8KInferenceMax(AccuracyTask):
+    # GSM8K under the InferenceMAX (SemiAnalysisAI/InferenceX) protocol: chat
+    # template + 5-shot multiturn + "#### [number]" format instruction + a
+    # 12288-token generation budget for thinking models, gated on strict
+    # "#### N" extraction. Scores are directly comparable to
+    # inferencex.semianalysis.com/evaluation; the completion-format GSM8K
+    # above measures the same model several points lower on chat/thinking
+    # models. Substantially slower than GSM8K: thinking output dominates
+    # (minutes with spec decoding + CUDA graphs, tens of minutes eager).
+    DATASET = "gsm8k_inferencemax"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 1319  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 12288
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8KInferenceMax
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=True,
+                            fewshot_as_multiturn=True)
+
+    # InferenceMAX publishes em_strict as the primary score.
+    EVALUATE_KWARGS = dict(scores_filter="exact_match,strict-match")
+
+
 class GPQADiamond(AccuracyTask):
     DATASET = "gpqa_diamond"
     DATASET_DIR = f"{llm_models_root()}/datasets/gpqa"

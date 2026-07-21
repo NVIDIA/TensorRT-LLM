@@ -44,8 +44,9 @@ from ..conftest import (check_device_contain, get_device_count, llm_models_root,
                         skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper, skip_ray)
 from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2)
+                            GSM8KInferenceMax, JsonModeEval,
+                            LlmapiAccuracyTestHarness, LongBenchV1,
+                            LongBenchV2)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -7636,14 +7637,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("use_msa", [False, True])
-    def test_nvfp4(self, use_msa):
+    def test_nvfp4(self, use_msa, eval_mode):
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint). The MSA path runs an FP8 KV cache; the
         # Triton path keeps the KV cache in BF16.
+        # eval_mode selects the accuracy protocol: "default" = completion-format
+        # MMLU + GSM8K; "inferencemax" = chat-format GSM8K matching the public
+        # InferenceMAX benchmark (needs a 16k context for thinking output).
         tp_size = ep_size = 4
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        inferencemax = eval_mode == "inferencemax"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=False,
                                         dtype="fp8" if use_msa else "auto")
@@ -7656,23 +7662,28 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
-                 max_seq_len=4096,
+                 max_seq_len=16384 if inferencemax else 4096,
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
+            if inferencemax:
+                task = GSM8KInferenceMax(model_name)
+                task.evaluate(llm)
+            else:
+                task = MMLU(model_name)
+                task.evaluate(llm)
+                task = GSM8K(model_name)
+                task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("eval_mode", ["default", "inferencemax"])
     @parametrize_with_ids("cuda_graph", [True])
     @parametrize_with_ids("use_msa", [True])
     @parametrize_with_ids("overlap_scheduler", [False, True])
     @parametrize_with_ids("attention_dp", [False, True])
     @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
     def test_nvfp4_eagle3(self, tp_size, ep_size, attention_dp,
-                          overlap_scheduler, use_msa, cuda_graph):
+                          overlap_scheduler, use_msa, cuda_graph, eval_mode):
         if use_msa:
             from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
                 msa_package_available
@@ -7680,6 +7691,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 pytest.skip("MSA kernels (fmha_sm100) not available")
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        inferencemax = eval_mode == "inferencemax"
         max_draft_len = 3
         spec_config = Eagle3DecodingConfig(
             max_draft_len=max_draft_len,
@@ -7697,7 +7709,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 sparse_attention_config=MiniMaxM3SparseAttentionConfig(
                     implementation="msa" if use_msa else "triton"),
                 moe_config=MoeConfig(backend="CUTLASS"),
-                max_seq_len=4096,
+                # The InferenceMAX protocol needs room for thinking output
+                # (12288 generated tokens on a ~2k chat prompt).
+                max_seq_len=16384 if inferencemax else 4096,
                 # The fmha_sm100 decode planner caps total_q x num_qo_heads at
                 # 65536; with 1 + draft_len = 4 verify tokens per row that
                 # bounds the batch at 1024 / TP-sharded heads (256 unsharded
@@ -7727,10 +7741,14 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                     steps += sd.get("numRequestsWithDraftTokens", 0)
                 return drafted, accepted, steps
 
-            task = MMLU(model_name)
-            task.evaluate(llm)
-            task = GSM8K(model_name)
-            task.evaluate(llm)
+            if inferencemax:
+                task = GSM8KInferenceMax(model_name)
+                task.evaluate(llm)
+            else:
+                task = MMLU(model_name)
+                task.evaluate(llm)
+                task = GSM8K(model_name)
+                task.evaluate(llm)
 
             # Chat-format acceptance — the drafter's training distribution
             # (Inferact/MiniMax-M3-EAGLE3 card: 0.839 / 3.518). Reuses the
