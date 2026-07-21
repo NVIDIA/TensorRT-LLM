@@ -5,6 +5,7 @@
 import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
     BatchedKVCacheCompaction,
@@ -442,7 +443,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
         swa_window=None,
         protected_tail_capacity=max(protected_tails),
     )
-    compaction.set_protected_tails(protected_tails)
+    _set_protected_tails(compaction, protected_tails)
     compaction.compact()
     torch.cuda.synchronize(device)
 
@@ -549,7 +550,7 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
         swa_window=None,
         protected_tail_capacity=max(protected_tails),
     )
-    cohort_compaction.set_protected_tails(protected_tails)
+    _set_protected_tails(cohort_compaction, protected_tails)
     cohort_compaction.compact()
 
     expected_pools = [pool.clone() for pool in initial_pools]
@@ -571,7 +572,7 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
             swa_window=None,
             protected_tail_capacity=protected_tails[request],
         )
-        single_compaction.set_protected_tails([protected_tails[request]])
+        _set_protected_tails(single_compaction, [protected_tails[request]])
         single_compaction.compact()
     torch.cuda.synchronize(device)
 
@@ -692,7 +693,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         swa_window=None,
         protected_tail_capacity=0,
     )
-    batched_compaction.set_protected_tails([0])
+    _set_protected_tails(batched_compaction, [0])
     batched_compaction.compact()
     torch.cuda.synchronize(device)
 
@@ -850,7 +851,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             swa_window=None,
             protected_tail_capacity=protected_tail,
         )
-        batched_compaction.set_protected_tails([protected_tail])
+        _set_protected_tails(batched_compaction, [protected_tail])
 
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
@@ -969,7 +970,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         swa_window=2,
         protected_tail_capacity=max(protected_tails),
     )
-    compaction.set_protected_tails(protected_tails)
+    _set_protected_tails(compaction, protected_tails)
     compaction.compact()
     torch.cuda.synchronize(device)
 

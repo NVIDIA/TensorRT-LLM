@@ -402,8 +402,8 @@ class BatchedKVCacheCompaction:
             object must support. A protected tail covers KV positions past
             the valid length reserved for a forward already in flight; each
             round's actual lengths arrive through the per-family move-offset
-            rows staged with the round metadata (`set_protected_tails` fills
-            the same rows for standalone use) and move with the kept tokens.
+            rows staged with the round metadata and move with the kept
+            tokens.
         `draft_*`: co-compressed draft-cache layout (union mode only); the
             draft reuses the target keep set and pins the same prompt.
     """
@@ -706,52 +706,6 @@ class BatchedKVCacheCompaction:
             move_source_offsets=draft_move_offsets,
             destination_bases=self.prompt_offsets,
         )
-
-    def _write_move_offsets(self, offsets: torch.Tensor, moves_per_request: List[int]) -> None:
-        cumulative = [0]
-        for count in moves_per_request:
-            cumulative.append(cumulative[-1] + count)
-        # Rows past the cohort are padding and contribute no moves.
-        cumulative.extend(cumulative[-1:] * (self.request_count - len(moves_per_request)))
-        offsets.copy_(torch.tensor(cumulative, dtype=torch.int32), non_blocking=True)
-
-    def set_protected_tails(
-        self,
-        tail_lengths: List[int],
-        draft_tail_lengths: Optional[List[int]] = None,
-    ) -> None:
-        """Load this cohort's per-request protected tails into the move offsets.
-
-        The pack kernel and the C++ compacts read every request's move range
-        from these offsets, so refreshing them retargets the fixed buffers to
-        the cohort at hand without any reallocation.
-        """
-        if len(tail_lengths) > self.request_count:
-            raise ValueError("the cohort exceeds the compaction request capacity")
-        if any(tail < 0 or tail > self.protected_tail_capacity for tail in tail_lengths):
-            raise ValueError("a protected tail exceeds the configured capacity")
-        self._write_move_offsets(
-            self.target_dense_compaction.move_source_offsets,
-            [self.decode_keep_count + int(tail) for tail in tail_lengths],
-        )
-        if self.target_swa_compaction is not None:
-            self._write_move_offsets(
-                self.target_swa_compaction.move_source_offsets,
-                [self.swa_window + int(tail) for tail in tail_lengths],
-            )
-        if self.draft_compaction is not None:
-            if draft_tail_lengths is None:
-                draft_tail_lengths = [0] * len(tail_lengths)
-            if len(draft_tail_lengths) != len(tail_lengths):
-                raise ValueError("draft protected tails must match the cohort")
-            if any(
-                tail < 0 or tail > self.draft_protected_tail_capacity for tail in draft_tail_lengths
-            ):
-                raise ValueError("a draft protected tail exceeds the configured capacity")
-            self._write_move_offsets(
-                self.draft_compaction.move_source_offsets,
-                [self.decode_keep_count + int(tail) for tail in draft_tail_lengths],
-            )
 
     def compact(self) -> None:
         """Pack the move indices, then run every cache family's C++ compacts."""

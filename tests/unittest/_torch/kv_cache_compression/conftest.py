@@ -41,6 +41,54 @@ def encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
     return encoded
 
 
+def _write_move_offsets(compaction, offsets, moves_per_request):
+    cumulative = [0]
+    for count in moves_per_request:
+        cumulative.append(cumulative[-1] + count)
+    # Rows past the cohort are padding and contribute no moves.
+    cumulative.extend(cumulative[-1:] * (compaction.request_count - len(moves_per_request)))
+    offsets.copy_(torch.tensor(cumulative, dtype=torch.int32), non_blocking=True)
+
+
+def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
+    """Load a cohort's per-request protected tails into the move offsets.
+
+    Production stages these rows through the single round-metadata upload;
+    tests drive the fixed buffers directly through this helper (moved out of
+    BatchedKVCacheCompaction, whose production surface has no caller for it).
+    """
+    if len(tail_lengths) > compaction.request_count:
+        raise ValueError("the cohort exceeds the compaction request capacity")
+    if any(tail < 0 or tail > compaction.protected_tail_capacity for tail in tail_lengths):
+        raise ValueError("a protected tail exceeds the configured capacity")
+    _write_move_offsets(
+        compaction,
+        compaction.target_dense_compaction.move_source_offsets,
+        [compaction.decode_keep_count + int(tail) for tail in tail_lengths],
+    )
+    if compaction.target_swa_compaction is not None:
+        _write_move_offsets(
+            compaction,
+            compaction.target_swa_compaction.move_source_offsets,
+            [compaction.swa_window + int(tail) for tail in tail_lengths],
+        )
+    if compaction.draft_compaction is not None:
+        if draft_tail_lengths is None:
+            draft_tail_lengths = [0] * len(tail_lengths)
+        if len(draft_tail_lengths) != len(tail_lengths):
+            raise ValueError("draft protected tails must match the cohort")
+        if any(
+            tail < 0 or tail > compaction.draft_protected_tail_capacity
+            for tail in draft_tail_lengths
+        ):
+            raise ValueError("a draft protected tail exceeds the configured capacity")
+        _write_move_offsets(
+            compaction,
+            compaction.draft_compaction.move_source_offsets,
+            [compaction.decode_keep_count + int(tail) for tail in draft_tail_lengths],
+        )
+
+
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     """Build an unallocated V2 double with TriAttention's production contract."""
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2

@@ -23,6 +23,7 @@ from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_request as _make_request
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
+from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
     BatchedKVCacheCompaction,
@@ -108,7 +109,7 @@ def _launched_draft_compaction(draft_protected_tails):
         draft_kv_block_offsets=_encode_block_offsets(draft_tables),
         draft_page_table_slots={0: 0},
     )
-    compaction.set_protected_tails(target_protected_tails, draft_protected_tails)
+    _set_protected_tails(compaction, target_protected_tails, draft_protected_tails)
     compaction.compact()
     torch.cuda.synchronize(device)
 
