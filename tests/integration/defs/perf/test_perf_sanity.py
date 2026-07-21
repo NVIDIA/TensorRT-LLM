@@ -19,6 +19,7 @@ import fcntl
 import glob
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -1069,6 +1070,7 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        internal_request_auth_key: str | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1079,6 +1081,7 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.internal_request_auth_key = internal_request_auth_key
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1274,6 +1277,7 @@ class DisaggTestCmds(NamedTuple):
             "hostname": self.hostname,
             "port": disagg_server_port,
             "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
             "context_servers": {
                 "num_instances": self.num_ctx_servers,
                 "urls": ctx_hostnames,
@@ -1892,6 +1896,7 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        internal_request_auth_key = config.get("internal_request_auth_key") or secrets.token_hex(32)
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1933,6 +1938,7 @@ class PerfSanityTestConfig:
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
             ctx_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1942,6 +1948,7 @@ class PerfSanityTestConfig:
             }
 
             gen_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1963,6 +1970,7 @@ class PerfSanityTestConfig:
                 model_name=model_name,
                 hardware=hardware,
                 server_env_var=server_env_var,
+                internal_request_auth_key=internal_request_auth_key,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
