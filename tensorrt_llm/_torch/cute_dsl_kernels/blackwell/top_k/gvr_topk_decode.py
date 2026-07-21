@@ -553,8 +553,6 @@ class GvrTopKKernel:
         # (interface v2: [0] valid, [1] kth proxy, [2] accepted threshold,
         # [3] cand_count). cs==1 only (leader-gather rows land later).
         self.emit_xstate = bool(emit_xstate)
-        if emit_xstate and cluster_size != 1:
-            raise ValueError("emit_xstate is single-CTA (cs==1) only")
         # use_ext_cand (waterfall L2 direct-to-P4): pre-collected (value,
         # index) pairs from the epilogue land straight in smem_keys/vals —
         # no P1, no counting, no P3 scan. Eligible when void==0, claimed
@@ -571,8 +569,10 @@ class GvrTopKKernel:
                 raise ValueError("use_ext_counts requires fb_fix")
             if self.M_thr != 3:
                 raise ValueError("use_ext_counts expects exactly 3 seed rungs")
-            if cluster_size != 1:
-                raise ValueError("use_ext_counts is single-CTA (cs==1) only")
+            # cluster_size > 1 supported: the ext rungs/counts are
+            # per-row (identical across the cluster), the stock multi
+            # count pass cluster-merges as usual, and the L2 direct
+            # loader runs leader-only (peers contribute zero candidates).
         # R1 inline shot aim in log2-count space: geometric center of the
         # [K, kC] acceptance window.
         self.log2_r1aim = math.log2(math.sqrt(self.top_k * self.kC)) if self.r0_qfracs else 0.0
@@ -4891,6 +4891,15 @@ class GvrTopKKernel:
                     # Cooperative sentinel-skipping load of (value, index)
                     # pairs into the P4 candidate arrays. SMEM-atomic
                     # compaction: order is irrelevant to rank-scatter.
+                    # cs > 1: the pre-collected pairs are O(cand_count) —
+                    # row splitting buys nothing, so the LEADER loads them
+                    # alone and peers publish zero local candidates for
+                    # the DSMEM gather (take_cand is cluster-uniform: all
+                    # CTAs read the same per-row control words).
+                    if cutlass.const_expr(cluster_size > 1):
+                        if tidx == cutlass.Int32(0):
+                            s_iscalars[5] = cutlass.Int32(0)
+                        cute.arch.barrier()
                     if tidx == cutlass.Int32(0):
                         s_iscalars[0] = cutlass.Int32(0)
                         s_thr[0] = seed_thr_row[self.cand_rung]
@@ -4898,6 +4907,9 @@ class GvrTopKKernel:
                     cute.arch.barrier()
                     cbase = cand_row.iterator.toint()
                     i_c = tidx
+                    if cutlass.const_expr(cluster_size > 1):
+                        if cta_in_cluster != cutlass.Int32(0):
+                            i_c = claimed_c  # peers: skip the walk
                     while i_c < claimed_c:
                         pa = cbase + cutlass.Int64(i_c) * cutlass.Int64(8)
                         ip_c = cute.make_ptr(
@@ -4924,6 +4936,12 @@ class GvrTopKKernel:
                                 smem_vals[wpos] = pidx
                         i_c = i_c + cutlass.Int32(num_threads)
                     cute.arch.barrier()
+                    if cutlass.const_expr(cluster_size > 1):
+                        # leader's local count feeds the DSMEM gather
+                        if is_leader:
+                            if tidx == cutlass.Int32(0):
+                                s_iscalars[5] = s_iscalars[0]
+                        cute.arch.barrier()
             if take_cand == cutlass.Int32(0):
                 # Stage this CTA's slice into SMEM once before Phase 2's
                 # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
@@ -5470,6 +5488,14 @@ class GvrTopKKernel:
                             warp_id,
                             lane,
                         )
+                    if cutlass.const_expr(self.emit_xstate):
+                        # closed-loop state, leader-only at cs > 1 (same
+                        # layout as the cs == 1 exit).
+                        if tidx == cutlass.Int32(0):
+                            xstate_row[0] = cutlass.Float32(1.0)
+                            xstate_row[1] = s_thr[0]
+                            xstate_row[2] = s_thr[0]
+                            xstate_row[3] = cutlass.Float32(cand_count_p4)
 
         # Final cluster barrier: keep peer CTAs (and their SMEM) alive
         # until the leader's gather + Phase 4 finish. Skipped at
