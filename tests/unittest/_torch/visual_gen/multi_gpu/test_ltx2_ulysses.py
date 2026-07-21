@@ -459,6 +459,10 @@ def _logic_ltx2_dual_topology(rank, world_size, backend, audio_seq_len):
                 assert mod.is_ulysses == isinstance(mod.attn, UlyssesAttention), (
                     f"Rank {rank}: {name}.is_ulysses stale (is_stage2={is_stage2})"
                 )
+        # CONDITIONAL audio mode keeps audio self-attn plain even at ulysses>1.
+        assert not isinstance(blk.audio_attn1.attn, UlyssesAttention), (
+            f"Rank {rank}: audio_attn1 wrapped despite CONDITIONAL mode (is_stage2={is_stage2})"
+        )
         sh = d_model._active_sharder
         assert sh.size == (world_size if is_stage2 else world_size // 2)
         assert torch.equal(sh.gather(sh.shard(x, dim=1), dim=1), x), (
