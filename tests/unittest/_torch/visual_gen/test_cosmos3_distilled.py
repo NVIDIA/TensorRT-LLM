@@ -83,6 +83,7 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
         audio_gen=False,
         action_gen=False,
         sampling=Cosmos3SamplingPolicy(),
+        default_use_system_prompt=False,
     )
     defaults.update(attrs)
     for key, value in defaults.items():
@@ -716,6 +717,60 @@ class TestForwardConditioningWiring:
         pipeline, captured = self._forward_ready_pipeline()
         self._forward(pipeline, image=None)
         assert captured["post_step_fn"] is None
+
+
+class TestSystemPromptDefault:
+    """use_system_prompt defaults are checkpoint-declared via model_index.json."""
+
+    def _write_model_index(self, checkpoint_dir: Path, content: dict) -> None:
+        with open(checkpoint_dir / "model_index.json", "w") as f:
+            json.dump(content, f)
+
+    def _loaded_pipeline(self, tmp_path) -> Cosmos3OmniMoTPipeline:
+        _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        pipeline = _bare_pipeline()
+        pipeline.load_standard_components(
+            str(tmp_path), torch.device("cpu"), skip_components=SKIP_NON_SCHEDULER
+        )
+        return pipeline
+
+    def test_checkpoint_declared_true(self, tmp_path):
+        self._write_model_index(tmp_path, {"default_use_system_prompt": True})
+        pipeline = self._loaded_pipeline(tmp_path)
+
+        assert pipeline.default_use_system_prompt is True
+        assert pipeline.extra_param_specs["use_system_prompt"].default is True
+        # The shared spec table must stay untouched (model_copy, not mutation).
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+
+        assert COSMOS3_EXTRA_SPECS["use_system_prompt"].default is False
+
+    def test_missing_model_index_keeps_false(self, tmp_path):
+        pipeline = self._loaded_pipeline(tmp_path)
+        assert pipeline.default_use_system_prompt is False
+        assert pipeline.extra_param_specs["use_system_prompt"].default is False
+
+    def test_model_index_without_field_keeps_false(self, tmp_path):
+        self._write_model_index(tmp_path, {"_class_name": "Cosmos3OmniPipeline"})
+        pipeline = self._loaded_pipeline(tmp_path)
+        assert pipeline.default_use_system_prompt is False
+
+    def _captured_use_system_prompt(self, pipeline, extra_params):
+        captured = {}
+        pipeline.forward = lambda **kwargs: captured.update(kwargs)
+        pipeline.infer(_fake_request("video", extra_params=extra_params))
+        return captured["use_system_prompt"]
+
+    def test_infer_unset_key_uses_checkpoint_default(self):
+        pipeline = _bare_pipeline(default_use_system_prompt=True)
+        assert self._captured_use_system_prompt(pipeline, {"output_type": "video"}) is True
+
+    def test_infer_explicit_false_preserved(self):
+        pipeline = _bare_pipeline(default_use_system_prompt=True)
+        got = self._captured_use_system_prompt(
+            pipeline, {"output_type": "video", "use_system_prompt": False}
+        )
+        assert got is False
 
 
 class TestAudioWeightPresenceGuard:

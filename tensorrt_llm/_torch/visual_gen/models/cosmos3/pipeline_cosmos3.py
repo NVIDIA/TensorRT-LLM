@@ -77,6 +77,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.audio_gen = False
         self.action_gen = False
         self.sampling = Cosmos3SamplingPolicy()
+        self.default_use_system_prompt = COSMOS3_EXTRA_SPECS["use_system_prompt"].default
         if getattr(
             primary_pretrained_config,
             "audio_gen",
@@ -106,6 +107,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self, checkpoint_dir: str, device: torch.device, skip_components: Optional[list] = []
     ) -> None:
         skip_components = skip_components or []
+
+        # Prompting defaults are checkpoint-declared: distilled conversions
+        # carry ``default_use_system_prompt`` in model_index.json (diffusers'
+        # distilled blocks default it to True); older checkpoints omit it and
+        # keep the historical False.
+        model_index_path = os.path.join(checkpoint_dir, "model_index.json")
+        if os.path.exists(model_index_path):
+            with open(model_index_path) as f:
+                model_index = json.load(f)
+            self.default_use_system_prompt = bool(
+                model_index.get("default_use_system_prompt", self.default_use_system_prompt)
+            )
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")
@@ -206,7 +219,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def extra_param_specs(self):
-        return dict(COSMOS3_EXTRA_SPECS)
+        specs = dict(COSMOS3_EXTRA_SPECS)
+        specs["use_system_prompt"] = specs["use_system_prompt"].model_copy(
+            update={"default": self.default_use_system_prompt}
+        )
+        return specs
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
@@ -267,7 +284,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 "use_resolution_template",
                 COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
             ),
-            use_system_prompt=extra_params.get("use_system_prompt", False),
+            use_system_prompt=extra_params.get("use_system_prompt", self.default_use_system_prompt),
             use_guardrails=extra_params.get("use_guardrails", True),
             enable_audio=extra_params.get("enable_audio", False),
             output_type=output_type,
