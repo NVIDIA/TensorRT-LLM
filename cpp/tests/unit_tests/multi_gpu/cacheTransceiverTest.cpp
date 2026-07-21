@@ -475,6 +475,10 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
             }
         }
         tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*request);
+        // A completed context request carries one generated token beyond the prompt;
+        // without it, storeBlocksForReuse drops the trailing prompt token and the
+        // final block never enters the reuse tree.
+        request->addNewToken(0, beamIdx);
         mManager->removeSequence(request->mRequestId, request);
     }
     else
@@ -486,7 +490,6 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
         auto future = mRequester->receiveAsync(request);
         future.get();
         TLLM_CUDA_CHECK(cudaDeviceSynchronize());
-        EXPECT_NE(request->getState(), LlmRequestState::kDISAGG_TRANS_ERROR);
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, request->mRequestId);
         for (auto const& windowSize : blockRange.getWindowSizes())
         {
@@ -499,13 +502,13 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
             }
         }
 
-        // Miss: tokens never stored on the sender must fail fast with an error state.
+        // Miss: tokens never stored on the sender are rejected; the rejection
+        // surfaces as an exception on the receive future.
         std::shared_ptr<LlmRequest> missRequest = makeArbitraryLlmRequest(missPromptLen, arbitraryId + 1);
         mManager->addSequenceBatch(
             {{{missRequest->mRequestId, missRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*missRequest)});
         auto missFuture = mRequester->receiveAsync(missRequest);
-        missFuture.get();
-        EXPECT_EQ(missRequest->getState(), LlmRequestState::kDISAGG_TRANS_ERROR);
+        EXPECT_THROW(missFuture.get(), tensorrt_llm::common::TllmException);
     }
     // The sender must not tear down while the receiver's transfers are in flight.
     tensorrt_llm::mpi::MpiComm::world().barrier();
