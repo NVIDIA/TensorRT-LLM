@@ -10,7 +10,8 @@ from tensorrt_llm.mapping import Mapping
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
-from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from .linear import (Linear, TensorParallelMode, WeightMode,
+                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
 
 
 class MLP(nn.Module):
@@ -99,10 +100,8 @@ class MLP(nn.Module):
         self.up_proj.create_weights()
         self.down_proj.create_weights()
 
-        has_nvfp4 = hasattr(self.down_proj,
-                            'has_nvfp4') and self.down_proj.has_nvfp4
+        has_static_nvfp4_input = is_static_nvfp4_input_eligible(self.down_proj)
         has_kernel = hasattr(torch.ops.trtllm, 'fused_relu2_quantize')
-        has_scale = hasattr(self.down_proj, 'input_scale')
         is_relu2 = self.activation is relu2
         # The fused relu2+fp4_quantize kernel body is guarded by
         # ``__CUDA_ARCH__ >= 1000`` (see fusedActivationQuant.cu). On pre-SM100
@@ -110,7 +109,7 @@ class MLP(nn.Module):
         # quantize in the downstream linear layer.
         is_sm100_or_later = get_sm_version() >= 100
 
-        self._use_fused_relu2_quant = (has_nvfp4 and has_kernel and has_scale
+        self._use_fused_relu2_quant = (has_static_nvfp4_input and has_kernel
                                        and is_relu2 and is_sm100_or_later)
 
         # Static eligibility for the fused GELU(tanh) CuteDSL epilogue (mirrors

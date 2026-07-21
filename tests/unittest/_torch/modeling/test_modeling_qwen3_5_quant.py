@@ -21,6 +21,7 @@ from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_qwen3_5 import (
+    _lm_head_nvfp4_enabled,
     _normalize_qwen35_exclude_modules,
     _normalize_qwen35_quant_config_dict,
 )
@@ -32,7 +33,11 @@ def test_qwen36_normalizes_modelopt_quantized_layer_paths_on_sm121():
     w4a16_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16)
     fp8_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     model_config = ModelConfig(
-        pretrained_config=SimpleNamespace(num_hidden_layers=40),
+        pretrained_config=SimpleNamespace(
+            num_hidden_layers=40,
+            tie_word_embeddings=False,
+            vocab_size=248320,
+        ),
         quant_config=QuantConfig(
             exclude_modules=[
                 "model.language_model.layers.0.linear_attn.in_proj_qkv",
@@ -53,12 +58,13 @@ def test_qwen36_normalizes_modelopt_quantized_layer_paths_on_sm121():
     )
 
     with patch("tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=121):
-        _normalize_qwen35_exclude_modules(model_config)
-        _normalize_qwen35_quant_config_dict(model_config)
+        keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)
+        assert keep_lm_head_quant
+        _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=keep_lm_head_quant)
+        _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
 
     assert model_config.quant_config.exclude_modules == [
         "*linear_attn.conv1d",
-        "lm_head",
         "model.layers.0.linear_attn.in_proj_qkvz*",
         "model.layers.40*",
     ]
@@ -69,6 +75,7 @@ def test_qwen36_normalizes_modelopt_quantized_layer_paths_on_sm121():
         "model.layers.0.mlp.shared_expert.gate_proj",
         "model.layers.0.mlp.shared_expert.up_proj",
         "model.layers.40.mlp.experts",
+        "lm_head",
     }
     for name, quant_config in model_config.quant_config_dict.items():
         if name.endswith("in_proj_qkvz"):

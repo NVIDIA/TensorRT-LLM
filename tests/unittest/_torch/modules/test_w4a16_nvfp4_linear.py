@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import (
     Linear,
@@ -28,6 +29,8 @@ from tensorrt_llm._torch.modules.linear import (
     get_quant_method,
     get_sm_version,
 )
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -181,6 +184,26 @@ def test_get_quant_method_returns_w4a16_nvfp4_linear_method():
     method = get_quant_method(quant_config)
 
     assert type(method) is W4A16NVFP4LinearMethod
+
+
+def test_w4a16_nvfp4_mlp_disables_relu2_fp4_fusion_without_input_scale():
+    model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4))
+
+    with patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=121):
+        mlp = MLP(
+            hidden_size=32,
+            intermediate_size=64,
+            bias=False,
+            activation=relu2,
+            dtype=torch.bfloat16,
+            config=model_config,
+            reduce_output=False,
+        )
+        mlp.create_weights()
+
+    assert mlp.down_proj.has_nvfp4
+    assert mlp.down_proj.input_scale is None
+    assert not mlp._use_fused_relu2_quant
 
 
 def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize():

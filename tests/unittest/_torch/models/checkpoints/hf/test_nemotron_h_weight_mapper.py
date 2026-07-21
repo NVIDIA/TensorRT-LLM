@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+from typing import Optional
 
 import torch
 
@@ -25,7 +26,9 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
-def _make_mapper() -> NemotronHHfWeightMapper:
+def _make_mapper(
+    quant_algo: Optional[QuantAlgo] = None,
+) -> NemotronHHfWeightMapper:
     mapper = NemotronHHfWeightMapper()
     mapper._config = ModelConfig(
         pretrained_config=SimpleNamespace(
@@ -33,54 +36,77 @@ def _make_mapper() -> NemotronHHfWeightMapper:
             mamba_num_heads=1,
             n_groups=1,
             num_hidden_layers=52,
+            quantization_config={
+                "producer": {"name": "modelopt", "version": "0.37.0"},
+                "quant_method": "modelopt",
+            },
             ssm_state_size=1,
         ),
         mapping=Mapping(),
         moe_backend="CUTLASS",
-        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4),
+        quant_config=QuantConfig(quant_algo=quant_algo),
     )
     return mapper
 
 
-def test_nemotron_h_mapper_canonicalizes_w4a16_nvfp4_checkpoint_keys():
+def test_nemotron_h_mapper_preserves_smart_panda_w4a16_lm_head_weights():
     mapper = _make_mapper()
+    weight_scale_2 = torch.tensor(0.291 / (448 * 6), dtype=torch.float32)
     weights = {
-        "lm_head.weight_packed": torch.empty((8, 4), dtype=torch.uint8),
+        "lm_head.weight": torch.empty((8, 4), dtype=torch.uint8),
         "lm_head.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
-        "lm_head.weight_global_scale": torch.tensor(0.25, dtype=torch.float32),
+        "lm_head.weight_scale_2": weight_scale_2,
     }
 
     mapped = mapper.preprocess_weights(weights)
 
-    assert "lm_head.weight" in mapped
-    assert "lm_head.weight_scale" in mapped
-    assert "lm_head.weight_scale_2" in mapped
-    assert "lm_head.input_scale" in mapped
-    assert "lm_head.weight_packed" not in mapped
-    assert "lm_head.weight_global_scale" not in mapped
-    assert mapped["lm_head.weight"] is weights["lm_head.weight_packed"]
-    torch.testing.assert_close(
-        mapped["lm_head.weight_scale_2"], torch.tensor(4.0, dtype=torch.float32)
-    )
-    torch.testing.assert_close(
-        mapped["lm_head.input_scale"], torch.tensor([1.0], dtype=torch.float32)
-    )
+    assert mapped["lm_head.weight"] is weights["lm_head.weight"]
+    assert mapped["lm_head.weight_scale"] is weights["lm_head.weight_scale"]
+    assert mapped["lm_head.weight_scale_2"] is weight_scale_2
+    assert "lm_head.input_scale" not in mapped
 
 
-def test_nemotron_h_mapper_handles_scalar_w4a16_nvfp4_moe_global_scales():
+def test_nemotron_h_mapper_remaps_smart_panda_w4a16_moe_weights():
     mapper = _make_mapper()
-    prefix = "backbone.layers.1.mixer.experts.0.up_proj"
+    up_prefix = "backbone.layers.1.mixer.experts.0.up_proj"
+    down_prefix = "backbone.layers.1.mixer.experts.0.down_proj"
+    up_weight_scale_2 = torch.tensor(0.134 / (448 * 6), dtype=torch.float32)
+    down_weight_scale_2 = torch.tensor(0.214 / (448 * 6), dtype=torch.float32)
     weights = {
-        f"{prefix}.weight_packed": torch.empty((8, 4), dtype=torch.uint8),
-        f"{prefix}.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
-        f"{prefix}.weight_global_scale": torch.tensor(0.25, dtype=torch.float32),
+        f"{up_prefix}.weight": torch.empty((8, 4), dtype=torch.uint8),
+        f"{up_prefix}.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
+        f"{up_prefix}.weight_scale_2": up_weight_scale_2,
+        f"{down_prefix}.weight": torch.empty((8, 4), dtype=torch.uint8),
+        f"{down_prefix}.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
+        f"{down_prefix}.weight_scale_2": down_weight_scale_2,
     }
 
     mapped = mapper.preprocess_weights(weights)
 
     assert "model.layers.1.mixer.experts.0.w1.weight" in mapped
     assert "model.layers.1.mixer.experts.0.w3.weight" in mapped
-    assert "model.layers.1.mixer.experts.0.w1.weight_scale_2" in mapped
-    assert "model.layers.1.mixer.experts.0.w3.weight_scale_2" in mapped
+    assert "model.layers.1.mixer.experts.0.w2.weight" in mapped
     assert mapped["model.layers.1.mixer.experts.0.w3.weight"].shape == (0, 4)
     assert mapped["model.layers.1.mixer.experts.0.w3.weight_scale_2"].shape == ()
+    assert mapped["model.layers.1.mixer.experts.0.w1.weight_scale_2"] is up_weight_scale_2
+    assert mapped["model.layers.1.mixer.experts.0.w3.weight_scale_2"] is up_weight_scale_2
+    assert mapped["model.layers.1.mixer.experts.0.w2.weight_scale_2"] is down_weight_scale_2
+    assert not any(key.endswith(".input_scale") for key in mapped)
+
+
+def test_nemotron_h_mapper_converts_compressed_tensors_global_scale():
+    mapper = _make_mapper(QuantAlgo.W4A16_NVFP4)
+    global_scale = torch.tensor(9362.2861328125, dtype=torch.float32)
+    weights = {
+        "lm_head.weight_packed": torch.empty((8, 4), dtype=torch.uint8),
+        "lm_head.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
+        "lm_head.weight_global_scale": global_scale,
+    }
+
+    mapped = mapper.preprocess_weights(weights)
+
+    assert mapped["lm_head.weight"] is weights["lm_head.weight_packed"]
+    assert "lm_head.weight_packed" not in mapped
+    assert "lm_head.weight_global_scale" not in mapped
+    assert "lm_head.input_scale" not in mapped
+    torch.testing.assert_close(mapped["lm_head.weight_scale_2"], global_scale.reciprocal())

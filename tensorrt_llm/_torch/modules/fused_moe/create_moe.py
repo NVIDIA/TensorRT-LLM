@@ -105,6 +105,13 @@ def get_moe_cls(
                 from tensorrt_llm._utils import get_sm_version
                 sm_version = get_sm_version()
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
+                    mapping = model_config.mapping
+                    if mapping.moe_ep_size > 1 or mapping.dp_size > 1:
+                        logger.info(
+                            "CuteDslB12xFusedMoE does not support expert "
+                            "parallelism or attention-DP/all-to-all; selecting "
+                            "CutlassFusedMoE.")
+                        return CutlassFusedMoE
                     try:
                         import flashinfer  # noqa: F401
                         logger.info(

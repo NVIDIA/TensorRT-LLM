@@ -50,20 +50,27 @@ class NemotronHHfWeightMapper(HfWeightMapper):
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
 
-        def _canonicalize_quant_key(key: str) -> str:
-            replacements = {
-                ".weight_packed": ".weight",
-                ".weight_global_scale": ".weight_scale_2",
-                ".input_global_scale": ".input_scale_2",
-            }
-            for suffix, replacement in replacements.items():
-                if key.endswith(suffix):
-                    return f"{key[:-len(suffix)]}{replacement}"
-            return key
+        def _invert_compressed_tensors_scale(value) -> torch.Tensor:
+            value = value[...] if not isinstance(value, torch.Tensor) else value
+            value = value.to(torch.float32)
+            return torch.where(value > 0, value.reciprocal(),
+                               torch.zeros_like(value)).contiguous()
+
+        def _canonicalize_quant_weight(key: str, value):
+            if key.endswith(".weight_packed"):
+                return f"{key[:-len('.weight_packed')]}.weight", value
+            if key.endswith(".weight_global_scale"):
+                key = f"{key[:-len('.weight_global_scale')]}.weight_scale_2"
+                return key, _invert_compressed_tensors_scale(value)
+            if key.endswith(".input_global_scale"):
+                key = f"{key[:-len('.input_global_scale')]}.input_scale"
+                return key, _invert_compressed_tensors_scale(value)
+            return key, value
 
         new_weights = {}
         for name, _ in weights.items():
             key = name
+            value = weights[name]
 
             # change backbone root name to model
             if "backbone" in key:
@@ -85,29 +92,28 @@ class NemotronHHfWeightMapper(HfWeightMapper):
             if "A_log" in key:
                 key = key.replace("A_log", "A")
 
-            key = _canonicalize_quant_key(key)
+            key, value = _canonicalize_quant_weight(key, value)
 
             if ("mixer.in_proj" in key
                     or "mixer.out_proj" in key) and "_scale" in key:
                 # Special handing for nvfp4 Mamba2 mixer in_proj.weight_scale.
                 if is_nvfp4 and "in_proj.weight_scale_2" not in key and "in_proj.weight_scale" in key:
-                    new_weights[key] = _split_mamba2_mixer_in_proj(
-                        weights[name])
+                    new_weights[key] = _split_mamba2_mixer_in_proj(value)
                 else:
-                    new_weights[key] = weights[name]
+                    new_weights[key] = value
             elif "A" in key:
-                w = split(weights[name], tp_size, tp_rank)
+                w = split(value, tp_size, tp_rank)
                 w = w.to(torch.float32)
                 # Avoid extra temporaries: one fp32 cast, then in-place exp/neg.
                 w.exp_()
                 w.neg_()
                 new_weights[key] = w
             elif "D" in key:
-                w = split(weights[name], tp_size, tp_rank)
+                w = split(value, tp_size, tp_rank)
                 w = w.to(torch.float32)
                 new_weights[key] = w
             elif "dt_bias" in key:
-                w = split(weights[name], tp_size, tp_rank)
+                w = split(value, tp_size, tp_rank)
                 w = w.to(torch.float32)
                 new_weights[key] = w
             elif "mixer.in_proj" in key:
@@ -116,9 +122,9 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 # ``weight_scale``, ``weight_scale_2``, …) under ``mixer.in_proj.*``
                 # — those are scalars / 1-D scales and must not go through the
                 # Mamba2 split rearrangement.
-                new_weights[key] = _split_mamba2_mixer_in_proj(weights[name])
+                new_weights[key] = _split_mamba2_mixer_in_proj(value)
             elif "conv1d" in key:
-                w = weights[name]
+                w = value
                 # removing dim(1) because we are using Linear to store conv1d weights
                 if "weight" in key:
                     w = w.squeeze(1)
@@ -136,12 +142,12 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 w = torch.concat(w).contiguous()
                 new_weights[key] = w
             elif "mixer.norm.weight" in key:
-                w = split(weights[name], tp_size, tp_rank)
+                w = split(value, tp_size, tp_rank)
                 new_weights[key] = w
             # Remap MoE expert weights.
             elif "mixer.experts." in key:
                 if self.config.moe_backend == 'VANILLA':
-                    new_weights[key] = weights[name]
+                    new_weights[key] = value
                 else:
                     # HF transformers 5.x exposes routed MoE experts as fused
                     # tensors stacked along dim 0 ([num_experts, ...]) under keys
@@ -150,7 +156,7 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                     # contrast, stores per-expert keys (``experts.{i}.up_proj``).
                     # The VANILLA FusedMoE loader expects per-expert keys, so
                     # unfuse the 3D HF format here before the standard rename.
-                    val = weights[name]
+                    val = value
                     m = re.match(r"(.*\.mixer\.experts)\.(up_proj|down_proj)$",
                                  key)
                     is_hf_fused = (m is not None
@@ -173,34 +179,37 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                     elif "up_proj" in key:
                         w1_key = key.replace("up_proj", "w1")
                         w3_key = key.replace("up_proj", "w3")
-                        # Don't need to handle with input_scale and weight_scale_2 since they are scalar for fp8 and nvfp4 models.
-                        if "input_scale" in key or "weight_scale_2" in key or "input_quantizer" in key or "weight_quantizer" in key:
-                            new_weights[w3_key] = weights[name]
-                            new_weights[w1_key] = weights[name]
+                        # Per-tensor quantization parameters are shared by w1
+                        # and the empty w3 projection.
+                        if ("input_scale" in key or "weight_scale_2" in key
+                                or "input_quantizer" in key
+                                or "weight_quantizer" in key):
+                            new_weights[w3_key] = value
+                            new_weights[w1_key] = value
                         elif "weight_scale" in key:
                             # NVFP4 case.
-                            if weights[name].shape:
+                            if value.shape:
                                 # w3 weight (gate_proj) scale should be empty for Nemotron-H MoE model.
                                 # Use [:0] to keep the same input dimension as the other weights.
                                 # The w3 weight_scale shape should be [0, input_dim].
-                                new_weights[w3_key] = weights[name][:0]
-                                new_weights[w1_key] = weights[name]
+                                new_weights[w3_key] = value[:0]
+                                new_weights[w1_key] = value
                             # FP8 case.
                             else:
-                                new_weights[w3_key] = weights[name]
-                                new_weights[w1_key] = weights[name]
+                                new_weights[w3_key] = value
+                                new_weights[w1_key] = value
                         else:
                             # w3 weight (gate_proj) should be empty for Nemotron-H MoE model.
                             # Use [:0] to keep the same input dimension as the other weights.
                             # The w3 weight shape should be [0, input_dim].
-                            new_weights[w3_key] = weights[name][:0]
-                            new_weights[w1_key] = weights[name]
+                            new_weights[w3_key] = value[:0]
+                            new_weights[w1_key] = value
                     elif "down_proj" in key:
                         key = key.replace("down_proj", "w2")
-                        new_weights[key] = weights[name]
+                        new_weights[key] = value
                     else:
                         raise ValueError(f"Unknown MoE weight: {key}")
             else:
-                new_weights[key] = weights[name]
+                new_weights[key] = value
 
         return new_weights

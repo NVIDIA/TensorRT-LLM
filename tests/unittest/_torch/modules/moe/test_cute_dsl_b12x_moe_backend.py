@@ -40,6 +40,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
     NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 _FUSED_MOE_MODULE = "tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x"
@@ -191,6 +192,30 @@ def test_get_moe_cls_cutedsl_selects_b12x_for_layer_w4a16_nvfp4_on_supported_sm(
     with patch("tensorrt_llm._utils.get_sm_version", return_value=sm_version):
         cls = get_moe_cls(cfg, layer_idx=0)
     assert cls is CuteDslB12xFusedMoE
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        Mapping(world_size=2, tp_size=2, moe_tp_size=1, moe_ep_size=2),
+        Mapping(
+            world_size=2,
+            tp_size=2,
+            enable_attention_dp=True,
+            dwdp_size=2,
+            dwdp_rank=0,
+        ),
+    ],
+)
+def test_get_moe_cls_cutedsl_falls_back_to_cutlass_for_distributed_b12x(mapping):
+    cfg = ModelConfig(mapping=mapping)
+    cfg.moe_backend = "CUTEDSL"
+    cfg.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+
+    with patch("tensorrt_llm._utils.get_sm_version", return_value=120):
+        cls = get_moe_cls(cfg)
+
+    assert cls is CutlassFusedMoE
 
 
 def test_get_moe_cls_cutedsl_falls_back_to_plain_cutedsl_when_flashinfer_missing(monkeypatch):

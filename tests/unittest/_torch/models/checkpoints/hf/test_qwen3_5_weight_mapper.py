@@ -46,6 +46,23 @@ def test_qwen35_modelopt_preprocess_preserves_scalar_fp8_scale_name():
     assert weights["model.layers.0.linear_attn.out_proj.weight_scale"].shape == torch.Size([])
 
 
+def test_qwen36_preserves_quantized_modelopt_lm_head():
+    mapper = _make_mapper()
+    mapper._config.quant_config_dict = {
+        "lm_head": QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4, group_size=16),
+    }
+    weights = {
+        "lm_head.weight": torch.empty((8, 4), dtype=torch.uint8),
+        "lm_head.weight_scale": torch.empty((8, 1), dtype=torch.float8_e4m3fn),
+        "lm_head.weight_scale_2": torch.tensor(0.00011189778888365254, dtype=torch.float32),
+        "lm_head.input_scale": torch.tensor(0.02771577425301075, dtype=torch.float32),
+    }
+
+    mapped = mapper._dequantize_lm_head_nvfp4(weights)
+
+    assert mapped is weights
+
+
 def test_qwen35_rescales_per_tensor_fp8_linear_attention_qkvz_projection():
     mapper = _make_mapper(dtype=torch.bfloat16)
     mapper._config.quant_config_dict = {
