@@ -326,7 +326,11 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
-        for attempt in range(self._max_retries + 1):
+        # Keep the extended budget for transient burst-start TCP races while
+        # timeout exceptions remain explicitly non-retryable below.
+        transient_tcp_budget = 5
+        loop_max = max(self._max_retries, transient_tcp_budget) + 1
+        for attempt in range(loop_max):
             # Regenerate disagg_request_id on retry to avoid ID collision on workers
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
@@ -418,16 +422,22 @@ class OpenAIHttpClient(OpenAIClient):
                         traceback.format_exc(),
                     )
                     raise
-                if attempt >= self._max_retries:
+                is_transient_tcp = isinstance(
+                    e,
+                    (aiohttp.ServerDisconnectedError, ConnectionResetError),
+                )
+                effective_max = self._max_retries
+                if is_transient_tcp:
+                    effective_max = max(self._max_retries, transient_tcp_budget)
+                if attempt >= effective_max:
                     logger.error(
                         f"Client error to {url}: {e} - last retry {attempt} of "
-                        f"{self._max_retries} failed",
+                        f"{effective_max} failed",
                         traceback.format_exc(),
                     )
                     raise
                 logger.error(
-                    f"{self._role} client error to {url}: {e} - retry {attempt} "
-                    f"of {self._max_retries}",
+                    f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
                     traceback.format_exc(),
                 )
                 await asyncio.sleep(self._retry_interval_sec)
