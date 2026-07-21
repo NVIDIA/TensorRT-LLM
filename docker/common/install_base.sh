@@ -109,7 +109,7 @@ init_ubuntu() {
   pip3 install --ignore-installed "setuptools<80"
 
   echo 'export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH' >> "${ENV}"
-  # Remove previous TRT installation
+  # Remove TRT installation
   if [[ $(apt list --installed | grep libnvinfer) ]]; then
     apt-get remove --purge -y libnvinfer*
   fi
