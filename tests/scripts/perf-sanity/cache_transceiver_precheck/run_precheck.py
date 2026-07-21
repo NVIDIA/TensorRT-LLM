@@ -25,6 +25,12 @@ stage with a specific error (TIMEOUT / TRANSFER_ERROR / MISMATCH / ...)
 before any model is loaded, so network/UCX misconfiguration is caught in
 minutes instead of after a full model bring-up.
 
+Vocabulary: a PAIR is one dp-rank-to-dp-rank transfer pairing (n_pairs =
+max of the two sides' dp sizes, so every dp rank is exercised); a REP is one
+repetition of all pairs (1 warmup + num_requests measured); a CHUNK is the
+batch of pairs in flight at once (at most max_concurrent_pairs) -- NOT
+token/data chunking.
+
 Asymmetric parallelism (e.g. ctx dep4 -> gen dep16, ctx pp8 -> gen tp32) is
 supported: the fill pattern is seeded per (request, GLOBAL layer) and is
 constant along the KV-head axis, so any TP resharding or PP re-splitting on
@@ -912,6 +918,25 @@ def chunk_timeout_s(plan, li, rep):
 
 # --------------------------------------------------------------------------- #
 # ctx / gen session loops
+#
+# Per (ctx, gen) pair, the leaders speak a lockstep REQ/REP protocol (all
+# frames HMAC-JSON; KV bytes themselves go through the transceiver under
+# test, never over ZMQ):
+#
+#   gen leader                                ctx leader
+#    | -- hello {fingerprint} --------------> |  yaml mismatch -> abort
+#    | <---------------- welcome ------------ |
+#    | -- go {li, rep, chunk} --------------> |  every rank posts its sends
+#    | <----- params {pair: ctx_phase} ------ |  (from the owning dp ranks)
+#    |   ...KV transfer + byte verification.. |
+#    |        (repeat per schedule entry)     |
+#    | -- done (deferred: after ALL peers) -> |  ctx exits only now
+#    | <------------------ bye -------------- |
+#
+# A "chunk" here is a batch of TRANSFER PAIRS in flight at once (at most
+# max_concurrent_pairs of the n_pairs dp-rank pairings) -- NOT token/data
+# chunking. It bounds the tiny synthetic KV pool and gives the per-chunk
+# alarm a precise target, while still exercising concurrent transfers.
 # --------------------------------------------------------------------------- #
 def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     """Serve one gen peer's full schedule on a dedicated REP socket."""
@@ -1101,6 +1126,127 @@ def load_plan(args):
     return plan, role_side
 
 
+def _install_watchdog(runner, plan, rank):
+    """Two-layer stall protection around every phase of the run.
+
+    signal.alarm catches Python-level stalls; HangDetector catches
+    GIL-released native hangs (dumps stacks, records TIMEOUT, SIGKILLs so
+    `srun --kill-on-bad-exit` tears the step down). The external `timeout`
+    around the srun is the guaranteed backstop for GIL-held hangs.
+
+    Returns (arm, disarm, stop, current_cell): per-phase alarm control, the
+    final shutdown, and the mutable "what phase are we in" marker used by
+    failure messages.
+    """
+    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
+
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    current_cell = {"what": "startup"}
+
+    def _on_hang():
+        runner.recorder.record("-", 0, "TIMEOUT", f"hang detected during {current_cell['what']}")
+        runner.recorder.finalize()
+        sys.stderr.write(
+            f"[precheck {runner.role}_{runner.server_idx} r{rank}] WATCHDOG_KILL "
+            f"{current_cell['what']}\n"
+        )
+        sys.stderr.flush()
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    # The detector must outlast the LONGEST legitimate wait (peer handshakes
+    # are serialized across sessions); per-cell alarms are the tighter bound
+    # for actual transfer work.
+    hang_detector = HangDetector(
+        timeout=hello_timeout_s(plan, runner.side["num_peers"]) + plan["chunk_timeout_s"] + 60,
+        on_detected=_on_hang,
+    )
+    hang_detector.start()
+
+    def arm(what, seconds=None):
+        current_cell["what"] = what
+        signal.alarm(seconds or plan["chunk_timeout_s"])
+        hang_detector.checkpoint()
+
+    def disarm():
+        signal.alarm(0)
+        hang_detector.cancel_task()
+
+    def stop():
+        disarm()
+        hang_detector.stop()
+
+    return arm, disarm, stop, current_cell
+
+
+def _make_peer_failure_recorder(runner, disarm, current_cell):
+    """Exception -> verdict mapping shared by all per-peer loops (isolation:
+    one bad peer never stops the others)."""
+
+    def record_peer_failure(peer, exc):
+        disarm()
+        if isinstance(exc, _Timeout):
+            runner.recorder.record(
+                peer, 0, "TIMEOUT", f"exceeded the budget during {current_cell['what']}"
+            )
+        elif isinstance(exc, _PeerAbort):
+            runner.recorder.record(peer, 0, "TRANSFER_ERROR", str(exc))
+        else:
+            runner.recorder.record(peer, 0, "TRANSFER_ERROR", repr(exc))
+
+    return record_peer_failure
+
+
+def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
+    """ctx role: bind one dedicated REP socket per gen peer (avoids REQ
+    interleaving across sessions on a shared socket), publish the addr files,
+    then serve each peer's full schedule. Each session gets a fresh HMAC key,
+    shared only through the work-dir addr file (0600)."""
+    num_peers = runner.side["num_peers"]
+    socks, keys = {}, {}
+    if runner.is_leader:
+        zmq, zctx = runner._zmq()
+        host = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
+        for gj in range(num_peers):
+            s = zctx.socket(zmq.REP)
+            s.setsockopt(zmq.LINGER, 0)
+            # Generous: gen peers are serialized across ctx servers.
+            s.setsockopt(zmq.RCVTIMEO, hello_timeout_s(plan, num_peers) * 1000)
+            port = s.bind_to_random_port("tcp://*")
+            keys[gj] = secrets.token_bytes(32)
+            write_addr(
+                addr_path(runner.work_dir, runner.server_idx, gj),
+                {"host": host, "port": port, "key": keys[gj].hex()},
+            )
+            socks[gj] = s
+    for gj in range(num_peers):
+        try:
+            ctx_serve_peer(runner, socks.get(gj), gj, arm, disarm, keys.get(gj))
+            runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
+        except Exception as e:  # noqa: BLE001 - per-peer isolation
+            record_peer_failure(f"gen_{gj}", e)
+
+
+def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
+    """gen role: run every ctx peer's schedule, then release all sessions.
+
+    The release ("done") is deferred until EVERY peer's schedule finished, so
+    all ctx instances stay alive for the whole precheck -- matching real
+    serving, where no transceiver ever holds connections to a dead agent
+    while transfers are still running."""
+    open_sessions = []
+    for ci in range(runner.side["num_peers"]):
+        try:
+            sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
+            open_sessions.append((ci, sock, sess_key))
+        except Exception as e:  # noqa: BLE001 - per-peer isolation
+            record_peer_failure(f"ctx_{ci}", e)
+    for ci, sock, sess_key in open_sessions:
+        try:
+            gen_release_peer(runner, ci, sock, sess_key, arm, disarm)
+        except Exception as e:  # noqa: BLE001 - best-effort release
+            record_peer_failure(f"ctx_{ci}", e)
+
+
 def main(argv=None):
     args = parse_args(argv)
     plan, side = load_plan(args)
@@ -1158,42 +1304,7 @@ def main(argv=None):
             flush=True,
         )
 
-    # --- watchdog: signal.alarm for Python-level stalls + HangDetector for
-    # GIL-released native hangs (dumps stacks, records TIMEOUT, SIGKILLs so
-    # `srun --kill-on-bad-exit` tears the step down; the external `timeout`
-    # around the srun is the guaranteed backstop for GIL-held hangs).
-    signal.signal(signal.SIGALRM, _alarm_handler)
-    from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
-
-    current_cell = {"what": "startup"}
-
-    def _on_hang():
-        runner.recorder.record("-", 0, "TIMEOUT", f"hang detected during {current_cell['what']}")
-        runner.recorder.finalize()
-        sys.stderr.write(
-            f"[precheck {args.role}_{args.server_idx} r{rank}] WATCHDOG_KILL "
-            f"{current_cell['what']}\n"
-        )
-        sys.stderr.flush()
-        os.kill(os.getpid(), signal.SIGKILL)
-
-    # The detector must outlast the LONGEST legitimate wait (peer handshakes
-    # are serialized across sessions); per-cell alarms below are the tighter
-    # bound for actual transfer work.
-    hang_detector = HangDetector(
-        timeout=hello_timeout_s(plan, side["num_peers"]) + plan["chunk_timeout_s"] + 60,
-        on_detected=_on_hang,
-    )
-    hang_detector.start()
-
-    def arm(what, seconds=None):
-        current_cell["what"] = what
-        signal.alarm(seconds or plan["chunk_timeout_s"])
-        hang_detector.checkpoint()
-
-    def disarm():
-        signal.alarm(0)
-        hang_detector.cancel_task()
+    arm, disarm, stop_watchdog, current_cell = _install_watchdog(runner, plan, rank)
 
     # --- setup: KV pool + transceiver (same config as the real test) ---------
     setup_err = None
@@ -1224,77 +1335,14 @@ def main(argv=None):
             flush=True,
         )
 
-    def record_peer_failure(peer, exc):
-        """Map a per-peer exception to its verdict (isolation: other peers
-        keep running)."""
-        disarm()
-        if isinstance(exc, _Timeout):
-            runner.recorder.record(
-                peer, 0, "TIMEOUT",
-                f"exceeded the budget during {current_cell['what']}",
-            )
-        elif isinstance(exc, _PeerAbort):
-            runner.recorder.record(peer, 0, "TRANSFER_ERROR", str(exc))
-        else:
-            runner.recorder.record(peer, 0, "TRANSFER_ERROR", repr(exc))
-
-    # --- sessions -------------------------------------------------------------
-    num_peers = side["num_peers"]
+    record_peer_failure = _make_peer_failure_recorder(runner, disarm, current_cell)
     try:
         if args.role == "ctx":
-            # One dedicated REP socket per gen peer (avoids REQ interleaving
-            # across sessions on a shared socket), published via addr files.
-            # Each session gets a fresh HMAC key, shared only through the
-            # work-dir addr file (0600).
-            socks, keys = {}, {}
-            if runner.is_leader:
-                zmq, zctx = runner._zmq()
-                host = os.environ.get("SLURMD_NODENAME") or socket.gethostname()
-                for gj in range(num_peers):
-                    s = zctx.socket(zmq.REP)
-                    s.setsockopt(zmq.LINGER, 0)
-                    # Generous: gen peers are serialized across ctx servers.
-                    s.setsockopt(zmq.RCVTIMEO, hello_timeout_s(plan, num_peers) * 1000)
-                    port = s.bind_to_random_port("tcp://*")
-                    keys[gj] = secrets.token_bytes(32)
-                    write_addr(
-                        addr_path(runner.work_dir, args.server_idx, gj),
-                        {"host": host, "port": port, "key": keys[gj].hex()},
-                    )
-                    socks[gj] = s
-            for gj in range(num_peers):
-                try:
-                    ctx_serve_peer(
-                        runner,
-                        socks.get(gj),
-                        gj,
-                        arm,
-                        disarm,
-                        keys.get(gj),
-                    )
-                    runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
-                except Exception as e:  # noqa: BLE001 - per-peer isolation
-                    record_peer_failure(f"gen_{gj}", e)
+            _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure)
         else:
-            open_sessions = []
-            for ci in range(num_peers):
-                try:
-                    sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
-                    open_sessions.append((ci, sock, sess_key))
-                except Exception as e:  # noqa: BLE001 - per-peer isolation
-                    record_peer_failure(f"ctx_{ci}", e)
-            # Deferred "done": released only after EVERY ctx peer's schedule
-            # finished, so all ctx instances stay alive for the whole
-            # precheck (real-serving lifecycle -- no dead-agent connections
-            # in anyone's transceiver while transfers are still running).
-            for ci, sock, sess_key in open_sessions:
-                try:
-                    gen_release_peer(runner, ci, sock, sess_key, arm, disarm)
-                except Exception as e:  # noqa: BLE001 - best-effort release
-                    record_peer_failure(f"ctx_{ci}", e)
+            _drive_ctx_peers(runner, arm, disarm, record_peer_failure)
     finally:
-        disarm()
-        hang_detector.stop()
+        stop_watchdog()
 
     # --- teardown + result ------------------------------------------------------
     bw = None

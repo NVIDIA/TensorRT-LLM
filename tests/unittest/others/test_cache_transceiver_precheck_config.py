@@ -354,3 +354,143 @@ def test_rid_tags_dense_within_session():
     assert not (set(a) & set(b))  # globally unique across sessions
     tags = [r & 0xFFF for r in a]
     assert len(set(tags)) == len(tags)  # no tag aliasing within a session
+
+
+class TestMultiPeerOrchestration:
+    """CPU-only end-to-end run of the 2-ctx x 1-gen session protocol.
+
+    Exercises the exact multi-instance logic of the hardware "B" topology:
+    real ZMQ sockets + HMAC frames + StatusRecorder + rendezvous files via
+    the real PrecheckRunner/_serve_gen_peers/_drive_ctx_peers, with only the
+    GPU transfer methods stubbed out.
+    """
+
+    class _FakeComm:
+        def Get_rank(self):
+            return 0
+
+        def Get_size(self):
+            return 1
+
+        def bcast(self, obj, root=0):
+            return obj
+
+        def gather(self, obj, root=0):
+            return [obj]
+
+        def allgather(self, obj):
+            return [obj]
+
+    class _FakeParams:
+        first_gen_tokens = [0]
+        req_id = 1
+        opaque_state = b"op"
+        draft_tokens = None
+        ctx_dp_rank = 0
+        disagg_info_endpoint = None
+
+    def _mk_runner(self, role, server_idx, plan, work_dir, monkeypatch, fail_ctx=False):
+        import sys
+        import types
+
+        # PrecheckRunner.__init__ imports mpi4py only to ensure MPI init.
+        monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
+        # The gen side converts wire params through tensorrt_llm bindings;
+        # identity is fine here (params_to_wire is covered separately).
+        monkeypatch.setattr(rp, "params_from_wire", lambda d: d)
+
+        args = types.SimpleNamespace(server_idx=server_idx, work_dir=work_dir)
+        side = pcfg.side_plan(plan, role)
+        runner = rp.PrecheckRunner(args, plan, side, self._FakeComm())
+
+        calls = {"chunks": 0}
+
+        def ctx_run_chunk(peer_idx, li, req_len, rep, chunk):
+            if fail_ctx:
+                raise rp._TransferError("injected ctx failure")
+            calls["chunks"] += 1
+            return {p: self._FakeParams() for p in chunk}, {}
+
+        runner.ctx_run_chunk = ctx_run_chunk
+        runner.ctx_finish_chunk = lambda reqs: None
+        runner.gen_run_chunk = (
+            lambda peer_idx, li, req_len, rep, chunk, params: (True, "")
+        )
+        runner._calls = calls
+        return runner
+
+    def _run(self, tmp_path, monkeypatch, fail_ctx1=False):
+        import threading
+
+        monkeypatch.setenv("SLURM_JOB_ID", "777")
+        # Publish loopback in the addr files: the real node hostname may not
+        # resolve in sandboxed/CI environments, and everything is one process.
+        monkeypatch.setenv("SLURMD_NODENAME", "127.0.0.1")
+        cfg = _disagg_yaml(
+            hardware={"gpus_per_node": 4, "num_ctx_servers": 2, "num_gen_servers": 1},
+            cache_transceiver_precheck={
+                "request_lengths": [32],
+                "num_requests": 1,
+                "warmup_requests": 1,
+                "rendezvous_timeout_s": 30,
+                "chunk_timeout_s": 30,
+                "wireup_timeout_s": 0,
+            },
+        )
+        plan = pcfg.resolve_plan(cfg)
+        work = str(tmp_path)
+        noop = lambda *a, **k: None  # noqa: E731 - signal.alarm needs main thread
+
+        gen = self._mk_runner("gen", 0, plan, work, monkeypatch)
+        ctxs = [
+            self._mk_runner("ctx", i, plan, work, monkeypatch, fail_ctx=(fail_ctx1 and i == 1))
+            for i in range(2)
+        ]
+
+        failures = []
+
+        def rec(peer, exc):
+            failures.append((peer, type(exc).__name__))
+
+        threads = [
+            threading.Thread(
+                target=rp._serve_gen_peers, args=(c, plan, noop, noop, rec), daemon=True
+            )
+            for c in ctxs
+        ]
+        for t in threads:
+            t.start()
+        rp._drive_ctx_peers(
+            gen, noop, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
+        )
+        for t in threads:
+            t.join(timeout=60)
+            assert not t.is_alive(), "ctx serve thread wedged"
+        return plan, gen, ctxs, failures
+
+    def test_two_ctx_full_pass(self, tmp_path, monkeypatch):
+        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch)
+        assert not failures
+        # gen recorded a PASS per (peer, req_len)
+        assert {(c["peer"], c["status"]) for c in gen.recorder.cases} == {
+            ("ctx_0", "PASS"),
+            ("ctx_1", "PASS"),
+        }
+        # every ctx served the full schedule (reps x chunks) and got its
+        # deferred done (PASS recorded only after done/bye completes)
+        total_chunks = len(pcfg.chunks(plan)) * (
+            plan["warmup_requests"] + plan["num_requests"]
+        )
+        for c in ctxs:
+            assert c._calls["chunks"] == total_chunks
+            assert [x["status"] for x in c.recorder.cases] == ["PASS"]
+
+    def test_ctx_failure_isolated(self, tmp_path, monkeypatch):
+        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_ctx1=True)
+        # gen side: healthy peer unaffected, failing peer gets a clear verdict
+        by_peer = {c["peer"]: c["status"] for c in gen.recorder.cases}
+        assert by_peer == {"ctx_0": "PASS", "ctx_1": "TRANSFER_ERROR"}
+        # ctx_1's own serve loop surfaced the failure (its peer is gen_0)
+        assert ("gen_0", "_TransferError") in failures
+        # ctx_0 served its full schedule and got the deferred done
+        assert [c["status"] for c in ctxs[0].recorder.cases] == ["PASS"]
