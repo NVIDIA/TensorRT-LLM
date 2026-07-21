@@ -3361,11 +3361,13 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
              False),
             (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True,
              True),
+            (8, 1, 8, 3, False, True, True, True, 24, "_DEFAULT", False, True,
+             True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
             "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1",
-            "cute_dsl_gvr_mtp1"
+            "cute_dsl_gvr_mtp1", "cute_dsl_gvr_mtp3"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
