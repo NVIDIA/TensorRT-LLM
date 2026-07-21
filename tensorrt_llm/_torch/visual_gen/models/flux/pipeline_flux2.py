@@ -341,6 +341,7 @@ class Flux2Pipeline(BasePipeline):
                         guidance_param_name=guidance_param,
                         forward_params=forward_params,
                         return_dict_default=False,
+                        return_tuple_when_return_dict_false=True,
                     )
                 )
 
