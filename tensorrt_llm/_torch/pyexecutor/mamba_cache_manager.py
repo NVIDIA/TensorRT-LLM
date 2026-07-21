@@ -2690,17 +2690,12 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
-    def _get_pool_page_index_role(self, pool_id: int) -> DataRole:
+    def _get_pool_roles(self,
+                        pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         layer_id = int(self.impl.layer_grouping[pool_id][0])
         if self._is_local_mamba_layer(layer_id):
-            return MambaRole.SSM_STATE
-        return Role.KEY
-
-    def _get_pool_paired_role(self, pool_id: int) -> Optional[DataRole]:
-        layer_id = int(self.impl.layer_grouping[pool_id][0])
-        if self._is_local_mamba_layer(layer_id):
-            return None
-        return super()._get_pool_paired_role(pool_id)
+            return MambaRole.SSM_STATE, None
+        return super()._get_pool_roles(pool_id)
 
     def _max_resident_sequences(self) -> int:
         return self.max_batch_size * self.mapping.pp_size

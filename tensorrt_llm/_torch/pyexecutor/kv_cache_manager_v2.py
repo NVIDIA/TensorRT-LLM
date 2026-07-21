@@ -1114,16 +1114,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
-    def _get_pool_page_index_role(self, pool_id: int) -> DataRole:
-        return Role.KEY
+    def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
+        """Return the roles represented by the two page-table index lanes.
 
-    def _get_pool_paired_role(self, pool_id: int) -> Optional[DataRole]:
-        if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
-            return None
-        return Role.VALUE
+        When present, role B must be addressable from role A using a constant
+        page-index offset.
+        """
+        role_b = None if self.kv_cache_type == CacheTypeCpp.SELFKONLY else Role.VALUE
+        return Role.KEY, role_b
 
-    def _get_block_scale_role_for_pool(self, pool_id: int) -> Optional[DataRole]:
-        if self.dtype != DataType.NVFP4 or self._get_pool_page_index_role(pool_id) != Role.KEY:
+    def _get_block_scale_role(self, role_a: DataRole) -> Optional[DataRole]:
+        if self.dtype != DataType.NVFP4 or role_a != Role.KEY:
             return None
         return Role.KEY_BLOCK_SCALE
 
@@ -1134,17 +1135,17 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.enable_swa_scratch_reuse:
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 pool_id = self.impl.get_layer_group_id(layer_id)
-                page_index_role = self._get_pool_page_index_role(pool_id)
+                role_a, _ = self._get_pool_roles(pool_id)
                 kv_cache_pool_pointers_list.append(
                     [
                         self.impl.get_mem_pool_base_address(
-                            layer_id, page_index_role, PageIndexMode.PER_LAYER
+                            layer_id, role_a, PageIndexMode.PER_LAYER
                         ),
                         0,
                     ]
                 )
                 if self.dtype == DataType.NVFP4:
-                    block_scale_role = self._get_block_scale_role_for_pool(pool_id)
+                    block_scale_role = self._get_block_scale_role(role_a)
                     block_scale_pool_pointers_list.append(
                         [
                             self.impl.get_mem_pool_base_address(
@@ -1159,17 +1160,15 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             for pool_id in range(self.num_pools):
                 layer_id = self.impl.layer_grouping[pool_id][0]
-                page_index_role = self._get_pool_page_index_role(pool_id)
+                role_a, _ = self._get_pool_roles(pool_id)
                 kv_cache_pool_pointers_list.append(
                     [
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, page_index_role, PageIndexMode.SHARED
-                        ),
+                        self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED),
                         0,
                     ]
                 )
                 if self.dtype == DataType.NVFP4:
-                    block_scale_role = self._get_block_scale_role_for_pool(pool_id)
+                    block_scale_role = self._get_block_scale_role(role_a)
                     block_scale_pool_pointers_list.append(
                         [
                             self.impl.get_mem_pool_base_address(
@@ -1183,23 +1182,21 @@ class KVCacheManagerV2(BaseResourceManager):
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)
-                page_index_role = self._get_pool_page_index_role(layer_group_id)
+                role_a, role_b = self._get_pool_roles(layer_group_id)
                 index_base_addr = kv_cache_pool_pointers_list[layer_group_id][0]
                 addr_offset = (
-                    self.impl.get_mem_pool_base_address(
-                        layer_id, page_index_role, PageIndexMode.SHARED
-                    )
+                    self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED)
                     - index_base_addr
                 )
-                offset_divisor = self.impl.get_page_stride(layer_id, page_index_role)
-                if self._get_pool_paired_role(layer_group_id) is not None:
+                offset_divisor = self.impl.get_page_stride(layer_id, role_a)
+                if role_b is not None:
                     offset_divisor *= self.kv_factor
                 offset = exact_div(addr_offset, offset_divisor)
 
                 if self.dtype != DataType.NVFP4:
                     block_scale_offset = None
                 else:
-                    block_scale_role = self._get_block_scale_role_for_pool(layer_group_id)
+                    block_scale_role = self._get_block_scale_role(role_a)
                     if block_scale_role is None:
                         block_scale_offset = None
                     else:
@@ -1211,7 +1208,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             - block_scale_base_addr
                         )
                         block_scale_divisor = self.impl.get_page_stride(layer_id, block_scale_role)
-                        if self._get_pool_paired_role(layer_group_id) is not None:
+                        if role_b is not None:
                             block_scale_divisor *= self.kv_factor
                         block_scale_offset = exact_div(block_scale_addr_offset, block_scale_divisor)
 
@@ -1250,16 +1247,13 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         for pool_id in range(self.num_pools):
             layer_id = self.impl.layer_grouping[pool_id][0]
-            page_index_role = self._get_pool_page_index_role(pool_id)
-            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, page_index_role)
-            paired_role = self._get_pool_paired_role(pool_id)
-            if paired_role is not None:
+            role_a, role_b = self._get_pool_roles(pool_id)
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, role_a)
+            if role_b is not None:
                 self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, paired_role, PageIndexMode.SHARED)
-                    - self.impl.get_mem_pool_base_address(
-                        layer_id, page_index_role, PageIndexMode.SHARED
-                    ),
-                    self.impl.get_page_stride(layer_id, page_index_role),
+                    self.impl.get_mem_pool_base_address(layer_id, role_b, PageIndexMode.SHARED)
+                    - self.impl.get_mem_pool_base_address(layer_id, role_a, PageIndexMode.SHARED),
+                    self.impl.get_page_stride(layer_id, role_a),
                 )
             else:
                 self.kv_offset[pool_id] = 0
@@ -1429,11 +1423,10 @@ class KVCacheManagerV2(BaseResourceManager):
         for local_layer_idx in range(self.num_local_layers):
             layer_id = LayerId(local_layer_idx)
             pool_id = self.layer_to_pool_mapping_dict[layer_id]
-            page_index_role = self._get_pool_page_index_role(pool_id)
-            paired_role = self._get_pool_paired_role(pool_id)
+            role_a, role_b = self._get_pool_roles(pool_id)
             roles = [
-                page_index_role,
-                page_index_role if paired_role is None else paired_role,
+                role_a,
+                role_a if role_b is None else role_b,
             ]
             for role_idx, role in enumerate(roles):
                 converter = self.impl.get_page_index_converter(layer_id, role)
