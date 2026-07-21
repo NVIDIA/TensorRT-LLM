@@ -387,52 +387,67 @@ def test_cancel_request_in_transmission(attention_type):
     kv_cache_transceiver_gen = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager_gen, attention_type,
         cache_transceiver_config)
+    try:
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
 
-    fill_kv_cache_buffer(kv_cache_manager_ctx)
+        sampling_params = SamplingParams()
+        ctx_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    # init ctx request
-    sampling_params = SamplingParams()
-    ctx_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, ctx_request.prompt_len, 1)],
+            [ctx_request])
+        ctx_ref = weakref.ref(ctx_request)
+        baseline_ctx_refcount = sys.getrefcount(ctx_request)
+        kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+        assert sys.getrefcount(ctx_request) == baseline_ctx_refcount + 1
 
-    kv_cache_manager_ctx.impl.add_sequence_batch(
-        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
-    # send ctx request
-    kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+        assert kv_cache_transceiver_ctx.cancel_request(ctx_request)
+        assert sys.getrefcount(ctx_request) == baseline_ctx_refcount + 1, (
+            "Accepted cancellation released ownership before the status "
+            "poll recorded a terminal rank outcome")
 
-    # wait for ctx request to be sent
-    time.sleep(2)
+        completed_ids, error_ids = (
+            kv_cache_transceiver_ctx.check_context_transfer_status(0))
+        assert completed_ids == []
+        assert error_ids == [ctx_request.py_request_id]
+        assert sys.getrefcount(ctx_request) == baseline_ctx_refcount
 
-    # cancel ctx request
-    is_cancelled = kv_cache_transceiver_ctx.cancel_request(ctx_request)
-    assert is_cancelled
+        context_phase_params = ctx_request.context_phase_params
+        del ctx_request
+        gc.collect()
+        assert ctx_ref() is None, (
+            "Terminal context cancellation retained LlmRequest ownership")
 
-    # init gen request
-    gen_request = LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=list(range(256)),
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            sampling_params._get_sampling_config()),
-        is_streaming=False,
-        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-        context_phase_params=ctx_request.context_phase_params)
+        gen_request = LlmRequest(
+            request_id=0,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=context_phase_params)
 
-    kv_cache_manager_gen.impl.add_sequence_batch(
-        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
-    # send gen request
-    kv_cache_transceiver_gen.request_and_receive_async(gen_request)
+        kv_cache_manager_gen.impl.add_sequence_batch(
+            [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+            [gen_request])
+        kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
-    # Block the main thread due to the async operation
-    time.sleep(2)
-    kv_cache_transceiver_gen.check_gen_transfer_status(0)
-    assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+        wait_for_transfer_completion(
+            lambda: kv_cache_transceiver_gen.check_gen_transfer_status(0),
+            lambda: gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR,
+            timeout_s=10,
+        )
+    finally:
+        shutdown_transceivers(kv_cache_transceiver_gen,
+                              kv_cache_transceiver_ctx)
 
 
 @pytest.mark.timeout(120)

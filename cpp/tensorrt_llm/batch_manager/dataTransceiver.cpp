@@ -543,31 +543,44 @@ public:
         bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
         bool isCancelled = false;
         bool isCurrentRequest = false;
+        std::optional<Response> cancelledResponse;
         {
             std::scoped_lock lock(mSenderMutex);
             auto it = mReadyResponses.find(llmRequest.mRequestId);
             if (it != mReadyResponses.end())
             {
                 isCurrentRequest = mCurrentRequest.has_value() && mCurrentRequest.value() == llmRequest.mRequestId;
-                // The legacy path cannot interrupt a ready/active transfer, so
-                // preserve its false return until the opt-in is enabled.
-                if (!isCurrentRequest || inflightCancelEnabled)
+                if (!isCurrentRequest)
                 {
+                    // Release a response that has not entered the ready-signal handshake immediately. Retain only
+                    // the request ID so a late peer receives ready=false without retaining the request or its future.
+                    mCancelledRequests.insert(llmRequest.mRequestId);
+                    cancelledResponse.emplace(std::move(it->second));
+                    mReadyResponses.erase(it);
+                    isCancelled = true;
+                }
+                else if (inflightCancelEnabled)
+                {
+                    // The legacy path cannot interrupt a current/active transfer. The opt-in path preserves the
+                    // response until sendResponse coordinates ready=false or the in-flight flag stops the transfer.
                     mCancelledRequests.insert(llmRequest.mRequestId);
                     isCancelled = true;
-                    if (inflightCancelEnabled && !isCurrentRequest)
-                    {
-                        // Keep only the request ID as a tombstone so a late peer
-                        // receives ready=false without retaining the request.
-                        failResponse(it->second,
-                            std::make_exception_ptr(
-                                TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
-                                    "Context KV cache request cancelled before a peer was ready for request %zu",
-                                    llmRequest.mRequestId)));
-                        mReadyResponses.erase(it);
-                    }
                 }
             }
+            else if (mCancelledRequests.find(llmRequest.mRequestId) != mCancelledRequests.end())
+            {
+                // Cancellation is idempotent while the late-peer tombstone is
+                // retained for the ready=false handshake.
+                isCancelled = true;
+            }
+        }
+        if (cancelledResponse.has_value())
+        {
+            failResponse(*cancelledResponse,
+                std::make_exception_ptr(
+                    TLLM_REQUEST_EXCEPTION(llmRequest.mRequestId, common::RequestErrorCode::kNETWORK_ERROR,
+                        "Context KV cache request cancelled before a peer was ready for request %zu",
+                        llmRequest.mRequestId)));
         }
         if (inflightCancelEnabled && (!isCancelled || isCurrentRequest))
         {

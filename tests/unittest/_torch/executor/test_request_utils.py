@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for request_utils.py functions.
 
 This module tests:
@@ -6,6 +9,7 @@ This module tests:
 
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -93,6 +97,92 @@ def test_request_broadcaster_requires_conversation_params_attr():
 
     with pytest.raises(AttributeError):
         RequestBroadcaster._collect_py_objects(None, source_items)
+
+
+def test_request_broadcaster_propagates_rank_zero_transfer_poll_bit():
+    dist = SimpleNamespace(rank=0, world_size=1)
+    hang_detector = Mock()
+    hang_detector.pause.return_value = nullcontext()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+
+    assert broadcaster.broadcast([], poll_context_transfers=True) == (
+        [],
+        None,
+        True,
+    )
+
+
+def test_request_broadcaster_non_root_uses_rank_zero_transfer_poll_bit():
+    dist = SimpleNamespace(
+        rank=1,
+        world_size=2,
+        has_pp=False,
+        broadcast=Mock(return_value=1),
+    )
+    hang_detector = Mock()
+    hang_detector.pause.return_value = nullcontext()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+
+    assert broadcaster.broadcast([], poll_context_transfers=False) == (
+        [],
+        None,
+        True,
+    )
+    dist.broadcast.assert_called_once_with(0, root=0)
+
+
+def test_request_broadcaster_preserves_poll_bit_with_nonempty_batch():
+    request = object()
+    dist = SimpleNamespace(rank=0, world_size=1)
+    hang_detector = Mock()
+    hang_detector.pause.return_value = nullcontext()
+    broadcaster = RequestBroadcaster(dist, hang_detector)
+    broadcaster._collect_py_objects = Mock(return_value=(("key", {}),))
+    broadcaster._broadcast_requests = Mock(return_value=([request], (("key", {}),)))
+
+    assert broadcaster.broadcast([request], poll_context_transfers=True) == (
+        [request],
+        (("key", {}),),
+        True,
+    )
+    broadcaster._broadcast_requests.assert_called_once_with([request], (("key", {}),))
+
+
+@pytest.mark.parametrize(
+    "is_first,is_last",
+    [
+        (True, False),
+        (False, False),
+        (False, True),
+    ],
+    ids=["first", "middle", "last"],
+)
+def test_request_broadcaster_propagates_header_through_pp_chain(is_first, is_last):
+    dist = SimpleNamespace(
+        world_size=3,
+        has_pp=True,
+        pp_size=3,
+        is_first_pp_rank=is_first,
+        is_last_pp_rank=is_last,
+        prev_pp_rank=0,
+        next_pp_rank=2,
+        tp_cp_broadcast=Mock(side_effect=lambda value, root: value),
+        recv_object=Mock(return_value=5),
+        send_object=Mock(),
+    )
+    broadcaster = RequestBroadcaster(dist, Mock())
+
+    assert broadcaster._broadcast_request_header(5) == 5
+    if is_first:
+        dist.tp_cp_broadcast.assert_called_once_with(5, root=0)
+        dist.recv_object.assert_not_called()
+    else:
+        dist.tp_cp_broadcast.assert_not_called()
+        dist.recv_object.assert_called_once_with(0, 4)
+    if is_last:
+        dist.send_object.assert_not_called()
+    else:
+        dist.send_object.assert_called_once_with(5, 2, 4)
 
 
 def test_merge_helix_requests_with_padding():

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,6 +74,7 @@ class _FakeExecutor:
         self.async_transfer_manager = async_transfer_manager
         self.kv_cache_transceiver = kv_cache_transceiver
         self.kv_connector_manager = None
+        self._async_context_transceiver_request_ids = set()
         self.disable_overlap_scheduler = True
         self.previous_batch = None
 
@@ -104,6 +105,7 @@ class TestSendKvAsyncReleasesIndexSlot:
         PyExecutor._send_kv_async(executor, [request])
 
         kv_cache_manager.release_index_slot.assert_called_once_with(42)
+        assert executor._async_context_transceiver_request_ids == {42}
 
     def test_send_kv_async_skips_release_for_v1_manager(self):
         """Verify _send_kv_async does not crash when kv_cache_manager lacks
@@ -135,6 +137,54 @@ class TestSendKvAsyncReleasesIndexSlot:
         PyExecutor._send_kv_async(executor, [request])
 
         kv_cache_manager.release_index_slot.assert_called_once_with(42)
+
+    def test_revisited_request_does_not_duplicate_transfer_owner(self):
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.store_blocks_for_reuse.return_value = 100
+        executor, transfer_manager = self._build(kv_cache_manager)
+        request = create_mock_request(42)
+
+        PyExecutor._send_kv_async(executor, [request])
+        PyExecutor._send_kv_async(executor, [request])
+
+        assert transfer_manager._request_transfer_metadata[42].counter == 1
+        executor.kv_cache_transceiver.respond_and_send_async.assert_called_once_with(request)
+        kv_cache_manager.release_index_slot.assert_called_once_with(42)
+
+
+def test_context_status_releases_only_transceiver_owner():
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.store_blocks_for_reuse.return_value = 100
+    transfer_manager = AsyncTransferManager(
+        create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
+    )
+    request = create_mock_request(42)
+    transfer_manager.start_transfer(request)
+    transfer_manager.start_transfer(request)
+
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = MagicMock()
+    executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([42], [])
+    executor.async_transfer_manager = transfer_manager
+    executor._async_context_transceiver_request_ids = {42}
+    executor._disagg_ctx_cancel_requested_ids = set()
+    executor.active_requests = []
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor._terminate_request = MagicMock()
+    executor._check_cache_transfer_errors = MagicMock()
+
+    PyExecutor._check_disagg_ctx_cache_transfer_status(executor, 0)
+
+    assert transfer_manager._request_transfer_metadata[42].counter == 1
+    assert 42 in transfer_manager.requests_in_transfer()
+    kv_cache_manager.unpin_blocks_by_id.assert_not_called()
+    executor._terminate_request.assert_not_called()
+
+    PyExecutor._end_transfer_and_maybe_terminate(executor, request)
+
+    assert 42 not in transfer_manager.requests_in_transfer()
+    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(100)
+    executor._terminate_request.assert_called_once_with(request)
 
 
 class TestIndexMapperSlotReuse:

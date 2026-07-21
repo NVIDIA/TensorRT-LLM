@@ -623,6 +623,10 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         }
         return;
     }
+    // Reserve the durable status record before handing the request to the
+    // sender. Once sendAsync succeeds it may own request-backed KV pages, and
+    // the noexcept moves below must not lose the only future that can reap it.
+    mSenderFutures.reserve(mSenderFutures.size() + 1);
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
@@ -631,6 +635,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
 void CacheTransceiver::respondAndSendLayerWise(
     RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
 {
+    mSenderFutures.reserve(mSenderFutures.size() + requests.size());
     for (auto const& llmRequest : requests)
     {
         TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
@@ -1289,6 +1294,10 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
     }
     if (llmRequest->isContextOnlyRequest())
     {
+        // Keep the high-level future until checkContextTransferStatus records
+        // this rank's terminal outcome. Queued/current classification can
+        // differ across model-parallel ranks, so rank-local reaping would
+        // remove the evidence needed by the existing transfer consensus.
         return mCacheSender->cancelRequest(*llmRequest);
     }
     else if (llmRequest->isGenerationOnlyRequest())
