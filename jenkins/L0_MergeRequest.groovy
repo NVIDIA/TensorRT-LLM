@@ -863,7 +863,7 @@ def _cbtsCoverageAudit(pipeline)
         trtllm_utils.llmExecStepWithRetry(pipeline, script:
             "wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
-        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py " +
+        sh "python3 ${LLM_ROOT}/jenkins/scripts/cbts/tools/coverage_audit.py " +
            "--db ${covDir}/cbts_touchmap.sqlite"
     } catch (InterruptedException e) {
         throw e
