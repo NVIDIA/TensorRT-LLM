@@ -33,7 +33,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 
@@ -366,19 +366,29 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return full_view[:, :2]
 
     def _kv_pool_mapping_offset(self, layer_id, layer_group_id, key_base_addr) -> int:
-        """Pool-mapping offset from layer position in the pool group.
+        """Pool-mapping offset from the layer's physical position in its pool.
 
         The base formula ``exact_div(addr_offset, key_bytes * kv_factor *
         tokens_per_block)`` assumes each layer contributes exactly K+V to
         its pool slot. When index-K coalesces into the K/V pool the layer
         stride is non-uniform (sparse layers add an INDEX_KEY sub-page),
-        so derive ``offset`` from ``self.impl.layer_grouping`` instead.
-        The M3 forward path uses :meth:`get_buffers` /
-        :meth:`get_index_k_buffer` rather than this mapping, so the
-        offset just needs to be consistent (layer position in group).
+        so no uniform-stride offset exists. The M3 forward path uses
+        :meth:`get_buffers` / :meth:`get_index_k_buffer` rather than this
+        mapping, so the offset just needs to be a consistent per-layer
+        position. Rank the group's layers by their K base address instead
+        of by ``layer_grouping`` iteration order: the ordering of
+        ``layer_grouping`` is not a V2 API contract, while the address
+        rank always reflects the physical slot layout (and keeps the
+        NVFP4 ``block_scale_offset == offset`` cross-check in the base
+        pool-mapping loop meaningful).
         """
-        layers_in_group = list(self.impl.layer_grouping[int(layer_group_id)])
-        return layers_in_group.index(int(layer_id))
+        layers_by_addr = sorted(
+            self.impl.layer_grouping[int(layer_group_id)],
+            key=lambda lid: self.impl.get_mem_pool_base_address(
+                lid, Role.KEY, PageIndexMode.SHARED
+            ),
+        )
+        return layers_by_addr.index(int(layer_id))
 
     def _get_batch_cache_indices_by_pool_id(
         self,

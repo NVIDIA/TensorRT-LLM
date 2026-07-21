@@ -121,6 +121,36 @@ def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
         )
 
 
+class _StubGroupingImpl:
+    """Stub ``manager.impl`` exposing only what ``_kv_pool_mapping_offset`` reads."""
+
+    def __init__(self, grouping, key_addrs):
+        self.layer_grouping = grouping
+        self._key_addrs = key_addrs
+
+    def get_mem_pool_base_address(self, layer_id, role, index_mode=None):
+        assert role == Role.KEY
+        return self._key_addrs[int(layer_id)]
+
+
+def test_minimax_kv_pool_mapping_offset_ignores_layer_grouping_order() -> None:
+    """Offsets must rank layers by physical K address, not grouping order.
+
+    ``layer_grouping``'s iteration order is not a V2 API contract; here it
+    deliberately disagrees with the physical slot layout (addresses put the
+    layers in order 0, 2, 1) and the offsets must follow the addresses.
+    """
+    manager = object.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.impl = _StubGroupingImpl(
+        grouping=((2, 0, 1),),
+        key_addrs={0: 0x1000, 1: 0x3000, 2: 0x2000},
+    )
+
+    offsets = {layer_id: manager._kv_pool_mapping_offset(layer_id, 0, 0) for layer_id in (0, 1, 2)}
+
+    assert offsets == {0: 0, 2: 1, 1: 2}
+
+
 def _create_manager(
     mapping: Mapping, dtype: DataType, sparse_layers: list[int] | None = None
 ) -> MiniMaxM3KVCacheManagerV2:
