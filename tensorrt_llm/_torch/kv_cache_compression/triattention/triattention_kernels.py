@@ -630,6 +630,12 @@ class _FixedScoreGroup:
             self._cute_scratch = scratch
             self._cute_seg_seq_len = seg_seq_len
             self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
+            from tensorrt_llm.logger import logger
+
+            logger.info(
+                f"TriAttention CuTe score enabled: {num_q_heads}q/{num_kv_heads}kv heads, "
+                f"{num_freqs} freqs, {tokens_per_block}-token pages"
+            )
         except (ImportError, RuntimeError, ValueError, AssertionError) as error:
             warnings.warn(
                 f"TriAttention CuTe score setup failed; using the C++ score ops: {error}",
