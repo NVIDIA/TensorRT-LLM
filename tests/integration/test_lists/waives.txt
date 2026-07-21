@@ -1,4 +1,3 @@
-accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype[False] SKIP (https://nvbugs/6120535)
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_first[noadp-mtp0] SKIP (https://nvbugs/6481375)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=2] SKIP (https://nvbugs/6427411)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/6428069)
