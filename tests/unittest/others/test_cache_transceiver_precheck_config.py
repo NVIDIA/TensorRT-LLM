@@ -85,7 +85,7 @@ def test_resolve_plan_adp_asymmetric():
     assert plan["gen"]["world_size"] == 16 and plan["gen"]["dp_size"] == 16
     # Cover every gen dp rank.
     assert plan["n_pairs"] == 16
-    assert plan["chunk_size"] == 8
+    assert plan["wave_size"] == 8
     assert plan["request_lengths"] == [1024, 8192]
     assert plan["ctx_num_nextn_predict_layers"] == 1
     assert plan["ctx_cache_transceiver_config"]["backend"] == "NIXL"
@@ -128,7 +128,7 @@ def test_backend_mismatch_raises():
         pcfg.resolve_plan(cfg)
 
 
-def test_pair_participation_and_chunks():
+def test_pair_participation_and_waves():
     plan = pcfg.resolve_plan(_disagg_yaml())
     # ADP ctx (dp4): pair k belongs to tp_rank k % 4.
     assert pcfg.pair_participates(plan, "ctx", 1, 5)
@@ -136,12 +136,12 @@ def test_pair_participation_and_chunks():
     # ADP gen (dp16): 1:1.
     assert pcfg.pair_participates(plan, "gen", 5, 5)
     assert not pcfg.pair_participates(plan, "gen", 4, 5)
-    assert pcfg.chunks(plan) == [list(range(8)), list(range(8, 16))]
-    # ctx rank owns 2 pairs per chunk of 8; gen rank owns at most 1.
-    assert pcfg.max_owned_per_chunk(plan, "ctx") == 2
-    assert pcfg.max_owned_per_chunk(plan, "gen") == 1
+    assert pcfg.waves(plan) == [list(range(8)), list(range(8, 16))]
+    # ctx rank owns 2 pairs per wave of 8; gen rank owns at most 1.
+    assert pcfg.max_owned_per_wave(plan, "ctx") == 2
+    assert pcfg.max_owned_per_wave(plan, "gen") == 1
 
-    # Non-ADP side participates everywhere and owns the whole chunk.
+    # Non-ADP side participates everywhere and owns the whole wave.
     plan_pp = pcfg.resolve_plan(
         _disagg_yaml(
             ctx_extra={
@@ -153,7 +153,7 @@ def test_pair_participation_and_chunks():
     )
     assert plan_pp["ctx"]["dp_size"] == 1 and plan_pp["n_pairs"] == 16
     assert pcfg.pair_participates(plan_pp, "ctx", 0, 11)
-    assert pcfg.max_owned_per_chunk(plan_pp, "ctx") == plan_pp["chunk_size"]
+    assert pcfg.max_owned_per_wave(plan_pp, "ctx") == plan_pp["wave_size"]
 
 
 def test_fingerprint_role_agnostic():
@@ -222,7 +222,7 @@ class TestControlWireFormat:
 
     def test_roundtrip(self):
         key = b"\x01" * 32
-        msg = ["go", {"li": 0, "rep": 1, "chunk": 2}]
+        msg = ["go", {"li": 0, "rep": 1, "wave": 2}]
         assert rp.unpack_msg(rp.pack_msg(msg, key), key) == msg
 
     def test_tampered_frame_rejected(self):
@@ -403,18 +403,18 @@ class TestMultiPeerOrchestration:
         side = pcfg.side_plan(plan, role)
         runner = rp.PrecheckRunner(args, plan, side, self._FakeComm())
 
-        calls = {"chunks": 0}
+        calls = {"waves": 0}
 
-        def ctx_run_chunk(peer_idx, li, req_len, rep, chunk):
+        def ctx_run_wave(peer_idx, li, req_len, rep, wave):
             if fail_ctx:
                 raise rp._TransferError("injected ctx failure")
-            calls["chunks"] += 1
-            return {p: self._FakeParams() for p in chunk}, {}
+            calls["waves"] += 1
+            return {p: self._FakeParams() for p in wave}, {}
 
-        runner.ctx_run_chunk = ctx_run_chunk
-        runner.ctx_finish_chunk = lambda reqs: None
-        runner.gen_run_chunk = (
-            lambda peer_idx, li, req_len, rep, chunk, params: (True, "")
+        runner.ctx_run_wave = ctx_run_wave
+        runner.ctx_finish_wave = lambda reqs: None
+        runner.gen_run_wave = (
+            lambda peer_idx, li, req_len, rep, wave, params: (True, "")
         )
         runner._calls = calls
         return runner
@@ -433,7 +433,7 @@ class TestMultiPeerOrchestration:
                 "num_requests": 1,
                 "warmup_requests": 1,
                 "rendezvous_timeout_s": 30,
-                "chunk_timeout_s": 30,
+                "wave_timeout_s": 30,
                 "wireup_timeout_s": 0,
             },
         )
@@ -476,13 +476,13 @@ class TestMultiPeerOrchestration:
             ("ctx_0", "PASS"),
             ("ctx_1", "PASS"),
         }
-        # every ctx served the full schedule (reps x chunks) and got its
+        # every ctx served the full schedule (reps x waves) and got its
         # deferred done (PASS recorded only after done/bye completes)
-        total_chunks = len(pcfg.chunks(plan)) * (
+        total_waves = len(pcfg.waves(plan)) * (
             plan["warmup_requests"] + plan["num_requests"]
         )
         for c in ctxs:
-            assert c._calls["chunks"] == total_chunks
+            assert c._calls["waves"] == total_waves
             assert [x["status"] for x in c.recorder.cases] == ["PASS"]
 
     def test_ctx_failure_isolated(self, tmp_path, monkeypatch):

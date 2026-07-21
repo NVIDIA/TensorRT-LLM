@@ -41,12 +41,12 @@ PRECHECK_DEFAULTS = {
     "num_requests": 2,
     "warmup_requests": 1,
     # Upper bound on concurrently in-flight transfer pairs. The n_pairs
-    # dp-rank pairings are processed in batches ("chunks") of at most this
-    # many -- see chunks() for the term's exact meaning (it is NOT token
+    # dp-rank pairings are processed in batches ("waves") of at most this
+    # many -- see waves() for the term's exact meaning (it is NOT token
     # chunking).
     "max_concurrent_pairs": 8,
-    # signal.alarm / hang-detector budget for one chunk of transfers.
-    "chunk_timeout_s": 180,
+    # signal.alarm / hang-detector budget for one wave of transfers.
+    "wave_timeout_s": 180,
     # Extra budget for the FIRST rep of the schedule, which pays the one-time
     # NIXL agent metadata wire-up (fetchRemoteMD over the mgmt network): with
     # MLA + ctx pp>1 every receiving rank must connect to every ctx rank, and
@@ -223,7 +223,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
     # cover every dp rank on both sides; without DP a single request already
     # involves every rank of the instance (KV is sharded across TP/PP).
     n_pairs = max(ctx["dp_size"], gen["dp_size"], 1)
-    chunk_size = max(1, min(n_pairs, int(knobs["max_concurrent_pairs"])))
+    wave_size = max(1, min(n_pairs, int(knobs["max_concurrent_pairs"])))
 
     plan = {
         "skip": False,
@@ -237,8 +237,8 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         "num_requests": int(knobs["num_requests"]),
         "warmup_requests": int(knobs["warmup_requests"]),
         "n_pairs": n_pairs,
-        "chunk_size": chunk_size,
-        "chunk_timeout_s": int(knobs["chunk_timeout_s"]),
+        "wave_size": wave_size,
+        "wave_timeout_s": int(knobs["wave_timeout_s"]),
         "wireup_timeout_s": int(
             knobs["wireup_timeout_s"]
             if knobs["wireup_timeout_s"] is not None
@@ -277,7 +277,7 @@ def plan_fingerprint(plan):
         "num_requests",
         "warmup_requests",
         "n_pairs",
-        "chunk_size",
+        "wave_size",
     )
     return json.dumps({k: plan[k] for k in keys}, sort_keys=True)
 
@@ -308,29 +308,29 @@ def pair_participates(plan, role, tp_rank, pair_idx):
     return tp_rank == pair_idx % side["dp_size"]
 
 
-def owned_pairs(plan, role, tp_rank, chunk_pairs):
-    return [k for k in chunk_pairs if pair_participates(plan, role, tp_rank, k)]
+def owned_pairs(plan, role, tp_rank, wave_pairs):
+    return [k for k in wave_pairs if pair_participates(plan, role, tp_rank, k)]
 
 
-def max_owned_per_chunk(plan, role):
+def max_owned_per_wave(plan, role):
     """Max concurrently owned pairs per rank (KV pool sizing)."""
     side = plan[role]
-    chunk = plan["chunk_size"]
+    wave = plan["wave_size"]
     if not side["enable_attention_dp"]:
-        return chunk
-    return (chunk + side["dp_size"] - 1) // side["dp_size"]
+        return wave
+    return (wave + side["dp_size"] - 1) // side["dp_size"]
 
 
-def chunks(plan):
-    """Pair indices grouped into concurrency-bounded chunks.
+def waves(plan):
+    """Pair indices grouped into concurrency-bounded waves.
 
-    A "chunk" is the batch of TRANSFER PAIRS in flight at once (at most
+    A "wave" is the batch of TRANSFER PAIRS in flight at once (at most
     max_concurrent_pairs of the n_pairs dp-rank pairings) -- NOT token/data
-    chunking. It bounds the synthetic KV pool size and gives the per-chunk
+    chunking. It bounds the synthetic KV pool size and gives the per-wave
     alarm a precise target while still exercising concurrent transfers.
     """
     pairs = list(range(plan["n_pairs"]))
-    size = plan["chunk_size"]
+    size = plan["wave_size"]
     return [pairs[i : i + size] for i in range(0, len(pairs), size)]
 
 
