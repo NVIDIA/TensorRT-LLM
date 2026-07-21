@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -56,7 +58,9 @@ def test_mem_snapshot_logs_compact_counters(monkeypatch) -> None:
     monkeypatch.setenv("TLLM_LOG_MEM_PROFILE", "1")
     monkeypatch.setattr(trace_log_utils.logger, "rank", 3)
     info = Mock()
+    nvml_query = Mock()
     monkeypatch.setattr(trace_log_utils.logger, "info", info)
+    monkeypatch.setattr(trace_log_utils, "_format_nvml_process_fields", nvml_query)
     _mock_cuda_counters(monkeypatch)
 
     trace_log_utils.log_mem_snapshot("stage/model", iter=7, active_requests=2)
@@ -71,12 +75,15 @@ def test_mem_snapshot_logs_compact_counters(monkeypatch) -> None:
     )
     assert len(trace_log_utils._MEM_HISTORY) == 1
     assert trace_log_utils._MEM_HISTORY[0][1] == info.call_args.args[0]
+    nvml_query.assert_not_called()
 
 
 def test_forced_mem_snapshot_bypasses_gate(monkeypatch) -> None:
     monkeypatch.delenv("TLLM_LOG_MEM_PROFILE", raising=False)
     warning = Mock()
+    nvml_query = Mock()
     monkeypatch.setattr(trace_log_utils.logger, "warning", warning)
+    monkeypatch.setattr(trace_log_utils, "_format_nvml_process_fields", nvml_query)
     _mock_cuda_counters(monkeypatch)
 
     trace_log_utils.log_mem_snapshot("oom/model", force=True)
@@ -84,6 +91,103 @@ def test_forced_mem_snapshot_bypasses_gate(monkeypatch) -> None:
     assert warning.call_count == 1
     assert warning.call_args.args[0].startswith("[mem-profile/oom/model]")
     assert not trace_log_utils._MEM_HISTORY
+    nvml_query.assert_not_called()
+
+
+def test_forced_mem_snapshot_adds_nvml_fields_when_profile_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("TLLM_LOG_MEM_PROFILE", "1")
+    warning = Mock()
+    nvml_query = Mock(return_value=" nvml_status=ok nvml_process_count=2")
+    monkeypatch.setattr(trace_log_utils.logger, "warning", warning)
+    monkeypatch.setattr(trace_log_utils, "_format_nvml_process_fields", nvml_query)
+    _mock_cuda_counters(monkeypatch)
+
+    trace_log_utils.log_mem_snapshot("oom/model", force=True)
+
+    nvml_query.assert_called_once_with(2)
+    assert warning.call_args.args[0].endswith("nvml_status=ok nvml_process_count=2")
+    assert not trace_log_utils._MEM_HISTORY
+
+
+def test_nvml_process_fields_use_uuid_and_split_self_from_nonself(monkeypatch) -> None:
+    gib = 1 << 30
+    handle = object()
+    pynvml = SimpleNamespace(
+        nvmlInit=Mock(),
+        nvmlShutdown=Mock(),
+        nvmlDeviceGetHandleByUUID=Mock(return_value=handle),
+        nvmlDeviceGetComputeRunningProcesses=Mock(
+            return_value=[
+                SimpleNamespace(pid=101, usedGpuMemory=3 * gib),
+                SimpleNamespace(pid=202, usedGpuMemory=5 * gib),
+                SimpleNamespace(pid=303, usedGpuMemory=2 * gib),
+            ]
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", pynvml)
+    monkeypatch.setattr(trace_log_utils.os, "getpid", Mock(return_value=101))
+    monkeypatch.setattr(
+        trace_log_utils.torch.cuda,
+        "get_device_properties",
+        Mock(return_value=SimpleNamespace(uuid="01234567-89ab-cdef-0123-456789abcdef")),
+    )
+
+    fields = trace_log_utils._format_nvml_process_fields(2)
+
+    pynvml.nvmlDeviceGetHandleByUUID.assert_called_once_with(
+        "GPU-01234567-89ab-cdef-0123-456789abcdef"
+    )
+    pynvml.nvmlDeviceGetComputeRunningProcesses.assert_called_once_with(handle)
+    pynvml.nvmlShutdown.assert_called_once_with()
+    assert fields == (
+        " nvml_status=ok nvml_self_found=1 nvml_self_used=3.00GiB"
+        " nvml_nonself_used=7.00GiB nvml_process_count=3"
+        " nvml_processes=202:5.00GiB,101:3.00GiB,303:2.00GiB"
+    )
+
+
+def test_nvml_process_fields_bound_output_and_report_partial_data(monkeypatch) -> None:
+    gib = 1 << 30
+    processes = [
+        SimpleNamespace(pid=100 + index, usedGpuMemory=(10 - index) * gib) for index in range(10)
+    ]
+    processes.append(SimpleNamespace(pid=999, usedGpuMemory=None))
+    pynvml = SimpleNamespace(
+        nvmlInit=Mock(),
+        nvmlShutdown=Mock(),
+        nvmlDeviceGetHandleByUUID=Mock(return_value=object()),
+        nvmlDeviceGetComputeRunningProcesses=Mock(return_value=processes),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", pynvml)
+    monkeypatch.setattr(trace_log_utils.os, "getpid", Mock(return_value=100))
+    monkeypatch.setattr(
+        trace_log_utils.torch.cuda,
+        "get_device_properties",
+        Mock(return_value=SimpleNamespace(uuid="GPU-device-uuid")),
+    )
+
+    fields = trace_log_utils._format_nvml_process_fields(0)
+
+    assert "nvml_status=partial" in fields
+    assert "nvml_process_count=10" in fields
+    assert "nvml_processes_omitted=2" in fields
+    assert "nvml_processes_unavailable=1" in fields
+    assert "100:10.00GiB" in fields
+    assert "107:3.00GiB" in fields
+    assert "108:2.00GiB" not in fields
+
+
+def test_nvml_process_fields_report_query_failure_without_raising(monkeypatch) -> None:
+    pynvml = SimpleNamespace(
+        nvmlInit=Mock(side_effect=RuntimeError("NVML unavailable")),
+        nvmlShutdown=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "pynvml", pynvml)
+
+    fields = trace_log_utils._format_nvml_process_fields(0)
+
+    assert fields == " nvml_status=unavailable nvml_error=RuntimeError"
+    pynvml.nvmlShutdown.assert_not_called()
 
 
 def test_mem_history_is_bounded(monkeypatch) -> None:
