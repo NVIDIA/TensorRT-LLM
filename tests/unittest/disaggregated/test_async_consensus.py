@@ -1159,6 +1159,36 @@ def test_round_watchdog_reports_missing_consensus_and_never_commits() -> None:
     assert follower._events == deque()
 
 
+def test_diagnostic_snapshot_reports_oldest_round_without_mutation() -> None:
+    clock = _FakeClock()
+    _, _, coordinators = _make_group(round_timeout_s=5.0, clock=clock)
+    follower = coordinators[0]
+    coordinator = coordinators[-1]
+
+    follower.publish_terminal(523, ConsensusOutcome.COMPLETED)
+    assert follower.poll() == []
+    assert coordinator.poll() == []
+    clock.advance(2.5)
+
+    rounds_before = dict(coordinator._round_progress)
+    snapshot = coordinator.diagnostic_snapshot()
+
+    assert snapshot["is_coordinator"] is True
+    assert snapshot["oldest_phase"] == "TERMINAL"
+    assert snapshot["oldest_request_id"] == 523
+    assert snapshot["oldest_epoch"] == 0
+    assert snapshot["oldest_age_s"] == 2.5
+    assert snapshot["missing_votes"] == [1, 2, 3]
+    assert coordinator._round_progress == rounds_before
+
+    follower_snapshot = follower.diagnostic_snapshot()
+    assert follower_snapshot["is_coordinator"] is False
+    assert follower_snapshot["oldest_request_id"] == 523
+    assert follower_snapshot["missing_votes"] is None
+    assert follower_snapshot["missing_ready_acks"] is None
+    assert follower_snapshot["missing_activation_acks"] is None
+
+
 def test_round_watchdog_refreshes_on_progress_then_expires_when_idle() -> None:
     clock = _FakeClock()
     _, _, coordinators = _make_group(round_timeout_s=5.0, clock=clock)

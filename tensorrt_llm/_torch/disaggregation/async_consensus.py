@@ -501,6 +501,66 @@ class AsyncConsensusCoordinator:
         """Rank that may transition the request after READY_RELEASE."""
         return self._scheduling_rank
 
+    def diagnostic_snapshot(self) -> dict[str, object]:
+        """Return a read-only, bounded view of the oldest open round."""
+        now = self._clock()
+        ready_rounds = sum(key[0] == ConsensusPhase.READY for key in self._round_progress)
+        terminal_rounds = len(self._round_progress) - ready_rounds
+        snapshot: dict[str, object] = {
+            "rank": self.rank,
+            "coordinator_rank": self._coordinator_rank,
+            "is_coordinator": self.rank == self._coordinator_rank,
+            "scheduling_rank": self._scheduling_rank,
+            "open_ready_rounds": ready_rounds,
+            "open_terminal_rounds": terminal_rounds,
+            "local_outbox": len(self._local_outbox),
+            "priority_outbox": len(self._priority_local_outbox),
+            "coordinator_actions": len(self._coordinator_actions),
+            "pending_sends": self._transport.pending_send_count,
+            "pending_events": len(self._events),
+        }
+        if not self._round_progress:
+            return snapshot
+
+        oldest_key, progress = min(
+            self._round_progress.items(),
+            key=lambda item: item[1].started_at,
+        )
+        phase, request_id, epoch = oldest_key
+        snapshot.update(
+            {
+                "oldest_phase": phase.name,
+                "oldest_request_id": request_id,
+                "oldest_epoch": epoch,
+                "oldest_age_s": round(now - progress.started_at, 6),
+                "oldest_idle_s": round(now - progress.last_progress_at, 6),
+            }
+        )
+        if self.rank != self._coordinator_rank:
+            snapshot.update(
+                {
+                    "missing_votes": None,
+                    "missing_ready_acks": None,
+                    "missing_activation_acks": None,
+                }
+            )
+            return snapshot
+
+        participants = self._participant_set
+        votes = set(self._votes.get(oldest_key, {}))
+        required_ready_acks = self._ready_required_acks.get(oldest_key, set())
+        ready_acks = self._ready_acks.get(oldest_key, set())
+        required_activation_acks = self._ready_activation_required_acks.get(oldest_key, set())
+        activation_acks = self._ready_activation_acks.get(oldest_key, set())
+        snapshot.update(
+            {
+                "missing_votes": sorted(participants - votes),
+                "missing_ready_acks": sorted(required_ready_acks - ready_acks),
+                "missing_activation_acks": sorted(required_activation_acks - activation_acks),
+            }
+        )
+        return snapshot
+
     def publish_ready(self, request_id: int, epoch: int = 0) -> None:
         self._publish(
             ConsensusPhase.READY,

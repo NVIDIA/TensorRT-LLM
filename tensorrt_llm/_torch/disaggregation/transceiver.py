@@ -68,9 +68,189 @@ _ASYNC_TERMINAL_ENV = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_TERMINAL_CONSENSUS"
 _ASYNC_PEER_READY_ENV = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CTX_PEER_READY_CONSENSUS"
 _ASYNC_STARTUP_TAG = "TRTLLM_PYTHON_TRANSCEIVER_ASYNC_CONSENSUS"
 _ASYNC_READY_CANCELLED_EPOCH_ATTR = "_trtllm_async_ready_cancelled_epoch"
+_DIAG_ENV = "TRTLLM_PYTHON_TRANSCEIVER_DIAG"
+_DIAG_PREFIX = "PYTHON_CONSENSUS_DIAG"
+_DIAG_MAX_SAMPLED_REQUESTS = 16
+_DIAG_MAX_TRACKED_REQUESTS_PER_STATE = 1024
+_DIAG_MAX_SLOW_COLLECTIVE_LOGS = 8
+_DIAG_SLOW_COLLECTIVE_S = 0.1
+_DIAG_SUMMARY_INTERVAL_S = 60.0
 _MAX_RETIRED_CONSENSUS_REQUESTS = 65536
 _STARTUP_ROLLBACK_TIMEOUT_S = 30.0
 _CONSENSUS_STARTUP_CLOSE_TIMEOUT_S = 1.0
+
+
+class _PythonTransceiverDiagnostics:
+    """Bounded, opt-in observability for the Python transfer lifecycle."""
+
+    def __init__(
+        self,
+        rank: int,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        summary_interval_s: float = _DIAG_SUMMARY_INTERVAL_S,
+    ) -> None:
+        self._rank = rank
+        self._clock = clock
+        self._summary_interval_s = summary_interval_s
+        self._started_at = clock()
+        self._last_summary_at = self._started_at - summary_interval_s
+        self._last_poll_at: Optional[float] = None
+        self._max_poll_gap_s = 0.0
+        self._poll_count = 0
+        self._transition_counts: Dict[str, int] = defaultdict(int)
+        self._sampled_request_ids: OrderedDict[int, None] = OrderedDict()
+        self._seen_transitions: set[tuple[str, int, int]] = set()
+        self._active_states: Dict[str, OrderedDict[int, float]] = defaultdict(OrderedDict)
+        self._collective_stats: Dict[str, Dict[str, float | int]] = {}
+        self._active_collectives: Dict[str, tuple[int, float]] = {}
+
+    def _elapsed_s(self, now: Optional[float] = None) -> float:
+        return (self._clock() if now is None else now) - self._started_at
+
+    def _is_sampled(self, request_id: int) -> bool:
+        if request_id in self._sampled_request_ids:
+            return True
+        if len(self._sampled_request_ids) >= _DIAG_MAX_SAMPLED_REQUESTS:
+            return False
+        self._sampled_request_ids[request_id] = None
+        return True
+
+    def record_transition(
+        self,
+        transition: str,
+        request_id: int,
+        epoch: int = 0,
+        outcome: Optional[str] = None,
+        duration_s: Optional[float] = None,
+        *,
+        once: bool = False,
+    ) -> None:
+        key = (transition, request_id, epoch)
+        if once and key in self._seen_transitions:
+            return
+        if len(self._seen_transitions) < _MAX_RETIRED_CONSENSUS_REQUESTS:
+            self._seen_transitions.add(key)
+        self._transition_counts[transition] += 1
+        if not self._is_sampled(request_id):
+            return
+        outcome_text = "" if outcome is None else f" outcome={outcome}"
+        duration_text = "" if duration_s is None else f" duration_s={duration_s:.6f}"
+        logger.info(
+            f"{_DIAG_PREFIX} event=transition transition={transition} "
+            f"rank={self._rank} request_id={request_id} epoch={epoch} "
+            f"elapsed_s={self._elapsed_s():.6f}{outcome_text}{duration_text}"
+        )
+
+    def enter_state(self, state: str, request_id: int) -> None:
+        active = self._active_states[state]
+        if request_id in active:
+            return
+        if len(active) >= _DIAG_MAX_TRACKED_REQUESTS_PER_STATE:
+            return
+        active[request_id] = self._clock()
+
+    def leave_state(self, state: str, request_id: int) -> None:
+        self._active_states[state].pop(request_id, None)
+
+    def record_poll(self) -> None:
+        now = self._clock()
+        if self._last_poll_at is not None:
+            self._max_poll_gap_s = max(self._max_poll_gap_s, now - self._last_poll_at)
+        self._last_poll_at = now
+        self._poll_count += 1
+
+    def snapshot_due(self, *, force: bool = False) -> bool:
+        return force or self._clock() - self._last_summary_at >= self._summary_interval_s
+
+    def collective_enter(self, label: str) -> int:
+        now = self._clock()
+        stats = self._collective_stats.setdefault(
+            label,
+            {"count": 0, "total_s": 0.0, "max_s": 0.0, "slow_count": 0},
+        )
+        sequence = int(stats["count"]) + 1
+        stats["count"] = sequence
+        if sequence <= _DIAG_MAX_SLOW_COLLECTIVE_LOGS or sequence % 512 == 0:
+            logger.info(
+                f"{_DIAG_PREFIX} event=collective_enter label={label} "
+                f"rank={self._rank} sequence={sequence} elapsed_s={self._elapsed_s(now):.6f}"
+            )
+        self._active_collectives[label] = (sequence, self._clock())
+        return sequence
+
+    def collective_exit(self, label: str, sequence: int) -> None:
+        active = self._active_collectives.pop(label, None)
+        if active is None:
+            return
+        active_sequence, started_at = active
+        if active_sequence != sequence:
+            return
+        now = self._clock()
+        duration_s = now - started_at
+        stats = self._collective_stats[label]
+        stats["total_s"] = float(stats["total_s"]) + duration_s
+        stats["max_s"] = max(float(stats["max_s"]), duration_s)
+        should_log = sequence <= _DIAG_MAX_SLOW_COLLECTIVE_LOGS or sequence % 512 == 0
+        if duration_s >= _DIAG_SLOW_COLLECTIVE_S:
+            stats["slow_count"] = int(stats["slow_count"]) + 1
+            slow_count = int(stats["slow_count"])
+            should_log = should_log or slow_count <= _DIAG_MAX_SLOW_COLLECTIVE_LOGS
+        if should_log:
+            logger.info(
+                f"{_DIAG_PREFIX} event=collective_exit label={label} "
+                f"rank={self._rank} sequence={sequence} duration_s={duration_s:.6f} "
+                f"slow={int(duration_s >= _DIAG_SLOW_COLLECTIVE_S)} "
+                f"elapsed_s={self._elapsed_s(now):.6f}"
+            )
+
+    def maybe_log_snapshot(
+        self,
+        state: Dict[str, Any],
+        coordinator: Optional[Dict[str, Any]],
+        *,
+        force: bool = False,
+        teardown: bool = False,
+    ) -> None:
+        now = self._clock()
+        if not force and now - self._last_summary_at < self._summary_interval_s:
+            return
+        self._last_summary_at = now
+        active_states = {}
+        for name, requests in sorted(self._active_states.items()):
+            if not requests:
+                continue
+            oldest_started_at = next(iter(requests.values()))
+            active_states[name] = {
+                "count": len(requests),
+                "oldest_s": round(now - oldest_started_at, 6),
+                "sample_ids": list(requests)[:_DIAG_MAX_SAMPLED_REQUESTS],
+            }
+        collective_stats = {
+            label: {
+                "count": int(stats["count"]),
+                "total_s": round(float(stats["total_s"]), 6),
+                "max_s": round(float(stats["max_s"]), 6),
+                "slow_count": int(stats["slow_count"]),
+            }
+            for label, stats in sorted(self._collective_stats.items())
+        }
+        active_collectives = {
+            label: {
+                "sequence": sequence,
+                "elapsed_s": round(now - started_at, 6),
+            }
+            for label, (sequence, started_at) in sorted(self._active_collectives.items())
+        }
+        logger.info(
+            f"{_DIAG_PREFIX} event=snapshot rank={self._rank} "
+            f"elapsed_s={self._elapsed_s(now):.6f} teardown={int(teardown)} "
+            f"poll_count={self._poll_count} max_poll_gap_s={self._max_poll_gap_s:.6f} "
+            f"transitions={dict(sorted(self._transition_counts.items()))} "
+            f"active_states={active_states} collectives={collective_stats} "
+            f"active_collectives={active_collectives} state={state} "
+            f"coordinator={coordinator}"
+        )
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -190,9 +370,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _init_async_consensus(self, cache_transceiver_config: CacheTransceiverConfig) -> None:
         terminal_value = os.getenv(_ASYNC_TERMINAL_ENV, "0")
         peer_ready_value = os.getenv(_ASYNC_PEER_READY_ENV, "0")
+        diag_value = os.getenv(_DIAG_ENV, "0")
+        diag_enabled = diag_value == "1"
+        if diag_value not in ("0", "1"):
+            logger.warning(
+                f"Ignoring invalid {_DIAG_ENV}={diag_value!r}; diagnostics remain disabled"
+            )
         self._async_terminal_flag_value = terminal_value
         self._async_peer_ready_flag_value = peer_ready_value
         self._async_consensus_config = cache_transceiver_config
+        self._diagnostics: Optional[_PythonTransceiverDiagnostics] = None
+        if diag_enabled:
+            self._diagnostics = _PythonTransceiverDiagnostics(int(self._dist.rank))
+            logger.info(
+                f"{_DIAG_PREFIX} event=mode_active rank={self._dist.rank} "
+                f"world_size={self._mapping.world_size} tp_size={self._mapping.tp_size} "
+                f"pp_size={self._mapping.pp_size} cp_size={self._mapping.cp_size} "
+                f"attention_dp={int(self._mapping.enable_attention_dp)}"
+            )
 
         self._async_terminal_consensus_enabled = False
         self._async_peer_ready_consensus_enabled = False
@@ -234,6 +429,142 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Multi-rank parsing and qualification happen in _exchange_rank_info.
         # A malformed or mismatched same-version opt-in must reach that
         # universally-entered allgather before every new worker rejects it.
+
+    def _record_diag_transition(
+        self,
+        transition: str,
+        request_id: int,
+        epoch: int = 0,
+        outcome: Optional[str] = None,
+        duration_s: Optional[float] = None,
+        *,
+        once: bool = False,
+    ) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record_transition(
+                transition,
+                request_id,
+                epoch,
+                outcome,
+                duration_s,
+                once=once,
+            )
+
+    def _enter_diag_state(self, state: str, request_id: int) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.enter_state(state, request_id)
+
+    def _leave_diag_state(self, state: str, request_id: int) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.leave_state(state, request_id)
+
+    @staticmethod
+    def _session_status_summary(sessions: Dict[int, Any]) -> Dict[str, Dict[str, Any]]:
+        summary: Dict[str, Dict[str, Any]] = {}
+        for request_id, session in sessions.items():
+            status = getattr(session, "status", None)
+            name = getattr(status, "name", str(status))
+            status_summary = summary.setdefault(name, {"count": 0, "sample_ids": []})
+            status_summary["count"] += 1
+            sample_ids = status_summary["sample_ids"]
+            if len(sample_ids) < _DIAG_MAX_SAMPLED_REQUESTS:
+                sample_ids.append(request_id)
+        return dict(sorted(summary.items()))
+
+    def _maybe_log_diagnostics(
+        self,
+        *,
+        force: bool = False,
+        teardown: bool = False,
+    ) -> None:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is None:
+            return
+        if not diagnostics.snapshot_due(force=force):
+            return
+        coordinator = getattr(self, "_async_consensus", None)
+        coordinator_snapshot = None
+        if coordinator is not None:
+            diagnostic_snapshot = getattr(coordinator, "diagnostic_snapshot", None)
+            if callable(diagnostic_snapshot):
+                coordinator_snapshot = diagnostic_snapshot()
+        state = {
+            "wait": len(getattr(self, "_wait_reqs", {})),
+            "ready_published": len(getattr(self, "_async_ready_published", {})),
+            "ready_prepared": len(getattr(self, "_async_ready_prepared", {})),
+            "ready_released": len(getattr(self, "_async_ready_released", set())),
+            "ready_activated": len(getattr(self, "_async_ready_activated", {})),
+            "terminal_published": len(getattr(self, "_async_terminal_published", {})),
+            "terminal_commits": len(getattr(self, "_async_terminal_commits", {})),
+            "send_sessions": len(getattr(self, "_send_sessions", {})),
+            "send_statuses": self._session_status_summary(getattr(self, "_send_sessions", {})),
+            "recv_sessions": len(getattr(self, "_recv_sessions", {})),
+            "recv_statuses": self._session_status_summary(getattr(self, "_recv_sessions", {})),
+            "gen_need_sync": int(getattr(self, "_gen_need_sync", False)),
+            "ctx_need_tp_sync": int(getattr(self, "_ctx_need_tp_sync", False)),
+            "ctx_need_pp_sync": int(getattr(self, "_ctx_need_pp_sync", False)),
+        }
+        diagnostics.maybe_log_snapshot(
+            state,
+            coordinator_snapshot,
+            force=force,
+            teardown=teardown,
+        )
+
+    def _diagnostic_allgather(
+        self,
+        label: str,
+        allgather: Callable,
+        value: Any,
+    ) -> Any:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is None:
+            return allgather(value)
+        self._maybe_log_diagnostics()
+        sequence = diagnostics.collective_enter(label)
+        try:
+            return allgather(value)
+        finally:
+            diagnostics.collective_exit(label, sequence)
+
+    def _diagnostic_wait_complete(
+        self,
+        side: str,
+        request_id: int,
+        session: TxSessionBase,
+        *,
+        blocking: bool,
+    ) -> Optional[WaitResult]:
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is None:
+            return session.wait_complete(blocking=blocking)
+        state = f"{side}_future_wait_call"
+        self._enter_diag_state(state, request_id)
+        self._record_diag_transition(
+            f"{side}_future_wait_call_enter",
+            request_id,
+            once=True,
+        )
+        started_at = time.monotonic()
+        try:
+            result = session.wait_complete(blocking=blocking)
+        finally:
+            self._leave_diag_state(state, request_id)
+        duration_s = time.monotonic() - started_at
+        status = session.status
+        if result is not None or status in (SessionStatus.CANCELLED, SessionStatus.ERROR):
+            result_name = "NONE" if result is None else result.name
+            self._record_diag_transition(
+                f"{side}_future_wait_call_exit",
+                request_id,
+                outcome=f"result:{result_name},status:{status.name}",
+                duration_s=duration_s,
+                once=True,
+            )
+        return result
 
     def _async_startup_descriptor(self) -> tuple:
         config = self._async_consensus_config
@@ -399,11 +730,24 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 endpoint,
                 self._async_startup_descriptor(),
             )
-        gathered = list(self._dist.allgather(contribution))
+        gathered = list(
+            self._diagnostic_allgather(
+                "startup_rank_info",
+                self._dist.allgather,
+                contribution,
+            )
+        )
         layer_num = len(self._kv_cache_manager.pp_layers)
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
-        layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
+        layer_num_per_pp = cast(
+            list,
+            self._diagnostic_allgather(
+                "startup_layer_count",
+                getattr(self._dist, "pp_allgather"),
+                layer_num,
+            ),
+        )
         # Validate only after every rank has entered both pre-existing startup
         # exchanges. This lets a mixed old/new worker group with an accidental
         # explicit opt-in fail on both sides instead of leaving the old worker
@@ -423,6 +767,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         worker_event = getattr(self, "_shutdown_worker_event", None)
         if worker_event is not None and not worker_event.is_set():
             return worker_event
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record_transition("teardown_start", 0, once=True)
+            self._maybe_log_diagnostics(force=True, teardown=True)
         self._shutdown = True
         shutdown_errors: list[tuple[str, Exception]] = []
 
@@ -670,7 +1018,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
         sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
-        all_ranks = self._dist.tp_allgather(local_ids) if self._ctx_need_tp_sync else [local_ids]
+        all_ranks = (
+            self._diagnostic_allgather(
+                "ctx_ready_tp",
+                self._dist.tp_allgather,
+                local_ids,
+            )
+            if self._ctx_need_tp_sync
+            else [local_ids]
+        )
         ready_ids = _find_consensus_request_ids(all_ranks, sync_size)
 
         # PP consensus: ensure all PP ranks have peer info before promoting.
@@ -683,7 +1039,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # decide the ready request ids, the other pp ranks treat the unready
         # request as ctx-first requests.
         if self._ctx_need_pp_sync:
-            pp_all_ranks = getattr(self._dist, "pp_allgather")(ready_ids)
+            pp_all_ranks = self._diagnostic_allgather(
+                "ctx_ready_pp",
+                getattr(self._dist, "pp_allgather"),
+                ready_ids,
+            )
             ready_ids = _find_consensus_request_ids(pp_all_ranks, self._mapping.pp_size)
 
         return ready_ids
@@ -692,7 +1052,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         sync_size = (
             self._mapping.pp_size if self._mapping.enable_attention_dp else self._mapping.world_size
         )
-        all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
+        all_ranks = (
+            self._diagnostic_allgather(
+                "gen_ready_ids",
+                self._gen_allgather,
+                local_ids,
+            )
+            if self._gen_need_sync
+            else [local_ids]
+        )
         return _find_consensus_request_ids(all_ranks, sync_size)
 
     @staticmethod
@@ -723,6 +1091,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         completed,
         allgather: Callable,
         need_sync: bool,
+        collective_label: str = "outcome",
     ):
         # A cancellation decision is global when ANY rank observes it, but its
         # resources are reclaimable only when ALL ranks report local
@@ -738,14 +1107,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             all_done = [list(completed)]
         else:
             packed = list(
-                allgather(
+                self._diagnostic_allgather(
+                    collective_label,
+                    allgather,
                     [
                         list(cancelled),
                         list(cancel_quiescent),
                         list(failed),
                         list(failed_quiescent),
                         list(completed),
-                    ]
+                    ],
                 )
             )
             all_c = [p[0] for p in packed]
@@ -796,6 +1167,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             completed,
             self._gen_allgather,
             self._gen_need_sync,
+            "gen_outcome",
         )
 
     def _ctx_consensus_outcome(
@@ -820,11 +1192,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             completed,
             self._dist.tp_allgather,
             self._ctx_need_tp_sync,
+            "ctx_outcome_tp",
         )
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
             c, cq, f, fq, d = self._consensus_outcome(
-                to_process, known_ids, c, cq, f, fq, d, pp_allgather, True
+                to_process,
+                known_ids,
+                c,
+                cq,
+                f,
+                fq,
+                d,
+                pp_allgather,
+                True,
+                "ctx_outcome_pp",
             )
         return c, cq, f, fq, d, timed_out
 
@@ -835,6 +1217,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         epoch: int,
         outcome: Optional[ConsensusOutcome] = None,
     ) -> None:
+        self._record_diag_transition(
+            transition,
+            request_id,
+            epoch,
+            None if outcome is None else outcome.name,
+        )
         self._async_consensus_counters[transition] += 1
         count = self._async_consensus_counters[transition]
         if count != 1 and count % 512 != 0:
@@ -861,6 +1249,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         coordinator = self._async_consensus
         if coordinator is None:
             return
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record_poll()
         for event in coordinator.poll():
             if event.kind == ConsensusEventKind.TERMINAL_COMMIT:
                 published_epoch = self._async_terminal_published.get(event.request_id)
@@ -889,6 +1280,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._apply_async_ready_abort_finalize(event)
             else:
                 raise RuntimeError(f"unhandled asynchronous consensus event: {event}")
+        self._maybe_log_diagnostics()
 
     def _apply_async_ready_prepare(self, event: ConsensusEvent) -> None:
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)
@@ -906,6 +1298,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._async_ready_prepared[key] = req
         coordinator.acknowledge_ready(event.request_id, event.epoch)
         self._async_ready_acknowledged.add(key)
+        self._leave_diag_state("ctx_wait", event.request_id)
+        self._enter_diag_state("ready_prepared", event.request_id)
         self._record_async_transition("ready_prepare", event.request_id, event.epoch)
 
     def _apply_async_ready_release(self, event: ConsensusEvent) -> None:
@@ -917,6 +1311,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise RuntimeError(f"READY_RELEASE has no prepared request: {event}")
         req.state = LlmRequestState.CONTEXT_INIT
         self._async_ready_released.add(key)
+        self._leave_diag_state("ready_prepared", event.request_id)
+        self._enter_diag_state("ready_released", event.request_id)
         self._record_async_transition("ready_release", event.request_id, event.epoch)
 
     def _apply_async_ready_complete(self, event: ConsensusEvent) -> None:
@@ -926,6 +1322,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise RuntimeError(f"READY_COMPLETE has no activated request: {event}")
         self._async_ready_released.discard(key)
         self._finish_async_ready_epoch(event.request_id, event.epoch)
+        self._leave_diag_state("ready_activated", event.request_id)
         self._record_async_transition("ready_complete", event.request_id, event.epoch)
 
     def _apply_async_ready_abort(self, event: ConsensusEvent) -> None:
@@ -942,6 +1339,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             setattr(req, _ASYNC_READY_CANCELLED_EPOCH_ATTR, event.epoch)
         self._async_ready_aborted[key] = req
         coordinator.acknowledge_ready_abort(event.request_id, event.epoch)
+        self._leave_diag_state("ctx_wait", event.request_id)
+        self._leave_diag_state("ready_prepared", event.request_id)
+        self._leave_diag_state("ready_released", event.request_id)
+        self._enter_diag_state("ready_aborted", event.request_id)
         self._record_async_transition("ready_abort", event.request_id, event.epoch)
 
     def _apply_async_ready_abort_finalize(self, event: ConsensusEvent) -> None:
@@ -962,6 +1363,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             ):
                 self._async_ready_finalized_without_request.popitem(last=False)
         self._finish_async_ready_epoch(event.request_id, event.epoch)
+        self._leave_diag_state("ready_aborted", event.request_id)
         self._record_async_transition("ready_abort_finalize", event.request_id, event.epoch)
 
     def _bind_async_ready_abort(self, req: LlmRequest) -> bool:
@@ -1065,7 +1467,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if session.has_transferring_tasks():
                 continue
 
-            result = session.wait_complete(blocking=block_all)
+            result = self._diagnostic_wait_complete(
+                "ctx",
+                rid,
+                session,
+                blocking=block_all,
+            )
             outcome = self._seal_and_snapshot_terminal(session, result)
             if outcome is None:
                 if result == WaitResult.TIMEOUT:
@@ -1122,7 +1529,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else:
                 raise RuntimeError(f"invalid terminal commit outcome: {event}")
 
+            self._leave_diag_state("ctx_send", rid)
+            self._record_diag_transition(
+                "ctx_global_terminal",
+                rid,
+                event.epoch,
+                event.outcome.name,
+                once=True,
+            )
             session.close()
+            self._record_diag_transition("ctx_session_closed", rid, event.epoch, once=True)
             del self._send_reqs[rid]
             del self._send_sessions[rid]
             del self._async_terminal_commits[rid]
@@ -1175,6 +1591,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _check_context_transfer_status_async(
         self, at_least_request_num: Optional[int], mark_complete: bool
     ) -> tuple[list[int], list[int]]:
+        self._maybe_log_diagnostics()
         snapshot_ids = set(self._send_sessions)
         drain_timeout_ms: Optional[int] = None
         if at_least_request_num is None:
@@ -1226,6 +1643,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     f"remaining_rids={sorted(remaining_ids)}"
                 )
         self._transfer_worker.sweep_stale_req_infos()
+        self._maybe_log_diagnostics()
         return completed, failed
 
     def _collect_done(self, sessions: dict, reqs: dict):
@@ -1286,7 +1704,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"cancellation is acknowledged: request_id={rid}"
             )
         if rid not in self._send_sessions:
-            self._send_sessions[rid] = self._transfer_worker.create_tx_session(req)
+            self._enter_diag_state("ctx_session_create", rid)
+            self._record_diag_transition("ctx_send_session_create_enter", rid, once=True)
+            try:
+                self._send_sessions[rid] = self._transfer_worker.create_tx_session(req)
+            finally:
+                self._leave_diag_state("ctx_session_create", rid)
+            self._enter_diag_state("ctx_send", rid)
+            self._record_diag_transition("ctx_send_session_create", rid, once=True)
         # Publish request ownership before any native dispatch. A pre-cancelled
         # session, or a cancellation racing send/send_aux, must never leave a
         # session without its matching request bookkeeping.
@@ -1298,8 +1723,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         rid = get_unique_rid(req)
         assert rid is not None
         if self._need_aux_transfer(req):
+            self._record_diag_transition("ctx_aux_pack_enter", rid, once=True)
             session.pack_aux(req)
+            self._record_diag_transition("ctx_aux_packed", rid, once=True)
+            self._record_diag_transition("ctx_aux_send_enter", rid, once=True)
             session.send_aux()
+            self._record_diag_transition("ctx_aux_send_dispatched", rid, once=True)
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
             req_id=rid,
@@ -1312,6 +1741,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
         self._ever_had_send_session = True
+        diag_rid = get_unique_rid(req) if getattr(self, "_diagnostics", None) is not None else None
         session = self._get_or_create_send_session(req)
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         if session.status == SessionStatus.CANCELLED:
@@ -1319,9 +1749,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kv_slice = self._create_kv_slice(req)
         try:
             session.send(kv_slice)
+            if diag_rid is not None:
+                self._record_diag_transition("ctx_kv_send_dispatched", diag_rid, once=True)
             if session.status == SessionStatus.CANCELLED:
                 return
             self._finalize_send(req, session)
+            if diag_rid is not None:
+                self._record_diag_transition("ctx_send_dispatched", diag_rid, once=True)
         except RuntimeError:
             # Native pre-cancellation seals the session. Retain the paired
             # maps so the ordinary cancellation/status path owns cleanup.
@@ -1375,23 +1809,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
             return
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        session = self._transfer_worker.create_rx_session(req)
+        self._enter_diag_state("gen_session_create", rid)
+        self._record_diag_transition("gen_receive_session_create_enter", rid, once=True)
+        try:
+            session = self._transfer_worker.create_rx_session(req)
+        finally:
+            self._leave_diag_state("gen_session_create", rid)
         self._recv_sessions[rid] = session
         self._recv_reqs[rid] = req
+        self._enter_diag_state("gen_recv", rid)
+        self._record_diag_transition("gen_receive_session_create", rid, once=True)
         if session.status == SessionStatus.CANCELLED:
             return
         kv_slice = self._create_kv_slice(req)
         req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+        self._enter_diag_state("gen_receive_dispatch", rid)
+        self._record_diag_transition("gen_receive_dispatch_enter", rid, once=True)
         try:
             session.receive(kv_slice)
+            self._record_diag_transition("gen_receive_dispatched", rid, once=True)
         except RuntimeError:
             if session.status == SessionStatus.CANCELLED:
                 return
             raise
+        finally:
+            self._leave_diag_state("gen_receive_dispatch", rid)
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
+        self._maybe_log_diagnostics()
         if getattr(self, "_async_terminal_consensus_enabled", False):
             return self._check_context_transfer_status_async(at_least_request_num, mark_complete)
         if getattr(self, "_async_consensus", None) is not None:
@@ -1429,7 +1876,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     failed_quiescent.append(rid)
         for rid in to_process:
             session = self._send_sessions[rid]
-            result = session.wait_complete(blocking=block_all)
+            result = self._diagnostic_wait_complete(
+                "ctx",
+                rid,
+                session,
+                blocking=block_all,
+            )
             if session.status == SessionStatus.CANCELLED:
                 if rid in failed:
                     failed.remove(rid)
@@ -1484,6 +1936,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         for rid in reclaimable_cancelled:
             self._legacy_failed_sessions.discard(rid)
+            self._leave_diag_state("ctx_send", rid)
+            self._record_diag_transition("ctx_global_cancelled", rid, once=True)
             self._send_sessions[rid].close()
             del self._send_reqs[rid]
             del self._send_sessions[rid]
@@ -1492,20 +1946,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             if mark_complete:
                 self._send_reqs[rid].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            self._leave_diag_state("ctx_send", rid)
+            self._record_diag_transition("ctx_global_complete", rid, once=True)
             self._send_sessions[rid].close()
             del self._send_reqs[rid]
             del self._send_sessions[rid]
         for rid in reclaimable_failed:
             self._legacy_failed_sessions.discard(rid)
+            self._leave_diag_state("ctx_send", rid)
+            self._record_diag_transition("ctx_global_failed", rid, once=True)
         self._close_failed_sessions(self._send_sessions, self._send_reqs, reclaimable_failed)
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
         self._transfer_worker.sweep_stale_req_infos()
 
+        self._maybe_log_diagnostics()
         return completed, reclaimable_failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
+        self._maybe_log_diagnostics()
         if getattr(self, "_async_consensus", None) is not None:
             self._progress_async_consensus()
         if not self._ever_had_recv_session and not self._gen_need_sync:
@@ -1517,6 +1977,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        for rid in local_completed:
+            self._record_diag_transition("gen_local_complete", rid, once=True)
+        for rid in local_failed:
+            self._record_diag_transition("gen_local_failed", rid, once=True)
         to_process = self._build_to_process(
             self._recv_sessions,
             self._gen_consensus(local_completed + local_failed),
@@ -1538,7 +2002,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     failed_quiescent.append(rid)
         for rid in to_process:
             session = self._recv_sessions[rid]
-            result = session.wait_complete(blocking=block_all)
+            result = self._diagnostic_wait_complete(
+                "gen",
+                rid,
+                session,
+                blocking=block_all,
+            )
             if session.status == SessionStatus.CANCELLED:
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
@@ -1588,6 +2057,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._legacy_failed_sessions.discard(rid)
             session = self._recv_sessions[rid]
             cancelled_reqs.append(self._recv_reqs[rid])
+            self._leave_diag_state("gen_recv", rid)
+            self._record_diag_transition("gen_global_cancelled", rid, once=True)
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
@@ -1598,9 +2069,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
-                self._apply_aux(session, req)
+                self._enter_diag_state("gen_aux_apply", rid)
+                self._record_diag_transition("gen_aux_apply_enter", rid, once=True)
+                try:
+                    self._apply_aux(session, req)
+                finally:
+                    self._leave_diag_state("gen_aux_apply", rid)
+                self._record_diag_transition("gen_aux_apply_exit", rid, once=True)
             self._assert_disagg_history_declared(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            self._leave_diag_state("gen_recv", rid)
+            self._record_diag_transition("gen_global_complete", rid, once=True)
             session.close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
@@ -1611,8 +2090,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
         for rid in reclaimable_failed:
             self._legacy_failed_sessions.discard(rid)
+            self._leave_diag_state("gen_recv", rid)
+            self._record_diag_transition("gen_global_failed", rid, once=True)
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, reclaimable_failed)
 
+        self._maybe_log_diagnostics()
         return completed, reclaimable_failed, cancelled_reqs
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
@@ -1625,8 +2107,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return
-            for session in self._recv_sessions.values():
-                session.wait_complete(blocking=False)
+            for rid, session in self._recv_sessions.items():
+                self._diagnostic_wait_complete(
+                    "gen",
+                    rid,
+                    session,
+                    blocking=False,
+                )
             time.sleep(min(0.001, remaining_s))
 
     def check_gen_transfer_complete(self):
@@ -1784,7 +2271,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if rid in self._async_ready_published:
                 return False
         else:
-            self._wait_reqs.pop(rid, None)
+            if self._wait_reqs.pop(rid, None) is not None:
+                self._leave_diag_state("ctx_wait", rid)
+                self._record_diag_transition("ctx_wait_cancelled", rid, once=True)
 
         has_transferring = False
 
@@ -1799,6 +2288,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 if rid in self._send_sessions:
                     has_transferring = True
             else:
+                self._leave_diag_state("ctx_send", rid)
+                self._record_diag_transition("ctx_send_cancelled", rid, once=True)
                 self._send_sessions[rid].close()
                 del self._send_reqs[rid]
                 del self._send_sessions[rid]
@@ -1808,6 +2299,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
+                self._leave_diag_state("gen_recv", rid)
+                self._record_diag_transition("gen_receive_cancelled", rid, once=True)
                 self._recv_sessions[rid].close()
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
@@ -1846,7 +2339,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # Terminal-only/default-off readiness still uses the legacy
                 # wait map. Remove an existing waiter before the immediately
                 # following prepare_context_requests([]) can promote it.
-                self._wait_reqs.pop(rid, None)
+                if self._wait_reqs.pop(rid, None) is not None:
+                    self._leave_diag_state("ctx_wait", rid)
+                    self._record_diag_transition("ctx_wait_excluded", rid, epoch, once=True)
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
                 continue
             prepared_key = next((key for key in self._async_ready_prepared if key[0] == rid), None)
@@ -1931,23 +2426,33 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._async_ready_prepared[key]
             self._async_ready_activated[key] = prepared_req
             coordinator.acknowledge_ready_activation(rid, epoch)
+            self._leave_diag_state("ready_prepared", rid)
+            self._leave_diag_state("ready_released", rid)
+            self._enter_diag_state("ready_activated", rid)
             self._record_async_transition("ready_activate", rid, epoch)
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
+        self._maybe_log_diagnostics()
         for req in requests:
             rid = get_unique_rid(req)
             if rid not in self._send_sessions:
                 if getattr(self, "_async_peer_ready_consensus_enabled", False):
                     if self._bind_async_ready_abort(req):
                         self._wait_reqs.pop(rid, None)
+                        self._leave_diag_state("ctx_wait", rid)
+                        self._record_diag_transition("ctx_wait_abort_bound", rid, once=True)
                         continue
                 if getattr(req, _ASYNC_READY_CANCELLED_EPOCH_ATTR, None) is not None:
                     self._wait_reqs.pop(rid, None)
+                    self._leave_diag_state("ctx_wait", rid)
+                    self._record_diag_transition("ctx_wait_pre_cancelled", rid, once=True)
                     continue
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+                self._enter_diag_state("ctx_wait", rid)
+                self._record_diag_transition("ctx_wait_enter", rid, once=True)
 
         # Materialize this iteration's requests before polling.  A READY_ABORT
         # can legally arrive before this rank has voted, and its handler must
@@ -1958,6 +2463,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if getattr(self, "_async_peer_ready_consensus_enabled", False):
             self._prepare_context_requests_async()
+            self._maybe_log_diagnostics()
             return
 
         # Nothing waiting on any rank, so skip the consensus. The waiting set is the same on every
@@ -1977,6 +2483,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in self._ctx_consensus(local_ready):
             self._wait_reqs[rid].state = LlmRequestState.CONTEXT_INIT
             del self._wait_reqs[rid]
+            self._leave_diag_state("ctx_wait", rid)
+            self._record_diag_transition("ctx_legacy_ready", rid, once=True)
+        self._maybe_log_diagnostics()
 
     def _prepare_context_requests_async(self) -> None:
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)
@@ -1986,6 +2495,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if not self._transfer_worker.has_all_peer_req_infos_for_send(rid):
                 continue
             epoch = self._async_ready_epoch.get(rid, 0)
+            self._record_diag_transition("ctx_peer_info_ready", rid, epoch, once=True)
             coordinator.publish_ready(rid, epoch)
             self._async_ready_published[rid] = epoch
             self._record_async_transition("ready_vote", rid, epoch)

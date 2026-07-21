@@ -41,6 +41,7 @@ from tensorrt_llm.bindings import LlmRequestState
 def _clear_async_consensus_env(monkeypatch) -> None:
     monkeypatch.delenv(transceiver_module._ASYNC_TERMINAL_ENV, raising=False)
     monkeypatch.delenv(transceiver_module._ASYNC_PEER_READY_ENV, raising=False)
+    monkeypatch.delenv(transceiver_module._DIAG_ENV, raising=False)
 
 
 @dataclass
@@ -184,6 +185,17 @@ class _FakeTask:
         return self._wait_result
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def _make_transceiver(
     sessions: dict[int, _FakeSession],
     reqs: Optional[dict[int, _FakeRequest]] = None,
@@ -318,6 +330,193 @@ def test_async_startup_flag_off_preserves_legacy_endpoint_exchange(monkeypatch) 
         endpoints=["local-endpoint", "local-endpoint"], layer_num_per_pp=[0, 0]
     )
     assert transceiver._async_consensus is None
+    assert transceiver._diagnostics is None
+
+
+def test_diagnostics_opt_in_does_not_enable_async_consensus(monkeypatch) -> None:
+    monkeypatch.setattr(transceiver_module, "MPIDist", _FakeStartupMpiDist)
+    monkeypatch.setenv(transceiver_module._DIAG_ENV, "1")
+    dist = _FakeStartupMpiDist()
+    transceiver = _make_startup_transceiver(dist)
+    config = SimpleNamespace(backend="NIXL", transceiver_runtime="PYTHON")
+
+    transceiver._init_async_consensus(config)
+
+    assert transceiver._diagnostics is not None
+    assert not transceiver._async_terminal_consensus_enabled
+    assert not transceiver._async_peer_ready_consensus_enabled
+    assert transceiver._async_consensus is None
+    assert dist.descriptors == []
+
+
+def test_malformed_diagnostic_env_does_not_interrupt_startup(monkeypatch) -> None:
+    monkeypatch.setattr(transceiver_module, "MPIDist", _FakeStartupMpiDist)
+    monkeypatch.setenv(transceiver_module._DIAG_ENV, "malformed")
+    dist = _FakeStartupMpiDist()
+    transceiver = _make_startup_transceiver(dist)
+    config = SimpleNamespace(backend="NIXL", transceiver_runtime="PYTHON")
+
+    transceiver._init_async_consensus(config)
+    transceiver._exchange_rank_info()
+
+    assert transceiver._diagnostics is None
+    assert dist.descriptors == ["local-endpoint"]
+    transceiver._transfer_worker.populate_instance_and_rank_info.assert_called_once_with(
+        endpoints=["local-endpoint", "local-endpoint"], layer_num_per_pp=[0, 0]
+    )
+
+
+def test_diagnostic_allgather_is_transparent_when_disabled() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._diagnostics = None
+    allgather = Mock(return_value=[[1], [1]])
+
+    result = transceiver._diagnostic_allgather("test", allgather, [1])
+
+    assert result == [[1], [1]]
+    allgather.assert_called_once_with([1])
+
+
+def test_diagnostic_wait_is_transparent_when_disabled() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._diagnostics = None
+    session = _FakeSession(11, WaitResult.TIMEOUT)
+
+    result = transceiver._diagnostic_wait_complete("gen", 11, session, blocking=False)
+
+    assert result == WaitResult.TIMEOUT
+    assert session.blocking_calls == [False]
+
+
+def test_diagnostic_wait_reports_individual_call_duration(monkeypatch) -> None:
+    fake_clock = _FakeClock()
+    info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", info)
+    monkeypatch.setattr(transceiver_module.time, "monotonic", fake_clock)
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._diagnostics = transceiver_module._PythonTransceiverDiagnostics(
+        0,
+        clock=fake_clock,
+    )
+    session = _FakeSession(12, WaitResult.TIMEOUT)
+    session.wait_complete = Mock(
+        side_effect=lambda *, blocking: (
+            fake_clock.advance(2.0),
+            WaitResult.TIMEOUT,
+        )[1]
+    )
+
+    result = transceiver._diagnostic_wait_complete("gen", 12, session, blocking=True)
+
+    assert result == WaitResult.TIMEOUT
+    messages = [call.args[0] for call in info.call_args_list]
+    assert any(
+        "transition=gen_future_wait_call_exit" in message and "duration_s=2.000000" in message
+        for message in messages
+    )
+
+
+def test_diagnostics_bound_samples_and_report_slow_collective(monkeypatch) -> None:
+    fake_clock = _FakeClock()
+    info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", info)
+    diagnostics = transceiver_module._PythonTransceiverDiagnostics(
+        3,
+        clock=fake_clock,
+        summary_interval_s=1.0,
+    )
+
+    for request_id in range(transceiver_module._DIAG_MAX_SAMPLED_REQUESTS + 4):
+        diagnostics.record_transition("created", request_id)
+    sequence = diagnostics.collective_enter("gen_ready_ids")
+    fake_clock.advance(0.2)
+    diagnostics.collective_exit("gen_ready_ids", sequence)
+    diagnostics.enter_state("gen_recv", 7)
+    fake_clock.advance(2.0)
+    diagnostics.maybe_log_snapshot({"recv_sessions": 1}, None, force=True)
+    status_summary = KvCacheTransceiverV2._session_status_summary(
+        {
+            request_id: SimpleNamespace(status=SessionStatus.READY)
+            for request_id in range(transceiver_module._DIAG_MAX_SAMPLED_REQUESTS + 4)
+        }
+    )
+
+    assert len(diagnostics._sampled_request_ids) == transceiver_module._DIAG_MAX_SAMPLED_REQUESTS
+    assert diagnostics._transition_counts["created"] == (
+        transceiver_module._DIAG_MAX_SAMPLED_REQUESTS + 4
+    )
+    assert status_summary["READY"]["count"] == transceiver_module._DIAG_MAX_SAMPLED_REQUESTS + 4
+    assert len(status_summary["READY"]["sample_ids"]) == (
+        transceiver_module._DIAG_MAX_SAMPLED_REQUESTS
+    )
+    messages = [call.args[0] for call in info.call_args_list]
+    assert any(
+        "event=collective_exit label=gen_ready_ids" in message and "duration_s=0.200000" in message
+        for message in messages
+    )
+    assert any(
+        "event=snapshot" in message and "'gen_recv': {'count': 1, 'oldest_s': 2.0" in message
+        for message in messages
+    )
+
+
+def test_diagnostic_snapshot_gate_avoids_hot_path_state_scans(monkeypatch) -> None:
+    class _Session:
+        @property
+        def status(self):
+            return status_getter()
+
+    fake_clock = _FakeClock()
+    diagnostics = transceiver_module._PythonTransceiverDiagnostics(
+        0,
+        clock=fake_clock,
+        summary_interval_s=10.0,
+    )
+    monkeypatch.setattr(transceiver_module.logger, "info", Mock())
+    diagnostics.maybe_log_snapshot({}, None, force=True)
+    status_getter = Mock(return_value=SessionStatus.READY)
+    coordinator = SimpleNamespace(diagnostic_snapshot=Mock(return_value={"rank": 0}))
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._diagnostics = diagnostics
+    transceiver._async_consensus = coordinator
+    transceiver._send_sessions = {1: _Session()}
+    transceiver._recv_sessions = {2: _Session()}
+
+    transceiver._maybe_log_diagnostics()
+
+    status_getter.assert_not_called()
+    coordinator.diagnostic_snapshot.assert_not_called()
+
+    fake_clock.advance(10.0)
+    transceiver._maybe_log_diagnostics()
+
+    assert status_getter.call_count == 2
+    coordinator.diagnostic_snapshot.assert_called_once_with()
+
+
+def test_direct_cancel_retires_diagnostic_ownership(monkeypatch) -> None:
+    info = Mock()
+    monkeypatch.setattr(transceiver_module.logger, "info", info)
+    send_session = _FakeSession(71, None)
+    recv_session = _FakeSession(72, None)
+    send_req = _FakeRequest(request_id=71)
+    recv_req = _FakeRequest(request_id=72)
+    transceiver = _make_transceiver({71: send_session}, {71: send_req})
+    _enable_fake_async_consensus(transceiver)
+    transceiver._recv_sessions[72] = recv_session
+    transceiver._recv_reqs[72] = recv_req
+    transceiver._diagnostics = transceiver_module._PythonTransceiverDiagnostics(0)
+    transceiver._enter_diag_state("ctx_send", 71)
+    transceiver._enter_diag_state("gen_recv", 72)
+
+    assert transceiver.cancel_request(send_req)
+    assert transceiver.cancel_request(recv_req)
+    transceiver._maybe_log_diagnostics(force=True)
+
+    assert not transceiver._diagnostics._active_states["ctx_send"]
+    assert not transceiver._diagnostics._active_states["gen_recv"]
+    snapshot = info.call_args_list[-1].args[0]
+    assert "active_states={}" in snapshot
 
 
 def test_async_startup_rejects_same_version_flag_mismatch(monkeypatch) -> None:
