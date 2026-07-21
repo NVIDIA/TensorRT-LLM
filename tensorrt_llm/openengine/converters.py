@@ -126,11 +126,10 @@ def to_sampling_params(request: generation_pb2.GenerateRequest) -> SamplingParam
     return SamplingParams(**kwargs)
 
 
-def to_priority(request: generation_pb2.GenerateRequest) -> float:
+def to_priority(priority: int | None) -> float:
     """Map signed OpenEngine ordering into TRT-LLM's bounded priority domain."""
-    if not request.HasField("priority"):
+    if priority is None:
         return 0.5
-    priority = request.priority
     return 0.5 + 0.5 * priority / (1 + abs(priority))
 
 

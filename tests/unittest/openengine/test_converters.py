@@ -180,14 +180,9 @@ def test_choice_guidance_escapes_literal_regex_characters() -> None:
 
 
 def test_priority_mapping_is_centered_bounded_and_strictly_monotonic() -> None:
-    absent = generation_pb2.GenerateRequest()
-    negative = generation_pb2.GenerateRequest(priority=-1000)
-    zero = generation_pb2.GenerateRequest(priority=0)
-    positive = generation_pb2.GenerateRequest(priority=1000)
-
-    assert 0 < to_priority(negative) < to_priority(zero)
-    assert to_priority(zero) == to_priority(absent) == 0.5
-    assert to_priority(zero) < to_priority(positive) < 1
+    assert 0 < to_priority(-1000) < to_priority(0)
+    assert to_priority(0) == to_priority(None) == 0.5
+    assert to_priority(0) < to_priority(1000) < 1
 
 
 @pytest.mark.asyncio

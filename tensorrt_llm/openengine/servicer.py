@@ -15,7 +15,6 @@ from typing import Any
 import grpc
 from openengine import MINIMUM_CLIENT_REVISION, SCHEMA_RELEASE, SCHEMA_REVISION
 from openengine.v1 import (
-    engine_pb2,
     error_pb2,
     generation_pb2,
     input_pb2,
@@ -25,6 +24,7 @@ from openengine.v1 import (
     model_pb2,
     observability_pb2,
     openengine_pb2_grpc,
+    server_pb2,
 )
 
 import tensorrt_llm
@@ -102,7 +102,10 @@ def _block_hash(value: object, hash_algo: str | None) -> kv_pb2.KvBlockHash:
     return kv_pb2.KvBlockHash(value=encoded, encoding=hash_algo or "hex")
 
 
-class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
+class OpenEngineServicer(
+    openengine_pb2_grpc.InferenceServicer,
+    openengine_pb2_grpc.ControlServicer,
+):
     """Engine-neutral service surface over TensorRT-LLM's Python LLM API."""
 
     def __init__(
@@ -151,13 +154,66 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
         self.event_host = event_host
         self.event_port = event_port
 
+    @staticmethod
+    def _request_metadata(context: grpc.aio.ServicerContext) -> dict[str, str]:
+        metadata: dict[str, str] = {}
+        for item in context.invocation_metadata():
+            try:
+                key, value = item
+            except (TypeError, ValueError):
+                key, value = item.key, item.value
+            normalized_key = str(key).lower()
+            if normalized_key.startswith("openengine-") and normalized_key in metadata:
+                raise ValueError(f"Duplicate reserved gRPC metadata key {normalized_key!r}")
+            if isinstance(value, bytes):
+                try:
+                    normalized_value = value.decode("ascii")
+                except UnicodeDecodeError as error:
+                    raise ValueError(
+                        f"gRPC metadata value for {normalized_key!r} must be ASCII"
+                    ) from error
+            else:
+                normalized_value = str(value)
+            metadata[normalized_key] = normalized_value
+        return metadata
+
+    @staticmethod
+    def _metadata_int(metadata: dict[str, str], key: str, minimum: int, maximum: int) -> int | None:
+        if key not in metadata:
+            return None
+        value = metadata[key]
+        digits = value[1:] if value.startswith("-") and minimum < 0 else value
+        if not digits or not digits.isdecimal():
+            raise ValueError(f"gRPC metadata {key!r} must be a base-10 integer")
+        try:
+            parsed = int(value, 10)
+        except ValueError as error:
+            raise ValueError(f"gRPC metadata {key!r} must be a base-10 integer") from error
+        if not minimum <= parsed <= maximum:
+            raise ValueError(f"gRPC metadata {key!r} must be in the range [{minimum}, {maximum}]")
+        return parsed
+
     async def Generate(
         self, request: generation_pb2.GenerateRequest, context: grpc.aio.ServicerContext
     ) -> AsyncGenerator[generation_pb2.GenerateResponse, None]:
         result = None
         consumed_session_id = None
         try:
-            self._validate_generate(request)
+            metadata = self._request_metadata(context)
+            priority_value = self._metadata_int(
+                metadata, "openengine-priority", -(1 << 31), (1 << 31) - 1
+            )
+            target_dp_rank = self._metadata_int(
+                metadata, "openengine-target-dp-rank", 0, (1 << 32) - 1
+            )
+            if self.role == server_pb2.ENGINE_ROLE_DECODE and request.kv.HasField("session"):
+                session_dp_rank = request.kv.session.dp_rank
+                if target_dp_rank is not None and target_dp_rank != session_dp_rank:
+                    raise ValueError(
+                        "openengine-target-dp-rank does not match the KV session dp_rank"
+                    )
+                target_dp_rank = session_dp_rank
+            self._validate_generate(request, target_dp_rank)
             params = to_sampling_params(request)
             media = await load_media(list(request.media), request.media_options, self.media_config)
             input_kind = request.WhichOneof("input")
@@ -177,17 +233,17 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
                 )
             if lora_request is None and request.lora_name:
                 lora_request = await self.loras.request(request.lora_name)
-            disaggregated = self._disaggregated_params(request)
+            disaggregated = self._disaggregated_params(request, target_dp_rank, metadata)
             context_usage = (
                 disaggregated.ctx_usage
                 if disaggregated is not None and disaggregated.request_type == "generation_only"
                 else None
             )
-            scheduling = self._scheduling_params(request)
-            priority = to_priority(request)
+            scheduling = self._scheduling_params(target_dp_rank)
+            priority = to_priority(priority_value)
             trace_headers = {
                 key.lower(): value
-                for key, value in request.metadata.items()
+                for key, value in metadata.items()
                 if key.lower() in ("traceparent", "tracestate", "baggage")
             }
             result = self.llm.generate_async(
@@ -248,7 +304,7 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
                         yield generation_pb2.GenerateResponse(
                             request_id=request.request_id, prompt=prompt
                         )
-                if self.role == engine_pb2.ENGINE_ROLE_PREFILL:
+                if self.role == server_pb2.ENGINE_ROLE_PREFILL:
                     if current.finished:
                         handoff = current.disaggregated_params
                         if handoff is None and current.outputs:
@@ -377,7 +433,9 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
         """Release protocol-owned timers without shutting down the shared LLM."""
         self._release_all_kv_sessions()
 
-    def _validate_generate(self, request: generation_pb2.GenerateRequest) -> None:
+    def _validate_generate(
+        self, request: generation_pb2.GenerateRequest, target_dp_rank: int | None = None
+    ) -> None:
         if not request.request_id:
             raise ValueError("request_id must not be empty")
         if request.model and request.model != self.model:
@@ -395,8 +453,8 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
             raise ValueError("Per-request guided decoding backend selection is not supported")
         if request.kv.HasField("bypass_prefix_cache") and request.kv.bypass_prefix_cache:
             raise ValueError("Prefix-cache bypass is not supported by TensorRT-LLM")
-        if request.kv.HasField("data_parallel_rank"):
-            self._scheduling_params(request)
+        if target_dp_rank is not None:
+            self._scheduling_params(target_dp_rank)
         if request.media:
             processor = getattr(self.llm, "input_processor", None)
             aggregate = self._available_modalities(processor)
@@ -408,7 +466,7 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
                 input_pb2.MODALITY_AUDIO: "audio",
             }
             allowed = (
-                aggregate if self.role == engine_pb2.ENGINE_ROLE_AGGREGATED else prefill_decode
+                aggregate if self.role == server_pb2.ENGINE_ROLE_AGGREGATED else prefill_decode
             )
             unsupported = {
                 names.get(item.modality, "unspecified")
@@ -424,7 +482,7 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
                     dict.fromkeys(names[item.modality] for item in request.media)
                 )
                 processor.get_required_lora_spec(requested_modalities)
-        if self.role == engine_pb2.ENGINE_ROLE_DECODE:
+        if self.role == server_pb2.ENGINE_ROLE_DECODE:
             if not request.kv.HasField("session"):
                 raise ValueError("Decode requests require a prefill KV session")
             requires_media = handoff_requires_decode_media(request.kv.session)
@@ -432,37 +490,34 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
                 raise ValueError("Decode request must resend the ordered context-phase media")
             if request.media and not requires_media:
                 raise ValueError("Decode KV session does not require raw media")
-        elif self.role == engine_pb2.ENGINE_ROLE_PREFILL:
+        elif self.role == server_pb2.ENGINE_ROLE_PREFILL:
             if request.kv.HasField("session"):
                 raise ValueError("Prefill requests cannot consume a KV session")
         elif request.kv.HasField("session"):
             raise ValueError("Aggregated requests cannot consume a KV session")
 
     def _disaggregated_params(
-        self, request: generation_pb2.GenerateRequest
+        self,
+        request: generation_pb2.GenerateRequest,
+        target_dp_rank: int | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> DisaggregatedParams | None:
-        if self.role == engine_pb2.ENGINE_ROLE_AGGREGATED:
+        if self.role == server_pb2.ENGINE_ROLE_AGGREGATED:
             return None
-        if self.role == engine_pb2.ENGINE_ROLE_PREFILL:
+        if self.role == server_pb2.ENGINE_ROLE_PREFILL:
             return DisaggregatedParams(
                 request_type="context_only",
                 disagg_request_id=stable_request_id(request.request_id),
-                ctx_dp_rank=(
-                    request.kv.data_parallel_rank
-                    if request.kv.HasField("data_parallel_rank")
-                    else None
-                ),
+                ctx_dp_rank=target_dp_rank,
                 schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
-                conversation_id=request.metadata.get("conversation_id"),
+                conversation_id=(metadata or {}).get("conversation_id"),
             )
         return decode_handoff(request.kv.session)
 
-    def _scheduling_params(
-        self, request: generation_pb2.GenerateRequest
-    ) -> SchedulingParams | None:
-        if not request.kv.HasField("data_parallel_rank"):
+    def _scheduling_params(self, target_dp_rank: int | None) -> SchedulingParams | None:
+        if target_dp_rank is None:
             return None
-        rank = request.kv.data_parallel_rank
+        rank = target_dp_rank
         data_parallel_size = int(_arg(self.llm, "data_parallel_size", 1))
         if rank >= data_parallel_size:
             raise ValueError(
@@ -609,26 +664,43 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
             finished.stop_match.stop_text = output.stop_reason
         return finished
 
-    async def GetEngineInfo(
-        self, request: engine_pb2.GetEngineInfoRequest, context: grpc.aio.ServicerContext
-    ) -> engine_pb2.EngineInfo:
+    async def GetServerInfo(
+        self, request: server_pb2.GetServerInfoRequest, context: grpc.aio.ServicerContext
+    ) -> server_pb2.ServerInfo:
         del request, context
         tp = _arg(self.llm, "tensor_parallel_size", 1)
         pp = _arg(self.llm, "pipeline_parallel_size", 1)
         dp = _arg(self.llm, "data_parallel_size", 1)
-        return engine_pb2.EngineInfo(
+        args = getattr(self.llm, "args", None)
+        kv_capacity = self._kv_capacity()
+        capacity = server_pb2.DeploymentCapacity()
+        if kv_capacity.get("tokensPerBlock") is not None:
+            capacity.kv_block_size = kv_capacity["tokensPerBlock"]
+        if kv_capacity.get("maxNumBlocks") is not None:
+            capacity.total_kv_blocks = kv_capacity["maxNumBlocks"]
+        max_requests = getattr(args, "max_batch_size", None)
+        if max_requests is not None:
+            capacity.max_running_requests = max_requests
+        max_tokens = getattr(args, "max_num_tokens", None)
+        if max_tokens is not None:
+            capacity.max_batched_tokens = max_tokens
+        max_loras = getattr(getattr(args, "lora_config", None), "max_loras", None)
+        if max_loras is not None:
+            capacity.max_loras = max_loras
+        return server_pb2.ServerInfo(
             engine_name="tensorrt_llm",
             engine_version=getattr(tensorrt_llm, "__version__", "unknown"),
-            role=self.role,
+            engine_role=self.role,
             instance_id=self.instance_id,
             supported_models=[self.model],
-            parallelism=engine_pb2.ParallelismInfo(
+            parallelism=server_pb2.ParallelismInfo(
                 tensor_parallel_size=tp,
                 pipeline_parallel_size=pp,
                 data_parallel_size=dp,
                 data_parallel_rank=_arg(self.llm, "data_parallel_rank", 0),
             ),
             kv_connector=self._kv_connector_info(),
+            capacity=capacity,
             schema_revision=SCHEMA_REVISION,
             minimum_client_revision=MINIMUM_CLIENT_REVISION,
             schema_release=schema_release(),
@@ -662,9 +734,6 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
             if guided_backend == "xgrammar":
                 guided_modes.append(model_pb2.GUIDED_DECODING_MODE_STRUCTURAL_TAG)
         max_context = getattr(args, "max_seq_len", None) or getattr(args, "max_input_len", None)
-        max_requests = getattr(args, "max_batch_size", None)
-        max_tokens = getattr(args, "max_num_tokens", None)
-        kv_capacity = self._kv_capacity()
         info = model_pb2.ModelInfo(
             model_id=self.model,
             served_model_name=self.model,
@@ -710,14 +779,6 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
         )
         if max_context is not None:
             info.max_context_length = max_context
-        if max_requests is not None:
-            info.max_running_requests = max_requests
-        if max_tokens is not None:
-            info.max_batched_tokens = max_tokens
-        if kv_capacity.get("tokensPerBlock") is not None:
-            info.kv_block_size = kv_capacity["tokensPerBlock"]
-        if kv_capacity.get("maxNumBlocks") is not None:
-            info.total_kv_blocks = kv_capacity["maxNumBlocks"]
         return info
 
     def _kv_capacity(self) -> dict[str, int]:
@@ -824,7 +885,7 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
         if request.model and request.model != self.model:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"Unknown model {request.model!r}")
             raise ValueError(f"Unknown model {request.model!r}")
-        if request.role not in (engine_pb2.ENGINE_ROLE_UNSPECIFIED, self.role):
+        if request.role not in (server_pb2.ENGINE_ROLE_UNSPECIFIED, self.role):
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 "Requested health role does not match this engine",
@@ -976,7 +1037,7 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
         return bool(getattr(plugin_config, "lora_plugin", False))
 
     def _kv_connector_info(self) -> kv_pb2.KvConnectorInfo:
-        enabled = self.role in (engine_pb2.ENGINE_ROLE_PREFILL, engine_pb2.ENGINE_ROLE_DECODE)
+        enabled = self.role in (server_pb2.ENGINE_ROLE_PREFILL, server_pb2.ENGINE_ROLE_DECODE)
         return kv_pb2.KvConnectorInfo(
             enabled=enabled,
             transfer_backend="tensorrt_llm" if enabled else "",

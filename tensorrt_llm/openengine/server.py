@@ -4,7 +4,7 @@
 """Lifecycle wrapper for the optional OpenEngine sibling gRPC server."""
 
 import grpc
-from openengine.v1 import engine_pb2, openengine_pb2_grpc
+from openengine.v1 import openengine_pb2_grpc, server_pb2
 
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.logger import logger
@@ -71,7 +71,8 @@ class OpenEngineServer:
             event_host=host,
             event_port=port,
         )
-        openengine_pb2_grpc.add_OpenEngineServicer_to_server(self.servicer, self._server)
+        openengine_pb2_grpc.add_InferenceServicer_to_server(self.servicer, self._server)
+        openengine_pb2_grpc.add_ControlServicer_to_server(self.servicer, self._server)
         bound = self._server.add_insecure_port(f"{host}:{port}")
         if bound == 0:
             raise RuntimeError(f"Failed to bind OpenEngine server to {host}:{port}")
@@ -115,12 +116,12 @@ class OpenEngineServer:
 def openengine_role(server_role: object | None) -> int:
     """Map TRT-LLM serve roles onto the supported OpenEngine milestone."""
     if server_role is None:
-        return engine_pb2.ENGINE_ROLE_AGGREGATED
+        return server_pb2.ENGINE_ROLE_AGGREGATED
     name = getattr(server_role, "name", str(server_role)).upper()
     if name == "CONTEXT":
-        return engine_pb2.ENGINE_ROLE_PREFILL
+        return server_pb2.ENGINE_ROLE_PREFILL
     if name == "GENERATION":
-        return engine_pb2.ENGINE_ROLE_DECODE
+        return server_pb2.ENGINE_ROLE_DECODE
     if name in ("MM_ENCODER", "VISUAL_GEN"):
         raise ValueError(f"OpenEngine does not support TRT-LLM server role {name!r}")
     raise ValueError(f"Unknown TRT-LLM server role {name!r}")

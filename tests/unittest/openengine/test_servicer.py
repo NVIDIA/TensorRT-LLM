@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 from openengine.v1 import (
-    engine_pb2,
     generation_pb2,
     input_pb2,
     kv_pb2,
@@ -14,6 +13,7 @@ from openengine.v1 import (
     lora_pb2,
     model_pb2,
     observability_pb2,
+    server_pb2,
 )
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -79,11 +79,15 @@ class _Llm:
 
 
 class _Context:
-    def __init__(self, cancelled: bool = False) -> None:
+    def __init__(self, cancelled: bool = False, metadata: tuple[tuple[str, str], ...] = ()) -> None:
         self._cancelled = cancelled
+        self._metadata = metadata
 
     def cancelled(self) -> bool:
         return self._cancelled
+
+    def invocation_metadata(self) -> tuple[tuple[str, str], ...]:
+        return self._metadata
 
     async def abort(self, code: object, message: str) -> None:
         raise AssertionError(f"unexpected abort {code}: {message}")
@@ -97,20 +101,26 @@ async def _collect_async(iterator):
 async def test_aggregate_streams_deltas_finish_and_terminal_usage() -> None:
     llm = _Llm()
     tracker = RequestTracker(llm)
-    servicer = OpenEngineServicer(llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, tracker)
+    servicer = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, tracker)
     request = generation_pb2.GenerateRequest(
         request_id="request",
         model="model",
         prompt="hello",
         stopping=generation_pb2.StoppingOptions(max_tokens=2),
-        metadata={
-            "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
-            "tracestate": "vendor=value",
-            "ignored": "not-a-trace-header",
-        },
     )
 
-    responses = [response async for response in servicer.Generate(request, _Context())]
+    context = _Context(
+        metadata=(
+            (
+                "traceparent",
+                "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            ),
+            ("tracestate", "vendor=value"),
+            ("openengine-priority", "7"),
+            ("ignored", "not-a-trace-header"),
+        )
+    )
+    responses = [response async for response in servicer.Generate(request, context)]
 
     assert [response.WhichOneof("event") for response in responses] == [
         "token",
@@ -124,6 +134,7 @@ async def test_aggregate_streams_deltas_finish_and_terminal_usage() -> None:
         "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
         "tracestate": "vendor=value",
     }
+    assert 0.5 < llm.kwargs["priority"] < 1
     assert tracker.active_count == 0
 
 
@@ -131,7 +142,7 @@ async def test_aggregate_streams_deltas_finish_and_terminal_usage() -> None:
 async def test_generate_cancellation_aborts_and_cleans_tracking() -> None:
     llm = _Llm()
     tracker = RequestTracker(llm)
-    service = OpenEngineServicer(llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, tracker)
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, tracker)
     request = generation_pb2.GenerateRequest(request_id="cancel", model="model", prompt="hello")
 
     responses = [response async for response in service.Generate(request, _Context(True))]
@@ -144,7 +155,7 @@ async def test_generate_cancellation_aborts_and_cleans_tracking() -> None:
 def test_generate_rejects_unsupported_cache_bypass_and_nonzero_dp_placement() -> None:
     llm = _Llm()
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     request = generation_pb2.GenerateRequest(request_id="request", model="model", prompt="hello")
     request.kv.bypass_prefix_cache = True
@@ -152,14 +163,12 @@ def test_generate_rejects_unsupported_cache_bypass_and_nonzero_dp_placement() ->
         service._validate_generate(request)
 
     request.kv.bypass_prefix_cache = False
-    request.kv.data_parallel_rank = 0
-    service._validate_generate(request)
-    assert service._scheduling_params(request) is None
+    service._validate_generate(request, 0)
+    assert service._scheduling_params(0) is None
 
     llm.args = SimpleNamespace(data_parallel_size=2)
-    request.kv.data_parallel_rank = 1
     with pytest.raises(ValueError, match="attention DP"):
-        service._validate_generate(request)
+        service._validate_generate(request, 1)
 
 
 @pytest.mark.asyncio
@@ -168,27 +177,41 @@ async def test_generate_applies_strict_attention_dp_placement() -> None:
     llm.args = SimpleNamespace(enable_attention_dp=True, data_parallel_size=4)
     llm._on_trt_backend = False
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     request = generation_pb2.GenerateRequest(request_id="request", model="model", prompt="hello")
-    request.kv.data_parallel_rank = 2
 
-    _ = [response async for response in service.Generate(request, _Context())]
+    context = _Context(metadata=(("openengine-target-dp-rank", "2"),))
+    _ = [response async for response in service.Generate(request, context)]
     scheduling = llm.kwargs["scheduling_params"]
 
     assert scheduling.attention_dp_rank == 2
     assert not scheduling.attention_dp_relax
 
 
+@pytest.mark.asyncio
+async def test_generate_rejects_non_decimal_priority_metadata() -> None:
+    llm = _Llm()
+    service = OpenEngineServicer(
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+    )
+    request = generation_pb2.GenerateRequest(request_id="request", model="model", prompt="hello")
+    context = _Context(metadata=(("openengine-priority", "1_000"),))
+
+    with pytest.raises(AssertionError, match="INVALID_ARGUMENT.*base-10 integer"):
+        _ = [response async for response in service.Generate(request, context)]
+
+    assert llm.kwargs is None
+
+
 def test_prefill_preserves_routing_rank_in_context_handoff() -> None:
     llm = _Llm()
     llm.args = SimpleNamespace(enable_attention_dp=True, data_parallel_size=4)
     llm._on_trt_backend = False
-    service = OpenEngineServicer(llm, "model", engine_pb2.ENGINE_ROLE_PREFILL, RequestTracker(llm))
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_PREFILL, RequestTracker(llm))
     request = generation_pb2.GenerateRequest(request_id="prefill", model="model", prompt="hello")
-    request.kv.data_parallel_rank = 3
 
-    params = service._disaggregated_params(request)
+    params = service._disaggregated_params(request, 3)
 
     assert params.ctx_dp_rank == 3
 
@@ -215,7 +238,7 @@ async def test_generate_selects_model_owned_multimodal_lora(monkeypatch, tmp_pat
     llm.args = SimpleNamespace(lora_config=object())
     llm.input_processor = _Processor()
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     request = generation_pb2.GenerateRequest(request_id="audio", model="model", prompt="transcribe")
     request.media.add(modality=input_pb2.MODALITY_AUDIO, raw_bytes=b"audio")
@@ -246,7 +269,7 @@ async def test_model_info_suppresses_modalities_when_required_lora_is_unavailabl
     llm = _Llm()
     llm.input_processor = _Processor()
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
 
     info = await service.GetModelInfo(model_pb2.GetModelInfoRequest(), _Context())
@@ -270,7 +293,7 @@ async def test_context_then_generation_round_trips_handoff() -> None:
     context_service = OpenEngineServicer(
         context_llm,
         "model",
-        engine_pb2.ENGINE_ROLE_PREFILL,
+        server_pb2.ENGINE_ROLE_PREFILL,
         RequestTracker(context_llm),
     )
     context_request = generation_pb2.GenerateRequest(
@@ -284,16 +307,14 @@ async def test_context_then_generation_round_trips_handoff() -> None:
     assert len(context_responses) == 1
     assert context_responses[0].WhichOneof("event") == "prefill_ready"
     assert len(context_service._kv_session_requests) == 1
-    context_load = await context_service.GetLoad(
-        observability_pb2.GetLoadRequest(), _Context()
-    )
+    context_load = await context_service.GetLoad(observability_pb2.GetLoadRequest(), _Context())
     assert context_load.active_kv_sessions == 0
 
     decode_llm = _Llm()
     decode_service = OpenEngineServicer(
         decode_llm,
         "model",
-        engine_pb2.ENGINE_ROLE_DECODE,
+        server_pb2.ENGINE_ROLE_DECODE,
         RequestTracker(decode_llm),
     )
     decode_request = generation_pb2.GenerateRequest(
@@ -342,7 +363,7 @@ async def test_prefill_adds_context_endpoint_from_llm_discovery() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_PREFILL,
+        server_pb2.ENGINE_ROLE_PREFILL,
         RequestTracker(llm),
     )
     request = generation_pb2.GenerateRequest(
@@ -368,7 +389,7 @@ async def test_prefill_session_expires_and_close_cancels_timers() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_PREFILL,
+        server_pb2.ENGINE_ROLE_PREFILL,
         RequestTracker(llm),
         kv_session_ttl_seconds=0.01,
     )
@@ -403,7 +424,7 @@ def test_decode_media_is_required_only_for_marked_handoff(monkeypatch) -> None:
     monkeypatch.setattr("tensorrt_llm.openengine.servicer.BaseMultimodalInputProcessor", _Processor)
     llm = _Llm()
     llm.input_processor = _Processor()
-    service = OpenEngineServicer(llm, "model", engine_pb2.ENGINE_ROLE_DECODE, RequestTracker(llm))
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_DECODE, RequestTracker(llm))
     session = encode_handoff(
         DisaggregatedParams(
             request_type="context_only",
@@ -429,7 +450,7 @@ def test_kv_batch_preserves_chain_geometry_and_source_sequence() -> None:
     llm = _Llm()
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(tokens_per_block=2))
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     service._lora_names_by_id[7] = "adapter"
     batch = service._kv_batch(
@@ -488,7 +509,7 @@ def test_kv_batch_stops_at_partial_block_and_uses_decimal_int_hashes() -> None:
     llm = _Llm()
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(tokens_per_block=2))
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     batch = service._kv_batch(
         {
@@ -530,7 +551,7 @@ def test_kv_batch_preserves_model_owned_lora_id_zero_and_gap_reset() -> None:
     llm.input_processor = _Processor()
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(tokens_per_block=2))
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     batch = service._kv_batch(
         {
@@ -568,7 +589,7 @@ def test_kv_batch_fails_closed_for_unrepresentable_cache_namespace(unsupported) 
     llm = _Llm()
     llm.args = SimpleNamespace(kv_cache_config=SimpleNamespace(tokens_per_block=2))
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     block = {
         "block_hash": 2,
@@ -616,14 +637,15 @@ async def test_discovery_and_load_use_config_and_shared_stats() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_AGGREGATED,
         RequestTracker(llm),
         stats_fanout=stats,
     )
 
+    server_info = await service.GetServerInfo(server_pb2.GetServerInfoRequest(), _Context())
+    assert server_info.capacity.kv_block_size == 64
+    assert server_info.capacity.total_kv_blocks == 100
     model_info = await service.GetModelInfo(model_pb2.GetModelInfoRequest(), _Context())
-    assert model_info.kv_block_size == 64
-    assert model_info.total_kv_blocks == 100
     assert not model_info.generation.guided_decoding.supported
     assert not model_info.supports_lora
 
@@ -660,7 +682,7 @@ async def test_load_never_undercounts_live_tracker_from_stale_stats() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_AGGREGATED,
         tracker,
         stats_fanout=stats,
     )
@@ -681,7 +703,7 @@ async def test_kv_event_sources_are_rank_scoped() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_AGGREGATED,
         RequestTracker(llm),
         kv_event_fanout=fanout,
     )
@@ -704,7 +726,7 @@ async def test_kv_event_discovery_requires_decimal_compatible_hashes() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_AGGREGATED,
         RequestTracker(llm),
         kv_event_fanout=KvEventFanout(llm),
     )
@@ -727,7 +749,7 @@ async def test_direct_kv_subscription_rejects_unknown_rank() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_AGGREGATED,
         RequestTracker(llm),
         kv_event_fanout=KvEventFanout(llm),
     )
@@ -745,7 +767,7 @@ async def test_drain_deadline_does_not_wait_forever_for_external_http() -> None:
     service = OpenEngineServicer(
         llm,
         "model",
-        engine_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_AGGREGATED,
         tracker,
         post_abort_cleanup_timeout_seconds=0.01,
     )
@@ -764,21 +786,21 @@ async def test_drain_deadline_does_not_wait_forever_for_external_http() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_info_omits_unknown_kv_geometry() -> None:
+async def test_server_info_omits_unknown_kv_geometry() -> None:
     llm = _Llm()
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
-    info = await service.GetModelInfo(model_pb2.GetModelInfoRequest(), _Context())
-    assert not info.HasField("kv_block_size")
-    assert not info.HasField("total_kv_blocks")
+    info = await service.GetServerInfo(server_pb2.GetServerInfoRequest(), _Context())
+    assert not info.capacity.HasField("kv_block_size")
+    assert not info.capacity.HasField("total_kv_blocks")
 
 
 @pytest.mark.asyncio
 async def test_model_info_unknown_model_maps_to_not_found() -> None:
     llm = _Llm()
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
 
     with pytest.raises(AssertionError, match="NOT_FOUND"):
@@ -789,7 +811,7 @@ async def test_model_info_unknown_model_maps_to_not_found() -> None:
 async def test_health_probe_and_unconfigured_lora_fail_explicitly(tmp_path) -> None:
     llm = _Llm()
     service = OpenEngineServicer(
-        llm, "model", engine_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
+        llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     with pytest.raises(AssertionError, match="UNIMPLEMENTED"):
         await service.Health(lifecycle_pb2.HealthRequest(include_inference_probe=True), _Context())
