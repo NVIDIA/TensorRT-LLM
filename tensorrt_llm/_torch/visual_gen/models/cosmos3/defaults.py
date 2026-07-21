@@ -53,7 +53,22 @@ def _normalize_condition_video_latent_indexes(
 ) -> tuple[int, ...]:
     if indexes is None:
         return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
-    normalized = tuple(int(index) for index in indexes)
+    values = []
+    for index in indexes:
+        # Strict: reject non-integers instead of silently truncating (1.9 -> 1)
+        # or TypeError-ing on None. Integral floats (JSON emitters) coerce.
+        if isinstance(index, bool) or not isinstance(index, (int, float)):
+            raise ValueError(
+                f"Cosmos3 condition_video_latent_indexes must be integers, got {index!r}."
+            )
+        if isinstance(index, float):
+            if not index.is_integer():
+                raise ValueError(
+                    f"Cosmos3 condition_video_latent_indexes must be integers, got {index!r}."
+                )
+            index = int(index)
+        values.append(index)
+    normalized = tuple(values)
 
     if not normalized:
         raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
@@ -99,6 +114,11 @@ def _crop_video_frames(video, extra_params) -> torch.Tensor:
     # A slice is a view over the full storage and would pickle all of it;
     # clone so the transport payload owns only the window.
     return sliced.clone()
+
+
+def _validate_output_type(output_type: str) -> None:
+    if output_type not in ("video", "image"):
+        raise ValueError(f"Cosmos3 output_type must be 'video' or 'image', got {output_type!r}.")
 
 
 def _validate_video_reference_tensor(video: torch.Tensor) -> None:
@@ -169,9 +189,10 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Whether to enable audio generation.",
     ),
     "output_type": ExtraParamSchema(
-        type="Literal['video', 'image']",
+        type="str",
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
+        validator=_validate_output_type,
     ),
     "condition_video_latent_indexes": ExtraParamSchema(
         type="list",

@@ -215,7 +215,9 @@ def validate_visual_gen_params(
             if validator is not None:
                 try:
                     validator(value)
-                except ValueError as exc:
+                except (TypeError, ValueError) as exc:
+                    # TypeError included: a validator tripping on a wrong-shaped
+                    # value is still a client error, not a server fault.
                     messages.append(f"extra_params['{key}']: {exc}")
                     continue
             # Range check (numeric only)
