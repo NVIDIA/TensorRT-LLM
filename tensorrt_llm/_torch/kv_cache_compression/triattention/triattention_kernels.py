@@ -9,9 +9,15 @@ EXCLUSIVELY through the SM100 CuTe-DSL kernel
 64/128, 32/128-token pages, GQA group 4 or 8. There is deliberately no other
 score path -- any geometry outside that contract raises loudly at setup
 instead of routing to a slower kernel (the original Triton score kernel and
-the C++ CUDA score stack have both been deleted). The unit tests validate
-the CuTe kernel against an independent PyTorch oracle. Selection and
-compaction live in their respective runtime modules.
+the C++ CUDA score stack have both been deleted). Union eviction likewise
+runs EXCLUSIVELY through the fused score+stats+union CuTe pipeline
+(``triattention_cute_score_fused.py`` + ``triattention_cute_selection.py``);
+the split Triton row-stats/union-reduce launches were retired with it, and
+their standalone copies live in the fused-pipeline unit test as references
+(the row-stats kernel itself remains: the per-head modes still normalize
+with it). The unit tests validate the CuTe kernels against independent
+PyTorch oracles. Selection and compaction live in their respective runtime
+modules.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
@@ -22,7 +28,6 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-import os
 from typing import List, Optional
 
 import torch
@@ -430,13 +435,10 @@ class _FixedScoreGroup:
         self._cute_scratch = scratch
         self._cute_seg_seq_len = seg_seq_len
         self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
-        # Opt-in fused score+stats+union pipeline (Fanrong Li's two-kernel
-        # scheme). ONE runner serves every cohort: the score window start is
-        # per-request runtime metadata, not a compile-time constant.
-        self._cute_union_fusion_enabled = (
-            os.environ.get("TRTLLM_TRIATTENTION_CUTE_UNION_FUSION", "0") == "1"
-        )
-        self._union_fusion_runner_built = False
+        # Fused score+stats+union pipeline (Fanrong Li's two-kernel scheme):
+        # THE union path, built lazily on the first union launch. ONE runner
+        # serves every cohort: the score window start is per-request runtime
+        # metadata, not a compile-time constant.
         self._union_fusion_runner_entry = None
         from tensorrt_llm.logger import logger
 
@@ -551,14 +553,12 @@ class _FixedScoreGroup:
 
         The score window start is per-request runtime metadata staged into a
         persistent device buffer, so a single compiled runner serves every
-        cohort. A ``None`` entry records that the fused pipeline rejected the
-        geometry.
+        cohort. This is THE union path: a construction failure raises loudly
+        instead of recording a fallback.
         """
-        if self._union_fusion_runner_built:
+        if self._union_fusion_runner_entry is not None:
             return self._union_fusion_runner_entry
-        self._union_fusion_runner_built = True
         num_q_heads, num_kv_heads, num_freqs, tokens_per_block, _ = self.geometry_args
-        entry = None
         try:
             from .triattention_cute_score_fused import (
                 TriAttentionCuteScoreRunner as _FusedUnionScoreRunner,
@@ -605,13 +605,12 @@ class _FixedScoreGroup:
                 output=self._cute_scratch,
                 enable_partial_stats=True,
             )
-            entry = (runner, union_rows, token_starts)
         except (ImportError, RuntimeError, ValueError, AssertionError) as error:
-            import warnings
-
-            warnings.warn(f"TriAttention CuTe union fusion unavailable: {error}")
-        self._union_fusion_runner_entry = entry
-        return entry
+            raise RuntimeError(
+                "TriAttention CuTe union fusion setup failed and no other union path exists"
+            ) from error
+        self._union_fusion_runner_entry = (runner, union_rows, token_starts)
+        return self._union_fusion_runner_entry
 
     def launch_cute_union_fusion(
         self,
@@ -622,26 +621,25 @@ class _FixedScoreGroup:
         mean_cos: torch.Tensor,
         mean_sin: torch.Tensor,
         union_out: torch.Tensor,
-    ) -> bool:
-        """Run the fused score+stats+normalized-union pipeline when possible.
+    ) -> None:
+        """Run the fused score+stats+normalized-union pipeline (THE union path).
 
         Each request scores its own window (``token_starts_device`` carries
         the per-request pinned prompt lengths), so mixed-prompt cohorts are
-        served directly. Returns False (without launching) only when the
-        opt-in is off or the geometry has no fused specialization — the
-        caller then falls back to the split score, row-stats, and union path.
+        served directly. There is deliberately no fallback: an unsupported
+        geometry or request count raises loudly instead of routing to the
+        retired split score/row-stats/union launches.
         """
         self.prepare_cute_score(mean_cos, mean_sin)
-        if not self._cute_union_fusion_enabled:
-            return False
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds fixed score capacity")
-        entry = self._union_fusion_runner(mean_cos, mean_sin)
-        if entry is None:
-            return False
-        runner, union_rows, staged_token_starts = entry
+        runner, union_rows, staged_token_starts = self._union_fusion_runner(mean_cos, mean_sin)
         if not runner.supports_union_fusion(request_count):
-            return False
+            raise RuntimeError(
+                f"TriAttention CuTe union fusion has no compiled variant for "
+                f"request_count={request_count} (capacity {self.max_requests}) "
+                "and no other union path exists"
+            )
         num_segments = request_count * self.num_layers
         torch.sub(
             valid_seq_lens[:request_count],
@@ -658,7 +656,6 @@ class _FixedScoreGroup:
         runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_rows[:request_count])
         columns = min(union_rows.shape[1], union_out.shape[1])
         union_out[:request_count, :columns].copy_(union_rows[:request_count, :columns])
-        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -699,92 +696,6 @@ def _score_row_stats_kernel(
     std = tl.sqrt(square_sum / valid_width)
     tl.store(row_mean + flat_row, mean)
     tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, 1e-6))
-
-
-@triton.jit
-def _score_union_kernel(
-    scores,
-    valid_widths,
-    row_mean,
-    row_inv_std,
-    combined,
-    ROWS: tl.constexpr,
-    WIDTH: tl.constexpr,
-    NORMALIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Normalize score rows and reduce them directly to one request-level union."""
-    request = tl.program_id(0)
-    token = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    valid_width = tl.load(valid_widths + request)
-    valid_token = token < valid_width
-    union_max = tl.full((BLOCK,), -float("inf"), tl.float32)
-    for row in tl.range(0, ROWS):
-        flat_row = request * ROWS + row
-        value = tl.load(
-            scores + flat_row * WIDTH + token,
-            mask=valid_token,
-            other=-float("inf"),
-        ).to(tl.float32)
-        if NORMALIZE:
-            mean = tl.load(row_mean + flat_row)
-            inv_std = tl.load(row_inv_std + flat_row)
-            value = tl.where(valid_token, (value - mean) * inv_std, -float("inf"))
-        union_max = tl.maximum(union_max, value)
-    tl.store(combined + request * WIDTH + token, union_max, mask=token < WIDTH)
-
-
-def prepare_union_scores(
-    scores: torch.Tensor,
-    valid_widths: torch.Tensor,
-    row_mean: torch.Tensor,
-    row_inv_std: torch.Tensor,
-    combined: torch.Tensor,
-    request_count: int,
-    *,
-    normalize_scores: bool,
-) -> None:
-    """Mask, normalize, and union-reduce score rows in two or three launches."""
-    request_count = int(request_count)
-    if not scores.is_cuda or scores.ndim != 3 or scores.dtype != torch.float32:
-        raise ValueError("union score preparation requires contiguous CUDA FP32 rows")
-    if not scores.is_contiguous() or request_count != scores.shape[0]:
-        raise ValueError("union score preparation request geometry does not match")
-    _, rows, width = scores.shape
-    if (
-        valid_widths.shape != (request_count,)
-        or valid_widths.dtype != torch.int32
-        or valid_widths.device != scores.device
-        or row_mean.numel() < request_count * rows
-        or row_inv_std.shape != row_mean.shape
-        or combined.shape != (request_count, width)
-    ):
-        raise ValueError("union score preparation buffers do not match")
-    stats_block = 256
-    if normalize_scores:
-        _score_row_stats_kernel[(request_count * rows,)](
-            scores,
-            valid_widths,
-            row_mean,
-            row_inv_std,
-            ROWS=rows,
-            WIDTH=width,
-            BLOCK=stats_block,
-            num_warps=4,
-        )
-    union_block = 32
-    _score_union_kernel[(request_count, triton.cdiv(width, union_block))](
-        scores,
-        valid_widths,
-        row_mean,
-        row_inv_std,
-        combined,
-        ROWS=rows,
-        WIDTH=width,
-        NORMALIZE=normalize_scores,
-        BLOCK=union_block,
-        num_warps=1,
-    )
 
 
 @triton.jit

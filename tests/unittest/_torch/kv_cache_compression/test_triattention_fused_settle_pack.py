@@ -444,8 +444,6 @@ def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buff
         dtype=torch.float32,
         device=device,
         max_requests=request_count,
-        input_scores=torch.zeros(request_count, 3, width, device=device),
-        normalize_scores=False,
     )
 
     def build_compaction(kept_token_ordinals):

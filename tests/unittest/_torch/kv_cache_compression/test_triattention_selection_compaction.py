@@ -152,6 +152,8 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
 def test_union_eager_runs_the_registered_cute_op():
     _require_cute_topk_op()
     device = torch.device("cuda", torch.cuda.current_device())
+    # The fused CuTe pipeline is the production union-row producer; these
+    # selector tests stage prepared union rows into ``combined`` directly.
     scores = torch.randn(2, 4, 96, dtype=torch.float32, device=device)
     selector = _BatchedUnionKeepSetSelector(
         rows=4,
@@ -160,62 +162,42 @@ def test_union_eager_runs_the_registered_cute_op():
         dtype=torch.float32,
         device=device,
         max_requests=2,
-        input_scores=scores,
-        normalize_scores=True,
     )
-    selector.select_prepared_requests()
+    selector.combined.copy_(scores.amax(dim=1))
+    selector.select_prepared_union_scores()
     torch.cuda.synchronize(device)
     assert torch.all(selector.keep[:, 1:] >= selector.keep[:, :-1])
 
 
-@pytest.mark.parametrize("normalize_scores", [False, True])
-def test_prepared_union_scores_match_checked_launch_and_exact_indices(normalize_scores):
+def test_prepared_union_rows_select_exact_indices():
     _require_cute_topk_op()
-    from tensorrt_llm._torch.kv_cache_compression.triattention import triattention_kernels
-
     device = torch.device("cuda", torch.cuda.current_device())
-    request_count, rows, width, keep_count = 2, 7, 97, 64
+    request_count, width, keep_count = 2, 97, 64
     generator = torch.Generator(device=device).manual_seed(53)
-    scores = torch.randn(
+    combined_rows = torch.randn(
         request_count,
-        rows,
         width,
         generator=generator,
         dtype=torch.float32,
         device=device,
     )
     valid_widths = torch.tensor([83, 91], dtype=torch.int32, device=device)
-    reference_mean = torch.empty(request_count, rows, 1, dtype=torch.float32, device=device)
-    reference_inv_std = torch.empty_like(reference_mean)
-    reference_combined = torch.empty(request_count, width, dtype=torch.float32, device=device)
-    triattention_kernels.prepare_union_scores(
-        scores,
-        valid_widths,
-        reference_mean,
-        reference_inv_std,
-        reference_combined,
-        request_count,
-        normalize_scores=normalize_scores,
-    )
 
     selector = _BatchedUnionKeepSetSelector(
-        rows=rows,
+        rows=7,
         width=width,
         keep_count=keep_count,
         dtype=torch.float32,
         device=device,
         max_requests=request_count,
-        input_scores=scores,
-        normalize_scores=normalize_scores,
     )
     selector.valid_widths.copy_(valid_widths)
-    selector.select_prepared_requests()
-    actual_combined = selector.combined.cpu()
+    selector.combined.copy_(combined_rows)
+    selector.select_prepared_union_scores()
     actual_keep = selector.keep.cpu()
-    expected_combined = reference_combined.cpu()
+    expected_combined = combined_rows.cpu()
     torch.cuda.synchronize(device)
 
-    assert torch.equal(actual_combined, expected_combined)
     for request, valid_width in enumerate(valid_widths.cpu().tolist()):
         expected_keep = torch.sort(
             _stable_topk(expected_combined[request], valid_width, keep_count)
@@ -246,8 +228,6 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         dtype=torch.float32,
         device=device,
         max_requests=request_count,
-        input_scores=scores,
-        normalize_scores=False,
     )
     selector.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
     # Write the shared per-request prompt lengths the way production staging
@@ -256,7 +236,8 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
     selector.refresh_row_prompt_offsets()
-    selector.select_prepared_requests()
+    selector.combined.copy_(scores.amax(dim=1))
+    selector.select_prepared_union_scores()
     actual = selector.keep.cpu()
 
     combined = scores.amax(dim=1).cpu()
@@ -267,46 +248,10 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         assert torch.equal(actual[request], expected_decode)
 
 
-def test_fused_union_preparation_matches_ragged_torch_reference():
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        prepare_union_scores,
-    )
-
-    device = torch.device("cuda", torch.cuda.current_device())
-    request_count, rows, width = 2, 7, 97
-    generator = torch.Generator(device=device).manual_seed(17)
-    scores = torch.randn(
-        request_count,
-        rows,
-        width,
-        generator=generator,
-        dtype=torch.float32,
-        device=device,
-    )
-    valid_widths = torch.tensor([83, 91], dtype=torch.int32, device=device)
-    row_mean = torch.empty(request_count, rows, 1, dtype=torch.float32, device=device)
-    row_inv_std = torch.empty_like(row_mean)
-    combined = torch.empty(request_count, width, device=device)
-
-    prepare_union_scores(
-        scores,
-        valid_widths,
-        row_mean,
-        row_inv_std,
-        combined,
-        request_count,
-        normalize_scores=True,
-    )
-    torch.cuda.synchronize(device)
-
-    expected = torch.full_like(combined, float("-inf"))
-    for request, valid_width in enumerate(valid_widths.tolist()):
-        valid_scores = scores[request, :, :valid_width]
-        mean = valid_scores.mean(dim=1, keepdim=True)
-        std = torch.linalg.vector_norm(valid_scores - mean, dim=1, keepdim=True)
-        std = (std / valid_width**0.5).clamp_min(1e-6)
-        expected[request, :valid_width] = ((valid_scores - mean) / std).amax(dim=0)
-    assert torch.allclose(combined, expected, rtol=2e-5, atol=2e-5)
+# The retired split-union preparation (``prepare_union_scores``) is covered
+# by its standalone reference copy in test_triattention_cute_union_fusion.py,
+# which validates it against a pure-torch oracle and uses it as the
+# fused-pipeline equivalence reference.
 
 
 @pytest.mark.parametrize("per_layer", [False, True])
@@ -912,10 +857,6 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             dense_layers=(0,),
             num_query_heads=num_q_heads,
             num_kv_heads=1,
-            input_scores=score_staging.fused_group.output.view(
-                1, num_q_heads, seq_len - prompt_len
-            ),
-            normalize_scores=False,
             prompt_offsets_buffer=score_staging.token_starts_device,
         )
         score_staging.bind_score_launcher(keep_set_selector.valid_widths, "mean")
@@ -949,8 +890,12 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
                 [seq_len + protected_tail],
             )
             keep_set_selector.refresh_row_prompt_offsets()
-            score_staging.launch_prepared_score()
-            keep_set_selector.select_prepared_requests()
+            # THE union path: the fused pipeline writes normalized union rows
+            # into ``combined``. Z-normalization is monotonic per row and all
+            # query heads carry identical scores here, so the expected keep
+            # set (derived from raw scores) is unchanged.
+            score_staging.launch_prepared_union_fusion(keep_set_selector.combined)
+            keep_set_selector.select_prepared_union_scores()
             selected = keep_set_selector.keep[0].clone().to(torch.long)
             batched_compaction.compact()
             score_staging.mark_page_tables_consumed(manager._stream)

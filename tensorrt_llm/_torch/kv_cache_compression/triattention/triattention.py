@@ -321,7 +321,15 @@ class _BatchedKeepSetSelectorBase:
 
 
 class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
-    """Persistent ``[request, ...]`` buffers for union selection."""
+    """Persistent ``[request, ...]`` buffers for union selection.
+
+    The fused score+stats+union CuTe pipeline is THE union score producer:
+    it writes the normalized per-request union rows straight into
+    ``combined``, so this selector owns only the top-k settle-and-pack
+    stage. The split row-stats/union-reduce Triton launches were retired
+    with their buffers; their standalone copies live in the fused-pipeline
+    unit test as references.
+    """
 
     def __init__(
         self,
@@ -335,8 +343,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         dense_layers: Tuple[int, ...] = (),
         num_query_heads: int = 0,
         num_kv_heads: int = 0,
-        input_scores: Optional[torch.Tensor] = None,
-        normalize_scores: bool = True,
         prompt_offsets_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if rows <= 0:
@@ -353,11 +359,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             device=device,
             max_requests=max_requests,
         )
-        if input_scores is None:
-            raise ValueError("union selection requires its fixed score input")
-
-        self.row_mean = torch.empty((max_requests, rows, 1), dtype=dtype, device=self.device)
-        self.row_std = torch.empty_like(self.row_mean)
         self.combined = torch.empty((max_requests, width), dtype=dtype, device=self.device)
         self.final_indices = torch.empty(
             (max_requests, keep_count), dtype=torch.int32, device=self.device
@@ -368,24 +369,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             (max_requests, self.keep_count), dtype=torch.int32, device=self.device
         )
         self._bind_selection_rows(self.combined, self.valid_widths, self.final_indices, self.keep)
-        # Callers select from exactly this tensor with exactly this flag.
-        self.input_scores = input_scores
-        self.normalize_scores = bool(normalize_scores)
-
-    def select_prepared_requests(self) -> None:
-        """Select from the CUDA score tensor bound to this fixed selector."""
-        from .triattention_kernels import prepare_union_scores
-
-        prepare_union_scores(
-            self.input_scores,
-            self.valid_widths,
-            self.row_mean,
-            self.row_std,
-            self.combined,
-            self.max_requests,
-            normalize_scores=self.normalize_scores,
-        )
-        self._select_top_tokens()
 
     def select_prepared_union_scores(self) -> None:
         """Select from normalized union rows already written into ``combined``.
@@ -791,12 +774,12 @@ class _FixedScoreStagingBuffers:
         self._score_valid_widths = valid_widths
         self._score_launcher_bound = True
 
-    def launch_prepared_union_fusion(self, union_out: torch.Tensor) -> bool:
-        """Try the fused score+stats+union pipeline over these buffers.
+    def launch_prepared_union_fusion(self, union_out: torch.Tensor) -> None:
+        """Run the fused score+stats+union pipeline over these buffers.
 
-        Returns False without side effects on the selection buffers when the
-        fused path cannot serve this cohort; the caller then runs the split
-        score and selection launches instead.
+        This is THE union score path; there is deliberately no fallback. A
+        geometry or capacity the fused pipeline cannot serve raises loudly
+        instead of routing to the retired split launches.
         """
         if not self._score_launcher_bound:
             raise RuntimeError("TriAttention score launcher is not bound")
@@ -1132,6 +1115,14 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "'union', 'per_head', 'per_layer_perhead'"
             )
         self.normalize_scores = bool(normalize_scores)
+        if self.eviction_mode == "union" and not self.normalize_scores:
+            # The fused score+stats+union CuTe pipeline is THE union path and
+            # always z-normalizes; the split un-normalized union launches
+            # were retired with the Triton/C++ score stacks.
+            raise ValueError(
+                "TriAttention union eviction requires normalize_scores=True: "
+                "the fused union pipeline always z-normalizes score rows"
+            )
         self.pin_prefill = bool(pin_prefill)
         # cpt=False (default): budget counts DECODE tokens only (pinned prompt is
         # extra). cpt=True: budget INCLUDES the pinned prompt.
@@ -1573,8 +1564,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _build_cross_request_keep_set_selector(
         plan: _CrossRequestSelectionPlan,
         *,
-        input_scores: Optional[torch.Tensor] = None,
-        normalize_scores: bool = True,
         prompt_offsets_buffer: Optional[torch.Tensor] = None,
     ) -> Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector]:
         """Allocate one fixed ``[request, ...]`` keep-set selector."""
@@ -1589,8 +1578,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 dense_layers=plan.dense_layers,
                 num_query_heads=plan.num_query_heads,
                 num_kv_heads=plan.num_kv_heads,
-                input_scores=input_scores,
-                normalize_scores=normalize_scores,
                 prompt_offsets_buffer=prompt_offsets_buffer,
             )
         return _BatchedPerHeadKeepSetSelector(
@@ -2066,12 +2053,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 device=first_pool.device,
                 max_requests=request_capacity,
             ),
-            input_scores=score_staging.fused_group.output.view(
-                request_capacity,
-                len(layout.dense_layers) * int(self._H),
-                decode_width,
-            ),
-            normalize_scores=self.normalize_scores,
             prompt_offsets_buffer=score_staging.token_starts_device,
         )
         # Padded rows carry zero valid width; their provisional TopK entries
@@ -2321,21 +2302,21 @@ class TriAttention(BaseKVCacheCompressionManager):
             keep_set_selector.refresh_row_prompt_offsets()
 
         try:
+            fused_union = isinstance(keep_set_selector, _BatchedUnionKeepSetSelector)
             with nvtx_range("triattention.score", color="blue"):
-                # The fused pipeline covers score, row stats, normalization,
-                # and the cross-row union maximum in two kernels; when it
-                # declines this cohort the split launches run instead.
-                fused_union = (
-                    self.normalize_scores
-                    and isinstance(keep_set_selector, _BatchedUnionKeepSetSelector)
-                    and score_staging.launch_prepared_union_fusion(keep_set_selector.combined)
-                )
-                per_head = None if fused_union else score_staging.launch_prepared_score()
+                # Union rounds run the fused pipeline (score, row stats,
+                # normalization, and the cross-row union maximum in two CuTe
+                # kernels) — THE only union path; it raises loudly if it
+                # cannot serve this cohort. The per-head modes run the split
+                # score launch and their own reduction kernels.
+                if fused_union:
+                    score_staging.launch_prepared_union_fusion(keep_set_selector.combined)
+                    per_head = None
+                else:
+                    per_head = score_staging.launch_prepared_score()
             with nvtx_range("triattention.select", color="yellow"):
                 if fused_union:
                     keep_set_selector.select_prepared_union_scores()
-                elif isinstance(keep_set_selector, _BatchedUnionKeepSetSelector):
-                    keep_set_selector.select_prepared_requests()
                 else:
                     keep_set_selector.select_requests(
                         per_head,

@@ -834,10 +834,11 @@ class TestTopKRouting:
             dtype=scores.dtype,
             device=device,
             max_requests=len(request_scores),
-            input_scores=scores,
-            normalize_scores=False,
         )
-        selector.select_prepared_requests()
+        # The fused CuTe pipeline is the production union-row producer; this
+        # top-k routing test stages the prepared rows into ``combined``.
+        selector.combined.copy_(scores.amax(dim=1))
+        selector.select_prepared_union_scores()
         selected = selector.keep.cpu()
 
         for actual, expected_keep in zip(selected, expected):
@@ -850,6 +851,16 @@ class TestFixedScoreMetadata:
     def test_fixed_buffers_bind_score_after_selection(self, eviction_mode, normalize_scores):
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
+        if eviction_mode == "union" and not normalize_scores:
+            # The fused pipeline (THE union path) always z-normalizes, so
+            # this combination is rejected loudly at construction.
+            with pytest.raises(ValueError, match="normalize_scores=True"):
+                _make_triattention(
+                    top_B=4,
+                    eviction_mode=eviction_mode,
+                    normalize_scores=normalize_scores,
+                )
+            return
         manager = _make_triattention(
             top_B=4,
             eviction_mode=eviction_mode,
@@ -913,7 +924,6 @@ class TestFixedScoreMetadata:
         )
         plan = build_selection.call_args.args[0]
         assert plan.eviction_mode == eviction_mode
-        assert build_selection.call_args.kwargs["normalize_scores"] is normalize_scores
         assert resources.score_staging is score_staging
         assert resources.keep_set_selector is keep_set_selector
 

@@ -3450,7 +3450,8 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
     normalize_scores: bool = Field(
         default=True,
         description="Z-normalize each head's scores over the decode region "
-        "before selection (upstream default).")
+        "before selection (upstream default). `union` eviction requires True: "
+        "its fused score+stats+union pipeline always normalizes.")
     pin_prefill: bool = Field(
         default=True,
         description="Always preserve the prompt (prefill) tokens; only decode "
