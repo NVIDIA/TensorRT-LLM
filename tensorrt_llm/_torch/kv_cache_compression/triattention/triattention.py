@@ -387,6 +387,14 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         )
         self._select_top_tokens()
 
+    def select_prepared_union_scores(self) -> None:
+        """Select from normalized union rows already written into ``combined``.
+
+        The fused score+stats+union pipeline produces the per-request union
+        rows on the device, so only the top-k settle-and-pack launch remains.
+        """
+        self._select_top_tokens()
+
 
 class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
     """Fixed ``[request, ...]`` selector for both per-head modes."""
@@ -770,6 +778,7 @@ class _FixedScoreStagingBuffers:
         self.stream = None
         self._score_valid_widths: Optional[torch.Tensor] = None
         self._score_launcher_bound = False
+        self.staged_uniform_token_start: Optional[int] = None
 
     def bind_score_launcher(self, valid_widths: torch.Tensor, aggregation: str) -> None:
         """Bind the per-row score widths for these buffers (mean-only)."""
@@ -782,6 +791,42 @@ class _FixedScoreStagingBuffers:
             )
         self._score_valid_widths = valid_widths
         self._score_launcher_bound = True
+
+    def launch_prepared_union_fusion(self, union_out: torch.Tensor) -> bool:
+        """Try the fused score+stats+union pipeline over these buffers.
+
+        Returns False without side effects on the selection buffers when the
+        fused path cannot serve this cohort; the caller then runs the split
+        score and selection launches instead.
+        """
+        if not self._score_launcher_bound:
+            raise RuntimeError("TriAttention score launcher is not bound")
+        stream = torch.cuda.current_stream(self.device)
+        if self.stream is None:
+            self.stream = stream
+        elif (stream.device, stream.cuda_stream) != (
+            self.stream.device,
+            self.stream.cuda_stream,
+        ):
+            raise _FixedScoreStreamMismatch(
+                "TriAttention score launches must stay on the staging CUDA stream"
+            )
+        self.mean_phase_table.gather(
+            self.round_starts_device,
+            self.mean_cos,
+            self.mean_sin,
+            self.max_requests,
+        )
+        return self.fused_group.launch_cute_union_fusion(
+            self.max_requests,
+            self.valid_seq_lens_device,
+            self._score_valid_widths,
+            self.token_starts_device,
+            getattr(self, "staged_uniform_token_start", None),
+            self.mean_cos,
+            self.mean_sin,
+            union_out,
+        )
 
     def launch_prepared_score(self) -> torch.Tensor:
         """Gather the phase means and launch the score kernel over these buffers."""
@@ -876,6 +921,13 @@ class _FixedScoreStagingBuffers:
         # integers: a stale-capacity gather is an out-of-bounds index_select
         # on the device.
         self.mean_phase_table.ensure(int(max(round_starts)) + 1)
+        # The fused score+stats+union kernel bakes one global score start at
+        # compile time, so it only serves cohorts whose pinned prompt lengths
+        # agree; padded rows are inert (zero valid length) regardless.
+        first_start = token_starts[0]
+        self.staged_uniform_token_start = (
+            int(first_start) if all(start == first_start for start in token_starts) else None
+        )
         if not self._stage_page_tables_bulk(
             manager,
             request_ids,
@@ -2269,9 +2321,19 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         try:
             with nvtx_range("triattention.score", color="blue"):
-                per_head = score_staging.launch_prepared_score()
+                # The fused pipeline covers score, row stats, normalization,
+                # and the cross-row union maximum in two kernels; when it
+                # declines this cohort the split launches run instead.
+                fused_union = (
+                    self.normalize_scores
+                    and isinstance(keep_set_selector, _BatchedUnionKeepSetSelector)
+                    and score_staging.launch_prepared_union_fusion(keep_set_selector.combined)
+                )
+                per_head = None if fused_union else score_staging.launch_prepared_score()
             with nvtx_range("triattention.select", color="yellow"):
-                if isinstance(keep_set_selector, _BatchedUnionKeepSetSelector):
+                if fused_union:
+                    keep_set_selector.select_prepared_union_scores()
+                elif isinstance(keep_set_selector, _BatchedUnionKeepSetSelector):
                     keep_set_selector.select_prepared_requests()
                 else:
                     keep_set_selector.select_requests(

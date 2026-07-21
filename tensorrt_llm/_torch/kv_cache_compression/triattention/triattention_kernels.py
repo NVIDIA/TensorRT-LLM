@@ -22,6 +22,7 @@ House rules honored throughout:
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional
 
 import torch
@@ -427,6 +428,13 @@ class _FixedScoreGroup:
         self._cute_scratch = scratch
         self._cute_seg_seq_len = seg_seq_len
         self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
+        # Opt-in fused score+stats+union pipeline (Fanrong Li's two-kernel
+        # scheme). Runners are built lazily per uniform score start because
+        # the start is a compile-time constant of the fused kernel.
+        self._cute_union_fusion_enabled = (
+            os.environ.get("TRTLLM_TRIATTENTION_CUTE_UNION_FUSION", "0") == "1"
+        )
+        self._union_fusion_runners = {}
         from tensorrt_llm.logger import logger
 
         logger.info(
@@ -534,6 +542,117 @@ class _FixedScoreGroup:
             ),
         )
         return output
+
+    def _union_fusion_runner_for(
+        self, score_start: int, mean_cos: torch.Tensor, mean_sin: torch.Tensor
+    ):
+        """Build (or reuse) the fused score/stats/union runner for one start.
+
+        The fused kernel bakes ``score_start`` at compile time, so one runner
+        exists per distinct uniform prompt length; the cache is capped so a
+        prompt-length churn cannot trigger unbounded recompiles. ``None``
+        entries record geometries the fused pipeline rejected.
+        """
+        if score_start in self._union_fusion_runners:
+            return self._union_fusion_runners[score_start]
+        if len(self._union_fusion_runners) >= 4 or not 0 <= score_start < self.seq_len:
+            return None
+        num_q_heads, num_kv_heads, num_freqs, tokens_per_block, _ = self.geometry_args
+        entry = None
+        try:
+            from .triattention_cute_score_fused import (
+                TriAttentionCuteScoreRunner as _FusedUnionScoreRunner,
+            )
+
+            device = self.output.device
+            seg_out_offset = (
+                torch.arange(self.max_requests * self.num_layers, dtype=torch.int64, device=device)
+                * self.seq_len
+            ).to(torch.int32)
+            union_rows = torch.empty(
+                (self.max_requests, self.seq_len - score_start),
+                dtype=torch.float32,
+                device=device,
+            )
+            runner = _FusedUnionScoreRunner(
+                layer_pools=self._cute_layer_pools,
+                layer_indices=self._cute_layer_indices,
+                max_requests=self.max_requests,
+                num_layers=self.num_layers,
+                seq_len=self.seq_len,
+                score_start=score_start,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                num_freqs=num_freqs,
+                tokens_per_block=tokens_per_block,
+                page_ids=self.pointer_prefix[2],
+                seg_page_off=self.pointer_prefix[3],
+                seg_req_id=self.pointer_prefix[4],
+                seg_layer_id=self.pointer_prefix[5],
+                seg_seq_len=self._cute_seg_seq_len,
+                seg_out_offset=seg_out_offset,
+                q_real=self.pointer_middle[0],
+                q_imag=self.pointer_middle[1],
+                mlr_coef=self.pointer_middle[2],
+                mean_cos=mean_cos,
+                mean_sin=mean_sin,
+                freq_scale_sq=self.pointer_tail[0],
+                output=self._cute_scratch,
+                enable_partial_stats=True,
+            )
+            entry = (runner, union_rows)
+        except (ImportError, RuntimeError, ValueError, AssertionError) as error:
+            import warnings
+
+            warnings.warn(f"TriAttention CuTe union fusion unavailable: {error}")
+        self._union_fusion_runners[score_start] = entry
+        return entry
+
+    def launch_cute_union_fusion(
+        self,
+        request_count: int,
+        valid_seq_lens: torch.Tensor,
+        valid_widths: torch.Tensor,
+        token_starts_device: torch.Tensor,
+        score_start: Optional[int],
+        mean_cos: torch.Tensor,
+        mean_sin: torch.Tensor,
+        union_out: torch.Tensor,
+    ) -> bool:
+        """Run the fused score+stats+normalized-union pipeline when possible.
+
+        Returns False (without launching) whenever the opt-in is off, the
+        cohort's prompt lengths are not uniform, or the geometry has no fused
+        specialization — the caller then falls back to the split score,
+        row-stats, and union path.
+        """
+        self.prepare_cute_score(mean_cos, mean_sin)
+        if not self._cute_union_fusion_enabled or score_start is None:
+            return False
+        if request_count <= 0 or request_count > self.max_requests:
+            raise ValueError("request count exceeds fixed score capacity")
+        entry = self._union_fusion_runner_for(int(score_start), mean_cos, mean_sin)
+        if entry is None:
+            return False
+        runner, union_rows = entry
+        if not runner.supports_union_fusion(request_count):
+            return False
+        num_segments = request_count * self.num_layers
+        torch.sub(
+            valid_seq_lens[:request_count],
+            token_starts_device[:request_count],
+            out=valid_widths[:request_count],
+        )
+        torch.index_select(
+            valid_seq_lens,
+            0,
+            self.pointer_prefix[4][:num_segments],
+            out=self._cute_seg_seq_len[:num_segments],
+        )
+        runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_rows[:request_count])
+        columns = min(union_rows.shape[1], union_out.shape[1])
+        union_out[:request_count, :columns].copy_(union_rows[:request_count, :columns])
+        return True
 
 
 # --------------------------------------------------------------------------- #

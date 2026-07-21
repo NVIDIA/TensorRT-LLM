@@ -1,0 +1,516 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""SM100 CuTe-DSL selection preparation for TriAttention scores."""
+
+from __future__ import annotations
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import AddressSpace
+from cutlass.cute.typing import Int32 as CuteInt32
+from cutlass.cute.typing import Pointer as CutePointer
+from cutlass.cutlass_dsl import T, dsl_user_op
+
+_REDUCE_THREADS = 256
+_WARP_SIZE = 32
+_REDUCE_WARPS = _REDUCE_THREADS // _WARP_SIZE
+_LARGE_TOKENS_PER_LANE = 4
+_LARGE_TOKEN_SUBTILES = 2
+_SMALL_TOKENS_PER_LANE = 2
+_SMALL_TOKEN_SUBTILES = 1
+_MAX_ROW_CLUSTER_CTAS = 4
+_SMALL_TILE_RESIDENT_CTAS_PER_SM = 6
+_STATS_FIELDS = 3
+_STD_EPSILON = 1.0e-6
+_SUPPORTED_PAGE_SHARDS = (2, 3)
+
+
+def _select_normalize_union_config(
+    request_count: int,
+    width: int,
+    sm_count: int,
+) -> tuple[int, int, int]:
+    """Return tokens per lane, token subtiles, and row-cluster CTAs."""
+    row_cluster_ctas = max(1, _MAX_ROW_CLUSTER_CTAS // request_count)
+    small_token_tile = _WARP_SIZE * _SMALL_TOKENS_PER_LANE * _SMALL_TOKEN_SUBTILES
+    token_tiles = (width + small_token_tile - 1) // small_token_tile
+    grid_ctas = request_count * token_tiles * row_cluster_ctas
+    if grid_ctas <= sm_count * _SMALL_TILE_RESIDENT_CTAS_PER_SM:
+        return _SMALL_TOKENS_PER_LANE, _SMALL_TOKEN_SUBTILES, row_cluster_ctas
+    return _LARGE_TOKENS_PER_LANE, _LARGE_TOKEN_SUBTILES, 1
+
+
+@dsl_user_op
+def _mapa_shared_cluster(
+    smem_ptr: CutePointer,
+    peer_rank: CuteInt32,
+    *,
+    loc=None,
+    ip=None,
+) -> CuteInt32:
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32, peer_rank.ir_value(loc=loc, ip=ip)],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _mapa_cluster(smem_ptr, peer_rank):
+    return _mapa_shared_cluster(smem_ptr, peer_rank)
+
+
+@dsl_user_op
+def _ld_shared_cluster_f32(
+    mapped_addr: CuteInt32,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [mapped_addr.ir_value(loc=loc, ip=ip)],
+            "ld.shared::cluster.f32 $0, [$1];",
+            "=f,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _ld_cluster_f32(mapped_addr):
+    return _ld_shared_cluster_f32(mapped_addr)
+
+
+class _TriAttentionNormalizeUnionKernel:
+    """Merge row moments, normalize scores, and reduce their elementwise maximum."""
+
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        seq_len: int,
+        score_start: int,
+        num_q_heads: int,
+        page_shards: int,
+        tokens_per_lane: int,
+        token_subtiles: int,
+        row_cluster_ctas: int,
+    ) -> None:
+        if min(num_layers, seq_len, num_q_heads) <= 0:
+            raise ValueError("TriAttention stats/union reduction requires positive geometry")
+        if not 0 <= score_start < seq_len:
+            raise ValueError("TriAttention stats/union score_start is out of range")
+        if page_shards not in _SUPPORTED_PAGE_SHARDS:
+            raise ValueError("TriAttention stats/union has unsupported page shards")
+        if tokens_per_lane not in (_SMALL_TOKENS_PER_LANE, _LARGE_TOKENS_PER_LANE):
+            raise ValueError("TriAttention stats/union has unsupported load width")
+        if token_subtiles not in (_SMALL_TOKEN_SUBTILES, _LARGE_TOKEN_SUBTILES):
+            raise ValueError("TriAttention stats/union has unsupported token subtiles")
+        if row_cluster_ctas not in (1, 2, 4):
+            raise ValueError("TriAttention stats/union has unsupported row cluster")
+        self.num_layers = num_layers
+        self.seq_len = seq_len
+        self.score_start = score_start
+        self.width = seq_len - score_start
+        self.num_q_heads = num_q_heads
+        self.num_rows = num_layers * num_q_heads
+        self.page_shards = page_shards
+        self.tokens_per_lane = tokens_per_lane
+        self.token_subtiles = token_subtiles
+        self.subtile_token_tile = _WARP_SIZE * self.tokens_per_lane
+        self.token_tile = self.subtile_token_tile * self.token_subtiles
+        self.reduce_threads = _REDUCE_THREADS
+        self.reduce_warps = _REDUCE_WARPS
+        self.row_cluster_ctas = row_cluster_ctas
+        self.num_token_tiles = (self.width + self.token_tile - 1) // self.token_tile
+
+    @cute.jit
+    def __call__(
+        self,
+        partial_stats: cute.Tensor,
+        scores: cute.Tensor,
+        seg_seq_len: cute.Tensor,
+        seg_out_offset: cute.Tensor,
+        union_scores: cute.Tensor,
+        request_count: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        kernel = self.kernel(
+            partial_stats,
+            scores,
+            seg_seq_len,
+            seg_out_offset,
+            union_scores,
+            request_count,
+        )
+        if cutlass.const_expr(self.row_cluster_ctas == 1):
+            kernel.launch(
+                grid=(request_count, self.num_token_tiles, 1),
+                block=(self.reduce_threads, 1, 1),
+                stream=stream,
+            )
+        else:
+            kernel.launch(
+                grid=(
+                    request_count * self.num_token_tiles * self.row_cluster_ctas,
+                    1,
+                    1,
+                ),
+                block=(self.reduce_threads, 1, 1),
+                cluster=(self.row_cluster_ctas, 1, 1),
+                stream=stream,
+            )
+
+    @cute.kernel
+    def kernel(
+        self,
+        partial_stats: cute.Tensor,
+        scores: cute.Tensor,
+        seg_seq_len: cute.Tensor,
+        seg_out_offset: cute.Tensor,
+        union_scores: cute.Tensor,
+        request_count: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        block_idx_x, block_idx_y, _ = cute.arch.block_idx()
+        cta_rank = cutlass.Int32(0)
+        if cutlass.const_expr(self.row_cluster_ctas == 1):
+            request_idx = block_idx_x
+            token_tile_idx = block_idx_y
+        else:
+            cta_rank = cute.arch.block_idx_in_cluster()
+            cluster_idx = block_idx_x // self.row_cluster_ctas
+            request_idx = cluster_idx // self.num_token_tiles
+            token_tile_idx = cluster_idx - request_idx * self.num_token_tiles
+        warp_idx = tidx // _WARP_SIZE
+        lane_idx = tidx % _WARP_SIZE
+        first_token = token_tile_idx * self.token_tile + lane_idx * self.tokens_per_lane
+        first_segment = request_idx * self.num_layers
+        valid_width = seg_seq_len[first_segment] - self.score_start
+        warp_max_ptr = cute.arch.alloc_smem(
+            cutlass.Float32,
+            self.reduce_threads * self.tokens_per_lane * self.token_subtiles,
+        )
+        warp_max = cute.make_tensor(
+            warp_max_ptr,
+            cute.make_layout(
+                (
+                    self.reduce_warps,
+                    self.token_subtiles,
+                    self.tokens_per_lane,
+                    _WARP_SIZE,
+                ),
+                stride=(
+                    self.token_subtiles * self.tokens_per_lane * _WARP_SIZE,
+                    self.tokens_per_lane * _WARP_SIZE,
+                    _WARP_SIZE,
+                    1,
+                ),
+            ),
+        )
+        union_values = cute.make_rmem_tensor(
+            (self.token_subtiles, self.tokens_per_lane),
+            cutlass.Float32,
+        )
+        score_value_tiles = tuple(
+            cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
+            for _ in range(self.token_subtiles)
+        )
+        score_copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            cutlass.Float32,
+            num_bits_per_copy=self.tokens_per_lane * cutlass.Float32.width,
+        )
+        for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+            for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                union_values[(token_subtile, token_slot)] = cutlass.Float32(float("-inf"))
+
+        common_count = cutlass.Float32(0.0)
+        mean_weight_1 = cutlass.Float32(0.0)
+        m2_cross_weight = cutlass.Float32(0.0)
+        shard_mean_weights = cute.make_rmem_tensor((self.page_shards,), cutlass.Float32)
+        shard_m2_cross_weights = cute.make_rmem_tensor((self.page_shards,), cutlass.Float32)
+        if cutlass.const_expr(self.page_shards == 2):
+            first_stats_row = first_segment * self.num_q_heads
+            first_stats_base = first_stats_row * 2 * _STATS_FIELDS
+            count_0 = partial_stats[first_stats_base]
+            count_1 = partial_stats[first_stats_base + _STATS_FIELDS]
+            common_count = count_0 + count_1
+            if cutlass.dynamic_expr(common_count > 0.0):
+                mean_weight_1 = count_1 / common_count
+                m2_cross_weight = count_0 * count_1 / common_count
+        else:
+            first_stats_row = first_segment * self.num_q_heads
+            first_stats_base = first_stats_row * self.page_shards * _STATS_FIELDS
+            for page_shard in cutlass.range_constexpr(self.page_shards):
+                shard_count = partial_stats[first_stats_base + page_shard * _STATS_FIELDS]
+                merged_count = common_count + shard_count
+                mean_weight = cutlass.Float32(0.0)
+                m2_cross = cutlass.Float32(0.0)
+                if cutlass.dynamic_expr(merged_count > 0.0):
+                    mean_weight = shard_count / merged_count
+                    m2_cross = common_count * shard_count / merged_count
+                shard_mean_weights[page_shard] = mean_weight
+                shard_m2_cross_weights[page_shard] = m2_cross
+                common_count = merged_count
+
+        first_logical_row = warp_idx + cta_rank * self.reduce_warps
+        logical_row_stride = self.reduce_warps * self.row_cluster_ctas
+        for logical_row in cutlass.range(
+            first_logical_row,
+            self.num_rows,
+            logical_row_stride,
+            unroll=1,
+        ):
+            layer_slot = logical_row // self.num_q_heads
+            q_head = logical_row - layer_slot * self.num_q_heads
+            segment = first_segment + layer_slot
+            stats_row = segment * self.num_q_heads + q_head
+
+            count = cutlass.Float32(0.0)
+            mean = cutlass.Float32(0.0)
+            m2 = cutlass.Float32(0.0)
+            delta = cutlass.Float32(0.0)
+            if cutlass.const_expr(self.page_shards == 2):
+                stats_base = stats_row * 2 * _STATS_FIELDS
+                mean_0 = partial_stats[stats_base + 1]
+                m2_0 = partial_stats[stats_base + 2]
+                mean_1 = partial_stats[stats_base + 4]
+                m2_1 = partial_stats[stats_base + 5]
+                delta = mean_1 - mean_0
+                count = common_count
+                mean = mean_0 + delta * mean_weight_1
+                m2 = m2_0 + m2_1 + delta * delta * m2_cross_weight
+            else:
+                count = common_count
+                for page_shard in cutlass.range_constexpr(self.page_shards):
+                    stats_base = (stats_row * self.page_shards + page_shard) * _STATS_FIELDS
+                    shard_mean = partial_stats[stats_base + 1]
+                    shard_m2 = partial_stats[stats_base + 2]
+                    delta = shard_mean - mean
+                    mean = mean + delta * shard_mean_weights[page_shard]
+                    m2 = m2 + shard_m2 + delta * delta * shard_m2_cross_weights[page_shard]
+            inv_std = cutlass.Float32(0.0)
+            if cutlass.dynamic_expr(count > 0.0):
+                variance = m2 / count
+                if cutlass.dynamic_expr(variance < _STD_EPSILON * _STD_EPSILON):
+                    inv_std = cutlass.Float32(1.0 / _STD_EPSILON)
+                else:
+                    inv_std = cute.math.rsqrt(variance)
+
+            for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+                subtile_first_token = first_token + token_subtile * self.subtile_token_tile
+                score_index = (
+                    cutlass.Int64(q_head) * request_count * self.num_layers * self.seq_len
+                    + seg_out_offset[segment]
+                    + self.score_start
+                    + subtile_first_token
+                )
+                if cutlass.const_expr(
+                    self.score_start % self.tokens_per_lane == 0
+                    and self.seq_len % self.tokens_per_lane == 0
+                ) and cutlass.dynamic_expr(
+                    subtile_first_token + self.tokens_per_lane <= valid_width
+                ):
+                    score_tile = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Float32,
+                            (scores.iterator + score_index).toint(),
+                            AddressSpace.gmem,
+                            assumed_align=self.tokens_per_lane * 4,
+                        ),
+                        cute.make_layout(self.tokens_per_lane),
+                    )
+                    cute.copy(
+                        score_copy_atom,
+                        cute.coalesce(score_tile),
+                        cute.coalesce(score_value_tiles[token_subtile]),
+                    )
+                else:
+                    for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                        token = subtile_first_token + token_slot
+                        if cutlass.dynamic_expr(token < valid_width):
+                            score_value_tiles[token_subtile][token_slot] = scores[
+                                score_index + token_slot
+                            ]
+                        else:
+                            score_value_tiles[token_subtile][token_slot] = cutlass.Float32(
+                                float("-inf")
+                            )
+
+            for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+                if cutlass.const_expr(self.tokens_per_lane >= 2):
+                    normalized_01 = cute.arch.sub_packed_f32x2(
+                        (
+                            score_value_tiles[token_subtile][0],
+                            score_value_tiles[token_subtile][1],
+                        ),
+                        (mean, mean),
+                    )
+                    normalized_01 = cute.arch.mul_packed_f32x2(
+                        normalized_01,
+                        (inv_std, inv_std),
+                    )
+                    union_values[(token_subtile, 0)] = cute.arch.fmax(
+                        union_values[(token_subtile, 0)], normalized_01[0]
+                    )
+                    union_values[(token_subtile, 1)] = cute.arch.fmax(
+                        union_values[(token_subtile, 1)], normalized_01[1]
+                    )
+                if cutlass.const_expr(self.tokens_per_lane == 4):
+                    normalized_23 = cute.arch.sub_packed_f32x2(
+                        (
+                            score_value_tiles[token_subtile][2],
+                            score_value_tiles[token_subtile][3],
+                        ),
+                        (mean, mean),
+                    )
+                    normalized_23 = cute.arch.mul_packed_f32x2(
+                        normalized_23,
+                        (inv_std, inv_std),
+                    )
+                    union_values[(token_subtile, 2)] = cute.arch.fmax(
+                        union_values[(token_subtile, 2)], normalized_23[0]
+                    )
+                    union_values[(token_subtile, 3)] = cute.arch.fmax(
+                        union_values[(token_subtile, 3)], normalized_23[1]
+                    )
+        for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+            for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                warp_max[(warp_idx, token_subtile, token_slot, lane_idx)] = union_values[
+                    (token_subtile, token_slot)
+                ]
+        cute.arch.sync_threads()
+        if cutlass.const_expr(self.row_cluster_ctas == 1):
+            if warp_idx == 0:
+                for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+                    reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
+                    for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                        union_value = union_values[(token_subtile, token_slot)]
+                        for other_warp in cutlass.range_constexpr(1, self.reduce_warps):
+                            union_value = cute.arch.fmax(
+                                union_value,
+                                warp_max[(other_warp, token_subtile, token_slot, lane_idx)],
+                            )
+                        reduced_values[token_slot] = union_value
+                    subtile_first_token = first_token + token_subtile * self.subtile_token_tile
+                    if cutlass.const_expr(self.width % self.tokens_per_lane == 0):
+                        if cutlass.dynamic_expr(
+                            subtile_first_token + self.tokens_per_lane <= self.width
+                        ):
+                            union_index = request_idx * self.width + subtile_first_token
+                            union_tile = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.Float32,
+                                    (union_scores.iterator + union_index).toint(),
+                                    AddressSpace.gmem,
+                                    assumed_align=self.tokens_per_lane * 4,
+                                ),
+                                cute.make_layout(self.tokens_per_lane),
+                            )
+                            cute.copy(
+                                score_copy_atom,
+                                cute.coalesce(reduced_values),
+                                cute.coalesce(union_tile),
+                            )
+                    else:
+                        for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                            token = subtile_first_token + token_slot
+                            if cutlass.dynamic_expr(token < self.width):
+                                union_scores[request_idx * self.width + token] = reduced_values[
+                                    token_slot
+                                ]
+        else:
+            # Warp 0 reduces its CTA's row partition, then CTA 0 combines the
+            # cluster's partial maxima through distributed shared memory.
+            if warp_idx == 0:
+                for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+                    for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                        union_value = union_values[(token_subtile, token_slot)]
+                        for other_warp in cutlass.range_constexpr(1, self.reduce_warps):
+                            union_value = cute.arch.fmax(
+                                union_value,
+                                warp_max[(other_warp, token_subtile, token_slot, lane_idx)],
+                            )
+                        warp_max[(0, token_subtile, token_slot, lane_idx)] = union_value
+            cute.arch.sync_threads()
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
+            if cta_rank == 0 and warp_idx == 0:
+                for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+                    reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
+                    for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                        union_value = warp_max[(0, token_subtile, token_slot, lane_idx)]
+                        shared_offset = (
+                            token_subtile * self.tokens_per_lane * _WARP_SIZE
+                            + token_slot * _WARP_SIZE
+                            + lane_idx
+                        )
+                        for peer_rank in cutlass.range_constexpr(1, self.row_cluster_ctas):
+                            remote_addr = _mapa_cluster(
+                                warp_max_ptr,
+                                cutlass.Int32(peer_rank),
+                            )
+                            union_value = cute.arch.fmax(
+                                union_value,
+                                _ld_cluster_f32(remote_addr + shared_offset * 4),
+                            )
+                        reduced_values[token_slot] = union_value
+                    subtile_first_token = first_token + token_subtile * self.subtile_token_tile
+                    if cutlass.const_expr(self.width % self.tokens_per_lane == 0):
+                        if cutlass.dynamic_expr(
+                            subtile_first_token + self.tokens_per_lane <= self.width
+                        ):
+                            union_index = request_idx * self.width + subtile_first_token
+                            union_tile = cute.make_tensor(
+                                cute.make_ptr(
+                                    cutlass.Float32,
+                                    (union_scores.iterator + union_index).toint(),
+                                    AddressSpace.gmem,
+                                    assumed_align=self.tokens_per_lane * 4,
+                                ),
+                                cute.make_layout(self.tokens_per_lane),
+                            )
+                            cute.copy(
+                                score_copy_atom,
+                                cute.coalesce(reduced_values),
+                                cute.coalesce(union_tile),
+                            )
+                    else:
+                        for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                            token = subtile_first_token + token_slot
+                            if cutlass.dynamic_expr(token < self.width):
+                                union_scores[request_idx * self.width + token] = reduced_values[
+                                    token_slot
+                                ]
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
