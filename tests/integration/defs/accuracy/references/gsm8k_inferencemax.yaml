@@ -7,12 +7,13 @@
 nvidia/MiniMax-M3-NVFP4:
   # Reference sparse-attention path (triton), BF16 KV cache, no spec decoding.
   - quant_algo: MIXED_PRECISION
-    accuracy: 95.53
+    accuracy: 95.45
   # MSA path (fmha_sm100), FP8 KV cache, no spec decoding.
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
-    accuracy: 95.91
-  # MSA path + one-model Eagle3 (mean of 3 runs: 95.38 / 95.45 / 95.60).
+    accuracy: 95.30
+  # MSA path + one-model Eagle3 + CUDA graphs (serve-based repeats of the
+  # same config: 95.38 / 95.45 / 95.60).
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: Eagle3
-    accuracy: 95.48
+    accuracy: 95.22
