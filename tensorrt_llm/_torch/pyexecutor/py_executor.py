@@ -85,7 +85,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
-                      SampleStateTensors, TRTLLMSampler)
+                      SampleStateTensors, TorchSampler, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
@@ -5855,7 +5855,56 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
+                # The context-side first token is a real generated token and can
+                # already satisfy a stop criterion (e.g. max_tokens=1, or the token
+                # is the end id / completes a stop word). In aggregated serving the
+                # sampler applies this exact check to the context step's first token
+                # and finishes the request before any generation step is scheduled.
+                # The disagg gen path injects the first token without that check, so a
+                # generation (MTP) step still runs and emits an extra token, and the
+                # request returns OSL+1 tokens (nvbugs/6482606). Apply the same stop
+                # criteria here, before this iteration's forward, so no extra token is
+                # produced (the sampler skips GENERATION_COMPLETE requests).
+                self._apply_disagg_gen_first_token_stop_criteria(
+                    req, first_gen_tokens, beam_width)
+
                 self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+    def _apply_disagg_gen_first_token_stop_criteria(self, req, first_gen_tokens,
+                                                    beam_width: int) -> None:
+        """Enforce stop criteria on the context-side first token of a disagg
+        generation request, mirroring the aggregated context-step behavior.
+
+        Marks the request GENERATION_COMPLETE once all beams have met a stop
+        criterion, so the immediately following generation step does not emit an
+        extra token. See nvbugs/6482606. Reuses the same primitives the aggregated
+        sampler applies in ``TorchSampler._handle_stop_criteria`` (END_ID, then
+        max-token / OSL, then stop-words), in the same order.
+        """
+        # max_seq_len is Optional on PyExecutor; when unset there is no seq-len cap
+        # to apply, only the per-request max_new_tokens budget.
+        max_seq_len = self.max_seq_len if self.max_seq_len is not None else (
+            1 << 62)
+        beam_finish_reasons: List[Optional[FinishReason]] = []
+        for beam in range(0, beam_width):
+            token = first_gen_tokens[beam]
+            if token == req.py_end_id:
+                reason = FinishReason.END_ID
+            elif TorchSampler._meet_max_token_stop_criteria(
+                    req, max_seq_len, beam):
+                reason = FinishReason.LENGTH
+            elif TorchSampler._meet_stop_token_criteria(req, token, beam):
+                reason = FinishReason.STOP_WORDS
+            else:
+                reason = None
+            beam_finish_reasons.append(reason)
+
+        # Complete the request only when every beam has stopped, matching the agg
+        # semantics in TorchSampler._handle_finish_reasons_impl.
+        if all(reason is not None for reason in beam_finish_reasons):
+            req.state = LlmRequestState.GENERATION_COMPLETE
+            for beam, reason in enumerate(beam_finish_reasons):
+                req.set_finished_reason(reason, beam)
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -6656,6 +6705,14 @@ class PyExecutor:
         new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
+                # A disagg gen request whose context-side first token already met a
+                # stop criterion (e.g. max_tokens=1) is finished at injection time.
+                # Its single, final response is emitted by _handle_responses; emitting
+                # a first-token response here would produce a second final response and
+                # double-count the token (nvbugs/6482606). Mirror the is_finished skip
+                # in _emit_first_token_responses.
+                if req.is_finished:
+                    continue
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
