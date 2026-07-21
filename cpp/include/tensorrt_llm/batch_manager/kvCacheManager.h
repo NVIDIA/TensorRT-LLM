@@ -2939,10 +2939,10 @@ public:
         mBlockManager.refreshBlocks();
     }
 
-    void setRetentionClock(std::int64_t nowNs)
+    void setRetentionClock(std::int64_t timestampNs)
     {
         mBlockManager.setRetentionClock(std::chrono::duration_cast<std::chrono::steady_clock::time_point::duration>(
-            std::chrono::nanoseconds(nowNs)));
+            std::chrono::nanoseconds(timestampNs)));
     }
 
     void flushIterationEvents() override
