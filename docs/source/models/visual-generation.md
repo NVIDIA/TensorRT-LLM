@@ -25,7 +25,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | HuggingFace Model ID | Tasks |
 |---|---|
 | `black-forest-labs/FLUX.1-dev` | Text-to-Image |
-| `black-forest-labs/FLUX.2-dev` | Text-to-Image (optional reference-image conditioning) |
+| `black-forest-labs/FLUX.2-dev` | Text-to-Image |
 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.1-T2V-14B-Diffusers` | Text-to-Video |
 | `FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers` | Text-to-Video (VSA) |
