@@ -374,13 +374,33 @@ def resolve_model_dir(cfg, llm_src=None, llm_models_root=None):
     return None
 
 
+def unmodelable_kv_reason(hf_cfg):
+    """Why the precheck cannot faithfully model this model's KV layout, or None.
+
+    The precheck allocates a SINGLE KV pool from (layers, kv_heads, head_dim).
+    Sparse-attention models (DeepSeek V4 / DSA: an indexer with its own
+    INDEX_KEY pool at a different stride than the main K/V pool) cannot be
+    represented that way. The precheck is a NETWORK/transceiver availability
+    check, not a KV-correctness test, so rather than skip these (the check
+    must still run) it falls back to a simple generic pool -- the transfer
+    exercises the exact same UCX/NIXL path, topology, and transceiver config,
+    just with generic bytes.
+    """
+    if any(k in hf_cfg for k in ("index_topk", "index_n_heads", "index_head_dim")):
+        return "sparse-attention model (DSA/indexer): using a generic KV pool -- this checks the network/transceiver path, not V4's exact KV layout"
+    return None
+
+
 def model_kv_shape(model_dir):
     """KV cache shape (per-token layout) from the model's config.json.
 
     Handles MLA checkpoints (kv_lora_rank present: one latent 'head' of
     kv_lora_rank + qk_rope_head_dim) and GQA/MHA. `num_layers` excludes the
     MTP nextn layers -- those are added by the KV cache manager via
-    spec_config, mirroring real serving.
+    spec_config, mirroring real serving. A model whose KV layout the precheck
+    can't model (see unmodelable_kv_reason) returns the generic
+    FALLBACK_KV_SHAPE plus a ``simplified`` note, so the network check still
+    runs with a stand-in pool instead of skipping.
     """
     if not model_dir:
         return dict(FALLBACK_KV_SHAPE)
@@ -393,6 +413,24 @@ def model_kv_shape(model_dir):
         hf_cfg = hf_cfg["text_config"]
 
     num_layers = hf_cfg.get("num_hidden_layers")
+
+    reason = unmodelable_kv_reason(hf_cfg)
+    if reason:
+        # Simple MLA-flavored stand-in pool: real layer count, one latent
+        # head, is_mla=True so the transceiver is set up with SELFKONLY +
+        # AttentionType.MLA exactly like the real sparse model -- only the
+        # per-token bytes are generic. Enough to check the network path.
+        latent = int(hf_cfg.get("kv_lora_rank") or 0) + int(hf_cfg.get("qk_rope_head_dim") or 0)
+        return {
+            "num_layers": int(num_layers) if num_layers else FALLBACK_KV_SHAPE["num_layers"],
+            "num_kv_heads": 1,
+            "head_dim": latent or int(hf_cfg.get("head_dim") or 0) or 576,
+            "is_mla": True,
+            "vocab_size": int(hf_cfg.get("vocab_size") or 0) or None,
+            "source": "config.json (simplified MLA stand-in)",
+            "simplified": reason,
+        }
+
     if num_layers is None:
         return dict(FALLBACK_KV_SHAPE)
 

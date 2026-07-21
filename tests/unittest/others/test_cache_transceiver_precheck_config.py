@@ -506,3 +506,66 @@ def test_status_env_snapshot_excludes_nixl(tmp_path, monkeypatch):
     rec = rp.StatusRecorder(str(tmp_path), "gen", 0, is_leader=True)
     assert not any(k.startswith("NIXL_") for k in rec.env)
     assert rec.env["UCX_TLS"] == "rc,cuda_copy"  # behavioral vars still captured
+
+
+def test_sparse_attention_model_uses_simplified_mla_pool(tmp_path):
+    """DeepSeek V4 / DSA can't be modeled as a single KV pool. The precheck is
+    a NETWORK check, so it falls back to a simple MLA-flavored stand-in pool
+    (real layer count, one latent head, is_mla=True) and still runs -- never
+    skips."""
+    d = tmp_path / "v4"
+    d.mkdir()
+    (d / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "num_hidden_layers": 43,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 1,
+                "head_dim": 512,
+                "index_head_dim": 128,
+                "index_n_heads": 64,
+                "index_topk": 512,
+                "sliding_window": 128,
+                "vocab_size": 129280,
+            }
+        )
+    )
+    shape = pcfg.model_kv_shape(str(d))
+    assert shape.get("simplified") and "sparse" in shape["simplified"]
+    assert shape["is_mla"] is True and shape["num_kv_heads"] == 1
+    assert shape["num_layers"] == 43  # real layer count preserved
+    assert shape["head_dim"] == 512 and shape["vocab_size"] == 129280
+    # a plain MLA model is modeled normally (no simplified marker)
+    m = tmp_path / "mla"
+    m.mkdir()
+    (m / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 4, "kv_lora_rank": 512, "qk_rope_head_dim": 64})
+    )
+    assert not pcfg.model_kv_shape(str(m)).get("simplified")
+
+
+def test_python_transceiver_bandwidth_csv(tmp_path):
+    """Bandwidth from the Python transceiver's perf_logger CSVs: median over
+    KVSendTask throughput_mbs (MB/s -> GB/s), receiver rows ignored."""
+    header = (
+        "timestamp,task_type,unique_rid,peer_rank,transfer_size_bytes,"
+        "avg_segment_size_bytes,transfer_entry_count,prepare_args_latency_ms,"
+        "queue_latency_ms,transfer_latency_ms,task_latency_ms,throughput_mbs"
+    )
+    # two ctx ranks, each its own perf file; KVSendTask rows carry throughput
+    (tmp_path / "perf_abc_0.csv").write_text(
+        header + "\n"
+        "t,KVSendTask,1,0,1000,,,0,0,0,0,102400.00\n"   # 100 GB/s
+        "t,AuxSendTask,1,0,10,,,0,0,0,0,1.00\n"          # tiny metadata, ignored
+    )
+    (tmp_path / "perf_abc_1.csv").write_text(
+        header + "\n"
+        "t,KVSendTask,2,1,1000,,,0,0,0,0,204800.00\n"   # 200 GB/s
+    )
+    # a receiver file (no throughput) must not contribute
+    (tmp_path / "perf_def_8.csv").write_text(header + "\nt,KVRecvTask,3,0,,,,,,,5.0,\n")
+    bw = rp.parse_python_bandwidth_gbps(str(tmp_path))
+    assert bw == 150.0  # median(100, 200)
+    # no perf files -> None
+    assert rp.parse_python_bandwidth_gbps(str(tmp_path / "empty")) is None
