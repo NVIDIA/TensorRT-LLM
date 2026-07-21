@@ -760,11 +760,100 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     def dockerArgs = null
 
     try {
-        // Run ssh command to start node in desired cluster via SLURM
+        // Run ssh command to start node in desired cluster via SLURM.
+        // Prepare Container runs first (inside the same SSH session) so that the fat sqsh
+        // is on disk before the GPU agent job starts and slurm_install.sh checks for it.
         CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
-            stage('Request Node Via Slurm') {
-                println("Selected Cluster: ${cluster.name}")
 
+            def tarName = BUILD_CONFIGS[config][TARNAME]
+            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmPath = sh(script: "realpath .", returnStdout: true).trim()
+            def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
+            def agentJobWorkspace = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+            def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
+            def scriptFatBuildPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_inline.sh"
+            def scriptFatBuildSbatchPathLocal = Utils.createTempLocation(pipeline, "./fat_build_sbatch.sh")
+            def scriptFatBuildSbatchPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_sbatch.sh"
+            def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
+            def scriptPreparePathNode = "${agentJobWorkspace}/${nodeName}-prepare_container.sh"
+            def scriptFatBuildBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_sbatch_body.sh"
+            def scriptFatBuildBodyPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_sbatch_body.sh"
+            def scriptPrepareBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/prepare_container.sh"
+            def scriptPrepareBodyPathNode = "${agentJobWorkspace}/${nodeName}-prepare_container_body.sh"
+
+            stage("Initialize Test") {
+                println("Selected Cluster: ${cluster.name}")
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${agentJobWorkspace}\""), numRetries: 3)
+
+                if (cluster.fatBuilderArgs != null) {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+                    }
+                    sh "cd ${llmPath} && tar -zxf ${tarName}"
+
+                    Utils.exec(pipeline, script: "echo 'Script to build fat sqsh inline:' && cat ${scriptFatBuildLocalPath}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildLocalPath, scriptFatBuildPathNode, true)
+
+                    def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${nodeName}-fat_build")
+
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
+
+                    def scriptFatBuildSbatchContent = """\
+#!/bin/bash
+#SBATCH --output=${fatBuildLogPath}
+#SBATCH ${cluster.fatBuilderArgs}
+export FAT_CONTAINER_DIR="${containerDir}"
+export FAT_CONTAINER="${container}"
+export FAT_SQSH_DIR="${fatSqshDir}"
+export FAT_LLM_TARFILE="${llmTarfile}"
+export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
+export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
+export FAT_TAR_NAME="${tarName}"
+bash "${scriptFatBuildBodyPathNode}"
+""".stripIndent()
+                    pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
+                    Utils.exec(pipeline, script: "echo 'Fat builder sbatch script:' && cat ${scriptFatBuildSbatchPathLocal}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildSbatchPathLocal, scriptFatBuildSbatchPathNode, true)
+
+                    def scriptPrepareContent = """\
+#!/bin/bash
+export FAT_SQSH_DIR="${fatSqshDir}"
+export FAT_LLM_TARFILE="${llmTarfile}"
+export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
+export FAT_BUILD_SBATCH_PATH="${scriptFatBuildSbatchPathNode}"
+export FAT_BUILD_LOG_TEMPLATE="${fatBuildLogPath}"
+bash "${scriptPrepareBodyPathNode}"
+""".stripIndent()
+                    pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
+                    Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPreparePathLocal, scriptPreparePathNode, true)
+                } else {
+                    echo "No fat sqsh builder configured for cluster ${cluster.name}; skipping fat sqsh script preparation."
+                }
+            }
+
+            stage("[${stageName}] Prepare Container") {
+                if (cluster.fatBuilderArgs != null) {
+                    try {
+                        Utils.exec(
+                            pipeline,
+                            timeout: false,
+                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                            numRetries: 3
+                        )
+                    } catch (Exception e) {
+                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
+                    }
+                } else {
+                    echo "No fat sqsh builder configured; skipping Prepare Container."
+                }
+            }
+
+            stage('Request Node Via Slurm') {
                 def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, entrypoint)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
@@ -1008,7 +1097,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
         long executeStartMs = System.currentTimeMillis()
         try {
+          stage("[${stageName}] Run Pytest") {
             executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
+          }
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1292,6 +1383,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
             def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
             def scriptPreparePathNode = "${jobWorkspace}/${jobUID}-prepare_container.sh"
+            def scriptFatBuildBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_sbatch_body.sh"
+            def scriptFatBuildBodyPathNode = "${jobWorkspace}/${jobUID}-fat_build_sbatch_body.sh"
+            def scriptPrepareBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/prepare_container.sh"
+            def scriptPrepareBodyPathNode = "${jobWorkspace}/${jobUID}-prepare_container_body.sh"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
@@ -1342,67 +1437,23 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
-                    def scriptFatBuildSbatchContent = """#!/bin/bash
+
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
+
+                    def scriptFatBuildSbatchContent = """\
+#!/bin/bash
 #SBATCH --output=${fatBuildLogPath}
 #SBATCH ${cluster.fatBuilderArgs}
-set -euo pipefail
-trap 'rc=\$?; echo "Error on line \$LINENO: exit \$rc"; exit \$rc' ERR
-export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
-
-# Resolve base sqsh using image digest (shared cache, same logic as srunPrologue).
-mkdir -p "${containerDir}"
-if printf '%s' "${container}" | grep -q '@sha256:'; then
-    imageDigest=\$(printf '%s' "${container}" | grep -oP '(?<=@sha256:)[a-f0-9]+')
-else
-    imageDigest=\$(printf '%s' "${container}" | sha256sum | cut -d' ' -f1)
-fi
-baseSqshPath="${containerDir}/container-\${imageDigest}.sqsh"
-
-# Import base sqsh if not already cached (flock so concurrent builds share one import).
-importContainerWithRetries() {
-    local docker_uri=\$1
-    local output_path=\$2
-    local max_attempts=\${3:-3}
-    local delay=\${4:-60}
-    local attempt=1
-    local tmp_path
-    exec 9>"\${output_path}.lock" || true
-    flock 9 || true
-    if [ -f "\$output_path" ]; then
-        echo "[fat_build_sbatch] Reusing cached base sqsh: \$output_path"
-        touch "\$output_path" || true
-        flock -u 9 || true
-        return 0
-    fi
-    tmp_path="\${output_path}.\${SLURM_JOB_ID:-\$\$}.tmp"
-    rm -f "\$tmp_path"
-    until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"; do
-        if (( attempt >= max_attempts )); then
-            echo "[fat_build_sbatch] enroot import failed after \$max_attempts attempts"
-            rm -f "\$tmp_path"
-            flock -u 9 || true
-            return 1
-        fi
-        echo "[fat_build_sbatch] enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
-        rm -f "\$tmp_path"
-        sleep \$delay
-        attempt=\$((attempt + 1))
-    done
-    mv -f "\$tmp_path" "\$output_path"
-    flock -u 9 || true
-}
-importContainerWithRetries "${container}" "\$baseSqshPath"
-
-# Build fat sqsh from cached base sqsh.
-mkdir -p "${fatSqshDir}"
-fatHash=\$(printf '%s' "${llmTarfile}|${LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
-fatSqshPath="${fatSqshDir}/fat-\${fatHash}.sqsh"
-if [ -f "\$fatSqshPath" ]; then
-    echo "[fat_build_sbatch] Fat sqsh already exists: \$fatSqshPath"
-    exit 0
-fi
-bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}" "${tarName}" || echo "[fat_build_sbatch] Build failed (non-fatal); GPU job will fall back to base sqsh + full install"
-""".replaceAll("(?m)^\\s{20}", "")
+export FAT_CONTAINER_DIR="${containerDir}"
+export FAT_CONTAINER="${container}"
+export FAT_SQSH_DIR="${fatSqshDir}"
+export FAT_LLM_TARFILE="${llmTarfile}"
+export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
+export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
+export FAT_TAR_NAME="${tarName}"
+bash "${scriptFatBuildBodyPathNode}"
+""".stripIndent()
                     pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
                     Utils.exec(pipeline, script: "echo \"Fat builder sbatch script: \" && cat ${scriptFatBuildSbatchPathLocal}")
                     Utils.copyFileToRemoteHost(
@@ -1803,87 +1854,15 @@ bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}
                 def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
                 if (cluster.fatBuilderArgs != null) {
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
-                    scriptPrepareContent = """#!/bin/bash
-set -euo pipefail
-echo "=== [Prepare Container] STAGE START: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
-mkdir -p "${fatSqshDir}"
-fatHash=\$(printf '%s' "${llmTarfile}|${LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
-fatSqshPath="${fatSqshDir}/fat-\${fatHash}.sqsh"
-
-if [ -f "\$fatSqshPath" ]; then
-    echo "Fat sqsh already cached: \$fatSqshPath"
-    echo "=== [Prepare Container] STAGE END (cache hit): \$(date '+%Y-%m-%d %H:%M:%S') fat_sqsh=\$fatSqshPath ==="
-    exit 0
-fi
-
-BUILDER_ID=""
-STATUS=""
-actualFatBuildLogPath=""
-FAT_BUILD_JOB_NAME="fat_build_\${fatHash}"
-EXISTING=\$(squeue -h -n "\$FAT_BUILD_JOB_NAME" -o "%i" 2>/dev/null | head -1 || true)
-if [ -n "\$EXISTING" ]; then
-    echo "Fat sqsh builder already running as job \$EXISTING, will wait for it"
-    BUILDER_ID="\$EXISTING"
-    # Locate the log file of the existing job (submitted by a different Jenkins run with a different jobUID)
-    actualFatBuildLogPath=\$(scontrol show job "\$BUILDER_ID" 2>/dev/null | grep -oP '(?<=StdOut=)\\S+' || true)
-else
-    # Submit the CPU builder. Best-effort: any submission failure is non-fatal;
-    # the GPU job will fall back to base sqsh + full install.
-    set +e
-    BUILDER_OUT=\$(sbatch --parsable --job-name="\$FAT_BUILD_JOB_NAME" --dependency=singleton "${scriptFatBuildSbatchPathNode}" 2>&1)
-    BUILDER_RC=\$?
-    set -e
-    # sbatch may print unrelated WARNINGs to stderr (captured via 2>&1); --parsable's real
-    # output is a line "<jobid>" or "<jobid>;<cluster>". Extract the numeric job id only.
-    BUILDER_ID=\$(printf '%s\\n' "\$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
-    if [ "\$BUILDER_RC" -eq 0 ] && [ -n "\$BUILDER_ID" ]; then
-        echo "Submitted fat sqsh builder as cpu_builder_job_id=\$BUILDER_ID at \$(date '+%Y-%m-%d %H:%M:%S')"
-        _fatLogTemplate="${fatBuildLogPath}"
-        actualFatBuildLogPath="\${_fatLogTemplate//%j/\$BUILDER_ID}"
-    else
-        echo "Fat sqsh builder submission failed (rc=\$BUILDER_RC): \$BUILDER_OUT"
-        echo "GPU test job will fall back to base sqsh + full install"
-        echo "=== [Prepare Container] STAGE END (builder submission failed): \$(date '+%Y-%m-%d %H:%M:%S') ==="
-        exit 0
-    fi
-fi
-
-# Poll until the builder job finishes (success or failure); tail the builder log live.
-echo "Waiting for fat sqsh builder job \$BUILDER_ID to complete..."
-FAT_TAIL_PID=""
-if [ -n "\$actualFatBuildLogPath" ]; then
-    touch "\$actualFatBuildLogPath" 2>/dev/null || true
-    tail -F -n +1 "\$actualFatBuildLogPath" &
-    FAT_TAIL_PID=\$!
-else
-    echo "Warning: could not determine fat build log path; builder output will not be shown here"
-fi
-while true; do
-    if ! STATUS=\$(sacct -j "\$BUILDER_ID" --format=State -Pn --allocations 2>&1); then
-        echo "Warning: sacct failed, retrying in 60s..."
-        sleep 60
-        continue
-    fi
-    case "\${STATUS:-}" in
-        COMPLETED|FAILED|CANCELLED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY)
-            echo "Fat sqsh builder job \$BUILDER_ID finished: \$STATUS"
-            break
-            ;;
-        *)
-            echo "Fat sqsh builder job \$BUILDER_ID state: \${STATUS:-UNKNOWN}, waiting..."
-            sleep 60
-            ;;
-    esac
-done
-[ -n "\$FAT_TAIL_PID" ] && kill \$FAT_TAIL_PID 2>/dev/null || true
-
-if [ -f "\$fatSqshPath" ]; then
-    echo "Fat sqsh ready: \$fatSqshPath"
-else
-    echo "Fat sqsh not found after builder completed (status=\$STATUS); GPU job will fall back to base sqsh + full install"
-fi
-echo "=== [Prepare Container] STAGE END: \$(date '+%Y-%m-%d %H:%M:%S') cpu_builder_job_id=\$BUILDER_ID final_status=\$STATUS ==="
-"""
+                    scriptPrepareContent = """\
+#!/bin/bash
+export FAT_SQSH_DIR="${fatSqshDir}"
+export FAT_LLM_TARFILE="${llmTarfile}"
+export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
+export FAT_BUILD_SBATCH_PATH="${scriptFatBuildSbatchPathNode}"
+export FAT_BUILD_LOG_TEMPLATE="${fatBuildLogPath}"
+bash "${scriptPrepareBodyPathNode}"
+""".stripIndent()
                 }
                 pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
                 Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
