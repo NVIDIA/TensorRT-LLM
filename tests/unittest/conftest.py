@@ -102,8 +102,6 @@ def pytest_configure(config):
         print_info(f"  XML path: {periodic_junit_xmlpath}")
         print_info(f"  Batch size: {periodic_batch_size}")
 
-    s3_output.register_plugin(config)
-
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):

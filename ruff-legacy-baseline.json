@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2358,
-    "total_files": 271
+    "total_violations": 2327,
+    "total_files": 266
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -228,15 +228,6 @@
   },
   "examples/run.py": {
     "E711": 4
-  },
-  "examples/scaffolding/contrib/mcp/e2b/e2bserver.py": {
-    "D202": 1,
-    "D205": 1,
-    "D411": 1
-  },
-  "examples/scaffolding/contrib/mcp/websearch/websearch.py": {
-    "D205": 1,
-    "D415": 1
   },
   "examples/summarize.py": {
     "E741": 1
@@ -543,11 +534,11 @@
     "E731": 2
   },
   "tensorrt_llm/llmapi/disagg_utils.py": {
-    "D205": 2,
+    "D205": 1,
     "D210": 1,
-    "D212": 2,
-    "D403": 2,
-    "D415": 2,
+    "D212": 1,
+    "D403": 1,
+    "D415": 1,
     "F822": 2
   },
   "tensorrt_llm/llmapi/llm.py": {
@@ -555,8 +546,7 @@
     "D205": 4
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D205": 11,
-    "D212": 1
+    "D205": 10
   },
   "tensorrt_llm/llmapi/llm_utils.py": {
     "D200": 1
@@ -684,14 +674,8 @@
   "tensorrt_llm/scaffolding/result.py": {
     "F821": 1
   },
-  "tensorrt_llm/scaffolding/scaffolding_llm.py": {
-    "PLE0302": 1
-  },
   "tensorrt_llm/scaffolding/task.py": {
     "F821": 1
-  },
-  "tensorrt_llm/scaffolding/worker.py": {
-    "PLE0302": 1
   },
   "tensorrt_llm/serve/disagg_auto_scaling.py": {
     "D205": 2,
@@ -708,15 +692,15 @@
     "D210": 1,
     "F811": 1
   },
+  "tensorrt_llm/serve/openai_server.py": {
+    "F821": 3
+  },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,
-    "D205": 4,
-    "D212": 11
+    "D212": 7
   },
   "tensorrt_llm/serve/router.py": {
     "D205": 1,
-    "D212": 1,
-    "D300": 1,
     "D415": 7
   },
   "tensorrt_llm/serve/scripts/benchmark_dataset.py": {
@@ -796,9 +780,9 @@
     "D205": 3,
     "D210": 2,
     "D212": 5,
-    "D300": 7,
-    "D403": 6,
-    "D415": 12
+    "D300": 6,
+    "D403": 5,
+    "D415": 11
   },
   "tests/integration/defs/conftest.py": {
     "D200": 3,
@@ -807,9 +791,9 @@
     "D209": 1,
     "D212": 5,
     "D214": 1,
-    "D300": 92,
+    "D300": 91,
     "D403": 51,
-    "D415": 92,
+    "D415": 91,
     "E722": 2,
     "E741": 1
   },
@@ -821,8 +805,7 @@
     "E741": 2
   },
   "tests/integration/defs/disaggregated/test_disaggregated.py": {
-    "D205": 3,
-    "D209": 1,
+    "D205": 2,
     "D212": 5,
     "D415": 1
   },
