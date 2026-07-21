@@ -587,9 +587,8 @@ def create_py_executor(
                                  and llm_args.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if (capturable_drafter_eligible
-                    and (use_chain_drafter
-                         or draft_spec_config.spec_dec_mode.is_mtp_eagle())):
+            if (use_chain_drafter
+                    or draft_spec_config.spec_dec_mode.is_mtp_eagle()):
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
@@ -598,7 +597,18 @@ def create_py_executor(
                         StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
 
-                    if model.config.model_type == "gemma4_assistant":
+                    shares_target_kv_cache = bool(
+                        getattr(model.config, "shares_target_kv_cache", False))
+                    if shares_target_kv_cache:
+                        if guided_decoding_config is not None:
+                            raise ValueError(
+                                "Guided decoding is not supported with draft "
+                                "models that share the target KV cache")
+                        if not capturable_drafter_eligible:
+                            raise ValueError(
+                                "Draft models that share the target KV cache "
+                                "require the capturable greedy drafting loop "
+                                "without a draft length schedule")
                         return Gemma4AssistantDraftingLoopWrapper(
                             spec_config.max_draft_len,
                             spec_config.tokens_per_gen_step - 1, model)
@@ -648,13 +658,11 @@ def create_py_executor(
             # Embedded MTP checkpoints expose a single draft layer. Standalone
             # Gemma4 assistants keep their full four-layer text backbone.
             if (spec_config.spec_dec_mode.is_mtp_eagle()
-                    and draft_model_engine.model.config.model_type
-                    != "gemma4_assistant"):
+                    and not getattr(draft_model_engine.model.config,
+                                    "preserve_checkpoint_layer_count", False)):
                 draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
-            if draft_model_engine.model.config.model_type == "gemma4_assistant":
-                draft_model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     else:
         draft_model_engine = None
 

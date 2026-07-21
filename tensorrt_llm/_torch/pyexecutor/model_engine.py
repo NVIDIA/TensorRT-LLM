@@ -66,7 +66,8 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            prepare_attn_metadata_for_draft_replay,
                            restore_attn_metadata_after_draft_replay,
                            update_spec_config_from_loaded_model)
-from ..speculative.drafting_loops import BaseDraftingLoopWrapper
+from ..speculative.drafting_loops import (BaseDraftingLoopWrapper,
+                                          get_draft_model_capability)
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
@@ -439,6 +440,11 @@ class PyTorchModelEngine(ModelEngine):
                 self.model_is_wrapped = False
         else:
             self.model_is_wrapped = False
+        self._shares_target_kv_cache = bool(
+            is_draft_model and get_draft_model_capability(
+                self.model, "shares_target_kv_cache", False))
+        self._cuda_graph_external_draft_len = get_draft_model_capability(
+            self.model, "cuda_graph_external_draft_len", None)
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -658,9 +664,13 @@ class PyTorchModelEngine(ModelEngine):
 
         self._cuda_graph_padding_enabled = cuda_graph_padding_enabled
 
+        cuda_graph_max_total_draft_tokens = (
+            self._cuda_graph_external_draft_len
+            if self._cuda_graph_external_draft_len is not None else
+            self.original_max_total_draft_tokens)
         self._cuda_graph_batch_sizes = _filter_cuda_graph_batch_sizes(
             cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
-            self.original_max_total_draft_tokens,
+            cuda_graph_max_total_draft_tokens,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
@@ -750,7 +760,10 @@ class PyTorchModelEngine(ModelEngine):
         # We look up this key in resource_manager during forward to find the
         # kv cache manager. Can be changed to support multiple model engines
         # with different KV cache managers.
-        self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
+        self.kv_cache_manager_key = (ResourceManagerType.DRAFT_KV_CACHE_MANAGER
+                                     if is_draft_model
+                                     and not self._shares_target_kv_cache else
+                                     ResourceManagerType.KV_CACHE_MANAGER)
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
 
@@ -771,15 +784,13 @@ class PyTorchModelEngine(ModelEngine):
             original_max_total_draft_tokens=self.
             original_max_total_draft_tokens,
             is_draft_model=self.is_draft_model,
-            is_gemma4_assistant=(self.is_draft_model and self.model_is_wrapped
-                                 and self.model.config.model_type
-                                 == "gemma4_assistant"),
             enable_attention_dp=self.enable_attention_dp,
             is_encoder_decoder=self._is_encoder_decoder_model(),
             batch_size=self.batch_size,
             mapping=self.mapping,
             dist=self.dist,
             kv_cache_manager_key=self.kv_cache_manager_key,
+            draft_model_external_draft_len=self._cuda_graph_external_draft_len,
             sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
@@ -1476,8 +1487,8 @@ class PyTorchModelEngine(ModelEngine):
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        if (self.is_draft_model and self.model_is_wrapped
-                and self.model.config.model_type == "gemma4_assistant"):
+        if (self.is_draft_model
+                and self._cuda_graph_external_draft_len is not None):
             token_num_upper_bound = 1
         else:
             token_num_upper_bound = min(
@@ -2416,14 +2427,15 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if self.is_draft_model and isinstance(spec_resource_manager,
                                               Eagle3ResourceManager):
-            is_gemma4_assistant = (self.model_is_wrapped
-                                   and self.model.config.model_type
-                                   == "gemma4_assistant")
-            spec_resource_manager.is_first_draft = (is_first_draft
-                                                    and not is_gemma4_assistant)
+            freezes_draft_attention_state = bool(
+                get_draft_model_capability(self.model,
+                                           "freezes_draft_attention_state",
+                                           False))
+            spec_resource_manager.is_first_draft = (
+                is_first_draft and not freezes_draft_attention_state)
             if is_first_draft:
                 for req in batch.generation_requests:
-                    req.py_is_first_draft = not is_gemma4_assistant
+                    req.py_is_first_draft = not freezes_draft_attention_state
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(

@@ -21,6 +21,7 @@ from ..pyexecutor.sampler import Sampler, SampleState, SampleStateTensors
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .drafter import Drafter
+from .drafting_loops import get_draft_model_capability
 from .spec_sampler_base import SampleStateTensorsSpec
 
 if TYPE_CHECKING:
@@ -96,10 +97,9 @@ class ModelDrafter(Drafter):
         self.guided_decoder = guided_decoder
 
         self.use_static_draft_loop = draft_model_engine.model_is_wrapped
-        draft_model = (draft_model_engine.model.draft_model if
-                       self.use_static_draft_loop else draft_model_engine.model)
-        self.is_gemma4_assistant = getattr(draft_model.config, "model_type",
-                                           None) == "gemma4_assistant"
+        self.shares_target_kv_cache = bool(
+            get_draft_model_capability(draft_model_engine.model,
+                                       "shares_target_kv_cache", False))
         if self.use_static_draft_loop:
             # TODO: enable sampling/guided decoding on static draft loop
             assert guided_decoder is None
@@ -170,7 +170,7 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         return new_request
 
-    def _create_gemma4_assistant_request(self, request: LlmRequest,
+    def _create_shared_target_kv_request(self, request: LlmRequest,
                                          input_tokens: List[int],
                                          is_first_draft: bool) -> LlmRequest:
         """Create a one-token query over the target model's existing KV cache."""
@@ -178,7 +178,8 @@ class ModelDrafter(Drafter):
         if self.spec_resource_manager is None or not hasattr(
                 self.spec_resource_manager, "draft_hidden_state_offsets"):
             raise RuntimeError(
-                "Gemma4 assistant requires an Eagle3 resource manager")
+                "A shared-target-KV drafter requires an Eagle3 resource manager"
+            )
         if is_first_draft:
             slot_id = self.spec_resource_manager.slot_manager.get_slot(
                 request.py_request_id)
@@ -255,8 +256,8 @@ class ModelDrafter(Drafter):
         num_overlap_tokens = 0 if self.disable_overlap_scheduler else 1
         is_first_draft = (request.max_beam_num_tokens - 1 +
                           num_overlap_tokens == request.py_prompt_len)
-        if self.is_gemma4_assistant:
-            return self._create_gemma4_assistant_request(
+        if self.shares_target_kv_cache:
+            return self._create_shared_target_kv_request(
                 request, list(request.get_tokens(0)), is_first_draft)
 
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
@@ -335,7 +336,7 @@ class ModelDrafter(Drafter):
             for request in scheduled_requests.context_requests:
                 if request.py_disable_speculative_decoding:
                     continue
-                if self.is_gemma4_assistant:
+                if self.shares_target_kv_cache:
                     # The assistant has no private KV cache to populate during
                     # chunked prefill. Drafting starts after target prefill.
                     continue

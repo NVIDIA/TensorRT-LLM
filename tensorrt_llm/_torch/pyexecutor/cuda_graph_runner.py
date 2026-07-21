@@ -103,7 +103,6 @@ class CUDAGraphRunnerConfig:
     original_max_draft_len: int
     original_max_total_draft_tokens: int
     is_draft_model: bool
-    is_gemma4_assistant: bool
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
@@ -112,6 +111,7 @@ class CUDAGraphRunnerConfig:
     kv_cache_manager_key: Any
     dynamic_draft_len_mapping: Optional[Dict[int, int]] = None
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    draft_model_external_draft_len: Optional[int] = None
 
 
 class CUDAGraphRunner:
@@ -159,6 +159,8 @@ class CUDAGraphRunner:
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
         runtime_draft_token_buffer_width = (
+            self.config.draft_model_external_draft_len
+            if self.config.draft_model_external_draft_len is not None else
             self.config.original_max_total_draft_tokens
             if self.config.spec_config is not None else 0)
         token_per_request = runtime_draft_token_buffer_width + 1
@@ -248,12 +250,10 @@ class CUDAGraphRunner:
 
         if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
                 spec_resource_manager, Eagle3ResourceManager):
-            if self.config.is_gemma4_assistant:
-                # Gemma4 captures the whole assistant drafting loop in one
-                # graph, but its external input always contains one query per
-                # request. The resource manager's first-draft flag is internal
-                # loop state and must not select a different graph at runtime.
-                draft_len = 0
+            if self.config.draft_model_external_draft_len is not None:
+                # Capturable draft models may execute the whole drafting loop
+                # internally while exposing a smaller fixed input shape.
+                draft_len = self.config.draft_model_external_draft_len
                 is_first_draft = False
             else:
                 # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.

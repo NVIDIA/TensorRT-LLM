@@ -130,9 +130,8 @@ def get_spec_metadata(spec_config,
             draft_vocab_size=draft_vocab_size,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
-        hidden_size = model_config.hidden_size
-        if model_config.model_type == "gemma4_assistant":
-            hidden_size = model_config.backbone_hidden_size
+        hidden_size = getattr(model_config, "speculative_hidden_size",
+                              model_config.hidden_size)
         return Eagle3SpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -146,7 +145,8 @@ def get_spec_metadata(spec_config,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=None,
             is_mtp_eagle=True,
-            is_gemma4_assistant=model_config.model_type == "gemma4_assistant",
+            shares_target_kv_cache=getattr(model_config,
+                                           "shares_target_kv_cache", False),
         )
     if spec_config.spec_dec_mode.is_eagle3():
         effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)

@@ -215,7 +215,7 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
     is_mtp_eagle: bool = False
-    is_gemma4_assistant: bool = False
+    shares_target_kv_cache: bool = False
 
     eagle_choices: Optional[List[List[int]]] = None
     max_total_draft_tokens: int = 0
@@ -283,19 +283,18 @@ class Eagle3SpecMetadata(SpecMetadata):
         for req_id, seq_len in zip(self.request_ids, self.seq_lens):
             slot_id = self.eagle3_resource_manager.slot_manager.get_slot(req_id)
             start_idx = self.eagle3_resource_manager.start_indices[slot_id]
-            # Gemma4 assistants issue one query per target iteration and reuse
-            # the target KV cache. Read the hidden state for the last validated
-            # target token, then overwrite that location with the projected
-            # assistant state for the remaining draft iterations.
-            if self.is_draft_model and self.is_gemma4_assistant:
+            # Shared-target-KV drafters issue one query per target iteration.
+            # Read the hidden state for the last validated target token, then
+            # overwrite that location for the remaining draft iterations.
+            if self.is_draft_model and self.shares_target_kv_cache:
                 assert seq_len == 1, (
-                    "Gemma4 assistant drafting expects one query token per "
+                    "Shared-target-KV drafting expects one query token per "
                     f"request, got {seq_len}")
                 old_seq_len = self.eagle3_resource_manager.seq_lens[slot_id]
                 hidden_state_offset = self.eagle3_resource_manager.draft_hidden_state_offsets.get(
                     req_id, max(old_seq_len - 1, 0))
                 assert old_seq_len == 0 or 0 <= hidden_state_offset < old_seq_len, (
-                    "Gemma4 assistant hidden-state offset is outside the "
+                    "Shared-target-KV hidden-state offset is outside the "
                     f"target span: offset={hidden_state_offset}, "
                     f"target_seq_len={old_seq_len}")
                 hidden_state_idx = start_idx + hidden_state_offset

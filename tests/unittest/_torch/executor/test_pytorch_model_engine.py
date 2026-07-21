@@ -17,7 +17,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
-    PyTorchModelEngine, _build_request_multimodal_input)
+    PyTorchModelEngine, _build_request_multimodal_input,
+    _filter_cuda_graph_batch_sizes)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # isort: off
@@ -191,11 +192,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
 
-    def test_gemma4_assistant_graph_key_ignores_first_draft_state(self) -> None:
+    def test_external_draft_len_graph_key_ignores_first_draft_state(
+            self) -> None:
         runner = object.__new__(CUDAGraphRunner)
         runner.config = SimpleNamespace(
             is_draft_model=True,
-            is_gemma4_assistant=True,
+            draft_model_external_draft_len=0,
             original_max_draft_len=2,
         )
         runner.sparse_config = None
@@ -217,6 +219,28 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(capture_key, (1, 0, False, False, True))
         self.assertEqual(runtime_key, capture_key)
+
+    def test_external_draft_len_preserves_cuda_graph_batch_capacity(
+            self) -> None:
+        batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
+
+        regular_draft_sizes = _filter_cuda_graph_batch_sizes(
+            batch_sizes,
+            max_batch_size=128,
+            max_num_tokens=128,
+            max_total_draft_tokens=5,
+            enable_padding=False,
+        )
+        external_draft_sizes = _filter_cuda_graph_batch_sizes(
+            batch_sizes,
+            max_batch_size=128,
+            max_num_tokens=128,
+            max_total_draft_tokens=0,
+            enable_padding=False,
+        )
+
+        self.assertEqual(regular_draft_sizes, [1, 2, 4, 8, 16])
+        self.assertEqual(external_draft_sizes, batch_sizes)
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()

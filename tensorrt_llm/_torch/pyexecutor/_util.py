@@ -1580,11 +1580,16 @@ class KvCacheCreator:
         # Split combined KV cache budgets before creating managers. Skip during
         # estimation — estimation uses max_tokens-based logic and must not
         # mutate the config.
-        has_draft = (
-            self._draft_model_engine is not None  # two-model
+        draft_shares_target_kv_cache = (
+            self._draft_model_engine is not None
+            and self._draft_model_engine.kv_cache_manager_key
+            == ResourceManagerType.KV_CACHE_MANAGER)
+        has_independent_draft_cache = (
+            (self._draft_model_engine is not None
+             and not draft_shares_target_kv_cache)  # two-model
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
-        if not estimating_kv_cache and has_draft:
+        if not estimating_kv_cache and has_independent_draft_cache:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
             # and V1 VSWA). V1 non-VSWA GPU uses shared max_tokens instead.
             if self._needs_gpu_kv_cache_budget_split(self_kv_cache_config):
@@ -1617,13 +1622,10 @@ class KvCacheCreator:
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Gemma4 assistants read the target model's KV cache directly. They
-        # still need a small draft manager for request/slot bookkeeping, but
-        # must not reserve a second full-size GPU cache during final capacity
-        # allocation.
-        if (self._draft_model_engine is not None
-                and self._draft_model_engine.kv_cache_manager_key
-                == ResourceManagerType.KV_CACHE_MANAGER):
+        # Shared-target-KV drafters still need a small draft manager for
+        # request/slot bookkeeping, but they neither reserve a second full-size
+        # cache nor reduce the target manager's GPU/host cache budget.
+        if draft_shares_target_kv_cache:
             draft_build_kv_cache_config = copy.deepcopy(
                 draft_build_kv_cache_config)
             draft_build_kv_cache_config.max_gpu_total_bytes = 0

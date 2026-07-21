@@ -165,6 +165,7 @@ class PlanParams:
     multi_item_params: Optional[FlashInferMultiItemParams] = None
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
+    kv_pool_id: Optional[int] = None
 
 
 # NB: Some features (multi-item scoring) are only supported with the paged KV-cache wrapper.
@@ -706,15 +707,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx
-                # Build head_dim → pool_id mapping using V2 per-layer head_dim
-                self._vswa_head_dim_to_pool: Dict[int, int] = {}
-                if hasattr(mgr, 'head_dim_per_layer'):
-                    for layer_idx, pool_id in self._vswa_layer_to_pool.items():
-                        hd = mgr.head_dim_per_layer[
-                            mgr.layer_offsets[layer_idx]]
-                        if hd not in self._vswa_head_dim_to_pool:
-                            self._vswa_head_dim_to_pool[hd] = pool_id
-
                 # Pre-allocate VSWA pool cache buffers.  These must be
                 # stable (never reallocated) so that CUDA-graph-recorded
                 # copies reference valid addresses across replays.
@@ -1327,12 +1319,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
 
-        # Gemma4's trtllm-gen paged-prefill graphs capture one stable block
-        # table per head dimension. Refresh those tables and KV lengths after
-        # request turnover instead of replaying with graph-warmup page IDs.
+        # trtllm-gen paged-prefill graphs capture one stable block table per KV
+        # pool. Refresh those tables and KV lengths after request turnover.
         if (self.is_cuda_graph and self.num_contexts > 0
                 and self._vswa_layer_to_pool is not None):
-            head_dim_to_pool = getattr(self, "_vswa_head_dim_to_pool", None)
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 if plan_params.attention_mask_data is not None:
                     continue
@@ -1341,8 +1331,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         or prefill_wrapper._backend != "trtllm-gen"):
                     continue
                 block_tables = prefill_wrapper._block_tables
-                pool_id = (head_dim_to_pool.get(plan_params.head_dim)
-                           if head_dim_to_pool else None)
+                pool_id = plan_params.kv_pool_id
                 if block_tables is None or pool_id is None:
                     continue
                 host_pool_indices = self._host_pool_indices[pool_id]
@@ -1378,7 +1367,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 and self._vswa_pool_indices_cache is not None
                 and self.num_generations > 0):
             decode_blocks = num_blocks[self.num_contexts:]
-            head_dim_to_pool = getattr(self, '_vswa_head_dim_to_pool', None)
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 if plan_params.attention_mask_data is not None:
                     continue
@@ -1386,8 +1374,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables = getattr(decode_wrapper, '_block_tables', None)
                 if block_tables is None:
                     continue
-                pool_id = (head_dim_to_pool.get(plan_params.head_dim)
-                           if head_dim_to_pool else None)
+                pool_id = plan_params.kv_pool_id
                 if pool_id is None:
                     continue
                 batch_size, table_width = block_tables.shape
@@ -1486,6 +1473,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             attention_mask_type=AttentionMaskType(attention_mask_type),
             attention_mask_data=attention_mask_data,
             multi_item_params=self._multi_item_params,
+            kv_pool_id=getattr(self, "_vswa_active_pool_id", None),
         )
         return self._plan_with_params(plan_params, flashinfer_backend)
 

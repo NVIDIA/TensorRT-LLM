@@ -11,7 +11,7 @@ for speculation can be launched as a single CUDA graph.
 """
 
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional, final
 
 import torch
@@ -57,6 +57,12 @@ class BaseDraftingLoopWrapper(ABC, torch.nn.Module):
                          None)
         if callable(loader):
             self.draft_model.load_weights_from_target_model(target_model)
+
+
+def get_draft_model_capability(model: torch.nn.Module, name: str, default=None):
+    """Read a capability from a wrapped or unwrapped draft model."""
+    draft_model = getattr(model, "draft_model", model)
+    return getattr(draft_model.config, name, default)
 
 
 @contextmanager
@@ -126,11 +132,13 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
         draft_logits = [logits]
         if self.max_draft_len > 1:
             is_eagle3 = isinstance(spec_metadata, Eagle3SpecMetadata)
-            with save_metadata_state(attn_metadata, spec_metadata):
+            with self.drafting_metadata_context(attn_metadata, spec_metadata):
                 batch_size = attn_metadata.num_seqs
 
                 new_position_ids = self.prepare_for_generation(
                     attn_metadata, spec_metadata, position_ids)
+                self.prepare_hidden_states_for_generation(
+                    spec_metadata, batch_size)
                 for i in range(self.max_draft_len - 1):
                     logits = self.draft_model.forward(
                         input_ids=new_draft_tokens[-1],
@@ -139,8 +147,8 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
                         spec_metadata=spec_metadata)
                     new_draft_tokens.append(self.sample(logits))
                     draft_logits.append(logits)
-                    new_position_ids += 1
-                    attn_metadata.kv_lens_cuda[:batch_size] += 1
+                    self.advance_generation_state(new_position_ids,
+                                                  attn_metadata, batch_size)
                     if i == 0 and is_eagle3:
                         spec_metadata.hidden_states_read_indices[:batch_size].copy_(
                             spec_metadata.
@@ -150,6 +158,20 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
             "new_draft_tokens": torch.stack(new_draft_tokens),
             "draft_logits": torch.stack(draft_logits)
         }
+
+    def drafting_metadata_context(self, attn_metadata: AttentionMetadata,
+                                  spec_metadata: SpecMetadata):
+        return save_metadata_state(attn_metadata, spec_metadata)
+
+    def prepare_hidden_states_for_generation(self, spec_metadata: SpecMetadata,
+                                             batch_size: int) -> None:
+        pass
+
+    def advance_generation_state(self, position_ids: torch.Tensor,
+                                 attn_metadata: AttentionMetadata,
+                                 batch_size: int) -> None:
+        position_ids += 1
+        attn_metadata.kv_lens_cuda[:batch_size] += 1
 
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         # TODO: inject the sampler here so we can support non-greedy
@@ -207,37 +229,21 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
 class Gemma4AssistantDraftingLoopWrapper(LinearDraftingLoopWrapper):
     """Draft tokens without advancing the target KV cache or position."""
 
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor,
-                attn_metadata: AttentionMetadata, spec_metadata: SpecMetadata,
-                **kwargs) -> dict[str, torch.Tensor]:
-        logits = self.draft_model.forward(input_ids=input_ids,
-                                          position_ids=position_ids,
-                                          attn_metadata=attn_metadata,
-                                          spec_metadata=spec_metadata,
-                                          return_context_logits=True)
-        logits = logits[spec_metadata.gather_ids]
+    def drafting_metadata_context(self, attn_metadata: AttentionMetadata,
+                                  spec_metadata: SpecMetadata):
+        return nullcontext()
 
-        new_draft_tokens = [self.sample(logits)]
-        draft_logits = [logits]
-        if self.max_draft_len > 1:
-            if not isinstance(spec_metadata, Eagle3SpecMetadata):
-                raise TypeError("Gemma4 assistant requires Eagle3 metadata")
-            batch_size = attn_metadata.num_seqs
-            spec_metadata.hidden_states_read_indices[:batch_size].copy_(
-                spec_metadata.hidden_states_write_indices[:batch_size])
-            for _ in range(self.max_draft_len - 1):
-                logits = self.draft_model.forward(
-                    input_ids=new_draft_tokens[-1],
-                    position_ids=position_ids,
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata)
-                new_draft_tokens.append(self.sample(logits))
-                draft_logits.append(logits)
+    def prepare_hidden_states_for_generation(self, spec_metadata: SpecMetadata,
+                                             batch_size: int) -> None:
+        if not isinstance(spec_metadata, Eagle3SpecMetadata):
+            raise TypeError("Gemma4 assistant requires Eagle3 metadata")
+        spec_metadata.hidden_states_read_indices[:batch_size].copy_(
+            spec_metadata.hidden_states_write_indices[:batch_size])
 
-        return {
-            "new_draft_tokens": torch.stack(new_draft_tokens),
-            "draft_logits": torch.stack(draft_logits),
-        }
+    def advance_generation_state(self, position_ids: torch.Tensor,
+                                 attn_metadata: AttentionMetadata,
+                                 batch_size: int) -> None:
+        pass
 
     def prepare_for_generation(self, attn_metadata: AttentionMetadata,
                                spec_metadata: SpecMetadata,
