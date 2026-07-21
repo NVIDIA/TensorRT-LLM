@@ -70,7 +70,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^6]: Qwen-Image-Layered supports baseline BF16 image-conditioned layer decomposition and returns the generated RGBA layer stack as a saveable image grid. FP8 blockwise, NVFP4, cache acceleration, attention-parallel/Sage/VSA backends, Tensor Parallelism, and `trtllm-serve` image-edit routing are not enabled for this pipeline yet.
 
-[^6]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, rejects TeaCache and Cache-DiT, and requires the combined target/reference token count to be divisible across sequence-parallel ranks. Other parallel and CUDA Graph combinations remain under qualification.
+[^6]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, including TeaCache and Cache-DiT. Sequence-parallel configurations require the combined target/reference token count to be divisible across ranks. Other parallel and CUDA Graph combinations remain under qualification.
 
 ## Quick Start
 
@@ -92,11 +92,10 @@ corresponding dimension; without references, the FLUX.2 fallback remains 1024×1
 TensorRT-LLM retains its existing FLUX.2 guidance default of `3.5`; Diffusers defaults to `4.0`,
 so pass `--guidance_scale 4.0` to the example when matching an otherwise-default Diffusers request.
 
-TeaCache and Cache-DiT remain available for FLUX.2 text-to-image requests but are not supported
-when reference images are present. Reference-image generation is currently qualified on one GPU;
-sequence-parallel configurations additionally require the combined target and reference token count
-to divide evenly across ranks, and fail early otherwise. Other parallel and CUDA graph combinations
-remain under qualification.
+TeaCache and Cache-DiT support FLUX.2 requests with or without reference images. Reference-image
+generation is currently qualified on one GPU; sequence-parallel configurations additionally require
+the combined target and reference token count to divide evenly across ranks, and fail early otherwise.
+Other parallel and CUDA graph combinations remain under qualification.
 
 ### Usage with `trtllm-serve`
 
