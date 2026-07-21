@@ -475,7 +475,9 @@ class LmEvalEvaluator(Evaluator):
                  output_path: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 shuffle_dataset: bool = True,
+                 fewshot_random_seed: Optional[int] = None):
         try:
             import lm_eval
         except ImportError as e:
@@ -509,6 +511,12 @@ class LmEvalEvaluator(Evaluator):
         # larger than the lm-eval task's max_gen_toks. Used by thinking
         # models (e.g. Kimi K2.5) whose CoT output exceeds the task default.
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # shuffle_dataset=False keeps every split in its published order, and
+        # fewshot_random_seed overrides random_seed for the few-shot sampler.
+        # Together they reproduce the lm-eval CLI's exemplar selection
+        # (unshuffled data, sampler seed 1234) for external comparability.
+        self.shuffle_dataset = shuffle_dataset
+        self.fewshot_random_seed = fewshot_random_seed
 
         task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
@@ -529,13 +537,16 @@ class LmEvalEvaluator(Evaluator):
                     }
                 else:
                     # NOTE: Few-shot random seed
-                    task_obj.set_fewshot_seed(seed=random_seed)
+                    task_obj.set_fewshot_seed(seed=self.fewshot_random_seed
+                                              if self.fewshot_random_seed
+                                              is not None else random_seed)
                     adjusted_task_dict[task_name] = task_obj
 
                     # NOTE: Shuffle dataset
-                    data = adjusted_task_dict[task_name].dataset
-                    for split in data.keys():
-                        data[split] = data[split].shuffle(random_seed)
+                    if self.shuffle_dataset:
+                        data = adjusted_task_dict[task_name].dataset
+                        for split in data.keys():
+                            data[split] = data[split].shuffle(random_seed)
 
             return adjusted_task_dict
 
@@ -823,9 +834,16 @@ class GSM8KInferenceMax(LmEvalEvaluator):
 
     Task yaml lives under ``tensorrt_llm/evaluate/lm_eval_tasks/
     gsm8k_inferencemax/`` (upstream lm-eval ships no such variant).
+
+    Exemplar fidelity: the lm-eval CLI (and therefore InferenceMAX) samples
+    the 5 few-shot exemplars from the unshuffled train split with sampler
+    seed 1234. Defaults below reproduce that; the usual dataset shuffle
+    would silently swap in different exemplars and shift scores.
     """
 
     def __init__(self, **kwargs):
+        kwargs.setdefault("shuffle_dataset", False)
+        kwargs.setdefault("fewshot_random_seed", 1234)
         super().__init__("gsm8k_inferencemax", **kwargs)
 
     @click.command("gsm8k_inferencemax")

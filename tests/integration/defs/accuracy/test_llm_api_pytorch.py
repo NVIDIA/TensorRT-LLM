@@ -7663,6 +7663,10 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  sparse_attention_config=sparse_attention_config,
                  moe_config=moe_config,
                  max_seq_len=16384 if inferencemax else 4096,
+                 # InferenceMAX evaluates a serving endpoint with client
+                 # concurrency capped at 64 (EVAL_CONCURRENT_REQUESTS); match
+                 # that batching regime.
+                 **({"max_batch_size": 64} if inferencemax else {}),
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if inferencemax:
@@ -7715,15 +7719,20 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # The fmha_sm100 decode planner caps total_q x num_qo_heads at
                 # 65536; with 1 + draft_len = 4 verify tokens per row that
                 # bounds the batch at 1024 / TP-sharded heads (256 unsharded
-                # under attention DP).
-                max_batch_size=256 if attention_dp else 512,
+                # under attention DP). The inferencemax cap of 64 matches the
+                # InferenceMAX eval regime (client concurrency 64) and keeps
+                # every decode iteration inside the captured graph range,
+                # as in real serving at that concurrency.
+                max_batch_size=64 if inferencemax else
+                (256 if attention_dp else 512),
                 speculative_config=spec_config,
                 # Graphs + spec requires the MSA path: its verify batches
                 # are decode-shaped and capture-safe (the reference path
                 # rejects graphs+spec at creation).
                 cuda_graph_config=CudaGraphConfig(
                     enable_padding=True,
-                    max_batch_size=64 if attention_dp else 128,
+                    max_batch_size=64 if
+                    (inferencemax or attention_dp) else 128,
                 ) if cuda_graph else None,
                 disable_overlap_scheduler=not overlap_scheduler,
                 enable_attention_dp=attention_dp,
