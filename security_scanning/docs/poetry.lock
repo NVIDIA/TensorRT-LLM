@@ -828,14 +828,14 @@ files = [
 
 [[package]]
 name = "soupsieve"
-version = "2.8.4"
+version = "2.9.1"
 description = "A modern CSS selector implementation for Beautiful Soup."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "soupsieve-2.8.4-py3-none-any.whl", hash = "sha256:e7e6b0769c8f51ed59acab6e994b00621096cfb1c640a7509295987388fbaf65"},
-    {file = "soupsieve-2.8.4.tar.gz", hash = "sha256:e121fd02e975c695e4e9e8774a5ee35d74714b59307868dcc5319ad2d9e3328e"},
+    {file = "soupsieve-2.9.1-py3-none-any.whl", hash = "sha256:4f4477399246b7a0c720a88ca2454b11cd6bb9ae4c9d170140786e916776c14c"},
+    {file = "soupsieve-2.9.1.tar.gz", hash = "sha256:c33e6605bbc71dd628b00c632d58ae607c22bade247e52553928f83bbb75b4ba"},
 ]
 
 [[package]]
@@ -1025,14 +1025,14 @@ test = ["flake8", "mypy", "pytest"]
 
 [[package]]
 name = "sphinxcontrib-mermaid"
-version = "2.0.3"
+version = "2.1.0"
 description = "Mermaid diagrams in your Sphinx-powered docs"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "sphinxcontrib_mermaid-2.0.3-py3-none-any.whl", hash = "sha256:f001ed36a55c108f6221a2d656a441c487ee30651b54db72b7c752a20c7a66e8"},
-    {file = "sphinxcontrib_mermaid-2.0.3.tar.gz", hash = "sha256:a6865ef6b65b225c5403a3170de63a04a07227cada11a4a71a6b87b4f9ed185a"},
+    {file = "sphinxcontrib_mermaid-2.1.0-py3-none-any.whl", hash = "sha256:417cd144ec4b28852f46ba653f02ce8e538881c812111671a4c30344e87f2112"},
+    {file = "sphinxcontrib_mermaid-2.1.0.tar.gz", hash = "sha256:13c5f9ac395cb6abf403eca34e228dc9fb3a30c9d960dbf3e40e9a8cef969549"},
 ]
 
 [package.dependencies]
@@ -1198,4 +1198,4 @@ packaging = ">=24.0"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6229137ad4354a8ad47953bd64635fd210251b2104fc49baad0d65705acc73cc"
+content-hash = "7af684263a6aff0d081aa130bca302515fac11c985e02a678c589f234cd97194"

@@ -5,6 +5,7 @@ import threading
 from unittest import mock
 
 import aiohttp
+import msgpack
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
@@ -24,6 +25,7 @@ from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
                                        BlockHashMixin, ConversationRouter,
+                                       CoordinatorDelegatingRouter,
                                        KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
@@ -72,6 +74,57 @@ def _make_mock_aiohttp_session(return_value=None):
     mock_session.get = mock.MagicMock(return_value=mock_ctx)
     mock_session.close = mock.AsyncMock()
     return mock_session
+
+
+@pytest.mark.asyncio
+async def test_coordinator_finish_retry_is_bounded():
+    local_router = RoundRobinRouter(server_role=None, servers=["server1"])
+    router = CoordinatorDelegatingRouter("http://coordinator", local_router,
+                                         "generation")
+
+    def _response(status, body):
+        response = mock.AsyncMock()
+        response.status = status
+        response.read = mock.AsyncMock(
+            return_value=msgpack.packb(body, use_bin_type=True))
+        context = mock.AsyncMock()
+        context.__aenter__ = mock.AsyncMock(return_value=response)
+        context.__aexit__ = mock.AsyncMock(return_value=False)
+        return context
+
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(side_effect=[
+        _response(503, {"error": "temporarily unavailable"}),
+        _response(503, {"error": "temporarily unavailable"}),
+        _response(503, {"error": "temporarily unavailable"}),
+    ])
+    session.close = mock.AsyncMock()
+    router._session = session
+
+    with mock.patch("tensorrt_llm.serve.router.asyncio.sleep",
+                    new_callable=mock.AsyncMock) as sleep:
+        await router._finish_async(123, True)
+
+    assert session.post.call_count == 3
+    assert sleep.await_count == 2
+    assert all(call.kwargs["timeout"] == 5
+               for call in session.post.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_finish_queue_is_bounded():
+    local_router = RoundRobinRouter(server_role=None, servers=["server1"])
+    router = CoordinatorDelegatingRouter("http://coordinator", local_router,
+                                         "generation")
+    router._finish_queue = asyncio.Queue(maxsize=1)
+    router._ensure_finish_workers = mock.Mock()
+
+    request = mock.Mock()
+    await router.finish_request(request, req_id=1)
+    await router.finish_request(request, req_id=2)
+
+    assert router._finish_queue.qsize() == 1
+    assert router._dropped_finishes == 1
 
 
 @pytest.fixture(autouse=True)
@@ -517,7 +570,7 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block)
-    monkeypatch.setattr("tensorrt_llm.serve.router.get_cache_salt_id",
+    monkeypatch.setattr("tensorrt_llm.serve.router_utils.get_cache_salt_id",
                         lambda cache_salt: cache_salt_id)
     for server in servers:
         router._server_info[server] = {
@@ -786,33 +839,8 @@ def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_tracks_routed_blocks_at_routing(servers):
-    tokens_per_block = 4
-    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
-    router = KvCacheAwareRouter(server_role=None,
-                                servers=servers,
-                                use_tokens=False,
-                                max_batch_size=32,
-                                tokens_per_block=tokens_per_block,
-                                track_routed_blocks=True)
-
-    request = CompletionRequest(model="TinyLlama",
-                                prompt=copy.deepcopy(token_lists))
-    server, info = await router.get_next_server(request)
-
-    assert id(request) in router._pending_routed_blocks
-    stashed, stashed_algo = router._pending_routed_blocks[id(request)]
-    expected_flat = [h for hl in info["block_hashes"] for h in hl]
-    assert stashed == expected_flat
-    assert stashed and not isinstance(stashed[0], list)
-    assert stashed_algo == info["hash_algo"]
-
-    await router.finish_request(request)
-    assert id(request) not in router._pending_routed_blocks
-
-
-@pytest.mark.asyncio
-async def test_kv_cache_aware_router_inserts_routed_blocks_on_finish(servers):
+async def test_kv_cache_aware_router_applies_blocks_after_successful_finish(
+        servers):
     tokens_per_block = 4
     token_lists = [[2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -855,8 +883,6 @@ async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
 
-    assert router._pending_routed_blocks == {}
-
     await router.finish_request(request)
 
     assert await router._server_state[server].matched_tokens(
@@ -864,7 +890,7 @@ async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_drops_routed_blocks_on_failure(servers):
+async def test_kv_cache_aware_router_discards_routed_blocks_on_failure(servers):
     tokens_per_block = 4
     token_lists = [[4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -877,11 +903,11 @@ async def test_kv_cache_aware_router_drops_routed_blocks_on_failure(servers):
     request = CompletionRequest(model="TinyLlama",
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
-    assert id(request) in router._pending_routed_blocks
+    assert await router._server_state[server].matched_tokens(
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 0
 
     await router.finish_request(request, success=False)
 
-    assert id(request) not in router._pending_routed_blocks
     assert await router._server_state[server].matched_tokens(
         info["block_hashes"], hash_algo=info["hash_algo"]) == 0
 
@@ -2051,7 +2077,7 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
             assert req.prompt_token_ids == reference
 
 
-def test_prefix_cache_tokenize_encodes_only_delta(servers):
+def test_prefix_cache_tokenize_uses_canonical_encoding(servers):
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=4)
@@ -2065,7 +2091,7 @@ def test_prefix_cache_tokenize_encodes_only_delta(servers):
 
     tok.encode = _recording_encode
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
-        for index, convo in enumerate(_grow_conversation()):
+        for convo in _grow_conversation():
             encoded_lengths.clear()
             req = ChatCompletionRequest(model="mock", messages=convo)
             rendered = tok.apply_chat_template(
@@ -2074,8 +2100,7 @@ def test_prefix_cache_tokenize_encodes_only_delta(servers):
                 tokenize=False)
             router._tokenize(req)
             assert encoded_lengths
-            if index >= 1:
-                assert min(encoded_lengths) < len(rendered)
+            assert encoded_lengths == [len(rendered)]
 
 
 def test_prefix_cache_tokenize_falls_back_on_divergent_prefix(servers):

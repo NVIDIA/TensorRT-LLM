@@ -45,6 +45,7 @@ def _make_active_request(
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
+    req.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
     req.state = (
@@ -509,12 +510,17 @@ class MockPadDummyExecutor:
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
+        self._pending_adp_dummy_request = None
+        self._enable_dsv4_adp_dummy_fixes = True
         self.max_num_tokens = None
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
+        self.dist.tp_allgather.side_effect = lambda value: [value]
 
         self.kv_cache_manager = Mock()
+        self.kv_cache_manager.mapping.has_cp_helix.return_value = False
+        self.kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
         dummy_req = Mock()
         dummy_req.is_attention_dp_dummy = True
         self.kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
@@ -526,6 +532,7 @@ class MockPadDummyExecutor:
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
+    _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
 
 

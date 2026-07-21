@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
@@ -27,10 +28,10 @@ using TensorPtr = DecoderState::TensorPtr;
 
 BeamSearchBuffers::BeamSearchBuffers(BufferManager const& bufferManager)
     : mOutputBeamHypotheses{}
-    , mCumLogProbsTmp(bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT))
+    , mCumLogProbsTmp(bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT))
 {
     mOutputBeamHypotheses.empty(bufferManager);
-    mCumLogProbsTmp = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kFLOAT);
+    mCumLogProbsTmp = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kFLOAT);
 
     int device;
     cudaGetDevice(&device);
@@ -54,8 +55,8 @@ DecoderState::DecoderState()
 }
 
 void DecoderState::setup(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
-    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, BufferManager const& bufferManager)
+    SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, tensorrt_llm::DataType dtype,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     setupBuffers(dtype, bufferManager);
@@ -64,7 +65,7 @@ void DecoderState::setup(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, Si
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& bufferManager)
+void DecoderState::setupBuffers(tensorrt_llm::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
@@ -114,7 +115,7 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
 }
 
 void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& speculativeDecodingMode,
-    SizeType32 maxTokensPerEngineStep, nvinfer1::DataType dtype, ModelConfig const& modelConfig,
+    SizeType32 maxTokensPerEngineStep, tensorrt_llm::DataType dtype, ModelConfig const& modelConfig,
     WorldConfig const& worldConfig, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -124,8 +125,8 @@ void DecoderState::setupSpeculativeDecoding(SpeculativeDecodingMode const& specu
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setupSpeculativeDecodingBuffers(
-    SpeculativeDecodingMode const speculativeDecodingMode, nvinfer1::DataType dtype, BufferManager const& bufferManager)
+void DecoderState::setupSpeculativeDecodingBuffers(SpeculativeDecodingMode const speculativeDecodingMode,
+    tensorrt_llm::DataType dtype, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -151,13 +152,13 @@ void DecoderState::setupSpeculativeDecodingBuffers(
     if (speculativeDecodingMode.predictsDraftTokens())
     {
         speculativeDecodingOutputs.nextDraftTokens
-            = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+            = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
         if (speculativeDecodingMode.variableDraftLength())
         {
             speculativeDecodingOutputs.nextDraftTokensLen
-                = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+                = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
             speculativeDecodingOutputs.prevDraftTokensLen
-                = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+                = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
         }
     }
     if (speculativeDecodingMode.isLookaheadDecoding())
@@ -167,11 +168,11 @@ void DecoderState::setupSpeculativeDecodingBuffers(
     if (speculativeDecodingMode.needsKVCacheRewind())
     {
         speculativeDecodingOutputs.acceptedTokensLen
-            = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+            = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
         speculativeDecodingOutputs.acceptedLengthsCumSum
-            = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+            = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
         speculativeDecodingOutputs.pathsOffsets
-            = bufferManager.emptyTensor(MemoryType::kGPU, nvinfer1::DataType::kINT32);
+            = bufferManager.emptyTensor(MemoryType::kGPU, tensorrt_llm::DataType::kINT32);
     }
     dOutput->speculativeDecodingOutputs = speculativeDecodingOutputs;
 
