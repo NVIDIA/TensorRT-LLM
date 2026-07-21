@@ -88,6 +88,22 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
+def _resolve_disagg_transceiver_route(
+    cache_transceiver_config: Optional[CacheTransceiverConfig],
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the effective backend and runtime used for manager routing."""
+    if cache_transceiver_config is None:
+        return None, None
+
+    backend, _ = cache_transceiver_config._resolve_default_backend()
+    runtime = cache_transceiver_config.transceiver_runtime
+    if runtime == "auto":
+        # Model loading normally resolves ``auto``. Paths that skip model
+        # defaults use the global C++ fallback, matching transceiver creation.
+        runtime = None
+    return backend, runtime
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -101,8 +117,14 @@ def get_kv_cache_manager_cls(
     unified-pool default.
 
     V1 is the default for hybrid Mamba models. V2 is selected only by an
-    explicit ``kv_cache_config.use_kv_cache_manager_v2=True`` and is rejected
-    for disaggregated serving until its transceiver/page-table adapter exists.
+    explicit ``kv_cache_config.use_kv_cache_manager_v2=True``. In
+    disaggregated serving, V2 additionally requires the Python transceiver
+    with the NIXL backend. Unsupported explicit V2 routes fail rather than
+    falling back to a different manager.
+
+    Env-var overrides:
+      * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager in aggregated serving.
+      * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -131,12 +153,6 @@ def get_kv_cache_manager_cls(
             or state_config.additional_snapshot_offsets_from_end)
         use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
 
-        if is_disagg and use_v2:
-            raise ValueError(
-                "KV cache manager V2 for hybrid Mamba models is not "
-                "supported with disaggregated serving. Set "
-                "use_kv_cache_manager_v2=False or 'auto' to use a V1 "
-                "Mamba cache manager.")
         if has_additional_snapshots and not use_v2:
             raise ValueError("Mamba additional snapshot offsets require "
                              "use_kv_cache_manager_v2=True; V1 supports only "
@@ -151,16 +167,29 @@ def get_kv_cache_manager_cls(
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
         if is_disagg:
-            if kv_cache_config.enable_block_reuse:
+            backend, runtime = _resolve_disagg_transceiver_route(
+                cache_transceiver_config)
+            if use_v2:
+                if runtime != "PYTHON" or backend != "NIXL":
+                    raise ValueError(
+                        "KV cache manager V2 for hybrid Mamba disaggregated "
+                        "serving requires transceiver_runtime='PYTHON' with "
+                        "backend='NIXL'.")
+            else:
+                if (kv_cache_config.enable_block_reuse and runtime == "PYTHON"):
+                    raise ValueError(
+                        "Hybrid Mamba disaggregated serving with block reuse "
+                        "and transceiver_runtime='PYTHON' requires "
+                        "use_kv_cache_manager_v2=True.")
+                if kv_cache_config.enable_block_reuse:
+                    return CppMambaHybridCacheManager
+                if runtime == "PYTHON" and backend == "NIXL":
+                    logger.info("Python transceiver detected; using "
+                                "MixedMambaHybridCacheManager for hybrid model")
+                    return MixedMambaHybridCacheManager
                 return CppMambaHybridCacheManager
-            if (cache_transceiver_config is not None and
-                    cache_transceiver_config.transceiver_runtime == "PYTHON"):
-                logger.info("Python transceiver detected; using "
-                            "MixedMambaHybridCacheManager for hybrid model")
-                return MixedMambaHybridCacheManager
-            return CppMambaHybridCacheManager
 
-        if use_py_mamba_cache_manager():
+        if use_py_mamba_cache_manager() and not is_disagg:
             if use_v2:
                 raise ValueError(
                     "TRTLLM_USE_PY_MAMBA=1 conflicts with explicit "
@@ -1913,6 +1942,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+    if issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+        manager_extra_kwargs["is_disagg"] = is_disagg
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -2016,7 +2047,9 @@ def _create_kv_cache_manager(
                                          and mamba_params.mamba_ssm_cache_dtype
                                          == torch.float16)
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if not issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+        if issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+            mamba_manager_extra_kwargs["conv_state_layout"] = "x_b_c"
+        else:
             mamba_manager_extra_kwargs["model_type"] = "nemotron_hybrid"
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
@@ -2115,7 +2148,9 @@ def _create_kv_cache_manager(
                     ("ENABLED" if use_replay else "DISABLED"))
 
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if not issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+        if issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+            mamba_manager_extra_kwargs["conv_state_layout"] = "q_k_v"
+        else:
             mamba_manager_extra_kwargs["model_type"] = "qwen3_next"
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
