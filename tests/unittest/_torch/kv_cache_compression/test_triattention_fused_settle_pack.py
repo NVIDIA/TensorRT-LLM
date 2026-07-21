@@ -4,8 +4,10 @@
 """The fused settle-and-pack kernel must reproduce the original two-kernel
 sequence byte for byte.
 
-The original tie settlement and move-source packing kernels stay in the
-module as the reference here: every case launches them on one set of buffers
+The reference legs are the pre-fusion kernels: the tie-settlement copy
+kept in this file (its production original was deleted once the fused
+kernel became the only launched settle path) and the move-source packing
+kernel the module still ships for the draft flow: every case launches them on one set of buffers
 and the fused kernel on an identically initialized set, then requires
 ``torch.equal`` on the kept ordinals, the dense move sources, and the SWA
 move sources -- including the buffer regions neither path overwrites (rows
@@ -15,6 +17,8 @@ forwards those stale entries the same way in both paths).
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from conftest import encode_block_offsets as _encode_block_offsets
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
@@ -25,9 +29,90 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _pack_compaction_sources_kernel,
-    _settle_ties_after_topk_kernel,
     _settle_ties_and_pack_compaction_sources_kernel,
 )
+
+
+@triton.jit
+def _settle_ties_after_topk_kernel(
+    scores,
+    seq_lens,
+    prompt_offsets,
+    provisional_indices,
+    output_indices,
+    WIDTH: tl.constexpr,
+    KEEP_COUNT: tl.constexpr,
+    OUTPUT_WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Resolve boundary ties and emit increasing physical token indices.
+
+    Pre-fusion standalone kept verbatim as the fused kernel's bit-equality
+    reference; the production module ships only the fused launch.
+    """
+    row = tl.program_id(0)
+    row_scores = scores + row * WIDTH
+    row_selected = provisional_indices + row * KEEP_COUNT
+    row_output = output_indices + row * OUTPUT_WIDTH
+    # Scores are decode-relative; this row's pinned prompt length rebases the
+    # emitted ordinals to absolute positions (per row, so one launch may mix
+    # prompt lengths).
+    prompt_len = tl.load(prompt_offsets + row)
+
+    threshold = float("inf")
+    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
+        selected_offset = start + tl.arange(0, BLOCK)
+        selected_mask = selected_offset < KEEP_COUNT
+        token_index = tl.load(
+            row_selected + selected_offset,
+            mask=selected_mask,
+            other=0,
+        )
+        selected_score = tl.load(
+            row_scores + token_index,
+            mask=selected_mask,
+            other=float("inf"),
+        ).to(tl.float32)
+        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
+
+    seq_len = tl.load(seq_lens + row)
+    greater_count = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
+
+    tie_quota = KEEP_COUNT - greater_count
+    output_count = 0
+    ties_seen = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater = valid & (score > threshold)
+        tied = valid & (score == threshold)
+        tied_i32 = tied.to(tl.int32)
+        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
+        selected = greater | (tied & (tie_rank < tie_quota))
+        selected_i32 = selected.to(tl.int32)
+        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
+        tl.store(
+            row_output + write_offset,
+            token_index + prompt_len,
+            mask=selected,
+        )
+        output_count += tl.sum(selected_i32)
+        ties_seen += tl.sum(tied_i32)
+
 
 _BLOCK = 256
 _NUM_WARPS = 4

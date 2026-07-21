@@ -1026,88 +1026,6 @@ def prepare_per_head_scores(
     )
 
 
-@triton.jit
-def _settle_ties_after_topk_kernel(
-    scores,
-    seq_lens,
-    prompt_offsets,
-    provisional_indices,
-    output_indices,
-    WIDTH: tl.constexpr,
-    KEEP_COUNT: tl.constexpr,
-    OUTPUT_WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Resolve boundary ties and emit increasing physical token indices.
-
-    The production selectors launch the fused settle-and-pack kernel below;
-    this standalone version is kept as the reference the unit tests compare
-    the fused kernel against.
-    """
-    row = tl.program_id(0)
-    row_scores = scores + row * WIDTH
-    row_selected = provisional_indices + row * KEEP_COUNT
-    row_output = output_indices + row * OUTPUT_WIDTH
-    # Scores are decode-relative; this row's pinned prompt length rebases the
-    # emitted ordinals to absolute positions (per row, so one launch may mix
-    # prompt lengths).
-    prompt_len = tl.load(prompt_offsets + row)
-
-    threshold = float("inf")
-    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
-        selected_offset = start + tl.arange(0, BLOCK)
-        selected_mask = selected_offset < KEEP_COUNT
-        token_index = tl.load(
-            row_selected + selected_offset,
-            mask=selected_mask,
-            other=0,
-        )
-        selected_score = tl.load(
-            row_scores + token_index,
-            mask=selected_mask,
-            other=float("inf"),
-        ).to(tl.float32)
-        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
-
-    seq_len = tl.load(seq_lens + row)
-    greater_count = 0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
-        score = tl.load(
-            row_scores + token_index,
-            mask=valid,
-            other=float("-inf"),
-        ).to(tl.float32)
-        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
-
-    tie_quota = KEEP_COUNT - greater_count
-    output_count = 0
-    ties_seen = 0
-    for start in tl.static_range(0, WIDTH, BLOCK):
-        token_index = start + tl.arange(0, BLOCK)
-        valid = (token_index < WIDTH) & (token_index < seq_len)
-        score = tl.load(
-            row_scores + token_index,
-            mask=valid,
-            other=float("-inf"),
-        ).to(tl.float32)
-        greater = valid & (score > threshold)
-        tied = valid & (score == threshold)
-        tied_i32 = tied.to(tl.int32)
-        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
-        selected = greater | (tied & (tie_rank < tie_quota))
-        selected_i32 = selected.to(tl.int32)
-        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
-        tl.store(
-            row_output + write_offset,
-            token_index + prompt_len,
-            mask=selected,
-        )
-        output_count += tl.sum(selected_i32)
-        ties_seen += tl.sum(tied_i32)
-
-
 # --------------------------------------------------------------------------- #
 # Compaction: pack the kept ordinals into per-request move indices.           #
 # --------------------------------------------------------------------------- #
@@ -1214,8 +1132,8 @@ def _settle_ties_and_pack_compaction_sources_kernel(
 ):
     """Settle one selection row's ties, then pack its compaction move sources.
 
-    One program per (request, selection row). The first half repeats
-    ``_settle_ties_after_topk_kernel`` verbatim: recover the top-k threshold
+    One program per (request, selection row). The first half settles the
+    provisional top-k: recover the top-k threshold
     from the provisional selection, count the strictly greater scores, then
     emit the kept ordinals in increasing order, rebased by the row's pinned
     prompt length. With ``HAS_PACK`` the same program then continues with the
@@ -1225,7 +1143,8 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     same conditions as the standalone kernel. Union selection has one row per
     request feeding every KV head's packed row, so that single program writes
     all of them. ``HAS_PACK=False`` compiles the second half away, leaving
-    exactly the standalone settle. Fusing the two launches was suggested by
+    exactly the settle stage (its pre-fusion standalone copy lives in the
+    fused-kernel unit test as the bit-equality reference). Fusing the two launches was suggested by
     Fanrong Li (torch-graph review 2026-07-20).
     """
     request = tl.program_id(0)
