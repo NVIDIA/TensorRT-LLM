@@ -23,11 +23,14 @@ from __future__ import annotations
 import dataclasses
 import functools
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 import torch
 
 from ..params import SparseParams
+
+if TYPE_CHECKING:
+    from .msa_plan_cache import MsaPlanCache
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,13 @@ class MiniMaxM3SparseParams(SparseParams):
 
     algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
     num_index_heads: int = 4
+    # Sparse index heads paired with each KV head
+    # (index_group = num_index_heads_global // num_kv_heads_global). Under
+    # TP a rank holding KV heads `[s, e)` scores with index heads
+    # `[s*index_group, e*index_group)`. `None` means "derive from the
+    # per-rank KV head count" (single-GPU / tests, where per-rank equals
+    # global).
+    index_group: Optional[int] = None
     sparse_index_dim: int = 128
     block_size: int = 128
     topk: int = 16
@@ -43,6 +53,24 @@ class MiniMaxM3SparseParams(SparseParams):
     local_blocks: int = 1
     score_type: str = "max"
     disable_index_value: bool = True
+    # When True, the layer dispatches the sparse forward through the
+    # MSA-backed FMHA runtime (`fmha_sm100` + `sparse_topk_select`)
+    # instead of the in-tree Triton + SDPA reference path. The MSA stack
+    # is only available on SM100 and requires the external
+    # `fmha_sm100` package; the layer raises a descriptive error if
+    # it is requested without those preconditions met.
+    use_msa: bool = False
+
+    @property
+    def indices_block_size(self) -> int:
+        """Block granularity of the sparse attention indices.
+
+        `TrtllmAttention.forward` reads this off the sparse params to
+        stamp `forward_args.sparse_prediction.sparse_attn_indices_block_size`.
+        For MiniMax-M3 the per-query selected indices are KV *block* indices,
+        so the granularity is the sparse block size.
+        """
+        return self.block_size
 
 
 @dataclass(frozen=True)
@@ -109,12 +137,32 @@ class MiniMaxM3SparseConfig:
     ) -> "MiniMaxM3SparseConfig":
         """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
         and the per-rank model geometry.
+
+        The per-rank index-head count is `index_group` heads per local KV
+        head, so index head `i` stays paired with KV head `i` under TP
+        (the model layer slices `idx_q` with the matching offsets; see
+        `modeling_minimaxm3.py`). Selecting blocks from all index heads'
+        scores would give every KV head the union/max over all index heads
+        instead of its own head's top-k.
         """
+        index_group = sparse_params.index_group
+        if index_group is None:
+            # Single-GPU / tests: per-rank KV heads equal the global count.
+            if int(sparse_params.num_index_heads) % int(num_kv_heads) != 0:
+                raise ValueError(
+                    f"num_index_heads ({sparse_params.num_index_heads}) must be "
+                    f"divisible by num_kv_heads ({num_kv_heads})"
+                )
+            index_group = int(sparse_params.num_index_heads) // int(num_kv_heads)
+        index_group = int(index_group)
+        # Per-rank KV heads never exceed the global count, so this is just
+        # index_group heads per local KV head.
+        num_index_heads_local = index_group * int(num_kv_heads)
         return cls(
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
             head_dim=int(head_dim),
-            num_index_heads=int(sparse_params.num_index_heads),
+            num_index_heads=num_index_heads_local,
             sparse_index_dim=int(sparse_params.sparse_index_dim),
             block_size=int(sparse_params.block_size),
             topk=int(sparse_params.topk),
@@ -122,6 +170,34 @@ class MiniMaxM3SparseConfig:
             local_blocks=int(sparse_params.local_blocks),
             score_type=str(sparse_params.score_type),
         )
+
+
+@dataclass
+class M3PlanTables:
+    """CUDA-graph-stable MSA staging for one scheduler step.
+
+    `kv_indices` / `kv_page_indptr` are prefix views into per-metadata-
+    instance persistent buffers (`MsaPlanCache`), refreshed by
+    `prepare()` outside any capture window; the CPU tensors feed the
+    eager prefill plan path.
+    """
+
+    kv_indices: torch.Tensor
+    kv_page_indptr: torch.Tensor
+    qo_lens_cpu: torch.Tensor
+    kv_lens_cpu: torch.Tensor
+    qo_offset_cpu: Optional[torch.Tensor]
+    max_batch: int
+    max_kv_len: int
+
+
+@dataclass
+class M3StepState:
+    """Per-step MiniMax-M3 sparse state built by `metadata.prepare()`."""
+
+    metadata: "MiniMaxM3SparseAttentionMetadata"
+    out_cache_loc: torch.Tensor
+    plans: Optional[M3PlanTables] = None
 
 
 @dataclass
@@ -674,6 +750,175 @@ def build_runtime_metadata_from_kv_manager(
     return meta, out_cache_loc
 
 
+def _build_msa_plans_for_metadata(
+    *,
+    m3_meta: "MiniMaxM3SparseAttentionMetadata",
+    block_size: int,
+    cache_device: torch.device,
+    max_batch: int,
+    plan_cache: Optional["MsaPlanCache"],
+) -> Tuple[Optional["MsaPlanCache"], Optional[M3PlanTables]]:
+    """Refresh the persistent paged-KV staging for one scheduler step.
+
+    Returns `(plan_cache, plan_tables)`. `plan_cache` owns the
+    per-metadata-instance persistent `kv_indices` / `kv_page_indptr`
+    buffers (stable `data_ptr()` across CUDA graph replays);
+    `plan_tables` carries the staged views plus the per-request CPU
+    lens/offsets the prefill path consumes.
+    """
+    # Local import so this file stays importable on hosts without MSA.
+    from .msa_plan_cache import MsaPlanCache
+
+    # 1) Derive per-request CPU tensors (mirrors msa_backend.
+    #    _whole_batch_lens, kept in sync here so the forward sees the
+    #    same values it would have built itself).
+    seq_lens_cpu = m3_meta.seq_lens_cpu.to(torch.int32)
+    batch = int(seq_lens_cpu.shape[0])
+    if m3_meta.is_prefill:
+        if m3_meta.extend_seq_lens_cpu is None or m3_meta.prefix_lens is None:
+            # Prefill metadata is incomplete; skip staging. The sparse
+            # forward's eager fallback builds the page table in-forward
+            # (safe when outside capture).
+            return plan_cache, None
+        qo_lens_cpu = torch.tensor(m3_meta.extend_seq_lens_cpu, dtype=torch.int32)
+        qo_offset_cpu = m3_meta.prefix_lens.detach().to(device="cpu", dtype=torch.int32)
+    else:
+        qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
+        qo_offset_cpu = (seq_lens_cpu - 1).to(torch.int32)
+
+    # 2) Allocate the staging buffers lazily on the first call. Sizes
+    #    are picked so any padded batch up to `max_batch` (from
+    #    `AttentionMetadata.max_num_sequences`) fits.
+    if plan_cache is None:
+        # kv_indices is max_batch * max_pages_per_seq; page_size is the
+        # sparse config's block_size (128 for M3) so max_pages_per_seq
+        # comes from req_to_token's max_kv_len column dimension.  Use
+        # the current metadata's `req_to_token` as the size witness.
+        max_kv_len = int(m3_meta.req_to_token.shape[1])
+        max_pages_per_seq = max(1, max_kv_len // int(block_size))
+        max_kv_indices = max_batch * max_pages_per_seq
+        plan_cache = MsaPlanCache(
+            device=cache_device,
+            max_batch=max_batch,
+            max_kv_indices=max_kv_indices,
+        )
+
+    # 3) Refresh the page table in-place into the persistent buffers.
+    plan_cache.build_from_metadata(
+        req_to_token=m3_meta.req_to_token,
+        slot_ids=m3_meta.slot_ids,
+        seq_lens=m3_meta.seq_lens,
+        seq_lens_cpu=m3_meta.seq_lens_cpu,
+        page_size=int(block_size),
+    )
+
+    plans = M3PlanTables(
+        kv_indices=plan_cache.kv_indices,
+        kv_page_indptr=plan_cache.kv_page_indptr,
+        qo_lens_cpu=qo_lens_cpu,
+        kv_lens_cpu=seq_lens_cpu,
+        qo_offset_cpu=qo_offset_cpu,
+        max_batch=int(plan_cache.max_batch),
+        max_kv_len=int(m3_meta.req_to_token.shape[1]),
+    )
+    return plan_cache, plans
+
+
+def build_m3_sparse_metadata_and_plans(
+    meta,
+    *,
+    static_buffers: Optional[dict],
+    plan_cache: Optional["MsaPlanCache"],
+    plan_block_size: Optional[int] = None,
+) -> Tuple[Optional[M3StepState], Optional["MsaPlanCache"]]:
+    """Build the per-step MiniMax-M3 sparse step state and MSA plans.
+
+    `meta` must expose the standard attention-metadata attributes;
+    `static_buffers` and `plan_cache` are the caller-owned
+    CUDA-graph-stable buffers (passed through so their `data_ptr()` stays
+    constant across replays). When `plan_block_size` is given (the sparse
+    KV block size, == the cache manager's `tokens_per_block`) the MSA
+    page-table staging is refreshed into `plan_cache` and attached as
+    `M3StepState.plans`.
+
+    Returns `(step_state_or_None, plan_cache)`; None when the manager is
+    not an M3 sparse cache or the batch is empty.
+    """
+    kv_cache_manager = getattr(meta, "kv_cache_manager", None)
+    if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
+        return None, plan_cache
+    request_ids = getattr(meta, "request_ids", None)
+    seq_lens = getattr(meta, "seq_lens", None)
+    if request_ids is None or seq_lens is None:
+        return None, plan_cache
+    num_contexts = int(getattr(meta, "num_contexts", 0) or 0)
+    batch_size = int(seq_lens.shape[0])
+    if batch_size == 0:
+        return None, plan_cache
+
+    try:
+        layer_buf = kv_cache_manager.get_buffers(0)
+        cache_device = layer_buf.device
+    except Exception:
+        cache_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    seq_lens_cpu = getattr(meta, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = seq_lens.detach().to("cpu")
+
+    kv_cache_params = getattr(meta, "kv_cache_params", None)
+    num_cached_per_seq = (
+        kv_cache_params.num_cached_tokens_per_seq
+        if kv_cache_params is not None
+        else [0] * batch_size
+    )
+    kv_lens_cpu_list = [
+        int(num_cached_per_seq[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
+    ]
+    kv_lens_cpu = torch.tensor(kv_lens_cpu_list, dtype=torch.int32)
+    kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
+
+    is_extend = num_contexts > 0
+    if is_extend:
+        prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
+        extend_seq_lens_cpu = [kv_lens_cpu_list[b] - prefix_lens_list[b] for b in range(batch_size)]
+        prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int32, device=cache_device)
+        m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            seq_lens=kv_lens_dev,
+            seq_lens_cpu=kv_lens_cpu,
+            is_prefill=True,
+            prefix_lens=prefix_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            device=cache_device,
+            static_buffers=static_buffers,
+        )
+    else:
+        m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            seq_lens=kv_lens_dev,
+            seq_lens_cpu=kv_lens_cpu,
+            is_prefill=False,
+            device=cache_device,
+            static_buffers=static_buffers,
+        )
+
+    step_state = M3StepState(metadata=m3_meta, out_cache_loc=out_cache_loc)
+
+    if plan_block_size is not None:
+        max_batch = int(getattr(meta, "max_num_sequences", None) or meta.max_num_requests)
+        plan_cache, step_state.plans = _build_msa_plans_for_metadata(
+            m3_meta=m3_meta,
+            block_size=int(plan_block_size),
+            cache_device=cache_device,
+            max_batch=max_batch,
+            plan_cache=plan_cache,
+        )
+    return step_state, plan_cache
+
+
 @functools.lru_cache(maxsize=1)
 def get_minimax_m3_attention_metadata_cls():
     """Return :class:`MiniMaxM3AttentionMetadata` (lazy import).
@@ -908,6 +1153,7 @@ __all__ = [
     "MiniMaxM3SparseConfig",
     "MiniMaxM3SparseAttentionMetadata",
     "allocate_minimax_m3_static_buffers",
+    "build_m3_sparse_metadata_and_plans",
     "build_runtime_metadata_from_kv_manager",
     "ensure_metadata_on_device",
     "get_minimax_m3_attention_metadata_cls",

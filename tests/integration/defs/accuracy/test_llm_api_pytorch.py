@@ -7683,8 +7683,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_mxfp8(self, tp_size, ep_size):
+    @parametrize_with_ids("use_msa", [True, False])
+    def test_mxfp8(self, use_msa):
+        tp_size, ep_size = 4, 4
         # MXFP8 checkpoint: weights are MXFP8 (e4m3 + UE8M0 1x32 block
         # scales) with MXFP8 dynamic activations; the KV cache stays in
         # BF16 and the sparse attention path is unchanged from BF16.
@@ -7694,9 +7695,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         # model + KV footprint; cap KV cache at 0.4 of free memory and
         # constrain batch / token budget so the runtime allocator stays
         # under the PyTorch cap.
+        # The MSA sparse kernel requires page_size == sparse_block_size(128).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        enable_block_reuse=False)
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            sparse_use_msa=use_msa)
         with LLM(model_path,
                  tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=ep_size,
@@ -7712,15 +7716,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             task = GSM8K(model_name)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
-    def test_mxfp8_piecewise_cuda_graph(self, tp_size, ep_size):
+    @parametrize_with_ids("use_msa", [True, False])
+    def test_mxfp8_piecewise_cuda_graph(self, use_msa):
+        tp_size, ep_size = 4, 4
         model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
         model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
+        # The MSA sparse kernel requires page_size == sparse_block_size(128).
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
-                                        enable_block_reuse=False)
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            sparse_use_msa=use_msa)
         cuda_graph_config = CudaGraphConfig(
             enable_padding=True, batch_sizes=[1, 2, 4, 8, 12, 16, 24, 32])
         torch_compile_config = TorchCompileConfig(
@@ -7747,16 +7755,20 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
-    @parametrize_with_ids("tp_size,ep_size", [(4, 4)])
-    def test_nvfp4(self, tp_size, ep_size):
+    @parametrize_with_ids("use_msa", [True, False])
+    def test_nvfp4(self, use_msa):
+        tp_size, ep_size = 4, 4
         # NVFP4 checkpoint: MXFP8 base layers with NVFP4 routed experts
         # (MIXED_PRECISION checkpoint); the KV cache stays in BF16 and the
         # sparse attention path is unchanged from BF16.
         model_name = "nvidia/MiniMax-M3-NVFP4"
         model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        # The MSA sparse kernel requires page_size == sparse_block_size(128)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
-                                        enable_block_reuse=False)
-        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+                                        enable_block_reuse=False,
+                                        tokens_per_block=128 if use_msa else 32)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig(
+            sparse_use_msa=use_msa)
         moe_config = MoeConfig(backend="CUTLASS")
         with LLM(model_path,
                  tensor_parallel_size=tp_size,

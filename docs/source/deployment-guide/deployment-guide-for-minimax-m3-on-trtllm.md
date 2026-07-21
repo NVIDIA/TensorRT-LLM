@@ -60,6 +60,7 @@ Both checkpoints ship their own chat template (`chat_template.jinja`), which is 
 * **`max_seq_len` must be capped for CUDA graphs.** The dense GQA expansion in the first few attention layers and the per-Q FP32 expansion in the sparse decode kernel allocate temporary tensors whose size grows linearly with the warmup decode's `max_k`. If `max_seq_len` is left at the checkpoint default, that `max_k` follows `max_position_embeddings` (1M for MXFP8, 512K for BF16) and the resulting gigabyte-scale single-allocation request exceeds the caching allocator's CUDA-graph-safe path, so capture fails with `cudaErrorStreamCaptureUnsupported` / OOM. The curated YAML therefore sets `max_seq_len` to a small value just above ISL+OSL (`2068` for the 1k/1k benchmark) so CUDA graphs can capture cleanly. Raise it for longer-context workloads, but expect a corresponding cut in `max_batch_size`.
 * **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.
 * **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture.
+* **Optional accelerated MSA kernels.** By default the sparse-attention layers run on the in-tree Triton reference path, which needs no extra packages. For higher performance on NVIDIA Blackwell (SM100) GPUs you can enable the MiniMax Sparse Attention (MSA) kernels by installing the external `fmha_sm100` package and setting `sparse_attention_config.sparse_use_msa: true`. This package is MIT-licensed, SM100-only, and not published on PyPI, so it is **not** installed with TensorRT LLM and must be installed manually — see [Optional: Accelerated MSA Attention Kernels](#optional-accelerated-msa-attention-kernels-fmha_sm100).
 
 ## Deployment Steps
 
@@ -77,6 +78,43 @@ Note:
 
 * See <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all available containers. Containers published in the main branch weekly have an `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 * If you want to use the latest main branch, you can build from source: [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html)
+
+### Optional: Accelerated MSA Attention Kernels (`fmha_sm100`)
+
+By default the MiniMax-M3 sparse-attention layers run on the in-tree Triton reference path, which requires no additional packages. On NVIDIA Blackwell (SM100) GPUs — including the GB200 target of this guide — you can optionally switch the sparse path to the **MiniMax Sparse Attention (MSA)** kernels for higher performance.
+
+The MSA kernels ship in the external `fmha_sm100` package (MSA: <https://github.com/MiniMax-AI/MSA>). This package is MIT-licensed, SM100-only, and **not published on PyPI**, so it is intentionally not a dependency of TensorRT LLM and is not installed by `pip install tensorrt-llm` or bundled in the NGC container. If you want the MSA path, install it yourself.
+
+**Prerequisites**
+
+* An NVIDIA Blackwell (SM100) GPU (e.g., B200 / GB200). The kernels are compiled and dispatched only for SM100.
+* A CUDA toolkit with `nvcc` on `PATH`. The MSA `csrc` kernels are JIT-compiled on first use, so the compiler must be available at runtime (it is present in the NGC TensorRT LLM container).
+* `git` (the package and its vendored CUTLASS headers are fetched from GitHub).
+
+**Install**
+
+Install the package into the same environment that runs the server (on every node, since each rank imports it). Pin the commit that matches your TensorRT LLM version:
+
+```bash
+pip install "git+https://github.com/MiniMax-AI/MSA.git@e2ebe7656649f619af0ad1d457b534283034655e"
+```
+
+This pulls MSA's own runtime dependencies (`nvidia-cutlass-dsl`, `quack-kernels`, `apache-tvm-ffi`, `ninja`, `pybind11`, `cuda-python`, `jinja2`) and fetches the CUTLASS headers via git submodule.
+
+**Enable**
+
+Set `sparse_use_msa: true` in the `sparse_attention_config` block of your `--extra_llm_api_options` YAML, and make sure the KV-cache block size matches the MSA sparse block size of 128 (`kv_cache_config.tokens_per_block: 128`):
+
+```yaml
+sparse_attention_config:
+  algorithm: minimax_m3
+  sparse_use_msa: true
+kv_cache_config:
+  enable_block_reuse: false
+  tokens_per_block: 128
+```
+
+If `sparse_use_msa: true` is set but `fmha_sm100` is not installed (or the GPU is not SM100), the server raises a descriptive error the first time a sparse layer dispatches, instructing you to install the package or unset the flag to fall back to the Triton reference path.
 
 ### Recommended Performance Settings
 
@@ -150,6 +188,10 @@ Must be set to `minimax_m3`. There is no dense fallback for the MiniMax-M3 spars
 ##### `kv_cache_config.enable_block_reuse`
 
 Must be `false`. The sparse-attention path does not support KV cache block reuse across requests with shared prefixes.
+
+##### `sparse_attention_config.sparse_use_msa` (optional)
+
+Defaults to `false` (the in-tree Triton reference path). Set to `true` to route the sparse-attention layers through the accelerated MSA kernels. This requires the external `fmha_sm100` package and an SM100 GPU, and requires `kv_cache_config.tokens_per_block: 128` (the MSA sparse block size). See [Optional: Accelerated MSA Attention Kernels](#optional-accelerated-msa-attention-kernels-fmha_sm100) for installation and prerequisites.
 
 ## Testing API Endpoint
 

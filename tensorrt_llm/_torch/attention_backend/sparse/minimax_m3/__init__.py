@@ -58,6 +58,7 @@ from .metadata import (
     get_minimax_m3_attention_metadata_cls,
     replace_metadata,
 )
+from .msa_backend import get_minimax_m3_msa_attention_backend_cls
 
 __all__ = [
     "MiniMaxM3KVCacheManagerV2",
@@ -70,6 +71,7 @@ __all__ = [
     "get_minimax_m3_attention_backend_cls",
     "get_minimax_m3_attention_metadata_cls",
     "get_minimax_m3_kv_cache_manager_cls",
+    "get_minimax_m3_msa_attention_backend_cls",
     "minimax_m3_sparse_decode",
     "minimax_m3_sparse_prefill",
     "replace_metadata",

@@ -730,6 +730,15 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    sparse_use_msa: bool = Field(
+        default=False,
+        description=("If True, route the sparse forward through the MSA-backed "
+                     "FMHA runtime (`fmha_sm100` and `sparse_topk_select`) "
+                     "instead of the in-tree Triton and SDPA reference path. "
+                     "Requires SM100 and the external `fmha_sm100` package "
+                     "(https://github.com/MiniMax-AI/MSA) to be importable."),
+        status="prototype",
+    )
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -741,8 +750,17 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
             MiniMaxM3SparseParams
 
+        # Sparse index heads paired with each KV head, used by the backend
+        # to localize index heads per TP rank. Derived from the
+        # checkpoint's global head counts; None if unavailable (the backend
+        # then falls back to the per-rank KV head count).
+        num_kv_heads_global = getattr(kwargs.get("pretrained_config"),
+                                      "num_key_value_heads", None)
+        index_group = (self.sparse_num_index_heads // int(num_kv_heads_global)
+                       if num_kv_heads_global else None)
         return MiniMaxM3SparseParams(
             num_index_heads=self.sparse_num_index_heads,
+            index_group=index_group,
             sparse_index_dim=self.sparse_index_dim,
             block_size=self.sparse_block_size,
             topk=self.sparse_topk_blocks,
@@ -750,6 +768,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             local_blocks=self.sparse_local_blocks,
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
+            use_msa=self.sparse_use_msa,
         )
 
 
