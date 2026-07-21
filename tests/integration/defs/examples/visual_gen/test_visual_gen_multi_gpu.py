@@ -273,7 +273,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
         )
 
     _ensure_slurm_external_launch_env()
-    ParallelConfig(**parallel).validate_world_size(world_size)
+    _parallel_config(**parallel).validate_world_size(world_size)
     model_path = _lpips_model_path("Wan2.2-T2V-A14B-Diffusers")
     _skip_if_missing(model_path, "Wan 2.2 checkpoint", is_dir=True)
 
