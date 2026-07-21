@@ -216,7 +216,9 @@ def _trtllm_launch_wrapper_world_size():
 
 
 def _multinode_subprocess_timeout():
-    return int(os.environ.get("TRTLLM_VISUAL_GEN_MULTINODE_TIMEOUT", "3600"))
+    # Default below the QA pipeline's outer --timeout=3600s so the inner srun
+    # timeout (with captured output) fires before pytest-timeout kills the test.
+    return int(os.environ.get("TRTLLM_VISUAL_GEN_MULTINODE_TIMEOUT", "3300"))
 
 
 def _resolve_slurm_master_addr():
