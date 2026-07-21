@@ -90,6 +90,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
+from .trace_log_utils import log_mem_history, log_mem_snapshot
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -113,6 +114,7 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+_RUNTIME_MEM_SNAPSHOT_INTERVAL_NS = 1_000_000_000
 
 
 class PPCommTag(IntEnum):
@@ -591,6 +593,9 @@ class PyExecutor:
         self.print_log = self.llm_args.print_iter_log
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
+        self._runtime_mem_profile_enabled = os.environ.get(
+            "TLLM_LOG_MEM_PROFILE", "") == "1"
+        self._last_runtime_mem_snapshot_ns: Optional[int] = None
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
@@ -1188,6 +1193,7 @@ class PyExecutor:
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold):
                 self.event_loop()
         except Exception as e:
+            self._log_runtime_oom(e, "event_loop")
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -1644,6 +1650,8 @@ class PyExecutor:
         def profile_step():
             nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
             calibrator.post_step(it)
+            if getattr(self, "_runtime_mem_profile_enabled", False):
+                self._maybe_log_runtime_mem_snapshot()
             if (self.iter_counter in self.profile_stop_iters
                     and not self.is_warmup):
                 assert enabled, "Inconsistent CUDA profiling state"
@@ -1761,6 +1769,62 @@ class PyExecutor:
                 calibrator.stop()
                 torch.cuda.synchronize()
                 torch.cuda.cudart().cudaProfilerStop()
+
+    def _maybe_log_runtime_mem_snapshot(self) -> None:
+        if not getattr(self, "_runtime_mem_profile_enabled", False):
+            return
+
+        now_ns = time.monotonic_ns()
+        last_ns = self._last_runtime_mem_snapshot_ns
+        if (last_ns is not None
+                and now_ns - last_ns < _RUNTIME_MEM_SNAPSHOT_INTERVAL_NS):
+            return
+        self._last_runtime_mem_snapshot_ns = now_ns
+
+        if self.dist.pp_size > 1:
+            loop = "pp"
+        elif self.disable_overlap_scheduler:
+            loop = "non_overlap"
+        else:
+            loop = "overlap"
+
+        kv_fields = {}
+        if self.kv_cache_manager is not None:
+            try:
+                kv_stats = self.kv_cache_manager.get_kv_cache_stats()
+                kv_fields = {
+                    "kv_used_blocks": kv_stats.used_num_blocks,
+                    "kv_free_blocks": kv_stats.free_num_blocks,
+                    "kv_max_blocks": kv_stats.max_num_blocks,
+                }
+            except Exception:
+                pass
+
+        log_mem_snapshot(
+            "runtime/before_iter",
+            iter=self.iter_counter,
+            loop=loop,
+            active_requests=len(self.active_requests),
+            prev_scheduled_requests=self.num_scheduled_requests,
+            **kv_fields,
+        )
+
+    def _log_runtime_oom(self, error, phase: str) -> None:
+        try:
+            if (not isinstance(error, torch.OutOfMemoryError)
+                    and "out of memory" not in str(error).lower()):
+                return
+
+            tag = f"oom/runtime/{phase}"
+            log_mem_snapshot(
+                tag,
+                force=True,
+                iter=getattr(self, "iter_counter", None),
+                active_requests=len(getattr(self, "active_requests", ())),
+            )
+            log_mem_history(tag)
+        except Exception:
+            pass
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
@@ -6445,6 +6509,7 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        self._log_runtime_oom(error_msg, "handled")
 
         budget_fatal = (self._error_budget.consume(error_msg)
                         if charge_budget else False)

@@ -46,7 +46,7 @@ def log_mem_history(reason: str) -> None:
             pass
 
 
-def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
+def log_mem_snapshot(tag: str, *, force: bool = False, **extra) -> None:
     """Log a compact snapshot of Torch and whole-device GPU memory.
 
     Routine snapshots are gated by ``TLLM_LOG_MEM_PROFILE=1`` and retained in
@@ -78,6 +78,7 @@ def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
         reserved_peak = torch.cuda.max_memory_reserved()
         device_used = total - free
         device_gap_estimate = device_used - reserved
+        extras = "".join(f" {key}={value}" for key, value in extra.items())
         message = (
             f"[mem-profile/{tag}] "
             f"rank={logger.rank} device={device} "
@@ -89,6 +90,7 @@ def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
             f"device_free={free / _GIB:.2f}GiB "
             f"device_total={total / _GIB:.2f}GiB "
             f"device_gap_estimate={device_gap_estimate / _GIB:.2f}GiB"
+            f"{extras}"
         )
         if profile_enabled and not force:
             _MEM_HISTORY.append((time.monotonic_ns(), message))
@@ -98,7 +100,10 @@ def log_mem_snapshot(tag: str, *, force: bool = False) -> None:
             logger.info(message)
     except Exception as error:
         # A diagnostic must not replace the failure it is trying to explain.
-        logger.warning(f"[mem-profile/{tag}] snapshot unavailable: {type(error).__name__}")
+        try:
+            logger.warning(f"[mem-profile/{tag}] snapshot unavailable: {type(error).__name__}")
+        except Exception:
+            pass
 
 
 def log_tensor_size(tag: str, tensor: torch.Tensor, **extra) -> None:

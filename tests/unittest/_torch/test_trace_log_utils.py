@@ -59,14 +59,15 @@ def test_mem_snapshot_logs_compact_counters(monkeypatch) -> None:
     monkeypatch.setattr(trace_log_utils.logger, "info", info)
     _mock_cuda_counters(monkeypatch)
 
-    trace_log_utils.log_mem_snapshot("stage/model")
+    trace_log_utils.log_mem_snapshot("stage/model", iter=7, active_requests=2)
 
     assert info.call_args.args[0] == (
         "[mem-profile/stage/model] rank=3 device=2 "
         "torch_alloc=1.00GiB torch_reserved=2.00GiB "
         "torch_alloc_peak=3.00GiB torch_reserved_peak=4.00GiB "
         "device_used=4.00GiB device_free=6.00GiB "
-        "device_total=10.00GiB device_gap_estimate=2.00GiB"
+        "device_total=10.00GiB device_gap_estimate=2.00GiB "
+        "iter=7 active_requests=2"
     )
     assert len(trace_log_utils._MEM_HISTORY) == 1
     assert trace_log_utils._MEM_HISTORY[0][1] == info.call_args.args[0]
