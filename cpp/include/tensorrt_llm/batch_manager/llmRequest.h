@@ -1233,6 +1233,18 @@ public:
         mEstimatedReusableTokens = estimatedReusableTokens;
     }
 
+    //! Get the absolute context positions at which recurrent-state snapshots are expected.
+    [[nodiscard]] std::vector<SizeType32> const& getExpectedSnapshotPoints() const noexcept
+    {
+        return mExpectedSnapshotPoints;
+    }
+
+    //! Set the absolute context positions at which recurrent-state snapshots are expected.
+    void setExpectedSnapshotPoints(std::vector<SizeType32> expectedSnapshotPoints)
+    {
+        mExpectedSnapshotPoints = std::move(expectedSnapshotPoints);
+    }
+
     void setDraftTokens(std::shared_ptr<VecTokens> const& draftTokens)
     {
         mDraftTokens = draftTokens;
@@ -2095,6 +2107,9 @@ protected:
     // capacity-scheduler queries. Reset to 0 after addSequenceBatch sets
     // the authoritative mPrepopulatedPromptLen and advances context position.
     mutable SizeType32 mEstimatedReusableTokens{0};
+
+    // Absolute context positions at which recurrent-state snapshots are expected.
+    std::vector<SizeType32> mExpectedSnapshotPoints;
 
     SizeType32 mMaxSentTokenLen;
 

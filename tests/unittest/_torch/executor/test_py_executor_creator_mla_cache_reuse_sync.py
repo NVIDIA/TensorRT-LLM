@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -112,21 +113,30 @@ class _DummyKvCacheCreator:
 class _DummyModelEngine:
     """Mock model engine that exposes attention runtime features and model configuration."""
 
-    def __init__(self, *, attn_runtime_features, kv_cache_quant_algo):
+    def __init__(
+        self,
+        *,
+        attn_runtime_features,
+        kv_cache_quant_algo,
+        enable_flash_mla=False,
+        max_seq_len=128,
+    ):
         """Initialize with runtime features and quantization algorithm.
 
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            enable_flash_mla: Whether to emulate the FlashMLA block-size override.
+            max_seq_len: Effective sequence length reported by the model engine.
         """
         self.attn_runtime_features = attn_runtime_features
-        self.max_seq_len = 128
+        self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
         self.sparse_attention_config = None
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
-                enable_flash_mla=False,
+                enable_flash_mla=enable_flash_mla,
                 is_generation=True,
                 pretrained_config=SimpleNamespace(),
                 quant_config=SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo),
@@ -184,7 +194,15 @@ def _make_llm_args():
     )
 
 
-def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
+def _run_create_py_executor(
+    monkeypatch,
+    *,
+    sm_version,
+    kv_cache_quant_algo,
+    cache_transceiver_config=None,
+    enable_flash_mla=False,
+    model_max_seq_len=128,
+):
     """Execute create_py_executor with mocked dependencies and return cache reuse flags.
 
     Mocks all external dependencies (model engine, resource managers, etc.) to isolate
@@ -195,11 +213,15 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        cache_transceiver_config: Optional transceiver configuration to mutate.
+        enable_flash_mla: Whether to emulate the FlashMLA block-size override.
+        model_max_seq_len: Effective sequence length reported by the model engine.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag) from created executor.
     """
     llm_args = _make_llm_args()
+    llm_args.cache_transceiver_config = cache_transceiver_config
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
@@ -248,6 +270,8 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            enable_flash_mla=enable_flash_mla,
+            max_seq_len=model_max_seq_len,
         )
 
     monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
@@ -335,3 +359,47 @@ def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch):
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
+
+
+def test_default_transceiver_buffer_rounds_up_to_tokens_per_block(monkeypatch):
+    config = CacheTransceiverConfig()
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        cache_transceiver_config=config,
+        model_max_seq_len=130,
+    )
+
+    assert config.max_tokens_in_buffer == 160
+
+
+def test_default_transceiver_buffer_uses_flash_mla_block_size(monkeypatch):
+    config = CacheTransceiverConfig()
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        cache_transceiver_config=config,
+        enable_flash_mla=True,
+        model_max_seq_len=130,
+    )
+
+    assert config.max_tokens_in_buffer == 192
+
+
+def test_explicit_transceiver_buffer_size_is_preserved(monkeypatch):
+    config = CacheTransceiverConfig(max_tokens_in_buffer=256)
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        cache_transceiver_config=config,
+        enable_flash_mla=True,
+        model_max_seq_len=130,
+    )
+
+    assert config.max_tokens_in_buffer == 256
