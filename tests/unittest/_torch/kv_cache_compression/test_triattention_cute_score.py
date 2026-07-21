@@ -10,7 +10,25 @@ import torch
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="TriAttention CuTe score kernel requires SM100",
 )
-def test_cute_score_matches_torch_mean_oracle(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "tokens_per_block,page_permutation,valid_lens",
+    [
+        # The originally validated geometry: 128-token pages, identity table.
+        (128, [0, 1], None),
+        # Production page size: a 64-token compute tile spans two pages, so a
+        # shuffled physical-page table catches any fragment/page mix-up.
+        (32, [3, 1, 4, 7, 5, 0, 2, 6], None),
+        # Ragged tails land mid-tile: the second page fragment of the last
+        # tile is clamped, and scores past the valid length are unspecified.
+        (32, [3, 1, 4, 7, 5, 0, 2, 6], [250, 198]),
+    ],
+)
+def test_cute_score_matches_torch_mean_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    tokens_per_block: int,
+    page_permutation: list,
+    valid_lens: "list | None",
+) -> None:
     pytest.importorskip("cutlass")
     monkeypatch.setenv("TRTLLM_TRIATTENTION_CUTE_SCORE", "1")
 
@@ -23,7 +41,11 @@ def test_cute_score_matches_torch_mean_oracle(monkeypatch: pytest.MonkeyPatch) -
     seq_len = 256
     num_q_heads = 8
     num_freqs = 32
-    pool = (0.125 * torch.randn(2, 2, 1, 128, 64, device=device)).to(torch.bfloat16)
+    num_pages = seq_len // tokens_per_block
+    assert sorted(page_permutation) == list(range(num_pages))
+    pool = (
+        0.125 * torch.randn(num_pages, 2, 1, tokens_per_block, 2 * num_freqs, device=device)
+    ).to(torch.bfloat16)
     q_real = 0.125 * torch.randn(1, num_q_heads, num_freqs, device=device)
     q_imag = 0.125 * torch.randn_like(q_real)
     mlr_coef = 0.125 * torch.randn_like(q_real)
@@ -37,9 +59,11 @@ def test_cute_score_matches_torch_mean_oracle(monkeypatch: pytest.MonkeyPatch) -
 
     # Native block-offset staging layout ([pool_slot, request, K/V plane,
     # block] int32): K-plane entries encode physical_page * kv_factor with
-    # kv_factor == 2. Both requests read pool pages [0, 1].
+    # kv_factor == 2. Both requests read the same (permuted) page sequence.
+    k_plane = [2 * page for page in page_permutation]
+    v_plane = [2 * page + 1 for page in page_permutation]
     block_offsets = torch.tensor(
-        [[[[0, 2], [1, 3]], [[0, 2], [1, 3]]]], dtype=torch.int32, device=device
+        [[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device
     )
     group = _FixedScoreGroup(
         [pool],
@@ -58,12 +82,18 @@ def test_cute_score_matches_torch_mean_oracle(monkeypatch: pytest.MonkeyPatch) -
         offsets,
         output_width=seq_len,
     )
-    keys = pool[:, 0, 0].reshape(seq_len, 2 * num_freqs).float()
+    keys = (
+        torch.cat([pool[page, 0, 0] for page in page_permutation], dim=0)
+        .reshape(seq_len, 2 * num_freqs)
+        .float()
+    )
     k_real = keys[:, :num_freqs]
     k_imag = keys[:, num_freqs:]
     magnitude = torch.sqrt(k_real.square() + k_imag.square())
-    valid_seq_lens = torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device)
-    valid_widths = torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device)
+    if valid_lens is None:
+        valid_lens = [seq_len, seq_len]
+    valid_seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=device)
+    valid_widths = torch.tensor(valid_lens, dtype=torch.int32, device=device)
     round_starts_device = torch.tensor([seq_len, seq_len + 1], dtype=torch.int32, device=device)
     token_starts_device = torch.zeros(2, dtype=torch.int32, device=device)
     for request_count in (1, 2):
@@ -87,9 +117,10 @@ def test_cute_score_matches_torch_mean_oracle(monkeypatch: pytest.MonkeyPatch) -
                 + q_imag[0, :, None] * rotated_imag[None]
                 + mlr_coef[0, :, None] * freq_scale_sq[None, None] * magnitude[None]
             ).sum(dim=-1)
+            valid = valid_lens[request]
             torch.testing.assert_close(
-                actual[request, 0],
-                expected,
+                actual[request, 0, :, :valid],
+                expected[:, :valid],
                 rtol=5.0e-3,
                 atol=5.0e-3,
             )

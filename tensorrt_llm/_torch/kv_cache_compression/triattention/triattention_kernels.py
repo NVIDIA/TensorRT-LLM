@@ -568,8 +568,8 @@ class _FixedScoreGroup:
             torch.cuda.get_device_capability(anchor.device) == (10, 0)
             and anchor.dtype == torch.bfloat16
             and kv_factor == 2
-            and tokens_per_block == 128
-            and num_freqs == 32
+            and tokens_per_block in (32, 128)
+            and num_freqs in (32, 64)
             and num_q_heads == num_kv_heads * 8
             and int(anchor.stride(-1)) == 1
             # The kernel computes flat score offsets in 32-bit arithmetic.
