@@ -3836,6 +3836,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 )
         return self
 
+    @model_validator(mode='after')
+    def validate_mamba_snapshot_offsets(self) -> 'KvCacheConfig':
+        state_config = self.mamba_state_config
+        has_additional_snapshots = bool(
+            state_config.additional_snapshot_offsets_from_start
+            or state_config.additional_snapshot_offsets_from_end)
+        if (has_additional_snapshots and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.mamba_state_config additional snapshot "
+                "offsets require kv_cache_config.use_kv_cache_manager_v2=True.")
+        return self
+
     @field_validator('max_attention_window')
     @classmethod
     def validate_max_attention_window(cls, v: Optional[List[int]]):

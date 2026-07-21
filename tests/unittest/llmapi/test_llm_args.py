@@ -675,6 +675,40 @@ def test_MambaStateConfig_rejects_invalid_snapshot_offsets(field, value):
         MambaStateConfig(**{field: value})
 
 
+@pytest.mark.parametrize(
+    ("field", "offsets"),
+    [
+        ("additional_snapshot_offsets_from_start", [128]),
+        ("additional_snapshot_offsets_from_end", [0]),
+    ],
+)
+def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
+        field, offsets):
+    state_config = MambaStateConfig(**{field: offsets})
+
+    with pytest.raises(ValidationError, match="use_kv_cache_manager_v2=True"):
+        KvCacheConfig(
+            mamba_state_config=state_config,
+            use_kv_cache_manager_v2=False,
+        )
+
+    for use_v2 in (True, "auto"):
+        config = KvCacheConfig(
+            mamba_state_config=state_config,
+            use_kv_cache_manager_v2=use_v2,
+        )
+        assert getattr(config.mamba_state_config, field) == offsets
+
+
+def test_KvCacheConfig_allows_periodic_snapshots_with_v1():
+    config = KvCacheConfig(
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+        use_kv_cache_manager_v2=False,
+    )
+
+    assert config.mamba_state_config.periodic_snapshot_interval == 64
+
+
 def test_KvCacheConfig_rejects_removed_mamba_interval_field():
     with pytest.raises(ValidationError, match="extra_forbidden"):
         KvCacheConfig(mamba_state_cache_interval=64)
