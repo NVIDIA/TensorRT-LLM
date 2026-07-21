@@ -256,6 +256,7 @@ class GvrTopKKernel:
         enable_smem_cache: bool = False,
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
+        kc_diet: Optional[bool] = None,
         enable_r0: bool = True,
         r0_qfracs: Optional[tuple] = None,
         mt_unroll: int = 4,
@@ -470,7 +471,13 @@ class GvrTopKKernel:
             else:
                 p1b_cache = dtype != cutlass.Float32
         self.p1b_cache = bool(p1b_cache)
-        if enable_r0 and top_k == 512 and cluster_size == 1 and self.kC > 3072:
+        # kc_diet: None → diet iff single-CTA (tuned default). The LB hybrid
+        # kernel passes False for BOTH member instances so their SMEM layouts
+        # stay byte-identical (the DSL sizes the launch from the last-traced
+        # SmemAllocator only; see GvrTopKLBKernel).
+        if kc_diet is None:
+            kc_diet = cluster_size == 1
+        if enable_r0 and top_k == 512 and kc_diet and self.kC > 3072:
             self.kC = 3072
         # K2048 R0 Phase-4 histogram diet: 2048 -> 512 bins (2026-07-19
         # paired nsys cold-L2 A/B on B200, all cells exact). The P4 zero /
@@ -3923,23 +3930,24 @@ class GvrTopKKernel:
         # slot k&1 — closes the straggler-read-vs-next-write DSMEM race),
         # slot 2 = tid0-private call counter. mapa.shared::cluster relies
         # on every CTA holding this block at the SAME SMEM offset, so it's
-        # allocated once here. Only needed at cs>1; skipped at cs=1 (all
-        # uses are gated by const_expr(cs>1) and None propagates
-        # harmlessly through the unused parameters).
+        # allocated once here. Only USED at cs>1 (uses are gated by
+        # const_expr(cs>1)), but ALLOCATED unconditionally: the LB hybrid
+        # kernel inlines a cs>1 and a cs=1 instance into one launch, and the
+        # DSL sizes the launch SMEM from the last-traced SmemAllocator only —
+        # the layouts must stay byte-identical across cluster_size (16B cost
+        # at cs=1).
+        s_cluster_partial = smem.allocate_tensor(
+            element_type=cutlass.Int32,
+            layout=cute.make_ordered_layout((3,), order=(0,)),
+            byte_alignment=16,
+        )
         if cutlass.const_expr(cluster_size > 1):
-            s_cluster_partial = smem.allocate_tensor(
-                element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((3,), order=(0,)),
-                byte_alignment=16,
-            )
             # Zero the call counter before any block_count_ge call. tid0-
             # private (same thread reads/increments it), so program order
             # suffices — but parity must start at 0 on EVERY CTA of the
             # cluster for lockstep alignment.
             if tidx == cutlass.Int32(0):
                 s_cluster_partial[2] = cutlass.Int32(0)
-        else:
-            s_cluster_partial = None
 
         # SMEM slice cache (optional). Sized in ``self.dtype`` so the same
         # vec_w-wide LDG→STS→LDS pipeline works for fp32/bf16/fp16.
@@ -3994,16 +4002,15 @@ class GvrTopKKernel:
                 byte_alignment=16,
             )
             # DSMEM scratch for the M-way cluster all-reduce of the R0 rung
-            # counts (cs>1 only; mapa.shared::cluster needs the same offset
-            # on every CTA).
-            if cutlass.const_expr(self.cluster_size > 1):
-                s_cluster_partial_m = smem.allocate_tensor(
-                    element_type=cutlass.Int32,
-                    layout=cute.make_ordered_layout((M_r0,), order=(0,)),
-                    byte_alignment=16,
-                )
-            else:
-                s_cluster_partial_m = None
+            # counts (mapa.shared::cluster needs the same offset on every
+            # CTA). Only USED at cs>1; allocated unconditionally so the
+            # cs=1 / cs>1 SMEM layouts stay byte-identical for the LB
+            # hybrid kernel (see s_cluster_partial above).
+            s_cluster_partial_m = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((M_r0,), order=(0,)),
+                byte_alignment=16,
+            )
             # p1b_cache: P1 stashes the K gathered preIdx values here so P1b
             # skips a second GMEM random gather (dtype-gated: 16-bit only).
             if cutlass.const_expr(self.p1b_cache):
