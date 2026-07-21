@@ -2372,6 +2372,15 @@ class OpenAIServer(_VideoRoutesMixin):
         with ``request.format`` extended to accept tensor payloads
         (``"safetensors"``/``"pt"``) alongside the PNG/WebP/JPEG encoders.
         """
+        return await self._generate_image(request, raw_request)
+
+    async def _generate_image(
+        self,
+        request: ImageGenerationRequest,
+        raw_request: Request,
+        reference_images: Optional[List[bytes]] = None,
+    ) -> Response:
+        """Generate an image from a validated request and optional references."""
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
@@ -2383,6 +2392,9 @@ class OpenAIServer(_VideoRoutesMixin):
             try:
                 params = parse_visual_gen_params(request, image_id,
                                                  self.generator)
+                if reference_images is not None:
+                    params.image = (reference_images[0] if len(reference_images)
+                                    == 1 else reference_images)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -2534,16 +2546,83 @@ class OpenAIServer(_VideoRoutesMixin):
         return f"{base}/v1/images/{image_id}/content?i={i}"
 
     async def openai_image_edit(self, raw_request: Request) -> Response:
-        """OpenAI-compatible image editing endpoint — returns HTTP 501.
+        """OpenAI-compatible multipart image-conditioned generation endpoint."""
+        content_type = raw_request.headers.get("content-type", "")
+        if "multipart/form-data" not in content_type:
+            return self.create_error_response(
+                message=("Unsupported content-type. "
+                         "Use 'multipart/form-data' for image edits."),
+                err_type="BadRequestError",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
 
-        No in-tree pipeline implements mask-based image editing today. FLUX.2
-        reference-image conditioning is available through
-        ``POST /v1/images/generations`` using ``input_reference``. The route
-        remains registered so callers get an honest NotImplemented signal
-        instead of a 404.
-        """
-        return self._create_not_supported_error(
-            "Image editing is not supported by any in-tree pipeline yet.")
+        form = await raw_request.form()
+        uploads = [*form.getlist("image"), *form.getlist("image[]")]
+        if not uploads:
+            return self.create_error_response(
+                message="Field 'image' is required.",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+        if len(uploads) > 10:
+            return self.create_error_response(
+                message="At most 10 input images are supported.",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+
+        reference_images = []
+        for index, upload in enumerate(uploads):
+            if not hasattr(upload, "read"):
+                return self.create_error_response(
+                    message=f"image[{index}] must be an uploaded file.",
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            image_bytes = await upload.read()
+            if not image_bytes:
+                return self.create_error_response(
+                    message=f"image[{index}] must not be empty.",
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            reference_images.append(image_bytes)
+
+        request_data: dict[str, Any] = {
+            "response_format": "b64_json",
+            "format": "png",
+            "size": "auto",
+            "n": 1,
+        }
+        allowed_fields = set(ImageGenerationRequest.model_fields)
+        for key, value in form.multi_items():
+            if key in ("image", "image[]"):
+                continue
+            request_key = "format" if key == "output_format" else key
+            if request_key not in allowed_fields:
+                return self.create_error_response(
+                    message=f"Unknown request field {key!r}.",
+                    err_type="BadRequestError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            if request_key == "extra_params":
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    return self.create_error_response(
+                        message=("'extra_params' must be a JSON object "
+                                 f"string; {exc}"),
+                        err_type="BadRequestError",
+                        status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                    )
+            request_data[request_key] = value
+
+        try:
+            request = ImageGenerationRequest(**request_data)
+        except ValidationError as exc:
+            return self._render_pydantic_validation_error(exc)
+        return await self._generate_image(request, raw_request,
+                                          reference_images)
 
     async def __call__(self,
                        host,

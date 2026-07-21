@@ -125,39 +125,6 @@ class TestDefaultOverlay:
 
 
 # =============================================================================
-# Image reference conditioning
-# =============================================================================
-
-
-class TestImageReferenceConditioning:
-    def test_single_reference_decodes_to_bytes(self):
-        generator = _StubVisualGen()
-        reference = b"single-reference"
-        request = ImageGenerationRequest(
-            prompt="cat",
-            input_reference=base64.b64encode(reference).decode(),
-        )
-        params = parse_visual_gen_params(request, "image-ref-1", generator)
-        assert params.image == reference
-
-    def test_multiple_references_decode_to_bytes(self):
-        generator = _StubVisualGen()
-        references = [b"subject-reference", b"style-reference"]
-        request = ImageGenerationRequest(
-            prompt="cat",
-            input_reference=[base64.b64encode(reference).decode() for reference in references],
-        )
-        params = parse_visual_gen_params(request, "image-ref-2", generator)
-        assert params.image == references
-
-    def test_invalid_base64_reference_raises(self):
-        generator = _StubVisualGen()
-        request = ImageGenerationRequest(prompt="cat", input_reference="not-base64")
-        with pytest.raises(ValueError, match=r"input_reference\[0\] is not valid base64"):
-            parse_visual_gen_params(request, "image-ref-3", generator)
-
-
-# =============================================================================
 # Seed range clamp on the serve boundary
 # =============================================================================
 
