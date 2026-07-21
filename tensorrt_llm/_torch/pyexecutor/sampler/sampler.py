@@ -3674,6 +3674,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 if get_draft_token_length(req) != 0 or req.py_stop_words_list:
                     fastpath_ok = False
                     break
+                assert req.py_seq_slot is not None
                 alive_reqs.append(req)
                 tokens_flat.append(new_tokens_step0[req.py_seq_slot][DEFAULT_BEAM_IDX])
             if fastpath_ok and alive_reqs:
@@ -3684,6 +3685,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     FinishReason.STOP_WORDS,
                 }
                 for req in alive_reqs:
+                    assert req.py_seq_slot is not None
                     reason_val = finish_reasons[req.py_seq_slot][0][DEFAULT_BEAM_IDX]
                     if reason_val != 0:
                         reason = FinishReason(reason_val)
