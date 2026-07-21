@@ -1025,16 +1025,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             return video_noise_pred
 
         def post_step_fn(step_latents):
-            if velocity_mask is not None and condition_latents is not None:
-                step_latents = (
-                    velocity_mask * step_latents + (1.0 - velocity_mask) * condition_latents
-                )
-            elif velocity_mask is not None and image_latent is not None:
-                step_latents = step_latents.clone()
-                step_latents[:, :, 0:1, :, :] = image_latent.to(
-                    device=step_latents.device, dtype=step_latents.dtype
-                )
-            return step_latents
+            # V2V only: re-impose the clean condition latents after every
+            # scheduler step. I2V deliberately keeps its pre-existing behavior
+            # (velocity mask during the loop, one write-back after it) so this
+            # PR does not alter I2V denoising; per-step anchoring for
+            # stochastic distilled schedulers belongs to the distilled work.
+            return velocity_mask * step_latents + (1.0 - velocity_mask) * condition_latents
 
         # 5. Build CFG tensors — text_ids and text_mask need to be split for CFG
         #    BasePipeline.denoise batches [uncond, cond] when guidance_scale > 1
@@ -1051,7 +1047,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         extra_streams = None
         if do_audio:
             extra_streams = {"audio": (audio_latents, self.audio_scheduler)}
-        should_pin_condition_latents = condition_latents is not None or image_latent is not None
+        should_pin_condition_latents = condition_latents is not None and velocity_mask is not None
         denoise_result = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
