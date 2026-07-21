@@ -1691,10 +1691,11 @@ class FilteredTopKKernelVarlen:
                     else:
                         dst[i] = i
                     if cutlass.const_expr(self.return_val):
-                        if cutlass.const_expr(self.enable_multi_cta):
-                            dst_values[i] = score[i + row_start]
-                        else:
-                            dst_values[i] = score[i]
+                        # dst[i] is a local index i; its value lives at the
+                        # absolute column row_start + i (row_start may be
+                        # non-zero for prefill). enable_multi_cta writes the
+                        # absolute index but reads the same absolute column.
+                        dst_values[i] = score[i + row_start]
                 else:
                     dst[i] = -1
                     if cutlass.const_expr(self.return_val):
