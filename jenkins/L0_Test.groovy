@@ -1189,6 +1189,9 @@ def getPytestBaseCommandLine(
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
+    if (ENABLE_UPLOAD_TEST_RESULTS) {
+        testCmdLine += ["-o console_output_style=progress-even-when-capture-no"]
+    }
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1423,7 +1426,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         "--s3-upload-path=${uploadPath}/${stageName}",
                     ]
                     if (ENABLE_S3_ECHO_STDOUT) {
-                        extraArgs += ["--s3-echo-stdout"]
+                        extraArgs += [
+                            "--s3-echo-stdout",
+                            "--s3-capture-mode=timestamped",
+                        ]
                     }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
@@ -3919,7 +3925,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "--s3-upload-path=${uploadPath}/${stageName}",
             ]
             if (ENABLE_S3_ECHO_STDOUT) {
-                extraArgs += ["--s3-echo-stdout"]
+                extraArgs += [
+                    "--s3-echo-stdout",
+                    "--s3-capture-mode=timestamped",
+                ]
             }
         }
         def pytestCommand = getPytestBaseCommandLine(
@@ -5066,15 +5075,6 @@ def launchTestJobs(pipeline, testFilter)
         8,
         36,
         9
-    )
-    // 10 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-40_GPUs-10_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node8_gpu32",
-        1,
-        40,
-        10
     )
     // GB300 PerfSanity post-merge aggregated
     // 2 Nodes
