@@ -57,7 +57,7 @@ def _get(url: str) -> tuple[Optional[int], Optional[bytes]]:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         return e.code, None
-    except Exception as e:  # noqa: BLE001
+    except OSError as e:
         print(f"[artifact] error fetching {url}: {e}", file=sys.stderr)
         return None, None
 
@@ -70,7 +70,7 @@ def _exists(url: str) -> bool:
             return resp.status in (200, 206)
     except urllib.error.HTTPError:
         return False
-    except Exception as e:  # noqa: BLE001
+    except OSError as e:
         print(f"[artifact] error probing {url}: {e}", file=sys.stderr)
         return False
 
@@ -140,7 +140,7 @@ def fetch_latest_touch_db(dest_dir: Path | str, url: Optional[str] = None) -> Op
         with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp, open(tarball, "wb") as f:
             shutil.copyfileobj(resp, f)
         return extract_touch_db(tarball, dest_dir)
-    except Exception as e:  # noqa: BLE001
+    except OSError as e:
         print(f"[artifact] download/extract failed {url}: {e}", file=sys.stderr)
         return None
 
