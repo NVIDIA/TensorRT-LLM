@@ -2851,6 +2851,34 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(num_ctx_requests))
         return None
 
+    def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
+        """All-gather the per-rank greedy flags and store the group AND.
+
+        Why the sampling-path choice must be group-uniform under
+        ADP + LM-head TP is documented on the anchor,
+        ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
+        per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
+        the CUDA graph key is built. The gate is pure config (identical on
+        every rank), so ranks also agree on whether the exchange happens; the
+        gather spans the whole TP group, a superset of any LM-head-TP
+        subgroup. A dedicated host all-gather rather than a piggyback on the
+        ``all_rank_num_tokens`` exchange, which runs in ``_prepare_inputs`` --
+        after the graph key, too late for the key to see the synced value.
+        """
+        # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
+        # Mapping.__init__), so ADP needs no separate check here.
+        if not (self.mapping.enable_lm_head_tp_in_adp
+                and spec_metadata.use_rejection_sampling):
+            return
+        local_flag = bool(spec_metadata.is_all_greedy_sample)
+        all_flags = self.dist.tp_allgather(local_flag)
+        spec_metadata.group_all_greedy_sample = all(all_flags)
+        # Also overwrite the live flag directly: this iteration's scan already
+        # ran (update_is_all_greedy_sample just returned) and the CUDA graph
+        # key reads the flag next -- the stored override only takes effect on
+        # the NEXT rescan (populate), which is after key selection.
+        spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
     def _set_spec_metadata_all_rank_num_tokens(
             self,
             spec_metadata: SpecMetadata,
@@ -6049,6 +6077,7 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(
                     padded_requests.all_requests())
+                self._sync_group_all_greedy_sample(spec_metadata)
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
