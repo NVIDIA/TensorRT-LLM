@@ -24,15 +24,36 @@ l0_l40s:
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3vl_init_preserves_caller_quant_config
+  - unittest/_torch/modeling/test_modeling_cosmos3.py::TestCosmos3::test_all
   - unittest/_torch/modeling/test_modeling_step3p7vl.py
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
   - unittest/llmapi/apps/_test_openai_chat_multimodal.py::test_single_chat_session_image_embeds -m needs_l40s
-  # MMMU sanity check
-  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
-  - accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
+  # Encoder-only /v1/embeddings dynamic batching (BERT classifier + PRM-7B reward + Qwen3-Embedding)
+  - unittest/llmapi/apps/_test_openai_embeddings.py
+  # Qwen3-Embedding text-embedding accuracy vs HuggingFace (0.6B small/fast + 8B large)
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-0.6b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
   # AutoDeploy: Nemotron-Nano-V3 on Ada uses flashinfer; trtllm has no
   # (E4M3 input, BF16 output, paged_kv, head_dim=128, sm_89) FMHA cubin.
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-flashinfer]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
+  # ------------- Encoder-decoder tests ---------------
+  # Representative pre-merge set: eager smoke, CUDA-graph greedy/beam, kv-v2,
+  # overlap scheduler, mBART, mixed batches.
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-overlap-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_mbart_pytorch_generate_encoder_decoder_end_to_end
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-overlap-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_context_generation_batch
 - condition:
     ranges:
       system_gpu_count:
@@ -47,22 +68,10 @@ l0_l40s:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
-  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  - unittest/trt/quantization
-  - unittest/trt/functional # 37 mins
-  - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_meta_recipe
-  - accuracy/test_cli_flow.py::TestGemma2_9BIt::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestPhi3Small128kInstruct::test_auto_dtype
-  - accuracy/test_llm_api.py::TestLlama3_1_8B::test_fp8_rowwise
-  - examples/test_llama.py::test_llm_llama_v3_dora_1gpu[commonsense-llama-v3-8b-dora-r32-llama-v3-8b-hf-base_fp16]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - llmapi/test_llm_examples.py::test_llmapi_quickstart
-  - examples/test_visual_gen.py::test_visual_gen_quickstart
-  - examples/test_visual_gen.py::test_visual_gen_api_walkthrough
+  - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
   - llmapi/test_llm_examples.py::test_llmapi_example_inference
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
@@ -83,22 +92,9 @@ l0_l40s:
       stage: post_merge
       backend: tensorrt
   tests:
-  - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_cpp_session-tp1] # 10 mins
-  - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp1]
-  - examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
-  - examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
   - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 8 mins
-  - unittest/trt/attention/test_bert_attention.py # 12 mins
-  - examples/test_medusa.py::test_llm_medusa_1gpu[use_py_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
-  - examples/test_medusa.py::test_llm_medusa_1gpu[use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-bfloat16-bs8]
-  - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
-  - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_cpp_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
-  - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
-  - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
-  - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-2b-instruct]
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] TIMEOUT (90)
-  - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora]
 - condition:
     ranges:
       system_gpu_count:

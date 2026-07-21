@@ -14,6 +14,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,18 +23,24 @@ import torch
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
+    ConditionalDisaggConfig,
     DisaggClusterConfig,
     DisaggServerConfig,
     MinimalInstances,
     ServerRole,
 )
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
+    ConversationParams,
     DisaggregatedParams,
     DisaggScheduleStyle,
     PromptTokensDetails,
@@ -49,7 +56,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_response_post_processor,
     completion_response_post_processor,
 )
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
 
 def _client_factory(*_args, **_kwargs):
@@ -58,11 +65,41 @@ def _client_factory(*_args, **_kwargs):
 
 def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+    # The coordinator builds its own (empty) routers from config; override them
+    # with mocks so tests can stub placement / readiness directly.
+    cluster = DisaggCoordinatorService(config, client_factory=_client_factory)
     ctx_router = AsyncMock(spec=Router)
     gen_router = AsyncMock(spec=Router)
-    return OpenAIDisaggregatedService(
-        config, ctx_router, gen_router, client_factory=_client_factory
+    cluster._ctx_router = ctx_router
+    cluster._gen_router = gen_router
+    service = OpenAIDisaggregatedService(config, cluster, client_factory=_client_factory)
+    # Convenience handles for tests that stub placement / readiness directly.
+    service._ctx_router = ctx_router
+    service._gen_router = gen_router
+    return service
+
+
+@pytest.mark.asyncio
+async def test_conditional_disagg_uses_selected_server_match_length():
+    service = _make_service("context_first")
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 64,
+                "num_tokens": 96,
+            },
+        )
     )
+    service._gen_router = router
+    request = CompletionRequest(model="model", prompt=[1] * 96)
+
+    server, need_context = await service._check_conditional_disagg(request, 123)
+
+    assert server == "gen:8000"
+    assert need_context is False
 
 
 def _make_completion_response(
@@ -101,10 +138,101 @@ def _make_completion_response(
     )
 
 
+def _make_chat_response(
+    finish_reason: str,
+    disagg_request_id: int = 42,
+    prompt_token_ids=None,
+) -> ChatCompletionResponse:
+    if prompt_token_ids is None:
+        prompt_token_ids = [1, 2, 3]
+    return ChatCompletionResponse(
+        model="test-model",
+        usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+        prompt_token_ids=prompt_token_ids,
+        choices=[
+            ChatCompletionResponseChoice(
+                index=0,
+                message=ChatMessage(role="assistant", content=""),
+                finish_reason=finish_reason,
+                disaggregated_params=DisaggregatedParams(
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    ctx_request_id=disagg_request_id,
+                ),
+            )
+        ],
+    )
+
+
 async def _mock_streaming_response(chunks):
     for chunk in chunks:
         await asyncio.sleep(0)
         yield chunk
+
+
+def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
+    service = _make_service("context_first")
+    ctx_prompt_token_ids = [101, 102, 103]
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        prompt_token_ids=[1, 2, 3],
+        conversation_params=ConversationParams(conversation_id="conv-chat"),
+    )
+    ctx_response = _make_chat_response(
+        finish_reason="length",
+        prompt_token_ids=ctx_prompt_token_ids,
+    )
+
+    gen_request = service._get_gen_request(request, ctx_response, 42)
+
+    assert gen_request.prompt_token_ids == ctx_prompt_token_ids
+    assert gen_request.disaggregated_params.request_type == "generation_only"
+    assert gen_request.conversation_params.conversation_id == "conv-chat"
+
+
+@pytest.mark.asyncio
+async def test_create_chat_response_sets_prompt_token_ids_for_context_only():
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    prompt_token_ids = [101, 102, 103]
+
+    class FakePromise:
+        def __init__(self) -> None:
+            self.outputs = []
+            self.prompt_token_ids = prompt_token_ids
+            self.error = None
+
+        async def aresult(self):
+            return self
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.generator = mock.MagicMock()
+    server.generator.args.num_postprocess_workers = 0
+    server._extract_metrics = mock.AsyncMock()
+
+    post_processor = mock.Mock(
+        return_value=_make_chat_response(
+            finish_reason="length",
+            prompt_token_ids=None,
+        )
+    )
+    postproc_params = SimpleNamespace(post_processor=post_processor, postproc_args=object())
+    disaggregated_params = SimpleNamespace(request_type="context_only", disagg_request_id=123)
+
+    response = await server._create_chat_response(
+        FakePromise(),
+        postproc_params,
+        raw_request=None,
+        disaggregated_params=disaggregated_params,
+    )
+
+    assert response.prompt_token_ids == prompt_token_ids
 
 
 @pytest.mark.asyncio
@@ -117,16 +245,18 @@ async def test_is_ready_waits_for_router_preparation():
         ),
         AsyncMock(),
     )
-    service._disagg_cluster_manager = cluster_manager
+    # Readiness now lives on the DisaggCoordinatorService the service holds.
+    local = service._coordinator
+    local._disagg_cluster_manager = cluster_manager
 
     cluster_manager._current_ctx_workers["ctx"] = WorkerInfo(
         worker_id="ctx", role=ServerRole.CONTEXT
     )
-    service._ctx_router = SimpleNamespace(num_prepared_servers=0)
-    service._gen_router = SimpleNamespace(num_prepared_servers=1)
+    local._ctx_router = SimpleNamespace(num_prepared_servers=0)
+    local._gen_router = SimpleNamespace(num_prepared_servers=1)
     assert await service.is_ready() is False
 
-    service._ctx_router.num_prepared_servers = 1
+    local._ctx_router.num_prepared_servers = 1
     assert await service.is_ready() is False
 
     cluster_manager._current_gen_workers["gen"] = WorkerInfo(
@@ -302,6 +432,37 @@ async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule
     )
 
 
+@pytest.mark.asyncio
+async def test_context_retry_preserves_generation_reservation_id():
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._check_conditional_disagg = AsyncMock(return_value=("gen:9001", True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+
+    async def _ctx_response(request, *_args, **_kwargs):
+        # OpenAIHttpClient regenerates this field before a successful retry.
+        request.disaggregated_params.disagg_request_id = 202
+        return _make_completion_response("", finish_reason="length", disagg_request_id=202)
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response(
+            "done", finish_reason="stop", disagg_request_id=202, context_only=False
+        )
+    )
+
+    request = CompletionRequest(model="test-model", prompt="hello")
+    await service._send_disagg_request(request)
+
+    service._gen_router.get_next_server.assert_not_awaited()
+    gen_call = service._gen_client.send_request.call_args
+    assert gen_call.kwargs["req_id"] == 101
+    assert gen_call.args[0].disaggregated_params.ctx_request_id == 202
+
+
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
     ctx_usage = UsageInfo(
         prompt_tokens=128,
@@ -429,7 +590,7 @@ class TestVerifyCtxResponseDiagnostics:
     @pytest.mark.asyncio
     async def test_missing_disagg_request_id_includes_ctx_id(self):
         svc = _make_service("context_first")
-        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=555)
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=555)
         resp.choices[0].disaggregated_params.disagg_request_id = None
         resp.choices[0].disaggregated_params.ctx_request_id = 555
         with pytest.raises(ValueError, match=r"disagg_request_id is None.*555"):
@@ -439,6 +600,24 @@ class TestVerifyCtxResponseDiagnostics:
     async def test_valid_response_passes(self):
         svc = _make_service("context_first")
         resp = _make_completion_response("ok", finish_reason="stop", disagg_request_id=42)
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+    @pytest.mark.asyncio
+    async def test_completed_response_with_null_ctx_request_id_passes(self):
+        # CTX finished early (finish_reason='stop'): no GEN handoff was set up,
+        # so ctx_request_id is None. The verifier must accept it (NVBug 6245861).
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=42)
+        resp.choices[0].disaggregated_params.ctx_request_id = None
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+    @pytest.mark.asyncio
+    async def test_completed_response_with_null_disagg_request_id_passes(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=42)
+        resp.choices[0].disaggregated_params.disagg_request_id = None
         result = await svc._verify_ctx_response(resp)
         assert result is resp
 

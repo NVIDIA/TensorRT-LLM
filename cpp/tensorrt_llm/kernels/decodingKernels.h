@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -133,5 +133,5 @@ namespace tensorrt_llm::runtime::kernels
 //! \param cudaStream the CUDA stream on which to perform the operation.
 
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
-    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
+    SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream, runtime::SizeType32 batchSlot = 0);
 } // namespace tensorrt_llm::runtime::kernels

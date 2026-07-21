@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -502,11 +503,29 @@ TEST(SerializeUtilsTest, KvCacheConfig)
 
 TEST(SerializeUtilsTest, SchedulerConfig)
 {
-    texec::SchedulerConfig schedulerConfig(
-        texec::CapacitySchedulerPolicy::kMAX_UTILIZATION, texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED);
+    texec::SchedulerConfig defaultSchedulerConfig;
+    EXPECT_TRUE(defaultSchedulerConfig.getEnablePrefixAwareScheduling());
+
+    texec::DynamicBatchConfig dynamicBatchConfig{/*enableBatchSizeTuning=*/true,
+        /*enableMaxNumTokensTuning=*/true, /*dynamicBatchMovingAverageWindow=*/64};
+    texec::SchedulerConfig schedulerConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, dynamicBatchConfig, false);
     auto schedulerConfig2 = serializeDeserialize(schedulerConfig);
     EXPECT_EQ(schedulerConfig.getCapacitySchedulerPolicy(), schedulerConfig2.getCapacitySchedulerPolicy());
     EXPECT_EQ(schedulerConfig.getContextChunkingPolicy(), schedulerConfig2.getContextChunkingPolicy());
+    EXPECT_EQ(schedulerConfig, schedulerConfig2);
+    ASSERT_TRUE(schedulerConfig2.getDynamicBatchConfig().has_value());
+    EXPECT_TRUE(schedulerConfig2.getDynamicBatchConfig()->getEnableBatchSizeTuning());
+    EXPECT_TRUE(schedulerConfig2.getDynamicBatchConfig()->getEnableMaxNumTokensTuning());
+    EXPECT_EQ(schedulerConfig2.getDynamicBatchConfig()->getDynamicBatchMovingAverageWindow(), 64);
+    EXPECT_FALSE(schedulerConfig2.getEnablePrefixAwareScheduling());
+
+    texec::SchedulerConfig differentDynamicBatchConfig(texec::CapacitySchedulerPolicy::kMAX_UTILIZATION,
+        texec::ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED,
+        texec::DynamicBatchConfig{/*enableBatchSizeTuning=*/false, /*enableMaxNumTokensTuning=*/true,
+            /*dynamicBatchMovingAverageWindow=*/64},
+        false);
+    EXPECT_FALSE(schedulerConfig == differentDynamicBatchConfig);
 }
 
 TEST(SerializeUtilsTest, ParallelConfig)
@@ -733,7 +752,8 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, nvinfer1::DataType::kFLOAT});
+        state->setCacheState(
+            texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, tensorrt_llm::DataType::kFLOAT});
         auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
@@ -1068,6 +1088,8 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferTimeoutMs(), cacheTransceiverConfig2.getKvTransferTimeoutMs());
     EXPECT_EQ(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(),
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
+    EXPECT_EQ(
+        cacheTransceiverConfig.getKvTransferPollIntervalMs(), cacheTransceiverConfig2.getKvTransferPollIntervalMs());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)
@@ -1097,7 +1119,7 @@ TEST(SerializeUtilsTest, BlockKeyWithExtras)
     VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
     std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
 
-    // Note: cacheSaltID is intentionally not set since it is not serialized
+    // Note: cacheSalt is intentionally not set; round-tripping with it set is covered separately.
     BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
 
     testSerializeDeserialize(key);
@@ -1533,7 +1555,7 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     texec::SizeType32 pp = 1;
     texec::SizeType32 cp = 1;
     std::vector<texec::SizeType32> attentionLayerNumPerPP{static_cast<texec::SizeType32>(nbKvHeadsPerLayer.size())};
-    auto dataType = nvinfer1::DataType::kFLOAT;
+    auto dataType = tensorrt_llm::DataType::kFLOAT;
     auto attentionType = CacheState::AttentionType::kDEFAULT;
     int kvFactor = 2;
     bool enableAttentionDP = false;

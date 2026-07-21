@@ -33,10 +33,11 @@ You MAY introduce ONLY the following changes:
   - `nn.Linear(...)` / `F.linear(...)` → `torch.ops.auto_deploy.torch_linear_simple(...)`
   - `tensor.view(...)` / `tensor.reshape(...)` → `torch.ops.auto_deploy.view(...)` (only when the shape contains a TP-scaled dim)
   - `torch.split(...)` / `torch.split_with_sizes(...)` → `torch.ops.auto_deploy.split_with_sizes(...)`
-- **A2. Sharding-hint kwargs added** to call sites of: `torch_moe`, `torch_ssm`, `torch_gated_delta_rule`, `torch_causal_conv1d`, `torch_rmsnorm_gated`, `torch_mla`, `torch_linear_simple`, `auto_deploy.split_with_sizes`, `auto_deploy.view`. Allowed kwargs: `tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`.
+- **A2. Sharding-hint kwargs added** to call sites of: `torch_moe`, `torch_ssm`, `torch_gated_delta_rule`, `torch_causal_conv1d`, `torch_rmsnorm_gated`, `torch_mla`, `torch_attention`, `torch_linear_simple`, `auto_deploy.split_with_sizes`, `auto_deploy.view`. Allowed kwargs: `tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`.
 - **A3. Inserting `torch.ops.auto_deploy.all_reduce(..., layer_type=...)`** after rowwise projections / at MoE merge points (single all_reduce after routed + shared sums).
-- **A4. Adding `import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401`** side-effect import at the top if not already present.
-- **A5. The module docstring update** describing the sharding strategy.
+- **A4. Docstring updates:**
+  - Module-level: a single-line header noting the file uses sharding IR, followed by the existing source-of-truth / HF link block. Example: `"""Llama 3 model (sharding IR)."""`.
+  - Per-class (MLP, Attention, MoE block, etc.): a short `Sharding strategy:` block listing what each projection maps to (`colwise` / `rowwise` / `all_reduce` / `tp_scaled_dim`).
 
 **FORBIDDEN (everything else, including but not limited to):**
 
@@ -71,76 +72,57 @@ Before editing, ensure the file is committed so you can diff against the origina
 git stash  # or commit — ensure a clean baseline to diff against
 ```
 
-### Step 2: Add the custom_ops side-effect import
-
-If not already present at the top of the file:
-
-```python
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-```
-
-Do **not** add global `SHARD_*` flags. Layer-level control uses the `layer_type` hint on each op and `shard_layers` in YAML.
-
-### Step 3: Replace linear projections
+### Step 2: Replace linear projections
 
 For every `self.proj(x)` or `nn.Linear` call, use `torch.ops.auto_deploy.torch_linear_simple` with explicit `tp_mode` and `layer_type`. Always set `tp_mode` unconditionally (no `if _s else "none"`). **Rules:** opening projections (Q/K/V/gate/up/in_proj) → `"colwise"`; closing (O/down/out_proj) → `"rowwise"`; tiny outputs (e.g. `shared_expert_gate` dim 1) → `"none"`; MLA latent projections (q_a, kv_a) → `"none"`. For fused weights split later, pass `output_sizes=[...]`. For GQA, use `tp_min_local_shape=self.head_dim` on K/V colwise lines.
 
-### Step 4: Replace split / chunk after fused colwise projections
+### Step 3: Replace split / chunk after fused colwise projections
 
 Use `torch.ops.auto_deploy.split_with_sizes` with `shardable` / `layer_type` where sizes scale with TP.
 
-### Step 5: Replace view / reshape with concrete head counts
+### Step 4: Replace view / reshape with concrete head counts
 
 During `torch.export`, `-1` becomes concrete; after TP, wrong values break. Any reshape whose dimension is a head count that scales with TP must use `torch.ops.auto_deploy.view` with `tp_scaled_dim` set appropriately. Safe cases: flat-to-2D, or `[B,S,-1]` when the input is already correctly sharded.
 
-### Step 6: Insert `all_reduce`
+### Step 5: Insert `all_reduce`
 
 After every rowwise projection, add `torch.ops.auto_deploy.all_reduce(..., layer_type=...)`. **Parallel branch rule:** when branches merge by addition, use a **single** `all_reduce` after the sum (e.g. MoE routed + shared expert; parallel attention + MLP residual branches).
 
-### Step 7: Special ops (Conv1d, SSM, GatedDeltaNet, gated RMSNorm)
+### Step 6: Special ops (Conv1d, SSM, GatedDeltaNet, gated RMSNorm)
 
 Add sharding hints on `torch_causal_conv1d`, `torch_ssm`, `torch_gated_delta_rule`, `torch_rmsnorm_gated` per docstrings—typically `shardable` / `output_sizes` / `tp_mode` as required.
 
-### Step 8: MoE
+### Step 7: MoE
 
 Pass `layer_type="moe"` into `torch_moe`; `apply_sharding_hints` handles EP/TP.
 
-### Step 9: Verify registration
+### Step 8: Verify registration
 
 The model's existing registration (`AutoModelForCausalLMFactory.register_custom_model_cls` at the bottom of the file and its import in `__init__.py`) stays unchanged. No new registration is needed — sharding hints do not change the model identity.
 
-### Step 10: YAML — enable hint-driven sharding
+### Step 9: YAML — no per-model opt-in needed
 
-Add `enable_sharder_ir.yaml` to the model's `yaml_extra` list in `examples/auto_deploy/model_registry/models.yaml` (if not already present). This composable fragment disables legacy sharding passes and enables `apply_sharding_hints`. Registry fragments are deep-merged in `yaml_extra` order (see `DynamicYamlMixInForSettings` in `tensorrt_llm/_torch/auto_deploy/utils/_config.py`).
+No YAML change is required to enable the IR path. The default sharding pipeline (`apply_sharding_hints`) auto-detects the presence of `torch.ops.auto_deploy.all_reduce` markers in the exported FX graph and routes IR-marked models to the IR pipeline; non-marked models fall through to the legacy `detect_sharding` + `sharding_transform_executor` pair. The markers you added in Steps 1–7 are sufficient.
 
-Example transform block:
+If the model needs a non-default `apply_sharding_hints` config (for example a non-NCCL `allreduce_strategy`, or selective `shard_layers`), add a per-model yaml override under `examples/auto_deploy/model_registry/configs/` that overrides only the keys you need:
 
 ```yaml
-# Typical contents for enable_sharder_ir.yaml (registry composable fragment)
 transforms:
+  apply_sharding_hints:
+    allreduce_strategy: SYMM_MEM
+    # shard_layers: ['mha', 'mlp']   # optional selective sharding
   export_to_gm:
     num_moe_experts_for_export: 2   # often required when expert count is large (>64)
-  detect_sharding:
-    stage: sharding
-    enabled: false
-  sharding_transform_executor:
-    stage: sharding
-    enabled: false
-  apply_sharding_hints:
-    stage: sharding
-    enabled: true
-    run_shape_prop: true
-    allreduce_strategy: NCCL
-    # shard_layers: ['mha', 'mlp']   # optional selective sharding
-  gather_logits_before_lm_head:
-    enabled: true
 ```
 
-Set `world_size` once, to the **maximum number of GPUs available on the machine**, auto-detected with `python -c 'import torch; print(torch.cuda.device_count())'` (or `nvidia-smi --list-gpus | wc -l`). Do **not** hardcode `world_size: 8` (or any other literal) — porting agents run on heterogeneous hardware and an 8-GPU literal will simply fail to launch on a 2- or 4-GPU machine. If the model's `num_attention_heads` (and, for GQA, `num_key_value_heads`) does not divide the detected GPU count, fall back to the largest power-of-two divisor that does (e.g. 4 on an 8-GPU machine if `num_attention_heads = 12`). Run the end-to-end command exactly once at that size — there is no value in repeating it at multiple smaller sizes, because the offline sharding equivalence test (Step 11b) already exercises 2- and 4-GPU dist configs cheaply.
+To force the legacy pipeline (e.g. while an IR port has a known bug awaiting fix), add `enable_legacy_sharding.yaml` to the model's `yaml_extra` — that override disables `apply_sharding_hints` and re-enables the legacy stages explicitly.
+
+
+Set `world_size` once, to the **maximum number of GPUs available on the machine**, auto-detected with `python -c 'import torch; print(torch.cuda.device_count())'` (or `nvidia-smi --list-gpus | wc -l`). Do **not** hardcode `world_size: 8` (or any other literal) — porting agents run on heterogeneous hardware and an 8-GPU literal will simply fail to launch on a 2- or 4-GPU machine. If the model's `num_attention_heads` (and, for GQA, `num_key_value_heads`) does not divide the detected GPU count, fall back to the largest power-of-two divisor that does (e.g. 4 on an 8-GPU machine if `num_attention_heads = 12`). Run the end-to-end command exactly once at that size — there is no value in repeating it at multiple smaller sizes, because the offline sharding equivalence test (Step 10b) already exercises 2- and 4-GPU dist configs cheaply.
 
 Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.
 
-### Step 11a — End-to-end run
+### Step 10a — End-to-end run
 
 Do not report success until a run completes successfully.
 
@@ -151,17 +133,17 @@ Do not report success until a run completes successfully.
 
 **Layer type strings** (for `layer_type` / `shard_layers`): use `"mha"`, `"mla"`, `"mlp"`, `"moe"`, `"ssm"`, `"delta"`, or `"unknown"` (default; skipped when `shard_layers` is set). Match the conventions used in `apply_sharding_hints` and project enums.
 
-### Step 11b — Sharding equivalence test (MANDATORY)
+### Step 10b — Sharding equivalence test (MANDATORY)
 
-Run the offline sharding-IR equivalence test ([`tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py)) against the modeling file you just edited, under **every** parallelism configuration the test exposes. The port is **not** complete until every configuration passes. Skipping this step or treating a partial pass (e.g. only `tep`) as success is not allowed.
+Run the offline sharding-IR equivalence test ([`tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py)) against the modeling file you just edited, under **every** parallelism configuration the test exposes. The port is **not** complete until every configuration passes. Skipping this step or treating a partial pass (e.g. only `tep`) as success is not allowed.
 
-The test compares a sharded prefill against the unsharded eager reference on a tiny (4-layer, hidden_size=64) instance of the model and asserts `rel_rmse < tol`, where `tol` is the test-defined relative-RMSE tolerance (`REL_RMSE_TOL` constant in [`test_sharding_ir_equivalence.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py); overridable per invocation via the `SHARDING_IR_REL_RMSE_TOL` env var). It uses no PyExecutor / no compile / no checkpoint download, so each cell runs in ~30s on 4xGPU.
+The test compares a sharded prefill against the unsharded eager reference on a tiny (4-layer, hidden_size=64) instance of the model and asserts `rel_rmse < tol`, where `tol` is the test-defined relative-RMSE tolerance (`REL_RMSE_TOL` constant in [`test_sharding_num_correctness.py`](tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py); overridable per invocation via the `SHARDING_IR_REL_RMSE_TOL` env var). It uses no PyExecutor / no compile / no checkpoint download, so each cell runs in ~30s on 4xGPU.
 
 **Run the matrix:**
 
 ```bash
 MODEL=tensorrt_llm/_torch/auto_deploy/models/custom/modeling_<name>.py
-TEST=tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_ir_equivalence.py
+TEST=tests/unittest/auto_deploy/multigpu/transformations/library/test_sharding_num_correctness.py
 
 for CFG in tp-only ep-only tep attn-dp; do
   pytest "$TEST" --sharding-ir-modeling-file "$MODEL" --sharding-ir-dist-config "$CFG" -s -v \
@@ -191,10 +173,10 @@ done
 **Failure handling:**
 
 - A cell failing with `KeyError`, `AttributeError`, `ValueError: You must specify exactly one of input_ids or inputs_embeds`, or any exception *before* `[sharding-ir-eq]` prints means the **modeling code itself** does not yet build / export on a tiny config — fix the modeling code (within the Step 0 allowlist) before proceeding. Do not silently skip the cell.
-- A cell where `[sharding-ir-eq]` prints `rel_rmse >= tol` (from the same log line) means a **sharding-hint bug**: a missing `all_reduce`, a wrong `tp_mode`, a `view` without `tp_scaled_dim`, a `split_with_sizes` whose sizes do not scale, etc. Re-read Step 6 (all_reduce), Step 3 (tp_mode), Step 5 (view), Step 4 (split_with_sizes) and the layer-specific patterns. Iterate on the hints until clean. If the failure is small (rel_rmse just slightly above tol) and you have reason to believe it is real numerical noise from the specific layer mix of this model rather than a sharding-hint bug, raise it with the parent agent rather than silently bumping `SHARDING_IR_REL_RMSE_TOL`.
+- A cell where `[sharding-ir-eq]` prints `rel_rmse >= tol` (from the same log line) means a **sharding-hint bug**: a missing `all_reduce`, a wrong `tp_mode`, a `view` without `tp_scaled_dim`, a `split_with_sizes` whose sizes do not scale, etc. Re-read Step 5 (all_reduce), Step 2 (tp_mode), Step 4 (view), Step 3 (split_with_sizes) and the layer-specific patterns. Iterate on the hints until clean. If the failure is small (rel_rmse just slightly above tol) and you have reason to believe it is real numerical noise from the specific layer mix of this model rather than a sharding-hint bug, raise it with the parent agent rather than silently bumping `SHARDING_IR_REL_RMSE_TOL`.
 - A cell that the modeling file legitimately does not support (e.g. `ep-only` on a dense model with no MoE) is acceptable only if the failure is a documented `pytest.skip(...)` from the test infrastructure. A silent `FAIL` is **not** acceptable.
 
-### Step 12 — Pre-finalization self-audit (MANDATORY)
+### Step 11 — Pre-finalization self-audit (MANDATORY)
 
 Before reporting the file as done, you MUST diff your changes against the git baseline:
 
@@ -209,8 +191,7 @@ Then classify every hunk into one of the following categories (defined in Step 0
 | **A1** | yes | Op substitution (`linear` / `view` / `split`) |
 | **A2** | yes | Sharding-hint kwarg added (`tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`) |
 | **A3** | yes | `auto_deploy.all_reduce` insertion |
-| **A4** | yes | `custom_ops` side-effect import added |
-| **A5** | yes | Module docstring update describing sharding strategy |
+| **A4** | yes | Docstring updates: one-line module header + per-class `Sharding strategy:` blocks |
 | **F1** | NO | `torch.ops.trtllm.*` replaced with vanilla PyTorch |
 | **F2** | NO | Input contract change (asserts, fallbacks added/removed) |
 | **F3** | NO | Module hierarchy / parameter / buffer / load-hook change |
@@ -245,6 +226,8 @@ You are NOT done until every row in the table is a yes-allowed category.
 
 **MLA (DeepSeek):** `layer_type="mla"`: keep `torch_mla` intact with `shardable=True`—do **not** decompose into separate linears + `torch_attention` (introduces bad `expand`/`view` with concrete head counts). q_a/kv_a latent: `tp_mode="none"`; q_b colwise; `o_proj` rowwise + `all_reduce`.
 
+**Per-head free Parameters on `torch_attention` (GPT-OSS-style sinks):** when an attention block has a learnable `nn.Parameter` indexed by Q-head count that flows DIRECTLY into `torch_attention` (not through a Linear) — e.g. GPT-OSS's `self.sinks = nn.Parameter(torch.empty(num_heads))` passed as `sinks=self.sinks` — pass `enable_sharding=True` to the `torch_attention(...)` call. The IR's `WeightedParamShardableNode` is registered for `torch_attention` and will slice every direct `get_attr` arg along dim 0 (= head dim) per rank. Q/K/V/O projection weights are unaffected (they belong to the preceding `torch_linear_simple` nodes and are sharded by `LinearShardableNode`). Models with no such head-wise Parameter (qwen3, llama, smollm3, ...) leave `enable_sharding` at its default `False` and the handler no-ops for them.
+
 ## Common pitfalls
 
 1. **Missing `auto_deploy::view` for head reshapes** — concrete shapes from export break after sharding.
@@ -255,14 +238,14 @@ You are NOT done until every row in the table is a yes-allowed category.
 6. **Decomposing ops that absorb weights** (e.g. `torch_mla`) — use `shardable` + handler instead of splitting into plain linears.
 7. **Interleaved vs contiguous fused weights** — interleaved per-head groups: colwise only; contiguous Q|K|V blocks: require `output_sizes`.
 8. **Omitting `layer_type` when using `shard_layers`** — `"unknown"` nodes are skipped; set hints explicitly on sharding-aware ops.
-9. **`layer_type` on non-hint ops** — do **not** pass `layer_type` to ops that are not designed for sharding hints (e.g. `torch_attention`, `torch_l2norm`, `torch_rope_*`); extra positional args break calls. Confirm in `custom_ops/` docstrings which ops accept hints.
+9. **`layer_type` on non-hint ops** — do **not** pass `layer_type` to ops that are not designed for sharding hints (e.g. `torch_l2norm`, `torch_rope_*`); extra positional args break calls. Note: `torch_attention` DOES accept `layer_type` (and `enable_sharding`) — see the per-head Parameters paragraph in "Layer-specific sharding patterns" above. Confirm in `custom_ops/` docstrings which ops accept hints.
 10. **Conditional hint values** — no `if _s else "none"`; use unconditional hints and rely on `shard_layers` / transform config.
 11. **Replacing `torch.ops.trtllm.*` ops** — `noaux_tc_op`, `dsv3_router_gemm_op`, fused norm/MLP kernels are TP-replicated and must be kept verbatim (rule F1). AD has no fusion pass to recover them from vanilla PyTorch.
 
 ## Validation checklist (human review)
 
-- All four configurations of the **sharding equivalence test** (Step 11b) pass with the parsed `rel_rmse` strictly below the parsed `tol` from the same rank-0 log line. Report the per-cell `rel_rmse` and `tol` pair.
+- All four configurations of the **sharding equivalence test** (Step 10b) pass with the parsed `rel_rmse` strictly below the parsed `tol` from the same rank-0 log line. Report the per-cell `rel_rmse` and `tol` pair.
 - `world_size=1`: unsharded path; hints should not break correctness.
-- `world_size=<max-available>`: end-to-end run (Step 11a) at the maximum GPU count auto-detected on the machine (head-divisibility permitting; see Step 11).
+- `world_size=<max-available>`: end-to-end run (Step 10a) at the maximum GPU count auto-detected on the machine (head-divisibility permitting; see Step 10).
 - `apply_sharding_hints` node count vs expectation.
 - Optional: `shard_layers: ['moe']` to verify selective sharding.

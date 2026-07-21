@@ -42,6 +42,7 @@ from ...utils import ActivationType, is_gated_activation
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    fclip_xorsign,
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -274,6 +275,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         topk: cutlass.Int64,
         raster_along_m: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
+        swiglu_limit: cutlass.Float32 = float("inf"),
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -399,6 +401,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.vectorized_f32 = vectorized_f32
+
+        if swiglu_limit < 0:
+            swiglu_limit = float("inf")
+        self.swiglu_limit = swiglu_limit
+        self.has_swiglu_limit = swiglu_limit != float("inf")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1114,7 +1121,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
         # Pipeline Init: Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        num_acc_consumer_threads = (
+            len(self.epilog_warp_id) * self.threads_per_warp * (2 if use_2cta_instrs else 1)
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -1479,8 +1488,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             # Get the first tile info
             tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(5, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1634,8 +1644,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(5, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -1675,10 +1686,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 )
 
                 # Get the first tile info
-                valid_tile_info = cute.make_rmem_tensor((1,), cutlass.Int32)
+                tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                valid_tile_info[0] = sInfo[(3, tile_info_consumer_state.index)]
-                is_valid_tile = valid_tile_info[0] == 1
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
                     space="cta",
@@ -1712,8 +1723,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Advance to next tile
                     #
                     tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                    valid_tile_info[0] = sInfo[(3, tile_info_consumer_state.index)]
-                    is_valid_tile = valid_tile_info[0] == 1
+                    tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
                     cute.arch.fence_proxy(
                         "async.shared",
                         space="cta",
@@ -1750,10 +1761,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             # Get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1815,8 +1828,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -1914,10 +1929,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             # Get the first tile info from pipeline (scheduler has filtered out tiles >= num_non_exiting_tiles)
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2118,8 +2135,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2225,11 +2244,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             )
 
             # Get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            tile_info = cute.make_rmem_tensor((5,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
-                tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+            tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+            tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+            tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+            tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -2343,8 +2364,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
@@ -2518,16 +2538,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Async arrive accumulator buffer empty
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
                 #
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
-                    tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                tile_info[0] = sInfo[(0, tile_info_consumer_state.index)]
+                tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
+                tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
+                tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
@@ -2593,6 +2614,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
                     (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
                 )
+                # SwiGLU clamp
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    gate_lo = fmin(acc_vec_gate_alpha[0], self.swiglu_limit)
+                    gate_hi = fmin(acc_vec_gate_alpha[1], self.swiglu_limit)
+                    acc_vec_gate_alpha = (gate_lo, gate_hi)
+                    up_lo = fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit)
+                    up_hi = fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit)
+                    acc_vec_up_alpha = (up_lo, up_hi)
                 tCompute_log2e = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
                     (-LOG2_E, -LOG2_E),
@@ -2627,6 +2656,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
+                    acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit

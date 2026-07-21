@@ -158,7 +158,7 @@ echo ""
 
 export SERVER_CMD="trtllm-serve ${MODEL} --host 0.0.0.0 --port ${SERVER_PORT}"
 if [ -n "$SERVER_CONFIG" ]; then
-    SERVER_CMD="${SERVER_CMD} --extra_visual_gen_options ${SERVER_CONFIG}"
+    SERVER_CMD="${SERVER_CMD} --visual_gen_args ${SERVER_CONFIG}"
 fi
 
 echo "Step 1: Starting distributed server..."

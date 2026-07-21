@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -97,6 +98,12 @@ tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     return blockTensor;
 }
 
+tk::KVCacheIndex::UnderlyingType KVCacheTransferManager::getPendingTransferIndex(BlockPtr const& block)
+{
+    auto const blockOffset = block->getMemoryPoolBlockIndex();
+    return block->isPrimary() ? blockOffset : blockOffset | tk::KVCacheIndex::kSecondaryPoolFlag;
+}
+
 void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -157,8 +164,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
             // If no partial tokens or if the dataType is not supported for partial copy, copy entire block.
             // Note that nvfp4 kv cache SFs use an interleaved layout, so we need to copy the entire block.
-            if (numTokensToCopy <= 0 || srcPtr->getDataType() == nvinfer1::DataType::kINT4
-                || srcPtr->getDataType() == nvinfer1::DataType::kFP4 || containsBlockScales)
+            if (numTokensToCopy <= 0 || srcPtr->getDataType() == tensorrt_llm::DataType::kINT4
+                || srcPtr->getDataType() == tensorrt_llm::DataType::kFP4 || containsBlockScales)
             {
                 // For partial copy not implemented with these data types,
                 // just do a full copy.
@@ -252,10 +259,9 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 }
 
 //
-// Note about recording events to wait for cudaMempyAsync calls between blocks:
-// The memory copy involves raw memory blocks, which are pointed to by the
-// memory pool block index. When recording events, you must use getMemoryPoolBlockIndex()
-// as the raw memory block identifier. Using getBlockId() when recording events is wrong.
+// Note about recording events to wait for cudaMemcpyAsync calls between blocks:
+// The memory copy involves raw memory blocks, which are identified by the pool-qualified
+// memory pool block index. Using getBlockId() when recording events is wrong.
 // getBlockId() returns the logical block id, which has nothing to do with the raw memory
 // block pointers involved in a cudaMemcpy.
 //
@@ -289,22 +295,25 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    auto const offloadedBlockIndex = getPendingTransferIndex(offloadedBlock);
+    auto const blockIndex = getPendingTransferIndex(block);
+
     // Wait for any pending writes before reading from offloadedBlock
-    auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlock->getMemoryPoolBlockIndex());
+    auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlockIndex);
     if (offloadedBlockPendingWriteItr != mPendingWrites.end())
     {
         mOnboardManager.getStream().wait(offloadedBlockPendingWriteItr->second);
         // Don't erase, we are not changing state of offloadedBlock
     }
     // Wait for any pending reads before overwriting block
-    auto blockPendingReadItr = mPendingReads.find(block->getMemoryPoolBlockIndex());
+    auto blockPendingReadItr = mPendingReads.find(blockIndex);
     if (blockPendingReadItr != mPendingReads.end())
     {
         mOnboardManager.getStream().wait(blockPendingReadItr->second);
         mPendingReads.erase(blockPendingReadItr);
     }
     // Wait for any pending writes before overwriting block
-    auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
+    auto blockPendingWriteItr = mPendingWrites.find(blockIndex);
     if (blockPendingWriteItr != mPendingWrites.end())
     {
         mOnboardManager.getStream().wait(blockPendingWriteItr->second);
@@ -330,33 +339,36 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     }
 
     // Record new pending read from offloadedBlock
-    mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOnboardManager.getStream().record(mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()]);
+    mPendingReads[offloadedBlockIndex] = tr::CudaEvent();
+    mOnboardManager.getStream().record(mPendingReads[offloadedBlockIndex]);
     // Record new pending write to block
-    mPendingWrites[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOnboardManager.getStream().record(mPendingWrites[block->getMemoryPoolBlockIndex()]);
+    mPendingWrites[blockIndex] = tr::CudaEvent();
+    mOnboardManager.getStream().record(mPendingWrites[blockIndex]);
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
+    auto const blockIndex = getPendingTransferIndex(block);
+    auto const offloadBlockIndex = getPendingTransferIndex(offloadBlock);
+
     // Wait for any pending writes before reading from block
-    auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
+    auto blockPendingWriteItr = mPendingWrites.find(blockIndex);
     if (blockPendingWriteItr != mPendingWrites.end())
     {
         mOffloadManager.getStream().wait(blockPendingWriteItr->second);
         // Don't erase, we are not changing state of block
     }
     // Wait for any pending reads before overwriting offloadBlock
-    auto offloadBlockPendingReadItr = mPendingReads.find(offloadBlock->getMemoryPoolBlockIndex());
+    auto offloadBlockPendingReadItr = mPendingReads.find(offloadBlockIndex);
     if (offloadBlockPendingReadItr != mPendingReads.end())
     {
         mOffloadManager.getStream().wait(offloadBlockPendingReadItr->second);
         mPendingReads.erase(offloadBlockPendingReadItr);
     }
     // Wait for any pending writes before overwriting offloadBlock
-    auto offloadBlockPendingWriteItr = mPendingWrites.find(offloadBlock->getMemoryPoolBlockIndex());
+    auto offloadBlockPendingWriteItr = mPendingWrites.find(offloadBlockIndex);
     if (offloadBlockPendingWriteItr != mPendingWrites.end())
     {
         mOffloadManager.getStream().wait(offloadBlockPendingWriteItr->second);
@@ -373,11 +385,11 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
     }
 
     // Record new pending read from block
-    mPendingReads[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOffloadManager.getStream().record(mPendingReads[block->getMemoryPoolBlockIndex()]);
+    mPendingReads[blockIndex] = tr::CudaEvent();
+    mOffloadManager.getStream().record(mPendingReads[blockIndex]);
     // Record new pending write to offloadBlock
-    mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOffloadManager.getStream().record(mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()]);
+    mPendingWrites[offloadBlockIndex] = tr::CudaEvent();
+    mOffloadManager.getStream().record(mPendingWrites[offloadBlockIndex]);
 }
 
 void KVCacheTransferManager::syncWithBufferManager()
@@ -390,7 +402,7 @@ void KVCacheTransferManager::syncWithBufferManager()
     mBufferManager.getStream().record(readyForOnboardEvent);
     mOnboardManager.getStream().wait(readyForOnboardEvent);
 
-    // Once we synchronize, clear our list of pending thransfers.
+    // Once we synchronize, clear our list of pending transfers.
     mPendingReads.clear();
     mPendingWrites.clear();
 }
@@ -405,7 +417,7 @@ void KVCacheTransferManager::syncTransfers()
     mOnboardManager.getStream().record(onboardEvent);
     mBufferManager.getStream().wait(onboardEvent);
 
-    // Once we synchronize, clear our list of pending thransfers.
+    // Once we synchronize, clear our list of pending transfers.
     mPendingReads.clear();
     mPendingWrites.clear();
 }
@@ -450,8 +462,8 @@ std::size_t KVCacheTransferManager::computeBlockTransferBytes(
 
         // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
         // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.
-        bool const isPartialCopy = numTokensToCopy > 0 && dataType != nvinfer1::DataType::kINT4
-            && dataType != nvinfer1::DataType::kFP4 && !pool.containsBlockScales
+        bool const isPartialCopy = numTokensToCopy > 0 && dataType != tensorrt_llm::DataType::kINT4
+            && dataType != tensorrt_llm::DataType::kFP4 && !pool.containsBlockScales
             && numTokensToCopy < pool.tokensPerBlock;
 
         if (isPartialCopy)

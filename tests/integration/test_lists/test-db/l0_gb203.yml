@@ -15,13 +15,6 @@ l0_gb203:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - unittest/trt/attention/test_gpt_attention.py -k "partition0"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition1"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition2"
-  - unittest/trt/attention/test_gpt_attention.py -k "partition3"
-  - unittest/trt/attention/test_gpt_attention.py -k "xqa_generic"
-  # - unittest/trt/quantization # https://nvbugs/5234573
-  # - unittest/trt/functional # https://nvbugs/5234573
   # - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora] # https://nvbugs/5234573
   # - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2.5_1.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha_fp32_acc] # https://nvbugs/5234573
   - llmapi/test_llm_examples.py::test_llmapi_quickstart

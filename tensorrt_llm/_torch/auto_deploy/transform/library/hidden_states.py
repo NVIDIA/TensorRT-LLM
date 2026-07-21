@@ -26,8 +26,8 @@ from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    EphemeralResourceHandler,
     MHACallable,
-    ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
 )
@@ -215,11 +215,16 @@ class DetectHiddenStatesForCapture(BaseTransform):
         )
 
 
-class HiddenStatesResourceHandler(ResourceHandler):
+class HiddenStatesResourceHandler(EphemeralResourceHandler):
     """A resource handler for hidden states."""
 
     def __init__(self, hidden_size: int, dtype: torch.dtype) -> None:
         """Initialize the HiddenStatesResourceHandler.
+
+        MTP/Eagle collects hidden states from the target model and reads them in the draft model
+        in the same forward pass. We store these resources in an EphemeralResourceHandler because
+        they do not need to persist between iterations, and can be dropped when transferring
+        resources between forward passes.
 
         Args:
             hidden_size: The size of the hidden states resource.

@@ -8,6 +8,7 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
@@ -89,6 +90,8 @@ class PromptAdapterRequest:
 
 
 class GenerationRequest:
+    # Mirrors C++ Request::Impl::kMaxCacheSaltLength
+    MAX_CACHE_SALT_LEN: int = 256
 
     def __init__(
         self,
@@ -105,8 +108,11 @@ class GenerationRequest:
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
-        cache_salt_id: Optional[int] = None,
+        conversation_params: Optional[ConversationParams] = None,
+        cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
+        encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                                list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
         if isinstance(prompt_token_ids, list):
@@ -134,17 +140,122 @@ class GenerationRequest:
         self.disaggregated_params = disaggregated_params
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
-        self.cache_salt_id = cache_salt_id
+        self.conversation_params = conversation_params
+        if cache_salt is not None:
+            if not isinstance(cache_salt, str):
+                raise TypeError(
+                    f"cache_salt must be str or None, got {type(cache_salt).__name__}"
+                )
+            # The C++ side validates against UTF-8 byte length, so do the same here
+            # (Python `len()` would count Unicode code points, which can pass this
+            # guard but fail at C++ dispatch for non-ASCII salts).
+            cache_salt_byte_len = len(cache_salt.encode("utf-8"))
+            if cache_salt_byte_len > self.MAX_CACHE_SALT_LEN:
+                raise ValueError(
+                    f"cache_salt UTF-8 byte length ({cache_salt_byte_len}) "
+                    f"exceeds the maximum supported length "
+                    f"({self.MAX_CACHE_SALT_LEN}).")
+        self.cache_salt = cache_salt
         self.arrival_time = arrival_time
+        self.encoder_input_token_ids = self._normalize_optional_token_ids(
+            encoder_input_token_ids, "encoder_input_token_ids")
         if not (0.0 <= priority <= 1.0):
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")
         self.priority = priority
 
+    @staticmethod
+    def _normalize_optional_token_ids(token_ids: Optional[Union[torch.Tensor,
+                                                                np.ndarray,
+                                                                list]],
+                                      name: str) -> Optional[list]:
+        if token_ids is None:
+            return None
+        if isinstance(token_ids, list):
+            return token_ids
+        if isinstance(token_ids, (torch.Tensor, np.ndarray)):
+            return token_ids.tolist()
+        raise TypeError(
+            f"{name} ({token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+        )
+
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"
         self.id = id
         return self
+
+    # --- int32 token-id wire serialization + LAZY list materialization ----------
+    # Pickling a flat list[int] on the hot proxy->worker RPC-submit path emits one
+    # PyLong frame per token (O(ISL)). Encode token-ids as int32 bytes for the wire.
+    # On decode we DO NOT eagerly rebuild the list: stash the int32 ndarray in
+    # `_prompt_token_ids_i32` (the C++ Request ctor memcpy's it -- see
+    # base_worker._enqueue_request) and leave the backing `_prompt_token_ids` None.
+    # The list is built lazily (and cached) by the `prompt_token_ids` property below
+    # only if a consumer actually reads it (e.g. prompt-logprobs, star-attention).
+    # Plain decode never reads it -> the O(ISL) `.tolist()` never runs.
+    #
+    # NOTE: implemented as a *property* (scoped to this one name), NOT a class-level
+    # __getattr__. A __getattr__ is invoked by the interpreter on EVERY missing
+    # attribute access on the object -- hasattr()/getattr(default) probes, copy/
+    # pickle dunder lookups, duck-typing -- each paying a Python frame + an
+    # AttributeError raise. A property has identical lazy-materialize behavior with
+    # zero blast radius on any other attribute.
+    _I32 = "\x00i32be"
+
+    @property
+    def prompt_token_ids(self):
+        ptids = self.__dict__.get("_prompt_token_ids")
+        if ptids is None:
+            buf = self.__dict__.get("_prompt_token_ids_i32")
+            if buf is not None:
+                ptids = buf.tolist()
+                self._prompt_token_ids = ptids  # cache
+        # Callers that mutate this returned list in place must clear
+        # `_prompt_token_ids_i32`; base_worker assumes both forms stay synced.
+        return ptids
+
+    @prompt_token_ids.setter
+    def prompt_token_ids(self, value):
+        self._prompt_token_ids = value
+
+    @staticmethod
+    def _enc_tokens(v):
+        # flat list[int] -> (_I32, int32 bytes); leave None / list[list[int]] /
+        # ndarray untouched.
+        if type(v) is list and (len(v) == 0 or type(v[0]) is int):
+            return (GenerationRequest._I32,
+                    np.asarray(v, dtype=np.int32).tobytes())
+        return v
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        buf = state.pop("_prompt_token_ids_i32", None)
+        ptids = state.get("_prompt_token_ids")
+        if ptids is not None:
+            state["_prompt_token_ids"] = GenerationRequest._enc_tokens(ptids)
+        elif buf is not None:
+            # not yet materialized -> encode the buffer's bytes directly
+            state["_prompt_token_ids"] = (GenerationRequest._I32, buf.tobytes())
+        if state.get("query_token_ids") is not None:
+            state["query_token_ids"] = GenerationRequest._enc_tokens(
+                state["query_token_ids"])
+        return state
+
+    def __setstate__(self, state):
+        buf = None
+        pt = state.get("_prompt_token_ids")
+        if type(pt) is tuple and len(
+                pt) == 2 and pt[0] == GenerationRequest._I32:
+            buf = np.frombuffer(pt[1], dtype=np.int32)
+            state["_prompt_token_ids"] = None  # leave None -> lazy via property
+        qt = state.get("query_token_ids")
+        if type(qt) is tuple and len(
+                qt) == 2 and qt[0] == GenerationRequest._I32:
+            # query_token_ids is rare/small -> materialize to list eagerly
+            state["query_token_ids"] = np.frombuffer(qt[1],
+                                                     dtype=np.int32).tolist()
+        self.__dict__.update(state)
+        self._prompt_token_ids_i32 = buf
 
 
 class TruncateKVCacheRequest:

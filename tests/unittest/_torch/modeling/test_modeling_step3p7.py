@@ -52,9 +52,11 @@ from utils.llm_data import llm_models_root
 #
 # The FP8 and BF16 checkpoints store text decoder keys directly under
 # ``model.layers.*`` and ship 3 plain-path MTP layers (45..47). The NVFP4
-# checkpoint is a modelopt export: text keys live under
-# ``model.language_model.layers.*``, vision keys under ``model.vision_model.*``,
-# and it carries no MTP layers.
+# checkpoint is a modelopt export: the decoder body lives under
+# ``model.language_model.layers.*`` and vision keys under
+# ``model.vision_model.*``. It also ships the 3 plain-path MTP layers (45..47),
+# but under the bare ``model.layers.*`` namespace (the loader flattens the
+# ``model.language_model.*`` body to ``model.layers.*`` so both land together).
 STEP3P7_FP8_DIR = str(os.path.join(llm_models_root(), "Step-3.7-Flash-FP8"))
 STEP3P7_NVFP4_DIR = str(os.path.join(llm_models_root(), "Step-3.7-Flash-NVFP4"))
 STEP3P7_BF16_DIR = str(os.path.join(llm_models_root(), "Step-3.7-Flash"))
@@ -417,10 +419,11 @@ class TestStep3p7Checkpoint(unittest.TestCase):
     The FP8 block-scale, NVFP4, and BF16 reference checkpoints share the same
     per-layer geometry; only the routed-expert dtype/layout differs. The FP8 and
     BF16 checkpoints store text keys under ``model.layers.*`` with 3 plain-path
-    MTP layers; the NVFP4 modelopt export stores text keys under
-    ``model.language_model.layers.*`` and carries no MTP layers. The checkpoints
-    are expected under ``LLM_MODELS_ROOT`` (as in CI); a missing checkpoint
-    surfaces as a test failure rather than a silent skip.
+    MTP layers; the NVFP4 modelopt export stores the decoder body under
+    ``model.language_model.layers.*`` and the 3 plain-path MTP layers (45..47)
+    under the bare ``model.layers.*`` namespace. The checkpoints are expected
+    under ``LLM_MODELS_ROOT`` (as in CI); a missing checkpoint surfaces as a test
+    failure rather than a silent skip.
     """
 
     def _check_text_config(self, text_cfg: dict):
@@ -454,9 +457,10 @@ class TestStep3p7Checkpoint(unittest.TestCase):
         - FP8 (fp8 block-scale) and NVFP4 (modelopt) checkpoints carry a
           quantization_config block; the BF16 reference does not
         - All consumed text-path keys can be enumerated; only vision, plain-path
-          MTP (layers 45..47, FP8/BF16 only), and the vision projector are
-          ignored. The NVFP4 export nests text keys under
-          ``model.language_model.*`` and vision keys under ``model.vision_model.*``.
+          MTP (layers 45..47), and the vision projector are ignored. The NVFP4
+          export nests the decoder body under ``model.language_model.*`` and
+          vision keys under ``model.vision_model.*``, while its MTP layers use the
+          bare ``model.layers.45..47`` namespace.
         """
         import re
 
@@ -472,9 +476,9 @@ class TestStep3p7Checkpoint(unittest.TestCase):
         self._check_text_config(text_cfg)
 
         # 2. Layer inventory: 45 decoder layers, full at idx 0,4,8,...,44 and
-        #    sliding elsewhere. The raw layer_types array can be longer (48
-        #    entries) because it also covers the 3 MTP layers (45..47); the
-        #    NVFP4 export has no MTP layers so it carries exactly 45 entries.
+        #    sliding elsewhere. The raw layer_types array is 48 entries long
+        #    because it also covers the 3 MTP layers (45..47); all three
+        #    checkpoints now ship those layers.
         layer_types = text_cfg["layer_types"]
         self.assertGreaterEqual(len(layer_types), 45)
         for idx in range(45):
@@ -532,9 +536,10 @@ class TestStep3p7Checkpoint(unittest.TestCase):
             self.assertNotIn("quantization_config", config_dict)
 
         # 4. Weight accounting on the actual safetensors keys. The NVFP4 export
-        #    nests the text decoder under ``model.language_model.*`` and the
-        #    vision tower under ``model.vision_model.*``; FP8/BF16 use bare
-        #    ``model.layers.*`` / ``vision_model.*`` prefixes.
+        #    nests the decoder body under ``model.language_model.*`` and the
+        #    vision tower under ``model.vision_model.*``, while its 3 MTP layers
+        #    use the bare ``model.layers.45..47`` namespace. FP8/BF16 use bare
+        #    ``model.layers.*`` / ``vision_model.*`` prefixes for everything.
         if is_nvfp4:
             vision_prefixes = ("model.vision_model.", "model.vit_large_projector")
             embed_norm_keys = (
@@ -543,6 +548,8 @@ class TestStep3p7Checkpoint(unittest.TestCase):
                 "lm_head.weight",
             )
             text_layer_re = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
+            # MTP layers (45..47) live under the bare ``model.layers.*`` prefix.
+            mtp_layer_re = re.compile(r"^model\.layers\.(\d+)\.")
         else:
             vision_prefixes = ("vision_model.", "vit_large_projector")
             embed_norm_keys = (
@@ -551,17 +558,21 @@ class TestStep3p7Checkpoint(unittest.TestCase):
                 "lm_head.weight",
             )
             text_layer_re = re.compile(r"^model\.layers\.(\d+)\.")
+            # Body and MTP share the ``model.layers.*`` namespace; the MTP layers
+            # are the >= 45 indices.
+            mtp_layer_re = text_layer_re
 
         consumed_text_keys = []
         ignored_vision_keys = []
         ignored_mtp_keys = []
         for key in safetensors_keys:
             m = text_layer_re.match(key)
-            if m:
-                if int(m.group(1)) >= 45:
-                    ignored_mtp_keys.append(key)
-                else:
-                    consumed_text_keys.append(key)
+            if m and int(m.group(1)) < 45:
+                consumed_text_keys.append(key)
+                continue
+            mm = mtp_layer_re.match(key)
+            if mm and int(mm.group(1)) >= 45:
+                ignored_mtp_keys.append(key)
             elif key.startswith(vision_prefixes):
                 ignored_vision_keys.append(key)
             elif key in embed_norm_keys:
@@ -571,12 +582,8 @@ class TestStep3p7Checkpoint(unittest.TestCase):
 
         self.assertGreater(len(consumed_text_keys), 0, "no consumed text keys found")
         self.assertGreater(len(ignored_vision_keys), 0, "no ignored vision keys found")
-        # FP8/BF16 ship 3 plain-path MTP layers (45..47); the NVFP4 export omits
-        # them entirely.
-        if is_nvfp4:
-            self.assertEqual(len(ignored_mtp_keys), 0, "NVFP4 export should carry no MTP keys")
-        else:
-            self.assertGreater(len(ignored_mtp_keys), 0, "no ignored MTP keys (expected 45..47)")
+        # All three checkpoints now ship 3 plain-path MTP layers (45..47).
+        self.assertGreater(len(ignored_mtp_keys), 0, "no ignored MTP keys (expected 45..47)")
 
     @parameterized.expand(
         [
@@ -619,10 +626,9 @@ class TestStep3p7Checkpoint(unittest.TestCase):
 
         Runs against all three checkpoints because the per-layer attention
         geometry is identical between them: only the routed-expert dtype/layout
-        differs. The layer-45 assertions exercise the out-of-range fallback path
-        (the NVFP4 export carries only 45 ``layer_types`` entries; FP8/BF16
-        include the 3 MTP layers), which resolves to the same sliding-attention
-        geometry either way.
+        differs. All three checkpoints carry 48 ``layer_types`` entries (the 3
+        MTP layers 45..47 included), and layer 45 resolves to sliding-attention
+        geometry.
         """
         from tensorrt_llm._torch.model_config import ModelConfig
         from tensorrt_llm._torch.models.modeling_step3p7 import (

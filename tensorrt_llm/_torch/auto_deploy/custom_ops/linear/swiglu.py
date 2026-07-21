@@ -30,12 +30,27 @@ try:
 except ImportError:
     _flashinfer_silu_and_mul = None
 
+# Lazily resolved TRT-LLM fused SiLU+Mul (resolved on first call; the op is only
+# registered after the C++ ops load). Faster than flashinfer, numerically identical.
+_trtllm_silu_and_mul = None
+_trtllm_silu_resolved = False
+
 
 def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
-    """SwiGLU activation: split x in half, apply silu to first half, multiply with second half.
-
-    Uses FlashInfer's fused kernel when available, falls back to manual implementation.
-    """
+    """SwiGLU activation. Prefer TRT-LLM fused kernel, fall back to flashinfer then manual."""
+    global _trtllm_silu_and_mul, _trtllm_silu_resolved
+    if not _trtllm_silu_resolved:
+        try:
+            _trtllm_silu_and_mul = torch.ops.trtllm.silu_and_mul
+        except AttributeError:
+            # Op not yet registered at resolve time; fall back to flashinfer/manual.
+            _trtllm_silu_and_mul = None
+        _trtllm_silu_resolved = True
+    if _trtllm_silu_and_mul is not None:
+        # trtllm::silu_and_mul expects 2D (rows, 2*D); flatten and restore.
+        s = x.shape
+        out_2d = _trtllm_silu_and_mul(x.reshape(-1, s[-1]), scale=None, dtype=None)
+        return out_2d.reshape(*s[:-1], out_2d.shape[-1])
     if _flashinfer_silu_and_mul is not None:
         return _flashinfer_silu_and_mul(x)
     gate, up = x.chunk(2, dim=-1)
@@ -68,6 +83,9 @@ def torch_swiglu_mlp(
         gate_bias: Optional gate projection bias of shape [intermediate_size].
         up_bias: Optional up projection bias of shape [intermediate_size].
         down_bias: Optional down projection bias of shape [hidden_size].
+        layer_type: Layer-classification sharding hint (e.g. "mlp"/"moe"/"shared_expert"),
+            propagated from the matched linears by the pattern matcher and consumed by
+            ``apply_sharding_hints`` (``shard_layers``). Does not affect the numeric result.
 
     Returns:
         Output tensor of shape [..., hidden_size].
@@ -184,6 +202,9 @@ def torch_nvfp4_swiglu_mlp(
         down_input_scale: Input scale for down projection.
         down_weight_scale: Per-block weight scale for down projection.
         down_alpha: Alpha (combined scale) for down projection.
+        layer_type: Layer-classification sharding hint (e.g. "mlp"/"moe"/"shared_expert"),
+            propagated from the matched linears by the pattern matcher and consumed by
+            ``apply_sharding_hints`` (``shard_layers``). Does not affect the numeric result.
 
     Returns:
         Output tensor of shape [..., hidden_size].
@@ -344,6 +365,9 @@ def torch_finegrained_fp8_swiglu_mlp(
         gate_weight_scale: Per-block weight scale for gate [N/128, K/128] float32.
         up_weight_scale: Per-block weight scale for up [N/128, K/128] float32.
         down_weight_scale: Per-block weight scale for down [N/128, K/128] float32.
+        layer_type: Layer-classification sharding hint (e.g. "mlp"/"moe"/"shared_expert"),
+            propagated from the matched linears by the pattern matcher and consumed by
+            ``apply_sharding_hints`` (``shard_layers``). Does not affect the numeric result.
 
     Returns:
         Output tensor of shape [..., hidden_size].

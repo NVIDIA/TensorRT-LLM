@@ -402,6 +402,7 @@ class Step3p7MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
     def apply(
         self,
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         scores = torch.sigmoid(router_logits.to(torch.float32))
         scores_with_bias = scores + self.router_bias.unsqueeze(0)
@@ -1473,6 +1474,7 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         resource_manager=None,
+        spec_input_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -1498,18 +1500,22 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
                 True,
             )
 
-            spec_input_ids = input_ids
+            # The MTP/spec worker always needs the real token ids. On the
+            # multimodal path the main model consumes fused ``inputs_embeds``
+            # and ``input_ids`` is None, so the VLM wrapper forwards the
+            # pre-fusion token ids via ``spec_input_ids``.
+            spec_token_ids = spec_input_ids if spec_input_ids is not None else input_ids
             spec_position_ids = position_ids
             if attn_metadata.padded_num_tokens is not None:
-                if input_ids is not None:
-                    spec_input_ids = input_ids[: attn_metadata.num_tokens]
+                if spec_token_ids is not None:
+                    spec_token_ids = spec_token_ids[: attn_metadata.num_tokens]
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens
                     )
 
             return self.spec_worker(
-                input_ids=spec_input_ids,
+                input_ids=spec_token_ids,
                 position_ids=spec_position_ids,
                 hidden_states=hidden_states,
                 logits=logits,

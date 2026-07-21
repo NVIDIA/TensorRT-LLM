@@ -36,8 +36,8 @@ from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
 from ..attention_interface import (
     AttentionRegistry,
     BatchInfo,
+    IntermediateConvStateHandler,
     MHACallable,
-    SpecCausalConvResourceHandler,
 )
 from .causal_conv_common import BaseCausalConvDescriptor
 
@@ -255,7 +255,7 @@ class TritonBackendCausalConv(BaseCausalConvDescriptor):
     @classmethod
     def get_cache_initializers(cls, source_attn_node, cache_config):
         ret = super().get_cache_initializers(source_attn_node, cache_config)
-        ret["intermediate_conv_state_cache"] = SpecCausalConvResourceHandler.from_base(
+        ret["intermediate_conv_state_cache"] = IntermediateConvStateHandler.from_base(
             ret["conv_state_cache"]
         )
         return ret

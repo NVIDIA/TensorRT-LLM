@@ -24,6 +24,7 @@ NVLINK Two-Sided supports post-quant dispatch for all quantization modes.
 import os
 from typing import List, Optional, Tuple
 
+import pynvml
 import torch
 from flashinfer.comm.mnnvl import MnnvlMemory as flashinfer_MnnvlMemory
 from flashinfer.comm.trtllm_alltoall import MnnvlMoe as flashinfer_MnnvlMoe
@@ -89,6 +90,13 @@ class NVLinkTwoSidedFlashinfer(Communication):
         """
         Check if NVLINK two-sided comm is supported on current hardware.
         """
+        # flashinfer's MnnvlMemory.supports_mnnvl() queries NVML without
+        # initializing it (only its initialize() guards), so satisfy that
+        # precondition on our side of the boundary.
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
         return flashinfer_MnnvlMemory.supports_mnnvl()
 
     def supports_post_quant_dispatch(self) -> bool:

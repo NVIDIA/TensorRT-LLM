@@ -41,9 +41,11 @@ class FluxJointAttention(Attention):
     - FLUX-style RoPE on concatenated text+image tokens
     - pre_only mode for single-stream blocks (no output projection)
 
-    When fuse_qk_norm_rope is enabled (default), the fused CUDA kernel handles
-    QK norm + RoPE in a single pass. When disabled, falls back to separate
-    F.rms_norm + apply_rotary_emb calls.
+    FLUX enables fuse_qk_norm_rope by default when TP=1: the fused CUDA
+    kernel handles QK norm + RoPE in a single pass. It falls back to separate
+    F.rms_norm + apply_rotary_emb calls when disabled, and is disabled under
+    tensor parallelism because the fused op currently requires TP=1
+    (apply_packed_qk_norm_rope asserts tp_size == 1).
     """
 
     def __init__(
@@ -57,7 +59,13 @@ class FluxJointAttention(Attention):
         pre_only: bool = False,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
+        # Opt in to the fused DiT QK-norm + RoPE kernel (per-head template), but
+        # only when TP=1: the fused op asserts tp_size == 1
+        # (apply_packed_qk_norm_rope), so under TP>1 we fall back to the unfused
+        # F.rms_norm + apply_rotary_emb path. Mirrors WAN's gating.
+        tp_size = config.mapping.tp_size if config and config.mapping else 1
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -68,8 +76,10 @@ class FluxJointAttention(Attention):
             eps=eps,
             bias=bias,
             interleave=True,
+            fuse_qk_norm_rope=(tp_size == 1),
             config=config,
             layer_idx=layer_idx,
+            module_name=module_name,
         )
 
         self.pre_only = pre_only
@@ -246,6 +256,7 @@ class FluxJointAttention(Attention):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of joint attention.
 
@@ -266,7 +277,7 @@ class FluxJointAttention(Attention):
             hidden_states, encoder_hidden_states, image_rotary_emb
         )
 
-        hidden_states = self._attn_impl(query, key, value)
+        hidden_states = self._attn_impl(query, key, value, timestep=timestep)
         hidden_states = hidden_states.to(query.dtype)
 
         if is_dual_stream:
@@ -313,6 +324,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         eps: float = 1e-6,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         # self.tp_size is set in super().__init__
         tp_size = config.mapping.tp_size if config and config.mapping else 1
@@ -332,6 +344,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             pre_only=True,  # Deletes base to_out
             config=config,
             layer_idx=layer_idx,
+            module_name=module_name,
         )
 
         # Output projection needs FULL dims (ROW parallel divides internally)
@@ -417,6 +430,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -432,7 +446,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
 
-        attn_out = self._attn_impl(q, k, v)
+        attn_out = self._attn_impl(q, k, v, timestep=timestep)
         attn_out = attn_out.to(q.dtype)
 
         # Parallel MLP path (reshape to 2D for Triton kernel, then back)

@@ -95,7 +95,7 @@ def ensure_bench_serving_repo() -> str:
     return bench_script
 
 
-DEFAULT_TIMEOUT = 5400
+DEFAULT_TIMEOUT = 10800
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
     "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
@@ -139,14 +139,20 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
 #   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
-#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
+#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...,
+#   states = {..., 'num_generation_tokens': 512, ...}
 # Only the gen worker (decode) emits this. The device value reported at iter N
 # is the device step time of iter N-1 (device runs async). Iters 0-4 are
 # skipped: iter 0/1 include KV-cache transfer wait time, and iters 2-4 are
 # warmup that has not yet reached steady state. prev_device_step_time may be
 # 'N/A' (e.g. iter 1); the regex requires a numeric value so those lines do
-# not match.
+# not match. num_generation_tokens is captured by a separate regex applied
+# to the same line (name is stable, order relative to prev_device_step_time
+# is not) so the scanner can bucket rows by ngen without silently dropping
+# any line whose states dict is printed before prev_device_step_time. See
+# _scan_gen_worker_device_step_time.
 _DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
+_NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
 
 
 def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
@@ -163,47 +169,150 @@ def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
     return sizes
 
 
+def _scan_gen_worker_device_step_time(
+    output_dir: str,
+    num_gen_servers: int,
+    start_offsets: Optional[List[int]] = None,
+) -> Tuple[List[Dict[int, Tuple[int, float]]], int]:
+    """Single-pass scan of the gen logs.
+
+    Returns (per_file_by_ngen, total_count):
+      - per_file_by_ngen: one dict per file that produced >=1 usable line,
+        mapping num_generation_tokens -> (count, Welford mean of
+        prev_device_step_time) over rows with iter >= 5 and a numeric
+        prev_device_step_time. Rows lacking num_generation_tokens on the same
+        line are skipped for the mean but still counted for settle detection.
+      - total_count: the number of iter >= 5 rows with a numeric
+        prev_device_step_time across all files. This is monotonic as new
+        lines flush across NFS (rows only get appended) so the caller can use
+        it as the settle signal without worrying that changes to a per-ngen
+        filter can make it drop.
+
+    Memory is O(distinct num_generation_tokens per file), a small constant
+    in practice (steady-state plus a shrinking tail).
+
+    errors="replace" guards against invalid UTF-8: tqdm progress bars
+    (model load) write partial multibyte sequences that would otherwise raise
+    UnicodeDecodeError mid-scan.
+    """
+    per_file_by_ngen: List[Dict[int, Tuple[int, float]]] = []
+    total_count = 0
+    for i in range(num_gen_servers):
+        log_path = os.path.join(output_dir, f"gen_server_{i}.log")
+        if not os.path.isfile(log_path):
+            continue
+
+        seek_to = (
+            start_offsets[i]
+            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]
+            else 0
+        )
+
+        by_ngen: Dict[int, Tuple[int, float]] = {}
+        with open(log_path, errors="replace") as f:
+            if seek_to:
+                f.seek(seek_to)
+            for line in f:
+                m = _DEVICE_STEP_TIME_RE.search(line)
+                if m is None:
+                    continue
+                if int(m.group(1)) < 5:
+                    continue
+                total_count += 1
+                ngen_m = _NUM_GEN_TOKENS_RE.search(line)
+                if ngen_m is None:
+                    continue
+                ngen = int(ngen_m.group(1))
+                dt = float(m.group(2))
+                count, mean = by_ngen.get(ngen, (0, 0.0))
+                count += 1
+                mean += (dt - mean) / count
+                by_ngen[ngen] = (count, mean)
+        if by_ngen:
+            per_file_by_ngen.append(by_ngen)
+    return per_file_by_ngen, total_count
+
+
+def _mean_at_mode_ngen(
+    per_file_by_ngen: List[Dict[int, Tuple[int, float]]],
+) -> Optional[float]:
+    """Aggregate per-file per-ngen buckets into a single mean.
+
+    Within each file pick the num_generation_tokens value with the most
+    iterations (the mode) and take its Welford mean; ties break to the
+    largest ngen because the steady-state plateau is the upper of any tied
+    clusters. Mode is more robust than strict == max — a one-off spike where
+    a single iter's ngen briefly exceeds the sustained batch would otherwise
+    collapse the mean to 1-2 samples. Then average the per-file means across
+    workers. Returns None if no file had a usable row.
+    """
+    means: List[float] = []
+    for by_ngen in per_file_by_ngen:
+        if not by_ngen:
+            continue
+        _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
+        means.append(mean)
+    if not means:
+        return None
+    return sum(means) / len(means)
+
+
 def parse_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
+    settle_timeout: float = 90.0,
+    poll_interval: float = 3.0,
 ) -> Optional[float]:
     """Mean per-iter prev_device_step_time (ms) across all gen workers.
 
-    For each gen_server_{i}.log, average prev_device_step_time over iters >= 5,
-    then average those per-file means across the num_gen_servers workers.
+    For each gen_server_{i}.log, bucket iter >= 5 rows by
+    num_generation_tokens, pick the bucket with the most rows (the mode; ties
+    break to the largest ngen), and take that bucket's mean. Then average
+    those per-file means across the num_gen_servers workers. Iterations near
+    the end of a run have a shrinking num_generation_tokens as sequences
+    finish and land in smaller-ngen buckets, so they don't drag the mean
+    below the steady-state cost. Using the mode (rather than strict == max)
+    is robust against a single iter whose ngen briefly spikes above the
+    sustained batch, which would otherwise collapse the mean to 1-2 samples.
     Returns None if no usable line is found in any file.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
     end-of-file are considered for gen_server_{i}.log — used to slice out a
     single client's iteration segment.
+
+    The gen worker writes gen_server_{i}.log on a different node than the
+    benchmark/pytest process, and the worker is kept alive (waiting on the
+    benchmark_status file) when this runs — so when the client returns, the
+    decode iterations are done but their log lines may still be flushing across
+    NFS. Reading once immediately can see zero iter>=5 lines and wrongly return
+    None. So poll the slice until the iter>=5 row count is non-zero AND
+    stable across two consecutive reads (flush drained), bounded by
+    settle_timeout. The settle signal is the raw iter>=5 row count (not the
+    mode-bucket count) because raw rows are monotonic across polls, whereas
+    the mode ngen — and therefore its bucket size — can shift while the tail
+    is still flushing.
     """
-    per_file_means: List[float] = []
-    for i in range(num_gen_servers):
-        log_path = os.path.join(output_dir, f"gen_server_{i}.log")
-        if not os.path.isfile(log_path):
-            continue
-        # Welford streaming mean: O(1) memory and numerically stable for
-        # large iteration counts.
-        count = 0
-        mean = 0.0
-        with open(log_path) as f:
-            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]:
-                f.seek(start_offsets[i])
-            for line in f:
-                m = _DEVICE_STEP_TIME_RE.search(line)
-                if m is None:
-                    continue
-                iter_idx = int(m.group(1))
-                if iter_idx < 5:
-                    continue
-                count += 1
-                mean += (float(m.group(2)) - mean) / count
-        if count:
-            per_file_means.append(mean)
-    if not per_file_means:
-        return None
-    return sum(per_file_means) / len(per_file_means)
+    deadline = time.time() + settle_timeout
+    prev_count = -1
+    while True:
+        per_file_by_ngen, total_count = _scan_gen_worker_device_step_time(
+            output_dir, num_gen_servers, start_offsets
+        )
+        # Non-empty and unchanged since the last poll → the flush has settled.
+        if total_count > 0 and total_count == prev_count:
+            return _mean_at_mode_ngen(per_file_by_ngen)
+        if time.time() >= deadline:
+            if per_file_by_ngen:
+                print_info(
+                    f"parse_gen_worker_device_step_time: settle_timeout "
+                    f"({settle_timeout}s) reached with {total_count} line(s); "
+                    "returning current mean."
+                )
+                return _mean_at_mode_ngen(per_file_by_ngen)
+            return None
+        prev_count = total_count
+        time.sleep(poll_interval)
 
 
 def add_perf_metric_value(
@@ -358,10 +467,18 @@ class ServerConfig:
         self.moe_max_num_tokens = moe_config.get("max_num_tokens", 0)
         self.use_low_precision_moe_combine = moe_config.get("use_low_precision_moe_combine", False)
         load_balancer_config = moe_config.get("load_balancer", {})
-        self.load_balancer_num_slots = load_balancer_config.get("num_slots", 0)
-        self.load_balancer_layer_updates_per_iter = load_balancer_config.get(
-            "layer_updates_per_iter", 0
-        )
+        # load_balancer may be either an inline dict (num_slots + layer_updates_per_iter)
+        # or a path string to an offline-eplb YAML that the TRT-LLM engine loads at
+        # runtime. When it is a string, skip the inline attribute extraction — those
+        # metrics live inside the referenced YAML and aren't scraped by perf-sanity.
+        if isinstance(load_balancer_config, str):
+            self.load_balancer_num_slots = 0
+            self.load_balancer_layer_updates_per_iter = 0
+        else:
+            self.load_balancer_num_slots = load_balancer_config.get("num_slots", 0)
+            self.load_balancer_layer_updates_per_iter = load_balancer_config.get(
+                "layer_updates_per_iter", 0
+            )
 
         # cuda_graph_config
         cuda_graph_config = server_config_data.get("cuda_graph_config", {})
@@ -576,6 +693,15 @@ class ServerConfig:
                 config_data["speculative_config"]["speculative_model"] = os.path.join(
                     llm_models_root(), spec_model
                 )
+
+        # Resolve `moe_config.load_balancer` when it is a repo-relative path
+        # string. The TRT-LLM engine accepts either a dict (inline) or a path
+        # to an offline-eplb YAML. Absolute paths and dicts are left alone.
+        moe_cfg = config_data.get("moe_config")
+        if isinstance(moe_cfg, dict):
+            lb = moe_cfg.get("load_balancer")
+            if isinstance(lb, str) and lb and not os.path.isabs(lb):
+                moe_cfg["load_balancer"] = os.path.join(get_llm_root(), lb)
 
         return yaml.dump(config_data, default_flow_style=False, sort_keys=False)
 
@@ -1617,6 +1743,17 @@ class PerfSanityTestConfig:
                 hardware["num_ctx_servers"] = 0
 
         worker_env_var = environment.get("worker_env_var", "")
+        # Optional per-role env vars appended to the shared worker_env_var so
+        # ctx and gen workers can diverge (e.g. PYTORCH_CUDA_ALLOC_CONF on ctx
+        # only). Absent keys leave the shared value untouched.
+        ctx_worker_env_var_extra = environment.get("ctx_worker_env_var", "") or ""
+        gen_worker_env_var_extra = environment.get("gen_worker_env_var", "") or ""
+        ctx_worker_env_var = " ".join(
+            part for part in (worker_env_var, ctx_worker_env_var_extra) if part
+        )
+        gen_worker_env_var = " ".join(
+            part for part in (worker_env_var, gen_worker_env_var_extra) if part
+        )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
 
@@ -1652,7 +1789,10 @@ class PerfSanityTestConfig:
                 **ctx_config,
             }
 
-            ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
+            # ctx_only runs the ctx worker in aggregated mode; use the merged
+            # ctx-side env var so the aggregated run still gets any ctx-only
+            # extras from the disagg yaml.
+            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
             self.server_configs = [ctx_server_config]
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
@@ -1674,8 +1814,8 @@ class PerfSanityTestConfig:
                 **worker_config.get("gen", {}),
             }
 
-            ctx_server_config = ServerConfig(ctx_server_config_data, worker_env_var)
-            gen_server_config = ServerConfig(gen_server_config_data, worker_env_var)
+            ctx_server_config = ServerConfig(ctx_server_config_data, ctx_worker_env_var)
+            gen_server_config = ServerConfig(gen_server_config_data, gen_worker_env_var)
 
             disagg_config = DisaggConfig(
                 name=f"{benchmark_mode}-{config_file_base_name}",
@@ -2164,10 +2304,19 @@ class PerfSanityTestConfig:
         else:
             return
 
+        stage_name = os.environ.get("stageName", "")
         extra_fields = {
-            "s_stage_name": os.environ.get("stageName", ""),
+            "s_stage_name": stage_name,
             "s_test_list": self._test_param_labels,
         }
+
+        # Stages tagged "FUNCTIONAL-ONLY" run the full perf harness (numbers are
+        # still uploaded to OpenSearch and dashboards) but do not fail CI on perf
+        # regression -- same behavior as post-merge. Used for pre-merge disagg
+        # coverage where the goal is functional-failure detection, not gating on
+        # perf. Explicit False (not None) so the auto-detect in
+        # process_and_upload_test_results does not flip it back on for pre-merge.
+        fail_on_regression = False if "FUNCTIONAL-ONLY" in stage_name else None
 
         # gen_only tests are gated solely on per-iter prev_device_step_time, not
         # token throughput (token-based numbers are dominated by KV cache transfer
@@ -2195,6 +2344,7 @@ class PerfSanityTestConfig:
             regression_metrics=regression_metrics,
             extra_fields=extra_fields,
             upload_to_db=self.upload_to_db,
+            fail_on_regression=fail_on_regression,
         )
 
 

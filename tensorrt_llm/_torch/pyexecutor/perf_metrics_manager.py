@@ -29,6 +29,7 @@ class PerfMetricsManager:
         self.enabled = enabled
         self._perf_events = None
         self._perf_event_idx = 0
+        self._forward_event_pool = []
 
     # ------------------------------------------------------------------
     # GPU event helpers
@@ -45,8 +46,8 @@ class PerfMetricsManager:
 
         Returns:
             Tuple of ``(gpu_forward_start, gpu_forward_end,
-            gpu_sample_end)`` or ``(None, None, None)`` if metrics are
-            disabled.
+            gpu_sample_end)`` or ``(None, None, None)`` if per-request perf
+            metrics are disabled.
         """
         if not self.enabled:
             return None, None, None
@@ -59,6 +60,16 @@ class PerfMetricsManager:
         events = self._perf_events[self._perf_event_idx % 2]
         self._perf_event_idx += 1
         return events
+
+    def borrow_forward_timing_events(self):
+        """Borrow a forward-only pair when the ping-pong perf events are unavailable."""
+        if self._forward_event_pool:
+            return self._forward_event_pool.pop()
+        return (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+
+    def release_forward_timing_events(self, start_event, end_event) -> None:
+        if start_event is not None and end_event is not None:
+            self._forward_event_pool.append((start_event, end_event))
 
     @contextmanager
     def record_perf_events(
@@ -104,6 +115,22 @@ class PerfMetricsManager:
     def get_timestamp(self) -> Optional[float]:
         """Return a CPU timestamp if metrics are enabled, else ``None``."""
         return get_steady_clock_now_in_seconds() if self.enabled else None
+
+    @staticmethod
+    def try_compute_gpu_elapsed_time_ms(
+        start_event: Optional[torch.cuda.Event],
+        end_event: Optional[torch.cuda.Event],
+    ) -> Optional[float]:
+        """Return CUDA-event elapsed time if ready, without synchronizing."""
+        if start_event is None or end_event is None:
+            return None
+        try:
+            if not end_event.query():
+                return None
+            return float(start_event.elapsed_time(end_event))
+        except RuntimeError as e:
+            logger.warning("Failed to compute GPU event elapsed_time: %s", e)
+            return None
 
     @staticmethod
     def save_timing_to_requests(

@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
+#include "tensorrt_llm/executor/version.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/runtimeDefaults.h"
 
@@ -50,9 +51,11 @@ namespace tensorrt_llm::executor
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 /// @brief Version of TRT-LLM
-char const* version() noexcept;
+inline char const* version() noexcept
+{
+    return kTensorRtLlmVersion;
+}
 
-class Model;
 class Serialization;
 class DataTransceiverState;
 
@@ -714,8 +717,9 @@ public:
     /// @param allottedTimeMs The allotted time in milliseconds after which the request is cancelled with a timedOut
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
-    /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
     /// @param disaggRequestId Disaggregated request ID.
+    /// @param cacheSalt Optional cache salt string. If provided, KV cache blocks are tagged so reuse is limited to
+    /// requests with the same salt. The string is also surfaced in KV cache events. Defaults to std::nullopt.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -743,8 +747,7 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<IdType> disaggRequestId = std::nullopt);
+        std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -758,6 +761,7 @@ public:
     ~Request();
 
     [[nodiscard]] VecTokens getInputTokenIds() const;
+    [[nodiscard]] SizeType32 getNumInputTokens() const;
     [[nodiscard]] SizeType32 getMaxTokens() const;
     [[nodiscard]] bool getStreaming() const;
     [[nodiscard]] SamplingConfig getSamplingConfig() const;
@@ -792,7 +796,7 @@ public:
     [[nodiscard]] std::optional<GuidedDecodingParams> getGuidedDecodingParams() const;
     [[nodiscard]] std::optional<SizeType32> getLanguageAdapterUid() const;
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
-    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
+    [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
@@ -829,7 +833,7 @@ public:
     void setGuidedDecodingParams(GuidedDecodingParams const& guidedDecodingParams);
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
-    void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setCacheSalt(std::optional<std::string> cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);
 
 private:
@@ -989,6 +993,8 @@ public:
 
     [[nodiscard]] std::vector<std::pair<SizeType32, SizeType32>> getBatchSizeTable() const;
 
+    bool operator==(DynamicBatchConfig const& other) const;
+
     /// @brief The default value of batch size table
     static std::vector<std::pair<SizeType32, SizeType32>> const kDefaultBatchSizeTable;
 
@@ -1019,7 +1025,7 @@ public:
     explicit SchedulerConfig(
         CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
         std::optional<ContextChunkingPolicy> contextChunkingPolicy = std::nullopt,
-        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt);
+        std::optional<DynamicBatchConfig> dynamicBatchConfig = std::nullopt, bool enablePrefixAwareScheduling = true);
 
     bool operator==(SchedulerConfig const& other) const;
 
@@ -1028,6 +1034,8 @@ public:
     [[nodiscard]] std::optional<ContextChunkingPolicy> getContextChunkingPolicy() const;
 
     [[nodiscard]] std::optional<DynamicBatchConfig> getDynamicBatchConfig() const;
+
+    [[nodiscard]] bool getEnablePrefixAwareScheduling() const;
 
 private:
     friend class Serialization;
@@ -1040,6 +1048,9 @@ private:
 
     /// @brief The config for tuning batch size dynamically. See DynamicBatchSizeConfig.
     std::optional<DynamicBatchConfig> mDynamicBatchConfig;
+
+    /// @brief Whether schedulers use KV prefix-reuse estimates for admission and token-budget decisions.
+    bool mEnablePrefixAwareScheduling;
 };
 
 /// @brief Configuration class for the KV cache
@@ -1225,6 +1236,11 @@ private:
     SizeType32 mDebugTensorsMaxIterations;
 };
 
+/// @brief Configuration for the orchestrator communication mode.
+/// @deprecated Orchestrator mode is non-functional: the worker binary it spawned
+/// (executorWorker) was removed together with the TensorRT backend. This class is
+/// retained only for serialization and Python-binding compatibility and is a
+/// candidate for removal in a follow-up (needs API-stability review).
 class OrchestratorConfig
 {
 public:
@@ -1501,20 +1517,25 @@ public:
         NIXL = 3,
         MOONCAKE = 4
     };
+    static constexpr int kDefaultKvTransferPollIntervalMs = 5000;
+
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
+    void setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferPollIntervalMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1526,6 +1547,9 @@ private:
     // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
     // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
     std::optional<int> mKvTransferSenderFutureTimeoutMs;
+    // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
+    // disaggregated admission.
+    std::optional<int> mKvTransferPollIntervalMs;
 };
 
 /// @brief Configuration class for the model executor
@@ -1539,6 +1563,9 @@ public:
 
     // Per request stats may have additional overhead due to going through all requests. Turned off by default.
     static constexpr SizeType32 kDefaultRequestStatsMaxIterations = 0;
+
+    // A value of -1 keeps all iteration/request stats until they are fetched.
+    static constexpr SizeType32 kUnlimitedStatsMaxIterations = -1;
 
     explicit ExecutorConfig(SizeType32 maxBeamWidth = 1, SchedulerConfig schedulerConfig = SchedulerConfig(),
         KvCacheConfig kvCacheConfig = KvCacheConfig(), bool enableChunkedContext = true, bool normalizeLogProbs = false,
@@ -1645,9 +1672,11 @@ private:
     bool mNormalizeLogProbs;
 
     /// @brief Controls the maximum number of iterations for which to keep statistics.
+    ///        Set to -1 to keep all iteration statistics. Set to 0 to disable iteration statistics.
     SizeType32 mIterStatsMaxIterations;
 
     /// @brief Controls the maximum number of iterations for which to keep per-request statistics.
+    ///        Set to -1 to keep all per-request statistics. Set to 0 to disable per-request statistics.
     SizeType32 mRequestStatsMaxIterations;
 
     /// @brief The type of batching strategy to use. See BatchingType.
@@ -1729,13 +1758,14 @@ struct KVCacheStoredBlockData
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
         std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
-        std::vector<MmKey> mmKeys = {})
+        std::vector<MmKey> mmKeys = {}, std::optional<std::string> cacheSalt = std::nullopt)
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
         , mmKeys{std::move(mmKeys)}
+        , cacheSalt{std::move(cacheSalt)}
     {
     }
 
@@ -1751,6 +1781,8 @@ struct KVCacheStoredBlockData
     SizeType32 priority;
     /// @brief The multimodal keys of the block
     std::vector<MmKey> mmKeys;
+    /// @brief The original cache salt string of the block, if any
+    std::optional<std::string> cacheSalt;
 };
 
 struct KVCacheStoredData
@@ -1811,7 +1843,13 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 struct KVCacheEvent
 {
     KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
-        std::optional<SizeType32> attentionDpRank = std::nullopt);
+        std::optional<SizeType32> attentionDpRank = std::nullopt)
+        : eventId{eventId}
+        , data{std::move(data)}
+        , windowSize{windowSize}
+        , attentionDpRank{attentionDpRank}
+    {
+    }
 
     /// @brief The unique id of this event
     IdType eventId;
@@ -1837,119 +1875,6 @@ public:
 
 private:
     std::shared_ptr<tensorrt_llm::batch_manager::kv_cache_manager::BaseKVCacheManager> kvCacheManager;
-};
-
-/// @brief The executor is responsible for receiving new requests and sending responses, and running the inference
-class Executor
-{
-
-public:
-    /// @brief
-    /// @param modelPath Path to the folder that defines the model to run
-    /// @param modelType The type of model
-    /// @param executorConfig The configuration for the executor
-    Executor(std::filesystem::path const& modelPath, ModelType modelType, ExecutorConfig const& executorConfig);
-
-    Executor(std::filesystem::path const& encoderModelPath, std::filesystem::path const& decoderModelPath,
-        ModelType modelType, ExecutorConfig const& executorConfig);
-
-    Executor(BufferView const& engineBuffer, std::string const& jsonConfigStr, ModelType modelType,
-        ExecutorConfig const& executorConfig,
-        std::optional<std::map<std::string, Tensor>> const& managedWeights = std::nullopt);
-
-    Executor(BufferView const& encoderEngineBuffer, std::string const& encoderJsonConfigStr,
-        BufferView const& decoderEngineBuffer, std::string const& decoderJsonConfigStr, ModelType modelType,
-        ExecutorConfig const& executorConfig);
-
-    Executor(std::shared_ptr<Model> model, ExecutorConfig const& executorConfig);
-
-    Executor(
-        std::shared_ptr<Model> encoderModel, std::shared_ptr<Model> decoderModel, ExecutorConfig const& executorConfig);
-
-    ~Executor();
-    Executor(Executor const& executor) = delete;
-    Executor& operator=(Executor const& executor) = delete;
-    Executor(Executor&&) = default;
-    Executor& operator=(Executor&&) = default;
-
-    /// @brief Enqueue a new request
-    /// @param request The LLM request which contains input tokens and request parameters
-    /// @return A unique id that identifies the request
-    [[nodiscard]] IdType enqueueRequest(Request const& request);
-
-    /// @brief Enqueue a batch of request
-    [[nodiscard]] std::vector<IdType> enqueueRequests(std::vector<Request> const& requests);
-
-    /// @brief Await for ready responses
-    ///
-    ///        This overload awaits for any ready responses. In particular, if several requests
-    ///        have been enqueued, this method will provide any ready responses without order guarantees.
-    /// @param timeout The maximum time to wait for new responses
-    /// @return A vector of responses
-    [[nodiscard]] std::vector<Response> awaitResponses(
-        std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
-
-    /// @brief Await for ready responses
-    /// @param id A request id
-    /// @param timeout The maximum time to wait for new responses
-    /// @return A vector of responses
-    [[nodiscard]] std::vector<Response> awaitResponses(
-        IdType const& requestId, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
-
-    /// @brief Await for multiple ready responses
-    ///
-    ///        A multiple ID request behaves as if awaitResponses(IdType, timeout)
-    ///        were invoked on all IDs. The returned vector contains
-    ///        a vector of responses per ID in the same order specified by the requestIds.
-    ///        The same behaviour as awaitResponses(IdType, timeout) applies:
-    ///        * Responses may be empty.
-    ///        * If all responses have already been given for one of the requestIds,
-    ///          then this method will hang unless a timeout is specified.
-    /// @param requestIds Ids requested
-    /// @param timeout The maximum time to wait for new responses
-    /// @return A vector of vector of responses
-    [[nodiscard]] std::vector<std::vector<Response>> awaitResponses(
-        std::vector<IdType> const& requestIds, std::optional<std::chrono::milliseconds> const& timeout = std::nullopt);
-
-    /// @brief Get the number of ready responses
-    /// @param requestId An optional request id
-    /// @return The number of ready responses
-    [[nodiscard]] SizeType32 getNumResponsesReady(std::optional<IdType> const& requestId = std::nullopt) const;
-
-    /// @brief Cancel the request with provided request id
-    /// @param id The request id for which to cancel the response
-    void cancelRequest(IdType requestId);
-
-    /// @brief   Signals the server to shutdown.
-    /// @details This call is blocking. Only returns when all requests have terminated or timeout has been reached
-    void shutdown();
-
-    /// @brief  Returns the per-iterations statistics computed since last call to getLatestIterationStats.
-    ///         Contains at most iterStatsMaxIterations iterations.
-    /// @return Iteration stats
-    std::deque<IterationStats> getLatestIterationStats();
-
-    /// @brief  Returns the request stats of each iteration computed since last call to getLatestRequestStats.
-    ///         Contains at most requestStatsMaxIterations iterations.
-    /// @return Request stats grouped by iterations
-    std::deque<RequestStatsPerIteration> getLatestRequestStats();
-
-    /// @brief  Returns the debug tensors of each iteration computed since last call to getLatestDebugTensors.
-    ///         Contains at most debugTensorsMaxIterations iterations.
-    /// @return Request debug tensors grouped by iterations
-    std::deque<DebugTensorsPerIteration> getLatestDebugTensors();
-
-    /// @brief  Indicates if the current process is allowed to enqueueRequests
-    [[nodiscard]] bool canEnqueueRequests() const;
-
-    /// @brief  Indicates if the current process participates in this executor instance
-    [[nodiscard]] bool isParticipant() const;
-
-    std::optional<std::shared_ptr<KVCacheEventManager>> getKVCacheEventManager() const;
-
-private:
-    class Impl;
-    std::unique_ptr<Impl> mImpl;
 };
 
 /// @brief Class with utility functions to serialize statistics to json string

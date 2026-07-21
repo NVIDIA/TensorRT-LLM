@@ -21,7 +21,7 @@
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 
-#include <NvInferRuntimeBase.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
@@ -128,7 +128,7 @@ size_t FabricMemory::getAlignedSize(size_t size)
     return (size + granularity - 1) / granularity * granularity;
 }
 
-bool FabricMemory::supportFbaricMemory()
+bool FabricMemory::supportFabricMemory()
 {
 #ifdef __aarch64__
     auto support_fun = []()
@@ -194,7 +194,7 @@ bool FabricMemory::supportFbaricMemory()
 size_t CacheTransBufferManager::computeTransferBufferSize(
     KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
 {
-    nvinfer1::DataType dataType;
+    tensorrt_llm::DataType dataType;
     if (transferIndexerKCache)
     {
         dataType = cacheManager->getIndexerKCachePool()->getDataType();
@@ -309,7 +309,7 @@ size_t CacheTransBufferManager::preAllocBufferSize(
             transferBufferSize += validTokenNum * cacheSizeBytesPerToken;
         }
     }
-    bool useFabricMemory = FabricMemory::supportFbaricMemory()
+    bool useFabricMemory = FabricMemory::supportFabricMemory()
         && (!(common::getEnvKVCacheTransferUseSyncBuffer() || common::getEnvKVCacheTransferUseAsyncBuffer()));
     if (useFabricMemory)
     {

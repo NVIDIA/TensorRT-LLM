@@ -43,7 +43,7 @@ worker_config:
   gen:
     print_iter_log: true
     max_batch_size: 16
-    max_num_tokens: 128
+    max_num_tokens: 64
     tensor_parallel_size: 32
     moe_expert_parallel_size: 32
     pipeline_parallel_size: 1

@@ -38,6 +38,11 @@ namespace moe_prepare
 
 static constexpr int THREADS_PER_PIPELINE = UNIT_PER_PIPELINE;
 
+// One FIFO slot per (expertCount + 1) values: index 0 carries token counts,
+// indices 1..expertCount carry per-expert statistics. Sized to match the
+// MAX_EXPERT_COUNT used by moeLoadBalanceKernels.
+static constexpr int kMaxFifoValues = 1024;
+
 #ifdef __CUDACC__
 #define ALIGN_256 __align__(256)
 #else
@@ -46,9 +51,9 @@ static constexpr int THREADS_PER_PIPELINE = UNIT_PER_PIPELINE;
 
 struct ALIGN_256 MoeCommFifoConnInfo
 {
-    volatile uint64_t head;   // write position
-    volatile uint64_t tail;   // read position
-    int volatile values[512]; // for values
+    volatile uint64_t head; // write position
+    volatile uint64_t tail; // read position
+    int volatile values[kMaxFifoValues];
 };
 
 struct MoeCommWorkspace

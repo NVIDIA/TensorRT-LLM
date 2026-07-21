@@ -78,6 +78,13 @@ public:
     {
     }
 
+    // Implicit conversion from OptionalRef<non-const T> to OptionalRef<const T>
+    template <typename U = T, typename = std::enable_if_t<std::is_const_v<U>>>
+    OptionalRef(OptionalRef<std::remove_const_t<T>> const& other)
+        : opt(other ? std::optional<std::reference_wrapper<T>>(std::ref(*other)) : std::nullopt)
+    {
+    }
+
     T* operator->() const
     {
         return opt ? &(opt->get()) : nullptr;

@@ -16,12 +16,14 @@
 
 import datetime
 import gc
+import importlib
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import time
 import urllib.request
@@ -37,6 +39,14 @@ import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
+# Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
+# non-top-level conftest: a repo-root invocation like `pytest tests` loads
+# this file as a NESTED conftest and would fail collection; and not via "-p"
+# in pytest.ini addopts, which imports at preparse, before the ini pythonpath
+# entries are usable). The wrappers below forward to the plugin; hooks are
+# idempotent, so a repo-root run that also dispatches from tests/conftest.py
+# is harmless.
+from test_common import session_prefetcher_hooks as _prefetch_hooks
 
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
@@ -63,6 +73,14 @@ logger = logging.getLogger(__name__)
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
+
+
+def _get_s3_output():
+    tests_root = Path(__file__).resolve().parents[2]
+    tests_root_str = str(tests_root)
+    if tests_root_str not in sys.path:
+        sys.path.append(tests_root_str)
+    return importlib.import_module("test_common.s3_output")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -666,12 +684,13 @@ def custom_user_workspace(request):
 
 
 @pytest.fixture(scope="session")
-def llm_venv(llm_root, custom_user_workspace):
+def llm_venv(request, llm_root, custom_user_workspace):
     workspace_dir = custom_user_workspace
     subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
     if workspace_dir is None:
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
+    keep_workspace = request.config.getoption("--keep-workspace", default=False)
     from defs.local_venv import PythonVenvRunnerImpl
 
     venv = PythonVenvRunnerImpl("", "", "python3",
@@ -679,11 +698,11 @@ def llm_venv(llm_root, custom_user_workspace):
     yield venv
     # Remove the workspace directory
     if os.path.exists(workspace_dir):
-        print(f"Cleaning up workspace: {workspace_dir}")
-        try:
-            shutil.rmtree(workspace_dir)
-        except Exception as e:
-            print(f"Failed to clean up workspace: {e}")
+        if keep_workspace:
+            print(f"Keeping workspace (--keep-workspace): {workspace_dir}")
+        else:
+            print(f"Cleaning up workspace: {workspace_dir}")
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -1776,7 +1795,12 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    prop = torch.cuda.get_device_properties(0)
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        prop = torch.cuda.get_device_properties(0)
+    except RuntimeError:
+        return 0
     return prop.major * 10 + prop.minor
 
 
@@ -1792,14 +1816,27 @@ def get_gpu_device_list():
         suffix = ".exe" if is_windows() else ""
         # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
         cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return []
     return [l.strip() for l in output.strip().split("\n")]
 
 
 def check_device_contain(keyword_list):
     "check device not contain keyword"
-    device = get_gpu_device_list()[0]
+    devices = get_gpu_device_list()
+    device = devices[0] if devices else ""
     return any(keyword in device for keyword in keyword_list)
+
+
+def is_ipc_nvls_supported():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return ipc_nvls_supported()
+    except RuntimeError:
+        return False
 
 
 skip_pre_ada = pytest.mark.skipif(
@@ -1809,6 +1846,11 @@ skip_pre_ada = pytest.mark.skipif(
 skip_pre_hopper = pytest.mark.skipif(
     get_sm_version() < 90,
     reason="This test is not supported in pre-Hopper architecture",
+)
+
+skip_post_hopper = pytest.mark.skipif(
+    get_sm_version() > 90,
+    reason="This test is not supported in post-Hopper architecture",
 )
 
 skip_pre_blackwell = pytest.mark.skipif(
@@ -1831,7 +1873,7 @@ skip_device_contain_gb200 = pytest.mark.skipif(
     reason="This test is not supported on GB200 or GB100",
 )
 
-skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
+skip_no_nvls = pytest.mark.skipif(not is_ipc_nvls_supported(),
                                   reason="NVLS is not supported")
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
@@ -1914,6 +1956,7 @@ def get_device_memory():
 
 
 def pytest_addoption(parser):
+    _get_s3_output().add_options(parser)
     parser.addoption(
         "--test-list",
         "-F",
@@ -1979,6 +2022,12 @@ def pytest_addoption(parser):
         "Enable Ray orchestrator path for integration tests (disables MPI).",
     )
     parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
+    )
+    parser.addoption(
         "--perf-log-formats",
         help=
         "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",
@@ -2033,6 +2082,13 @@ def pytest_addoption(parser):
         default=False,
         help="Enable GPU clock locking during tests. "
         "By default, GPU clock locking is disabled.",
+    )
+    parser.addoption(
+        "--keep-workspace",
+        action="store_true",
+        default=False,
+        help=
+        "Skip workspace cleanup at session end (useful for inspecting logs after a failure).",
     )
     parser.addoption(
         "--periodic-save-unfinished-test",
@@ -2147,6 +2203,7 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    _prefetch_hooks.pytest_configure(config)
     os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
 
     # avoid thread leak of tqdm's TMonitor
@@ -2155,6 +2212,13 @@ def pytest_configure(config):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
         os.environ["RAY_raylet_start_wait_time_s"] = "120"
+
+    # xdist worker processes must not register PeriodicJUnitXML: all worker
+    # reports are forwarded to the controller via xdist and processed there,
+    # so registering on workers causes concurrent writers to the same
+    # unfinished_test.txt and races out cleanup entries.
+    if hasattr(config, "workerinput"):
+        return
 
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)
@@ -2174,93 +2238,6 @@ def pytest_configure(config):
         # Create the reporter with logger
         xmlpath = periodic_junit_xmlpath or os.path.join(
             output_dir, "results.xml")
-        reporter = PeriodicJUnitXML(
-            xmlpath=xmlpath,
-            interval=periodic_interval,
-            batch_size=periodic_batch_size,
-            logger={
-                'info': print_info,
-                'warning': print_warning
-            },
-            save_unfinished_test=periodic_save_unfinished_test,
-        )
-
-        # Configure and register the reporter
-        reporter.pytest_configure(config)
-        config.pluginmanager.register(reporter, 'periodic_junit')
-
-        print_info("PeriodicJUnitXML reporter registered")
-        print_info(
-            f"  Interval: {periodic_interval}s ({periodic_interval/60:.1f} min)"
-        )
-        print_info(f"  Batch size: {periodic_batch_size} tests")
-        print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
-    elif periodic and not output_dir:
-        print_warning(
-            "Warning: --periodic-junit requires --output-dir to be set. "
-            "Periodic reporting disabled.")
-
-
-def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
-                                  config):
-    """Filter tests based on the test model suites specified.
-    If a test matches any of the test model suite names, it is considered selected.
-
-    Args:
-        test_model_suites: String containing test model suite names separated by semicolons
-        items: List of pytest items to filter
-        test_prefix: Test prefix if any
-        config: Pytest config object
-    """
-    if not test_model_suites:
-        return
-
-    # Split by semicolon or space and strip whitespace
-    suite_names = [
-        suite.strip() for suite in test_model_suites.replace(';', ' ').split()
-        if suite.strip()
-    ]
-
-    if not suite_names:
-        return
-
-    selected = []
-    deselected = []
-
-    for item in items:
-        # Get the test name without prefix for comparison
-        test_name = item.nodeid
-        if test_prefix and test_name.startswith(f"{test_prefix}/"):
-            test_name = test_name[len(f"{test_prefix}/"):]
-
-        # Check if any suite name matches the test name
-        found = False
-        for suite_name in suite_names:
-            if suite_name in test_name or test_name.endswith(suite_name):
-                found = True
-                break
-
-        if found:
-            selected.append(item)
-        else:
-            deselected.append(item)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-    items[:] = selected
-
-    # Initialize PeriodicJUnitXML reporter if enabled
-    periodic = config.getoption("--periodic-junit", default=False)
-    output_dir = config.getoption("--output-dir", default=None)
-
-    if periodic and output_dir:
-        periodic_interval = config.getoption("--periodic-interval")
-        periodic_batch_size = config.getoption("--periodic-batch-size")
-        periodic_save_unfinished_test = config.getoption(
-            "--periodic-save-unfinished-test", default=False)
-
-        # Create the reporter with logger
-        xmlpath = os.path.join(output_dir, "results.xml")
         reporter = PeriodicJUnitXML(
             xmlpath=xmlpath,
             interval=periodic_interval,
@@ -2618,15 +2595,6 @@ def pytest_runtest_protocol(item, nextitem):
 
 
 @pytest.fixture(scope="function")
-def deterministic_test_root(llm_root, llm_venv):
-    "Get deterministic test root"
-    deterministic_root = os.path.join(llm_root,
-                                      "tests/integration/defs/deterministic")
-
-    return deterministic_root
-
-
-@pytest.fixture(scope="function")
 def disaggregated_test_root(llm_root, llm_venv):
     "Get disaggregated test root"
     disaggregated_root = os.path.join(llm_root,
@@ -2696,3 +2664,11 @@ def torch_empty_cache() -> None:
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()
+
+
+def pytest_runtest_setup(item):
+    _prefetch_hooks.pytest_runtest_setup(item)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

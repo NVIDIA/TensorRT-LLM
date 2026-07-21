@@ -54,6 +54,8 @@ from ...custom_ops.attention_interface import (
     Constant,
     KVPagedResourceHandler,
     PrepareMetadataCallable,
+    ResourceHandler,
+    SpeculativeOnly,
 )
 from ...custom_ops.semantic_mask_registry import SemanticMaskRegistry
 from ...models.factory import ModelFactory
@@ -329,6 +331,22 @@ class _InsertCachedOperator(BaseTransform):
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
 
+    @staticmethod
+    def _suppress_spec_handlers_maybe(
+        resource_handler: Optional[ResourceHandler], spec_config: Optional[object]
+    ) -> Optional[ResourceHandler]:
+        """Drop a speculative-only resource to the None sentinel when spec decoding is off.
+
+        Handlers carrying the ``SpeculativeOnly`` trait are read only on the speculative extend
+        path and are never bound by the cache manager without ``spec_config``; registering them
+        would leak an unmanaged per-layer allocation. Returns ``None`` for such handlers when
+        ``spec_config`` is None, otherwise returns ``resource_handler`` unchanged (``isinstance``
+        is None-safe, so the existing None sentinel passes through untouched).
+        """
+        if spec_config is None and isinstance(resource_handler, SpeculativeOnly):
+            return None
+        return resource_handler
+
     def _apply(
         self,
         gm: GraphModule,
@@ -348,6 +366,12 @@ class _InsertCachedOperator(BaseTransform):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
+
+        # Record whether this backend's kernel applies the sliding-window mask
+        # itself (cyclic KV indexing, e.g. trtllm). The executor uses this to
+        # decide between passing the full per-window block table + global KV
+        # lengths (cyclic) and host-slicing to the live window (triton/flashinfer).
+        cm.set_kernel_handles_cyclic_swa(attn_descriptor.kernel_handles_cyclic_swa())
 
         # get standard metadata nodes for all source attention nodes
         meta_nodes_std = self._process_metadata_std(gm, cm)
@@ -379,8 +403,6 @@ class _InsertCachedOperator(BaseTransform):
         # --- Pass 1: register resources and assign per-layer group_idx ---
         # Group identity comes from KVPagedResourceHandler.__eq__ (which
         # includes sliding_window).  A group IS a pool IS a metadata set.
-        from ...custom_ops.attention_interface import KVPagedResourceHandler
-
         handler_groups: list[KVPagedResourceHandler] = []
         per_layer_group_idx: list[int] = []
         group_idx_by_layer_idx: dict[int, int] = {}
@@ -428,10 +450,27 @@ class _InsertCachedOperator(BaseTransform):
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
+                    # Speculative-only resources (intermediate SSM/conv state and replay
+                    # buffers) are never bound by the cache manager when spec decoding is off
+                    # (see CachedSequenceInterface._create_and_assign_state_views), so
+                    # allocating them would waste a full per-layer state buffer and OOM. Drop
+                    # them to the None sentinel instead of registering an unmanaged resource.
+                    resource_handler = self._suppress_spec_handlers_maybe(
+                        resource_handler, cm._spec_config
+                    )
                     if resource_handler is None:
                         # None sentinel: pass literal None positionally, no resource allocated.
                         cache_in_nodes.append(None)
                     else:
+                        # A window that can't slide within max_seq_len is functionally
+                        # full attention; normalize it to 0 so the layer shares the
+                        # full-attention pool instead of forking a redundant
+                        # single-window pool.
+                        if (
+                            isinstance(resource_handler, KVPagedResourceHandler)
+                            and resource_handler.sliding_window >= cm.info.max_seq_len
+                        ):
+                            resource_handler.sliding_window = 0
                         resource_name = cm.add_resource(k, resource_handler)
                         node = self._process_cache_node(gm, resource_name)
                         cache_in_nodes.append(node)

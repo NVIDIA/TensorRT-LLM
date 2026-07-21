@@ -11,7 +11,9 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -26,7 +28,6 @@ except ImportError:
     # Removed in transformers>=5
     def get_parameter_device(module):
         return next(module.parameters()).device
-
 
 # =========================================================================
 # 1. Rotary Positional Embeddings
@@ -246,6 +247,19 @@ class WanTimeTextImageEmbedding(nn.Module):
         return temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image
 
 
+def _default_vsa_gate(linear: Linear, bias_value: float) -> None:
+    """Default a VSA gate Linear absent from the checkpoint: weight=0, bias=bias_value
+    (G_c=0 / G_f=1, preserving dense behavior at sparsity=0)."""
+    if not linear._weights_created:
+        linear.create_weights()
+    if linear.weight.is_meta:
+        return
+    with torch.no_grad():
+        linear.weight.zero_()
+        if linear.bias is not None:
+            linear.bias.fill_(bias_value)
+
+
 class WanBlock(nn.Module):
     def __init__(
         self,
@@ -290,17 +304,31 @@ class WanBlock(nn.Module):
         # However, this kernel does not support TP due to the cross-head
         # normalization being a collective op. Thus, we must disable it if
         # using TP.
+        # When ulysses_size > 1 AND parallel.async_ulysses is set, switch
+        # to SEPARATE_QKV so V/Q/K projections can stream-pipeline through
+        # the async ulysses A2A path.
         tp_size = model_config.mapping.tp_size if model_config.mapping else 1
+        vgm_self = model_config.visual_gen_mapping
+        ulysses_size_self = vgm_self.ulysses_size if vgm_self is not None else 1
+        _async_a2a = model_config.parallel.async_ulysses if model_config is not None else False
+        self._use_async_ulysses = bool(ulysses_size_self > 1) and _async_a2a
+        _qkv_mode_self = QKVMode.SEPARATE_QKV if self._use_async_ulysses else QKVMode.FUSE_QKV
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=_qkv_mode_self,
             qk_norm=True,
             eps=eps,
+            # fuse_qk_norm_rope=True drives the packed kernel on sync (FUSE_QKV)
+            # and the split kernel on async (SEPARATE_QKV via forward_async).
+            # Disabled when TP>1 since the fused kernel lacks cross-rank
+            # all-reduce for the cross-head RMSNorm variance.
             fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
+            async_ulysses=self._use_async_ulysses,
+            module_name=f"blocks.{_layer_idx}.attn1",
         )
 
         # Cross-attention with separate Q, K, V
@@ -313,6 +341,7 @@ class WanBlock(nn.Module):
             eps=eps,
             config=model_config,
             layer_idx=_layer_idx,
+            module_name=f"blocks.{_layer_idx}.attn2",
             enable_sequence_parallel=False,
         )
 
@@ -334,12 +363,52 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=True,
-            activation=lambda x: F.gelu(x, approximate="tanh"),
+            activation=gelu_tanh,  # named (not a lambda) so MLP can detect+fuse GELU+NVFP4
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
             reduce_output=(tp_size != 1),
         )
+
+        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # G_c weights the coarse branch; G_f weights the fine branch.
+        self.to_gate_compress = None
+        self.to_gate_fine = None
+        _attn_cfg = getattr(model_config, "attention", None)
+        _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
+        _is_vsa = (
+            _attn_cfg is not None
+            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sa_cfg is not None
+            and getattr(_sa_cfg, "algorithm", None) == "vsa"
+        )
+        if _is_vsa:
+            q_dim = num_heads * head_dim
+            gate_tp_mode = TensorParallelMode.COLUMN if tp_size > 1 else None
+            self.to_gate_compress = Linear(
+                hidden_size,
+                q_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=model_config.mapping,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights,
+                force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=gate_tp_mode,
+                reduce_output=False,
+            )
+            self.to_gate_fine = Linear(
+                hidden_size,
+                q_dim,
+                bias=True,
+                dtype=dtype,
+                mapping=model_config.mapping,
+                quant_config=quant_config,
+                skip_create_weights_in_init=skip_create_weights,
+                force_dynamic_quantization=force_dynamic_quant,
+                tensor_parallel_mode=gate_tp_mode,
+                reduce_output=False,
+            )
 
         # I2V: Additional K/V projections for image embeddings.
         self.add_k_proj = self.add_v_proj = None
@@ -389,6 +458,7 @@ class WanBlock(nn.Module):
         temb,
         freqs_cos,
         freqs_sin,
+        timestep=None,
     ):
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, hidden_size
@@ -414,15 +484,21 @@ class WanBlock(nn.Module):
         # Prepare frequencies for Attention
         freqs = (freqs_cos, freqs_sin) if freqs_cos is not None and freqs_sin is not None else None
 
-        # Self-attention with RoPE
-        x = (
-            x.float()
-            + self.attn1(
-                normed,
-                freqs=freqs,
-            ).float()
-            * gate_msa
-        ).to(x.dtype)
+        attn1_kwargs = {}
+        if self.to_gate_compress is not None:
+            attn1_kwargs["gate_compress"] = self.to_gate_compress(normed)
+        if self.to_gate_fine is not None:
+            attn1_kwargs["gate_fine"] = self.to_gate_fine(normed)
+
+        # Self-attention with RoPE. Async-ulysses dispatches to forward_async
+        # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
+        # side stream; both paths return 3D [B, S, H*D].
+        if self._use_async_ulysses:
+            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+        else:
+            attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
+
+        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         norm_x = self.norm2(x.float()).to(x.dtype)
 
@@ -445,6 +521,7 @@ class WanBlock(nn.Module):
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=encoder_hidden_states_text.shape[1],
+            timestep=timestep,
         )
 
         # I2V: image cross-attention
@@ -459,6 +536,7 @@ class WanBlock(nn.Module):
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=encoder_hidden_states_img.shape[1],
+                timestep=timestep,
             )
             attn2_output = attn2_output + attn_img_output
 
@@ -474,16 +552,14 @@ class WanBlock(nn.Module):
         return x
 
 
-class WanTransformer3DModel(nn.Module):
+class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
 
     def __init__(
         self,
         model_config: DiffusionModelConfig,
     ):
-        super().__init__()
-
-        self.model_config = model_config
+        super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
 
@@ -635,8 +711,8 @@ class WanTransformer3DModel(nn.Module):
     def forward(
         self,
         hidden_states,
-        timestep,
-        encoder_hidden_states,
+        timestep=None,
+        encoder_hidden_states=None,
         encoder_hidden_states_image=None,
         **kwargs,
     ):
@@ -649,6 +725,9 @@ class WanTransformer3DModel(nn.Module):
             3. All-gather output sequence: [B, S/P] -> [B, S]
 
         When TeaCache is enabled, TeaCacheHook intercepts and replaces this call.
+
+        Args:
+            timestep: Normalized scheduler timestep tensor in [0, 1].
         """
         original_shape = hidden_states.shape
         B, C, T, H, W = original_shape
@@ -667,17 +746,19 @@ class WanTransformer3DModel(nn.Module):
         if rope is not None:
             freqs_cos, freqs_sin = rope
 
-        # Time and text/image embeddings
+        # Time and text/image embeddings. WAN timestep embeddings use the
+        # scheduler's 1000-step scale internally.
+        timestep_for_embedding = timestep * 1000
         # Timestep shape: [batch_size] or [batch_size, seq_len]
-        if timestep.ndim == 2:
-            ts_seq_len = timestep.shape[1]
-            timestep = timestep.flatten()
+        if timestep_for_embedding.ndim == 2:
+            ts_seq_len = timestep_for_embedding.shape[1]
+            timestep_for_embedding = timestep_for_embedding.flatten()
         else:
             ts_seq_len = None
 
         temb, temb_proj, encoder_hidden_states, encoder_hidden_states_image = (
             self.condition_embedder(
-                timestep,
+                timestep_for_embedding,
                 encoder_hidden_states,
                 encoder_hidden_states_image,
                 timestep_seq_len=ts_seq_len,
@@ -715,6 +796,7 @@ class WanTransformer3DModel(nn.Module):
                 temb_proj,
                 freqs_cos,
                 freqs_sin,
+                timestep=timestep,
             )
 
         # All-gather sequence from all ranks: [B, S/P] -> [B, S] (no-op when inactive).
@@ -786,6 +868,12 @@ class WanTransformer3DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
+                # VSA gates absent from the checkpoint default to G_c=0 / G_f=1
+                # (dense behavior at sparsity=0).
+                elif name.endswith(".to_gate_compress"):
+                    _default_vsa_gate(module, 0.0)
+                elif name.endswith(".to_gate_fine"):
+                    _default_vsa_gate(module, 1.0)
                 elif "add_k_proj" in name or "add_v_proj" in name:
                     logger.info(f"[Weight Loading] No weights found for I2V module: {name}")
             elif isinstance(module, RMSNormTPAware):

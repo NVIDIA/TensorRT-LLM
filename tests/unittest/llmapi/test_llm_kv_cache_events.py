@@ -24,6 +24,7 @@ from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -34,7 +35,8 @@ llama_model_path = get_model_path(default_model_name)
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
-                                      max_tokens=256)
+                                      max_tokens=256,
+                                      use_kv_cache_manager_v2=False)
 
 
 def create_kv_cache_manager():
@@ -63,6 +65,17 @@ def create_llm(tensor_parallel_size=1):
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
                kv_cache_config=global_kvcache_config,
+               enable_autotuner=False)
+
+
+def create_v2_llm():
+    v2_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
+                                      event_buffer_max_size=1024,
+                                      enable_block_reuse=True,
+                                      max_tokens=256,
+                                      use_kv_cache_manager_v2=True)
+    return LLM(model=llama_model_path,
+               kv_cache_config=v2_kvcache_config,
                enable_autotuner=False)
 
 
@@ -109,6 +122,9 @@ def test_kv_cache_event_data_serialization():
     # Verify mm_keys field exists (empty for text-only requests)
     assert "mm_keys" in serialized_event[0]["data"]["blocks"][0]
     assert serialized_event[0]["data"]["blocks"][0]["mm_keys"] == []
+    # Verify cache_salt field exists (None for unsalted requests)
+    assert "cache_salt" in serialized_event[0]["data"]["blocks"][0]
+    assert serialized_event[0]["data"]["blocks"][0]["cache_salt"] is None
 
     req2 = create_llm_request(1, [1, 2, 3, 4, 5])
     kv_cache_manager.impl.add_sequence_batch(
@@ -260,8 +276,8 @@ def test_apply_mm_hashes_with_uuids():
         0]  # UUID changes hash
     # Second hash should be content-only (same as without UUID)
     assert hashes_partial["image"][1] == hashes_no_uuid["image"][1]
-    # UUIDs list should have the UUID and None
-    assert uuids_partial == ["sku-1234-a", None]
+    # UUIDs are returned per-modality, parallel to mm_hashes.
+    assert uuids_partial == {"image": ["sku-1234-a", None]}
 
     # Test with all UUIDs
     mm_uuids_all = {"image": ["sku-1234-a", "sku-1234-b"]}
@@ -274,7 +290,7 @@ def test_apply_mm_hashes_with_uuids():
     assert hashes_all["image"][1] != hashes_no_uuid["image"][1]
     # Different UUIDs with different content should produce different hashes
     assert hashes_all["image"][0] != hashes_all["image"][1]
-    assert uuids_all == ["sku-1234-a", "sku-1234-b"]
+    assert uuids_all == {"image": ["sku-1234-a", "sku-1234-b"]}
 
 
 def test_apply_mm_hashes_uuid_content_combined():
@@ -765,8 +781,9 @@ def test_apply_mm_hashes_multiple_modalities():
     assert hashes["image"][0] != hashes_no_uuid["image"][0]
     assert hashes["video"][0] != hashes_no_uuid["video"][0]
 
-    # Check flattened UUID list (order may vary based on dict iteration)
-    assert set(uuids_list) == {"img-uuid-001", "vid-uuid-001"}
+    # UUIDs are returned per-modality; flatten across modalities to compare.
+    flat_uuids = [u for lst in uuids_list.values() for u in lst]
+    assert set(flat_uuids) == {"img-uuid-001", "vid-uuid-001"}
 
 
 def test_mm_keys_in_stored_events():
@@ -779,7 +796,7 @@ def test_mm_keys_in_stored_events():
 
     events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify mm_keys field
+    # Find stored events and verify mm_keys and cache_salt fields
     for event in events:
         if event and event["data"]["type"] == "stored":
             blocks = event["data"]["blocks"]
@@ -789,6 +806,86 @@ def test_mm_keys_in_stored_events():
                 assert isinstance(block["mm_keys"], list)
                 # For text-only requests, mm_keys should be empty
                 assert block["mm_keys"] == []
+                # cache_salt should be present (None for unsalted requests)
+                assert "cache_salt" in block
+                assert block["cache_salt"] is None
+
+
+def test_cache_salt_in_stored_events():
+    """Test that cache_salt string is preserved in stored block events."""
+    llm = create_llm()
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+
+    _ = llm.generate(prompt,
+                     sampling_params=sampling_params,
+                     cache_salt="tenant-A")
+
+    events = llm.get_kv_cache_events(5)
+
+    # Find stored events and verify cache_salt field
+    found_stored = False
+    for event in events:
+        if event and event["data"]["type"] == "stored":
+            found_stored = True
+            blocks = event["data"]["blocks"]
+            for block in blocks:
+                assert "cache_salt" in block
+                assert block["cache_salt"] == "tenant-A"
+
+    assert found_stored, "No stored events found"
+
+
+def test_cache_salt_max_length_validation():
+    """cache_salt longer than MAX_CACHE_SALT_LEN UTF-8 bytes is rejected."""
+    from tensorrt_llm.executor.request import GenerationRequest
+
+    max_len = GenerationRequest.MAX_CACHE_SALT_LEN
+    sampling_params = SamplingParams()
+
+    # ASCII salt at the limit is accepted.
+    GenerationRequest(prompt_token_ids=[1, 2, 3],
+                      sampling_params=sampling_params,
+                      cache_salt="a" * max_len)
+
+    # ASCII salt one byte over the limit is rejected.
+    with pytest.raises(ValueError, match="cache_salt UTF-8 byte length"):
+        GenerationRequest(prompt_token_ids=[1, 2, 3],
+                          sampling_params=sampling_params,
+                          cache_salt="a" * (max_len + 1))
+
+    # Non-ASCII salt: each character is 3 UTF-8 bytes. A salt whose
+    # `len()` is below the limit but whose UTF-8 byte count exceeds it
+    # must be rejected (this is the case Python's len()-based check missed).
+    char_count = (max_len // 3) + 1  # len() is well below max_len
+    salt = "中" * char_count  # Chinese character, 3 UTF-8 bytes each
+    assert len(salt) <= max_len
+    assert len(salt.encode("utf-8")) > max_len
+    with pytest.raises(ValueError, match="cache_salt UTF-8 byte length"):
+        GenerationRequest(prompt_token_ids=[1, 2, 3],
+                          sampling_params=sampling_params,
+                          cache_salt=salt)
+
+
+def test_non_ascii_cache_salt_in_stored_events():
+    """Test that a non-ASCII cache_salt string is preserved in stored block events."""
+    llm = create_llm()
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+    salt = "tenant-中文"  # mixed ASCII + Chinese
+
+    _ = llm.generate(prompt, sampling_params=sampling_params, cache_salt=salt)
+
+    events = llm.get_kv_cache_events(5)
+
+    found_stored = False
+    for event in events:
+        if event and event["data"]["type"] == "stored":
+            found_stored = True
+            for block in event["data"]["blocks"]:
+                assert block.get("cache_salt") == salt
+
+    assert found_stored, "No stored events found"
 
 
 def test_expected_kv_cache_events():
@@ -807,6 +904,38 @@ def test_expected_kv_cache_events():
                 assert event["data"]["type"] == "created"
             elif event["event_id"] == 1:
                 assert event["data"]["type"] == "stored"
+
+
+def test_expected_v2_kv_cache_events():
+    with create_v2_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = list(range(127))
+
+        _ = llm.generate(prompt, sampling_params=sampling_params)
+
+        events = llm.get_kv_cache_events(5)
+        assert events and len(events) >= 2
+        assert all(event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+                   for event in events if event)
+
+        created_events = [
+            event for event in events
+            if event and event["data"]["type"] == "created"
+        ]
+        stored_events = [
+            event for event in events
+            if event and event["data"]["type"] == "stored"
+        ]
+        assert created_events
+        assert stored_events
+        assert created_events[0]["event_id"] == 0
+
+        block_hashes = [
+            block["block_hash"] for event in stored_events
+            for block in event["data"]["blocks"]
+        ]
+        assert block_hashes
+        assert all(isinstance(block_hash, int) for block_hash in block_hashes)
 
 
 def test_kv_cache_event_async_api():

@@ -50,6 +50,7 @@ class ADPIterStatsRecord:
     # step in lockstep, so this is a reasonable approximation.
     host_step_time_ms: Optional[float] = None
     prev_device_step_time_ms: Optional[float] = None
+    gpu_forward_time_ms: Optional[float] = None
 
 
 class ADPIterStatsBuffer:
@@ -78,6 +79,7 @@ class ADPIterStatsBuffer:
         # _make_rank_iter_stats / finalize).
         self._rank0_host_step_time_ms: Dict[int, Optional[float]] = {}
         self._rank0_prev_device_step_time_ms: Dict[int, Optional[float]] = {}
+        self._rank0_gpu_forward_time_ms: Dict[int, Optional[float]] = {}
         self._oldest_iter: Optional[int] = None
 
     @staticmethod
@@ -105,6 +107,7 @@ class ADPIterStatsBuffer:
         is_rank0: bool,
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
+        gpu_forward_time_ms: Optional[float] = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
@@ -125,6 +128,7 @@ class ADPIterStatsBuffer:
             self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
             self._rank0_prev_device_step_time_ms[iter_id] = prev_device_step_time_ms
+            self._rank0_gpu_forward_time_ms[iter_id] = gpu_forward_time_ms
 
     def next_payload(self) -> Optional[RankIterStatsPayload]:
         """Return the oldest pending stats payload to piggyback."""
@@ -158,6 +162,7 @@ class ADPIterStatsBuffer:
         self._rank0_kv_iter_stats.pop(iter_id, None)
         self._rank0_host_step_time_ms.pop(iter_id, None)
         self._rank0_prev_device_step_time_ms.pop(iter_id, None)
+        self._rank0_gpu_forward_time_ms.pop(iter_id, None)
         if recompute_oldest and iter_id == self._oldest_iter:
             self._recompute_oldest_iter()
 
@@ -288,6 +293,7 @@ class ADPIterStatsBuffer:
             kv_iter_stats = self._rank0_kv_iter_stats.get(iter_stats_iter)
             host_step_time_ms = self._rank0_host_step_time_ms.get(iter_stats_iter)
             prev_device_step_time_ms = self._rank0_prev_device_step_time_ms.get(iter_stats_iter)
+            gpu_forward_time_ms = self._rank0_gpu_forward_time_ms.get(iter_stats_iter)
 
             for rank_state in sorted(matching_states, key=lambda s: s.rank):
                 rank = rank_state.rank
@@ -299,6 +305,7 @@ class ADPIterStatsBuffer:
                         attention_dp_rank=rank,
                         host_step_time_ms=host_step_time_ms,
                         prev_device_step_time_ms=prev_device_step_time_ms,
+                        gpu_forward_time_ms=gpu_forward_time_ms,
                     )
                 )
 

@@ -16,17 +16,16 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
 
-import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from tensorrt_llm.llmapi.llm_args import (
-    BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+from tensorrt_llm.llmapi.utils import get_device_count
 
 from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
@@ -75,13 +74,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     model_config = _get_config_dict()
 
-    build_config: Optional[BuildConfig] = Field(
-        default_factory=BuildConfig,
-        description="!!! DO NOT USE !!! Internal only; needed for BaseLlmArgs compatibility.",
-        exclude_from_json=True,
-        frozen=True,
-        repr=False,
-    )
     backend: Literal["_autodeploy"] = Field(
         default="_autodeploy",
         description="The backend to use for this LLM instance.",
@@ -89,7 +81,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     gpus_per_node: int = Field(
-        default=torch.cuda.device_count(),
+        default=get_device_count(),
         description="The number of GPUs per node.",
         frozen=True,
     )
@@ -100,12 +92,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         if value is not None and value > 1:
             raise ValueError("AutoDeploy does not support beam search (max_beam_width > 1).")
         return value
-
-    @field_validator("build_config", mode="before")
-    @classmethod
-    def ensure_no_build_config(cls, value: Any, info: ValidationInfo) -> Any:
-        msg = "build_config is not in use by AutoDeploy's LlmArgs"
-        return _check_for_default_value_only(cls, value, info, msg)
 
     @field_validator(
         "tensor_parallel_size",
@@ -180,6 +166,25 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             capture_layers
         )
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_ssm_replay_requires_spec(self):
+        """Reject the replay SSM kernel when speculative decoding is off.
+
+        ``ssm_replay`` makes the SSM backend emit per-layer replay state buffers (``Replay*``
+        handlers), which are read only on the speculative extend (draft-verification) path.
+        Those handlers carry the ``SpeculativeOnly`` trait, so without ``speculative_config``
+        the kvcache insert transform drops them entirely and the ``ssm_replay`` flag becomes a
+        no-op. Reject the contradictory config here rather than silently ignoring the flag.
+        """
+        ssm_cfg = self.transforms.get("insert_cached_ssm_attention", {})
+        if ssm_cfg.get("ssm_replay", False) and self.speculative_config is None:
+            raise ValueError(
+                "transforms.insert_cached_ssm_attention.ssm_replay=True requires speculative "
+                "decoding (speculative_config must be set). Replay buffers are only used on the "
+                "speculative extend path."
+            )
         return self
 
     @model_validator(mode="after")
@@ -412,25 +417,62 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def disable_cudagraph_for_speculative_flashinfer(self):
+    def reject_cudagraph_for_speculative_flashinfer(self):
         if (
             self.speculative_config is not None
             and self.attn_backend == "flashinfer"
             and self.is_cuda_graph_enabled()
         ):
-            ad_logger.warning(
+            raise ValueError(
                 "Speculative decoding with FlashInfer attention does not currently support CUDA "
-                "graph replay in AutoDeploy; falling back to compile_backend='torch-simple'."
+                "graph replay in AutoDeploy. Use compile_backend='torch-simple' instead."
             )
-            self.compile_backend = "torch-simple"
-            self.update_transforms_with_shortcuts()
+        return self
+
+    @model_validator(mode="after")
+    def reject_piecewise_cuda_graph_for_speculative_decoding(self):
+        compile_model = self.transforms.get("compile_model", {})
+        if (
+            self.speculative_config is not None
+            and self.is_cuda_graph_enabled()
+            and compile_model.get("piecewise_enabled", False)
+        ):
+            raise ValueError(
+                "Speculative decoding with AutoDeploy does not currently support piecewise CUDA "
+                "graph capture."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def disable_piecewise_for_non_piecewise_backend(self):
+        compile_model = self.transforms.get("compile_model")
+        if compile_model is not None and not self.is_cuda_graph_enabled():
+            compile_model["piecewise_enabled"] = False
         return self
 
     ### UTILITY METHODS ############################################################################
     @property
     def requires_uniform_kv_caches(self) -> bool:
-        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping."""
-        return self.attn_backend.lower() == "trtllm"
+        """Whether CachedSequenceInterface must enforce a uniform KV cache mapping.
+
+        No attention backend currently requires this. The trtllm backend used to
+        return ``True`` here to force a single KV pool, but it now supports
+        multiple KV cache memory pools for non-uniform sliding-window models
+        (e.g. gpt-oss) -- the kernel applies the sliding-window mask internally
+        via cyclic indexing, so per-window pools route correctly. The flag is
+        kept (defaulting to ``False``) so the uniformity enforcement in
+        ``CachedSequenceInterface`` remains available should a future backend
+        need it.
+        """
+        return False
+
+    @property
+    def reject_unmanaged_persistent_caches(self) -> bool:
+        """Whether unmanaged persistent cache resources should be rejected."""
+        return (
+            self.cache_transceiver_config is not None
+            and self.cache_transceiver_config.backend is not None
+        )
 
     def create_factory(self) -> ModelFactory:
         """Create a model factory from the arguments.
@@ -440,6 +482,15 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             The value is inferred from the model configuration via the factory and written back to
             `self.max_seq_len` so that all downstream consumers see the same value.
         """
+
+        # Resolve enable_attention_dp from the same source `init_dist_config`
+        # uses so the factory sees the same value the runtime will see.
+        # TODO remove it once this is fixed: https://github.com/NVIDIA/TensorRT-LLM/issues/13134
+        ash = self.transforms.get("apply_sharding_hints", {})
+        sharding_config = (
+            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
+        )
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
 
         # TODO (lucaslie): consider supporting Path objects in the model factory
         factory = ModelFactoryRegistry.get(self.model_factory)(
@@ -451,6 +502,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
             max_seq_len=self.max_seq_len,
             # Extra kwargs consumed by EagleOneModelFactory (ignored by others via **kwargs)
             sync_before_hidden_state_capture=self.attn_backend == "flashinfer",
+            enable_attention_dp=enable_attention_dp,
             speculative_config=self.speculative_config,
             speculative_model_kwargs=self.speculative_model_kwargs or None,
         )
@@ -462,7 +514,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return factory
 
     def is_cuda_graph_enabled(self) -> bool:
-        return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+        cuda_graph_backends = {"torch-cudagraph", "torch-opt"}
+        return self.compile_backend in cuda_graph_backends
 
     def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
         """Build DistConfig from YAML transform config and runtime MPI info.

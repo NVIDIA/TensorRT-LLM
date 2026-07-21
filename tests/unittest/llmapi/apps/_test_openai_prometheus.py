@@ -12,13 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 import re
 import tempfile
 import time
-from typing import Dict
-from urllib.request import urlopen
+from typing import Dict, Optional
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 import yaml
@@ -212,3 +214,143 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
 
     assert METRIC_PREFIX + "kv_cache_hit_rate" in data
     assert METRIC_PREFIX + "kv_cache_iter_reuse_rate" in data
+
+
+def _wait_for_metric_line(server: RemoteOpenAIServer,
+                          line_prefix: str,
+                          timeout: float = 10.0,
+                          poll_interval: float = 0.5) -> str:
+    """Poll /prometheus/metrics until a line starting with ``line_prefix`` appears.
+
+    The metric must be ``_total`` counters, gauges, or histogram ``_count``/``_sum``
+    samples. Returns the full /prometheus/metrics body when found, or the final
+    body on timeout (caller asserts).
+    """
+    start = time.time()
+    data = ""
+    while time.time() - start < timeout:
+        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        assert response.status == 200
+        data = response.read().decode("utf-8")
+        if re.search(r'^' + re.escape(line_prefix), data, re.MULTILINE):
+            return data
+        time.sleep(poll_interval)
+    return data
+
+
+def _wait_for_metric_regex(
+        server: RemoteOpenAIServer,
+        pattern: str,
+        timeout: float = 10.0,
+        poll_interval: float = 0.5) -> tuple[str, Optional[re.Match[str]]]:
+    """Poll /prometheus/metrics until ``pattern`` matches a sample line."""
+    compiled = re.compile(pattern, re.MULTILINE)
+    start = time.time()
+    data = ""
+    match: Optional[re.Match[str]] = None
+    while time.time() - start < timeout:
+        response = urlopen(f'{server.url_root}/prometheus/metrics')
+        assert response.status == 200
+        data = response.read().decode("utf-8")
+        match = compiled.search(data)
+        if match is not None:
+            return data, match
+        time.sleep(poll_interval)
+    return data, match
+
+
+def _trigger_validation_error_400(server: RemoteOpenAIServer) -> None:
+    """Send a request that fails Pydantic validation and returns HTTP 400.
+
+    ``truncate_prompt_tokens=0`` violates CompletionRequest's Field(ge=1)
+    constraint, which routes through the RequestValidationError handler that
+    increments trtllm_request_error_total{http_code="400"}.
+    """
+    req = Request(
+        f'{server.url_root}/v1/completions',
+        data=json.dumps({
+            "model": "Server",
+            "prompt": "Hello",
+            "truncate_prompt_tokens": 0,
+        }).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urlopen(req)
+        pytest.fail("Expected HTTP 400 RequestValidationError")
+    except HTTPError as e:
+        assert e.code == 400, f"Expected HTTP 400, got {e.code}"
+        logger.info("Validation error correctly returned: %s", e)
+
+
+def test_new_metrics_exposed(server: RemoteOpenAIServer):
+    """Verify metrics added by this PR appear on the /prometheus/metrics endpoint.
+
+    Asserts that, after issuing real completion requests, the following metric
+    families show up alongside the standard ones:
+    - trtllm_prompt_cached_tokens_total / trtllm_prompt_cached_tokens_per_request
+    - trtllm_prefill_batch_occupancy
+    - trtllm_prefill_batch_tokens
+
+    Also exercises the validation-error path to populate
+    trtllm_request_error_total{http_code="400"}.
+    """
+    METRIC_PREFIX = "trtllm_"
+    error_pattern = (r'^' + re.escape(METRIC_PREFIX + "request_error_total") +
+                     r'\{[^}]*http_code="400"[^}]*\}\s+(\S+)')
+
+    # Validation errors are counted synchronously in the exception handler.
+    _trigger_validation_error_400(server)
+    data, error_match = _wait_for_metric_regex(server,
+                                               error_pattern,
+                                               timeout=10.0)
+    assert error_match is not None, (
+        f"missing {METRIC_PREFIX}request_error_total{{http_code=\"400\"}} "
+        "in metrics after validation request")
+    assert float(error_match.group(1)) >= 1.0, (
+        f"expected request_error_total{{http_code=\"400\"}} >= 1, "
+        f"got {error_match.group(1)}")
+
+    client = server.get_client()
+    # Issue a few identical completion requests so the KV-cache reuses blocks
+    # and trtllm_prompt_cached_tokens_total gets a non-zero increment.
+    for _ in range(3):
+        client.completions.create(
+            model="Server",
+            prompt="The quick brown fox jumps over the lazy dog.",
+            max_tokens=20,
+            stream=False,
+        )
+
+    # Wait for the background iteration stats loop to populate prefill_batch_*.
+    # Histogram _count only appears after numCtxTokens > 0 on an iteration.
+    data = _wait_for_metric_line(server,
+                                 METRIC_PREFIX + "prefill_batch_tokens_count",
+                                 timeout=30.0)
+
+    # Per-request metrics added by this PR
+    assert METRIC_PREFIX + "prompt_cached_tokens_total" in data, \
+        f"missing {METRIC_PREFIX}prompt_cached_tokens_total in metrics"
+    assert METRIC_PREFIX + "prompt_cached_tokens_per_request" in data, \
+        f"missing {METRIC_PREFIX}prompt_cached_tokens_per_request in metrics"
+
+    # Iteration-level metrics added by this PR
+    assert METRIC_PREFIX + "prefill_batch_occupancy" in data, \
+        f"missing {METRIC_PREFIX}prefill_batch_occupancy in metrics"
+    assert METRIC_PREFIX + "prefill_batch_tokens" in data, \
+        f"missing {METRIC_PREFIX}prefill_batch_tokens in metrics"
+
+    # Request-error counter should still be present after completions.
+    error_total_400 = re.search(error_pattern, data, re.MULTILINE)
+    assert error_total_400 is not None, \
+        f"missing {METRIC_PREFIX}request_error_total{{http_code=\"400\"}} in metrics"
+    assert float(error_total_400.group(1)) >= 1.0, \
+        f"expected request_error_total{{http_code=\"400\"}} >= 1, got {error_total_400.group(1)}"
+
+    # Sanity: the new cached_tokens_total counter has accumulated at least once
+    # because we ran identical prompts.
+    cached_total = _parse_prometheus_sample(
+        data, METRIC_PREFIX + "prompt_cached_tokens_total")
+    assert cached_total is not None and cached_total >= 0, \
+        f"prompt_cached_tokens_total not found or invalid: {cached_total}"

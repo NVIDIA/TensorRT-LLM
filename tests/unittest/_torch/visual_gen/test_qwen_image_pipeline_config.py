@@ -10,7 +10,7 @@ import pytest
 
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenJointAttention
 from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -178,7 +178,7 @@ def test_qwen_pipeline_quant_config_parses_from_args(
     checkpoint_dir = _write_minimal_qwen_checkpoint(tmp_path)
     args = VisualGenArgs(model=str(checkpoint_dir), quant_config=quant_config)
 
-    config = DiffusionModelConfig.from_pretrained(str(checkpoint_dir), args=args)
+    config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_dir), args=args)
 
     assert config.quant_config.quant_algo == quant_algo
     assert config.quant_config.group_size == group_size

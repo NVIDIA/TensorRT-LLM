@@ -3,6 +3,9 @@
 
 # Initial Video-MME short-shard guardrail for E2E video QA. Update these values
 # after collecting stable model baselines on the generated 300-question shard.
+Qwen/Qwen3-VL-2B-Instruct:
+  - accuracy: 54.5
+    num_samples: 300
 nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8

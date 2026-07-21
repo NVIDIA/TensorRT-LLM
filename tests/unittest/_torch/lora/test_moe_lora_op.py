@@ -88,7 +88,52 @@ def _build_lora_request_buffers(
     )
 
 
-def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs=None):
+def _build_lora_slot_buffers(
+    num_tokens, fc1_a, fc1_b, fc2_a, fc2_b, rank, lora_max_low_rank=None, gated_a=None, gated_b=None
+):
+    """Pack LoRA into the slot-indexed CPU tensors used by the CUDA-graph path.
+
+    Uses a single adapter slot (max_lora_size == 1) and routes every token
+    to slot 0 via token_to_slot. The per-token expansion the op performs
+    from these tables is identical to the single-request per-request path, so
+    the two schemas must produce bit-identical kernel inputs (and outputs).
+    """
+    if lora_max_low_rank is None:
+        lora_max_low_rank = rank
+    if gated_a is None:
+        gated_a = fc1_a
+    if gated_b is None:
+        gated_b = fc1_b
+    max_lora_size = 1
+    fc1_slot_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    fc2_slot_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    gated_slot_ranks = torch.tensor([rank], dtype=torch.int32, device="cpu")
+    fc1_slot_ptrs = torch.tensor(
+        [[fc1_a.data_ptr(), fc1_b.data_ptr(), 0]], dtype=torch.int64, device="cpu"
+    )
+    fc2_slot_ptrs = torch.tensor(
+        [[fc2_a.data_ptr(), fc2_b.data_ptr(), 0]], dtype=torch.int64, device="cpu"
+    )
+    gated_slot_ptrs = torch.tensor(
+        [[gated_a.data_ptr(), gated_b.data_ptr(), 0]], dtype=torch.int64, device="cpu"
+    )
+    token_to_slot = torch.zeros(num_tokens, dtype=torch.int32, device="cpu")
+    assert max_lora_size == fc1_slot_ranks.size(0)
+    return dict(
+        fc1_slot_lora_ranks=fc1_slot_ranks,
+        fc1_slot_lora_weight_ptrs=fc1_slot_ptrs,
+        fc2_slot_lora_ranks=fc2_slot_ranks,
+        fc2_slot_lora_weight_ptrs=fc2_slot_ptrs,
+        gated_slot_lora_ranks=gated_slot_ranks,
+        gated_slot_lora_weight_ptrs=gated_slot_ptrs,
+        token_to_slot=token_to_slot,
+        lora_max_low_rank=lora_max_low_rank,
+    )
+
+
+def _call_fused_moe(
+    x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwargs=None, quant_scales=None
+):
     common = dict(
         input=x,
         token_selected_experts=topk_ids,
@@ -98,7 +143,7 @@ def _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype, lora_kwar
         fc2_expert_weights=w2,
         fc2_expert_biases=None,
         output_dtype=output_dtype,
-        quant_scales=[],
+        quant_scales=quant_scales if quant_scales is not None else [],
     )
     if lora_kwargs is not None:
         common.update(lora_kwargs)
@@ -160,6 +205,160 @@ def test_moe_per_expert_lora_changes_output():
     assert torch.isfinite(out_lora).all()
     diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
     assert diff > 1e-3, f"LoRA had no observable effect (mean abs diff={diff})"
+
+
+@requires_cuda_and_op
+def test_moe_lora_slot_indexed_matches_per_request():
+    """The slot-indexed (CUDA-graph) input schema must produce bit-identical
+    output to the per-request (eager) schema for the same adapter, since both
+    expand to the same per-token (rank, A_ptr, B_ptr) arrays inside the op.
+
+    Both schemas feed the identical grouped-GEMM LoRA core (pointer-expand +
+    problem-builder + grouped GEMM), so identical per-token tables yield
+    bit-identical output.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+
+    fc1_adapter = make_per_expert_lora(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=10
+    )
+    fc2_adapter = make_per_expert_lora(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
+    )
+
+    per_request_kwargs = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+    slot_kwargs = _build_lora_slot_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+
+    # Both schemas feed the same grouped-GEMM core; use a fresh runner.
+    MoERunner.runner_dict.clear()
+    try:
+        out_per_request = _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=per_request_kwargs
+        )[0]
+        out_slot = _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=slot_kwargs
+        )[0]
+    finally:
+        MoERunner.runner_dict.clear()
+
+    assert torch.isfinite(out_slot).all()
+    # Identical per-token kernel inputs => bit-identical output.
+    torch.testing.assert_close(out_slot, out_per_request, rtol=0, atol=0)
+
+
+@requires_cuda_and_op
+def test_moe_lora_rejects_mixed_per_request_and_slot_indexed():
+    """Supplying both the per-request and slot-indexed schemas in one call is
+    ambiguous and must be rejected before the kernel runs.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    fc1_adapter = make_per_expert_lora(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=10
+    )
+    fc2_adapter = make_per_expert_lora(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
+    )
+    mixed = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+    mixed.update(
+        _build_lora_slot_buffers(
+            num_tokens,
+            fc1_adapter["A"],
+            fc1_adapter["B"],
+            fc2_adapter["A"],
+            fc2_adapter["B"],
+            rank=rank,
+        )
+    )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        _call_fused_moe(x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=mixed)
+
+
+@requires_cuda_and_op
+def test_moe_lora_rejects_overlong_context_lengths():
+    """A per-request expansion whose host_context_lengths sum past the op's token
+    count must raise cleanly instead of overrunning the fixed-capacity pinned
+    expansion buffer.
+
+    The per-token (rank, A, B) tables are written into buffers sized for
+    num_tokens; a context request claiming more tokens than the op actually has
+    would, without the bounds guard in expandPerRequestLoraTo, scribble past the
+    end of pinned memory. Here a single context request declares 2 * num_tokens,
+    so the expansion must fail fast.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    fc1_adapter = make_per_expert_lora(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=10
+    )
+    fc2_adapter = make_per_expert_lora(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=11
+    )
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+    )
+    # Single context request (host_request_types == 0) whose declared context
+    # length exceeds the op's token count, so the expansion overruns by design.
+    lora_kwargs["host_request_types"] = torch.zeros(1, dtype=torch.int32, device="cpu")
+    lora_kwargs["host_context_lengths"] = torch.tensor(
+        [2 * num_tokens], dtype=torch.int32, device="cpu"
+    )
+
+    with pytest.raises((RuntimeError, ValueError)):
+        _call_fused_moe(
+            x, w3_w1, w2, topk_ids, topk_scores, output_dtype=dtype, lora_kwargs=lora_kwargs
+        )
 
 
 @requires_cuda_and_op
@@ -1036,5 +1235,262 @@ def test_moe_all_three_lora_with_gated_aliased_to_fc1_eager_matches_pytorch_refe
             f"rel_err={rel_err:.3e}"
         )
         torch.testing.assert_close(out_op, out_ref, rtol=5e-2, atol=1.0)
+    finally:
+        MoERunner.runner_dict.clear()
+
+
+# -- Per-tensor FP8 (qdq) base weights + routed-expert LoRA -----------------
+#
+# The CUTLASS MoE LoRA kernel dequantizes per-tensor FP8 activations to the
+# bf16/fp16 LoRA compute type before the LoRA GEMM, so FP8-qdq base weights are
+# supported alongside MoE LoRA. These tests quantize the base MoE inputs to FP8
+# and feed the four quant_scales the op expects, in the order consumed by
+# moeOp.cpp::getQuantParams:
+#
+#     [fc1_dequant (per-expert), fc2_quant (scalar),
+#      fc2_dequant (per-expert), fc1_input_dequant (scalar)]
+
+_FP8_E4M3_MAX = 448.0
+
+
+def _quant_per_tensor_fp8(t):
+    """Per-tensor symmetric FP8 (e4m3) quantization.
+
+    Returns (t_fp8, dequant) with t ~= t_fp8.float() * dequant. dequant is the
+    scalar dequant scale (amax / 448).
+    """
+    amax = t.detach().abs().max().float().clamp(min=1e-6)
+    dequant = amax / _FP8_E4M3_MAX
+    t_fp8 = (t.float() / dequant).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return t_fp8, dequant
+
+
+def _quant_per_expert_fp8(w):
+    """Per-expert per-tensor FP8 quantization of a `[E, ...]` weight tensor.
+
+    Returns (w_fp8 `[E, ...]` e4m3, scale `[E]` float32) with
+    `w[e] ~= w_fp8[e].float() * scale[e]`.
+    """
+    num_experts = w.shape[0]
+    scales = torch.empty(num_experts, dtype=torch.float32, device=w.device)
+    w_fp8 = torch.empty_like(w, dtype=torch.float8_e4m3fn)
+    for e in range(num_experts):
+        q, s = _quant_per_tensor_fp8(w[e])
+        w_fp8[e] = q
+        scales[e] = s
+    return w_fp8, scales
+
+
+def _build_fp8_moe_inputs(x_bf16, w3_w1_bf16, w2_bf16):
+    """Quantize base bf16 MoE inputs to per-tensor FP8 (qdq).
+
+    Returns `(x_fp8, w3_w1_fp8, w2_fp8, quant_scales, x_deq, w3_w1_deq,
+    w2_deq)`. The `*_deq` tensors are the FP8 values dequantized back to bf16;
+    feeding them to the reference removes the base-weight quantization error so
+    the comparison isolates kernel correctness (modulo the fc1->fc2 intermediate
+    requant the op performs internally).
+
+    `fc2_quant` is fixed to 1.0 (i.e. the fc1 output is requantized to FP8 with a
+    unit scale): at the shapes/magnitudes used here the SwiGLU intermediate stays
+    well within the FP8 e4m3 range, so this avoids depending on a calibrated
+    activation scale while keeping the math consistent (fc2_dequant == w2_scale).
+    """
+    x_fp8, input_dequant = _quant_per_tensor_fp8(x_bf16)
+    x_deq = (x_fp8.float() * input_dequant).to(x_bf16.dtype)
+
+    w3_w1_fp8, w31_scale = _quant_per_expert_fp8(w3_w1_bf16)
+    w2_fp8, w2_scale = _quant_per_expert_fp8(w2_bf16)
+    w3_w1_deq = (w3_w1_fp8.float() * w31_scale.view(-1, 1, 1)).to(w3_w1_bf16.dtype)
+    w2_deq = (w2_fp8.float() * w2_scale.view(-1, 1, 1)).to(w2_bf16.dtype)
+
+    device = x_bf16.device
+    fc1_dequant = (w31_scale * input_dequant).to(torch.float32)
+    fc2_quant = torch.tensor(1.0, dtype=torch.float32, device=device)
+    fc2_dequant = w2_scale.to(torch.float32)
+    fc1_input_dequant = input_dequant.to(torch.float32).reshape(())
+    quant_scales = [fc1_dequant, fc2_quant, fc2_dequant, fc1_input_dequant]
+    return x_fp8, w3_w1_fp8, w2_fp8, quant_scales, x_deq, w3_w1_deq, w2_deq
+
+
+@requires_cuda_and_op
+@pytest.mark.parametrize("schema", ["per_request", "slot_indexed"])
+def test_moe_fp8_lora_changes_output(schema):
+    """FP8 (qdq) base weights + routed-expert LoRA must run and apply the LoRA.
+
+    Validates the FP8 enablement end to end through `torch.ops.trtllm.fused_moe`
+    for both LoRA input schemas (per-request and slot-indexed), which share the
+    grouped-GEMM LoRA core: the op accepts FP8 weights/activations together with
+    LoRA tensors, produces finite output, and the output differs from the FP8
+    no-LoRA baseline (the LoRA delta is actually applied on the FP8 base).
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    MoERunner.runner_dict.clear()
+    try:
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_tokens, hidden_size, inter_size = 16, 128, 256
+        num_experts, top_k = 4, 2
+        rank = 8
+
+        x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+            num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+        )
+        x_fp8, w3_w1_fp8, w2_fp8, quant_scales, *_ = _build_fp8_moe_inputs(x, w3_w1, w2)
+
+        out_baseline = _call_fused_moe(
+            x_fp8,
+            w3_w1_fp8,
+            w2_fp8,
+            topk_ids,
+            topk_scores,
+            output_dtype=dtype,
+            quant_scales=quant_scales,
+        )[0]
+
+        fc1_adapter = _make_per_expert_lora_scaled(
+            num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=410
+        )
+        fc2_adapter = _make_per_expert_lora_scaled(
+            num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=411
+        )
+
+        if schema == "per_request":
+            lora_kwargs = _build_lora_request_buffers(
+                num_tokens,
+                fc1_adapter["A"],
+                fc1_adapter["B"],
+                fc2_adapter["A"],
+                fc2_adapter["B"],
+                rank=rank,
+            )
+        else:
+            lora_kwargs = _build_lora_slot_buffers(
+                num_tokens,
+                fc1_adapter["A"],
+                fc1_adapter["B"],
+                fc2_adapter["A"],
+                fc2_adapter["B"],
+                rank=rank,
+            )
+
+        out_lora = _call_fused_moe(
+            x_fp8,
+            w3_w1_fp8,
+            w2_fp8,
+            topk_ids,
+            topk_scores,
+            output_dtype=dtype,
+            lora_kwargs=lora_kwargs,
+            quant_scales=quant_scales,
+        )[0]
+
+        assert out_lora.shape == out_baseline.shape
+        assert torch.isfinite(out_lora).all(), f"FP8 fused_moe + LoRA ({schema}) produced NaN / Inf"
+        diff = (out_lora.float() - out_baseline.float()).abs().mean().item()
+        assert diff > 1e-3, (
+            f"FP8 MoE LoRA ({schema}) had no observable effect (mean abs diff={diff})"
+        )
+    finally:
+        MoERunner.runner_dict.clear()
+
+
+def _run_fp8_eager_vs_dequant_reference_check():
+    """Body of `test_moe_fp8_lora_eager_matches_dequant_reference`.
+
+    Compares the FP8 fused MoE + LoRA op against an fp32 PyTorch reference built
+    from the *dequantized* FP8 base weights/activations and the same LoRA
+    adapters. Using the dequantized values removes the base-weight quantization
+    error so any mismatch reflects the kernel pipeline. Tolerances are loose
+    because the op additionally requantizes the fc1->fc2 intermediate to FP8,
+    which the reference does not model.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 16, 128, 256
+    num_experts, top_k = 4, 2
+    rank = 8
+
+    x, w3_w1, w2, topk_ids, topk_scores = _build_base_inputs(
+        num_tokens, hidden_size, inter_size, num_experts, top_k, dtype, device
+    )
+    (x_fp8, w3_w1_fp8, w2_fp8, quant_scales, x_deq, w3_w1_deq, w2_deq) = _build_fp8_moe_inputs(
+        x, w3_w1, w2
+    )
+
+    fc1_adapter = _make_per_expert_lora_scaled(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=420
+    )
+    gated_adapter = _make_per_expert_lora_scaled(
+        num_experts, rank, hidden_size, inter_size, dtype=dtype, device=device, seed=421
+    )
+    fc2_adapter = _make_per_expert_lora_scaled(
+        num_experts, rank, inter_size, hidden_size, dtype=dtype, device=device, seed=422
+    )
+
+    lora_kwargs = _build_lora_request_buffers(
+        num_tokens,
+        fc1_adapter["A"],
+        fc1_adapter["B"],
+        fc2_adapter["A"],
+        fc2_adapter["B"],
+        rank=rank,
+        gated_a=gated_adapter["A"],
+        gated_b=gated_adapter["B"],
+    )
+
+    out_op = _call_fused_moe(
+        x_fp8,
+        w3_w1_fp8,
+        w2_fp8,
+        topk_ids,
+        topk_scores,
+        output_dtype=dtype,
+        lora_kwargs=lora_kwargs,
+        quant_scales=quant_scales,
+    )[0]
+
+    out_ref = reference_swiglu_moe_lora(
+        x_deq,
+        w3_w1_deq,
+        w2_deq,
+        topk_ids,
+        topk_scores,
+        fc1_a=fc1_adapter["A"],
+        fc1_b=fc1_adapter["B"],
+        gated_a=gated_adapter["A"],
+        gated_b=gated_adapter["B"],
+        fc2_a=fc2_adapter["A"],
+        fc2_b=fc2_adapter["B"],
+    )
+
+    assert torch.isfinite(out_op).all(), "FP8 fused_moe + LoRA produced NaN / Inf"
+    assert torch.isfinite(out_ref).all(), "Dequant reference produced NaN / Inf"
+
+    op_max_mag = out_op.float().abs().max().item()
+    ref_max_mag = out_ref.float().abs().max().item()
+    abs_diff = (out_op.float() - out_ref.float()).abs()
+    max_abs = abs_diff.max().item()
+    rel_err = max_abs / max(op_max_mag, 1e-12)
+
+    print(
+        f"[fp8_eager_vs_ref] op_max_mag={op_max_mag:.3e} "
+        f"ref_max_mag={ref_max_mag:.3e} max_abs_diff={max_abs:.3e} "
+        f"rel_err={rel_err:.3e}"
+    )
+    # Loose tolerance: FP8 base plus the fc1->fc2 intermediate requant.
+    torch.testing.assert_close(out_op, out_ref, rtol=2e-1, atol=2.0)
+
+
+@requires_cuda_and_op
+def test_moe_fp8_lora_eager_matches_dequant_reference():
+    """FP8 (qdq) base + all-three-module routed-expert LoRA parity vs an fp32
+    reference built from the dequantized FP8 base weights.
+    """
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+    MoERunner.runner_dict.clear()
+    try:
+        _run_fp8_eager_vs_dequant_reference_check()
     finally:
         MoERunner.runner_dict.clear()

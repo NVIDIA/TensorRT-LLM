@@ -25,8 +25,6 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 
-from ...utils import ActType_TrtllmGen
-
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -117,6 +115,7 @@ class MoEOpBackend:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         gated_act_type: int = 0,
+        gemm1_clamp_limit: Optional[float] = None,
         output: Optional[torch.Tensor] = None,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
@@ -258,6 +257,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=0,
+        gemm1_clamp_limit=None,
         output=None,
         use_shuffled_weight=False,
         weight_layout=0,
@@ -286,6 +286,7 @@ class TRTLLMOpBackend(MoEOpBackend):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             act_type=gated_act_type,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             output=output,
             tune_max_num_tokens=tune_max_num_tokens,
             use_dp=use_dp,
@@ -601,6 +602,7 @@ class FlashinferOpBackend(MoEOpBackend):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=0,
+        gemm1_clamp_limit=None,
         output=None,
         use_shuffled_weight=False,
         weight_layout=0,
@@ -608,6 +610,11 @@ class FlashinferOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
+        if gemm1_clamp_limit is not None:
+            raise NotImplementedError(
+                "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
+                "forward gemm1_clamp_limit; use the trtllm op backend."
+            )
         if router_logits is not None:
             return self._fused_moe.trtllm_fp8_block_scale_moe(
                 router_logits,
@@ -805,11 +812,8 @@ class FlashinferOpBackend(MoEOpBackend):
         enable_pdl=None,
         tune_max_num_tokens=8192,
     ):
-        # FlashInfer BF16 MoE does not expose an activation_type argument.
-        # TRTLLMGen constrains the BF16 path to Swiglu, so reject anything
-        # else here instead of silently calling a mismatched kernel.
-        if gated_act_type != ActType_TrtllmGen.SwiGlu:
-            raise ValueError("FlashInfer BF16 fused MoE only supports Swiglu activation.")
+        # Forward the activation (Swiglu/Relu2) to the FlashInfer BF16 kernels.
+        activation_type = self.cvt_activation_type(gated_act_type)
 
         if router_logits is not None:
             result = self._fused_moe.trtllm_bf16_moe(
@@ -832,6 +836,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 do_finalize=do_finalize,
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=tune_max_num_tokens,
+                activation_type=activation_type,
             )
         else:
             packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
@@ -856,6 +861,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 do_finalize=do_finalize,
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=tune_max_num_tokens,
+                activation_type=activation_type,
             )
 
         if output is not None and do_finalize:

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # 4-GPU Wan 2.2 T2V with NVFP4 dynamic quantization.
-# Shared by offline examples (--extra_visual_gen_options) and trtllm-serve.
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
 quant_config:
   quant_algo: NVFP4
   dynamic: true
@@ -23,6 +23,7 @@ attention_config:
 parallel_config:
   cfg_size: 2
   ulysses_size: 2
+  async_ulysses: true
   parallel_vae_size: 4
 cuda_graph_config:
   enable: false

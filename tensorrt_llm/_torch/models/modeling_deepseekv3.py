@@ -53,19 +53,21 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+from ..modules.attention import (maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
+from ..modules.mla import MLA
 
 # isort: off
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
-from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
+from ..modules.linear import (Linear, TensorParallelMode, WeightsLoadingConfig,
+                              is_static_nvfp4_input_eligible)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
@@ -142,6 +144,18 @@ def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
         return out
     # In-place add to avoid allocating a temporary tensor, reducing peak memory
     return shared_output.add_(routed_reduced)
+
+
+def _static_nvfp4_input_scale(linear):
+    """Return `linear`'s calibrated NVFP4 input_scale if it is eligible to be
+    folded into a producing RMSNorm's fused NVFP4 quantize, else None.
+
+    Eligibility is the shared `is_static_nvfp4_input_eligible` predicate, also
+    used by MLA._resolve_qa_fused_scale, so every fold site agrees on what
+    "static-NVFP4 eligible" means."""
+    if is_static_nvfp4_input_eligible(linear):
+        return linear.input_scale
+    return None
 
 
 class DeepseekV3WeightLoader:
@@ -340,7 +354,7 @@ class DeepseekV3WeightLoader:
         # preserved as `_ckpt_num_nextn_predict_layers`.
         ckpt_num_nextn_predict_layers = (
             getattr(self.config, '_ckpt_num_nextn_predict_layers', None)
-            or self.config.num_nextn_predict_layers)
+            or getattr(self.config, 'num_nextn_predict_layers', None))
 
         def detect_shared_mtp_weights() -> bool:
             # Detect if MTP layers share checkpoint weights (model has more MTP
@@ -348,7 +362,8 @@ class DeepseekV3WeightLoader:
             # multiple model MTP layers map to the same checkpoint layer via
             # modulo, and mark_consumed must be skipped to avoid deleting
             # weights that later MTP layers still need.
-            model_nextn = self.config.num_nextn_predict_layers or 0
+            model_nextn = getattr(self.config, 'num_nextn_predict_layers',
+                                  None) or 0
             return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
@@ -890,13 +905,20 @@ class DeepseekV3Gate(nn.Module):
                 out_dtype=torch.float32)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
-
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
+        w = weights[0].get("weight")
+        bias = weights[0].get("e_score_correction_bias")
+        if not allow_partial_loading:
+            assert w is not None and bias is not None, (
+                "DeepseekV3Gate expects 'weight' and 'e_score_correction_bias' "
+                "when partial loading is disabled")
+        if w is not None:
+            self.weight.copy_(w[:])
+        if bias is not None:
+            self.e_score_correction_bias.copy_(bias[:].to(
                 self.e_score_correction_bias.dtype))
 
     @property
@@ -1327,9 +1349,18 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 use_cute_dsl_blockscaling_mm,
             )
 
+        # On NVFP4 models, construct the boundary/prologue norms as NVFP4 norms.
+        # post_load_weights attaches each norm's .nvfp4_scale (the consuming
+        # Linear's static input_scale); the fused (add+)RMSNorm+NVFP4-quant then
+        # fires automatically from that attribute (RMSNorm.forward) only when a
+        # scale was attached, kernel chosen by the size gate. input_layernorm
+        # serves both layer 0's residual-less prologue and, as the previous
+        # layer's next_layer_layernorm, the layer-boundary add+RMSNorm edge.
+        nvfp4_norm = "nvfp4" if self.is_nvfp4 else None
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
-                                       dtype=config.torch_dtype)
+                                       dtype=config.torch_dtype,
+                                       quantize_type=nvfp4_norm)
 
         # When enable_attention_dp is True, we normally skip attention all-reduce since each
         # DP rank works on different batch elements. However, with CP > 1, attention is split
@@ -1341,9 +1372,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        or self.mapping.tp_size == 1
                                        or can_skip_for_attention_dp)
 
+        # Dense (GatedMLP) layers fold post_attention_layernorm -> NVFP4
+        # gate_up_proj; MoE layers route expert-input quant differently and
+        # never get an .nvfp4_scale attached, so the fused path stays inert for
+        # them even when constructed as an NVFP4 norm.
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
-                                                dtype=config.torch_dtype)
+                                                dtype=config.torch_dtype,
+                                                quantize_type=nvfp4_norm)
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
@@ -1410,7 +1446,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            if self.input_layernorm.nvfp4_scale is not None:
+                # Layer-0 prologue: the residual-less input_layernorm folds the
+                # NVFP4 kv_a_proj input-quant via its attached .nvfp4_scale
+                # (RMSNorm.forward), returning an Fp4QuantizedTensor.
+                # return_norm_out stashes the BF16 view DSA's pre_indexer_proj
+                # needs on that tensor's unquantized_hidden_states.
+                hidden_states = self.input_layernorm(hidden_states,
+                                                     return_norm_out=True)[0]
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
             position_ids=position_ids,
@@ -1527,11 +1572,27 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
-            if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+            hidden_states, residual = self._apply_next_layer_layernorm(
+                hidden_states, residual)
 
         return hidden_states, residual
+
+    def _apply_next_layer_layernorm(self, hidden_states, residual):
+        """Apply the next layer's input_layernorm at a layer boundary on the
+        attention-DP / no-allreduce path. When that norm has an .nvfp4_scale
+        attached, RMSNorm.forward folds the next layer's NVFP4 kv_a_proj
+        input-quant into the same kernel and returns (Fp4QuantizedTensor,
+        residual_out) with the BF16 view stashed for DSA's pre_indexer_proj
+        (return_norm_out); otherwise it applies the plain add+RMSNorm. Shared by
+        forward_MoE and forward_mlp so the boundary fold stays identical for MoE
+        and dense layers."""
+        if self.next_layer_layernorm is None:
+            return hidden_states, residual
+        if self.next_layer_layernorm.nvfp4_scale is not None:
+            return self.next_layer_layernorm(hidden_states,
+                                             residual,
+                                             return_norm_out=True)
+        return self.next_layer_layernorm(hidden_states, residual)
 
     def forward_mlp(
         self,
@@ -1541,17 +1602,36 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
-            act_fp4, act_sf, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.mlp.gate_up_proj.input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ),
-            )
-            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            if self.mlp.gate_up_proj.has_nvfp4:
+                act_fp4, act_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        scale=self.mlp.gate_up_proj.input_scale,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
+        elif self.post_attention_layernorm.nvfp4_scale is not None:
+            # Attention-DP path (no allreduce): post_attention_layernorm folds
+            # the dense MLP's NVFP4 gate_up_proj input-quant into one kernel via
+            # its attached .nvfp4_scale (RMSNorm.forward), mirroring the
+            # PRE_MLP_FUSION quant but without the allreduce.
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
@@ -1579,9 +1659,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     self.layer_idx):
                 spec_metadata.maybe_capture_hidden_states(
                     self.layer_idx, hidden_states, residual)
-            if self.next_layer_layernorm is not None:
-                hidden_states, residual = self.next_layer_layernorm(
-                    hidden_states, residual)
+            hidden_states, residual = self._apply_next_layer_layernorm(
+                hidden_states, residual)
 
         return hidden_states, residual
 
@@ -1920,11 +1999,39 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
                 layer.next_layer_layernorm = self.model.norm
             else:
-                layer.next_layer_layernorm = self.model.layers[
-                    idx + 1].input_layernorm
+                next_layer = self.model.layers[idx + 1]
+                layer.next_layer_layernorm = next_layer.input_layernorm
+
+            # Attach each norm's .nvfp4_scale (the consuming Linear's static
+            # input_scale) so RMSNorm.forward folds (add+)RMSNorm + NVFP4
+            # input-quant into one kernel on the attention-DP path. The fold is
+            # self-gating: _static_nvfp4_input_scale returns None (no fold)
+            # unless that Linear is NVFP4 with a static (calibrated) input_scale,
+            # so this is safe to run unconditionally on every layer.
+            #
+            # input_layernorm -> this layer's kv_a_proj covers BOTH the layer-0
+            # residual-less prologue AND the layer-boundary add+RMSNorm edge (the
+            # previous layer's next_layer_layernorm IS this input_layernorm).
+            # Both DSA (DSv3.2) and non-DSA (Kimi-K2.5) MLA are supported: the
+            # non-DSA forward_impl slices the Fp4QuantizedTensor by num_tokens
+            # via _slice_hidden_states_to_num_tokens, and kv_a_proj_with_mqa
+            # consumes the FP4 form directly.
+            self_attn = getattr(layer, "self_attn", None)
+            layer.input_layernorm.nvfp4_scale = _static_nvfp4_input_scale(
+                getattr(self_attn, "kv_a_proj_with_mqa", None))
+
+            # Intra-layer dense-MLP fold: post_attention_layernorm -> this
+            # layer's NVFP4 gate_up_proj. Only dense (GatedMLP) layers — MoE
+            # layers route their expert input quant differently and get no
+            # scale, so their fused path stays inert.
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, GatedMLP):
+                layer.post_attention_layernorm.nvfp4_scale = (
+                    _static_nvfp4_input_scale(getattr(mlp, "gate_up_proj",
+                                                      None)))

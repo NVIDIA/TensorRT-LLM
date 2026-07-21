@@ -9,7 +9,7 @@ from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrained
 from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
-from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_disagg
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
 
 from ...inputs import (
     ContentFormat,
@@ -198,7 +198,7 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.text_config
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             mm_encoder_config = copy.deepcopy(model_config)
             self.mm_encoder = Exaone4_5_VisionModel(mm_encoder_config, Qwen2_5_VisionModel)
         else:
@@ -231,7 +231,7 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
         mm_multimodal_params = self._get_requests_with_mm_data(multimodal_params)
 
         if len(mm_multimodal_params) > 0:
-            if not _is_disagg():
+            if not _is_mm_disagg():
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
@@ -262,6 +262,6 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         assert isinstance(weight_mapper, Exaone4_5HfWeightMapper)
         weights = weight_mapper.preprocess_weights(weights)
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder.load_weights(weights)
         self.llm.load_weights(weights, weight_mapper)

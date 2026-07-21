@@ -964,7 +964,9 @@ def create_aiperf_command(model_name,
         "--concurrency",
         str(concurrency),
         "--output-artifact-dir",
-        ARTIFACTS_DIR,
+        os.path.join(
+            ARTIFACTS_DIR,
+            f"{model_name}-openai-completions-concurrency{concurrency}"),
         # "--verbose",
     ]
 

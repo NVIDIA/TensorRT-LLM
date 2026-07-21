@@ -100,15 +100,35 @@ class PercentileStats(BaseModel):
     average: float
 
     @classmethod
-    def from_iterable(cls, values: List[Any]) -> PercentileStats:
+    def from_iterable(cls,
+                      values: List[Any],
+                      weights: Optional[List[float]] = None) -> PercentileStats:
+        """Build percentile statistics from ``values``.
+
+        When ``weights`` is provided, ``average`` is computed as a weighted
+        mean (``sum(w * v) / sum(w)``) instead of an equally-weighted mean.
+        This is used to weight per-request metrics (e.g. speculative decoding
+        acceptance rate / acceptance length) by the number of decoding
+        iterations so that longer requests, which run more decoding iterations,
+        contribute proportionally. Percentiles, minimum and maximum are
+        unaffected.
+        """
         length = len(values)
         sorted_values = sorted(values)
+        if weights is not None:
+            total_weight = sum(weights)
+            average = (sum(w * v
+                           for w, v in zip(weights, values, strict=True)) /
+                       total_weight
+                       if total_weight > 0 else float(sum(values)) / length)
+        else:
+            average = float(sum(values)) / length
         return cls(
             p50=sorted_values[int(length * 0.50)],
             p90=sorted_values[int(length * 0.90)],
             p95=sorted_values[int(length * 0.95)],
             p99=sorted_values[int(length * 0.99)],
-            average=float(sum(values)) / length,
+            average=average,
             minimum=min(values),
             maximum=max(values),
         )

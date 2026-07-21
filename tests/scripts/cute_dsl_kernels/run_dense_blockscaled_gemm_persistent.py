@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -306,6 +306,10 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
+    # alpha: kernel expects a single-element device tensor (uses alpha[0])
+    alpha_torch = torch.ones((1,), dtype=torch.float32).cuda()
+    alpha_tensor = from_dlpack(alpha_torch).mark_layout_dynamic()
+
     # Compile gemm kernel
     compiled_gemm = cute.compile(
         gemm,
@@ -314,7 +318,7 @@ def run(
         sfa_tensor,
         sfb_tensor,
         c_tensor,
-        1.0,  # alpha
+        alpha_tensor,  # alpha
         max_active_clusters,
         current_stream,
         options="--opt-level 2",
@@ -323,7 +327,9 @@ def run(
     # Compute reference result
     if not skip_ref_check:
         # Execute kernel once for reference checking
-        compiled_gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, 1.0, current_stream)
+        compiled_gemm(
+            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha_tensor, current_stream
+        )
         print("Verifying results...")
         res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
         res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
@@ -386,7 +392,7 @@ def run(
         _, sfa_tensor, _ = create_scale_factor_tensor(batch, m, k, sf_vec_size, sf_dtype)
         _, sfb_tensor, _ = create_scale_factor_tensor(batch, n, k, sf_vec_size, sf_dtype)
         return cute.testing.JitArguments(
-            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, 1.0, current_stream
+            a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, alpha_tensor, current_stream
         )
 
     workspace_count = 1

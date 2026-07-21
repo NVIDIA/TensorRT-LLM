@@ -36,6 +36,7 @@ namespace torch_ext
 // nvfp4: sfVecSize = 16, sfUseUE8M0 = false
 // mxfp4: sfVecSize = 32, sfUseUE8M0 = true
 // alignment: sfVecSize
+// sfUseUE8M0: bool, if true, scale factors use UE8M0 format (MXFP4); otherwise UE4M3 (NVFP4).
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in linear layout.
 // See QuantizationSFLayout enum for more details about the two layouts.
 // returns self_fp4, self_block_scale_factors

@@ -107,6 +107,11 @@ MODEL_PATH_DICT = {
     # DeepSeek V3.2 (671B MoE)
     "deepseek_v3.2_fp8": "DeepSeek-V3.2-hf",
     "deepseek_v3.2_fp4": "DeepSeek-V3.2-NVFP4",
+    # DeepSeek V4
+    "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro",
+    "deepseek_v4_flash": "DeepSeek-V4-Flash",
+    "deepseek_v4_flash_base_fp8": "DeepSeek-V4-Flash-Base",
+    "deepseek_v4_pro_dspark": "DeepSeek-V4-Pro-DSpark",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # Kimi K2.5 NVFP4 (~1T MoE multimodal)
@@ -123,16 +128,9 @@ MODEL_PATH_DICT = {
     "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
-# Model PATH of HuggingFace
+# Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).
 HF_MODEL_PATH = {
-    "llama_v3.1_8b_hf": "meta-llama/Llama-3.1-8B",
-    "llama_v3.1_8b_instruct_hf": "nvidia/Llama-3.1-8B-Instruct-FP8",
-    "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-    "llama_v3.1_nemotron_nano_8b_fp8_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
-    "llama_v3.3_nemotron_super_49b_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.3_nemotron_super_49b_fp8_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
-    "llama_v3.1_nemotron_ultra_253b_fp8_hf": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
-    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
+    "nemotron_3_ultra_550b_nvfp4": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
 }
 
 LORA_MODEL_PATH = {

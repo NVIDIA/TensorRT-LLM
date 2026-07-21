@@ -49,21 +49,32 @@ else:
     torch_dtype_to_binding = None
 
 from ..custom_ops.attention_interface import (
+    AttentionType,
     CausalConvResourceHandler,
+    EphemeralResourceHandler,
+    IntermediateConvStateHandler,
+    IntermediateSSMStateHandler,
     KVPagedResourceHandler,
     ReplayCacheBufIdxHandler,
+    ReplayNWritesHandler,
     ReplayOldBHandler,
     ReplayOldDAcumsumHandler,
     ReplayOldDtHandler,
     ReplayOldXHandler,
     ReplayPrevNumAcceptedHandler,
+    ReplayWorkItemsHandler,
     ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
-    SpecCausalConvResourceHandler,
-    SpecSSMResourceHandler,
     SSMResourceHandler,
     StateResourceHandler,
+)
+from ..custom_ops.mamba.replay_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
 )
 from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
@@ -101,6 +112,7 @@ class CachedSequenceInterface:
         vocab_size_padded: Optional[int] = None,
         spec_config=None,
         requires_uniform_kv_caches: bool = False,
+        reject_unmanaged_persistent_caches: bool = False,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -117,6 +129,8 @@ class CachedSequenceInterface:
                 cache mapping. When True, KV layers incompatible with the managed KV cache
                 reference raise during initialization, and managed KV layers must share a
                 single page-stride multiplier.
+            reject_unmanaged_persistent_caches: Whether to reject non-ephemeral cache resources
+                that are not managed by cache managers.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -147,10 +161,19 @@ class CachedSequenceInterface:
         # same order as the C++ manager's internal pool ordering (i.e. the
         # insertion order of the per-window shape map keys).
         self._kv_group_windows: List[int] = []
+        # Whether the attention backend's kernel applies the sliding-window mask
+        # itself via cyclic KV indexing (trtllm). When True the executor passes
+        # the full per-window block table and global KV lengths instead of
+        # host-slicing to the live window. Set by the kvcache transform from the
+        # attention descriptor's ``kernel_handles_cyclic_swa()``.
+        self._kernel_handles_cyclic_swa: bool = False
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
+        self._replay_work_items: Optional[torch.Tensor] = None
+        self._replay_n_writes: Optional[torch.Tensor] = None
         self._spec_config = spec_config
         self._requires_uniform_kv_caches = requires_uniform_kv_caches
+        self._reject_unmanaged_persistent_caches = reject_unmanaged_persistent_caches
 
         # Propagate spec-dec config into BatchInfo so attention backends can read it
         # via the per-forward batch_info_host tensor without needing the Python config.
@@ -344,6 +367,7 @@ class CachedSequenceInterface:
         pool_by_window: Dict[int, PoolConfiguration] = {}
 
         max_seq_len = self.info.max_seq_len
+        attention_type: Optional[AttentionType] = None
 
         for name, handler in self._resource_lookup.items():
             if not isinstance(handler, KVPagedResourceHandler):
@@ -351,6 +375,15 @@ class CachedSequenceInterface:
             # Effective window: full-attention layers (sliding_window == 0) use
             # max_seq_len so the C++ side gets a single concrete window key.
             effective_window = handler.sliding_window if handler.sliding_window > 0 else max_seq_len
+
+            if attention_type is None:
+                attention_type = handler.attention_type
+            elif handler.attention_type != attention_type:
+                raise RuntimeError(
+                    f"KV layer {name} has attention_type={handler.attention_type!r} but "
+                    f"managed KV resources already use attention_type={attention_type!r}. "
+                    "Disaggregated KV transfer requires a single attention type."
+                )
 
             kv_managed[name] = handler
 
@@ -380,6 +413,7 @@ class CachedSequenceInterface:
                     dtype=handler_dtype,
                 )
 
+        self.info.attention_type = attention_type
         pool_configurations: List[PoolConfiguration] = list(pool_by_window.values())
 
         # If the runtime requires uniform KV caches (e.g. legacy single-pool
@@ -454,8 +488,8 @@ class CachedSequenceInterface:
         ssm_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecSSMResourceHandler)
-            and handler == SpecSSMResourceHandler.from_base(ssm_ref)
+            if isinstance(handler, IntermediateSSMStateHandler)
+            and handler == IntermediateSSMStateHandler.from_base(ssm_ref)
         ]
         conv_managed = [
             (name, handler)
@@ -465,8 +499,8 @@ class CachedSequenceInterface:
         conv_spec = [
             (name, handler)
             for name, handler in self._resource_lookup.items()
-            if isinstance(handler, SpecCausalConvResourceHandler)
-            and handler == SpecCausalConvResourceHandler.from_base(conv_ref)
+            if isinstance(handler, IntermediateConvStateHandler)
+            and handler == IntermediateConvStateHandler.from_base(conv_ref)
         ]
 
         # Replay SSM buffers — per-layer (old_x, old_B, old_dt, old_dA_cumsum)
@@ -501,6 +535,16 @@ class CachedSequenceInterface:
             for name, handler in self._resource_lookup.items()
             if isinstance(handler, ReplayPrevNumAcceptedHandler)
         ]
+        replay_work_items = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayWorkItemsHandler)
+        ]
+        replay_n_writes = [
+            (name, handler)
+            for name, handler in self._resource_lookup.items()
+            if isinstance(handler, ReplayNWritesHandler)
+        ]
 
         # When speculative decoding is enabled, the backend must supply matching spec buffers.
         # When it is not enabled, spec buffers may still be registered by the backend (e.g.
@@ -528,6 +572,14 @@ class CachedSequenceInterface:
                 f"Replay bundle mismatch: replay_prev_num_accepted has "
                 f"{len(replay_prev_num_accepted)} entries, expected {n} (== len(ssm_managed))"
             )
+            assert len(replay_work_items) == n, (
+                f"Replay bundle mismatch: replay_work_items has {len(replay_work_items)} "
+                f"entries, expected {n} (== len(ssm_managed))"
+            )
+            assert len(replay_n_writes) == n, (
+                f"Replay bundle mismatch: replay_n_writes has {len(replay_n_writes)} "
+                f"entries, expected {n} (== len(ssm_managed))"
+            )
         if self._spec_config is not None:
             if not use_replay:
                 assert len(ssm_spec) == len(ssm_managed), (
@@ -551,6 +603,8 @@ class CachedSequenceInterface:
             replay_old_dA_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
         )
 
     def _prepare_kv_cache_config(
@@ -589,6 +643,9 @@ class CachedSequenceInterface:
             ]
         else:
             kv_cache_config.max_attention_window = None
+        has_swa_window = kv_cache_config.max_attention_window is not None and any(
+            window < self.info.max_seq_len for window in kv_cache_config.max_attention_window
+        )
 
         # Update kv_cache_config based on max_tokens if provided
         if max_tokens is not None:
@@ -597,7 +654,11 @@ class CachedSequenceInterface:
                 max_tokens_gathered = [None] * get_world_size()
                 all_gather_object(max_tokens_gathered, max_tokens)
                 max_tokens = min(max_tokens_gathered)
-            kv_cache_config.free_gpu_memory_fraction = None
+            # VSWA uses a memory-fraction/byte pool split across window groups.
+            # Keep the fraction even when AD passes a synthetic token estimate,
+            # because VSWA ignores max_tokens during final block allocation.
+            if not has_swa_window:
+                kv_cache_config.free_gpu_memory_fraction = None
             kv_cache_config.max_tokens = min(kv_cache_config.max_tokens or max_tokens, max_tokens)
 
         # Check if we should disable block reuse
@@ -737,6 +798,8 @@ class CachedSequenceInterface:
         replay_old_dA_cumsum: list = (),
         replay_cache_buf_idx: list = (),
         replay_prev_num_accepted: list = (),
+        replay_work_items: list = (),
+        replay_n_writes: list = (),
     ) -> Tuple[MambaHybridCacheManager, int]:
         """Create MambaHybridCacheManager and assign views for state resources.
 
@@ -754,12 +817,15 @@ class CachedSequenceInterface:
             conv_spec: List of speculative Conv resources.
             replay_old_x/B/dt/dA_cumsum: Per-layer replay cache resource lists.
             replay_cache_buf_idx/prev_num_accepted: Global replay resource lists.
+            replay_work_items/replay_n_writes: Per-forward replay metadata resources.
 
         Returns:
             Tuple of (manager, num_managed_mamba_layers).
         """
         # Detect replay mode from presence of ReplayOldXHandler resources.
         use_replay = len(replay_old_x) > 0
+        if use_replay and self._spec_config is None:
+            raise RuntimeError("Replay SSM state update requires speculative decoding config.")
 
         # Mamba state params can be derived from reference handlers and number of managed (non-speculative) resources.
         mamba_params = self._get_mamba_state_params(
@@ -837,7 +903,77 @@ class CachedSequenceInterface:
                 for buf_name, _ in buf_list:
                     self._caches[buf_name] = global_tensor
 
+            if replay_work_items:
+                # Zero-init as an extra precaution (not torch.empty). The
+                # prepare_replay_metadata host-prepare hook (registered in
+                # initialize_resources) populates this buffer on every
+                # nest_sequences -- runtime and cudagraph capture alike -- so the
+                # replay SSM kernel never reads it unprepared.
+                self._replay_work_items = torch.zeros(
+                    self.info.max_num_state_slots,
+                    REPLAY_WORK_ITEM_WIDTH,
+                    device=self.info.device,
+                    dtype=torch.int32,
+                )
+                for buf_name, _ in replay_work_items:
+                    self._caches[buf_name] = self._replay_work_items
+
+            if replay_n_writes:
+                self._replay_n_writes = torch.zeros(1, device=self.info.device, dtype=torch.int32)
+                for buf_name, _ in replay_n_writes:
+                    self._caches[buf_name] = self._replay_n_writes
+
         return manager, num_managed_mamba_layers
+
+    def prepare_replay_metadata(self) -> None:
+        """Populate replay work items for the current AD batch."""
+        if self._replay_work_items is None or self._replay_n_writes is None:
+            return
+        if not self.info.batch_info.is_use_replay():
+            return
+        if not hasattr(self._kv_cache_manager, "get_replay_state_update_metadata"):
+            return
+
+        replay_metadata = self._kv_cache_manager.get_replay_state_update_metadata()
+        self._replay_n_writes.zero_()
+        if replay_metadata is None:
+            return
+
+        num_prefill, num_extend, _ = self.info.batch_info.get_num_sequences()
+        if num_extend == 0:
+            return
+
+        slot_idx = self.info.get_arg("slot_idx", truncate=True)
+        cache_slot = slot_idx[num_prefill : num_prefill + num_extend].to(torch.int32)
+        cache_slot_idx = cache_slot.to(torch.long)
+        prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
+        cache_buf_idx = replay_metadata.cache_buf_idx
+
+        position_in_decode_batch = torch.arange(
+            num_extend, dtype=torch.int32, device=slot_idx.device
+        )
+        pnat = prev_num_accepted_tokens[cache_slot_idx].to(torch.int32)
+        active_cache_buf_idx = cache_buf_idx[cache_slot_idx].to(torch.int32)
+
+        # Keep field order and write-first partitioning in sync with the
+        # PyTorch replay metadata path in mamba2_metadata.py.
+        writes = pnat + replay_metadata.replay_step_width > replay_metadata.replay_history_size
+        writes_i32 = writes.to(torch.int32)
+        write_offsets = torch.cumsum(writes_i32, dim=0) - writes_i32
+        n_writes = torch.sum(writes_i32, dim=0, keepdim=True).to(torch.int32)
+        no_write_offsets = position_in_decode_batch - write_offsets
+        output_offsets = torch.where(writes, write_offsets, n_writes + no_write_offsets).to(
+            torch.long
+        )
+
+        work_items = self._replay_work_items[:num_extend]
+        work_items[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH].scatter_(
+            0, output_offsets, position_in_decode_batch
+        )
+        work_items[:, REPLAY_WORK_CACHE_SLOT].scatter_(0, output_offsets, cache_slot)
+        work_items[:, REPLAY_WORK_PNAT].scatter_(0, output_offsets, pnat)
+        work_items[:, REPLAY_WORK_CACHE_BUF_IDX].scatter_(0, output_offsets, active_cache_buf_idx)
+        self._replay_n_writes.copy_(n_writes)
 
     def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.
@@ -879,6 +1015,68 @@ class CachedSequenceInterface:
                 )
 
         return block_offset_multiplier
+
+    def _validate_no_unmanaged_persistent_caches(
+        self,
+        kv_managed: ResourceHandlerDict,
+        ssm_managed: list,
+        ssm_spec: list,
+        conv_managed: list,
+        conv_spec: list,
+        replay_old_x: list,
+        replay_old_B: list,
+        replay_old_dt: list,
+        replay_old_dA_cumsum: list,
+        replay_cache_buf_idx: list,
+        replay_prev_num_accepted: list,
+        replay_work_items: list,
+        replay_n_writes: list,
+    ) -> None:
+        """Validate persistent cache resources are cache-manager backed.
+
+        Speculative resources (intermediate SSM/conv states and replay buffers) are bound by the
+        cache manager only when speculative decoding is enabled (see _create_and_assign_state_views),
+        so they count as managed only under that condition. When spec decoding is off they are not
+        registered at all (see kvcache._suppress_spec_handlers_maybe), so the loop never encounters
+        them.
+        """
+        if not self._reject_unmanaged_persistent_caches:
+            return
+
+        managed_names = set(kv_managed)
+        managed_names.update(name for name, _ in ssm_managed)
+        managed_names.update(name for name, _ in conv_managed)
+        if self._spec_config is not None:
+            managed_names.update(name for name, _ in ssm_spec)
+            managed_names.update(name for name, _ in conv_spec)
+            for replay_resources in (
+                replay_old_x,
+                replay_old_B,
+                replay_old_dt,
+                replay_old_dA_cumsum,
+                replay_cache_buf_idx,
+                replay_prev_num_accepted,
+                replay_work_items,
+                replay_n_writes,
+            ):
+                managed_names.update(name for name, _ in replay_resources)
+
+        unmanaged_transfer_resources = []
+        for name, handler in self._resource_lookup.items():
+            if isinstance(handler, EphemeralResourceHandler):
+                continue
+            if name in managed_names:
+                continue
+            unmanaged_transfer_resources.append(f"{name} ({type(handler).__name__})")
+
+        if unmanaged_transfer_resources:
+            raise RuntimeError(
+                "Found unmanaged persistent cache resources while "
+                "reject_unmanaged_persistent_caches is enabled: "
+                f"{unmanaged_transfer_resources}. Persistent cache resources must be managed by "
+                "a cache manager for configurations that need cache transfer, such as "
+                "disaggregated serving."
+            )
 
     def _allocate_unmanaged_resources(self) -> None:
         """Allocate resources not managed by cache managers.
@@ -985,6 +1183,7 @@ class CachedSequenceInterface:
         - SSMResourceHandler maps to MambaHybridCacheManager's ssm_states buffer
         - CausalConvResourceHandler maps to MambaHybridCacheManager's conv_states buffer
         - Generic StateResourceHandler and incompatible typed handlers are allocated locally
+          unless transfer policy requires persistent cache resources to be managed
         - When both SSM and Conv handlers exist, uses min(ssm_count, conv_count) layers
 
         Args:
@@ -1012,6 +1211,8 @@ class CachedSequenceInterface:
             replay_old_dA_cumsum,
             replay_cache_buf_idx,
             replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
         ) = self._identify_managed_state_resources()
 
         # Propagate replay mode into BatchInfo so SSM backends can branch on it
@@ -1053,6 +1254,8 @@ class CachedSequenceInterface:
                 replay_old_dA_cumsum=replay_old_dA_cumsum,
                 replay_cache_buf_idx=replay_cache_buf_idx,
                 replay_prev_num_accepted=replay_prev_num_accepted,
+                replay_work_items=replay_work_items,
+                replay_n_writes=replay_n_writes,
             )
         else:
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
@@ -1097,20 +1300,37 @@ class CachedSequenceInterface:
             block_offset_multiplier=block_offset_multiplier,
         )
 
-        # 7. Allocate remaining unmanaged resources
+        # 7. Validate persistent cache resources before allocating local fallbacks
+        self._validate_no_unmanaged_persistent_caches(
+            kv_managed,
+            ssm_managed,
+            ssm_spec,
+            conv_managed,
+            conv_spec,
+            replay_old_x,
+            replay_old_B,
+            replay_old_dt,
+            replay_old_dA_cumsum,
+            replay_cache_buf_idx,
+            replay_prev_num_accepted,
+            replay_work_items,
+            replay_n_writes,
+        )
+
+        # 8. Allocate remaining unmanaged resources
         self._allocate_unmanaged_resources()
 
-        # 8. Patch shutdown
+        # 9. Patch shutdown
         self._kv_cache_manager.shutdown = with_pre_callback(
             self._kv_cache_manager.shutdown,
             self._clear_caches,
         )
 
-        # 8. Compute final token count and cache statistics
+        # 10. Compute final token count and cache statistics
         max_resource_count = self._kv_cache_manager.get_max_resource_count()
         max_tokens_final = max_resource_count * self._kv_cache_manager.tokens_per_block
 
-        # 9. Collect statistics of different types of resources
+        # 11. Collect statistics of different types of resources
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
@@ -1118,16 +1338,14 @@ class CachedSequenceInterface:
             1 for h in self._resource_lookup.values() if isinstance(h, SSMResourceHandler)
         )
         num_ssm_spec_total = sum(
-            1 for h in self._resource_lookup.values() if isinstance(h, SpecSSMResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateSSMStateHandler)
         )
         num_ssm_total = num_ssm_base_total + num_ssm_spec_total
         num_conv_base_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, CausalConvResourceHandler)
         )
         num_conv_spec_total = sum(
-            1
-            for h in self._resource_lookup.values()
-            if isinstance(h, SpecCausalConvResourceHandler)
+            1 for h in self._resource_lookup.values() if isinstance(h, IntermediateConvStateHandler)
         )
         num_conv_total = num_conv_base_total + num_conv_spec_total
         num_state_other = num_state_total - num_ssm_total - num_conv_total
@@ -1203,6 +1421,15 @@ class CachedSequenceInterface:
             f"other={s['other']}, "
             f"max_tokens={s['max_tokens']}"
         )
+
+        if self.info.batch_info.is_use_replay():
+            # Wrapper takes **kwargs to satisfy the host-prepare callable protocol;
+            # prepare_replay_metadata reads everything it needs from self, so no
+            # graph-input args are requested (empty arg list).
+            def _replay_metadata_hook(**_sequence_info_args) -> None:
+                self.prepare_replay_metadata()
+
+            self.info.register_host_prepare_for_attention_forward(_replay_metadata_hook, [])
 
         return len(self._caches)
 
@@ -1301,6 +1528,21 @@ class CachedSequenceInterface:
         self._kv_group_windows = list(group_windows)
 
     @property
+    def kernel_handles_cyclic_swa(self) -> bool:
+        """Whether the attention kernel applies the sliding-window mask itself.
+
+        When True (trtllm), the executor passes the full per-window block table
+        and global KV lengths; when False (triton/flashinfer), it host-slices to
+        the live sliding window.
+        """
+        return self._kernel_handles_cyclic_swa
+
+    def set_kernel_handles_cyclic_swa(self, value: bool) -> None:
+        """Record the attention backend's cyclic-SWA capability (called by the
+        kvcache transform from ``AttentionDescriptor.kernel_handles_cyclic_swa``)."""
+        self._kernel_handles_cyclic_swa = bool(value)
+
+    @property
     def kv_cache_manager(self) -> Optional[KVCacheManager]:
         """Return the unified KVCacheManager, or None if not initialized."""
         assert self._kv_cache_manager is not None, "KVCacheManager not initialized."
@@ -1319,11 +1561,17 @@ class CachedSequenceInterface:
         """Return the original KVCacheConfig as passed in."""
         return self._kv_cache_config_original
 
+    @property
+    def attention_type(self) -> Optional[AttentionType]:
+        return self.info.attention_type
+
     def _clear_caches(self) -> None:
         """Clear all caches and views before pool release."""
         for k in self._caches:
             self._caches[k] = None
         self._unmanaged_resources.clear()
+        self._replay_work_items = None
+        self._replay_n_writes = None
 
     def shutdown(self) -> None:
         """Shutdown and release all resources."""

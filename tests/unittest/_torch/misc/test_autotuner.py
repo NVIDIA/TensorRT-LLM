@@ -765,9 +765,13 @@ def _distributed_worker_function(world_size, strategy):
                          tuning_config=config_independent,
                          inputs=inputs)
 
-    # Check only one file is created in the cache path
-    assert len(os.listdir(os.path.dirname(
-        cache_path))) == 1, "Only one rank file should be created"
+    # Check only one cache file is created in the cache path.
+    # The sibling ".lock" file is an implementation artifact of
+    # _exclusive_cache_lock (see tensorrt_llm/_torch/autotuner.py) and is not
+    # a per-rank cache file.
+    cache_dir = os.path.dirname(cache_path)
+    cache_files = [f for f in os.listdir(cache_dir) if not f.endswith(".lock")]
+    assert len(cache_files) == 1, "Only one rank file should be created"
 
     dist.barrier()
 
@@ -986,3 +990,278 @@ def test_global_timer_vs_cuda_event(use_cuda_graph, monkeypatch):
               f"{event_ms:>16.4f} {gt_ms:>17.4f} "
               f"{abs_diff:>14.4f} {rel_diff * 100:>13.2f}")
     print("-" * 102)
+
+
+def _make_shapes(*sizes):
+    """Convert size-tuples into Tuple[torch.Size, ...] for _find_nearest_profile."""
+    return tuple(torch.Size(s) for s in sizes)
+
+
+class TestSpecBoundsChecking:
+    """Bounds-checking in AutoTuner._find_nearest_profile and AutoTuner._optimization_profiles."""
+
+    def setup_method(self):
+        AutoTuner._find_nearest_profile.cache_clear()
+
+    @pytest.mark.parametrize("entry", ["find_nearest", "optimization_profiles"])
+    @pytest.mark.parametrize(
+        "spec_class,input_idx,dim_idx",
+        [
+            pytest.param("dynamic", 5, 0, id="dynamic_input_idx_out_of_range"),
+            pytest.param("dynamic", 0, 10, id="dynamic_dim_idx_out_of_range"),
+            pytest.param("dynamic", -1, 0, id="dynamic_negative_input_idx"),
+            pytest.param("dynamic", 0, -1, id="dynamic_negative_dim_idx"),
+            pytest.param(
+                "constraint", 3, 0, id="constraint_input_idx_out_of_range"),
+            pytest.param(
+                "constraint", 0, 7, id="constraint_dim_idx_out_of_range"),
+            pytest.param(
+                "constraint", -1, 0, id="constraint_negative_input_idx"),
+            pytest.param("constraint", 0, -1, id="constraint_negative_dim_idx"),
+        ],
+    )
+    def test_oob_spec_skipped(self, entry, spec_class, input_idx, dim_idx):
+        from tensorrt_llm._torch.autotuner import ConstraintSpec
+        if spec_class == "dynamic":
+            spec = DynamicTensorSpec(input_idx=input_idx,
+                                     dim_idx=dim_idx,
+                                     gen_tuning_buckets=(1, 2))
+            dyn_specs = (spec, )
+            con_specs = ()
+        else:
+            spec = ConstraintSpec(input_idx=input_idx,
+                                  dim_idx=dim_idx,
+                                  infer_shape=lambda shapes: 1)
+            dyn_specs = ()
+            con_specs = (spec, )
+
+        if entry == "find_nearest":
+            shapes = _make_shapes([4, 8])
+            result = AutoTuner._find_nearest_profile(
+                shapes,
+                dynamic_tensor_specs=dyn_specs,
+                constraint_specs=con_specs)
+            assert result == ((4, 8), )
+        else:
+            tuner = AutoTuner()
+            x = torch.rand([4, 8])
+            # Constraint-only configs need a dynamic spec to drive the cartesian product.
+            if not dyn_specs:
+                dyn_specs = (DynamicTensorSpec(input_idx=0,
+                                               dim_idx=0,
+                                               gen_tuning_buckets=(1, )), )
+            config = TuningConfig(dynamic_tensor_specs=dyn_specs,
+                                  constraint_specs=con_specs)
+            profiles = tuner._optimization_profiles(config, [x])
+            # OOB spec skipped — profile generation still produces at least one profile.
+            assert len(profiles) >= 1
+
+
+def test_single_pair_shortcut(monkeypatch):
+    """Single (runner, tactic) candidate must bypass the timed profile loop.
+
+    When ``_profile_runners`` sees exactly one (runner, tactic) pair, it
+    must (1) skip ``_profile_single_kernel`` entirely, (2) still fire the
+    ``do_preparation`` hook for runners that opt in, (3) fire exactly one
+    ``forward()`` to drive any JIT side effect, and (4) record the pair
+    in the profiling cache. Multi-tactic ops in the same fixture must
+    still use the timed path.
+    """
+
+    profile_calls: List[Any] = []
+
+    def _track(self, runner, inputs, tactic, tuning_config, **kwargs):
+        profile_calls.append(tactic)
+        return 1.0 + len(profile_calls) * 0.01
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", _track)
+
+    forward_calls: List[tuple] = []
+
+    class PrepRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    do_preparation: bool = False,
+                    **kwargs) -> torch.Tensor:
+            forward_calls.append((tactic, do_preparation))
+            if do_preparation:
+                return None
+            x, w = inputs
+            return x @ w
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    x = torch.randn(M, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+
+    # Single (runner, tactic): shortcut must fire.
+    op_single = "autotuner_test::single_pair_shortcut"
+    with autotune():
+        _, tactic = tuner.choose_one(op_single, [PrepRunner()], TuningConfig(),
+                                     [x, w])
+    assert tactic == 0
+    assert profile_calls == [], (
+        f"_profile_single_kernel must not be called for single-pair op; "
+        f"got {profile_calls}")
+    assert forward_calls == [
+        (-1, True), (0, False)
+    ], (f"Expected do_preparation then exactly one forward(tactic=0); "
+        f"got {forward_calls}")
+    assert len(tuner.profiling_cache.get_specific_custom_op(op_single)) == 1, (
+        "single-pair shortcut must still record the (runner, tactic) entry")
+
+    # Multi-tactic on the same fixture: timed profile path must still run.
+    forward_calls.clear()
+    op_multi = "autotuner_test::single_pair_shortcut_multi"
+    with autotune():
+        tuner.choose_one(op_multi, [GemmRunner()], TuningConfig(), [x, w])
+    # GemmRunner exposes 3 tactics -> 3 profile calls.
+    assert len(profile_calls) == 3, (
+        f"Multi-tactic op must hit _profile_single_kernel per tactic; "
+        f"got {len(profile_calls)} ({profile_calls})")
+
+
+def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
+    """End-to-end guard for the nvMatmulHeuristics tactic pruning.
+
+    For one representative problem size, the tactic the AutoTuner selects when
+    nvMatmulHeuristics prunes the tile/cluster candidates must be no slower (up
+    to a small tolerance) than the tactic it selects from the full CuteDSL
+    NVFP4 tactic sweep. This validates that pruning does not cost performance.
+
+    It additionally compares the heuristic-chosen CuteDSL kernel against the
+    cuBLASLt NVFP4 GEMM on the same fp4 inputs: the CuteDSL kernel-only device
+    time must be within a small tolerance of cuBLAS. Both kernel symbol names
+    are logged for manual inspection -- cuBLAS exposes no API for its selected
+    kernel's CTA tile / cluster shape, so that is not asserted.
+
+    Note: the sweep and heuristic paths do NOT profile identical candidate sets
+    -- the heuristic path is a strict validated subset of the sweep -- so the
+    exact winning tactic can differ. Only the achieved runtime is a meaningful
+    invariant, hence the tolerance comparisons.
+
+    Blackwell only (SM100/SM103) and requires the nvMatmulHeuristics library;
+    skipped otherwise.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    try:
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+    except Exception:
+        sm_version = None
+    if sm_version not in (100, 103):
+        pytest.skip("CuteDSL NVFP4 requires SM100 (B200) / SM103 (B300)")
+
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as nvmmh
+    if not nvmmh.IS_NVMMH_AVAILABLE:
+        pytest.skip("nvMatmulHeuristics library not installed")
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLNVFP4BlackwellRunner
+
+    # One representative square problem. fp4 packing / scale-factor layout
+    # follows shmoo_nvfp4_cutedsl_heuristics.py::_quantize_inputs.
+    m = n = k = 4096
+    dtype = torch.bfloat16
+    sf_vec_size = 16
+    torch.manual_seed(0)
+    x = torch.randn((m, k), dtype=dtype).cuda()
+    w = torch.randn((n, k), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+    w_sf_global = (448 * 6) / w.abs().max().float()
+    x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(x, x_sf_global, sf_vec_size,
+                                                False)
+    w_fp4, w_sf = torch.ops.trtllm.fp4_quantize(w, w_sf_global, sf_vec_size,
+                                                False)
+    alpha = torch.tensor([1.0], device="cuda")
+    inputs = [x_fp4, w_fp4, x_sf, w_sf, alpha]
+
+    runner = CuteDSLNVFP4BlackwellRunner(output_dtype=dtype)
+    tuning_config = runner.__class__.tuning_config
+
+    def _best_tactic():
+        tuner = AutoTuner.get()
+        tuner.clear_cache()
+        with autotune():
+            _, tactic = tuner.choose_one(
+                "test::cutedsl_nvfp4_heuristic_match",
+                [runner],
+                tuning_config,
+                inputs,
+            )
+        return tactic
+
+    def _dominant_kernel(fn, iters=20):
+        """(name, per-call device-us) of the longest-running CUDA kernel that
+        fn launches, isolating kernel time from host/op overhead."""
+        from torch.profiler import ProfilerActivity, profile
+        fn()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(iters):
+                fn()
+            torch.cuda.synchronize()
+        best_name, best_total, best_count = "<none>", -1.0, 1
+        for e in prof.key_averages():
+            t = (getattr(e, "self_device_time_total", 0)
+                 or getattr(e, "self_cuda_time_total", 0))
+            if t and t > best_total:
+                best_name, best_total, best_count = e.key, t, max(1, e.count)
+        return best_name, best_total / best_count
+
+    # Full sweep: heuristics disabled.
+    monkeypatch.delenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", raising=False)
+    sweep_tactic = _best_tactic()
+
+    # Pruned: nvMatmulHeuristics drives the (coupled) tile+cluster candidates.
+    # Pin MAX_TACTICS so the tolerance below is not affected by an env override.
+    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_ENABLE", "1")
+    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_FIELDS", "tile,cluster")
+    monkeypatch.setenv("TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS", "5")
+    heuristic_tactic = _best_tactic()
+
+    # cuBLASLt runs its own heuristic auto-tuning; warm it under autotune().
+    def _cublas_call():
+        return torch.ops.trtllm.nvfp4_gemm_cublaslt(x_fp4, w_fp4, x_sf, w_sf,
+                                                    alpha, dtype)
+
+    with autotune():
+        _cublas_call()
+    torch.cuda.synchronize()
+
+    # All comparisons use kernel-only device time (isolates the GEMM kernel from
+    # host/op dispatch overhead), measured via the CUDA profiler.
+    _, sweep_us = _dominant_kernel(lambda: runner(inputs, tactic=sweep_tactic))
+    _, heuristic_us = _dominant_kernel(
+        lambda: runner(inputs, tactic=heuristic_tactic))
+    _, cublas_us = _dominant_kernel(_cublas_call)
+
+    # Pruning must not degrade the achieved kernel runtime beyond this tolerance.
+    # With the default MAX_TACTICS=5 the heuristic set includes the empirical
+    # best tile (its cluster ranking can still be slightly off, ~2-3% on square
+    # 4096), so a tight bound catches gross regressions while allowing that.
+    tolerance = 1.05
+    assert heuristic_us <= sweep_us * tolerance, (
+        f"heuristic-pruned tactic {heuristic_tactic} ({heuristic_us:.2f} us) is "
+        f">{tolerance:.2f}x slower than full-sweep tactic {sweep_tactic} "
+        f"({sweep_us:.2f} us) for M={m}, N={n}, K={k}")
+
+    # The heuristic CuteDSL kernel should beat cuBLAS or be within tolerance.
+    cublas_tolerance = 1.05
+    assert heuristic_us <= cublas_us * cublas_tolerance, (
+        f"CuteDSL heuristic kernel ({heuristic_us:.2f} us) is "
+        f">{cublas_tolerance:.2f}x slower than cuBLAS NVFP4 "
+        f"({cublas_us:.2f} us) for M={m}, N={n}, K={k}")
