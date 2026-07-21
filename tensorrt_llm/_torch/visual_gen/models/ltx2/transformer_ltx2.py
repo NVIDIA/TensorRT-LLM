@@ -29,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from tensorrt_llm._torch.modules.linear import Linear, WeightMode
+from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
@@ -504,6 +504,9 @@ class LTX2Attention(Attention):
                 q_src = kv_src = q_input
             elif (
                 self._maybe_share_qkv_quantize
+                # Runtime guard: the two-stage LoRA cache swaps merged Linears to
+                # BF16 UnquantizedLinearMethod (F.linear rejects Fp4QuantizedTensor).
+                and not isinstance(self.to_q.quant_method, UnquantizedLinearMethod)
                 and getattr(self.to_q, "input_scale", None) is not None
             ):
                 x_2d = q_input.reshape(-1, q_input.shape[-1])
