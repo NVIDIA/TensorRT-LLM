@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import os
 import shutil
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,18 @@ _NO_SEMANTIC_FIELD_WARNINGS: Dict[str, str] = {
         "ignored; the engine has no equivalent semantic."
     ),
 }
+
+
+def _decode_image_references(input_reference: str | List[str]) -> bytes | List[bytes]:
+    """Decode one or more base64 reference images for ``VisualGenParams.image``."""
+    encoded_images = input_reference if isinstance(input_reference, list) else [input_reference]
+    decoded_images = []
+    for index, encoded_image in enumerate(encoded_images):
+        try:
+            decoded_images.append(base64.b64decode(encoded_image, validate=True))
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"input_reference[{index}] is not valid base64") from exc
+    return decoded_images if isinstance(input_reference, list) else decoded_images[0]
 
 
 def _warn_if_set_with_no_semantic(
@@ -127,6 +140,8 @@ def parse_visual_gen_params(
     if isinstance(request, ImageGenerationRequest):
         if request.n is not None:
             params.num_images_per_prompt = request.n
+        if request.input_reference is not None:
+            params.image = _decode_image_references(request.input_reference)
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:
