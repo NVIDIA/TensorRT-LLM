@@ -345,6 +345,44 @@ def emu_block_meta(
     return meta.contiguous()
 
 
+def derive_seed_rungs(
+    prev_thr: torch.Tensor,
+    prev_sthr: "torch.Tensor | None" = None,
+    prev_counts: "torch.Tensor | None" = None,
+    count_octaves: float = 2.0,
+    fallback_spread: float = 0.5,
+) -> torch.Tensor:
+    """Host-side slope-adaptive seed rung derivation (waterfall closed loop).
+
+    Estimates the per-row local slope of log2(count) vs threshold from the
+    PREVIOUS step's 3 rung measurements and places the next step's guard
+    rungs ``count_octaves`` octaves away from the mid rung (= the previous
+    accepted threshold). Real-chain validation (V4-Pro/Flash captures):
+    in-band admission 0.958/0.975 vs 0.82-0.97 for any fixed spread.
+
+    Args:
+        prev_thr: [rows] previous accepted threshold (xstate[:, 2]).
+        prev_sthr: [rows, 3] previous step's rung thresholds (or None).
+        prev_counts: [rows, 3] previous step's rung counts (or None).
+
+    Returns:
+        [rows, 3] fp32 seed thresholds (ascending).
+    """
+    if prev_sthr is None or prev_counts is None:
+        d = torch.full_like(prev_thr, fallback_spread)
+    else:
+        c_lo = prev_counts[:, 0].float().clamp(min=1.0)
+        c_hi = prev_counts[:, 2].float().clamp(min=1.0)
+        dthr = (prev_sthr[:, 2] - prev_sthr[:, 0]).clamp(min=1e-3)
+        slope = (torch.log2(c_lo) - torch.log2(c_hi)) / dthr
+        d = torch.where(
+            slope > 0.05,
+            count_octaves / slope.clamp(min=0.05),
+            torch.full_like(slope, fallback_spread),
+        ).clamp(0.1, 4.0)
+    return torch.stack([prev_thr - d, prev_thr, prev_thr + d], dim=1).contiguous()
+
+
 def emu_seed_counts(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
