@@ -645,6 +645,13 @@ class KVCacheManager(BaseResourceManager):
                 f"enable_attention_dp={mapping.enable_attention_dp}, pp_size={mapping.pp_size}, "
                 f"cp_size={mapping.cp_size}. "
                 "Disable disk_cache_size or use plain tensor parallelism.")
+        if disk_cache_size and mapping.tp_size > 1 and os.environ.get(
+                "TLLM_KV_DISK_DROP_ON_PRESSURE", "0") not in ("", "0"):
+            raise ValueError(
+                "TLLM_KV_DISK_DROP_ON_PRESSURE is not supported with tensor parallelism: "
+                "the drop decision depends on each rank's write-queue depth at spill time, "
+                "so ranks diverge on which blocks remain reusable. Unset it or use TP=1."
+            )
         blocks_in_disk_pool = 0
         if disk_cache_size:
             max_tokens_disk = disk_cache_size // self.get_cache_bytes_per_token(
