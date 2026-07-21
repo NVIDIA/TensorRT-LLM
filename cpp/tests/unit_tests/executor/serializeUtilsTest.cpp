@@ -18,6 +18,7 @@
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -751,7 +752,8 @@ TEST(SerializeUtilsTest, ContextPhaseParams)
     {
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-        state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, nvinfer1::DataType::kFLOAT});
+        state->setCacheState(
+            texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {4}, tensorrt_llm::DataType::kFLOAT});
         auto stats = texec::ContextPhaseParams({10, 20, 30, 40, 50, 60}, 0, state.release(), VecTokens{10, 20});
         auto stats2 = serializeDeserialize(stats);
         EXPECT_EQ(stats, stats2);
@@ -1553,7 +1555,7 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     texec::SizeType32 pp = 1;
     texec::SizeType32 cp = 1;
     std::vector<texec::SizeType32> attentionLayerNumPerPP{static_cast<texec::SizeType32>(nbKvHeadsPerLayer.size())};
-    auto dataType = nvinfer1::DataType::kFLOAT;
+    auto dataType = tensorrt_llm::DataType::kFLOAT;
     auto attentionType = CacheState::AttentionType::kDEFAULT;
     int kvFactor = 2;
     bool enableAttentionDP = false;

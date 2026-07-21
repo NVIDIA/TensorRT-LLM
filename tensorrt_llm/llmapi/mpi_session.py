@@ -8,6 +8,7 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
@@ -125,10 +126,12 @@ class MpiSession(abc.ABC):
         try:
             fut.result(timeout=timeout)
         except TimeoutError:
-            logger.critical("MpiSession shutdown timeout, aborting...")
+            logger.critical(f"MpiSession shutdown timeout after {timeout}s; "
+                            "calling MPI_Abort to force-kill stuck ranks...")
             if reason is not None:
-                logger.info(f"Reason to shutdown: {repr(reason)}")
+                logger.info(f"Reason to shutdown: {reason!r}")
             self.abort()
+            logger.critical("MpiSession MPI_Abort returned")
 
     def shutdown_abort(self, grace: float = 60, reason=None):
         if sys.is_finalizing():
@@ -136,6 +139,9 @@ class MpiSession(abc.ABC):
             # simply don't wait to avoid hang
             return self.shutdown(wait=False)
 
+        logger.info(
+            f"MpiSession.shutdown_abort: waiting up to {grace}s for workers to exit"
+        )
         fut = Future()
         killer = threading.Thread(group=None,
                                   target=self._abort_on_timeout,
@@ -143,16 +149,122 @@ class MpiSession(abc.ABC):
                                   args=(fut, grace, reason))
         killer.start()
         self.shutdown()
+        logger.info("MpiSession.shutdown_abort: workers exited cleanly")
         fut.set_result(None)
         killer.join()
+
+    def release_exit_joins(self):
+        """Mark the worker world dead and release anything that would join it.
+
+        Non-destructive, so it may be called by a component that does not
+        own the session. Must not tear the session down -- only ensure that
+        nothing (interpreter exit, a later blocking ``shutdown()`` by the
+        owner) waits forever on the dead world. Default: no-op.
+        """
+
+    def abandon(self):
+        """Tear the session down without waiting on a dead worker world."""
+        self.release_exit_joins()
+        self.shutdown(wait=False)
+
+
+def _abandon_mpi_pool_threads(mpi_pool) -> None:
+    """Let interpreter exit proceed despite a wedged pool manager thread.
+
+    When the worker world dies abruptly, the ``MPIPoolExecutor`` manager
+    thread stays blocked in an MPI call forever, and process exit hangs on
+    it twice: mpi4py's exit hook joins every registered manager thread, and
+    CPython joins every non-daemon thread. Deregister the thread from both;
+    it is reaped with the process.
+
+    Best-effort: the touched names are private to mpi4py (``THREADS_QUEUES``
+    in ``_lib``/3.x and ``_core``/4.x) and CPython
+    (``threading._shutdown_locks``, 3.9-3.12). Where a name is absent, that
+    mechanism is left alone and exit may still block on it.
+    """
+    thread = getattr(getattr(mpi_pool, '_pool', None), 'thread', None)
+    if thread is None:
+        return
+    # mpi4py's own exit hook (joins all registered manager threads).
+    for mod_name in ('mpi4py.futures._lib', 'mpi4py.futures._core'):
+        mod = sys.modules.get(mod_name)
+        registry = getattr(mod, 'THREADS_QUEUES', None) if mod else None
+        if registry is not None:
+            try:
+                registry.pop(thread, None)
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(f"THREADS_QUEUES cleanup failed (ignored): {e!r}")
+    # CPython's non-daemon thread join at interpreter shutdown.
+    tstate_lock = getattr(thread, '_tstate_lock', None)
+    shutdown_locks = getattr(threading, '_shutdown_locks', None)
+    if tstate_lock is not None and shutdown_locks is not None:
+        try:
+            shutdown_locks.discard(tstate_lock)
+        except Exception as e:  # noqa: BLE001 - best-effort cleanup
+            logger.debug(f"_shutdown_locks cleanup failed (ignored): {e!r}")
+
+
+def _process_start_time(pid: int) -> Optional[bytes]:
+    """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
+
+    PIDs are recycled by the OS, but the (pid, start_time) pair uniquely
+    identifies a process incarnation — comparing it prevents waiting on an
+    unrelated process that inherited a dead worker's PID.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+        # Field 2 (comm) may contain spaces/parens; parse after the last ')'.
+        return stat.rsplit(b")", 1)[1].split()[19]  # field 22 overall
+    except OSError:
+        return None
+
+
+def _worker_identity_barrier():
+    """Runs inside a pool worker; module-level so it is picklable.
+
+    The leading barrier pins the ``n_workers`` submitted tasks one-per-worker
+    (a worker holding one task blocks until every other worker holds its own,
+    so no worker can drain a second one), collecting every worker's identity
+    exactly once. The workers' ``MPI_COMM_WORLD`` is the spawned worker world
+    (the parent process is not a member).
+    """
+    from mpi4py import MPI
+    MPI.COMM_WORLD.barrier()
+    pid = os.getpid()
+    return (pid, _process_start_time(pid))
 
 
 class MpiPoolSession(MpiSession):
 
-    def __init__(self, n_workers: int):
+    def __init__(self,
+                 n_workers: int,
+                 wait_shutdown: bool = False,
+                 env_overrides: Optional[Dict[str, str]] = None):
+        """Args:
+        n_workers: number of MPI workers to spawn.
+        wait_shutdown: when True, ``shutdown()`` blocks until the spawned
+            worker processes have actually exited. ``MPIPoolExecutor.shutdown``
+            returns at disconnect, but a worker's GPU memory is only released
+            when its process exits; callers that start new GPU work right
+            after ``shutdown()`` (e.g. CI test infrastructure handing a
+            pre-spawned pool to the next test) race that release and can OOM.
+            Off by default: production teardown does not need the barrier and
+            keeps its current latency.
+        env_overrides: extra environment variables to set in the WORKERS at
+            spawn, on top of the TRTLLM*/TLLM* variables forwarded from the
+            parent. The parent process environment is never touched — this
+            replaces the racy "set os.environ around the spawn, then restore"
+            pattern for callers that spawn pools from background threads.
+        """
         self.n_workers = n_workers
+        self._wait_shutdown = wait_shutdown
+        self._env_overrides = dict(env_overrides) if env_overrides else {}
+        self._worker_identities: Tuple = ()
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
+        if wait_shutdown:
+            self._worker_identities = self._collect_worker_identities()
         if ENABLE_MULTI_DEVICE:
             self.comm = mpi4py.MPI.COMM_WORLD
 
@@ -174,9 +286,103 @@ class MpiPoolSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
+        if getattr(self, '_pool_dead', False):
+            # A dead pool can never be joined; never block on it, no matter
+            # what the caller asked for.
+            wait = False
         if self.mpi_pool is not None:
+            logger.info(
+                f"MpiPoolSession.shutdown: joining {self.n_workers} worker(s) "
+                f"(wait={wait})")
             self.mpi_pool.shutdown(wait=wait)
+            logger.info("MpiPoolSession.shutdown: done")
             self.mpi_pool = None
+            if self._wait_shutdown:
+                self._wait_workers_exit()
+
+    def _collect_worker_identities(self) -> Tuple:
+        """(pid, start_time) of every worker, recorded right after spawn.
+
+        FAIL-CLOSED (review requirement): ``wait_shutdown=True`` is a
+        contract — shutdown blocks until the workers exited. A pool without
+        complete identities cannot honor it, and returning it anyway would
+        silently downgrade to the old non-waiting behavior (the timeout can
+        trip on a slow-but-healthy bootstrap, and ``futures_wait`` does not
+        cancel the pending tasks). Instead of handing out such a pool, tear
+        it down and raise; callers fall back to a fresh spawn.
+        """
+        try:
+            futures = [
+                self.mpi_pool.submit(_worker_identity_barrier)
+                for _ in range(self.n_workers)
+            ]
+            done, not_done = futures_wait(futures, timeout=60.0)
+            identities = tuple(f.result() for f in done)
+        except Exception as e:
+            self._teardown_unidentified_pool(())
+            raise RuntimeError(
+                f"MpiPoolSession(wait_shutdown=True): worker identity "
+                f"collection failed ({e}); pool torn down") from e
+        if (not_done or len(identities) != self.n_workers
+                or len({pid
+                        for pid, _ in identities}) != self.n_workers
+                or any(start is None for _, start in identities)):
+            self._teardown_unidentified_pool(identities)
+            raise RuntimeError(
+                "MpiPoolSession(wait_shutdown=True): worker identity "
+                f"collection incomplete ({len(identities)}/{self.n_workers} "
+                "valid identities); pool torn down instead of handing out a "
+                "session that cannot honor the wait_shutdown contract")
+        return identities
+
+    def _teardown_unidentified_pool(self, partial_identities: Tuple) -> None:
+        """Dispose of a pool whose identity collection failed.
+
+        The workers may be stuck in the collection barrier (one of them
+        never picked up its task), so a graceful blocking shutdown could
+        hang; disconnect without waiting and SIGKILL the workers we did
+        identify (with the pid-recycling guard). Workers we never identified
+        exit with the MPI runtime teardown; if one is truly wedged it leaks
+        until job end — the same bounded leak class as any wedged pool.
+        """
+        import signal
+
+        try:
+            self.mpi_pool.shutdown(wait=False)
+        except Exception:
+            pass
+        self.mpi_pool = None
+        for pid, start in partial_identities:
+            if start is None or _process_start_time(pid) != start:
+                continue  # gone already, or the PID was recycled
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def _wait_workers_exit(self, timeout: float = 30.0) -> None:
+        """Block until the spawned worker processes have actually exited.
+
+        Bounded: a wedged worker stops blocking the caller after ``timeout``
+        (its memory is not coming back anyway; the caller's own recovery —
+        e.g. an OOM retry or a fresh spawn — takes over from there).
+        """
+        deadline = time.monotonic() + timeout
+        for pid, start in self._worker_identities:
+            if start is None:
+                continue
+            while _process_start_time(pid) == start:
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        f"MpiPoolSession.shutdown: worker pid {pid} still "
+                        f"alive after {timeout}s; not waiting further")
+                    return
+                time.sleep(0.05)
+
+    def release_exit_joins(self):
+        if self.mpi_pool is not None:
+            _abandon_mpi_pool_threads(self.mpi_pool)
+        self._pool_dead = True
 
     def abort(self):
         self.get_comm().Abort(1)
@@ -189,6 +395,7 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
+        env.update(self._env_overrides)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)
@@ -258,7 +465,11 @@ class MpiCommSession(MpiSession):
         # Only shutdown the mpi_pool if this instance created it
         # For shared global mpi_pool, we don't shut it down
         if self.mpi_pool is not None and self.owns_mpi_pool:
+            logger.info(
+                f"MpiCommSession.shutdown: joining {self.n_workers - 1} worker(s) "
+                f"(wait={wait})")
             self.mpi_pool.shutdown(wait=wait)
+            logger.info("MpiCommSession.shutdown: mpi_pool done")
         self.mpi_pool = None
         if self.thread_pool is not None:
             self.thread_pool.shutdown(wait=wait)
