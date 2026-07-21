@@ -873,8 +873,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         buffer (not a fresh tensor) so the CUDA-Graph-captured op reads a valid
         permutation on every replay.
         """
+        # Gate on row count (num_generations * next_n) rather than request count
+        # so the threshold aligns with the kernel-side tuning note that records
+        # the win region starting at num_rows >= 2 * num_sms.  Using
+        # num_generations alone is only correct for next_n == 2; for next_n == 1
+        # it engages inside the measured regression band, and for next_n == 4 it
+        # misses the win region between 2*num_sms and 4*num_sms rows.
+        next_n = 1 + self.max_draft_tokens
         if (self.enable_heuristic_topk and self.use_cute_dsl_topk
-                and self.num_generations >= self.num_sms):
+                and self.num_generations * next_n >= 2 * self.num_sms):
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
             order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
             self.kv_lens_row_reorder_buffer[:self.num_generations].copy_(order)
