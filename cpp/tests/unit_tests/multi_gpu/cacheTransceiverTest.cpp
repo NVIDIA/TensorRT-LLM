@@ -35,6 +35,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
@@ -105,7 +106,7 @@ TEST_F(RequestInfoTest, Basic)
     }
     auto state = std::make_unique<texec::DataTransceiverState>();
     state->setCommState(texec::kv_cache::CommState{12, "127.0.0.1"});
-    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, nvinfer1::DataType::kFLOAT});
+    state->setCacheState(texec::kv_cache::CacheState{10, 12, 128, 128, 8, 8, 8, {10}, tensorrt_llm::DataType::kFLOAT});
     RequestInfo info{1, *state};
     auto info2 = serializeDeserialize(info);
     EXPECT_EQ(info, info2);
@@ -135,7 +136,7 @@ TEST_F(CacheConfigTest, EqualTo)
     constexpr SizeType32 nbRnnLayers{2};
     constexpr SizeType32 nbHeads{12};
     constexpr SizeType32 hiddenSize{768};
-    constexpr nvinfer1::DataType dtype{nvinfer1::DataType::kFLOAT};
+    constexpr tensorrt_llm::DataType dtype{tensorrt_llm::DataType::kFLOAT};
     constexpr SizeType32 tokensPerBlock{64};
     constexpr SizeType32 tensorParallelism{8};
     constexpr SizeType32 pipelineParallelism{2};
@@ -215,7 +216,7 @@ protected:
         auto totalNumBlocks = mMaxNumSequences * numBlocksPerSeq;
         auto constexpr blocksInSecondaryPool = 0;
 
-        auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+        auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
@@ -512,8 +513,8 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
 
 #if ENABLE_MULTI_DEVICE
 
-using AsymmetricTestParam = std::tuple<int, int, int, int, int, int, int, int, int, int, nvinfer1::DataType, int, bool,
-    bool, bool, bool, bool, int, int>;
+using AsymmetricTestParam = std::tuple<int, int, int, int, int, int, int, int, int, int, tensorrt_llm::DataType, int,
+    bool, bool, bool, bool, bool, int, int>;
 
 // CPMetaData struct to hold CP-specific information
 struct CPMetaData
@@ -663,7 +664,7 @@ protected:
     }
 
     void setUpCacheManager(int numLayers, int numHeads, int sizePerHead, int tokensPerBlock,
-        nvinfer1::DataType dataType, int kvFactor = 2, bool isMLA = false, bool enableDPAttention = false,
+        tensorrt_llm::DataType dataType, int kvFactor = 2, bool isMLA = false, bool enableDPAttention = false,
         bool isWindow = false, bool isIndexerKCache = true, int indexerDimPerHead = 0,
         int indexerKCacheQuantBlockSize = 128)
     {
@@ -963,16 +964,18 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
-        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
-        auto state = std::make_unique<texec::DataTransceiverState>();
 
+        auto state = std::make_unique<texec::DataTransceiverState>();
         TLLM_CHECK(mContextCommState);
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
         state->setCacheState(*mContextCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
+        tr::SamplingConfig samplingConfig{1};
+        auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
+        auto llmRequestPtr = std::make_shared<LlmRequest>(
+            mRequestId++, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+        llmRequestPtr->setContextPhaseParams(std::move(stats));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -988,7 +991,6 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
-        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
@@ -1003,8 +1005,12 @@ protected:
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
+
+        tr::SamplingConfig samplingConfig{1};
+        auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
+        auto llmRequestPtr
+            = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+        llmRequestPtr->setContextPhaseParams(std::move(stats));
 
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
@@ -1327,7 +1333,7 @@ protected:
     }
 
     std::variant<double, float, int16_t, int8_t, uint8_t> generateExpectedValue(size_t initial, int windowSize,
-        int tokenId, int layerId, int headId, int hiddenId, bool key, nvinfer1::DataType dataType)
+        int tokenId, int layerId, int headId, int hiddenId, bool key, tensorrt_llm::DataType dataType)
     {
         size_t seed = 0;
         std::size_t hashValue = std::hash<size_t>{}(initial);
@@ -1403,7 +1409,7 @@ TEST_P(AsymmetricalCacheTest, TestCase)
     int numHeads = std::get<7>(param);
     int sizePerHead = std::get<8>(param);
     int tokensPerBlock = std::get<9>(param);
-    nvinfer1::DataType dataType = std::get<10>(param);
+    tensorrt_llm::DataType dataType = std::get<10>(param);
 
     int kvFactor = std::get<11>(param);
     bool isMLA = std::get<12>(param);
@@ -1518,7 +1524,7 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     int numHeads = std::get<7>(param);
     int sizePerHead = std::get<8>(param);
     int tokensPerBlock = std::get<9>(param);
-    nvinfer1::DataType dataType = std::get<10>(param);
+    tensorrt_llm::DataType dataType = std::get<10>(param);
 
     int kvFactor = std::get<11>(param);
     bool isMLA = std::get<12>(param);
@@ -1655,7 +1661,7 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
     int numHeads = std::get<7>(param);
     int sizePerHead = std::get<8>(param);
     int tokensPerBlock = std::get<9>(param);
-    nvinfer1::DataType dataType = std::get<10>(param);
+    tensorrt_llm::DataType dataType = std::get<10>(param);
 
     int kvFactor = std::get<11>(param);
     bool isMLA = std::get<12>(param);
@@ -1802,87 +1808,87 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
 INSTANTIATE_TEST_CASE_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest,
     testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4), testing::Values(16),
-        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(0),
-        testing::Values(128)));
+        testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(2), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(0), testing::Values(128)));
 
 // Waive off isWindow test for now
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(/*true,*/ false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(/*true,*/ false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithWindow, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(1),
         testing::Values(1), testing::Values(5), testing::Values(4), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(true),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(8), testing::Values(4), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false /*, true*/),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1EvenLayer, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(10), testing::Values(4), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(0),
-        testing::Values(128)));
+        testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(2), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2EvenLayer, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(10), testing::Values(4), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(0),
-        testing::Values(128)));
+        testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(2), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1), testing::Values(2), testing::Values(1), testing::Values(1),
         testing::Values(1, 4), testing::Values(1), testing::Values(16), testing::Values(16), testing::Values(4),
-        testing::Values(8), testing::Values(nvinfer1::DataType::kFLOAT), testing::Values(2), testing::Values(false),
+        testing::Values(8), testing::Values(tensorrt_llm::DataType::kFLOAT), testing::Values(2), testing::Values(false),
         testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
         testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLA, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(1), testing::Values(true), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLA, AsymmetricalCacheTest,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1ForMLAEvenLayer, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2ForMLAEvenLayer, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(10), testing::Values(1), testing::Values(4), testing::Values(8),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(false, true), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0ForMLAWithIndexerKCache, AsymmetricalCacheTest,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values(true), testing::Values(256), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(1), testing::Values(true), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(true), testing::Values(256), testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side but only CP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
@@ -1896,7 +1902,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
@@ -1918,7 +1924,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
@@ -1940,7 +1946,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForGQA, AsymmetricalCacheTest,
         /*numHeads*/ testing::Values(4),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(2),
         /*isMLA*/ testing::Values(false),
         /*contextDP*/ testing::Values(false),
@@ -1959,7 +1965,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForGQA, AsymmetricalCacheTest,
         /*numHeads*/ testing::Values(4),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(2),
         /*isMLA*/ testing::Values(false),
         /*contextDP*/ testing::Values(false),
@@ -1978,7 +1984,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLAUnevenLayer, Asymmetrical
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
@@ -2000,7 +2006,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, Asymmetrical
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
@@ -2022,7 +2028,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, Asymmetrical
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
@@ -2044,7 +2050,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheT
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
@@ -2066,7 +2072,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheT
         /*numHeads*/ testing::Values(1),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(1),
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(true),
@@ -2088,7 +2094,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA0, AsymmetricalCacheT
         /*numHeads*/ testing::Values(4),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(2),
         /*isMLA*/ testing::Values(false),
         /*contextDP*/ testing::Values(false),
@@ -2107,7 +2113,7 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA1, AsymmetricalCacheT
         /*numHeads*/ testing::Values(4),
         /*sizePerHead*/ testing::Values(4),
         /*tokensPerBlock*/ testing::Values(8),
-        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*dataType*/ testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
         /*kvFactor*/ testing::Values(2),
         /*isMLA*/ testing::Values(false),
         /*contextDP*/ testing::Values(true),
@@ -2117,97 +2123,97 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA1, AsymmetricalCacheT
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(true), testing::Values(true), testing::Values(false),
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(1), testing::Values(true), testing::Values(true), testing::Values(true), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA2, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(true), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(1), testing::Values(true), testing::Values(true), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA3, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
-        testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(1), testing::Values(true), testing::Values(false), testing::Values(true),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA4, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForMLA5, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(2), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(16),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(1),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(1),
         testing::Values(true), testing::Values(false), testing::Values(true), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true), testing::Values(true), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(true), testing::Values(true),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(true), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLA2, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(1, 2),
         testing::Values(1, 2), testing::Values(1), testing::Values(4), testing::Values(4), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(false), testing::Values(true),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(4),
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(true, false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate0EvenLayer, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(5), testing::Values(2), testing::Values(4), testing::Values(16),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate1, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(1, 2), testing::Values(1, 2), testing::Values(1), testing::Values(2),
         testing::Values(2), testing::Values(1), testing::Values(4), testing::Values(1), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(true, false), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(true, false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate2, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(4, 2),
         testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate3, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(2), testing::Values(1), testing::Values(1), testing::Values(4), testing::Values(1),
         testing::Values(1), testing::Values(4), testing::Values(2), testing::Values(4), testing::Values(16),
-        testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
+        testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8), testing::Values(2),
         testing::Values(false), testing::Values(false), testing::Values(true), testing::Values(false),
         testing::Values(false), testing::Values(0), testing::Values(128)));
 
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithDPForNoMLADuplicate4, AsymmetricalCacheTestWithDP,
     testing::Combine(testing::Values(4), testing::Values(1), testing::Values(1), testing::Values(1, 2),
         testing::Values(2), testing::Values(1), testing::Values(4), testing::Values(1, 2), testing::Values(4),
-        testing::Values(16), testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8), testing::Values(2),
-        testing::Values(false), testing::Values(false), testing::Values(false), testing::Values(false),
-        testing::Values(false), testing::Values(0), testing::Values(128)));
+        testing::Values(16), testing::Values(tensorrt_llm::DataType::kFLOAT, tensorrt_llm::DataType::kINT8),
+        testing::Values(2), testing::Values(false), testing::Values(false), testing::Values(false),
+        testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
 #endif
 
@@ -2218,7 +2224,7 @@ TEST(targetTest, CacheStateNODP)
     int const numHeads = 2;
     int const sizePerHead = 64;
     int const tokensPerBlock = 64;
-    auto const dataType = nvinfer1::DataType::kFLOAT;
+    auto const dataType = tensorrt_llm::DataType::kFLOAT;
     bool const isMLA = true;
     int const kvFactor = 2;
 
@@ -2508,7 +2514,7 @@ TEST(targetTest, CacheStateNODPForGQAWithCP)
     int const numHeads = 4;
     int const sizePerHead = 64;
     int const tokensPerBlock = 64;
-    auto const dataType = nvinfer1::DataType::kFLOAT;
+    auto const dataType = tensorrt_llm::DataType::kFLOAT;
     bool const isMLA = false;
     int const kvFactor = 2;
 
@@ -2724,7 +2730,7 @@ TEST(targetTest, CacheStateContextDP)
     int const numHeads = 2;
     int const sizePerHead = 64;
     int const tokensPerBlock = 64;
-    auto const dataType = nvinfer1::DataType::kFLOAT;
+    auto const dataType = tensorrt_llm::DataType::kFLOAT;
     bool const isMLA = true;
     int const kvFactor = 2;
 

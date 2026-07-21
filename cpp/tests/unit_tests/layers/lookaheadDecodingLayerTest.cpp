@@ -23,6 +23,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/decodingParams.h"
 #include "tensorrt_llm/layers/lookaheadDecodingLayer.h"
@@ -320,7 +321,7 @@ void LookaheadDecodingLayerTest::allocateBuffers()
         mLlm[gbi] = std::make_shared<LookaheadRandomLlm>(mAscii, mOracle[gbi], gbi);
 
         mScoreBoard[gbi] = std::ostringstream();
-        mHistogram[gbi] = BufferManager::cpu(ITensor::makeShape({mTestParam.n + 1}), nvinfer1::DataType::kINT32);
+        mHistogram[gbi] = BufferManager::cpu(ITensor::makeShape({mTestParam.n + 1}), tensorrt_llm::DataType::kINT32);
     }
     switch (mTestParam.batchType)
     {
@@ -348,48 +349,50 @@ void LookaheadDecodingLayerTest::allocateBuffers()
 
     auto maxBatchShape1D = ITensor::makeShape({maxBatchSize});
 
-    mAlgoConfigBatch = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, 3}), nvinfer1::DataType::kINT32);
+    mAlgoConfigBatch = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, 3}), tensorrt_llm::DataType::kINT32);
 
-    mEndIds = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mTokensPerStep = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mEndIds = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    mTokensPerStep = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
 
-    mOutputIds = BufferManager::pinnedPool(
-        ITensor::makeShape({maxBatchSize, maxBeamSize, mMaxSeqLen + mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mSequenceLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mOutputIds
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxBeamSize, mMaxSeqLen + mMaxTokensPerStep}),
+            tensorrt_llm::DataType::kINT32);
+    mSequenceLengths = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
 
     mProbs = BufferManager::pinnedPool(
-        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, vocabSize}), nvinfer1::DataType::kFLOAT);
+        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, vocabSize}), tensorrt_llm::DataType::kFLOAT);
 
     mGoldenSampledTokens
-        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mInputTokensBatch
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mPositionIdsBatch
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
+        = BufferManager::cpu(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), tensorrt_llm::DataType::kINT32);
+    mInputTokensBatch = BufferManager::pinnedPool(
+        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), tensorrt_llm::DataType::kINT32);
+    mPositionIdsBatch = BufferManager::pinnedPool(
+        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), tensorrt_llm::DataType::kINT32);
 
     mNewTokens = BufferManager::pinnedPool(
-        ITensor::makeShape({mMaxTokensPerStep, maxBatchSize, 1}), nvinfer1::DataType::kINT32);
-    mNumNewTokens = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mPrevDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+        ITensor::makeShape({mMaxTokensPerStep, maxBatchSize, 1}), tensorrt_llm::DataType::kINT32);
+    mNumNewTokens = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    mDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    mPrevDraftLengths = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
     mDraftTokens
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), nvinfer1::DataType::kINT32);
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, maxDraftLen}), tensorrt_llm::DataType::kINT32);
     auto packedMaskShape = ITensor::makeShape(
         {maxBatchSize, mMaxTokensPerStep, static_cast<ITensor::DimType64>(common::divUp(mMaxTokensPerStep, 32))});
-    mPackedMasks = BufferManager::pinnedPool(packedMaskShape, nvinfer1::DataType::kINT32);
+    mPackedMasks = BufferManager::pinnedPool(packedMaskShape, tensorrt_llm::DataType::kINT32);
     mPackedMasksBool = BufferManager::pinnedPool(
-        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, mMaxTokensPerStep}), nvinfer1::DataType::kBOOL);
-    mNumNewTokensCumSum = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize + 1}), nvinfer1::DataType::kINT32);
+        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep, mMaxTokensPerStep}), tensorrt_llm::DataType::kBOOL);
+    mNumNewTokensCumSum
+        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize + 1}), tensorrt_llm::DataType::kINT32);
     mPathsOffsets = BufferManager::pinnedPool(
-        ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), nvinfer1::DataType::kINT32);
-    mGenerationLengths = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
-    mPositionOffsets
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mPositionIds
-        = BufferManager::pinnedPool(ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), nvinfer1::DataType::kINT32);
-    mAttentionPackedMask = BufferManager::pinnedPool(packedMaskShape, nvinfer1::DataType::kINT32);
+        ITensor::makeShape({maxBatchSize, maxAcceptedDraftLen}), tensorrt_llm::DataType::kINT32);
+    mGenerationLengths = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
+    mPositionOffsets = BufferManager::pinnedPool(
+        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), tensorrt_llm::DataType::kINT32);
+    mPositionIds = BufferManager::pinnedPool(
+        ITensor::makeShape({maxBatchSize, mMaxTokensPerStep}), tensorrt_llm::DataType::kINT32);
+    mAttentionPackedMask = BufferManager::pinnedPool(packedMaskShape, tensorrt_llm::DataType::kINT32);
 
-    mBatchSlotsMax = BufferManager::pinnedPool(maxBatchShape1D, nvinfer1::DataType::kINT32);
+    mBatchSlotsMax = BufferManager::pinnedPool(maxBatchShape1D, tensorrt_llm::DataType::kINT32);
 
     auto const batchSize = 0;
     auto batchShape1D = ITensor::makeShape({batchSize});

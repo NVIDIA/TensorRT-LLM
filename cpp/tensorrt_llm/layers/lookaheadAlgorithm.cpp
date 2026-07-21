@@ -17,6 +17,7 @@
 #include "tensorrt_llm/layers/lookaheadAlgorithm.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/layers/lookaheadDecodingUtils.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -35,14 +36,14 @@ LookaheadAlgorithm::LookaheadAlgorithm(
     runtime::SizeType32 maxW, runtime::SizeType32 maxN, runtime::SizeType32 maxG, runtime::SizeType32 id)
     : mPoolManager(maxG)
     , mPrefillsMax(runtime::BufferManager::cpu(
-          runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), nvinfer1::DataType::kINT32))
+          runtime::ITensor::makeShape({(maxN <= 1 ? 0 : maxN - 2)}), tensorrt_llm::DataType::kINT32))
     , mPastTokensMax(
-          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), nvinfer1::DataType::kINT32))
-    , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), nvinfer1::DataType::kINT32))
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW * (maxN - 1)}), tensorrt_llm::DataType::kINT32))
+    , mKeyTokensMax(runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxW}), tensorrt_llm::DataType::kINT32))
     , mGoldenTokensMax(
-          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), nvinfer1::DataType::kINT32))
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxN * 2 - 1}), tensorrt_llm::DataType::kINT32))
     , mGuessTokensMax(
-          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxG * (maxN - 1)}), nvinfer1::DataType::kINT32))
+          runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxG * (maxN - 1)}), tensorrt_llm::DataType::kINT32))
     , mMaxW(maxW)
     , mMaxN(maxN)
     , mMaxG(maxG)
@@ -52,12 +53,13 @@ LookaheadAlgorithm::LookaheadAlgorithm(
     std::tie(maxGeneratedLen, std::ignore, maxDraftLen, std::ignore)
         = executor::LookaheadDecodingConfig(maxW, maxN, maxG).calculateSpeculativeResource();
     mAttentionMask = runtime::BufferManager::cpu(
-        runtime::ITensor::makeShape({maxDraftLen, maxDraftLen}), nvinfer1::DataType::kBOOL);
+        runtime::ITensor::makeShape({maxDraftLen, maxDraftLen}), tensorrt_llm::DataType::kBOOL);
     mDraftTokensMax
-        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), nvinfer1::DataType::kINT32);
+        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), tensorrt_llm::DataType::kINT32);
     mSampledTokensMax
-        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxGeneratedLen}), nvinfer1::DataType::kINT32);
-    mEncodeMapMax = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), nvinfer1::DataType::kINT32);
+        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxGeneratedLen}), tensorrt_llm::DataType::kINT32);
+    mEncodeMapMax
+        = runtime::BufferManager::cpu(runtime::ITensor::makeShape({maxDraftLen}), tensorrt_llm::DataType::kINT32);
 }
 
 void LookaheadAlgorithm::setup(TensorConstPtr const& prompt, SizeType32 w, SizeType32 n, SizeType32 g, uint64_t seed)

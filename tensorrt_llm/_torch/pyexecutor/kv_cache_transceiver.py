@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from os import getenv
 from typing import Any, Dict, List, Optional
@@ -6,12 +9,14 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
+                                          CacheTransceiverConfig)
 from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager)
+                                  CppMambaHybridCacheManager,
+                                  MixedMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -25,12 +30,6 @@ _DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERL
 _DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
 _TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
-_CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
-    ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
-    ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
-    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
-    ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
-)
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
 
 
@@ -122,29 +121,41 @@ def create_kv_cache_transceiver(
         logger.info("cache_transceiver is disabled")
         return None
 
+    # "auto" is normally resolved against the model's preference at config
+    # load time (ModelLoader.load_config_and_apply_defaults); paths that skip
+    # that step (e.g. AutoDeploy) fall back to the C++ transceiver here. This
+    # must run before any consumer of transceiver_runtime below (e.g. the
+    # inflight-cancel validation, which treats non-CPP runtimes as
+    # unsupported).
+    if cache_transceiver_config.transceiver_runtime == "auto":
+        cache_transceiver_config.transceiver_runtime = None
+
+    if (cache_transceiver_config.transceiver_runtime != "PYTHON"
+            and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
+        raise ValueError(
+            "MixedMambaHybridCacheManager requires the Python transceiver "
+            "runtime in disaggregated serving.")
+
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
-        cache_transceiver_config.backend = "NIXL"
-        # Ordered by priority
-        for env_var, be_type in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
-            if getenv(env_var) == "1":
-                logger.warning(
-                    f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
-                )
-                cache_transceiver_config.backend = be_type
-                break
+        backend, env_var = cache_transceiver_config._resolve_default_backend()
+        if env_var is not None:
+            logger.warning(
+                f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
+            )
+        cache_transceiver_config.backend = backend
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
     elif cache_transceiver_config.backend == "UCX":
         logger.info(
-            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
-            f"hangs or lower-than-expected performance.")
+            "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
+            "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            "hangs or lower-than-expected performance.")
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
