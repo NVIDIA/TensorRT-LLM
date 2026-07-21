@@ -39,6 +39,27 @@ ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
 
 
+def _save_spec_decode_capture_state(
+        attn_metadata: Any, enable_spec_decode: bool) -> Optional[torch.Tensor]:
+    if not enable_spec_decode or not hasattr(attn_metadata, 'kv_lens_cuda'):
+        return None
+    return attn_metadata.kv_lens_cuda[:attn_metadata.num_seqs].clone()
+
+
+def _restore_spec_decode_capture_state(
+        attn_metadata: Any, saved_kv_lens_cuda: Optional[torch.Tensor]) -> None:
+    if saved_kv_lens_cuda is None:
+        return
+    # Speculative decoding updates kv_lens_cuda in-place during every forward.
+    # CUDA graph warmup reuses one dummy request for multiple eager forwards, so
+    # letting those updates accumulate would make later warmups/capture advertise
+    # more KV tokens than the dummy request actually allocated. Restore the
+    # single-step input state outside the graph after each forward instead.
+    batch_size = saved_kv_lens_cuda.shape[0]
+    attn_metadata.kv_lens_cuda[:batch_size].copy_(saved_kv_lens_cuda)
+    attn_metadata.on_update_kv_lens()
+
+
 @dataclass
 class CUDAGraphRunnerConfig:
     """Configuration for the CUDAGraphRunner, passed from the ModelEngine."""
@@ -407,9 +428,12 @@ class CUDAGraphRunner:
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
+        attn_metadata = capture_inputs["attn_metadata"]
+        saved_kv_lens_cuda = _save_spec_decode_capture_state(
+            attn_metadata, enable_spec_decode)
 
         self.graph_metadata[key] = {
-            "attn_metadata": initial_inputs["attn_metadata"],
+            "attn_metadata": attn_metadata,
             "spec_metadata": initial_inputs.get("spec_metadata", None),
         }
 
@@ -433,12 +457,16 @@ class CUDAGraphRunner:
                                                  capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
+                _restore_spec_decode_capture_state(attn_metadata,
+                                                   saved_kv_lens_cuda)
 
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
             if postprocess_fn is not None:
                 postprocess_fn(capture_inputs)
+            _restore_spec_decode_capture_state(attn_metadata,
+                                               saved_kv_lens_cuda)
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)

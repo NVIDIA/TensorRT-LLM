@@ -1272,6 +1272,8 @@ class ModelLoader:
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
+            kv_cache_compression_config=(
+                self.llm_args.kv_cache_compression_config),
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,

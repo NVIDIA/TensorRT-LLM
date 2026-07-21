@@ -26,3 +26,12 @@ l0_gb300_multi_gpus_perf_sanity:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con1_ctx1_dep2_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con512_ctx1_dep2_gen1_dep32_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL] TIMEOUT (90)
+  # deepseek-v4-pro-fp4 8k1k
+  # ctx_only variants are commented out; enable in a follow-up PR after
+  # investigating the CI-side cross-test cleanup that caused an OOM cascade
+  # on stage-2 (the con4301 ctx_only test passed cleanly in isolation on
+  # OCI-AGA, so the shared-stage leak is orthogonal to these configs).
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (90)
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (90)
+  # - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (90)
