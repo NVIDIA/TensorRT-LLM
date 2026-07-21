@@ -1327,6 +1327,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
         # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self._use_gdn_cached_replay_all_layer_commit = (
+            use_replay_state_update and model_type == "qwen3_next"
+            and self.local_num_mamba_layers > 0)
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update else None)
@@ -1535,6 +1538,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self._setup_states()
         self._setup_replay_buffers(spec_config)
+        if use_replay_state_update and model_type == "qwen3_next":
+            logger.info_once(
+                "Configured GDN cached replay commit mode: small-batch fused, "
+                "large-batch all-layer",
+                key="gdn_cached_replay_commit_mode_fused",
+            )
 
     @staticmethod
     def get_cache_size_per_token(
@@ -1607,6 +1616,46 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if mamba_slope > 0:
             intercept = 0
         return attention_slope + mamba_slope, intercept
+
+    @property
+    def use_gdn_cached_replay_all_layer_commit(self) -> bool:
+        return self._use_gdn_cached_replay_all_layer_commit
+
+    def _commit_gdn_cached_replay_history_layers(
+        self,
+        attn_metadata: "AttentionMetadata",
+        num_decodes: int,
+    ) -> None:
+        """Synchronously advance every local GDN checkpoint in one launch."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+            commit_gdn_cached_replay_history_layers)
+
+        if (not self._use_gdn_cached_replay_all_layer_commit
+                or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
+            return
+        if (self.all_ssm_states is None or self.old_x is None
+                or self.old_B is None or self.old_dt is None
+                or self.replay_history_size is None):
+            raise RuntimeError(
+                "GDN cached replay all-layer commit requires replay state buffers."
+            )
+
+        mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.replay_num_decodes != num_decodes:
+            raise RuntimeError(
+                "GDN replay metadata contains "
+                f"{mamba_metadata.replay_num_decodes} decode requests, "
+                f"but state update received {num_decodes}.")
+        commit_gdn_cached_replay_history_layers(
+            ssm_states=self.all_ssm_states,
+            old_u=self.old_x,
+            old_k=self.old_B,
+            old_G=self.old_dt,
+            replay_work_items=mamba_metadata.replay_work_items[:num_decodes],
+            n_writes=mamba_metadata.replay_n_writes,
+            history_size=self.replay_history_size,
+        )
 
     def shutdown(self):
         # Release tensor views into the pool before the pool memory is freed,
@@ -1784,6 +1833,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # writes through the view's real strides (~85% of HBM peak, one launch
         # per state).
         if self._use_replay_state_update:
+            # Every GDN layer has finished reading the old checkpoint and
+            # writing its candidate history. Advance all local checkpoints
+            # in one launch before PNAT and the active history buffer change.
+            self._commit_gdn_cached_replay_history_layers(
+                attn_metadata, num_gens)
             # SSM state is handled incrementally by the kernel. Mirror the
             # kernel's checkpoint predicate from the previous PNAT and fixed
             # replay step width: checkpoint steps flip buffers, while no-write
@@ -1984,15 +2038,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
+        is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(
-            [req.is_dummy for req in self.requests])
+            is_dummy if requests is
+            self.requests else [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        for i, req in enumerate(requests):
-            self._request_id_to_state_index[
-                req.py_request_id] = self._host_state_indices[i].item()
-            self._request_id_to_is_dummy[req.py_request_id] = req.is_dummy
+        # Bulk tolist avoids a per-request tensor-index + .item() round-trip.
+        state_values = self._host_state_indices[:n].tolist()
+        for req, value, dummy in zip(requests, state_values, is_dummy):
+            self._request_id_to_state_index[req.py_request_id] = value
+            self._request_id_to_is_dummy[req.py_request_id] = dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
