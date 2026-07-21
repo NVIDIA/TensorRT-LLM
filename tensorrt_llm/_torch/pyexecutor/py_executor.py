@@ -2557,6 +2557,17 @@ class PyExecutor:
                 if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
+                    # Replay the cache-hit attach (mirrors `_schedule()` on
+                    # the scheduling rank): every rank encodes the same
+                    # broadcast items into its own cache, so the replay makes
+                    # identical hit decisions. Without it, leader-side hits
+                    # stay pending here and the model forward falls back to
+                    # the unbudgeted legacy inline encode.
+                    # TODO: interim — proper VLM PP support should scope MM
+                    # work to the embedding-consuming stages (fuse +
+                    # deepstack-injection) so other ranks skip it entirely.
+                    if self._supports_mm_encoder_item_scheduling:
+                        self._attach_mm_encoder_cache_hits()
                     # Run scheduler locally because scheduler may change llm requests' state.
                     if hasattr(self.kv_cache_manager,
                                "prepare_expect_snapshot_points"):
