@@ -85,7 +85,8 @@ def test_dflash_qwen3_8b(disable_overlap_scheduler: bool):
         dflash_model_dir=f"{models_path}/Qwen3-8B-DFlash-b16",
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
-    _run_and_check(llm_config, min_avg_accepted=1.0)
+    # Expected acceptance is 1.77, use 1.5 to leave 15% margin
+    _run_and_check(llm_config, min_avg_accepted=1.5)
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
@@ -101,7 +102,8 @@ def test_dflash_qwen3_5_4b(disable_overlap_scheduler: bool):
         dflash_model_dir=f"{models_path}/Qwen3.5-4B-DFlash",
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
-    _run_and_check(llm_config, min_avg_accepted=1.0)
+    # Expected acceptance is 1.77, use 1.5 to leave 15% margin
+    _run_and_check(llm_config, min_avg_accepted=1.5)
 
 
 @pytest.mark.high_cuda_memory
