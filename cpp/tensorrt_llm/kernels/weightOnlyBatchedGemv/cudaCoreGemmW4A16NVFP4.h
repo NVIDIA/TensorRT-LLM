@@ -19,8 +19,6 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/runtime/common.h"
 
-#include <NvInferRuntime.h>
-
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
