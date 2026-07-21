@@ -15,7 +15,11 @@ from tensorrt_llm._torch.speculative.model_drafter import ModelDrafter
 class _DummyGemma4Assistant(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.config = SimpleNamespace(model_type="gemma4_assistant")
+        self.config = SimpleNamespace(
+            model_type="gemma4_assistant",
+            shares_target_kv_cache=True,
+            freezes_draft_attention_state=True,
+        )
         self.model_config = None
         self.model = SimpleNamespace()
         self.calls = []
@@ -82,12 +86,12 @@ def test_gemma4_drafter_records_target_hidden_state_offset():
     )
 
     assert (
-        drafter._create_gemma4_assistant_request(request, [1, 2], is_first_draft=True)
+        drafter._create_shared_target_kv_request(request, [1, 2], is_first_draft=True)
         is draft_request
     )
     assert drafter.spec_resource_manager.draft_hidden_state_offsets[17] == 9
 
-    drafter._create_gemma4_assistant_request(request, [1, 2], is_first_draft=False)
+    drafter._create_shared_target_kv_request(request, [1, 2], is_first_draft=False)
     assert drafter.spec_resource_manager.draft_hidden_state_offsets[17] == 3
 
 
@@ -95,7 +99,7 @@ def test_gemma4_cuda_graph_warmup_uses_one_token_generation_request():
     engine = object.__new__(PyTorchModelEngine)
     engine.is_draft_model = True
     engine.model_is_wrapped = True
-    engine.model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4_assistant"))
+    engine.model = SimpleNamespace(config=SimpleNamespace(freezes_draft_attention_state=True))
     spec_resource_manager = object.__new__(Eagle3ResourceManager)
     spec_resource_manager.is_first_draft = True
     resource_manager = SimpleNamespace(

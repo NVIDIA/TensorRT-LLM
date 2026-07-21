@@ -42,6 +42,7 @@ from ..attention_backend.interface import (
     PredefinedAttentionMask,
     RopeParams,
 )
+from ..distributed import AllReduce
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -1450,12 +1451,37 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
             bias=False,
             dtype=config.torch_dtype,
         )
+        self.vocab_all_reduce = AllReduce(
+            mapping=model_config.mapping,
+            dtype=config.torch_dtype,
+        )
         self.register_buffer(
             "token_ordering",
             torch.empty(self.vocab_size, dtype=torch.long, device="cuda"),
         )
 
-    def forward(self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _selected_logits_for_vocab_shard(
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        canonical_positions: torch.Tensor,
+        vocab_start_index: int,
+    ) -> torch.Tensor:
+        """Compute selected logits owned by one vocab-parallel shard."""
+        local_positions = canonical_positions - vocab_start_index
+        is_local = (local_positions >= 0) & (local_positions < lm_head_weight.shape[0])
+        safe_positions = local_positions.clamp(0, lm_head_weight.shape[0] - 1)
+        selected_embeddings = lm_head_weight[safe_positions.reshape(-1)].view(
+            hidden_states.shape[0],
+            canonical_positions.shape[1],
+            hidden_states.shape[1],
+        )
+        selected_logits = torch.bmm(
+            hidden_states.unsqueeze(1), selected_embeddings.transpose(1, 2)
+        ).squeeze(1)
+        return selected_logits.masked_fill(~is_local, 0)
+
+    def forward(self, hidden_states: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
         centroid_logits = self.centroids(hidden_states)
         _, top_k_indices = torch.topk(
             centroid_logits,
@@ -1464,22 +1490,28 @@ class Gemma4AssistantMaskedEmbedder(nn.Module):
         )
         canonical_positions = self.token_ordering.view(
             self.num_centroids, self.vocab_size_per_centroid
-        )[top_k_indices]
-        selected_embeddings = lm_head_weight[canonical_positions.reshape(-1)].view(
-            hidden_states.shape[0],
-            self.centroid_intermediate_top_k * self.vocab_size_per_centroid,
-            self.hidden_size,
+        )[top_k_indices].flatten(1)
+
+        vocab_start_index = 0
+        is_vocab_sharded = lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.tp_size > 1
+        if is_vocab_sharded:
+            vocab_start_index = lm_head.tp_rank * lm_head.out_features
+        selected_logits = self._selected_logits_for_vocab_shard(
+            hidden_states,
+            lm_head.weight,
+            canonical_positions,
+            vocab_start_index,
         )
-        selected_logits = torch.bmm(
-            hidden_states.unsqueeze(1), selected_embeddings.transpose(1, 2)
-        ).squeeze(1)
+        if is_vocab_sharded:
+            selected_logits = self.vocab_all_reduce(selected_logits)
+
         logits = torch.full(
             (hidden_states.shape[0], self.vocab_size),
             torch.finfo(hidden_states.dtype).min,
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        return logits.scatter_(1, canonical_positions.flatten(1), selected_logits)
+        return logits.scatter_(1, canonical_positions, selected_logits)
 
 
 @register_auto_model("Gemma4AssistantForCausalLM")
@@ -1611,7 +1643,7 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
         else:
             logits_hidden_states = self._last_token_states(assistant_hidden_states, attn_metadata)
         if self.masked_embedding is not None:
-            return self.masked_embedding(logits_hidden_states, self.lm_head.weight).float()
+            return self.masked_embedding(logits_hidden_states, self.lm_head).float()
         return self.lm_head(logits_hidden_states).float()
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
