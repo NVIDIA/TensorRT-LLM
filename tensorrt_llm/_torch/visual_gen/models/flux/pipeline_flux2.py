@@ -427,13 +427,6 @@ class Flux2Pipeline(BasePipeline):
             raise ValueError(f"num_images_per_prompt must be >= 1, got {num_images_per_prompt}")
         batch_size = len(prompt) * num_images_per_prompt
 
-        if image is not None and self.pipeline_config.cache_backend is not None:
-            raise ValueError(
-                "FLUX.2 reference-image conditioning does not yet support "
-                f"cache_backend={self.pipeline_config.cache_backend!r}. Disable cache "
-                "acceleration for reference-image requests."
-            )
-
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Encode prompt using Mistral3 multi-layer extraction

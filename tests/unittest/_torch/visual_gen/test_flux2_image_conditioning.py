@@ -4,6 +4,7 @@
 """Unit tests for FLUX.2 reference-image conditioning."""
 
 import io
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import PIL.Image
@@ -73,12 +74,84 @@ def test_target_dimensions_default_to_first_processed_reference() -> None:
 
 
 @pytest.mark.parametrize("cache_backend", ["teacache", "cache_dit"])
-def test_reference_images_reject_cache_acceleration(cache_backend: str) -> None:
+@pytest.mark.parametrize("reference_count", [1, 3])
+def test_reference_images_run_with_cache_acceleration(
+    cache_backend: str,
+    reference_count: int,
+) -> None:
     pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
     pipeline.pipeline_config = SimpleNamespace(cache_backend=cache_backend)
+    pipeline._encode_prompt = lambda _prompt, _max_length: (
+        torch.zeros(1, 2, 8),
+        torch.zeros(2, 4),
+    )
+    pipeline._preprocess_reference_images = lambda images: [
+        torch.zeros(1, 3, 16, 16) for _ in images
+    ]
+    pipeline._prepare_latents = lambda _batch_size, _height, _width, _generator: (
+        torch.zeros(1, 4, 8),
+        torch.zeros(4, 4),
+    )
+    pipeline._prepare_image_latents = lambda images, batch_size: (
+        torch.zeros(batch_size, 4 * len(images), 8),
+        torch.zeros(4 * len(images), 4),
+    )
 
-    with pytest.raises(ValueError, match="does not yet support"):
-        pipeline.forward(prompt="edit this image", seed=0, image=_png_bytes())
+    class Transformer:
+        guidance_embeds = False
+        sharder = SimpleNamespace(is_active=False)
+
+        def __init__(self) -> None:
+            self.sequence_lengths: list[int] = []
+
+        def parameters(self) -> Iterator[torch.Tensor]:
+            return iter([torch.empty(0)])
+
+        def __call__(self, hidden_states: torch.Tensor, **_kwargs) -> tuple[torch.Tensor]:
+            self.sequence_lengths.append(hidden_states.shape[1])
+            return (hidden_states + 1,)
+
+    class Scheduler:
+        config = SimpleNamespace(use_flow_sigmas=False)
+
+        def set_timesteps(self, *_args, **_kwargs) -> None:
+            self.timesteps = torch.tensor([1000.0])
+
+        def set_begin_index(self, _index: int) -> None:
+            return None
+
+    transformer = Transformer()
+    pipeline.transformer = transformer
+    pipeline.scheduler = Scheduler()
+
+    denoised_latents: list[torch.Tensor] = []
+
+    def denoise(**kwargs) -> torch.Tensor:
+        result = kwargs["forward_fn"](
+            kwargs["latents"],
+            {},
+            0,
+            kwargs["timesteps"][0],
+            kwargs["prompt_embeds"],
+            {},
+        )
+        denoised_latents.append(result)
+        return result
+
+    pipeline.denoise = denoise
+    pipeline.decode_latents = lambda _latents, _decode_fn: torch.zeros(1, 16, 16, 3)
+
+    references = [_png_bytes() for _ in range(reference_count)]
+    result = pipeline.forward(
+        prompt="edit this image",
+        seed=0,
+        image=references[0] if reference_count == 1 else references,
+        num_inference_steps=1,
+    )
+
+    assert transformer.sequence_lengths == [4 + 4 * reference_count]
+    assert denoised_latents[0].shape == (1, 4, 8)
+    assert result.image.shape == (1, 16, 16, 3)
 
 
 def test_prepare_image_ids_assigns_distinct_time_offsets() -> None:

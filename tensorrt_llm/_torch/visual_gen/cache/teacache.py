@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import inspect
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -154,11 +157,9 @@ class GenericExtractor:
                 if isinstance(output, tuple):
                     return output
                 return Transformer2DModelOutput(sample=output)
-            # For return_dict=False, unwrap single-element tuple to raw tensor
-            if isinstance(output, tuple) and len(output) == 1:
-                return output[0]
-            # Return raw tensor as-is (TeaCacheHook always passes tensors to postprocess)
-            return output
+            # Diffusers transformers return a one-element tuple when
+            # return_dict=False. Preserve that contract on cache hits and misses.
+            return (output,)
 
         return CacheContext(
             modulated_input=t_emb,
