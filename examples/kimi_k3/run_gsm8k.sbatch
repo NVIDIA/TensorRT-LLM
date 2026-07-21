@@ -4,9 +4,8 @@
 #
 # Kimi K3 ("golden prairie") GSM8K eval on 16 GPUs (4x GB300 trays).
 #
-# Preferred: submit via examples/kimi_k3/run_kimi.py, which resolves all
-# inputs from ~/.config/kimi-bringup.ini (see kimi-bringup.ini.example).
-# Direct sbatch use requires exporting the inputs yourself:
+# Submit from the repo root (paths default to tali's workspace; override
+# KIMI_K3_* / IMAGE via the environment for other checkouts):
 #
 #   KIMI_K3_OPT_WORK_DIR=/path/to/exisiting_optimization_work \
 #   KIMI_K3_MODEL_DIR=/path/to/goldenprairie-final-weights_vv1 \
@@ -28,19 +27,17 @@
 
 set -euo pipefail
 
-# Required inputs — no defaults; submit via examples/kimi_k3/run_kimi.py
-# (reads ~/.config/kimi-bringup.ini) or export these before sbatch.
-: "${KIMI_K3_OPT_WORK_DIR:?set via run_kimi.py or export (exisiting_optimization_work checkout)}"
-: "${KIMI_K3_MODEL_DIR:?set via run_kimi.py or export (goldenprairie-final-weights_vv1 checkpoint)}"
-: "${IMAGE:?set via run_kimi.py or export (path to the 26.05 sbsa .sqsh)}"
-KIMI_K3_CACHE_DIR=${KIMI_K3_CACHE_DIR:-$SLURM_SUBMIT_DIR/.kimi_k3_cache}
-export KIMI_K3_OPT_WORK_DIR KIMI_K3_MODEL_DIR KIMI_K3_CACHE_DIR
+# Paths — defaults point at tali's golden-prairie workspace; override via
+# the environment for other checkouts.
+KIMI_K3_OPT_WORK_DIR=${KIMI_K3_OPT_WORK_DIR:-/home/tali/tali/goldenprairie/exisiting_optimization_work}
+KIMI_K3_MODEL_DIR=${KIMI_K3_MODEL_DIR:-/home/tali/tali/goldenprairie/goldenprairie-final-weights_vv1}
+IMAGE=${IMAGE:-/home/tali/tali/trtllm-pytorch-26.05-py3-sbsa-ubuntu24.04-trt10.16.1.11-skip-tritondevel-202607151440-16194.sqsh}
+export KIMI_K3_OPT_WORK_DIR KIMI_K3_MODEL_DIR
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
 # Mount every input at its host path so the env vars are valid inside too.
-MOUNTS="$REPO:$REPO:rw,$KIMI_K3_OPT_WORK_DIR:$KIMI_K3_OPT_WORK_DIR:ro"
+MOUNTS="$REPO:$REPO:rw,$KIMI_K3_OPT_WORK_DIR:$KIMI_K3_OPT_WORK_DIR:rw"
 MOUNTS+=",$KIMI_K3_MODEL_DIR:$KIMI_K3_MODEL_DIR:ro"
-MOUNTS+=",$KIMI_K3_CACHE_DIR:$KIMI_K3_CACHE_DIR:rw"
 
 srun --mpi=pmix \
     --container-image="$IMAGE" \
@@ -50,14 +47,17 @@ srun --mpi=pmix \
         ulimit -n 65536
 
         # --- Kimi K3 runtime env (every rank, before any python import) ---
-        SNAP=\$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE
-        CACHE=\$KIMI_K3_CACHE_DIR
-        # Import paths: the repo itself (the editable install records the
-        # build-time mount point) and the private flashinfer snapshot with
-        # the SiTU MXFP4 MoE cubins (must shadow the stock flashinfer).
-        export PYTHONPATH=$REPO:\$SNAP:\${PYTHONPATH:-}
-        export FLASHINFER_PRIVATE_CUBIN_DIR=\$SNAP/local_cubins/20260617_v0613rc1_situ_v0611_barrierfix
-        # Persistent caches (first flashinfer JIT build ~10 min, then reused).
+        CACHE=\$KIMI_K3_OPT_WORK_DIR/.kimi_k3_cache
+        # Import path: the repo itself (the editable install records the
+        # build-time mount point). The fused MoE default is the in-tree
+        # TRTLLM-Gen SiTU op (KIMI_K3_FUSED_MOE=native) — no private
+        # flashinfer snapshot or FLASHINFER_PRIVATE_CUBIN_DIR needed. To run
+        # the legacy private-flashinfer path (KIMI_K3_FUSED_MOE=1), restore
+        #   SNAP=\$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE
+        #   export PYTHONPATH=$REPO:\$SNAP:...
+        #   export FLASHINFER_PRIVATE_CUBIN_DIR=\$SNAP/local_cubins/20260617_v0613rc1_situ_v0611_barrierfix
+        export PYTHONPATH=$REPO:\${PYTHONPATH:-}
+        # Persistent caches for stock flashinfer JIT artifacts (non-MoE ops).
         export FLASHINFER_WORKSPACE_BASE=\$CACHE/fi_workspace
         export FLASHINFER_CUBIN_DIR=\$CACHE/fi_cubins
         export HF_HOME=\${HF_HOME:-\$CACHE/hf_home}
@@ -66,13 +66,13 @@ srun --mpi=pmix \
         export TRITON_CACHE_DIR=/tmp/triton-cache-rank\${SLURM_PROCID:-0}
         mkdir -p \"\$FLASHINFER_WORKSPACE_BASE\" \"\$FLASHINFER_CUBIN_DIR\" \"\$HF_HOME\" \"\$TRITON_CACHE_DIR\"
         export KIMI_K3_CKPT=\$KIMI_K3_MODEL_DIR
-        export KIMI_K3_FUSED_MOE=\${KIMI_K3_FUSED_MOE:-1}
+        export KIMI_K3_FUSED_MOE=\${KIMI_K3_FUSED_MOE:-native}
         export PATH='$REPO/.venv-3.12/bin':\$PATH
 
         # trtllm-eval is a console script whose shebang records the
         # build-time venv path — run it through python explicitly so it
         # works regardless of where the repo is mounted.
-        exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python '$REPO/.venv-3.12/bin/trtllm-eval' \
+        exec trtllm-llmapi-launch python '$REPO/.venv-3.12/bin/trtllm-eval' \
             --model \"\$KIMI_K3_CKPT\" \
             --backend pytorch \
             --tp_size ${KIMI_K3_TP:-16} \

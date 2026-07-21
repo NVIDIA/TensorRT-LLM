@@ -22,12 +22,15 @@ Two mutually exclusive kernel paths coexist:
 * ``use_fused_cubin=False`` (default) — Python fallback with MXFP4
   bank + activation. Byte-exact HF parity under random weights when
   weights are canonicalized via :func:`copy_hf_moe_block_weights`.
-* ``use_fused_cubin=True`` — Private-SiTU
-  ``trtllm_mxint4_block_scale_moe(is_private=True,
-  activation_type=Situ)`` invocation on a locally-allocated MXINT4
-  bank. Increments ``_cubin_call_count`` on every dispatch so
-  module-path AC5 evidence can distinguish a real cubin invocation
-  from a silent no-op.
+* ``use_fused_cubin=True`` — native in-tree SiTU path through
+  ``torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner``
+  (``act_type=SiTu``) on checkpoint-derived MXFP4 weights. The same
+  MXFP4 bank is the quantization source of truth for both paths, so
+  fused-vs-fallback comparisons differ only by activation quantization
+  (MXFP8) and kernel arithmetic. Routing uses the K3 gate's real
+  top-k via the op's ``topk_weights``/``topk_ids`` bypass; weights must
+  be loaded through :func:`copy_hf_moe_block_weights` (or
+  :meth:`KimiK3SparseMoeBlock.build_fused_weights`) before forward.
 
 Two mutation flags cover the negative controls required by AC4:
 
@@ -46,7 +49,12 @@ import torch
 from torch import nn
 
 from ._mlp import KimiK3MLP, KimiK3RMSNorm, NonSituActivation, SituAndMul
-from ._moe_kernels import invoke_private_situ_moe
+from ._moe_kernels import (
+    assert_native_situ_supported,
+    invoke_native_situ_moe,
+    make_situ_alpha_beta,
+    pack_routed_expert_weights,
+)
 from ._mxfp4 import DEFAULT_GROUP_SIZE, dequantize_last_dim_mxfp4, quantize_last_dim_mxfp4
 from .kimi_k3_moe_gate import KimiK3MoEGate
 
@@ -237,15 +245,18 @@ class KimiK3SparseMoeBlock(nn.Module):
         Mutation control — replace SiTU with SiLU-based activation in
         both routed and shared experts.
     use_fused_cubin
-        When True, ``forward()`` dispatches routed compute through
-        ``flashinfer.fused_moe.trtllm_mxint4_block_scale_moe(is_private=True,
-        activation_type=ActivationType.Situ.value)`` on a locally-allocated
-        MXINT4 bank (random init; suitable for cubin-invocation evidence,
-        not HF parity). The MXFP4 ``expert_bank`` is not allocated in
-        this mode.
+        When True, ``forward()`` dispatches routed compute through the
+        in-tree ``torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner``
+        custom op with ``act_type=SiTu``. The MXFP4 ``expert_bank`` is
+        still allocated (it is the checkpoint-quantization source of
+        truth); the fused device buffers are derived from it by
+        :meth:`build_fused_weights`, which
+        :func:`copy_hf_moe_block_weights` calls automatically. Forward
+        raises if the fused weights have not been built — there is no
+        random-weight fallback.
     dtype
         Dtype used for latent projections, shared experts, RMSNorm
-        weight, and the MXINT4 fused-cubin bank scales. Default fp32.
+        weight. Default fp32.
         Set to bf16 to match HF's bf16 forward at real K3 dims.
     """
 
@@ -295,21 +306,36 @@ class KimiK3SparseMoeBlock(nn.Module):
 
         self.gate = KimiK3MoEGate(config)
 
-        # Routed expert storage — MXFP4 bank (Python fallback) OR MXINT4
-        # bank (fused SiTU cubin invocation for AC5 evidence). Only one
-        # is allocated per block.
+        # Routed expert storage — the MXFP4 bank is always the checkpoint
+        # quantization source of truth. The fused path derives its packed
+        # and shuffled device buffers from the same bank so both paths see
+        # identical canonical weights.
+        self.expert_bank = KimiK3RoutedExpertBank(
+            num_experts=config.num_experts,
+            hidden_size=self.moe_hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            activation=routed_activation,
+            device=device,
+        )
+        self._fused_bank_ready = False
+        self.gemm1_weights: Optional[torch.Tensor] = None
+        self.gemm1_weights_scale: Optional[torch.Tensor] = None
+        self.gemm2_weights: Optional[torch.Tensor] = None
+        self.gemm2_weights_scale: Optional[torch.Tensor] = None
+        self._gemm1_alpha: Optional[torch.Tensor] = None
+        self._gemm1_beta: Optional[torch.Tensor] = None
         if use_fused_cubin:
-            self.expert_bank = None
-            self._init_fused_cubin_bank(device=device)
-        else:
-            self.expert_bank = KimiK3RoutedExpertBank(
-                num_experts=config.num_experts,
+            # Fail before any weight processing when the platform cannot run
+            # the fused path at all.
+            assert_native_situ_supported(
                 hidden_size=self.moe_hidden_size,
                 intermediate_size=config.moe_intermediate_size,
-                activation=routed_activation,
-                device=device,
             )
-            self._fused_bank_ready = False
+            if non_situ_activation_mutation:
+                raise RuntimeError(
+                    "non_situ_activation_mutation is a Python-reference mutation "
+                    "control; it cannot be combined with use_fused_cubin=True"
+                )
 
         # Shared experts — HF fuses ``num_shared_experts`` KimiMLPs into
         # one, with ``intermediate_size = moe_intermediate_size *
@@ -364,120 +390,77 @@ class KimiK3SparseMoeBlock(nn.Module):
             self.routed_expert_norm = None
 
     # ------------------------------------------------------------------
-    # Fused-cubin path — private MXINT4 bank + SiTU dispatch.
+    # Fused path — native in-tree TRTLLM-Gen SiTU dispatch.
     # ------------------------------------------------------------------
 
-    def _init_fused_cubin_bank(self, device: Optional[torch.device]) -> None:
-        """Allocate MXINT4 packed weight + bf16 scale buffers matching
-        the ``trtllm_mxint4_block_scale_moe`` contract.
+    def build_fused_weights(self) -> None:
+        """Derive the fused TRTLLM-Gen device buffers from ``expert_bank``.
 
-        Buffer shapes copied from
-        ``exisiting_optimization_work/trtllmgen_MOE/tests/moe/test_trtllm_gen_routed_fused_moe.py::test_trtllm_gen_mxint4_routed_fused_moe``:
-
-        * ``gemm1_weights``: ``uint8 [E, 2*I, H // 2]``
-        * ``gemm1_weights_scale``: ``bf16 [E, 2*I, H // 32]``
-        * ``gemm2_weights``: ``uint8 [E, H, I // 2]``
-        * ``gemm2_weights_scale``: ``bf16 [E, H, I // 32]``
-
-        Random-initialised on construction so the block is self-
-        contained (no HF load required for cubin-invocation evidence).
-        Two fp4 codes per byte in ``uint8``; bf16 scales per 32-element
-        group.
+        Packs the bank's per-expert MXFP4 tensors into the padded and
+        shuffled ``gemm1_*``/``gemm2_*`` layout expected by
+        ``mxe4m3_mxe2m1_block_scale_moe_runner`` (w3 first / w1 second,
+        opposite of the HF gate-first order) and materializes the
+        per-expert alpha/beta CUDA buffers. Must be called after the bank
+        holds checkpoint weights (``copy_hf_moe_block_weights`` does this
+        automatically for fused-mode blocks).
         """
-        E = self.num_experts
-        H = self.moe_hidden_size
-        II = self.config.moe_intermediate_size
-        g = 32
-
-        assert H % 2 == 0 and H % g == 0, (
-            f"moe_hidden_size {H} must be divisible by 2 and 32 for MXINT4"
+        assert self.use_fused_cubin, "build_fused_weights requires use_fused_cubin=True"
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        packed = pack_routed_expert_weights(
+            w1_packed=self.expert_bank.w1_packed,
+            w1_scales=self.expert_bank.w1_scales,
+            w3_packed=self.expert_bank.w3_packed,
+            w3_scales=self.expert_bank.w3_scales,
+            w2_packed=self.expert_bank.w2_packed,
+            w2_scales=self.expert_bank.w2_scales,
+            device=device,
         )
-        assert II % 2 == 0 and II % g == 0, (
-            f"moe_intermediate_size {II} must be divisible by 2 and 32 for MXINT4"
+        self.gemm1_weights = packed["gemm1_weights"]
+        self.gemm1_weights_scale = packed["gemm1_weights_scale"]
+        self.gemm2_weights = packed["gemm2_weights"]
+        self.gemm2_weights_scale = packed["gemm2_weights_scale"]
+        self._gemm1_alpha, self._gemm1_beta = make_situ_alpha_beta(
+            local_num_experts=self.num_experts,
+            situ_beta=self._situ_beta,
+            situ_linear_beta=self._situ_linear_beta,
+            device=device,
         )
-
-        gemm1_weights = torch.randint(0, 256, (E, 2 * II, H // 2), dtype=torch.uint8, device=device)
-        gemm1_weights_scale = torch.randn((E, 2 * II, H // g), dtype=torch.bfloat16, device=device)
-        gemm2_weights = torch.randint(0, 256, (E, H, II // 2), dtype=torch.uint8, device=device)
-        gemm2_weights_scale = torch.randn((E, H, II // g), dtype=torch.bfloat16, device=device)
-
-        self.register_buffer("gemm1_weights", gemm1_weights)
-        self.register_buffer("gemm1_weights_scale", gemm1_weights_scale)
-        self.register_buffer("gemm2_weights", gemm2_weights)
-        self.register_buffer("gemm2_weights_scale", gemm2_weights_scale)
         self._fused_bank_ready = True
 
-    def _invoke_fused_moe_kernel(
+    def _moe_infer_fused(
         self,
         routed_in: torch.Tensor,
-        *,
-        activation_type_value: Optional[int] = None,
-        output: Optional[torch.Tensor] = None,
-        routing_logits: Optional[torch.Tensor] = None,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Invoke ``trtllm_mxint4_block_scale_moe`` on the private SiTU MXINT4 bank.
+        """Fused variant of :meth:`_moe_infer` via the in-tree SiTU op.
 
-        Callers use this method for both the normal module path (via
-        :meth:`_moe_infer_fused_cubin`) and for AC5 evidence checks that
-        pass a pre-filled sentinel ``output`` and/or a specific
-        ``activation_type_value`` (e.g. ``Swiglu`` for a negative control
-        that must raise on the SiTU-only private pool).
-
-        Parameters
-        ----------
-        routed_in
-            bf16 ``[num_tokens, moe_hidden_size]``.
-        activation_type_value
-            Passed to the kernel's ``activation_type`` slot. Defaults
-            to ``ActivationType.Situ.value``.
-        output
-            Pre-allocated output buffer (bf16 ``[num_tokens,
-            moe_hidden_size]``). Written in place — smoke tests pre-fill
-            it with a sentinel to detect silent no-ops.
-        routing_logits
-            fp32 ``[num_tokens, num_experts]``. Defaults to random
-            uniform per the reference test.
+        ``topk_ids``/``topk_weights`` come from the K3 gate (bypass
+        contract; weights already renormalized and scaled).
         """
-        assert self.use_fused_cubin and self._fused_bank_ready, (
-            "fused-cubin path invoked but bank was not allocated (use_fused_cubin=False)"
-        )
-        assert routed_in.dtype == torch.bfloat16, (
-            f"private SiTU MxInt4/Bfloat16 kernel requires bf16 "
-            f"hidden_states, got {routed_in.dtype}"
-        )
-        assert routed_in.is_cuda, "fused kernel requires CUDA hidden_states"
-
-        num_tokens = routed_in.shape[0]
-        E = self.num_experts
-        II = self.config.moe_intermediate_size
-
-        if routing_logits is None:
-            routing_logits = torch.rand(num_tokens, E, device=routed_in.device, dtype=torch.float32)
-
-        result = invoke_private_situ_moe(
-            routing_logits=routing_logits,
+        if not (self.use_fused_cubin and self._fused_bank_ready):
+            raise RuntimeError(
+                "fused SiTU path invoked, but fused weights were never built. "
+                "Load checkpoint weights via copy_hf_moe_block_weights() or call "
+                "build_fused_weights(); there is no random-weight fallback."
+            )
+        result = invoke_native_situ_moe(
             hidden_states=routed_in,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
             gemm1_weights=self.gemm1_weights,
             gemm1_weights_scale=self.gemm1_weights_scale,
             gemm2_weights=self.gemm2_weights,
             gemm2_weights_scale=self.gemm2_weights_scale,
-            num_experts=E,
+            gemm1_alpha=self._gemm1_alpha,
+            gemm1_beta=self._gemm1_beta,
+            num_experts=self.num_experts,
             top_k=self.top_k,
-            intermediate_size=II,
-            routed_scaling_factor=1.0,
-            activation_type_value=activation_type_value,
-            output=output,
+            valid_hidden_size=self.moe_hidden_size,
+            valid_intermediate_size=self.config.moe_intermediate_size,
         )
         self._cubin_call_count += 1
         return result
-
-    def _moe_infer_fused_cubin(self, routed_in: torch.Tensor) -> torch.Tensor:
-        """Fused-cubin variant of :meth:`_moe_infer`.
-
-        Wraps :meth:`_invoke_fused_moe_kernel` with default args for the
-        normal forward path (no sentinel, activation=Situ).
-        """
-        return self._invoke_fused_moe_kernel(routed_in)
 
     # ------------------------------------------------------------------
     # Forward + Python fallback MoE inference.
@@ -500,21 +483,18 @@ class KimiK3SparseMoeBlock(nn.Module):
         8. Add ``shared_experts(identity)`` if configured (mutation:
            skip).
 
-        Fused-cubin path (``use_fused_cubin=True``): same skeleton, but
-        step 5 is :meth:`_moe_infer_fused_cubin`, which invokes the
-        private SiTU ``trtllm_mxint4_block_scale_moe`` cubin. Steps 4/6/8
-        still run (outside the fused kernel's scope). The gate call at
-        step 2 is skipped in fused mode since the kernel does its own
-        routing internally.
+        Fused path (``use_fused_cubin=True``): same skeleton, but step 5
+        is :meth:`_moe_infer_fused`, which invokes the in-tree
+        ``mxe4m3_mxe2m1_block_scale_moe_runner`` op with
+        ``act_type=SiTu``. The gate at step 2 runs in both modes — the
+        fused path feeds its real top-k through the op's
+        ``topk_weights``/``topk_ids`` bypass. Steps 4/6/8 still run
+        (outside the fused kernel's scope).
         """
         identity = hidden_states
         orig_shape = hidden_states.shape
 
-        if self.use_fused_cubin:
-            topk_idx = None
-            topk_weight = None
-        else:
-            topk_idx, topk_weight = self.gate(hidden_states)
+        topk_idx, topk_weight = self.gate(hidden_states)
 
         flat = hidden_states.view(-1, self.hidden_size)
 
@@ -527,7 +507,7 @@ class KimiK3SparseMoeBlock(nn.Module):
             routed_in_bf16 = (
                 routed_in if routed_in.dtype == torch.bfloat16 else routed_in.to(torch.bfloat16)
             )
-            y = self._moe_infer_fused_cubin(routed_in_bf16)
+            y = self._moe_infer_fused(routed_in_bf16, topk_idx, topk_weight)
             if y.dtype != self._proj_dtype:
                 y = y.to(self._proj_dtype)
         else:
@@ -613,20 +593,13 @@ def copy_hf_moe_block_weights(
        c. Retrieve canonical fp32 (quantize→dequantize) values.
        d. Overwrite HF's Linear weights with the canonical values so
           both modules see byte-identical numbers on forward.
-
-    Not applicable when ``k3.use_fused_cubin=True`` (that mode uses
-    random MXINT4 data for AC5 cubin-invocation evidence; HF parity is
-    out of scope for the fused path).
+    5. When ``k3.use_fused_cubin=True``, additionally derive the fused
+       TRTLLM-Gen device buffers from the freshly loaded bank via
+       :meth:`KimiK3SparseMoeBlock.build_fused_weights`. Both paths then
+       hold the same canonical checkpoint weights.
 
     Returns provenance metadata for logging.
     """
-    if k3.use_fused_cubin:
-        raise RuntimeError(
-            "copy_hf_moe_block_weights: k3 block is in fused-cubin mode "
-            "(use_fused_cubin=True). HF parity is not defined for the "
-            "random MXINT4 bank; skip this copy in fused-cubin tests."
-        )
-
     with torch.no_grad():
         k3.gate.weight.data.copy_(hf.gate.weight.data.to(k3.gate.weight.dtype))
         k3.gate.e_score_correction_bias.data.copy_(
@@ -680,6 +653,9 @@ def copy_hf_moe_block_weights(
             expert.w1.weight.data.copy_(w1c.to(expert.w1.weight.dtype))
             expert.w2.weight.data.copy_(w2c.to(expert.w2.weight.dtype))
             expert.w3.weight.data.copy_(w3c.to(expert.w3.weight.dtype))
+
+    if k3.use_fused_cubin:
+        k3.build_fused_weights()
 
     return MoEBlockProvenance(
         n_experts=k3.num_experts,

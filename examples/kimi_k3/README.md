@@ -15,9 +15,13 @@ mount them into the container at identical paths):
 | `KIMI_K3_MODEL_DIR` | the complete HF checkpoint (`goldenprairie-final-weights_vv1`): config + tokenizer + 96 safetensors shards |
 
 Each sbatch script sets up the runtime env inline on every rank (before any
-python import): the private flashinfer snapshot on `PYTHONPATH`,
-`FLASHINFER_PRIVATE_CUBIN_DIR`, persistent JIT caches, and a node-local
-per-rank `TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks).
+python import): persistent JIT caches and a node-local per-rank
+`TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks). The
+default fused MoE path (`KIMI_K3_FUSED_MOE=native`) uses the in-tree
+TRTLLM-Gen SiTU cubins — no private flashinfer snapshot or
+`FLASHINFER_PRIVATE_CUBIN_DIR` is needed; those are only required for the
+legacy `KIMI_K3_FUSED_MOE=1` path (see the commented-out lines in the
+sbatch scripts).
 
 ## Prerequisites
 
@@ -25,10 +29,11 @@ per-rank `TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks).
    editable build inside the 26.05 sbsa PyTorch container.
 2. `pip install fla-core einops` into the venv (KDA prefill/decode kernels
    use FLA's Triton implementation).
-3. One-time: set up the flashinfer snapshot 3rdparty deps per
+3. (Legacy path only) When running `KIMI_K3_FUSED_MOE=1`, set up the
+   flashinfer snapshot 3rdparty deps per
    `$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE/SNAPSHOT_SETUP.md` (clone the pinned
    `3rdparty/{cutlass,spdlog,cccl}` and create the `flashinfer/data/*`
-   symlinks).
+   symlinks). Not needed for the default `native` path.
 
 ## Deployment shape
 
@@ -36,10 +41,13 @@ per-rank `TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks).
   is reinterpreted by the model as expert-parallel width — each rank holds
   the full ~70 GB bf16 non-expert model plus 896/16 = 56 experts per MoE
   layer (~90 GB MXFP4), with an allreduce of the routed latent partial sums.
-* Fused MoE (`KIMI_K3_FUSED_MOE=1`, default): private flashinfer
-  `trtllm_fp4_block_scale_routed_moe` with SiTU activation, consuming the
-  checkpoint's MXFP4 weights natively (~0.5–0.8 ms/layer vs ~60–140 ms for
-  the reference dequant loop).
+* Fused MoE (`KIMI_K3_FUSED_MOE=native`, default): in-tree TRTLLM-Gen SiTU
+  op (`mxe4m3_mxe2m1_block_scale_moe_runner`, W4A8 MXFP4 weights × MXFP8
+  activations) consuming the checkpoint's MXFP4 weights via a one-time
+  load-time shuffle. `KIMI_K3_FUSED_MOE=1` selects the legacy private
+  flashinfer `trtllm_fp4_block_scale_routed_moe` path (W4A16, requires the
+  snapshot env). Both are ~0.5–0.8 ms/layer vs ~60–140 ms for the
+  reference dequant loop.
 * Required LLM args (see `eval_extra_llm_options.yaml`): overlap scheduler
   off, CUDA graphs off, chunked prefill off, KV block reuse off,
   `tokens_per_block=64`. Keep `max_batch_size` ≤ ~32 (each KDA state slot
@@ -81,7 +89,9 @@ defaults; override on the command line as needed.
   (loads only those shards; output is gibberish by construction, pipeline
   checks only).
 * `KIMI_K3_FUSED_MOE=0` — fall back to the in-tree MXFP4 dequant reference
-  MoE (bit-parity oracle for the fused path, ~100× slower).
+  MoE (bit-parity oracle for the fused paths, ~100× slower).
+* `KIMI_K3_FUSED_MOE=1` — legacy private-flashinfer SiTU path (W4A16);
+  requires the snapshot env and `FLASHINFER_PRIVATE_CUBIN_DIR`.
 * `KIMI_K3_MLA_MAX_POSITIONS` (default 65536) — identity-RoPE table bound
   (K3 MLA is NoPE); raise for longer sequences.
 * `TLLM_LOG_LEVEL_BY_MODULE="debug:_torch"` — verbose model-side logging.
