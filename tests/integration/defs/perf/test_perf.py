@@ -1598,13 +1598,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 print_info("skip building process for multi-gpu test"
                            )  #https://nvbugspro.nvidia.com/bug/5210111
                 metric_values = [0.0]
-            elif metric.metric_type == PerfMetricType.KV_CACHE_SIZE:
-                # Best-effort telemetry parsed from a log line: a miss (e.g. log
-                # format drift) must not fail the whole run, unlike core metrics.
-                print_warning(
-                    f"Cannot find {metric_name} from perf script logs; recording 0.0 instead of failing the test."
-                )
-                metric_values = [0.0]
             else:
                 raise RuntimeError(
                     f"Cannot find perf result for {metric_name} from perf script logs!"

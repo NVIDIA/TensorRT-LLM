@@ -256,7 +256,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_flash-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
-  - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:9216-kv_frac:0.5-input_output_len:8192,1024-ep:8-tp:8-gpus:8] TIMEOUT(120)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
   #kimi_k2.5_fp4 (multimodal MoE FP4 553G, 8-GPU ep=8)
   - perf/test_perf.py::test_perf[kimi_k2.5_fp4-bench-pytorch-float4-input_output_len:128,128-ep:8-tp:8-gpus:8]

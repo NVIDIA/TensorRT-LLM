@@ -100,6 +100,7 @@ def get_model_yaml_config(model_label: str,
                 },
                 'max_seq_len': 10240,
                 'max_num_tokens': 4096,
+                'enable_chunked_prefill': True,
                 'kv_cache_config': {
                     'free_gpu_memory_fraction': 0.5,
                 },
@@ -126,7 +127,7 @@ def get_model_yaml_config(model_label: str,
                     'backend': 'MEGAMOE_DEEPGEMM',
                 },
                 'max_seq_len': 10240,
-                'max_num_tokens': 4096,
+                'max_num_tokens': 9216,
                 'kv_cache_config': {
                     'enable_block_reuse': False,
                     'free_gpu_memory_fraction': 0.5,
@@ -135,8 +136,10 @@ def get_model_yaml_config(model_label: str,
                 'disable_overlap_scheduler': True,
                 'custom_tokenizer': 'deepseek_v4',
                 'speculative_config': {
-                    'decoding_type': 'DSpark',
-                    'max_draft_len': 5,
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    5,
                     'speculative_model':
                     f'{llm_models_root()}/DeepSeek-V4-Pro-DSpark',
                 },
