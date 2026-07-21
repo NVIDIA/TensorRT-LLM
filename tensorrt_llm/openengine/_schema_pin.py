@@ -3,6 +3,6 @@
 
 """OpenEngine source identity embedded in TensorRT-LLM distributions."""
 
-OPENENGINE_COMMIT = "7d6ac3848bba9c9a2b1aabcd4fab5f1a4ea04558"
+OPENENGINE_COMMIT = "f1a7189311770f8aa1f0dd787561df809847595d"
 
 __all__ = ["OPENENGINE_COMMIT"]
