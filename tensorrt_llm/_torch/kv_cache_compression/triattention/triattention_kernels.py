@@ -353,9 +353,11 @@ class _FixedScoreGroup:
             and num_q_heads // num_kv_heads in (4, 8)
             and int(anchor.stride(-1)) == 1
             and self.seq_len % score_tile_tokens == 0
-            # The kernel computes flat score offsets in 32-bit arithmetic;
-            # group-4 geometries pad the head axis to the MMA tile N=8.
-            and num_kv_heads * 8 * max_segments * self.seq_len < 2**31
+            # The kernel's head-plane base offset is 64-bit; the widest
+            # 32-bit product left is one plane (N-1 head columns of one
+            # segment stride), which the score bucket keeps far below 2^31.
+            # Group-4 geometries pad the head axis to the MMA tile N=8.
+            and (8 - 1) * max_segments * self.seq_len < 2**31
         )
         if not supported:
             raise ValueError(

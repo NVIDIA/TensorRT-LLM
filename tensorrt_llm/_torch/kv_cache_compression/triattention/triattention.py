@@ -1986,7 +1986,17 @@ class TriAttention(BaseKVCacheCompressionManager):
             needed_width,
             self.top_B + 2 * self.beta + int(mgr.max_total_draft_tokens or 0),
         )
-        seq_capacity = max(needed_page_tokens, int(mgr.max_seq_len))
+        # Bucket the score scratch by what cohorts actually present instead of
+        # pinning it to max_seq_len: with pinned prompts the post-compaction
+        # length is bounded by prompt + budget + slack, so one power-of-two
+        # bucket serves the steady state, and a cohort that outgrows it simply
+        # rebuilds these resources through the capacity check above. The old
+        # max_seq_len floor made the scratch unindexable in 32 bits and tens
+        # of GiB at large batch (BS=256 x 8K bucket) for work that never
+        # scored past ~1K tokens per request.
+        seq_capacity = max(int(needed_page_tokens), 1024)
+        seq_capacity = 1 << (seq_capacity - 1).bit_length()
+        seq_capacity = min(seq_capacity, max(int(mgr.max_seq_len), int(needed_page_tokens)))
         # The CuTe score kernel stores full compute tiles (64 tokens, or one
         # page for 128-token pages) into a scratch strided by this bucket
         # capacity, so the capacity must be tile-aligned (its geometry gate

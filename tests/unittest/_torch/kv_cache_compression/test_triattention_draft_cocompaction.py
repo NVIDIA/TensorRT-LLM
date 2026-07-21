@@ -448,13 +448,15 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
     ):
         resources = manager._fixed_resources_for(layout, prepared)
 
-        # The buffers follow the executor limits, not this one-request cohort.
+        # Request capacity follows the executor limits, while the score
+        # bucket follows what the cohort actually presents (power-of-two,
+        # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
         assert resources.score_staging is score_staging
         assert score_cls.call_args.kwargs["max_requests"] == 8
         assert score_cls.call_args.kwargs["decode_width"] == 4 + 2 * 128
-        assert score_cls.call_args.kwargs["seq_len"] == 65536
-        assert score_cls.call_args.kwargs["page_table_token_capacity"] == 65536 + 1
-        assert score_cls.call_args.kwargs["draft_page_table_token_capacity"] == 65536 + 1
+        assert score_cls.call_args.kwargs["seq_len"] == 1024
+        assert score_cls.call_args.kwargs["page_table_token_capacity"] == 1024 + 1
+        assert score_cls.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
 
         # A second round with unchanged pools reuses the resident buffers and
         # keeps the cached compaction launches.

@@ -1138,8 +1138,14 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         if cutlass.const_expr(page_half == 0):
                             cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                # 64-bit: the head-plane product exceeds 2^31 once the scratch
+                # spans many request*layer segments (large batch), so promote
+                # before the multiply reaches Int32 arithmetic.
                 output_offset = (
-                    kv_head * N * self.sum_seq + out_base + page_start + page_half * CTA_M
+                    cutlass.Int64(kv_head) * (N * self.sum_seq)
+                    + out_base
+                    + page_start
+                    + page_half * CTA_M
                 )
                 page_output = cute.make_tensor(
                     output.iterator + output_offset,
