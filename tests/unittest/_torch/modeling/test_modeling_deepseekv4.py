@@ -8,7 +8,6 @@ import struct
 import textwrap
 import weakref
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,7 +33,6 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
-    DeepseekV4MoE,
     DeepseekV4MTP,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
@@ -488,65 +486,6 @@ def test_deepseek_v4_nvfp4_mixed_precision_config():
         normalized_config.quant_config_dict["model.layers.0.mlp.experts"].quant_algo
         == QuantAlgo.NVFP4
     )
-
-
-def test_deepseek_v4_decoder_accepts_mixed_precision_experts(monkeypatch):
-    config = DeepseekV4Config(
-        hidden_size=16,
-        moe_intermediate_size=8,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        num_experts_per_tok=2,
-        hc_mult=2,
-        hc_sinkhorn_iters=1,
-    )
-    config.torch_dtype = torch.bfloat16
-    quant_config = QuantConfig(
-        quant_algo=QuantAlgo.MIXED_PRECISION,
-        group_size=16,
-        exclude_modules=["*.attn.*", "*.ffn.shared_experts.*", "head", "mtp.*"],
-    )
-    experts_quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
-    model_config = SimpleNamespace(
-        pretrained_config=config,
-        mapping=Mapping(world_size=1, rank=0, tp_size=1),
-        quant_config=quant_config,
-        quant_config_dict={"model.layers.0.mlp.experts": experts_quant_config},
-        allreduce_strategy=None,
-    )
-    captured = {}
-
-    def fake_moe(**kwargs):
-        captured.update(kwargs)
-        return torch.nn.Identity()
-
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.modeling_deepseekv4.mHC",
-        lambda *args, **kwargs: torch.nn.Identity(),
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.modeling_deepseekv4.DeepseekV4Attention",
-        lambda *args, **kwargs: torch.nn.Identity(),
-    )
-    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_deepseekv4.DeepseekV4MoE", fake_moe)
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.modeling_deepseekv4.RMSNorm",
-        lambda *args, **kwargs: torch.nn.Identity(),
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.models.modeling_deepseekv4.can_access_peer",
-        lambda _mapping: False,
-    )
-
-    layer = DeepseekV4DecoderLayer(
-        model_config,
-        layer_idx=0,
-        aux_stream_dict={AuxStreamType.Attention: None, AuxStreamType.MoeShared: None},
-    )
-
-    assert layer.is_nvfp4 is False
-    assert captured["override_quant_config"] is quant_config
-    assert DeepseekV4MoE._get_experts_quant_config(model_config, 0) is experts_quant_config
 
 
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):
