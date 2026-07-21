@@ -769,10 +769,10 @@ class PyExecutor:
         # models, so encoder PP send/recv support is not implemented in the
         # PyTorch path for now. Reject pp_size > 1.
         # TODO: Add support for pp + encoder models
-        is_encoder_decoder = bool(
+        self.is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
-        if is_encoder_decoder:
+        if self.is_encoder_decoder:
             if self.dist.pp_size > 1:
                 raise NotImplementedError(
                     "pp_size > 1 is not supported for encoder-decoder models "
@@ -829,6 +829,7 @@ class PyExecutor:
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
         self.batch_wait_iters_count = 0
+        self.encoder_batch_wait_iters_count = 0
 
         def on_detected():
             # The graceful shutdown path can itself deadlock on collectives
@@ -5228,6 +5229,37 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _waiting_encoder_requests(
+            self, encoder_requests: list[LlmRequest],
+            generation_requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Accumulate encoder work while an admitted decode batch progresses.
+
+        Encoder-decoder serving can otherwise launch one eager encoder forward
+        for each replacement request. Use the existing iteration deadline and
+        token threshold to form a larger encoder microbatch without blocking
+        the executor thread. Decoder generation continues while the encoder
+        requests wait. The encoder has its own counter because the resulting
+        decoder-context requests are already coalesced and must not wait for a
+        second window.
+        """
+        if not encoder_requests or not generation_requests:
+            self.encoder_batch_wait_iters_count = 0
+            return encoder_requests
+
+        num_scheduled_tokens = sum(request.encoder_output_len
+                                   for request in encoder_requests)
+        num_scheduled_tokens += sum(1 + request.num_draft_tokens
+                                    for request in generation_requests)
+        should_wait = (self.encoder_batch_wait_iters_count
+                       < self.batch_wait_timeout_iters and num_scheduled_tokens
+                       < self.batch_wait_max_tokens_ratio * self.max_num_tokens)
+        if should_wait:
+            self.encoder_batch_wait_iters_count += 1
+            return []
+
+        self.encoder_batch_wait_iters_count = 0
+        return encoder_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
@@ -5237,6 +5269,15 @@ class PyExecutor:
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
+        scheduled_encoder_requests = scheduler_output.encoder_requests
+        should_batch_encoder_requests = (self.is_encoder_decoder
+                                         and not self.enable_attention_dp
+                                         and self.enable_batch_waiting)
+        if should_batch_encoder_requests:
+            scheduled_encoder_requests = self._waiting_encoder_requests(
+                scheduler_output.encoder_requests,
+                scheduler_output.generation_requests)
+
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
@@ -5244,9 +5285,12 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         # If no generation requests, no need to wait, to avoid dead waiting
-        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
-            scheduler_output.context_requests) > 0 and len(
-                scheduler_output.generation_requests) > 0
+        should_check_waiting = (not self.is_encoder_decoder
+                                and not self.enable_attention_dp
+                                and self.enable_batch_waiting
+                                and len(scheduler_output.context_requests) > 0
+                                and len(
+                                    scheduler_output.generation_requests) > 0)
         if should_check_waiting:
             # With KV cache manager V2, scheduling has already grown context request KV cache capacity. Requests dropped
             # for batch waiting still occupy KV cache and may reduce the batch size available for generation requests.
@@ -5265,7 +5309,7 @@ class PyExecutor:
                 num_fitting = len(scheduled_context_requests)
 
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.encoder_requests = scheduler_output.encoder_requests
+        scheduled_requests.encoder_requests = scheduled_encoder_requests
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
