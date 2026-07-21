@@ -333,6 +333,7 @@ def test_teacache_preserves_tuple_output_on_cache_miss_and_hit() -> None:
             timestep_embed_fn=_identity_timestep_embedding,
             forward_params=["hidden_states", "timestep", "return_dict"],
             return_dict_default=False,
+            return_tuple_when_return_dict_false=True,
         )
     )
     backend = TeaCacheBackend(
@@ -358,6 +359,51 @@ def test_teacache_preserves_tuple_output_on_cache_miss_and_hit() -> None:
     assert isinstance(cache_hit, tuple)
     torch.testing.assert_close(cache_miss[0], hidden_states + 1)
     torch.testing.assert_close(cache_hit[0], hidden_states + 1)
+    assert cache_stats["cached"] == 1
+
+
+class _TensorTransformer(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        return hidden_states + timestep[:, :1].unsqueeze(-1)
+
+
+def test_teacache_preserves_tensor_output_on_cache_miss_and_hit() -> None:
+    transformer = _TensorTransformer()
+    register_extractor_from_config(
+        ExtractorConfig(
+            model_class_name=transformer.__class__.__name__,
+            timestep_embed_fn=_identity_timestep_embedding,
+            forward_params=["hidden_states", "timestep"],
+            return_dict_default=False,
+        )
+    )
+    backend = TeaCacheBackend(
+        TeaCacheConfig(
+            coefficients=[0.0, 0.0],
+            teacache_thresh=0.2,
+            use_ret_steps=False,
+        )
+    )
+    backend.enable(transformer)
+    backend.refresh(num_inference_steps=4)
+
+    hidden_states = torch.zeros(1, 8, 4)
+    timestep = torch.ones(1, 4)
+    try:
+        cache_miss = transformer(hidden_states, timestep)
+        cache_hit = transformer(hidden_states, timestep)
+        cache_stats = backend.get_stats()
+    finally:
+        backend.disable(transformer)
+
+    assert isinstance(cache_miss, torch.Tensor)
+    assert isinstance(cache_hit, torch.Tensor)
+    torch.testing.assert_close(cache_miss, hidden_states + 1)
+    torch.testing.assert_close(cache_hit, hidden_states + 1)
     assert cache_stats["cached"] == 1
 
 
