@@ -10,15 +10,20 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID,
+    LlmRequest,
+    SamplingConfig,
+)
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -341,6 +346,64 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
     ]
 
 
+def test_cpp_hybrid_prepare_expect_snapshot_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=64,
+    )
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64)
+    requests = [
+        SimpleNamespace(prompt_len=150, expect_snapshot_points=[999]),
+        SimpleNamespace(prompt_len=128, expect_snapshot_points=[]),
+        SimpleNamespace(prompt_len=32, expect_snapshot_points=[]),
+    ]
+
+    mgr.prepare_expect_snapshot_points(requests)
+
+    assert [request.expect_snapshot_points for request in requests] == [
+        [64, 128],
+        [64, 128],
+        [],
+    ]
+
+
+def test_cpp_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[64])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == []
+
+
+@pytest.mark.parametrize("interval", [0, -64, None])
+def test_cpp_hybrid_prepare_expect_snapshot_points_clears_for_invalid_interval(interval):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = SimpleNamespace(enable_block_reuse=True)
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=interval)
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[64])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == []
+
+
+def test_expect_snapshot_points_binding_round_trip():
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+
+    assert request.expect_snapshot_points == []
+    request.expect_snapshot_points = [64, 128]
+    assert request.expect_snapshot_points == [64, 128]
+
+
 # ---------------------------------------------------------------------------
 # CppMambaHybridCacheManager: recurrent-state snapshot pool sizing
 #
@@ -360,13 +423,17 @@ def _build_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     mamba_state_cache_interval=256,
     is_estimating_kv_cache=False,
+    dtype=DataType.HALF,
+    mamba_layer_mask=None,
+    attention_layer_mask=None,
+    mamba_ssm_cache_dtype=torch.float16,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
     linear-attention pool sizing path."""
     # Layer 0: mamba; Layer 1: full attention. Single rank, no MPI.
-    mamba_mask = [True, False]
-    attn_mask = [False, True]
+    mamba_mask = mamba_layer_mask or [True, False]
+    attn_mask = attention_layer_mask or [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap max_tokens to keep the real C++ pool allocation tiny.
     kv_cache_config = KvCacheConfig(
@@ -380,13 +447,13 @@ def _build_hybrid_with_mamba_layer(
         mamba_num_heads=4,
         mamba_n_groups=1,
         mamba_head_dim=8,
-        mamba_num_layers=1,
+        mamba_num_layers=sum(mamba_mask),
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
-        mamba_ssm_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=1,
+        num_layers=sum(attn_mask),
         num_kv_heads=4,
         head_dim=64,
         tokens_per_block=32,
@@ -396,7 +463,61 @@ def _build_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         is_estimating_kv_cache=is_estimating_kv_cache,
+        dtype=dtype,
     )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "mamba_ssm_cache_dtype",
+    [torch.float16, torch.float32, torch.bfloat16],
+)
+def test_cpp_hybrid_passes_per_window_pool_dtypes_for_nvfp4_kv_cache(
+    mamba_ssm_cache_dtype,
+):
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
+    recurrent_pool_dtype = torch_dtype_to_binding(mamba_ssm_cache_dtype)
+
+    expected_dtypes = [
+        (LinearCacheType.RECURRENT_STATES.value, recurrent_pool_dtype),
+        (128, DataType.NVFP4),
+    ]
+    assert [
+        (config.window_size, config.dtype) for config in mgr.pool_configurations
+    ] == expected_dtypes
+    assert [
+        (config.window_size, config.dtype) for config in mgr.impl.pool_configurations
+    ] == expected_dtypes
+    assert mgr._layer_to_pool_idx == {0: 0, 1: 1}
+    assert mgr.recurrent_states_pool_index == 0
+    assert mgr.impl.get_recurrent_states_pool().dtype == mamba_ssm_cache_dtype
+
+    compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
+    assert mgr.impl.get_block_pool_pointers().shape == (2, 2)
+    assert compact_scale_pointers.shape == (1, 2)
+    assert mgr.kv_cache_pool_pointers.shape == (2, 2, 2)
+    assert torch.count_nonzero(mgr.kv_cache_pool_pointers[0, :, 1]) == 0
+    assert torch.equal(mgr.kv_cache_pool_pointers[1, :, 1], compact_scale_pointers[0])
+
+
+@skip_no_cuda
+def test_cpp_hybrid_merges_compact_scale_rows_with_unmanaged_layers():
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        mamba_layer_mask=[True, False, True, False],
+        attention_layer_mask=[False, False, False, True],
+    )
+
+    assert mgr.pp_layers == [0, 2, 3]
+    assert mgr.kv_cache_pool_mapping[:, 0].tolist() == [0, 0, 1]
+    compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
+    assert compact_scale_pointers.shape == (1, 2)
+    assert mgr.kv_cache_pool_pointers.shape == (2, 2, 2)
+    assert torch.count_nonzero(mgr.kv_cache_pool_pointers[0, :, 1]) == 0
+    assert torch.equal(mgr.kv_cache_pool_pointers[1, :, 1], compact_scale_pointers[0])
 
 
 @skip_no_cuda
@@ -582,7 +703,10 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
 # ---------------------------------------------------------------------------
 
 
-def _build_zero_mamba_hybrid():
+def _build_zero_mamba_hybrid(
+    enable_block_reuse=False,
+    mamba_state_cache_interval=256,
+):
     """Construct a real CppMambaHybridCacheManager whose this-rank slice has
     no mamba layers. world_size=1 / pp_size=1 keeps the real parent
     KVCacheManager off the MPI path."""
@@ -595,7 +719,11 @@ def _build_zero_mamba_hybrid():
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap KV pool size so the real C++ allocator only takes a tiny slice of
     # GPU memory; we don't actually use the cache.
-    kv_cache_config = KvCacheConfig(max_tokens=128)
+    kv_cache_config = KvCacheConfig(
+        max_tokens=128,
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_cache_interval=mamba_state_cache_interval,
+    )
 
     mgr = CppMambaHybridCacheManager(
         # mamba cache parameters — values are unused on the early-exit path
@@ -630,7 +758,10 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     """End-to-end: real parent KVCacheManager + real early-exit. Verifies
     early-exit invariants on the manager state AND that the three guarded
     methods no-op without raising on uninitialized mamba-only state."""
-    mgr = _build_zero_mamba_hybrid()
+    mgr = _build_zero_mamba_hybrid(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=64,
+    )
 
     # Early-exit indicators.
     assert mgr.local_num_mamba_layers == 0
@@ -646,6 +777,14 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     # On the early-exit branch, num_layers is forwarded as-is.
     assert mgr.num_layers == 4
     assert mgr.num_local_layers == 2
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.pool_configurations
+    )
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.impl.pool_configurations
+    )
 
     # No mamba-only state was allocated.
     for attr in (
@@ -659,6 +798,20 @@ def test_cpp_hybrid_zero_local_mamba_layers():
         assert not hasattr(mgr, attr), f"{attr} must not be set on the zero-mamba early-exit path"
     # Parent must not have been told to treat this as linear attention.
     assert mgr.is_linear_attention is False
+
+    # The scheduler hook is still advertised on ranks without local Mamba
+    # layers, so its inputs must be initialized with the same interval as
+    # Mamba-owning PP ranks to keep their scheduling decisions aligned.
+    assert mgr.kv_cache_config.enable_block_reuse is True
+    assert mgr.linear_attention_metadata.states_snapshot_interval == 64
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[])
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [64, 128]
+    # The shared interval must not make this attention-only rank consult its
+    # nonexistent recurrent-state pool and report zero KV capacity.
+    attention_capacity = KVCacheManager.get_num_available_tokens(mgr, 128)
+    assert attention_capacity > 0
+    assert mgr.get_num_available_tokens(128) == attention_capacity
 
     # Guards on the three mamba-only methods must turn them into no-ops
     # instead of crashing on the missing state above.

@@ -37,8 +37,6 @@
 /tests/unittest @NVIDIA/trt-llm-devs
 
 # ===== TensorRT backend (will be deprecated soon) — also on the trt-llm-devs fallback =====
-/cpp/include/tensorrt_llm/plugins @NVIDIA/trt-llm-devs
-/cpp/tensorrt_llm/plugins @NVIDIA/trt-llm-devs
 /tensorrt_llm/builder.py @NVIDIA/trt-llm-devs
 /tensorrt_llm/commands/build.py @NVIDIA/trt-llm-devs
 /tensorrt_llm/commands/prune.py @NVIDIA/trt-llm-devs
@@ -105,7 +103,6 @@
 /cpp/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/common @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
-/cpp/tensorrt_llm/executor_worker @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/layers @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/nanobind @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/runtime @NVIDIA/trt-llm-runtime-devs
@@ -169,7 +166,6 @@
 /examples/llm-api/quickstart_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /examples/models @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /examples/serve/*multimodal* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
-/scripts/build_cpp_examples.py @NVIDIA/trt-llm-models-devs
 /scripts/generate_config_database_tests.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /scripts/generate_config_table.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /tensorrt_llm/_torch/models @NVIDIA/trt-llm-models-devs
@@ -221,6 +217,11 @@
 /tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/runtime/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_dual_pool_kv_cache.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_kv_cache* @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_kv_pool_rebalance.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_mamba_cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/kv_cache_manager_v2_tests @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # ===== DISAGGREGATED SERVING =====
@@ -240,7 +241,17 @@
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
+# Disagg tests: co-own with the owning team so disagg-devs review disagg-test changes.
+/tests/integration/defs/accuracy/*disagg* @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa
+/tests/integration/defs/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa
+/tests/integration/defs/stress_test/disagg_cancel @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-qa
+/tests/scripts/perf-sanity/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
+/tests/scripts/perf/disaggregated @NVIDIA/trt-llm-perf-devs @NVIDIA/trt-llm-disagg-devs
+/tests/unittest/_torch/executor/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+/tests/unittest/_torch/multimodal/*disagg* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-disagg-devs
 /tests/unittest/disaggregated @NVIDIA/trt-llm-disagg-devs
+/tests/unittest/llmapi/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
+/tests/unittest/llmapi/apps/*disagg* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
 # ===== ATTENTION =====
 # Where a kernel is both a dir and sibling .cu/.h, keep the bare dir (subtree) AND a trailing-* (siblings).
@@ -443,7 +454,6 @@
 # ===== DISAGG BLAST-RADIUS CO-OWNS (Tier-1) =====
 # Last-match cross-cutting: adds disagg-devs to shared files that can silently break disagg e2e.
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/_torch/modules/mla.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 

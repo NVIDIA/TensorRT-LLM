@@ -46,6 +46,7 @@ from ..model_config import ModelConfig
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..utils import is_gdn_replay_enabled
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
                            is_hybrid_linear, is_mla, is_nemotron_hybrid,
                            is_qwen3_hybrid)
@@ -581,6 +582,10 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
+        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
+        # nothing to profile.
+        if getattr(self._model_engine.model, "mm_encoder", object()) is None:
+            return []
         input_processor = self._model_engine.input_processor
         _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
         # Modality-agnostic: the model declares each modality's per-item token
@@ -627,6 +632,21 @@ class KvCacheCreator:
         with torch.inference_mode():
             return self._model_engine.model.encode_multimodal_inputs(
                 self._dummy_encoder_inputs)
+
+    def _reserve_multimodal_encoder_cache_memory(
+        self,
+        peak_memory: int,
+    ) -> int:
+        """Reserve encoder-cache capacity when the model implements that cache."""
+        model = self._model_engine.model
+        if (not isinstance(model, MultimodalModelMixin)
+                or not model.supports_encoder_cache):
+            return peak_memory
+
+        multimodal_config = model.model_config.multimodal_config
+        if multimodal_config is None:
+            return peak_memory
+        return peak_memory + multimodal_config.encoder_cache_max_bytes
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -875,6 +895,14 @@ class KvCacheCreator:
             peak_memory = total_used_bytes
             allocated_bytes = 0
             activation_bytes = 0
+
+        peak_memory_without_encoder_cache = peak_memory
+        peak_memory = self._reserve_multimodal_encoder_cache_memory(peak_memory)
+        if peak_memory != peak_memory_without_encoder_cache:
+            mem_gb = (peak_memory - peak_memory_without_encoder_cache) / GB
+            logger.info(
+                f"Reserving {mem_gb:.2f} GiB for the multimodal encoder cache while estimating KV cache "
+                "capacity.", )
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
@@ -1960,6 +1988,47 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             quant_config=quant_config,
         )
+
+        # Replay state update for GDN MTP: mirrors the nemotron_hybrid gating
+        # above, minus the Mamba2-specific stochastic-rounding/Philox gate.
+        # The GDN replay kernel does a plain cast on checkpoint commit, so
+        # quantized SSM cache dtypes stay on the legacy path.
+        sm = get_sm_version()
+        use_replay = spec_config is not None and sm >= 80
+        if spec_config is None:
+            logger.info(
+                "GDN replay kernel requires speculative decoding; using "
+                "non-replay path")
+        elif spec_config.tokens_per_gen_step > 8:
+            logger.info("GDN cached replay supports at most 8 tokens per "
+                        "generation step; using non-replay path")
+            use_replay = False
+
+        # Tree attention: replay assumes a linear token sequence.
+        if (spec_config is not None
+                and (getattr(spec_config, 'eagle_choices', None) is not None
+                     or getattr(spec_config, 'use_dynamic_tree', False))):
+            logger.info("GDN replay kernel incompatible with tree attention; "
+                        "using legacy MTP path")
+            use_replay = False
+
+        if mamba_params.mamba_ssm_cache_dtype not in (torch.float32,
+                                                      torch.bfloat16,
+                                                      torch.float16):
+            logger.info(
+                "GDN replay kernel does not support quantized SSM cache "
+                f"dtype {mamba_params.mamba_ssm_cache_dtype}; using legacy "
+                "MTP path")
+            use_replay = False
+
+        # Replay is opt-in because its end-to-end benefit is workload-dependent.
+        if not is_gdn_replay_enabled():
+            logger.info("GDN replay kernel is disabled; set "
+                        "TRTLLM_USE_GDN_REPLAY=1 to enable it")
+            use_replay = False
+        logger.info("GDN replay state update: " +
+                    ("ENABLED" if use_replay else "DISABLED"))
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1988,6 +2057,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             model_type="qwen3_next",
+            use_replay_state_update=use_replay,
             **manager_extra_kwargs,
         )
     else:
@@ -2040,16 +2110,38 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
+def validate_kv_cache_compression_with_spec(
+    config: KvCacheCompressionConfig,
+    spec_config: Optional[SpeculativeConfig],
+    draft_kv_cache_manager: Optional[KVCacheManagerV2],
+) -> None:
+    """Reject speculative setups the compression method cannot run with."""
+    if (spec_config is None
+            or not config.kv_cache_compression_mode.is_eviction_method()):
+        return
+    # Evicting methods co-compact the draft KV, so the draft must be a
+    # standard paged cache in the same forward (one-model speculation).
+    mode = spec_config.spec_dec_mode
+    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+        raise ValueError(
+            f"KV-cache compression algorithm {config.algorithm!r} does not "
+            f"support speculative decoding mode {mode.name}: the draft KV "
+            "must be a standard paged cache compacted together with the "
+            "target (one-model MTP/EAGLE3).")
+
+
 def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
 ) -> Optional[BaseKVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
 
     Called from ``create_py_executor`` and registered as a resource manager,
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here; the framework ships none.
+    here; the framework ships none. Speculative-decoding compatibility is
+    checked by the caller via ``validate_kv_cache_compression_with_spec``.
     """
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "
@@ -2057,6 +2149,43 @@ def create_kv_cache_compression_manager(
         config.algorithm,
     )
     return None
+
+
+def compute_max_num_sequences(mapping: Mapping,
+                              max_batch_size: int,
+                              disable_overlap_scheduler: bool,
+                              enable_overlap_headroom: bool = False) -> int:
+    """Size the sequence-slot pool (and the sampler state it indexes).
+
+    ``enable_overlap_headroom`` is intentionally opt-in. DeepSeek-V4 needs a
+    second non-PP slot set because the V2 scheduler can backfill seats before
+    the overlap scheduler releases the previous iteration's terminal slots.
+    Other models retain their established sizing until that behavior is
+    validated independently. Pipeline parallelism already sizes the pool by
+    ``pp_size``.
+    """
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = (2 if enable_overlap_headroom
+                             and not disable_overlap_scheduler else 1)
+    return max_batch_size * num_micro_batches
+
+
+def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
+                                       mapping: Mapping) -> bool:
+    """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
+    return model_type == "deepseek_v4" and not mapping.has_pp()
+
+
+def should_enable_dsv4_overlap_headroom(
+        model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
+    return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
+            and spec_config is not None
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and not disable_overlap_scheduler)
 
 
 def create_py_executor_instance(
@@ -2085,6 +2214,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    max_num_sequences: Optional[int] = None,
 ) -> PyExecutor:
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
@@ -2093,7 +2223,9 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    max_num_sequences = max_batch_size * mapping.pp_size
+    if max_num_sequences is None:
+        max_num_sequences = compute_max_num_sequences(
+            mapping, max_batch_size, llm_args.disable_overlap_scheduler)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
@@ -2263,8 +2395,16 @@ def create_py_executor_instance(
     kv_cache_compression_config = getattr(llm_args,
                                           "kv_cache_compression_config", None)
     if kv_cache_compression_config is not None:
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        validate_kv_cache_compression_with_spec(kv_cache_compression_config,
+                                                spec_config,
+                                                draft_kv_cache_manager)
         compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config, kv_cache_manager)
+            kv_cache_compression_config,
+            kv_cache_manager,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
@@ -2276,21 +2416,22 @@ def create_py_executor_instance(
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
-    # Compression manager runs after the cache manager: reconciles history once it's resized.
-    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
-            in resource_manager.resource_managers):
-        resource_manager.resource_managers.move_to_end(
-            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
-
     cross_kv_cache_manager = resources.get(
         ResourceManagerType.CROSS_KV_CACHE_MANAGER)
     if cross_kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.CROSS_KV_CACHE_MANAGER, last=True)
+    # Compression is the final reconciler after every native KV manager.
+    if (ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER
+            in resource_manager.resource_managers):
+        resource_manager.resource_managers.move_to_end(
+            ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER, last=True)
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    scheduler_capacity = max_num_sequences
+    # V1 scheduler handles overlap via two_step_lookahead, so skip the
+    # slot-pool overlap factor here.
+    scheduler_capacity = max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
@@ -2446,8 +2587,13 @@ def create_torch_sampler_args(
     disable_overlap_scheduler: bool,
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
+    max_num_sequences: Optional[int] = None,
 ):
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # The sampler's per-slot state is indexed by sequence slots, so it must
+    # be sized identically to the executor's slot pool.
+    if max_num_sequences is None:
+        max_num_sequences = compute_max_num_sequences(
+            mapping, max_batch_size, disable_overlap_scheduler)
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
@@ -2477,6 +2623,7 @@ def instantiate_sampler(
     speculative_config: SpeculativeConfig,
     decoding_config: trtllm.DecodingConfig,
     kv_cache_config: KvCacheConfig,
+    max_num_sequences: Optional[int] = None,
 ):
     enable_async_worker = (confidential_compute_enabled()
                            or llm_args.sampler_force_async_worker)
@@ -2491,6 +2638,7 @@ def instantiate_sampler(
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
+        max_num_sequences=max_num_sequences,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
@@ -2519,7 +2667,8 @@ def instantiate_sampler(
                              max_beam_width=max_beam_width,
                              decoding_config=decoding_config,
                              kv_cache_config=kv_cache_config,
-                             enable_async_worker=enable_async_worker)
+                             enable_async_worker=enable_async_worker,
+                             max_num_sequences=max_num_sequences)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()

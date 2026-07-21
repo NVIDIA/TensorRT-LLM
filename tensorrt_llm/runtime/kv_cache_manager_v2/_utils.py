@@ -123,6 +123,14 @@ class HalfOpenRange(tuple[Idx, Idx], Generic[Idx]):
     def end(self) -> Idx:
         return self[1]
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, HalfOpenRange):
+            return NotImplemented
+        return (not self and not other) or tuple.__eq__(self, other)
+
+    def __hash__(self) -> int:
+        return hash((0, 0)) if not self else tuple.__hash__(self)
+
     def __bool__(self) -> bool:
         return self[0] < self[1]
 
