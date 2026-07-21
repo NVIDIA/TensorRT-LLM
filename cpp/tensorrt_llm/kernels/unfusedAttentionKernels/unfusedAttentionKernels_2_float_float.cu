@@ -25,7 +25,6 @@ namespace kernels
 
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(float, float, KVBlockArray);
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(float, float, KVLinearBuffer);
-INSTANTIATE_SPARSE_KV_CACHE_COMPACT_V2_LAYERS(float);
 
 } // namespace kernels
 

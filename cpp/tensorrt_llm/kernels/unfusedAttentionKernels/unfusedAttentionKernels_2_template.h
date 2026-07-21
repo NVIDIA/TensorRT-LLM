@@ -1756,70 +1756,6 @@ void invokeUpdateCyclicKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-//! Layered KVCacheManagerV2 layout policy for the existing sparse-KV updater.
-//! blockIdx.x selects an independent per-layer pool view. Layers in this launch
-//! share one V2 block-offset table and the production FMHA updater copy loop.
-struct KvCacheV2LayersBuffer
-{
-    int64_t const* poolPointers;
-    int32_t const* pageTable;
-    int32_t const* sourceLayerIndices;
-    int64_t sourceLayerStride;
-    // Head-plane stride of the packed move-source indices. The move buffers
-    // may be wider than one round's move count, so the stride comes from the
-    // host-side allocation width, not from the last source-offsets entry.
-    int64_t sourceHeadStride;
-    int64_t pageTableRequestStride;
-    int32_t tokensPerBlock;
-    int32_t const* destinationBases;
-    size_t bytesPerPage;
-    size_t bytesPerKvHalf;
-
-    __device__ __forceinline__ uint8_t* getPool() const
-    {
-        return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(poolPointers[blockIdx.x]));
-    }
-
-    // KVCacheManagerV2 block offsets encode page and K/V plane as
-    // 2*page + plane (K = 2p, V = 2p + 1); this table carries the K plane,
-    // so dividing by 2 recovers the page for both halves.
-    __device__ __forceinline__ void* getKBlockPtr(int32_t batchIdx, int32_t tokenIdx) const
-    {
-        int32_t const blockOffset = pageTable[batchIdx * pageTableRequestStride + tokenIdx / tokensPerBlock];
-        int32_t const page = blockOffset / 2;
-        return getPool() + static_cast<size_t>(page) * bytesPerPage;
-    }
-
-    __device__ __forceinline__ void* getVBlockPtr(int32_t batchIdx, int32_t tokenIdx) const
-    {
-        int32_t const blockOffset = pageTable[batchIdx * pageTableRequestStride + tokenIdx / tokensPerBlock];
-        int32_t const page = blockOffset / 2;
-        return getPool() + static_cast<size_t>(page) * bytesPerPage + bytesPerKvHalf;
-    }
-
-    __device__ __forceinline__ int32_t getKVLocalIdx(
-        int32_t tokenIdx, int32_t headIdx, int32_t valuesPerHead, int32_t headValueIdx) const
-    {
-        return (headIdx * tokensPerBlock + (tokenIdx % tokensPerBlock)) * valuesPerHead + headValueIdx;
-    }
-
-    __device__ __forceinline__ int32_t getSparseKvSourceToken(
-        int32_t const* sourceIndices, int32_t headIdx, int32_t globalMove) const
-    {
-        int32_t const layer
-            = sourceLayerIndices == nullptr ? static_cast<int32_t>(blockIdx.x) : sourceLayerIndices[blockIdx.x];
-        int64_t const offset = static_cast<int64_t>(layer) * sourceLayerStride
-            + static_cast<int64_t>(headIdx) * sourceHeadStride + globalMove;
-        return sourceIndices[offset];
-    }
-
-    __device__ __forceinline__ int32_t getSparseKvDestinationToken(int32_t batchIdx, int32_t requestMove) const
-    {
-        // Per-request landing positions: cohorts may mix prompt lengths.
-        return destinationBases[batchIdx] + requestMove;
-    }
-};
-
 #ifdef ENABLE_BF16
 
 // Optimized bf16 compaction fast path, ported from Fanrong Li's optimized
@@ -1932,7 +1868,7 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
         return;
     }
 
-    // Layer resolution matches KvCacheV2LayersBuffer::getSparseKvSourceToken:
+    // Layer resolution rule shared with the packed move-source layout:
     // without an explicit map, launch layer i reads source plane i (the flat
     // layout passes sourceLayerStride == 0, which collapses the term).
     int32_t const sourceLayer = params.sourceLayerIndices == nullptr ? layerIdx : params.sourceLayerIndices[layerIdx];
@@ -2432,28 +2368,6 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int32_t HeadDim, typename T>
-void launchSparseKvCacheCompactV2Layers(
-    QKVPreprocessingParams<T, KvCacheV2LayersBuffer> params, int32_t numLayers, cudaStream_t stream)
-{
-    constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / 16;
-    constexpr int32_t kDefaultSharedMemoryBytes = 48 * 1024;
-    constexpr int32_t kSharedBytesPerToken = 2 * kVectorsPerHead * sizeof(uint4);
-    constexpr bool kUseRegisterStaging = (HeadDim == 64 || HeadDim == 128) && sizeof(T) == 2;
-    constexpr int32_t kVectorThreads = kUseRegisterStaging ? kVectorsPerHead : 32;
-    constexpr int32_t kTokensPerTile
-        = kUseRegisterStaging ? 16 : (kSharedBytesPerToken * 32 <= kDefaultSharedMemoryBytes ? 32 : 16);
-    constexpr int32_t kBlockSize = kVectorThreads * kTokensPerTile;
-    static_assert(kSharedBytesPerToken * kTokensPerTile <= kDefaultSharedMemoryBytes);
-    dim3 const block(kVectorThreads, kTokensPerTile);
-    dim3 const grid(numLayers, params.kv_head_num, params.batch_size);
-    size_t const sharedBytes = kUseRegisterStaging ? 0 : 2 * block.y * kVectorsPerHead * sizeof(uint4);
-    updateSparseKvCacheAfterFmha<T, T, kBlockSize, HeadDim, KvCacheV2LayersBuffer, true>
-        <<<grid, block, sharedBytes, stream>>>(params);
-}
-
 template <typename T>
 void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
     int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
@@ -2464,13 +2378,11 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
 #ifdef ENABLE_BF16
     if constexpr (std::is_same_v<T, __nv_bfloat16>)
     {
-        // Production path for bf16 pools with head size 64/128 and 32/128-token
-        // pages: the pipelined kernels won the A/B comparison against the
-        // register-staging kernel everywhere (verified 2026-07-20: 1.47x at
-        // batch 1, 1.09-1.30x at batch 32, 1.09-1.13x at batch 256, with
-        // byte-identical outputs), so they dispatch unconditionally here. The
-        // register-staging path below remains only as the fallback for other
-        // dtypes and geometries.
+        // The pipelined kernels are the only shipped path: they won the A/B
+        // comparison against the retired register-staging kernel everywhere
+        // (verified 2026-07-20: 1.47x at batch 1, 1.09-1.30x at batch 32,
+        // 1.09-1.13x at batch 256, byte-identical outputs). Unsupported pool
+        // dtypes and geometries fail the check below instead of falling back.
         if ((headDim == 64 || headDim == 128) && (tokensPerBlock == 32 || tokensPerBlock == 128))
         {
             SparseKvCacheCompactV2Bf16Params fastParams{};
@@ -2509,35 +2421,10 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
     }
 #endif // ENABLE_BF16
 
-    KvCacheV2LayersBuffer buffer{};
-    buffer.poolPointers = poolPointers;
-    buffer.pageTable = pageTable;
-    buffer.sourceLayerIndices = sourceLayerIndices;
-    buffer.sourceLayerStride = sourceLayerStride;
-    buffer.sourceHeadStride = sourceHeadStride;
-    buffer.pageTableRequestStride = pageTableRequestStride;
-    buffer.tokensPerBlock = tokensPerBlock;
-    buffer.destinationBases = destinationBases;
-    buffer.bytesPerKvHalf = static_cast<size_t>(numKvHeads) * tokensPerBlock * headDim * sizeof(T);
-    buffer.bytesPerPage = 2 * buffer.bytesPerKvHalf;
-
-    QKVPreprocessingParams<T, KvCacheV2LayersBuffer> params{};
-    params.kv_cache_buffer = buffer;
-    params.sparse_kv_indices = sparseKvIndices;
-    params.sparse_kv_offsets = sparseKvOffsets;
-    params.batch_size = batchSize;
-    params.kv_head_num = numKvHeads;
-    params.size_per_head = headDim;
-
-    switch (headDim)
-    {
-    case 16: launchSparseKvCacheCompactV2Layers<16>(params, numLayers, stream); break;
-    case 32: launchSparseKvCacheCompactV2Layers<32>(params, numLayers, stream); break;
-    case 64: launchSparseKvCacheCompactV2Layers<64>(params, numLayers, stream); break;
-    case 128: launchSparseKvCacheCompactV2Layers<128>(params, numLayers, stream); break;
-    case 256: launchSparseKvCacheCompactV2Layers<256>(params, numLayers, stream); break;
-    default: TLLM_CHECK_WITH_INFO(false, "Sparse KV compaction does not support head size %d", headDim);
-    }
+    TLLM_CHECK_WITH_INFO(false,
+        "Sparse KV compaction ships only the pipelined bf16 kernels (head size 64/128, page size 32/128 "
+        "tokens); got element size %zu, head size %d, %d tokens per page",
+        sizeof(T), headDim, tokensPerBlock);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

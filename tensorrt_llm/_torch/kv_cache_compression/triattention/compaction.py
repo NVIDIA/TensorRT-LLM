@@ -31,7 +31,7 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
-_SUPPORTED_POOL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_SUPPORTED_POOL_DTYPES = (torch.bfloat16,)
 
 
 class _CppCompactGroup(NamedTuple):
@@ -112,8 +112,7 @@ def _validated_kv_head_count(
         for layer in layers
     ):
         raise ValueError(
-            f"{what} requires contiguous interleaved BF16/FP16/FP32 pools "
-            "with one common KV-head count"
+            f"{what} requires contiguous interleaved BF16 pools with one common KV-head count"
         )
     return num_kv_heads
 

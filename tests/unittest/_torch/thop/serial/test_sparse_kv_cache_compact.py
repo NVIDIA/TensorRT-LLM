@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the layered V2 adapter over the existing sparse-KV updater."""
+"""Tests for the layered V2 sparse-KV compaction op (pipelined bf16 kernels)."""
 
 from typing import NamedTuple, Optional
 
@@ -10,20 +10,19 @@ import torch
 
 import tensorrt_llm  # noqa: F401  # Register torch.ops.trtllm operators.
 
-_TOKENS_PER_BLOCK = 4
+_TOKENS_PER_BLOCK = 32
 _NUM_KV_HEADS = 2
 _BATCH_SIZE = 2
 _MAX_PAGES_PER_SEQUENCE = 3
 _NUM_PAGES = _BATCH_SIZE * _MAX_PAGES_PER_SEQUENCE
 _PAGE_INDEX_DIVISOR = 2
 
-# Kernel-name substrings for the profiler probes below: the pipelined bf16
-# kernel dispatches unconditionally on eligible geometry, the register-staging
-# kernel covers everything else. The byte-compare tests would pass no matter
-# which kernel ran, so the probes pin down that the dispatch gate routes each
-# case to the intended kernel.
+# Kernel-name substrings for the profiler probes below. The pipelined bf16
+# kernels are the only shipped compaction path; the retired register-staging
+# kernel (still present for the sparse-attention updater) must never appear
+# in this op's launches.
 _FAST_KERNEL_NAME = "sparseKvCacheCompactV2Bf16PipelineKernel"
-_EXISTING_KERNEL_NAME = "updateSparseKvCacheAfterFmha"
+_RETIRED_KERNEL_NAME = "updateSparseKvCacheAfterFmha"
 
 
 def _encode_k_block_offsets(
@@ -181,12 +180,8 @@ def _compact(
 @pytest.mark.parametrize(
     "dtype,head_dim",
     [
-        (torch.float16, 16),
-        (torch.bfloat16, 32),
-        (torch.float32, 64),
-        (torch.float16, 128),
-        (torch.bfloat16, 256),
-        (torch.float32, 256),
+        (torch.bfloat16, 64),
+        (torch.bfloat16, 128),
     ],
 )
 @pytest.mark.parametrize(
@@ -538,18 +533,25 @@ def test_sparse_kv_cache_compact_layers_fast_geometry_per_layer_source():
         (torch.bfloat16, 64, 16),  # page size outside the gate
     ],
 )
-def test_sparse_kv_cache_compact_layers_fast_gate_fallback(dtype, head_dim, tokens_per_block):
-    # Near-miss geometries must fall back to the register-staging kernel and
-    # stay byte-correct. The profiler probe proves the gate actually rejected
-    # the case: a gate widened by accident would hand the pipelined kernel a
-    # geometry it was never built for.
+def test_sparse_kv_cache_compact_layers_rejects_unsupported_geometry(
+    dtype, head_dim, tokens_per_block
+):
+    # There is no fallback kernel: near-miss geometries must fail loudly
+    # instead of silently degrading, and the pools must stay untouched.
     case = _make_fast_geometry_case(head_dim, tokens_per_block, dtype=dtype)
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
-        expected = _run_fast_geometry_case(case)
-    names = [event.name for event in profiler.events()]
-    assert any(_EXISTING_KERNEL_NAME in name for name in names)
-    assert not any(_FAST_KERNEL_NAME in name for name in names)
-    for actual, reference in zip(case.pools, expected):
+    arguments = _device_arguments(
+        case.pools, case.source_indices, case.source_offsets, case.source_layer_indices
+    )
+    with pytest.raises((RuntimeError, ValueError), match="bf16|BF16"):
+        _compact(
+            case.pools,
+            case.page_tables,
+            arguments,
+            case.destination_bases,
+            batch_size=case.batch_size,
+        )
+    torch.cuda.synchronize()
+    for actual, reference in zip(case.pools, case.pools_cpu):
         assert torch.equal(actual.cpu(), reference)
 
 
@@ -565,4 +567,4 @@ def test_sparse_kv_cache_compact_layers_fast_path_actually_runs(head_dim, tokens
         _run_fast_geometry_case(case)
     names = [event.name for event in profiler.events()]
     assert any(_FAST_KERNEL_NAME in name for name in names)
-    assert not any(_EXISTING_KERNEL_NAME in name for name in names)
+    assert not any(_RETIRED_KERNEL_NAME in name for name in names)

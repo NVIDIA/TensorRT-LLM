@@ -77,8 +77,8 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
         pageTable.get_device() == device, "sparse_kv_cache_compact_layers: block offsets must be on the pool device");
 
     TORCH_CHECK(poolPointers.is_cuda() && poolPointers.get_device() == device
-            && poolPointers.scalar_type() == th::kInt64 && poolPointers.dim() == 1
-            && poolPointers.size(0) == numLayers && poolPointers.is_contiguous(),
+            && poolPointers.scalar_type() == th::kInt64 && poolPointers.dim() == 1 && poolPointers.size(0) == numLayers
+            && poolPointers.is_contiguous(),
         "sparse_kv_cache_compact_layers: pool_pointers must be contiguous CUDA int64 [num_layers]");
 
     TORCH_CHECK(sourceIndices.is_cuda() && sourceIndices.get_device() == device
@@ -138,23 +138,12 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
             sourceLayerPtr, sourceLayerStride, sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize,
             numKvHeads, tokensPerBlock, headDim, stream);
     }
-    else if (dtype == th::kHalf)
-    {
-        tk::invokeSparseKvCacheCompactV2Layers<half>(poolPointers.data_ptr<int64_t>(), pageTable.data_ptr<int32_t>(),
-            numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(), sourceLayerPtr, sourceLayerStride,
-            sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim,
-            stream);
-    }
-    else if (dtype == th::kFloat)
-    {
-        tk::invokeSparseKvCacheCompactV2Layers<float>(poolPointers.data_ptr<int64_t>(), pageTable.data_ptr<int32_t>(),
-            numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(), sourceLayerPtr, sourceLayerStride,
-            sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim,
-            stream);
-    }
     else
     {
-        TORCH_CHECK(false, "sparse_kv_cache_compact_layers: unsupported pool dtype ", dtype);
+        TORCH_CHECK(false,
+            "sparse_kv_cache_compact_layers ships only the pipelined bf16 kernels (head size 64/128, page size "
+            "32/128 tokens); got pool dtype ",
+            dtype);
     }
 }
 
