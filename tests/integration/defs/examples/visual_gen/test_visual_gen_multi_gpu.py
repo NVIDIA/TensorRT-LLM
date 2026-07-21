@@ -79,12 +79,11 @@ WAN22_LPIPS_TP_VARIANTS = [
 WAN22_LPIPS_MULTINODE_WORLD_SIZE = 16
 WAN22_LPIPS_MULTINODE_NODES = 2
 WAN22_LPIPS_MULTINODE_GPUS_PER_NODE = 8
-WAN22_LPIPS_MULTINODE_VARIANTS = [
-    (
-        "cfg2_attn2d_2x2_ulysses2",
-        {"cfg_size": 2, "attn2d_size": (2, 2), "ulysses_size": 2},
-    ),
-]
+WAN22_LPIPS_MULTINODE_PARALLEL = {
+    "cfg_size": 2,
+    "attn2d_size": (2, 2),
+    "ulysses_size": 2,
+}
 _MULTINODE_SLURM_CHILD_ENV = "TRTLLM_VISUAL_GEN_MULTINODE_SLURM_CHILD"
 
 
@@ -258,7 +257,7 @@ def _ensure_slurm_external_launch_env():
         os.environ.pop(var, None)
 
 
-def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
+def _run_wan22_multinode_slurm_rank(tmp_path):
     rank_env = _slurm_rank_env()
     if rank_env is None:
         pytest.skip("This VisualGen multi-node case must run under SLURM rank env")
@@ -272,7 +271,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
         )
 
     _ensure_slurm_external_launch_env()
-    _parallel_config(**parallel).validate_world_size(world_size)
+    _parallel_config(**WAN22_LPIPS_MULTINODE_PARALLEL).validate_world_size(world_size)
     model_path = _lpips_model_path("Wan2.2-T2V-A14B-Diffusers")
     _skip_if_missing(model_path, "Wan 2.2 checkpoint", is_dir=True)
 
@@ -284,7 +283,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
         compilation_config=CompilationConfig(skip_warmup=True),
         torch_compile_config=TorchCompileConfig(enable=False),
         attention_config=AttentionConfig(backend="FA4"),
-        parallel_config=parallel,
+        parallel_config=WAN22_LPIPS_MULTINODE_PARALLEL,
     )
 
     visual_gen = None
@@ -311,7 +310,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
         assert output.error is None, f"unexpected error on Wan 2.2 multi-node run: {output.error}"
         assert output.video is not None
 
-        generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}_slurm.mp4"
+        generated_path = tmp_path / "wan22_t2v_generated_multinode_slurm.mp4"
         output.save(generated_path, frame_rate=WAN22_LPIPS_FRAME_RATE)
         assert generated_path.is_file(), (
             f"VisualGen multi-node run did not produce {generated_path}"
@@ -322,7 +321,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
         )
         score = _run_lpips_eval(
             tmp_path,
-            f"wan22_t2v_{variant_name}_slurm",
+            "wan22_t2v_multinode_slurm",
             "video",
             WAN22_LPIPS_PROMPT,
             golden_path,
@@ -334,7 +333,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel):
             visual_gen.shutdown()
 
 
-def _run_wan22_multinode_slurm_parent(variant_name):
+def _run_wan22_multinode_slurm_parent():
     if (
         os.environ.get("TLLM_SPAWN_PROXY_PROCESS") == "1"
         and _trtllm_launch_wrapper_world_size() >= WAN22_LPIPS_MULTINODE_WORLD_SIZE
@@ -374,7 +373,7 @@ def _run_wan22_multinode_slurm_parent(variant_name):
         env.pop(var, None)
 
     test_file = str(Path(__file__).resolve())
-    nodeid = f"{test_file}::test_wan22_t2v_lpips_against_golden_multinode_slurm[{variant_name}]"
+    nodeid = f"{test_file}::test_wan22_t2v_lpips_against_golden_multinode_slurm"
     cmd = [
         "srun",
         "-l",
@@ -518,14 +517,9 @@ def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_n
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
 
 
-@pytest.mark.parametrize(
-    "variant_name,parallel",
-    WAN22_LPIPS_MULTINODE_VARIANTS,
-    ids=[name for name, _ in WAN22_LPIPS_MULTINODE_VARIANTS],
-)
-def test_wan22_t2v_lpips_against_golden_multinode_slurm(request, tmp_path, variant_name, parallel):
+def test_wan22_t2v_lpips_against_golden_multinode_slurm(request, tmp_path):
     if _slurm_rank_env() is not None:
-        _run_wan22_multinode_slurm_rank(tmp_path, variant_name, parallel)
+        _run_wan22_multinode_slurm_rank(tmp_path)
         return
 
     if os.environ.get(_MULTINODE_SLURM_CHILD_ENV):
@@ -536,4 +530,4 @@ def test_wan22_t2v_lpips_against_golden_multinode_slurm(request, tmp_path, varia
     # and the bare child pytest invocation has no llm_venv harness to run
     # the fixture (16 ranks racing pip/apt would be unsafe anyway).
     request.getfixturevalue("_visual_gen_deps")
-    _run_wan22_multinode_slurm_parent(variant_name)
+    _run_wan22_multinode_slurm_parent()
