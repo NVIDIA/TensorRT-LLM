@@ -47,7 +47,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
 |---|---|---|---|---|---|---|---|---|---|---|--|--|--|--|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **FLUX.2** [^6] | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
+| **FLUX.2** | Yes | Yes | Yes | Yes | No [^1] | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.1 VSA** [^2] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | Yes [^3] | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
@@ -65,8 +65,6 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
 
-[^6]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, including TeaCache and Cache-DiT. Sequence-parallel configurations require the combined target/reference token count to be divisible across ranks. Other parallel and CUDA Graph combinations remain under qualification.
-
 ## Quick Start
 
 Here is a simple example to generate a video with Wan 2.1:
@@ -76,21 +74,6 @@ python examples/visual_gen/quickstart_example.py
 ```
 
 To learn more about VisualGen, see [`examples/visual_gen/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen) for more examples including text-to-image, image-to-video, and batch generation.
-
-FLUX.2 reference-image generation uses the existing offline `VisualGen` request contract. Set
-`VisualGenParams.image` to an image path, encoded image bytes, or a list of either. See
-[`examples/visual_gen/models/flux2.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/models/flux2.py),
-which accepts one or more `--reference_image` arguments.
-The list is one shared reference set for every prompt in the request, with at most 10 images.
-When `height` or `width` is omitted, it defaults to the first processed reference image's
-corresponding dimension; without references, the FLUX.2 fallback remains 1024×1024.
-TensorRT-LLM retains its existing FLUX.2 guidance default of `3.5`; Diffusers defaults to `4.0`,
-so pass `--guidance_scale 4.0` to the example when matching an otherwise-default Diffusers request.
-
-TeaCache and Cache-DiT support FLUX.2 requests with or without reference images. Reference-image
-generation is currently qualified on one GPU; sequence-parallel configurations additionally require
-the combined target and reference token count to divide evenly across ranks, and fail early otherwise.
-Other parallel and CUDA graph combinations remain under qualification.
 
 ### Usage with `trtllm-serve`
 
