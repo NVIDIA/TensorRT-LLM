@@ -24,6 +24,8 @@ import tempfile
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm.executor.utils import (
     FRONTEND_COUNTER_MASK,
     MAX_NUM_FRONTENDS,
@@ -32,6 +34,10 @@ from tensorrt_llm.executor.utils import (
     get_frontend_id,
     namespace_client_id,
 )
+
+# The CI CPU stages collect with -m "cpu_only and not disabled" and skip
+# files that don't mention pytest.mark.cpu_only (see unittest/conftest.py).
+pytestmark = pytest.mark.cpu_only
 
 
 class TestClientIdNamespacing:
@@ -219,8 +225,6 @@ class TestClassicFrontendProxyEndToEnd:
             )
 
     def test_check_health_and_submit_reflect_fatal_error(self):
-        import pytest
-
         from tensorrt_llm.executor.request import GenerationRequest
         from tensorrt_llm.executor.utils import EngineDeadError
         from tensorrt_llm.sampling_params import SamplingParams
