@@ -8,7 +8,14 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 # Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+# Force a deterministic UCX config regardless of what the cluster/CI injects;
+# see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ.pop("UCX_NET_DEVICES", None)
+# Limit NIXL busy-polling progress threads; see test_kv_transfer.py for the
+# full rationale (intermittent 120s timeouts on shared CI nodes,
+# https://nvbugs/6426834).
+os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "1")
 
 import tensorrt_llm
 import tensorrt_llm.bindings

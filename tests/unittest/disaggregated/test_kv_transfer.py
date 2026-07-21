@@ -5,8 +5,24 @@ import random
 import time
 import uuid
 
-# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+# Force a deterministic UCX config regardless of what the cluster/CI injects
+# (enroot may inject UCX_TLS=rc_v,sm + UCX_NET_DEVICES=mlx5_*; the CI agent
+# bootstrap exports UCX_TLS=tcp,cuda_copy,cuda_ipc):
+# - exclude IB (no fabric assumed) and gdr_copy (UCX rcache SIGABRT at
+#   teardown);
+# - drop UCX_NET_DEVICES, otherwise with ^ib the remaining transports cannot
+#   use the injected mlx5_* device list and UCX fails with "no active
+#   messages transport".
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ.pop("UCX_NET_DEVICES", None)
+# Each NIXL agent spawns TRTLLM_NIXL_NUM_THREADS (default 8) busy-polling
+# progress threads, and a single case builds up to 8 TransferWorkers (one per
+# rank). On CI nodes shared with other single-GPU jobs the resulting CPU
+# oversubscription inflates agent construction from ~3s to ~30s each, blowing
+# the 120s per-test timeout intermittently (https://nvbugs/6426834). One
+# progress thread is enough here: these tests verify transfer logic, not
+# transfer-engine threading.
+os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "1")
 from dataclasses import dataclass
 from typing import List, Optional
 
