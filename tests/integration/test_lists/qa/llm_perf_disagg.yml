@@ -127,10 +127,9 @@ llm_perf_disagg:
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v32-fp4_8k1k_con4096_ctx1_dep4_gen1_dep32_eplb256_mtp0_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v32-fp4_8k1k_con4096_ctx1_dep4_gen1_dep32_eplb256_mtp0_ccb-UCX] TIMEOUT (120)
   # GB300 DeepSeek-V4-Pro
-  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
-  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
-  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
-  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con1229_ctx7_dep4_gen1_dep8_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx8_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con2_ctx1_dep4_gen5_tep4_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
   # GB300 Kimi-K2.5-Thinking
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_1k1k_con2048_ctx1_dep4_gen1_dep32_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_1k1k_con4096_ctx1_dep4_gen1_dep8_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
