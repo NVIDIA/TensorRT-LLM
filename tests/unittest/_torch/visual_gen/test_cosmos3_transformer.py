@@ -497,3 +497,60 @@ class TestConfigCompatDefaults:
         snapshot = vars(config).copy()
         apply_pretrained_config_compat_defaults(config)
         assert vars(config) == snapshot
+
+
+class TestI2V4StepConfigShape:
+    """The Image2Video-4Step conversion drops the audio/action towers
+    (``sound_dim: null``, no ``action_*`` keys) and carries newer schema
+    fields (``qk_norm_for_text``, ``hidden_act``, nested ``rope_theta``).
+    The transformer must construct from that exact key set. CPU-only with
+    shrunk dimensions; the real 64B shape is covered by the checkpoint
+    integration test."""
+
+    def _reduced_i2v_config(self) -> SimpleNamespace:
+        # Key set mirrors the checkpoint's transformer/config.json verbatim;
+        # only the sizes are reduced (head_dim 8 -> mrope_section sums to 4).
+        return SimpleNamespace(
+            attention_bias=False,
+            attention_dropout=0.0,
+            base_fps=16,
+            enable_fps_modulation=True,
+            head_dim=8,
+            hidden_act="silu",
+            hidden_size=32,
+            intermediate_size=64,
+            latent_channel=4,
+            latent_patch_size=2,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            num_key_value_heads=2,
+            patch_latent_dim=16,
+            qk_norm_for_text=True,
+            rms_norm_eps=1e-6,
+            rope_axes_dim=[2, 1, 1],
+            rope_scaling={
+                "mrope_interleaved": True,
+                "mrope_section": [2, 1, 1],
+                "rope_theta": 5000000,
+                "rope_type": "default",
+            },
+            rope_theta=5000000,
+            sound_dim=None,
+            sound_gen=False,
+            sound_latent_fps=25,
+            timestep_scale=0.001,
+            unified_3d_mrope_reset_spatial_ids=True,
+            unified_3d_mrope_temporal_modality_margin=15000,
+            vocab_size=64,
+        )
+
+    def test_constructs_without_audio_or_action_towers(self):
+        model_config = DiffusionModelConfig(pretrained_config=self._reduced_i2v_config())
+        model = Cosmos3VFMTransformer(model_config)
+
+        assert model.audio_gen is False
+        assert model.action_gen is False
+        assert not hasattr(model, "audio2llm")
+        assert not hasattr(model, "audio_modality_embed")
+        assert model.base_fps == 16
+        assert len(model.gen_layers) == 2

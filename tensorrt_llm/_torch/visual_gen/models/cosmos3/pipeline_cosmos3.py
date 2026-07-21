@@ -65,6 +65,7 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
         "nvidia/Cosmos3-Nano",
         "nvidia/Cosmos3-Super",
         "nvidia/Cosmos3-Super-Image2Video",
+        "nvidia/Cosmos3-Super-Image2Video-4Step",
         "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Text2Image-4Step",
     ],
@@ -537,6 +538,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         velocity_mask = 1.0 - condition_mask
         return latents, velocity_mask, image_latent
 
+    def _conditioning_anchor_post_step(self, image_latent: Optional[torch.Tensor]):
+        """Per-step re-anchor of the conditioned frame for distilled sampling.
+
+        The distilled FlowMatchEuler step is stochastic: it re-noises every
+        position, including the frame the velocity mask holds still, so the
+        conditioning frame the model reads as clean context degrades from step
+        2 on. Writing the clean latent back after every scheduler step keeps
+        it clean (diffusers' distilled loop re-anchors the same way).
+        Deterministic UniPC steps never move a zero-velocity frame, so base
+        checkpoints need no per-step anchor and keep their exact behavior.
+
+        Returns a ``post_step_fn`` for ``BasePipeline.denoise``, or ``None``
+        when no anchoring is needed.
+        """
+        if not self.sampling.is_distilled or image_latent is None:
+            return None
+
+        def post_step_fn(latents: torch.Tensor) -> torch.Tensor:
+            # In-place: writes one latent frame, no full-tensor copies.
+            latents[:, :, 0:1] = image_latent
+            return latents
+
+        return post_step_fn
+
     # =========================================================================
     # VAE decode
     # =========================================================================
@@ -649,6 +674,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # rebuilt the scheduler with shift=3.0.
             self.scheduler = self.sampling.set_flow_shift(
                 self.scheduler, self.sampling.checkpoint_flow_shift
+            )
+
+        # Weight-presence guard, not workflow policy: the request explicitly
+        # asks for audio, but the checkpoint ships no audio tower. Silently
+        # returning a silent video would hide the capability limit.
+        if enable_audio and not self.audio_gen:
+            raise ValueError(
+                "enable_audio=True, but this checkpoint has no audio tower "
+                "(transformer config declares sound_gen=false). Drop enable_audio "
+                "or use an audio-capable Cosmos3 checkpoint."
             )
 
         if isinstance(prompt, str):
@@ -856,6 +891,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             extra_streams=extra_streams,
             guidance_interval=guidance_interval,
             scheduler_step_kwargs=self.sampling.scheduler_step_kwargs(generator),
+            post_step_fn=self._conditioning_anchor_post_step(image_latent),
         )
 
         if extra_streams is not None:
@@ -872,8 +908,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         decode_start = time.time()
 
         if image_latent is not None:
-            latents = latents.clone()
-            latents[:, :, 0:1, :, :] = image_latent.to(device=latents.device, dtype=latents.dtype)
+            # In-place: the loop output is consumed only by the decode below.
+            latents[:, :, 0:1] = image_latent
 
         video = self.decode_latents(latents, self._decode_latents)
 

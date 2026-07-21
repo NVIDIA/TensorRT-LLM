@@ -542,6 +542,227 @@ class TestDistilledDenoiseLoop:
         assert torch.all(result == 2.0)
 
 
+class _PerturbingScheduler(_AdditiveScheduler):
+    """step(v, t, x) = x + v + 1.0 — every position moves every step even
+    where the velocity is zero, emulating the distilled SDE step's
+    re-noising. A conditioned frame stays clean only if something re-anchors
+    it after each step."""
+
+    def step(self, model_output, timestep, sample, return_dict=False):
+        assert return_dict is False
+        return (sample + model_output + 1.0,)
+
+
+class TestDistilledConditioningAnchor:
+    """Per-step re-anchoring of image-conditioned frames under SDE sampling."""
+
+    CLEAN = 7.0  # conditioned-frame latent value; drift is detected against it
+
+    def _clean_frame(self):
+        return torch.full((1, 4, 1, 2, 2), self.CLEAN)
+
+    def test_anchor_gating(self):
+        image_latent = self._clean_frame()
+        distilled = _bare_pipeline(sampling=_distilled_policy())
+        assert callable(distilled._conditioning_anchor_post_step(image_latent))
+        assert distilled._conditioning_anchor_post_step(None) is None
+        assert (
+            _bare_pipeline(sampling=_base_policy())._conditioning_anchor_post_step(image_latent)
+            is None
+        )
+        assert _bare_pipeline()._conditioning_anchor_post_step(image_latent) is None
+
+    def test_anchor_writes_only_frame_zero_in_place(self):
+        pipeline = _bare_pipeline(sampling=_distilled_policy())
+        post_step_fn = pipeline._conditioning_anchor_post_step(self._clean_frame())
+
+        latents = torch.arange(48, dtype=torch.float32).reshape(1, 4, 3, 2, 2)
+        untouched = latents[:, :, 1:].clone()
+        returned = post_step_fn(latents)
+
+        assert returned is latents, "must write in place, not copy"
+        assert torch.all(latents[:, :, 0:1] == self.CLEAN)
+        assert torch.equal(latents[:, :, 1:], untouched)
+
+    def _run_denoise(self, with_anchor: bool):
+        """Run the real BasePipeline.denoise loop with a perturbing scheduler,
+        recording what the transformer receives at every step."""
+        pipeline = _denoise_ready_pipeline()
+        pipeline.sampling = _distilled_policy()
+        timesteps = torch.tensor([s * 1000.0 for s in DISTILLED_SIGMAS])
+        scheduler = _PerturbingScheduler(timesteps)
+
+        seen = []
+
+        def forward_fn(latent_input, extra_streams, step_index, timestep, embeds, extras):
+            seen.append(latent_input.clone())
+            return torch.full_like(latent_input, 0.5)
+
+        latents = torch.zeros(1, 4, 3, 2, 2)
+        latents[:, :, 0:1] = self.CLEAN  # frame 0 pinned clean, rest noise-like
+        image_latent = self._clean_frame()
+
+        post_step_fn = (
+            pipeline._conditioning_anchor_post_step(image_latent) if with_anchor else None
+        )
+        result = pipeline.denoise(
+            latents=latents,
+            scheduler=scheduler,
+            prompt_embeds=torch.arange(8).unsqueeze(0),
+            neg_prompt_embeds=torch.arange(8).unsqueeze(0) + 100,
+            guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            forward_fn=forward_fn,
+            extra_cfg_tensors={},
+            post_step_fn=post_step_fn,
+        )
+        return result, seen
+
+    def test_every_forward_sees_clean_conditioned_frame(self):
+        result, seen = self._run_denoise(with_anchor=True)
+
+        assert len(seen) == 4
+        for step, latent_input in enumerate(seen):
+            assert torch.all(latent_input[:, :, 0:1] == self.CLEAN), (
+                f"transformer input at step {step} lost the clean conditioning frame"
+            )
+        # The perturbing step really moved everything else: unconditioned
+        # frames accumulate (velocity 0.5 + drift 1.0) per completed step.
+        for step, latent_input in enumerate(seen):
+            assert torch.all(latent_input[:, :, 1:] == step * 1.5)
+        assert torch.all(result[:, :, 0:1] == self.CLEAN)
+        assert torch.all(result[:, :, 1:] == 4 * 1.5)
+
+    def test_without_anchor_the_conditioned_frame_drifts(self):
+        """Control: the same loop without the anchor corrupts frame 0 from the
+        second forward on — the exact failure mode the anchor exists for."""
+        _, seen = self._run_denoise(with_anchor=False)
+
+        assert torch.all(seen[0][:, :, 0:1] == self.CLEAN)
+        for step, latent_input in enumerate(seen[1:], start=1):
+            assert torch.all(latent_input[:, :, 0:1] == self.CLEAN + step * 1.5)
+
+
+class TestForwardConditioningWiring:
+    """forward() must hand the denoise loop the anchor exactly when the
+    checkpoint is distilled and the request carries image conditioning."""
+
+    T_LAT, H_LAT, W_LAT = 2, 2, 2  # from num_frames=5, 32x32, scale 4/16
+    CLEAN = 7.0
+
+    def _forward_ready_pipeline(self):
+        pipeline = _bare_pipeline(
+            sampling=_distilled_policy(),
+            pipeline_config=SimpleNamespace(torch_dtype=torch.float32, visual_gen_mapping=None),
+            transformer=SimpleNamespace(
+                latent_channel_size=4,
+                reset_cache=lambda: None,
+                device=torch.device("cpu"),
+            ),
+            vae_scale_factor_temporal=4,
+            vae_scale_factor_spatial=16,
+            scheduler=SimpleNamespace(
+                set_timesteps=lambda *args, **kwargs: None,
+                config=SimpleNamespace(num_train_timesteps=1000),
+            ),
+        )
+        pipeline._tokenize_prompt = lambda *args, **kwargs: (
+            torch.ones(1, 4, dtype=torch.long),
+            torch.ones(1, 4, dtype=torch.long),
+        )
+        pipeline._encode_conditioning_video = lambda *args, **kwargs: torch.full(
+            (1, 4, self.T_LAT, self.H_LAT, self.W_LAT), self.CLEAN
+        )
+        pipeline.decode_latents = lambda latents, decode_fn: torch.zeros(1, 5, 32, 32, 3)
+
+        captured = {}
+
+        def denoise(**kwargs):
+            captured.update(kwargs)
+            return kwargs["latents"]
+
+        pipeline.denoise = denoise
+        return pipeline, captured
+
+    def _forward(self, pipeline, image):
+        return pipeline.forward(
+            prompt="x",
+            seed=0,
+            image=image,
+            height=32,
+            width=32,
+            num_frames=5,
+            num_inference_steps=4,
+            guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            use_guardrails=False,
+            enable_audio=False,
+        )
+
+    def test_i2v_request_wires_anchor_and_seeded_steps(self):
+        pipeline, captured = self._forward_ready_pipeline()
+        self._forward(pipeline, image=torch.zeros(3, 32, 32))
+
+        post_step_fn = captured["post_step_fn"]
+        assert post_step_fn is not None
+        latents = torch.zeros(1, 4, self.T_LAT, self.H_LAT, self.W_LAT)
+        post_step_fn(latents)
+        assert torch.all(latents[:, :, 0:1] == self.CLEAN)
+        assert torch.all(latents[:, :, 1:] == 0.0)
+
+        assert isinstance(captured["scheduler_step_kwargs"]["generator"], torch.Generator)
+        # Initial latents enter the loop with the clean frame already pinned.
+        assert torch.all(captured["latents"][:, :, 0:1] == self.CLEAN)
+
+    def test_t2v_request_wires_no_anchor(self):
+        pipeline, captured = self._forward_ready_pipeline()
+        self._forward(pipeline, image=None)
+        assert captured["post_step_fn"] is None
+
+
+class TestAudioWeightPresenceGuard:
+    """enable_audio=True must fail loudly when the checkpoint ships no audio
+    tower — a weight-presence guard, not a workflow restriction."""
+
+    def _pipeline(self, **attrs):
+        return _bare_pipeline(sampling=_distilled_policy(), scheduler=None, **attrs)
+
+    def test_explicit_audio_on_audioless_checkpoint_raises(self):
+        with pytest.raises(ValueError, match="audio tower"):
+            self._pipeline().forward(
+                prompt="x",
+                seed=0,
+                use_guardrails=False,
+                enable_audio=True,
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            )
+
+    def test_t2i_disables_audio_before_the_guard(self):
+        """T2I force-disables audio for every checkpoint (existing semantics);
+        the guard must not fire for it. The batch error proves forward got
+        past the guard."""
+        with pytest.raises(ValueError, match="Batch generation"):
+            self._pipeline().forward(
+                prompt=["a", "b"],
+                seed=0,
+                use_guardrails=False,
+                enable_audio=True,
+                output_type="image",
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            )
+
+    def test_audio_capable_checkpoint_passes_the_guard(self):
+        with pytest.raises(ValueError, match="Batch generation"):
+            self._pipeline(audio_gen=True).forward(
+                prompt=["a", "b"],
+                seed=0,
+                use_guardrails=False,
+                enable_audio=True,
+                num_inference_steps=4,
+                guidance_scale=DISTILLED_GUIDANCE_SCALE,
+            )
+
+
 class TestRegistryDispatch:
     def test_model_index_class_name_dispatches(self, tmp_path):
         with open(tmp_path / "model_index.json", "w") as f:
@@ -551,3 +772,4 @@ class TestRegistryDispatch:
     def test_hf_id_registered(self):
         entry = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"]
         assert "nvidia/Cosmos3-Super-Text2Image-4Step" in entry.hf_ids
+        assert "nvidia/Cosmos3-Super-Image2Video-4Step" in entry.hf_ids
