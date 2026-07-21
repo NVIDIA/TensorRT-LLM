@@ -17,98 +17,9 @@
 
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/medusaModule.h"
-#include "tensorrt_llm/runtime/utils/speculativeChoicesUtils.h"
 
 namespace tensorrt_llm::batch_manager
 {
-
-MedusaBuffers::MedusaBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::BufferManager const& manager,
-    runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, runtime::TllmRuntime const& runtime)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_CHECK_WITH_INFO(maxBeamWidth == 1, "Medusa does not support beam search");
-
-    auto const& engine = runtime.getEngine();
-
-    auto const maxNumSequences = maxBatchSize;
-
-    auto const medusaModule = std::dynamic_pointer_cast<tensorrt_llm::runtime::MedusaModule const>(
-        modelConfig.getSpeculativeDecodingModulePtr());
-
-    auto const medusaHeads = medusaModule->getMaxDraftPathLen();
-    auto const maxPathLen = medusaModule->getMaxPathLen();               // medusaHeads + 1
-    auto const maxMedusaTokens = medusaModule->getMaxDecodingDraftTokens();
-    auto const maxDecodingTokens = medusaModule->getMaxDecodingTokens(); // maxMedusaTokens + 1
-    auto const numPackedMasks = medusaModule->getNumPackedMasks();
-
-    auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
-
-    if (worldConfig.isLastPipelineParallelRank())
-    {
-        auto logitsType = engine.getTensorDataType("medusa_logits");
-        medusaLogitsDevice = manager.gpu(
-            ITensor::makeShape({medusaHeads, maxBatchSize, maxDecodingTokens, vocabSizePadded}), logitsType);
-    }
-
-    // Note: reserved for variable sequence length support.
-    medusaGenerationLengthsHost
-        = runtime::BufferManager::pinned(ITensor::makeShape({maxNumSequences}), nvinfer1::DataType::kINT32);
-    // TODO: pack batch and tokensPerStep into one dim to support variable sequence length without padddings.
-    attentionPackedMaskHost = runtime::BufferManager::pinned(
-        ITensor::makeShape({maxNumSequences, maxDecodingTokens, numPackedMasks}), nvinfer1::DataType::kINT32);
-    medusaPositionOffsetsHost = runtime::BufferManager::pinned(
-        ITensor::makeShape({maxNumSequences, maxDecodingTokens}), nvinfer1::DataType::kINT32);
-    medusaTreeIdsHost = runtime::BufferManager::pinned(
-        ITensor::makeShape({maxNumSequences, maxMedusaTokens}), nvinfer1::DataType::kINT32);
-    medusaPathsHost = runtime::BufferManager::pinned(
-        ITensor::makeShape({maxNumSequences, maxDecodingTokens, maxPathLen}), nvinfer1::DataType::kINT32);
-
-    TensorPtr medusaPositionOffsetsHostSlice = ITensor::slice(medusaPositionOffsetsHost, 0, 1);
-    medusaPositionOffsetsHostSlice->squeeze(0);
-    TensorPtr medusaTreeIdsHostSlice = ITensor::slice(medusaTreeIdsHost, 0, 1);
-    medusaTreeIdsHostSlice->squeeze(0);
-    TensorPtr medusaPathsHostSlice = ITensor::slice(medusaPathsHost, 0, 1);
-    medusaPathsHostSlice->squeeze(0);
-    TensorPtr attentionPackedMaskHostSlice = ITensor::slice(attentionPackedMaskHost, 0, 1);
-    attentionPackedMaskHostSlice->squeeze(0);
-
-    // Init buffers for 1 request
-    auto const& choices = decodingConfig.getMedusaChoices().value_or(medusaModule->getMedusaChoices());
-    runtime::utils::initTensorsFromChoices(*medusaModule, choices, mTopKs, medusaGenerationLengthsHost,
-        medusaPositionOffsetsHostSlice, medusaTreeIdsHostSlice, medusaPathsHostSlice, attentionPackedMaskHostSlice);
-
-    auto scatterToBatch = [maxBatchSize, &manager](TensorPtr& data)
-    {
-        auto srcSlice = ITensor::slice(data, 0, 1);
-        // Populate data from the 1st request to the other requests in the batch
-        for (SizeType32 bi = 1; bi < maxBatchSize; ++bi)
-        {
-            auto dstSlice = ITensor::slice(data, bi, 1);
-            manager.copy(*srcSlice, *dstSlice);
-        }
-    };
-
-    scatterToBatch(medusaPositionOffsetsHost);
-    scatterToBatch(medusaTreeIdsHost);
-    scatterToBatch(medusaPathsHost);
-    scatterToBatch(attentionPackedMaskHost);
-
-    // Copy buffers to device
-    // 1st dimension of packed mask is num_total_generation_tokens now (packed without paddings).
-    attentionPackedMaskHost->reshape(ITensor::makeShape({maxNumSequences * maxDecodingTokens, numPackedMasks}));
-    attentionPackedMaskDevice = manager.copyFrom(*attentionPackedMaskHost, runtime::MemoryType::kGPU);
-    medusaGenerationLengthsDevice = manager.copyFrom(*medusaGenerationLengthsHost, runtime::MemoryType::kGPU);
-    medusaPositionOffsetsDevice = manager.copyFrom(*medusaPositionOffsetsHost, runtime::MemoryType::kGPU);
-    medusaTreeIdsDevice = manager.copyFrom(*medusaTreeIdsHost, runtime::MemoryType::kGPU);
-    medusaPathsDevice = manager.copyFrom(*medusaPathsHost, runtime::MemoryType::kGPU);
-
-    // use speculative decoding buffer
-    medusaUseSpecDecoding = manager.cpu(ITensor::makeShape({1}), nvinfer1::DataType::kINT32);
-    runtime::bufferCast<SizeType32>(*medusaUseSpecDecoding)[0] = 1;
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
 
 void MedusaBuffers::reshape(SizeType32 /* numCtxSequences */, SizeType32 numGenSequences, SizeType32 tokensPerStep)
 {

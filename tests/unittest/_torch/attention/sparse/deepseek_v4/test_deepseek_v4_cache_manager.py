@@ -84,6 +84,35 @@ def test_cache_size_estimation_uses_model_attention_layer_count():
     assert cost.intercept == 0
 
 
+def test_mtp_extra_tokens_are_in_context_capacity():
+    cache_manager = object.__new__(DeepseekV4CacheManager)
+    cache_manager.pp_layers = [0]
+    cache_manager._compress_ratios = [1]
+    cache_manager._get_attn_bytes_per_block = lambda _attn_type, _layer_idx: 1
+    cache_manager._get_window_size = lambda _compress_ratio, _attn_type: 128
+    cache_manager.max_batch_size = 1
+    cache_manager.max_seq_len = 264
+    cache_manager._max_num_tokens = 256
+    cache_manager._max_draft_len = 3
+    cache_manager.num_extra_kv_tokens = 2
+    cache_manager.enable_stats = False
+    cache_manager.enable_swa_scratch_reuse = False
+    cache_manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+
+    config = cache_manager._build_cache_config(
+        KvCacheConfig(),
+        tokens_per_block=128,
+        vocab_size=129280,
+        cache_tiers=[GpuCacheTierConfig(quota=1024)],
+    )
+
+    assert config.typical_step is not None
+    assert config.typical_step.kv_caches[0].capacity == 258
+    assert config.typical_step.kv_caches[0].history_length == 0
+    assert config.constraints[1].kv_caches[0].capacity == 258
+    assert config.constraints[1].kv_caches[0].history_length == 0
+
+
 def test_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(DeepseekV4CacheManager)
     manager.pp_layers = [0, 1]
@@ -229,7 +258,7 @@ def test_deepseek_v4_pool_ratio_overrides_typical_step_and_constraints():
         KvCacheConfig(pool_ratio=[0.2, 0.3, 0.5], avg_seq_len=256)
     )
 
-    assert config.initial_pool_ratio == [0.2, 0.3, 0.5]
+    assert config.initial_pool_ratio == pytest.approx([0.2, 0.3, 0.5])
     assert config.typical_step is None
     assert config.constraints == []
 

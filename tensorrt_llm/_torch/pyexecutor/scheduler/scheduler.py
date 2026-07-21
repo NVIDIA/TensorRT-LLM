@@ -116,6 +116,22 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    next_point = min(
+        (point for point in req.expect_snapshot_points if point > req.context_current_position),
+        default=None,
+    )
+    if next_point is None:
+        return req.context_remaining_length
+    next_position = min(next_point, req.prompt_len)
+    return max(0, next_position - req.context_current_position)
+
+
+def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
+    next_position = req.context_current_position + chunk_size
+    return next_position >= req.prompt_len or next_position in req.expect_snapshot_points
+
+
 class ScheduledRequests:
     """Scheduled requests separated into disjoint sets.
 
@@ -664,6 +680,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             all_context_requests_fit = False
 
         if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
+            # Run snapshot-boundary selection even when the full contexts fit.
             all_context_requests_fit = False
 
         # 3. Apply Chunking Strategy if needed
@@ -886,8 +903,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
 
-        Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
-        Requests that would exceed the capacity budget are zeroed out.
+        Requests advance to their next expected snapshot point. With no
+        remaining snapshot point, they consume the full remaining context.
+        Capacity-limited chunks are rounded down to a unit_size multiple.
 
         This policy is designed for linear attention / Mamba2 state caching, which doesn't support
         estimating reusable tokens, so we don't subtract them from the budget.
@@ -899,9 +917,14 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             )
         total_tokens = 0
         for req in requests:
-            req.context_chunk_size = min(req.context_remaining_length, unit_size)
-            if capacity is not None and total_tokens + req.context_chunk_size > capacity:
-                req.context_chunk_size = 0
+            assert isinstance(req.expect_snapshot_points, list)
+            chunk_size = _get_forced_context_chunk_size(req)
+            if self.max_context_length is not None and chunk_size > self.max_context_length:
+                chunk_size = (self.max_context_length // unit_size) * unit_size
+            if capacity is not None and total_tokens + chunk_size > capacity:
+                remaining_capacity = max(0, capacity - total_tokens)
+                chunk_size = (min(chunk_size, remaining_capacity) // unit_size) * unit_size
+            req.context_chunk_size = int(chunk_size)
             total_tokens += req.context_chunk_size
         assert capacity is None or total_tokens <= capacity
 

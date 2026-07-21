@@ -1136,26 +1136,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                         kv_cache_dtype_byte_size)
 
 
-def calc_context_stop_positions(prompt_len: int,
-                                tokens_per_block: int,
-                                mamba_state_cache_interval: int,
-                                save_last_snapshot: bool = False) -> list[int]:
-    """Compute token positions at which mamba state snapshots should be saved.
-
-    Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length (and optionally the last block-aligned position).
-    """
-    stop_positions = list(
-        range(mamba_state_cache_interval, prompt_len,
-              mamba_state_cache_interval))
-    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
-    if save_last_snapshot and (last_ckpt not in stop_positions):
-        stop_positions.append(last_ckpt)
-    if prompt_len not in stop_positions:
-        stop_positions.append(prompt_len)
-    return stop_positions
-
-
 @triton.jit
 def _promote_mamba_state_kernel(
     src_ptr,
@@ -1327,6 +1307,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # accessors (get_mamba_ssm_cache_dtype, use_replay_state_update) work
         # on ranks with no local mamba layers.
         self._use_replay_state_update = use_replay_state_update
+        self._use_gdn_cached_replay_all_layer_commit = (
+            use_replay_state_update and model_type == "qwen3_next"
+            and self.local_num_mamba_layers > 0)
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update else None)
@@ -1363,6 +1346,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
             )
+            # PP ranks replay the same scheduling decisions, so a rank without
+            # local Mamba layers must still publish the configured boundaries.
+            self.kv_cache_config = kv_cache_config
+            self.linear_attention_metadata = LinearAttentionMetadata()
+            self.linear_attention_metadata.states_snapshot_interval = (
+                kv_cache_config.mamba_state_cache_interval
+                if kv_cache_config.enable_block_reuse else 0)
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
@@ -1535,6 +1525,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self._setup_states()
         self._setup_replay_buffers(spec_config)
+        if use_replay_state_update and model_type == "qwen3_next":
+            logger.info_once(
+                "Configured GDN cached replay commit mode: small-batch fused, "
+                "large-batch all-layer",
+                key="gdn_cached_replay_commit_mode_fused",
+            )
 
     @staticmethod
     def get_cache_size_per_token(
@@ -1607,6 +1603,46 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         if mamba_slope > 0:
             intercept = 0
         return attention_slope + mamba_slope, intercept
+
+    @property
+    def use_gdn_cached_replay_all_layer_commit(self) -> bool:
+        return self._use_gdn_cached_replay_all_layer_commit
+
+    def _commit_gdn_cached_replay_history_layers(
+        self,
+        attn_metadata: "AttentionMetadata",
+        num_decodes: int,
+    ) -> None:
+        """Synchronously advance every local GDN checkpoint in one launch."""
+        from tensorrt_llm._torch.modules.fla.cached_replay import (
+            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+            commit_gdn_cached_replay_history_layers)
+
+        if (not self._use_gdn_cached_replay_all_layer_commit
+                or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE):
+            return
+        if (self.all_ssm_states is None or self.old_x is None
+                or self.old_B is None or self.old_dt is None
+                or self.replay_history_size is None):
+            raise RuntimeError(
+                "GDN cached replay all-layer commit requires replay state buffers."
+            )
+
+        mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.replay_num_decodes != num_decodes:
+            raise RuntimeError(
+                "GDN replay metadata contains "
+                f"{mamba_metadata.replay_num_decodes} decode requests, "
+                f"but state update received {num_decodes}.")
+        commit_gdn_cached_replay_history_layers(
+            ssm_states=self.all_ssm_states,
+            old_u=self.old_x,
+            old_k=self.old_B,
+            old_G=self.old_dt,
+            replay_work_items=mamba_metadata.replay_work_items[:num_decodes],
+            n_writes=mamba_metadata.replay_n_writes,
+            history_size=self.replay_history_size,
+        )
 
     def shutdown(self):
         # Release tensor views into the pool before the pool memory is freed,
@@ -1784,6 +1820,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # writes through the view's real strides (~85% of HBM peak, one launch
         # per state).
         if self._use_replay_state_update:
+            # Every GDN layer has finished reading the old checkpoint and
+            # writing its candidate history. Advance all local checkpoints
+            # in one launch before PNAT and the active history buffer change.
+            self._commit_gdn_cached_replay_history_layers(
+                attn_metadata, num_gens)
             # SSM state is handled incrementally by the kernel. Mirror the
             # kernel's checkpoint predicate from the previous PNAT and fixed
             # replay step width: checkpoint steps flip buffers, while no-write
@@ -1854,7 +1895,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # request, so no additional capping is required here.
         interval = (self.linear_attention_metadata.states_snapshot_interval
                     if self.linear_attention_metadata is not None else 0)
-        if interval and interval > 0:
+        # Attention-only PP ranks keep the interval so every rank publishes
+        # identical scheduling boundaries, but they have no recurrent-state
+        # pool whose capacity should constrain their attention KV cache.
+        if self.local_num_mamba_layers > 0 and interval and interval > 0:
             stats = self.impl.get_kv_cache_stats()
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
@@ -1984,15 +2028,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
+        is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(
-            [req.is_dummy for req in self.requests])
+            is_dummy if requests is
+            self.requests else [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        for i, req in enumerate(requests):
-            self._request_id_to_state_index[
-                req.py_request_id] = self._host_state_indices[i].item()
-            self._request_id_to_is_dummy[req.py_request_id] = req.is_dummy
+        # Bulk tolist avoids a per-request tensor-index + .item() round-trip.
+        state_values = self._host_state_indices[:n].tolist()
+        for req, value, dummy in zip(requests, state_values, is_dummy):
+            self._request_id_to_state_index[req.py_request_id] = value
+            self._request_id_to_is_dummy[req.py_request_id] = dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
@@ -2016,38 +2063,23 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return indices
         return self.cuda_state_indices
 
-    def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
-        """Compute the next prefill chunk size for a context request when block reuse is enabled.
-
-        When kv_cache_config.enable_block_reuse is True, context prefill must stop exactly at
-        the positions returned by calc_context_stop_positions (mamba_state_cache_interval boundaries
-        and block boundaries). This returns the chunk_size to use for the next prefill step so
-        that the next stop position is not exceeded.
-
-        Args:
-            request: Context request with prompt_len and context_current_position set.
-
-        Returns:
-            Number of tokens to prefill in the next step (0 if context is already complete).
-        """
-        prompt_len = request.prompt_len
-        current = request.context_current_position
-        if current >= prompt_len:
-            return 0
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        """Set reusable Mamba snapshot boundaries before scheduling."""
         if not self.kv_cache_config.enable_block_reuse:
-            assert current == 0, (
-                "Expected context_current_position to be 0 when block reuse is "
-                f"disabled, but got {current}")
-            return prompt_len - current
-        step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(prompt_len,
-                                                     self.tokens_per_block,
-                                                     step)
-        stop_positions = sorted(set(stop_positions))
-        for pos in stop_positions:
-            if pos > current:
-                return pos - current
-        return prompt_len - current
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        interval = self.linear_attention_metadata.states_snapshot_interval
+        if interval is None or interval <= 0:
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        for request in requests:
+            request.expect_snapshot_points = list(
+                range(interval, request.prompt_len + 1, interval))
 
     def _setup_states(self) -> None:
         # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)

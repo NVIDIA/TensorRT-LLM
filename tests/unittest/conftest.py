@@ -39,7 +39,15 @@ from tensorrt_llm._utils import print_all_stacks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+# Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
+# non-top-level conftest: a repo-root invocation like `pytest tests` loads
+# this file as a NESTED conftest and would fail collection; and not via "-p"
+# in pytest.ini addopts, which imports at preparse, before the ini pythonpath
+# entries are usable). The wrappers below forward to the plugin; hooks are
+# idempotent, so a repo-root run that also dispatches from tests/conftest.py
+# is harmless.
 from test_common import s3_output
+from test_common import session_prefetcher_hooks as _prefetch_hooks
 
 
 def dump_threads(signum, frame):
@@ -47,6 +55,7 @@ def dump_threads(signum, frame):
 
 
 def pytest_configure(config):
+    _prefetch_hooks.pytest_configure(config)
     os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
 
     # avoid thread leak of tqdm's TMonitor
@@ -92,8 +101,6 @@ def pytest_configure(config):
         print_info("PeriodicJUnitXML reporter registered (unittest)")
         print_info(f"  XML path: {periodic_junit_xmlpath}")
         print_info(f"  Batch size: {periodic_batch_size}")
-
-    s3_output.register_plugin(config)
 
 
 @pytest.hookimpl(wrapper=True)
@@ -510,3 +517,11 @@ def setup_ray_cluster() -> Generator[int, None, None]:
     finally:
         if ray.is_initialized():
             ray.shutdown()
+
+
+def pytest_runtest_setup(item):
+    _prefetch_hooks.pytest_runtest_setup(item)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _prefetch_hooks.pytest_sessionfinish(session, exitstatus)

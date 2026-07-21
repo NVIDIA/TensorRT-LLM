@@ -20,7 +20,7 @@ This test:
    (including source, tests, and pyproject.toml)
 2. Creates a venv and installs the package with dev deps
 3. Verifies TRTLLM_AVAILABLE is False and core subsystems work
-4. Runs the copied unit tests from the standalone package's own tests/ dir
+4. Collects the complete copied test tree and runs its standalone unit tests
 
 The venv Python is run with `-I` (isolated mode) to prevent the host env's
 editable TRT-LLM install from leaking in.
@@ -217,11 +217,12 @@ class TestStandalonePackage:
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
     def test_run_unit_tests(self, standalone_package):
-        """Run the copied unit tests from the standalone package's tests/ dir.
+        """Collect every copied test and run the standalone single-GPU tests.
 
         Tests have been import-rewritten to use `paragraf` instead of
         `tensorrt_llm._torch.auto_deploy`, so they run directly against the
-        standalone package.
+        standalone package. Optional TensorRT-LLM tests must skip cleanly when
+        its wheel is not installed.
         """
         python = standalone_package["python"]
         pkg_dir = standalone_package["pkg_dir"]
@@ -286,6 +287,21 @@ class TestStandalonePackage:
             f"stdout:\n{isolation_probe.stdout}\nstderr:\n{isolation_probe.stderr}"
         )
 
+        collection_result = subprocess.run(
+            [python, "-I", "-m", "pytest", tests_dir, "--collect-only", "-q"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=pkg_dir,
+            env=standalone_env,
+        )
+        assert collection_result.returncode == 0, (
+            "The complete standalone test tree must collect without "
+            "TensorRT-LLM installed. Optional tests should skip at module "
+            f"collection.\nstdout:\n{collection_result.stdout[-5000:]}\n"
+            f"stderr:\n{collection_result.stderr[-5000:]}"
+        )
+
         cmd = [
             python,
             "-I",
@@ -330,12 +346,12 @@ class TestStandalonePackage:
             f"Stderr:\n{result.stderr[-3000:]}"
         )
 
-        # Strict: zero test failures — if a test can't pass standalone, it must
-        # be in the EXCLUDE list in create_standalone_package.py
+        # Strict: zero test failures. Tests that require the optional
+        # TensorRT-LLM wheel must use the generated module-level guard.
         assert num_failed == 0, (
             f"{num_failed} test(s) failed in standalone mode!\n"
             f"Summary: {summary_str}\n"
-            f"These tests should be added to EXCLUDE_TEST_FILES in "
+            f"TensorRT-LLM-dependent tests should be guarded in "
             f"create_standalone_package.py.\n"
             f"Failed tests:\n"
             + "\n".join(lin for lin in lines if lin.startswith("FAILED"))
