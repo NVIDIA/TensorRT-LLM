@@ -33,7 +33,6 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_nvfp4_marlin_enabled,
                      replace_parameter_and_save_metadata, unswizzle_sf)
-from .fused_ops.fp8_dynamic_quant import fp8_dynamic_quantize
 
 
 class WeightMode(str, enum.Enum):
@@ -657,15 +656,10 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     input, static_input_scale)
             else:
-                # Dynamic quantization. The fused CUDA op's amax half
-                # (computeFP8QuantizeScale) is SM-underutilized/sync-bound (~6us)
-                # and serializes ahead of the projection GEMM at skinny decode
-                # shapes (M=64), x30 GDN layers. Replace ONLY the amax with a
-                # fused Triton per-tensor amax->scale kernel (1.84x vs the CUDA
-                # fused op under CUDA graph), then the same apply-only op. The
-                # scale/quantized output are bitwise-identical to
-                # torch.ops.tensorrt_llm.quantize_e4m3_per_tensor.
-                qinput, cur_input_scale = fp8_dynamic_quantize(input)
+                # Dynamic quantization
+                qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+                    input)
+                cur_input_scale = cur_input_scale.to(torch.float32)
 
         else:
             qinput = input
