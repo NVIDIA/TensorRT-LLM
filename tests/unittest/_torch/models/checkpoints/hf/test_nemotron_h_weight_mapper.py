@@ -49,7 +49,7 @@ def _make_mapper(
     return mapper
 
 
-def test_nemotron_h_mapper_preserves_smart_panda_w4a16_lm_head_weights():
+def test_nemotron_h_mapper_preserves_w4a16_lm_head_weights_without_input_scale():
     mapper = _make_mapper()
     weight_scale_2 = torch.tensor(0.291 / (448 * 6), dtype=torch.float32)
     weights = {
@@ -66,7 +66,7 @@ def test_nemotron_h_mapper_preserves_smart_panda_w4a16_lm_head_weights():
     assert "lm_head.input_scale" not in mapped
 
 
-def test_nemotron_h_mapper_remaps_smart_panda_w4a16_moe_weights():
+def test_nemotron_h_mapper_remaps_w4a16_moe_weights_without_input_scale():
     mapper = _make_mapper()
     up_prefix = "backbone.layers.1.mixer.experts.0.up_proj"
     down_prefix = "backbone.layers.1.mixer.experts.0.down_proj"

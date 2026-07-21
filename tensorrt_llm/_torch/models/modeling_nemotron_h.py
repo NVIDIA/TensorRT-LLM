@@ -1256,10 +1256,9 @@ class NemotronHMTP(nn.Module):
                                        layer_idx: int):
         """
         Get quantization config for MTP sublayer.
-        The Nano3.5 NVFP4 W4A16 checkpoint stores the MTP body tensors in BF16.
-        The shared MTP head still receives the checkpoint-backed lm_head, so its
-        logits path keeps the lm_head precision instead of inheriting this
-        sublayer override.
+        The MTP body tensors are stored in BF16. The shared MTP head still
+        receives the checkpoint-backed lm_head, so its logits path keeps the
+        lm_head precision instead of inheriting this sublayer override.
         """
         from tensorrt_llm.models.modeling_utils import QuantConfig
 

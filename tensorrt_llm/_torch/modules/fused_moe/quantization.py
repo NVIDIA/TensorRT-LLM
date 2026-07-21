@@ -3388,8 +3388,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
                 f"supported: {supported}.")
 
         # The model config may carry the logical intermediate size while the
-        # NVFP4 weight tensors are padded for kernel alignment, e.g. Nano3.5
-        # uses 1856 logical channels and 1920 stored channels. FlashInfer's
+        # NVFP4 weight tensors are padded for kernel alignment. FlashInfer's
         # CUDA-graph workspace must match the stored tensors.
         b12x_intermediate_size = w2_in_dim
 
