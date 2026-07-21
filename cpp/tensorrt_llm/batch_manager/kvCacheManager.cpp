@@ -2169,7 +2169,20 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
             ? searchRoot->findMatchingBlock(blockKey, true, true)
             : std::make_tuple(false, 0, nullptr);
 
-        if (matchingBlock == nullptr)
+        // Only blocks matching ALL requested tokens at this position are eligible: a
+        // prefix-only match (e.g. cached [A,B,C] vs requested [A,B,C,D,E]) holds KV for
+        // fewer tokens than the requester assumes, and a generation-only receiver has no
+        // context phase to recompute the missing suffix. An exact non-full final block
+        // where all requested tokens match remains valid. Pinning (arbitrary-transfer)
+        // lookups additionally require primary-pool, non-placeholder blocks: they read
+        // primary buffers directly and onboarding from the transceiver path is not
+        // supported yet. isPlaceholder is checked first because isPrimary asserts on
+        // placeholder blocks.
+        bool const fullyMatched
+            = matchingBlock != nullptr && numMatched == static_cast<SizeType32>(blockKey.uniqueTokens.size());
+        bool const transferable
+            = fullyMatched && (!pinBlocks || (!matchingBlock->isPlaceholder() && matchingBlock->isPrimary()));
+        if (!transferable)
         {
             // Roll back any pins taken during this partial walk so callers see a
             // clean miss with no refcount or eviction-queue side-effects.
