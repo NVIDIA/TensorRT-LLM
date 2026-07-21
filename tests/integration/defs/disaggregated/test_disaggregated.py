@@ -58,6 +58,7 @@ class TestConfig:
     cancellation_rate: Optional[int] = None
     cancellation_delay: Optional[float] = None
     concurrency: int = 512
+    accuracy_concurrency: Optional[int] = None
     request_timeout: int = 180
     heartbeat_interval_sec: Optional[int] = None
     inactive_timeout_sec: Optional[int] = None
@@ -2376,7 +2377,8 @@ def run_disaggregated_aiperf(config_file,
                              cwd=None,
                              request_timeout=180,
                              heartbeat_interval_sec: int | None = None,
-                             inactive_timeout_sec: int | None = None):
+                             inactive_timeout_sec: int | None = None,
+                             accuracy_concurrency: Optional[int] = None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2400,8 +2402,12 @@ def run_disaggregated_aiperf(config_file,
         request_timeout: End-to-end disaggregated request timeout in seconds
         heartbeat_interval_sec: Optional worker heartbeat interval override
         inactive_timeout_sec: Optional worker inactivity timeout override
+        accuracy_concurrency: Optional concurrency override for the accuracy phase
     """
     cleanup_output_files()
+    if accuracy_concurrency is not None and accuracy_concurrency <= 0:
+        raise ValueError("accuracy_concurrency must be positive")
+
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
@@ -2513,6 +2519,10 @@ def run_disaggregated_aiperf(config_file,
 
         if accuracy_test:
             accuracy_server_url = f"http://{server_host}:{server_port}"
+            # Keep lm-eval retries from recreating the stress burst while
+            # uncancelled AIPerf backend work finishes naturally.
+            resolved_accuracy_concurrency = (concurrency if accuracy_concurrency
+                                             is None else accuracy_concurrency)
             # Give the proxy time to return its bounded timeout and finish
             # cleanup before lm-eval abandons an individual HTTP attempt. The
             # complete evaluation retains a separate, longer global safety
@@ -2520,7 +2530,7 @@ def run_disaggregated_aiperf(config_file,
             accuracy_test_result, accuracy_value = run_accuracy_test(
                 model_path=model_path,
                 server_url=accuracy_server_url,
-                concurrency=concurrency,
+                concurrency=resolved_accuracy_concurrency,
                 max_retries=3,
                 request_timeout=(request_timeout +
                                  _ACCURACY_CLIENT_TIMEOUT_GRACE_SECS),
@@ -2872,7 +2882,10 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                             request_count=3000,
                             accuracy_threshold=0.72,
                             cancellation_rate=10,
-                            cancellation_delay=0.5),
+                            cancellation_delay=0.5,
+                            accuracy_concurrency=32,
+                            heartbeat_interval_sec=5,
+                            inactive_timeout_sec=10),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
     pytest.param(TestConfig(model_path='GLM-5-NVFP4',
                             test_desc='glm5_nvfp4_tp4_ep4_dp_stress',
@@ -2889,6 +2902,7 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
         speculative_model_path='Zhi-Create-Qwen3-32B-Eagle3',
         cancellation_rate=10,
         cancellation_delay=0.5,
+        accuracy_concurrency=32,
         heartbeat_interval_sec=5,
         inactive_timeout_sec=10),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
@@ -2962,6 +2976,7 @@ def test_disaggregated_stress_test(disaggregated_test_root,
         threshold=test_config.accuracy_threshold,
         cancellation_rate=test_config.cancellation_rate,
         cancellation_delay=test_config.cancellation_delay,
+        accuracy_concurrency=test_config.accuracy_concurrency,
         env=llm_venv._new_env,
         cwd=llm_venv.get_working_directory(),
         request_timeout=test_config.request_timeout,
