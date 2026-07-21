@@ -351,28 +351,18 @@ class MambaPolicy:
         layer_offsets: Dict[int, int],
         overlapping_layers: List[int],
         slot: int,
-        layer_slot0_addresses: Optional[Dict[int, int]] = None,
     ) -> np.ndarray:
-        """Build per-layer pointers for a given pool (conv or SSM) and slot.
-
-        V1 stores states layer-major, so its layer base is derived from the
-        Mamba-local layer offset. V2 stores buffers inside coalesced slot-major
-        pools; its manager-provided slot-0 addresses preserve the per-layer
-        offsets within that physical slot.
-        """
-        ptrs = []
+        """Build per-layer pointers from a pool's affine layer/slot layout."""
         slot_stride_bytes = pool.slot_stride_bytes
+        layer_stride_bytes = pool.layer_stride_bytes
         assert slot_stride_bytes is not None
-        for glid in overlapping_layers:
-            if layer_slot0_addresses is not None:
-                ptrs.append(layer_slot0_addresses[glid] + slot * slot_stride_bytes)
-            else:
-                lid = layer_offsets[glid]
-                ptrs.append(
-                    pool.base_address
-                    + lid * pool.num_slots * pool.slot_bytes
-                    + slot * pool.slot_bytes
-                )
+        assert layer_stride_bytes is not None
+        ptrs = [
+            pool.base_address
+            + layer_offsets[global_layer_id] * layer_stride_bytes
+            + slot * slot_stride_bytes
+            for global_layer_id in overlapping_layers
+        ]
         return np.array(ptrs, dtype=np.int64)
 
     @staticmethod
@@ -458,29 +448,17 @@ class MambaPolicy:
             (self_mlg.conv_states, peer_mlg.conv_states, True),
             (self_mlg.ssm_states, peer_mlg.ssm_states, False),
         ]:
-            self_layer_slot0_addresses = (
-                self_mlg.conv_layer_slot0_addresses
-                if is_conv
-                else self_mlg.ssm_layer_slot0_addresses
-            )
-            peer_layer_slot0_addresses = (
-                peer_mlg.conv_layer_slot0_addresses
-                if is_conv
-                else peer_mlg.ssm_layer_slot0_addresses
-            )
             src_ptrs = MambaPolicy._build_layer_ptrs(
                 self_pool,
                 self_mlg.mamba_layer_offsets,
                 overlapping_layers,
                 src_slot,
-                self_layer_slot0_addresses,
             )
             dst_ptrs = MambaPolicy._build_layer_ptrs(
                 peer_pool,
                 peer_mlg.mamba_layer_offsets,
                 overlapping_layers,
                 dst_slot,
-                peer_layer_slot0_addresses,
             )
 
             src_region = SpecRegion(

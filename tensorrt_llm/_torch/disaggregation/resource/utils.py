@@ -132,11 +132,11 @@ def get_unique_pool_memory_descs(
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if isinstance(lg, MambaLayerGroup):
-            is_v2_layout = (
-                lg.conv_layer_slot0_addresses is not None
-                or lg.ssm_layer_slot0_addresses is not None
-            )
-            if is_v2_layout:
+            # V2 Mamba layer groups reference manager-owned physical pools.
+            # V1 Mamba state views are standalone and use the first invalid
+            # pool-group index after the attention groups.
+            has_physical_pool_group = 0 <= int(lg.pool_group_idx) < len(page_table.pool_groups)
+            if has_physical_pool_group:
                 pools_and_sizes = [
                     (pool, get_pool_bytes(pool))
                     for pool in page_table.pool_groups[int(lg.pool_group_idx)].pools

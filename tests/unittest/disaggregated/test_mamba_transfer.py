@@ -289,17 +289,17 @@ def test_mamba_policy_slot_major_layer_ptrs():
             slot_bytes=10,
             num_slots=8,
             slot_stride_bytes=20,
+            layer_stride_bytes=10,
         ),
         ssm_states=page.PhysicalPool(
             base_address=3000,
             slot_bytes=20,
             num_slots=8,
             slot_stride_bytes=40,
+            layer_stride_bytes=20,
         ),
         conv_section_bytes=[10],
         ssm_bytes_per_head=10,
-        conv_layer_slot0_addresses={1: 1000, 2: 1010},
-        ssm_layer_slot0_addresses={1: 3000, 2: 3020},
     )
     peer_mlg = page.MambaLayerGroup(
         pool_group_idx=0,
@@ -309,17 +309,17 @@ def test_mamba_policy_slot_major_layer_ptrs():
             slot_bytes=10,
             num_slots=8,
             slot_stride_bytes=20,
+            layer_stride_bytes=10,
         ),
         ssm_states=page.PhysicalPool(
             base_address=7000,
             slot_bytes=20,
             num_slots=8,
             slot_stride_bytes=40,
+            layer_stride_bytes=20,
         ),
         conv_section_bytes=[10],
         ssm_bytes_per_head=10,
-        conv_layer_slot0_addresses={1: 5000, 2: 5010},
-        ssm_layer_slot0_addresses={1: 7000, 2: 7020},
     )
     self_ri = rank_info.RankInfo(
         instance_name="self",
@@ -371,6 +371,7 @@ def test_mamba_policy_slot_major_interleaved_role_ptrs():
         slot_bytes=state_bytes,
         num_slots=8,
         slot_stride_bytes=physical_slot_bytes,
+        layer_stride_bytes=2 * state_bytes,
     )
 
     ptrs = peer.MambaPolicy._build_layer_ptrs(
@@ -378,10 +379,6 @@ def test_mamba_policy_slot_major_interleaved_role_ptrs():
         layer_offsets={1: 0, 2: 1},
         overlapping_layers=[1, 2],
         slot=3,
-        layer_slot0_addresses={
-            1: 1000 + state_bytes,
-            2: 1000 + 3 * state_bytes,
-        },
     )
 
     np.testing.assert_array_equal(

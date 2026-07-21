@@ -14,10 +14,12 @@
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
     KVRegionExtractorV1,
+    _build_v2_mamba_state_pool,
     build_page_table,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
@@ -255,12 +257,14 @@ def test_mamba_layer_group_serialization():
         slot_bytes=128,
         num_slots=10,
         slot_stride_bytes=512,
+        layer_stride_bytes=256,
     )
     ssm_pool = PhysicalPool(
         base_address=8000,
         slot_bytes=256,
         num_slots=8,
         slot_stride_bytes=1024,
+        layer_stride_bytes=512,
     )
     mlg = MambaLayerGroup(
         pool_group_idx=1,
@@ -269,17 +273,15 @@ def test_mamba_layer_group_serialization():
         ssm_states=ssm_pool,
         conv_section_bytes=[512, 256, 256],
         ssm_bytes_per_head=128,
-        conv_layer_slot0_addresses={10: 1000, 11: 2000, 12: 3000},
-        ssm_layer_slot0_addresses={10: 8000, 11: 9000, 12: 10000},
     )
 
     d = mlg.to_dict()
     assert d["mamba_layer_offsets"] == {10: 0, 11: 1, 12: 2}
     assert d["conv_section_bytes"] == [512, 256, 256]
-    assert d["conv_layer_slot0_addresses"] == {10: 1000, 11: 2000, 12: 3000}
-    assert d["ssm_layer_slot0_addresses"] == {10: 8000, 11: 9000, 12: 10000}
     assert d["conv_states"]["slot_stride_bytes"] == 512
+    assert d["conv_states"]["layer_stride_bytes"] == 256
     assert d["ssm_states"]["slot_stride_bytes"] == 1024
+    assert d["ssm_states"]["layer_stride_bytes"] == 512
 
     from tensorrt_llm._torch.disaggregation.resource.page import LayerGroup
 
@@ -290,18 +292,53 @@ def test_mamba_layer_group_serialization():
     assert restored.conv_states.slot_bytes == 128
     assert restored.conv_states.num_slots == 10
     assert restored.conv_states.slot_stride_bytes == 512
+    assert restored.conv_states.layer_stride_bytes == 256
     assert get_slot_address(restored.conv_states, 3) == 1000 + 3 * 512
     assert restored.ssm_states.base_address == 8000
     assert restored.ssm_states.slot_bytes == 256
     assert restored.ssm_states.num_slots == 8
     assert restored.ssm_states.slot_stride_bytes == 1024
+    assert restored.ssm_states.layer_stride_bytes == 512
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
-    assert restored.conv_layer_slot0_addresses == {10: 1000, 11: 2000, 12: 3000}
-    assert restored.ssm_layer_slot0_addresses == {10: 8000, 11: 9000, 12: 10000}
 
     legacy_pool = PhysicalPool.from_dict({"base_address": 1000, "slot_bytes": 128, "num_slots": 10})
     assert legacy_pool.slot_stride_bytes == legacy_pool.slot_bytes
+    assert legacy_pool.layer_stride_bytes == legacy_pool.num_slots * legacy_pool.slot_bytes
+
+
+def test_v2_mamba_state_pool_uses_affine_layer_and_slot_strides():
+    num_slots = 3
+    state_bytes = 64
+    storage = torch.empty((num_slots, 4, state_bytes), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 2, :]]
+
+    pool = _build_v2_mamba_state_pool(states)
+
+    assert pool.base_address == states[0].data_ptr()
+    assert pool.slot_bytes == state_bytes
+    assert pool.num_slots == num_slots
+    assert pool.slot_stride_bytes == 4 * state_bytes
+    assert pool.layer_stride_bytes == 2 * state_bytes
+
+
+def test_v2_mamba_single_layer_pool_preserves_shared_role_footprint():
+    state_bytes = 64
+    storage = torch.empty((3, 2, state_bytes), dtype=torch.uint8)
+
+    pool = _build_v2_mamba_state_pool([storage[:, 1, :]])
+
+    assert pool.slot_bytes == state_bytes
+    assert pool.slot_stride_bytes == 2 * state_bytes
+    assert pool.layer_stride_bytes == 2 * state_bytes
+
+
+def test_v2_mamba_state_pool_rejects_non_affine_layer_offsets():
+    storage = torch.empty((3, 6, 64), dtype=torch.uint8)
+    states = [storage[:, 0, :], storage[:, 2, :], storage[:, 5, :]]
+
+    with pytest.raises(ValueError, match="uniform layer stride"):
+        _build_v2_mamba_state_pool(states)
 
 
 def test_v2_mamba_registration_uses_coalesced_physical_pool():
@@ -331,21 +368,15 @@ def test_v2_mamba_registration_uses_coalesced_physical_pool():
             slot_bytes=state_bytes,
             num_slots=num_slots,
             slot_stride_bytes=physical_slot_bytes,
+            layer_stride_bytes=2 * state_bytes,
         ),
         ssm_states=PhysicalPool(
             base_address=1000,
             slot_bytes=state_bytes,
             num_slots=num_slots,
             slot_stride_bytes=physical_slot_bytes,
+            layer_stride_bytes=2 * state_bytes,
         ),
-        conv_layer_slot0_addresses={
-            1: 1000 + state_bytes,
-            2: 1000 + state_bytes * 3,
-        },
-        ssm_layer_slot0_addresses={
-            1: 1000,
-            2: 1000 + state_bytes * 2,
-        },
     )
     page_table = KVCachePageTable(
         tokens_per_block=16,

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
@@ -120,12 +121,14 @@ def _build_layer_group_for_mamba(
         base_address=conv_state.data_ptr(),
         slot_bytes=conv_state.stride(1) * conv_state.element_size(),
         num_slots=conv_state.shape[1],
+        layer_stride_bytes=conv_state.stride(0) * conv_state.element_size(),
     )
 
     ssm_pool = PhysicalPool(
         base_address=ssm_state.data_ptr(),
         slot_bytes=ssm_state.stride(1) * ssm_state.element_size(),
         num_slots=ssm_state.shape[1],
+        layer_stride_bytes=ssm_state.stride(0) * ssm_state.element_size(),
     )
 
     # Per-section bytes for conv_state and per-head bytes for ssm_state.
@@ -156,6 +159,46 @@ def _slot_stride_bytes(tensor) -> int:
     return int(tensor.stride(0) * tensor.element_size())
 
 
+def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
+    """Describe affine layer/slot addressing for one V2 Mamba state role."""
+    if not states:
+        raise ValueError("V2 Mamba state pool requires at least one layer")
+
+    first_state = states[0]
+    base_address = int(first_state.data_ptr())
+    num_slots = int(first_state.shape[0])
+    slot_bytes = int(first_state[0].numel() * first_state.element_size())
+    slot_stride_bytes = _slot_stride_bytes(first_state)
+
+    num_layers = len(states)
+    if slot_stride_bytes % num_layers != 0:
+        raise ValueError("V2 Mamba physical slot must divide evenly across layers")
+    # Each role appears once per layer in its size-class pool. Equal-size SSM
+    # and convolution states share that pool and are interleaved, so their
+    # layer stride includes both role payloads.
+    layer_stride_bytes = slot_stride_bytes // num_layers
+
+    for layer_offset, state in enumerate(states):
+        state_slot_bytes = int(state[0].numel() * state.element_size())
+        if (
+            int(state.shape[0]) != num_slots
+            or state_slot_bytes != slot_bytes
+            or _slot_stride_bytes(state) != slot_stride_bytes
+        ):
+            raise ValueError("V2 Mamba state tensors must share one slot layout per role")
+        expected_address = base_address + layer_offset * layer_stride_bytes
+        if int(state.data_ptr()) != expected_address:
+            raise ValueError("V2 Mamba state tensors must have a uniform layer stride per role")
+
+    return PhysicalPool(
+        base_address=base_address,
+        slot_bytes=slot_bytes,
+        num_slots=num_slots,
+        slot_stride_bytes=slot_stride_bytes,
+        layer_stride_bytes=layer_stride_bytes,
+    )
+
+
 def _build_layer_group_for_v2_mamba(
     manager: V2MambaHybridCacheManager, pool_group_idx: int
 ) -> MambaLayerGroup:
@@ -164,27 +207,20 @@ def _build_layer_group_for_v2_mamba(
         for global_layer_id, local_layer_id in manager.mamba_layer_offsets.items()
     }
 
+    expected_offsets = list(range(len(mamba_layer_offsets)))
+    if sorted(mamba_layer_offsets.values()) != expected_offsets:
+        raise ValueError("V2 Mamba layer offsets must be dense")
+    if len(manager.all_conv_states) != len(expected_offsets) or len(manager.all_ssm_states) != len(
+        expected_offsets
+    ):
+        raise ValueError("V2 Mamba state tensors must match the layer-offset table")
+
     first_conv_state = manager.all_conv_states[0]
     first_ssm_state = manager.all_ssm_states[0]
-    conv_slot_stride_bytes = _slot_stride_bytes(first_conv_state)
-    ssm_slot_stride_bytes = _slot_stride_bytes(first_ssm_state)
-    conv_slot_bytes = int(first_conv_state[0].numel() * first_conv_state.element_size())
-    ssm_slot_bytes = int(first_ssm_state[0].numel() * first_ssm_state.element_size())
-    num_slots = int(first_ssm_state.shape[0])
-
-    # V2 coalesces equal-size buffers into slot-major physical pools. The
-    # SHARED tensor bases include each layer/role's offset within slot 0, while
-    # stride(0) is the distance to the same buffer in the next physical slot.
-    # Preserve both pieces: V1's layer-major ``layer * num_slots`` formula does
-    # not describe this layout.
-    conv_layer_slot0_addresses = {
-        int(global_layer_id): int(manager.all_conv_states[offset].data_ptr())
-        for global_layer_id, offset in mamba_layer_offsets.items()
-    }
-    ssm_layer_slot0_addresses = {
-        int(global_layer_id): int(manager.all_ssm_states[offset].data_ptr())
-        for global_layer_id, offset in mamba_layer_offsets.items()
-    }
+    conv_pool = _build_v2_mamba_state_pool(manager.all_conv_states)
+    ssm_pool = _build_v2_mamba_state_pool(manager.all_ssm_states)
+    if conv_pool.num_slots != ssm_pool.num_slots:
+        raise ValueError("V2 Mamba convolution and SSM states must have the same number of slots")
 
     d_conv_m1 = manager.conv_state_shape[1]
     conv_elem_size = first_conv_state.element_size()
@@ -197,22 +233,10 @@ def _build_layer_group_for_v2_mamba(
     return MambaLayerGroup(
         pool_group_idx=pool_group_idx,
         mamba_layer_offsets=mamba_layer_offsets,
-        conv_states=PhysicalPool(
-            base_address=int(first_conv_state.data_ptr()),
-            slot_bytes=conv_slot_bytes,
-            num_slots=num_slots,
-            slot_stride_bytes=conv_slot_stride_bytes,
-        ),
-        ssm_states=PhysicalPool(
-            base_address=int(first_ssm_state.data_ptr()),
-            slot_bytes=ssm_slot_bytes,
-            num_slots=num_slots,
-            slot_stride_bytes=ssm_slot_stride_bytes,
-        ),
+        conv_states=conv_pool,
+        ssm_states=ssm_pool,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
-        conv_layer_slot0_addresses=conv_layer_slot0_addresses,
-        ssm_layer_slot0_addresses=ssm_layer_slot0_addresses,
     )
 
 
