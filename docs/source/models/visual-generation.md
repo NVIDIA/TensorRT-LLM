@@ -67,7 +67,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
 
-[^6]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B. Its transformer, VAE, and text encoder are identical to Wan2.2-5B; only the sampling loop changes: 3 denoising steps with fixed timesteps, no CFG, and a distribution-matching-distillation (DMD) noise update. It runs through the `WanDMDPipeline` and currently supports text-to-video only. Because there is no CFG path, CFG parallelism does not apply; and with only 3 steps, step caching (TeaCache / Cache-DiT) gives no benefit. VSA is not enabled in this full-attention checkpoint.
+[^6]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
 ## Quick Start
 
