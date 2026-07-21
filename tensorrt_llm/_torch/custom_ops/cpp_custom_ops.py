@@ -276,6 +276,12 @@ def _register_fake():
         # In-place operation, no return value (void function)
         pass
 
+    @torch.library.register_fake("trtllm::minimax_m3_select_blocks")
+    def _(scores, n_valid_blocks, topk, init_blocks, local_blocks):
+        del n_valid_blocks, init_blocks, local_blocks
+        return scores.new_empty((scores.shape[2], scores.shape[0], topk),
+                                dtype=torch.int32)
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)
