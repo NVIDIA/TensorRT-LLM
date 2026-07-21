@@ -4789,7 +4789,10 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 // cleanup pod before failing closed.
                 if (attemptPlacementContext.runnerStarted) {
                     if (slurmDispatcher && isDispatcherPodFailure(e)) {
-                        finalizeOrphanedSlurmResource(pipeline, stageName)
+                        // Pass this attempt's pod spec explicitly so the finalizer
+                        // never depends on the registry entry's podSpec surviving a
+                        // prior attempt's deregister.
+                        finalizeOrphanedSlurmResource(pipeline, stageName, attemptPodSpec)
                     }
                     throw e
                 }
@@ -6026,66 +6029,66 @@ pipeline {
             steps {
                 script {
                     try {
-                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                        parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
-                    } else {
-                        parallelJobs = launchTestJobs(this, testFilter)
-                    }
+                        if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                            parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
+                        } else {
+                            parallelJobs = launchTestJobs(this, testFilter)
+                        }
 
-                    singleGpuJobs = parallelJobs
-                    dgxJobs = [:]
+                        singleGpuJobs = parallelJobs
+                        dgxJobs = [:]
 
-                    def testPhase2StageName = env.testPhase2StageName
-                    if (testPhase2StageName) {
-                        def multiGpuPattern = /\d+_GPUs/
-                        singleGpuJobs = parallelJobs.findAll{!(it.key =~ multiGpuPattern)}
-                        dgxJobs = parallelJobs.findAll{it.key =~ multiGpuPattern}
-                    }
+                        def testPhase2StageName = env.testPhase2StageName
+                        if (testPhase2StageName) {
+                            def multiGpuPattern = /\d+_GPUs/
+                            singleGpuJobs = parallelJobs.findAll{!(it.key =~ multiGpuPattern)}
+                            dgxJobs = parallelJobs.findAll{it.key =~ multiGpuPattern}
+                        }
 
-                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
-                        echo "Only run single-GPU tests."
-                        if (dgxJobs.size() > 0) {
-                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
-                                // We add a special marker to the parent job's description.
-                                // This will be used to decide whether to run multi-GPU test stage.
-                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
-                                def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
-                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
+                        if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                            echo "Only run single-GPU tests."
+                            if (dgxJobs.size() > 0) {
+                                if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                    // We add a special marker to the parent job's description.
+                                    // This will be used to decide whether to run multi-GPU test stage.
+                                    def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                    def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
+                                    trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
+                                } else {
+                                    echo "No parent job found to add the special marker for executing multi-GPU test stage."
+                                }
                             } else {
-                                echo "No parent job found to add the special marker for executing multi-GPU test stage."
+                                echo "Skip multi-GPU testing. No test to run."
                             }
-                        } else {
-                            echo "Skip multi-GPU testing. No test to run."
-                        }
-                        if (singleGpuJobs.size() > 0) {
-                            singleGpuJobs.failFast = params.enableFailFast
-                            parallel singleGpuJobs
-                        } else {
-                            echo "Skip single-GPU testing. No test to run."
-                        }
-                    } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
-                        echo "Only run multi-GPU tests."
-                        if (dgxJobs.size() > 0) {
-                            dgxJobs.failFast = params.enableFailFast
-                            parallel dgxJobs
-                        } else {
-                            error "Skip multi-GPU testing. No test to run."
-                        }
-                    } else {
-                        if (singleGpuJobs.size() > 0) {
-                            singleGpuJobs.failFast = params.enableFailFast
-                            parallel singleGpuJobs
-                        } else {
-                            echo "Skip single-GPU testing. No test to run."
-                        }
-
-                        if (dgxJobs.size() > 0) {
-                            stage(testPhase2StageName) {
+                            if (singleGpuJobs.size() > 0) {
+                                singleGpuJobs.failFast = params.enableFailFast
+                                parallel singleGpuJobs
+                            } else {
+                                echo "Skip single-GPU testing. No test to run."
+                            }
+                        } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                            echo "Only run multi-GPU tests."
+                            if (dgxJobs.size() > 0) {
                                 dgxJobs.failFast = params.enableFailFast
                                 parallel dgxJobs
+                            } else {
+                                error "Skip multi-GPU testing. No test to run."
+                            }
+                        } else {
+                            if (singleGpuJobs.size() > 0) {
+                                singleGpuJobs.failFast = params.enableFailFast
+                                parallel singleGpuJobs
+                            } else {
+                                echo "Skip single-GPU testing. No test to run."
+                            }
+
+                            if (dgxJobs.size() > 0) {
+                                stage(testPhase2StageName) {
+                                    dgxJobs.failFast = params.enableFailFast
+                                    parallel dgxJobs
+                                }
                             }
                         }
-                    }
                     } finally {
                         // Backstop: reclaim any SLURM job / Jenkins node left orphaned
                         // by a dispatcher-pod death whose in-catch finalize did not run
