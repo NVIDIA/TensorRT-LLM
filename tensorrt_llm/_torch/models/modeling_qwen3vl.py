@@ -313,9 +313,9 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # the ViT then produces garbage for the raw modality. Fail fast; the
         # default `get_preferred_media_io_kwargs` ships `np` for both, so a
         # divergence here means a caller override drifted.
-        image_is_pre = not images or isinstance(images[0], torch.Tensor)
-        video_is_pre = not videos or isinstance(videos[0][0], torch.Tensor)
-        if image_is_pre != video_is_pre:
+        image_is_pre = bool(images) and isinstance(images[0], torch.Tensor)
+        video_is_pre = bool(videos) and isinstance(videos[0][0], torch.Tensor)
+        if images and videos and image_is_pre != video_is_pre:
             raise ValueError(
                 "Qwen3-VL requires image and video items to arrive in the same "
                 "pre-rescaled state (both torch.Tensor, or both uint8 numpy). "
@@ -323,7 +323,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 f"video_is_pre_rescaled={video_is_pre}. Configure consistent "
                 "formats via `media_io_kwargs`."
             )
-        do_rescale = not image_is_pre
+        do_rescale = not (image_is_pre if images else video_is_pre)
 
         do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
