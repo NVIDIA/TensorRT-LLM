@@ -2169,23 +2169,16 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
             ? searchRoot->findMatchingBlock(blockKey, true, true)
             : std::make_tuple(false, 0, nullptr);
 
-        // Only blocks matching ALL requested tokens at this position are eligible: a
-        // prefix-only match (e.g. cached [A,B,C] vs requested [A,B,C,D,E]) holds KV for
-        // fewer tokens than the requester assumes, and a generation-only receiver has no
-        // context phase to recompute the missing suffix. An exact non-full final block
-        // where all requested tokens match remains valid. Pinning (arbitrary-transfer)
-        // lookups additionally require primary-pool, non-placeholder blocks: they read
-        // primary buffers directly and onboarding from the transceiver path is not
-        // supported yet. isPlaceholder is checked first because isPrimary asserts on
-        // placeholder blocks.
+        // A prefix-only match lacks KV for the requested tail, and pinning (transfer)
+        // lookups read primary-pool buffers directly, so offloaded and placeholder blocks
+        // are misses too (isPlaceholder first: isPrimary asserts on placeholders).
         bool const fullyMatched
             = matchingBlock != nullptr && numMatched == static_cast<SizeType32>(blockKey.uniqueTokens.size());
         bool const transferable
             = fullyMatched && (!pinBlocks || (!matchingBlock->isPlaceholder() && matchingBlock->isPrimary()));
         if (!transferable)
         {
-            // Roll back any pins taken during this partial walk so callers see a
-            // clean miss with no refcount or eviction-queue side-effects.
+            // Roll back pins taken during the partial walk.
             for (auto const& block : pinnedInScope)
             {
                 unpinBlock(block);
@@ -3037,11 +3030,7 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
 void WindowBlockManager::pinBlock(BlockPtr const& block)
 {
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
-    // If the block has no refs it sits in the eviction policy's free queue.
-    // Claim it first so it cannot be handed out while pinned and so the later
-    // unpin/release cycle does not create a duplicate queue entry. Pass the
-    // block's existing priority and duration so that claimBlock does not clear
-    // its retention/expiry metadata.
+    // Claim free blocks out of the eviction queue first, keeping their retention metadata.
     if (!block->hasRefs())
     {
         mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());

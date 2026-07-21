@@ -234,8 +234,7 @@ public:
         return mLastBlockKey;
     }
 
-    /// @brief Whether this is an arbitrary (llmRequest-agnostic) transfer served from the
-    /// sender's reuse tree, i.e. the sender has no LlmRequest to match this request against.
+    /// @brief Arbitrary (llmRequest-agnostic) transfer served from the sender's reuse tree.
     [[nodiscard]] bool isArbitraryTransfer() const noexcept
     {
         return mIsArbitraryTransfer;

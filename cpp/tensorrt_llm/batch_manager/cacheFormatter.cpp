@@ -197,7 +197,6 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::option
         || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
     {
         // disable reuse path, and vwsa don't support reuse.
-        // This path requires an LlmRequest with an active sequence in the cache manager.
         TLLM_CHECK_WITH_INFO(llmRequest.has_value(), "LlmRequest required for non-reuse-tree transfer path");
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
 
@@ -237,9 +236,7 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::option
 
     TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
 
-    // Multimodal block-key construction needs the LlmRequest. On the arbitrary
-    // reuse-tree transfer path there is no request, so fall through to the plain
-    // lastBlockKey lookup below.
+    // No request on the reuse-tree path: fall through to the plain lastBlockKey lookup.
     if (llmRequest.has_value())
     {
         auto multimodalHashes = (*llmRequest)->getMultimodalHashes();

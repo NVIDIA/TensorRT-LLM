@@ -611,10 +611,8 @@ UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId(std::sh
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
-    // The receive state must outlive this stack frame: on the terminate path below we
-    // return while the (asynchronously cancelled) UCX request may still write into the
-    // buffer and will still fire the completion callback. The callback co-owns the
-    // heap-allocated state so both stay valid until UCX is done with them.
+    // Co-owned by the completion callback: the terminate path returns while the
+    // cancelled request may still write the buffer and fire the callback.
     struct RecvState
     {
         std::vector<char> mBuffer;

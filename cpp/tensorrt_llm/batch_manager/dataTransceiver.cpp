@@ -82,9 +82,7 @@ void TransferSession::send(size_t idx, void const* data, size_t size)
     }
     catch (std::exception const& e)
     {
-        // A RequestSpecificException must carry a real request ID. On the
-        // llmRequest-agnostic path (e.g. arbitrary reuse-tree transfer) there is
-        // no request, so throw a generic exception instead of inventing an ID.
+        // Request-free (llmRequest-agnostic) transfer: there is no valid ID to attach.
         if (mRequest == nullptr)
         {
             TLLM_THROW("%s", e.what());
@@ -102,9 +100,7 @@ void TransferSession::recv(size_t idx, void* data, size_t size)
     }
     catch (std::exception const& e)
     {
-        // A RequestSpecificException must carry a real request ID. On the
-        // llmRequest-agnostic path (e.g. arbitrary reuse-tree transfer) there is
-        // no request, so throw a generic exception instead of inventing an ID.
+        // Request-free (llmRequest-agnostic) transfer: there is no valid ID to attach.
         if (mRequest == nullptr)
         {
             TLLM_THROW("%s", e.what());
@@ -189,8 +185,7 @@ void TransferSession::poisonReservedRecvBuffers() noexcept
 
 void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
 {
-    // Request-free (llmRequest-agnostic reuse-tree) transfers are excluded from
-    // KV cache time capture: the exported row is keyed by the LlmRequest.
+    // Request-free transfers are excluded: the exported row is keyed by the LlmRequest.
     if (!mTimes || mTimes->measures.empty() || mRequest == nullptr)
     {
         return;
@@ -385,8 +380,6 @@ public:
             TLLM_CHECK_WITH_INFO(
                 result.second, "Request %zu is already queued for KV cache transfer", llmRequest->mRequestId);
         }
-        // Wake the response thread in case the counterpart's RequestInfo arrived
-        // before this response was registered.
         mSenderCv.notify_all();
         return future;
     }
@@ -651,11 +644,8 @@ public:
 private:
     struct Response
     {
-        // Single source of truth for the request identity. A response is either:
-        // - backed by an LlmRequest (normal disagg flow): the shared_ptr co-owns the
-        //   request until the promise resolves, and the request id is the request's own
-        //   mRequestId; or
-        // - id-only (llmRequest-agnostic reuse-tree transfer): just the RequestIdType.
+        // An LlmRequest (co-owned until the promise resolves) for normal transfers, or
+        // just the request id for llmRequest-agnostic reuse-tree transfers.
         std::variant<std::shared_ptr<LlmRequest>, RequestIdType> mRequestOrId;
         std::promise<void> mPromise;
         std::vector<kv_cache_manager::KVCacheBlock::IdType> mPinnedBlockIds;
@@ -703,16 +693,13 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            // Read the id before the move: argument initializations are
-            // indeterminately sequenced, so calling resp.getRequestId() inline
-            // alongside std::move(resp) could observe a moved-from response.
+            // Read before std::move(resp): argument evaluations are indeterminately sequenced.
             auto const requestId = resp.getRequestId();
             sendAndRemoveResponse(requestId, std::move(resp));
         }
     }
 
-    //! Release the reuse-tree blocks pinned for a response. Must not throw: it is called
-    //! from noexcept send/failure paths, and unpinBlocksById can throw on invalid ids.
+    //! Must not throw: called from noexcept send/failure paths.
     void releasePinnedBlocks(Response& response) noexcept
     {
         if (response.mPinnedBlockIds.empty())
@@ -768,9 +755,6 @@ private:
             discardTransferState(id);
             failResponse(resp, exception);
         }
-        // Release any reuse-tree blocks we pinned for this transfer. Safe on every exit
-        // path: the LlmRequest-backed branch never populates mPinnedBlockIds, and the
-        // error paths above already released them via failResponse.
         releasePinnedBlocks(resp);
     }
 
@@ -887,16 +871,12 @@ private:
             TLLM_CHECK(it != mRequestToSession.end());
             session = std::addressof(it->second);
         }
-        // format() without LlmRequest — uses reuse tree path. The READY signal was
-        // already sent by response() before dispatching here (the receiver consumes
-        // exactly one READY per transfer, before the data); do not send another.
+        // READY was already sent by response(); the receiver consumes exactly one per transfer.
         mCacheTransferLayer.format(*session);
     }
 
-    // Look up the requested chain in the sender's reuse tree and pin it so the
-    // eviction policy cannot reclaim the blocks while the transfer is in flight.
-    // Returns the pinned block IDs (caller must unpin once transfer is settled);
-    // empty vector means no matching chain was found.
+    // Pin the requested chain in the reuse tree; an empty result means no full match.
+    // The caller must unpin once the transfer settles.
     std::vector<kv_cache_manager::KVCacheBlock::IdType> pinReuseTreeBlocks(RequestIdType requestId)
     {
         std::unique_lock<std::mutex> lk(mMtxForMap);
@@ -927,9 +907,8 @@ private:
                     break;
                 }
 
-                // Always listen for incoming transfer requests: arbitrary (llmRequest-agnostic)
-                // transfers arrive without a pre-registered response, so the loop cannot gate on
-                // mReadyResponses being non-empty.
+                // Arbitrary transfers arrive without a pre-registered response; do not gate on
+                // mReadyResponses.
                 auto requestInfo = recvRequestInfo();
                 if (!requestInfo.has_value() || mTerminate || !mManager->isRunning())
                 {
@@ -944,10 +923,7 @@ private:
 
                 if (requestInfo->isArbitraryTransfer())
                 {
-                    // Arbitrary transfer — no LlmRequest will ever be registered for it; serve it
-                    // from the reuse tree. Dispatch through the async send thread (same as the
-                    // normal UCX flow) to avoid blocking the response() thread, which shares state
-                    // with recvConnect.
+                    // No LlmRequest will ever be registered; serve from the reuse tree off-thread.
                     {
                         std::scoped_lock lock(mSenderMutex);
                         mCurrentRequest = reqId;
@@ -991,10 +967,7 @@ private:
                 }
                 else
                 {
-                    // Normal disagg flow: the context request registers its response via
-                    // sendAsync, and its RequestInfo may race ahead of that registration.
-                    // Wait for the specific response instead of misclassifying the transfer
-                    // as an arbitrary reuse-tree send.
+                    // The RequestInfo may race ahead of sendAsync; wait for the specific response.
                     {
                         std::unique_lock lock(mSenderMutex);
                         mCurrentRequest = reqId;
@@ -1089,8 +1062,6 @@ private:
         {
             TLLM_LOG_ERROR("Failed to set CacheSender response exception: %s", err.what());
         }
-        // Release any reuse-tree blocks pinned for this transfer so a failed or drained
-        // response cannot leak pins; normal responses never populate mPinnedBlockIds.
         releasePinnedBlocks(response);
     }
 
@@ -1277,12 +1248,8 @@ public:
                 requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
             }
         }
-        // Tell the sender whether this transfer is llmRequest-agnostic (served from the
-        // sender's reuse tree) so it does not wait for a context request that will never
-        // arrive — and, conversely, does wait for normal transfers whose context request
-        // has not reached the sender's send queue yet. The provenance of the request's
-        // DataTransceiverState carries this intent: it is marked when exported standalone
-        // via getSerializedDataTransceiverState, while context responses leave it unset.
+        // The state's provenance marks llmRequest-agnostic transfers: only
+        // getSerializedDataTransceiverState sets it; context responses leave it unset.
         requestInfo.setIsArbitraryTransfer(contextState.isArbitraryTransferState());
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);

@@ -328,10 +328,8 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
-    // Build a generation-only request for an arbitrary (llmRequest-agnostic) transfer:
-    // its DataTransceiverState carries the provenance marker that states exported via
-    // getSerializedDataTransceiverState have, so the sender serves it from its reuse
-    // tree instead of waiting for a context request that will never arrive.
+    // Generation-only request whose DataTransceiverState carries the arbitrary-transfer
+    // provenance marker, as getSerializedDataTransceiverState would produce.
     auto makeArbitraryLlmRequest(SizeType32 length, LlmRequest::RequestIdType arbitraryId)
     {
         constexpr SizeType32 maxNewTokens{1};
@@ -461,9 +459,8 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
 
     if (isSender)
     {
-        // Populate the sender's reuse tree: run a request, fill its blocks with a known
-        // pattern, then store the blocks for reuse. No LlmRequest exists on the sender for
-        // the arbitrary transfers below; the response thread serves them from the tree.
+        // Store a patterned request in the reuse tree; no LlmRequest exists on the
+        // sender for the transfers below.
         auto request = makeLlmRequest(promptLen);
         mManager->addSequenceBatch(
             {{{request->mRequestId, request->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*request)});
@@ -501,8 +498,7 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
             }
         }
 
-        // Miss: tokens never stored on the sender must fail fast with an error state
-        // (isReady=false from the sender) instead of waiting for a context request.
+        // Miss: tokens never stored on the sender must fail fast with an error state.
         std::shared_ptr<LlmRequest> missRequest = makeArbitraryLlmRequest(missPromptLen, arbitraryId + 1);
         mManager->addSequenceBatch(
             {{{missRequest->mRequestId, missRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*missRequest)});
@@ -510,8 +506,7 @@ TEST_F(SymmetricalCacheTest, ArbitraryTransferTest)
         missFuture.get();
         EXPECT_EQ(missRequest->getState(), LlmRequestState::kDISAGG_TRANS_ERROR);
     }
-    // The receiver only reaches this point after validating (or failing) both transfers,
-    // so the sender cannot tear down its transceiver while a send is still in flight.
+    // The sender must not tear down while the receiver's transfers are in flight.
     tensorrt_llm::mpi::MpiComm::world().barrier();
 }
 

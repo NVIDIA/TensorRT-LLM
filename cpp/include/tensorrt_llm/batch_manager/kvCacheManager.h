@@ -1254,9 +1254,8 @@ public:
     //! \brief Look up the block chain matching blockKey in the reuse tree.
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
-    //! \brief Same lookup, additionally pinning every matched block (see pinBlock) and recording
-    //! the pinned ids so the caller can unpin them later via unpinBlocksById. On a miss, pins
-    //! taken during the partial walk are rolled back and pinnedBlockIds is cleared.
+    //! \brief Same lookup, additionally pinning matched blocks; on a miss all pins are
+    //! rolled back and pinnedBlockIds is cleared.
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, std::vector<KVCacheBlock::IdType>& pinnedBlockIds);
 
@@ -1266,15 +1265,9 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
-    //! \brief Pin a single block: claim it from the eviction policy if it is free, then take a
-    //! reference. This is the one canonical pinning primitive — all pin paths (storeBlocks,
-    //! findBlocksInReuseTreeByBlockKey, pinBlocks) must go through it so a pinned block can
-    //! neither be evicted nor handed out by the eviction policy while the pin is held.
-    //!
-    //! Thread safety: pin/unpin may be called from cache-transceiver threads (arbitrary
-    //! reuse-tree transfers), concurrently with the executor loop. All block bookkeeping —
-    //! eviction-policy free queues and refcount 0<->1 transitions — is serialized by the
-    //! lookup-tree mutex, which every mutating WindowBlockManager entry point acquires.
+    //! \brief Pin a block: claim it from the eviction policy if free, then take a reference.
+    //! Safe to call from cache-transceiver threads: block bookkeeping is serialized by the
+    //! lookup-tree mutex, which every mutating entry point acquires.
     void pinBlock(BlockPtr const& block);
 
     //! \brief Inverse of pinBlock: drop one reference and release the block back to the
@@ -2242,8 +2235,7 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize)
         = 0;
 
-    //! \brief Pinning lookup: additionally pins every matched block and records the pinned ids
-    //! so the caller can unpin them later via unpinBlocksById.
+    //! \brief Pinning lookup: pins matched blocks and records their ids for unpinBlocksById.
     [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, SizeType32 windowSize, std::vector<KVCacheBlock::IdType>& pinnedBlockIds)
         = 0;

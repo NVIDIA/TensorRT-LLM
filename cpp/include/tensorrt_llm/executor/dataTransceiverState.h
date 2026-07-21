@@ -618,11 +618,8 @@ public:
         return mCacheState.has_value() && mCacheState->hasRnnConfig();
     }
 
-    /// @brief Whether this state was exported standalone (via
-    /// CacheTransceiver::getSerializedDataTransceiverState) for an arbitrary
-    /// (llmRequest-agnostic) KV cache transfer, as opposed to being produced by a
-    /// context response. Transfers driven by such a state have no LlmRequest on the
-    /// sender and are served from its reuse tree.
+    /// @brief Set only when exported via CacheTransceiver::getSerializedDataTransceiverState:
+    /// transfers driven by such a state have no LlmRequest on the sender.
     [[nodiscard]] bool isArbitraryTransferState() const noexcept
     {
         return mIsArbitraryTransferState;
