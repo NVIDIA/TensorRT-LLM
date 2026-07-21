@@ -795,13 +795,24 @@ class BaseTransform(ABC):
         )
 
     def _add_or_retrieve_input(
-        self, gm: GraphModule, cm: CachedSequenceInterface, name: str
+        self, gm: GraphModule, cm: CachedSequenceInterface, name: str, init_val: bool = False
     ) -> Node:
         """Add or retrieve an input node from the graph."""
         input_nodes = gm.graph.find_nodes(op="placeholder", target=name)
         if len(input_nodes) == 0:
             cm.info.activate_arg(name)
-            return add_graph_input(gm, name)
+            if init_val:
+                # Pass the runtime tensor so add_graph_input populates the
+                # placeholder's meta["val"] with a proper FakeTensor (shape +
+                # dtype propagated via fake_mode.from_tensor). Leaving meta empty
+                # (the default _NO_VAL path) causes downstream transforms that
+                # look up node.meta["val"] (FX export, fuse_fp8_linear's pattern
+                # matcher) to silently misbehave -- e.g. an adjacent
+                # fc2_latent_proj ends up with None in its input slot and the FP8
+                # fake impl crashes on `input.dtype`.
+                return add_graph_input(gm, name, val=cm.info.get_arg(name))
+            else:
+                return add_graph_input(gm, name)
         elif len(input_nodes) == 1:
             return input_nodes[0]
         else:

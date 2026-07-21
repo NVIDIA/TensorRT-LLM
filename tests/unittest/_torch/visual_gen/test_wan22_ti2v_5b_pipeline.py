@@ -36,13 +36,13 @@ from diffusers import WanImageToVideoPipeline as HFWanImageToVideoPipeline
 from diffusers import WanPipeline as HFWanPipeline
 from PIL import Image
 
-from tensorrt_llm._torch.visual_gen.config import (
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
     TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -110,10 +110,8 @@ def _load_trtllm_pipeline(checkpoint_path: str):
     if not os.path.exists(checkpoint_path):
         pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
-        checkpoint_path=checkpoint_path,
-        device="cuda",
-        dtype="bfloat16",
-        torch_compile=TorchCompileConfig(enable_torch_compile=False),
+        model=checkpoint_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
     )
     return PipelineLoader(args).load(skip_warmup=True)
 
@@ -331,10 +329,8 @@ class TestWan22TI2V5BBatchGeneration:
             pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN22_TI2V_5B.")
 
         args = VisualGenArgs(
-            checkpoint_path=WAN22_TI2V_5B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            model=WAN22_TI2V_5B_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         yield pipeline
@@ -430,13 +426,11 @@ class TestWan22TI2V5BCombinedOptimizations:
         if not os.path.exists(WAN22_TI2V_5B_PATH):
             pytest.skip(f"Checkpoint not found: {WAN22_TI2V_5B_PATH}")
         args = VisualGenArgs(
-            checkpoint_path=WAN22_TI2V_5B_PATH,
-            device="cuda",
-            dtype="bfloat16",
-            torch_compile=TorchCompileConfig(enable_torch_compile=False),
+            model=WAN22_TI2V_5B_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            attention=AttentionConfig(backend="TRTLLM"),
-            cache=CacheDiTConfig(),
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            cache_config=CacheDiTConfig(),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:

@@ -41,6 +41,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
     "deepseek-ai/DeepSeek-R1": "DeepSeek-R1/DeepSeek-R1",
     "deepseek-ai/DeepSeek-R1-0528": "DeepSeek-R1/DeepSeek-R1-0528",
+    "nvidia/DeepSeek-R1-0528-NVFP4-v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2",
     "ibm-ai-platform/Bamba-9B-v2": "Bamba-9B-v2",
     "nvidia/NVIDIA-Nemotron-Nano-12B-v2": "NVIDIA-Nemotron-Nano-12B-v2",
     "nvidia/NVIDIA-Nemotron-Nano-31B-A3-v3": "NVIDIA-Nemotron-Nano-31B-A3-v3",
@@ -49,8 +50,6 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8": "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
-    "zai-org/GLM-4.7-Flash": "GLM-4.7-Flash",
-    "DeepInfra/GLM-4.7-Flash-NVFP4": "GLM-4.7-Flash-NVFP4",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726": "NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726": "NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726": "NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-012726",
@@ -69,7 +68,8 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "nvidia/Llama-3.1-Nemotron-Nano-8B-v1": "Llama-3.1-Nemotron-Nano-8B-v1",
     "google/gemma-4-26B-A4B-it": "gemma/gemma-4-26B-A4B-it",
     "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
-    "MiniMaxAI/MiniMax-M2": "MiniMax-M2",
+    "nvidia/Cosmos3-Nano": "nvidia/Cosmos3-Nano",
+    "nvidia/Cosmos3-Super": "nvidia/Cosmos3-Super",
     "nvidia/Nemotron-Ultra-V3-NVFP4": "nemotron-ultra-sample-ckpt-old-format-sft_nvfp4_aggressive_03_04_26_nvfp4",
 }
 

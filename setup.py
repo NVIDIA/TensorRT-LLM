@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +14,10 @@
 # limitations under the License.
 import os
 import platform
+import re
+import subprocess
+import sys
 from pathlib import Path
-from typing import List
 
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
@@ -71,6 +73,23 @@ def get_version():
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
 
+    # For develop / editable installs (`pip install -e .` or
+    # `python setup.py develop`), append the git commit hash as a PEP 440
+    # local version segment so the installed package is identifiable,
+    # e.g. "1.3.0rc21+58d8964d13".
+    is_develop = any(arg in sys.argv for arg in ("develop", "editable_wheel"))
+    if is_develop:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=10", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            commit = ""
+        commit = re.sub(r"[^A-Za-z0-9.]", "", commit)
+        if commit:
+            version = f"{version}+{commit}"
+
     return version
 
 
@@ -110,6 +129,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+mx_deps = ["modelexpress==0.4.1"]
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -117,15 +137,13 @@ if constraints_file.exists():
 
 if on_windows:
     package_data = [
-        'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
+        'libs/th_common.dll', 'libs/tensorrt_llm.dll', 'bindings.*.pyd',
+        "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker',
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
-        'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -197,7 +215,19 @@ def download_precompiled(workspace: str, version: str) -> str:
         return wheel_path
 
 
-def extract_from_precompiled(precompiled_location: str, package_data: List[str],
+def should_skip_precompiled_package_data(filename: str) -> bool:
+    """Return True for source-owned package data kept from local checkout.
+
+    Precompiled wheels own native bits. Source owns telemetry schema JSON.
+    Skip those wheel files so Python-only schema edits layer over old wheels.
+    """
+    filename = filename.replace("\\", "/")
+    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
+    return filename.endswith(".json") and filename.startswith(
+        source_owned_package_data_prefixes)
+
+
+def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                              workspace: str) -> None:
     """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
     This allows skipping the compilation, and repackaging the binaries and Python files in the working directory to a new wheel.
@@ -237,6 +267,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
                 # Skip yaml files
                 if dst_file.endswith(".yaml"):
+                    continue
+
+                # Keep source-owned package data local so Python-only schema edits
+                # layer over precompiled wheels.
+                if should_skip_precompiled_package_data(dst_file):
                     continue
 
                 # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -299,6 +334,11 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
+                continue
+
+            # Keep source-owned package data local so Python-only schema edits
+            # layer over precompiled wheels.
+            if should_skip_precompiled_package_data(file.filename):
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -416,9 +456,6 @@ setup(
     license_files=get_license(),
     entry_points={
         'console_scripts': [
-            'trtllm-build=tensorrt_llm.commands.build:main',
-            'trtllm-prune=tensorrt_llm.commands.prune:main',
-            'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
             'trtllm-eval=tensorrt_llm.commands.eval:main'
@@ -427,10 +464,7 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        # MX remains prototype-only and is intentionally not declared as an
-        # optional package extra until its external dependency completes OSS
-        # allowlist onboarding. Keep install instructions in docs/PR text
-        # rather than packaging metadata.
+        "mx": mx_deps,
     },
     zip_safe=True,
     install_requires=required_deps,

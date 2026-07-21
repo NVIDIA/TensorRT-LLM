@@ -301,24 +301,6 @@ dealing with very long sequences.
 _Note that the cyclic kv cache feature doesn't work with beam searching currently as
 the context kv cache are shared across beams.
 
-### StreamingLLM
-
-The StreamingLLM feature uses a window attention to perform efficient and stable LLM
-on long texts, which means that only `N` tokens need to be stored in the KV cache.
-Similar to the cyclic KV cache feature in TensorRT LLM, `attention_window_size`
-parameter is used to determine `N`. Different from the cyclic KV cache feature,
-the first `S` tokens, called sink tokens, are always kept in the attention window,
-where `S` is determined by `sink_token_length` parameter.
-But in context phase, the self-attentions are dense in the official implementation of
-StreamingLLM. It uses all of the tokens for computation and only saves `N` tokens
-to the KV cache.
-
-In addition, the relative position embedding is also changed in StreamingLLM.
-When determining the relative distance and adding positional information to tokens,
-StreamingLLM uses the positions within the cache rather than those in the original text.
-
-`sink_token_length` is also used to enable this feature.
-
 ### Beam-Search
 
 The attention operator supports beam-search. In the context phase, a single

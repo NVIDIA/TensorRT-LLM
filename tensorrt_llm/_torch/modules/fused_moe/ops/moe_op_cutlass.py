@@ -204,16 +204,44 @@ class CutlassMoEOp(MoEOp):
         if not isinstance(quant_scales, list):
             quant_scales = list(quant_scales)
 
-        # Run the actual MoE computation
-        output = run_moe(x, token_selected_slots, token_final_scales,
-                         w3_w1_weight.view(weight_dtype), w3_w1_bias,
-                         w2_weight.view(weight_dtype), w2_bias, quant_scales,
-                         input_sf, swizzled_input_sf, swiglu_alpha, swiglu_beta,
-                         swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
-                         cluster_size, cluster_rank, use_all_to_all,
-                         min_latency_mode, self.gemm_tactics, activation_type,
-                         unpadded_hidden_size, tuner_num_tokens, None,
-                         use_dynamic_fc2_scale)
+        # The C++ run_moe / run_moe_min_latency TorchBind methods share this
+        # positional prefix. The TorchBind schemas do not honor C++ default
+        # arguments, so every positional argument must be supplied. This
+        # profiling/tuning path never applies MoE LoRA (LoRA is fused into
+        # torch.ops.trtllm.fused_moe), so all eager (per-request) and
+        # slot-indexed LoRA args are passed as None/0.
+        run_moe_args = [
+            x, token_selected_slots, token_final_scales,
+            w3_w1_weight.view(weight_dtype), w3_w1_bias,
+            w2_weight.view(weight_dtype), w2_bias, quant_scales, input_sf,
+            swizzled_input_sf, swiglu_alpha, swiglu_beta, swiglu_limit, tp_size,
+            tp_rank, ep_size, ep_rank, cluster_size, cluster_rank,
+            use_all_to_all, min_latency_mode, self.gemm_tactics,
+            activation_type, unpadded_hidden_size, tuner_num_tokens, None
+        ]
+        if not min_latency_mode:
+            run_moe_args += [
+                use_dynamic_fc2_scale,
+                # Eager (per-request) LoRA args.
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                # Slot-indexed (CUDA-graph) LoRA args.
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None
+            ]
+        output = run_moe(*run_moe_args)
 
         # Return output based on latency mode
         return output if min_latency_mode else [output]

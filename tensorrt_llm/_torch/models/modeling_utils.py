@@ -1,10 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import inspect
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -300,11 +304,25 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 skip_forward(module)
 
         num_hidden_layers = self.model_config.pretrained_config.num_hidden_layers
-        assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        assert num_hidden_layers >= mapping.pp_size, (
+            f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        )
+
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
+        total_num_layers = num_hidden_layers
+        spec_config = getattr(self.model_config, "spec_config", None)
+        if spec_config is not None:
+            from ..speculative.utils import get_num_spec_layers
+
+            num_spec_layers = get_num_spec_layers(spec_config) or 0
+            total_num_layers += num_spec_layers
+            if num_spec_layers > 0 and mapping.is_last_pp_rank():
+                pp_layer_list.extend(
+                    range(total_num_layers - num_spec_layers, total_num_layers))
+        if len(pp_layer_list) == 0:
+            pp_layer_list.append(0)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx in range(num_hidden_layers):
-            layer = self.layers[layer_idx]
+        for layer_idx, layer in enumerate(self.layers[:num_hidden_layers]):
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
@@ -376,8 +394,6 @@ class DecoderModelForCausalLM(nn.Module,
                 dtype=config.pretrained_config.torch_dtype,
             )
         else:
-            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-            # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
@@ -389,16 +405,41 @@ class DecoderModelForCausalLM(nn.Module,
                         self.has_custom_lm_head = True
                         vocab_size = lora_loader.vocab_size
 
+            # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
+            # checkpoints that quantize lm_head to NVFP4). Model-specific
+            # config normalizers opt in by keeping/synthesizing this entry;
+            # exclude_modules still wins.
+            lm_head_quant_config = None
+            if not self.has_custom_lm_head and config.quant_config_dict is not None:
+                lm_head_quant_config = config.quant_config_dict.get("lm_head")
+                if (lm_head_quant_config is not None
+                        and config.quant_config is not None
+                        and config.quant_config.
+                        is_module_excluded_from_quantization("lm_head")):
+                    lm_head_quant_config = None
+                if (lm_head_quant_config is not None
+                        and getattr(config.pretrained_config,
+                                    'tie_word_embeddings', False)):
+                    # Tied embeddings replace lm_head.weight with the dense
+                    # bf16 embedding weight below, which would silently clash
+                    # with a quantized (packed) weight and its quant method.
+                    logger.info(
+                        "Ignoring lm_head quant entry: tie_word_embeddings "
+                        "shares the dense embedding weight, so lm_head stays "
+                        "unquantized")
+                    lm_head_quant_config = None
+
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gather_output=True,
+                gather_output=config.lm_head_gather_output,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
+                quant_config=lm_head_quant_config,
             )
 
             if self.has_custom_lm_head:
@@ -568,8 +609,40 @@ class DecoderModelForCausalLM(nn.Module,
 
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.
+
+        Note: ``cache_transceiver_config`` is rejected here (enforced at
+        load time) — the deep-merge could materialize or silently enable a
+        transceiver config the user did not turn on. Use
+        :meth:`get_preferred_transceiver_runtime` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Return the model's preferred KV-cache transceiver runtime.
+
+        Subclasses can override this to opt into a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted when the user
+        leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'. Return None to defer to the global default (C++).
+
+        Args:
+            pretrained_config: the loaded HF pretrained config (may be None
+                on paths where no config was loaded). Implementation classes
+                shared by several architectures can inspect e.g.
+                ``pretrained_config.architectures`` to differentiate per
+                checkpoint.
+
+        This preference is intentionally kept out of the generic
+        :meth:`get_model_defaults` deep-merge: it must not materialize a
+        ``cache_transceiver_config`` when disaggregated serving is disabled,
+        and it is only honored when the effective backend supports it (the
+        Python transceiver requires NIXL).
+        """
+        return None
 
     @property
     def config(self):
@@ -578,6 +651,63 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    def setup_aliases(self) -> None:
+        """Wire structural Python references between modules.
+
+        This stage is for module-tree structure only, such as assigning
+        cross-layer module references or shared module aliases. It must not
+        read or mutate tensor values, so callers may run it before weight bytes
+        are available, materialized, or transformed.
+
+        The method is intentionally idempotent. Reassigning the same module
+        reference should preserve the same module graph, matching
+        ``torch.nn.Module.__setattr__`` semantics.
+
+        Returns:
+            None.
+        """
+
+    def transform_weights(self) -> None:
+        """Apply one-shot post-load transformations to weight tensors.
+
+        This stage is for irreversible or layout-changing tensor operations,
+        such as fusing weights or converting quantized weight representations.
+        Subclasses that migrate transform logic here should return early when
+        ``_weights_transformed`` is already true, and set it only after the
+        transform succeeds. Orchestrators that replace the underlying tensors
+        with fresh, untransformed bytes are responsible for resetting that flag.
+
+        Returns:
+            None.
+        """
+
+    def cache_derived_state(self) -> None:
+        """Recompute Python-side state derived from currently loaded weights.
+
+        This stage is reserved for idempotent recomputation from real tensors,
+        such as cached scalars, validation results, or fingerprints. It should
+        not perform one-shot weight transforms. Callers may run it after weight
+        bytes arrive from any loading or sharing mechanism.
+
+        Returns:
+            None.
+        """
+
+    def post_load_weights(self) -> None:
+        """Run the default staged post-load hook sequence.
+
+        Existing model-loading paths continue to call this method for backward
+        compatibility. More specialized loaders can call individual stages when
+        they need a subset of alias setup, tensor transformation, or derived
+        state recomputation.
+
+        Returns:
+            None.
+        """
+        self.setup_aliases()
+        self.transform_weights()
+        self.cache_derived_state()
 
     def forward(
         self,
@@ -698,12 +828,13 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
+        registered = False
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls.__name__ == model_cls.__name__:
+            if registered_cls is model_cls:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
                     vision_encoder_cls, vlm_base_model)
-                break
-        else:
+                registered = True
+        if not registered:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."
@@ -770,6 +901,7 @@ def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
 _GEMMA4_ARCHITECTURES = (
     "Gemma4ForCausalLM",
     "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
 )
 
 
@@ -780,7 +912,7 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
     else:
-        raise RuntimeError(f"Model architecture is not provided.")
+        raise RuntimeError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]

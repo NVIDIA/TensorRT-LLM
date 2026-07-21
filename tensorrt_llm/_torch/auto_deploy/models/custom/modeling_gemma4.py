@@ -70,7 +70,7 @@ except ModuleNotFoundError:
     MULTIMODAL_PLACEHOLDER_REGISTRY = None
     MultimodalPlaceholderMetadata = None
 
-from ..._compat import ActivationType
+from ..._compat import ActivationType, MultimodalInput
 from ...custom_ops.semantic_mask_registry import SemanticMaskLoweringSpec, SemanticMaskRegistry
 from ..factory import ModelFactoryRegistry
 from ..hf import (
@@ -78,6 +78,7 @@ from ..hf import (
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 # ---------------------------------------------------------------------------
 # Multimodal semantic mask custom ops — prefill-only and cached variants.
@@ -249,7 +250,7 @@ SemanticMaskRegistry.register(
     torch.ops.auto_deploy.gemma4_multimodal_mask, "torch", _GEMMA4_MASK_SPEC
 )
 SemanticMaskRegistry.register(
-    torch.ops.auto_deploy.gemma4_multimodal_mask, "triton_paged", _GEMMA4_MASK_SPEC
+    torch.ops.auto_deploy.gemma4_multimodal_mask, "triton", _GEMMA4_MASK_SPEC
 )
 
 
@@ -448,11 +449,11 @@ AutoConfig.register("gemma4_vision", Gemma4VisionConfig, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 
-def _build_rope_cache(
+def _build_rope_inv_freq(
     config: Gemma4TextConfig,
     layer_type: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pre-compute cos/sin RoPE cache for the given layer type."""
+) -> tuple[torch.Tensor, float]:
+    """Build RoPE inverse frequencies for the given layer type."""
     rope_params = config.rope_parameters[layer_type]
     rope_type = rope_params.get("rope_type", "default")
     base = rope_params["rope_theta"]
@@ -485,10 +486,7 @@ def _build_rope_cache(
         rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
         inv_freq, attention_scaling = rope_init_fn(config, device=None, layer_type=layer_type)
 
-    positions = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
-    freqs = torch.outer(positions, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos() * attention_scaling, emb.sin() * attention_scaling
+    return inv_freq, attention_scaling
 
 
 # ---------------------------------------------------------------------------
@@ -538,24 +536,22 @@ class Gemma4ClippableLinear(nn.Module):
         return self.linear(hidden_states)
 
 
-class Gemma4RotaryEmbedding(nn.Module):
-    """Pre-computed RoPE cache for a single layer type (global or local)."""
+class Gemma4RotaryEmbedding(RotaryEmbeddingBase):
+    """RoPE for a single layer type (global or local)."""
 
     def __init__(self, config: Gemma4TextConfig, layer_type: str):
         super().__init__()
-        (
-            cos,
-            sin,
-        ) = _build_rope_cache(config, layer_type)
-        self.register_buffer("_ad_cos_cached", cos, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+        inv_freq, self.attention_scaling = _build_rope_inv_freq(config, layer_type)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self._ad_cos_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        return cos, sin
+        cos, sin = build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
+        return cos[position_ids], sin[position_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -1563,7 +1559,7 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
 
 class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
     config_class = Gemma4TextConfig
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}
 
     def __init__(self, config: Gemma4TextConfig, **kwargs):
         del kwargs
@@ -2085,7 +2081,11 @@ class Gemma4Model(Gemma4PreTrainedModel):
                 llm_input_ids,
             )
             inputs_embeds = self.get_input_embeddings()(llm_input_ids)
-            per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids)
+            # Exported text graphs do not carry helper methods; only configs
+            # with per-layer input embeddings need this optional side input.
+            get_per_layer_inputs = getattr(self.language_model, "get_per_layer_inputs", None)
+            if get_per_layer_inputs is not None:
+                per_layer_inputs = get_per_layer_inputs(llm_input_ids)
         else:
             image_mask = self.get_placeholder_mask(inputs_embeds=inputs_embeds)
 
@@ -2299,6 +2299,11 @@ class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
             **model_kwargs,
         )
         return Gemma4ConditionalOutput(logits=outputs.logits)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 processor helpers
+# ---------------------------------------------------------------------------
 
 
 _PROCESSOR_CONFIG_FILE = "processor_config.json"
@@ -2830,16 +2835,8 @@ class Gemma4ADInputProcessor:
         return num_soft_tokens + 2  # include BOI + EOI
 
     def get_vocab_size(self) -> Optional[int]:
-        tokenizer = getattr(self, "tokenizer", None)
-        if tokenizer is not None and hasattr(tokenizer, "vocab_size"):
-            return int(tokenizer.vocab_size)
-        wrapped_tokenizer = getattr(tokenizer, "tokenizer", None)
-        if wrapped_tokenizer is not None and hasattr(wrapped_tokenizer, "vocab_size"):
-            return int(wrapped_tokenizer.vocab_size)
-        processor = getattr(self, "processor", None)
-        processor_tokenizer = getattr(processor, "tokenizer", None)
-        if processor_tokenizer is not None and hasattr(processor_tokenizer, "vocab_size"):
-            return int(processor_tokenizer.vocab_size)
+        # Gemma4 multimodal masks are identified by the explicit image token id.
+        # Avoid probing tokenizer.vocab_size; it is only needed when mm_token_ids is unavailable.
         return None
 
     def get_mm_token_ids(self) -> torch.Tensor:
@@ -2883,8 +2880,6 @@ class Gemma4ADInputProcessor:
         if "multimodal_input" not in extra:
             positions, lengths = self._find_image_spans(token_ids)
             if positions:
-                from tensorrt_llm.inputs.multimodal import MultimodalInput
-
                 # Dummy hashes — KV-cache reuse for images is not yet supported.
                 dummy_hashes = [[0] * 8 for _ in positions]
                 extra["multimodal_input"] = MultimodalInput.from_components(
@@ -2913,16 +2908,21 @@ class Gemma4TextExportInfo(TextModelExportInfo):
     def post_process(self, sub_mod: nn.Module, sub_gm: GraphModule):
         super().post_process(sub_mod, sub_gm)
 
+        # Gemma4Model.forward calls language_model.get_per_layer_inputs unconditionally,
+        # so the GraphModule must expose it on every variant. The method itself short-circuits
+        # to None when embed_tokens_per_layer is None, which is the non-E2B case.
         embed_tokens_per_layer = getattr(sub_mod, "embed_tokens_per_layer", None)
+        sub_gm.get_per_layer_inputs = types.MethodType(
+            sub_mod.get_per_layer_inputs.__func__, sub_gm
+        )
+
         if embed_tokens_per_layer is None:
+            sub_gm.embed_tokens_per_layer = None
             return
 
         sub_gm.config = sub_mod.config
         sub_gm.hidden_size_per_layer_input = sub_mod.hidden_size_per_layer_input
         sub_gm.vocab_size_per_layer_input = sub_mod.vocab_size_per_layer_input
-        sub_gm.get_per_layer_inputs = types.MethodType(
-            sub_mod.get_per_layer_inputs.__func__, sub_gm
-        )
 
         for embed_name, subsubmod in sub_mod.named_modules():
             if subsubmod is embed_tokens_per_layer:

@@ -1,12 +1,90 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
     _rope_deinterleave_load_hook,
 )
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek import (
+    DeepSeekV3YarnRotaryEmbedding,
+)
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v2 import (
+    DeepSeekV2YarnRotaryEmbedding,
+)
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_glm4_moe_lite import (
+    Glm4MoeLiteYarnRotaryEmbedding,
+)
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_kimi_k2 import KimiK2YarnRotaryEmbedding
+from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla import (
+    _compute_rotary_cos_sin_from_config,
+)
+
+
+def _flatten_cos_sin(cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return torch.stack([cos.float().cpu(), sin.float().cpu()], dim=-1).reshape(1, -1)
+
+
+class _Factory:
+    def __init__(self, config):
+        self.config = config
+
+    def _get_model_config(self):
+        return self.config, None
+
+
+@pytest.mark.parametrize(
+    "rope_cls",
+    [
+        DeepSeekV2YarnRotaryEmbedding,
+        DeepSeekV3YarnRotaryEmbedding,
+        Glm4MoeLiteYarnRotaryEmbedding,
+        KimiK2YarnRotaryEmbedding,
+    ],
+)
+@pytest.mark.parametrize("rope_type_key", ["type", "rope_type"])
+def test_fused_mla_yarn_config_fallback_matches_model_rope_variants(rope_cls, rope_type_key):
+    dim = 64
+    max_pos = 128
+    rope_scaling = {
+        rope_type_key: "yarn",
+        "factor": 40.0,
+        "original_max_position_embeddings": 4096,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+    }
+    config = SimpleNamespace(
+        rope_theta=10000.0,
+        qk_rope_head_dim=dim,
+        max_position_embeddings=max_pos,
+        rope_scaling=rope_scaling,
+    )
+
+    rope = rope_cls(
+        dim,
+        max_pos,
+        base=config.rope_theta,
+        scaling_factor=rope_scaling["factor"],
+        original_max_position_embeddings=rope_scaling["original_max_position_embeddings"],
+        beta_fast=rope_scaling["beta_fast"],
+        beta_slow=rope_scaling["beta_slow"],
+        mscale=rope_scaling["mscale"],
+        mscale_all_dim=rope_scaling["mscale_all_dim"],
+    )
+    if hasattr(rope, "_ad_cos_cached"):
+        expected = _flatten_cos_sin(rope._ad_cos_cached, rope._ad_sin_cached)
+    else:
+        x = torch.empty(1, 1, 1, dim, dtype=torch.float32, device="cuda")
+        cos, sin = rope.to("cuda")(x)
+        expected = _flatten_cos_sin(cos, sin)
+
+    actual = _compute_rotary_cos_sin_from_config(_Factory(config)).cpu()
+    torch.testing.assert_close(actual, expected, atol=3e-7, rtol=1e-4)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])

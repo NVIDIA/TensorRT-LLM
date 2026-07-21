@@ -34,7 +34,7 @@ import math
 import os
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -73,6 +73,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -614,7 +615,7 @@ class EncoderLayer(nn.Module):
         return x
 
 
-class MoonViT3dEncoder(nn.Module):
+class MoonViT3dEncoder(nn.Module, MultimodalEncoderMixin):
     """Stack of MoonViT3d encoder layers + 2D RoPE + final LayerNorm."""
 
     def __init__(
@@ -649,12 +650,11 @@ class MoonViT3dEncoder(nn.Module):
             dtype=model_config.torch_dtype,
         )
 
+        # Context-only metadata (kv_cache_manager=None) built by the engine via
+        # ``MultimodalEncoderMixin.setup_attn_metadata`` at the encoder budget;
+        # filled per forward by ``prepare_attn_metadata``.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,
-            max_num_tokens=8192,
-            kv_cache_manager=None,
-        )
+        self.attn_metadata: Optional[AttentionMetadata] = None
 
     def prepare_attn_metadata(
         self,
@@ -1169,7 +1169,7 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         return total_tokens
 
     @torch.inference_mode()
-    def __call__(
+    def call_with_text_prompt(
         self,
         inputs: TextPrompt,
         sampling_params: SamplingParams,
@@ -1411,12 +1411,12 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             "multimodal_data": multimodal_data,
         }
 
-    def get_prompt_token_ids(
+    def build_disagg_prefill_multimodal_inputs(
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> Tuple[List[int], List[int], List[int]]:
-        """Build token IDs with multimodal placeholders expanded for disaggregated serving.
+    ) -> DisaggPrefillMultimodalInputs:
+        """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
@@ -1424,7 +1424,9 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 context phase, each containing ``tensor_size``.
 
         Returns:
-            Tuple of (expanded_ids, mm_token_lengths, mm_token_offsets).
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1472,7 +1474,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return (expanded_ids.to(torch.int32).tolist(), mm_token_length, mm_token_offsets)
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+            multimodal_lengths=mm_token_length,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
+            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
+            multimodal_run_positions=mm_token_offsets,
+            multimodal_run_lengths=mm_token_length,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +1516,21 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
     """
 
     _LANG_PREFIX = "language_model."
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["PYTHON"]:
+        """Kimi-K2.5 defaults to the Python (v2) KV-cache transceiver.
+
+        The DeepSeek-V3 MLA backbone transfers a large latent KV, which the
+        Python transceiver handles better in disaggregated serving. This is
+        only adopted when the user leaves
+        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the
+        effective backend is NIXL; otherwise the C++ transceiver is used.
+        """
+        return "PYTHON"
 
     def __init__(
         self,
@@ -1571,6 +1596,9 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         self._media_placeholder_token_id = getattr(
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
+        # Backing storage for the ``mm_token_ids`` property below — built once
+        # here so the executor doesn't re-allocate per step.
+        self._mm_token_ids = torch.tensor([self._media_placeholder_token_id], dtype=torch.int32)
 
         # Align model config with the LLM backbone's text_config.
         # The executor reads eos_token_id and other generation params from
@@ -1581,6 +1609,34 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         model_config.pretrained_config = self.llm.config
         model_config._frozen = True
 
+    # Forward spec-dec / weight-loading attrs to self.llm: this wrapper is not
+    # itself a spec-dec model but is the outer model that those paths see.
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    @property
+    def model(self):
+        return self.llm.model
+
+    @property
+    def lm_head(self):
+        return self.llm.lm_head
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
+
+    def set_guided_decoder(self, *args, **kwargs):
+        return self.llm.set_guided_decoder(*args, **kwargs)
+
+    def load_draft_weights(self, *args, **kwargs):
+        return self.llm.load_draft_weights(*args, **kwargs)
+
     @property
     def multimodal_data_device_paths(self) -> List[str]:
         return [
@@ -1590,6 +1646,16 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             "video.video_grid_thw",
             "multimodal_embedding",
         ]
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        """Surface the in-vocab media placeholder to the model engine so
+        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        instead of the OOV (``>= vocab_size``) fallback (which would miss
+        Kimi's placeholder and force ``fuse_input_embeds`` through the
+        ``torch.where`` host-sync path on GPU input_ids).
+        """
+        return self._mm_token_ids
 
     def load_weights(self, weights) -> None:
         """Load vision + projector + LLM weights from checkpoint."""
@@ -1627,55 +1693,40 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
+        multimodal_params: Optional[List[MultimodalParams]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        num_context_requests = attn_metadata.num_contexts
-        multimodal_params = kwargs.get("multimodal_params", [])
+        multimodal_params = multimodal_params or []
         mm_embeds: List[torch.Tensor] = []
+        mm_token_ids = None
 
         if len(multimodal_params) > 0:
-            if not DISAGG:
-                mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.mm_encoder.forward,
-                    multimodal_params=multimodal_params[:num_context_requests],
-                )
-            else:
+            if DISAGG:
                 raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds,
-                multimodal_params[:num_context_requests],
+            mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
+            mm_embeds = get_multimodal_embeddings(
+                encoder_forward_fn=self.mm_encoder.forward,
+                multimodal_params=mm_ctx_params,
             )
+            mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
-        fuse_kwargs = kwargs
-        mm_token_ids = None
-        if len(mm_embeds) > 0:
-            placeholder_id = self._media_placeholder_token_id
-            num_mm_in_ids = int((input_ids == placeholder_id).sum().item())
-            if num_mm_in_ids == 0:
-                logger.warning(
-                    "Vision embeddings computed but no placeholder tokens "
-                    "found in input_ids — embeddings discarded."
-                )
-                mm_embeds = []
-            else:
-                # Exclude keys not accepted by fuse_input_embeds
-                fuse_kwargs = {
-                    k: v
-                    for k, v in kwargs.items()
-                    if k not in ("mm_token_indices", "text_token_indices")
-                }
-                mm_token_ids = torch.tensor(
-                    [placeholder_id],
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
-                )
-
+            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
+            # that match ``find_input_mm_embeds``'s active-chunk slice. The
+            # previous ``(input_ids == placeholder).sum().item()`` guard was a
+            # host sync used to detect chunked-prefill / KV-reuse mismatches;
+            # that mismatch surfaces as a row-count error inside
+            # ``fuse_input_embeds`` itself, so the explicit check is no longer
+            # needed.
+            if len(mm_embeds) > 0:
+                mm_token_ids = self.mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
             mm_token_ids=mm_token_ids,
-            **fuse_kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         return self.llm.forward(
@@ -1684,4 +1735,5 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             position_ids,
             inputs_embeds,
             return_context_logits,
+            **kwargs,
         )

@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import torch
 import torch.nn.functional as F
@@ -44,12 +45,43 @@ from .ssd_state_passing import _state_passing_fwd
 # `_plan_tmem_offsets`). Otherwise we fall back to the Triton reference kernels.
 _FLASHINFER_SSD_VALID_M_MODES = (64, 128)
 _FLASHINFER_SSD_VALID_HEAD_DIMS = (64, 128)
+_USE_FLASHINFER_SSD_ENV = "TRTLLM_USE_MAMBA_FI_SSD"
+
+
+def _use_flashinfer_ssd():
+    # Default is to use Triton SSD prefill.
+    env_value = os.environ.get(_USE_FLASHINFER_SSD_ENV, "0")
+    if env_value == "0":
+        logger.info_once(
+            f"FlashInfer SSD disabled by {_USE_FLASHINFER_SSD_ENV}=0; "
+            "using Triton SSD prefill",
+            key="mamba_fi_ssd_disabled",
+        )
+        return False
+    elif env_value == "1":
+        logger.info_once(
+            f"FlashInfer SSD enabled by {_USE_FLASHINFER_SSD_ENV}=1; "
+            "using FlashInfer SSD prefill",
+            key="mamba_fi_ssd_enabled",
+        )
+        return True
+    else:
+        raise ValueError(
+            f"Invalid value for {_USE_FLASHINFER_SSD_ENV}: {env_value}")
 
 
 def _flashinfer_ssd_supported(chunk_size, dstate, headdim):
+    # The kernel was written for Nemotron-H (chunk_size=128, dstate=128) and has a
+    # bug in tma_partition_for_mma_b_operand: it tiles the B SSM operand with
+    # tile_shape_mnk_intra2[1:] = (headdim, chunk_size) instead of the correct
+    # tile_shape_mnk_intra1[1:] = (chunk_size, dstate), making gmem K-mode =
+    # chunk_size/16 mismatch smem K-mode = dstate/16. Only compiles when
+    # dstate == chunk_size (masked the bug for NemotronH). See
+    # https://github.com/flashinfer-ai/flashinfer/issues/3397 for upstream fix.
     return (chunk_size in _FLASHINFER_SSD_VALID_M_MODES
             and dstate in _FLASHINFER_SSD_VALID_M_MODES
-            and headdim in _FLASHINFER_SSD_VALID_HEAD_DIMS)
+            and headdim in _FLASHINFER_SSD_VALID_HEAD_DIMS
+            and dstate == chunk_size)
 
 
 @functools.cache
@@ -439,7 +471,7 @@ def mamba_chunk_scan_combined(
     # MMA tile constraints on (chunk_size, dstate, headdim) aren't met.
     dstate = B.shape[-1]
     headdim = x.shape[-1]
-    flashinfer_eligible = (z is None and is_sm_100f())
+    flashinfer_eligible = z is None and is_sm_100f() and _use_flashinfer_ssd()
     if flashinfer_eligible and _flashinfer_ssd_supported(
             chunk_size, dstate, headdim):
         return _mamba_chunk_scan_flashinfer_fwd(

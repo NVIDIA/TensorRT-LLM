@@ -268,6 +268,26 @@ Checklist:
 - Existing legacy `forward` methods can be read for compatibility context, but
   they are not the default pattern for new backend work.
 
+### Imported Kernel ABI Checklist
+
+When importing or wrapping an upstream kernel, derive the TRT-LLM adapter
+contract from the lowest-level kernel consumer. Comments, docs, design notes,
+and parameter names are useful hints, but they are not proof of the runtime ABI.
+
+- Derive weight shape and layout from the kernel entrypoint, `make_layout`, TMA,
+  MMA/GEMM transforms, and stride usage. Record required tensor shape, stride,
+  physical storage layout, and boundary view layout.
+- Derive alpha and scale semantics from kernel consumption points. Trace where
+  alpha, norm constants, block scales, activation scales, and weight scales are
+  loaded and multiplied before deciding how upper layers compute or pack them.
+  Treat weight bytes, block scales/SF, and global alpha/norm constants as
+  separate contracts.
+- Design the upper-layer adapter from the kernel ABI upward. Map each kernel
+  input/output to an adapter responsibility: storage tensor, view/transposition,
+  dtype reinterpretation, padding, scale packing, workspace ownership,
+  synchronization, and output reduction. Validate parity with upstream
+  invocation dumps, not just final output.
+
 ### Quantization And Weights
 
 Role:

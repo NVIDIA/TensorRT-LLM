@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -55,12 +55,15 @@ namespace jit
 CubinObj CompileEngine::compile() const
 {
     tllmXqaJitProgram program;
-    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
+    // QGMMA runs attention fully in native FP8 format, including the output of the tiled
+    // Q @ K^T. For the multi-query spec-dec verify, this introduces undue errors on the verify
+    // path, which causes the rejection of otherwise legitimate tokens. In these cases, we defer
+    // to the HMMA kernel, which avoids that particular issue.
+    bool const isLinearSpecDec = mXqaParams.multi_query_tokens && !mXqaParams.is_spec_dec_tree;
+    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true) && !isLinearSpecDec;
+
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
-    bool const applyRoPEInXqaKernel = !mXqaParams.multi_query_tokens && useQGMMAKernel
-        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
-                                              PositionEmbeddingType::kROPE_GPTJ},
-            mXqaParams.position_embedding_type);
+    bool const applyRoPEInXqaKernel = appliesRoPEInXqaKernel(mXqaParams, useQGMMAKernel);
     if (applyRoPEInXqaKernel)
     {
         TLLM_CHECK(useQGMMAKernel);
@@ -105,6 +108,11 @@ CubinObj CompileEngine::compile() const
         // scratch in this case.
         /*use_input_kv=*/applyRoPEInXqaKernel,
         /*rope_style=*/ropeStyle,
+        // When applying RoPE in-kernel, pass the actual rotary dim
+        // Otherwise pass head_size so the (unused) ROPE_ELEMS is valid for static_asserts.
+        /*rotary_embedding_dim=*/
+        applyRoPEInXqaKernel ? static_cast<uint32_t>(mXqaParams.rotary_embedding_dim)
+                             : static_cast<uint32_t>(mXqaParams.head_size),
         /*is_spec_dec_tree=*/mXqaParams.is_spec_dec_tree,
         /*use_skip_softmax_attn=*/mXqaParams.skip_softmax_threshold_scale_factor != 0};
     if (context.kernel_type == TLLM_XQA_JIT_MLA)

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -98,6 +98,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         use_prefetch: bool = False,
+        swizzle_size: int = 1,
+        raster_along_m: bool = True,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -111,10 +113,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         2.  Cluster Shape:
             - cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster.
 
+        3.  Persistent tile scheduler:
+            - swizzle_size: cluster-swizzle size for L2-locality (1 = no swizzle).
+            - raster_along_m: cluster rasterization order (M-major when True).
+
         Args:
             sf_vec_size (int): Scalefactor vector size.
             mma_tiler_mn (Tuple[int, int]): Shape of the Matrix Multiply-Accumulate (MMA) tile (M, N).
             cluster_shape_mn (Tuple[int, int]): Cluster dimensions (M, N) for parallel processing.
+            swizzle_size (int): Tile-scheduler swizzle size in clusters (default 1).
+            raster_along_m (bool): Tile-scheduler rasterization order (default M-major).
         """
 
         self.acc_dtype = cutlass.Float32
@@ -124,6 +132,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.use_prefetch = use_prefetch
+        self.swizzle_size = swizzle_size
+        self.raster_along_m = raster_along_m
         self.cta_group = (tcgen05.CtaGroup.TWO
                           if self.use_2cta_instrs else tcgen05.CtaGroup.ONE)
 
@@ -493,6 +503,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
             max_active_clusters,
+            self.swizzle_size,
+            self.raster_along_m,
         )
 
         self.buffer_align_bytes = 1024
@@ -1415,8 +1427,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     epilog_threads = 32 * len(self.epilog_warp_id)
                     cute.arch.barrier(
@@ -1768,6 +1780,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
+        swizzle_size: cutlass.Constexpr = 1,
+        raster_along_m: cutlass.Constexpr = True,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Computes the grid size for the kernel launch.
 
@@ -1781,6 +1795,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cluster_shape_mn (Tuple[int, int]): The shape of a CTA cluster.
             max_active_clusters (cutlass.Constexpr): The maximum number of
                 active clusters supported by the hardware.
+            swizzle_size (cutlass.Constexpr): Tile-scheduler swizzle size in
+                clusters (1 = no swizzle).
+            raster_along_m (cutlass.Constexpr): Tile-scheduler rasterization
+                order (M-major when True).
 
         Returns:
             A tuple containing the tile scheduler parameters and the computed
@@ -1792,7 +1810,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl)
+            num_ctas_mnl,
+            cluster_shape_mnl,
+            swizzle_size=swizzle_size,
+            raster_along_m=raster_along_m)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters)
 

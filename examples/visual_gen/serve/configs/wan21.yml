@@ -1,6 +1,6 @@
-cache:
+cache_config:
   cache_backend: teacache
   teacache_thresh: 0.2
-parallel:
-  dit_cfg_size: 1
-  dit_ulysses_size: 1
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1

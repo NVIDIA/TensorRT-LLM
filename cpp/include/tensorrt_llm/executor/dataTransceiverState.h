@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
@@ -50,7 +51,7 @@ public:
     };
 
     CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false,
         bool enablePartialReuse = false, bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0,
         SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false)
@@ -71,7 +72,7 @@ public:
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
@@ -92,7 +93,7 @@ public:
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
@@ -178,20 +179,57 @@ public:
 
     struct RnnModelConfig
     {
+        /// Conv state section layout for section-aware split/concat in TP mismatch.
+        /// Conv state = [section0 | section1 | section2], always 3 sections.
+        /// Each section is independently TP-sharded, so TP mismatch requires per-section split.
+        /// Section dims are derived from mHiddenSize (= d_inner) and mNGroups * mDState (= ng_ds):
+        ///   kXBC: [d_inner, ng_ds, ng_ds]  (x | B | C)
+        ///   kQKV: [ng_ds, ng_ds, d_inner] (Q | K | V)
+        enum class ConvSectionLayout : SizeType32
+        {
+            kNONE = 0, // Legacy / unknown — no section-aware split
+            kXBC = 1,  // [d_inner, ng_ds, ng_ds]
+            kQKV = 2,  // [ng_ds, ng_ds, d_inner]
+        };
+
+        static constexpr SizeType32 kNumConvSections = 3;
+
         SizeType32 mDState;      // SSM state dimension
         SizeType32 mDConv;       // Conv state dimension (convKernel - 1)
-        SizeType32 mHiddenSize;  // Hidden dimension
+        SizeType32 mHiddenSize;  // Hidden dimension (= d_inner = head_dim * num_heads, GLOBAL)
         SizeType32 mHeadDim;     // Head dimension (0 for Mamba1, >0 for Mamba2)
-        SizeType32 mConvDimSize; // Conv dimension size
+        SizeType32 mConvDimSize; // Conv dimension size (GLOBAL, pre-TP-division)
         SizeType32 mNGroups;     // Number of groups (for Mamba2)
         SizeType32 mNumLayers;   // Number of layers
-        SizeType32 mNumHeads;    // Number of heads
+        SizeType32 mNumHeads;    // Number of heads (GLOBAL, pre-TP-division)
+
+        ConvSectionLayout mConvSectionLayout{ConvSectionLayout::kNONE};
+
+        /// Compute the 3 GLOBAL conv section element counts for the first dim.
+        /// Returns {section0, section1, section2} in element counts (GLOBAL, pre-TP).
+        [[nodiscard]] std::array<SizeType32, kNumConvSections> getConvSectionDims() const noexcept
+        {
+            SizeType32 const dInner = mHiddenSize;      // = head_dim * num_heads
+            SizeType32 const ngDs = mNGroups * mDState; // n_groups * d_state
+            switch (mConvSectionLayout)
+            {
+            case ConvSectionLayout::kXBC: return {dInner, ngDs, ngDs};
+            case ConvSectionLayout::kQKV: return {ngDs, ngDs, dInner};
+            default: return {0, 0, 0}; // ConvSectionLayout::kNONE
+            }
+        }
+
+        [[nodiscard]] bool hasConvSections() const noexcept
+        {
+            return mConvSectionLayout != ConvSectionLayout::kNONE;
+        }
 
         [[nodiscard]] bool operator==(RnnModelConfig const& other) const noexcept
         {
             return mDState == other.mDState && mDConv == other.mDConv && mHiddenSize == other.mHiddenSize
                 && mHeadDim == other.mHeadDim && mConvDimSize == other.mConvDimSize && mNGroups == other.mNGroups
-                && mNumLayers == other.mNumLayers && mNumHeads == other.mNumHeads;
+                && mNumLayers == other.mNumLayers && mNumHeads == other.mNumHeads
+                && mConvSectionLayout == other.mConvSectionLayout;
         }
     };
 
@@ -201,8 +239,8 @@ public:
         RnnModelConfig mModelConfig;
         /// Number of RNN layers per pipeline parallelism rank.
         std::vector<SizeType32> mLayerNumPerPP;
-        nvinfer1::DataType mConvStateDataType;
-        nvinfer1::DataType mSsmStateDataType;
+        tensorrt_llm::DataType mConvStateDataType;
+        tensorrt_llm::DataType mSsmStateDataType;
 
         [[nodiscard]] bool operator==(RnnCacheState const& other) const noexcept
         {
@@ -226,7 +264,7 @@ public:
         return mAttentionConfig;
     }
 
-    [[nodiscard]] nvinfer1::DataType const& getDataType() const
+    [[nodiscard]] tensorrt_llm::DataType const& getDataType() const
     {
         return mDataType;
     }
@@ -271,7 +309,7 @@ public:
     }
 
     void setRnnConfig(RnnModelConfig rnnModelConfig, std::vector<SizeType32> rnnLayerNumPerPP,
-        nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+        tensorrt_llm::DataType convStateDataType, tensorrt_llm::DataType ssmStateDataType)
     {
         mRnnCacheState = RnnCacheState{
             std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType};
@@ -288,12 +326,12 @@ public:
         return getRnnCacheState().mModelConfig;
     }
 
-    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const
+    [[nodiscard]] tensorrt_llm::DataType getConvStateDataType() const
     {
         return getRnnCacheState().mConvStateDataType;
     }
 
-    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const
+    [[nodiscard]] tensorrt_llm::DataType getSsmStateDataType() const
     {
         return getRnnCacheState().mSsmStateDataType;
     }
@@ -335,6 +373,19 @@ public:
             sstring << "  nGroups:" << rnn.mModelConfig.mNGroups << "\n";
             sstring << "  numLayers:" << rnn.mModelConfig.mNumLayers << "\n";
             sstring << "  numHeads:" << rnn.mModelConfig.mNumHeads << "\n";
+            sstring << "  convSectionLayout:" << static_cast<int32_t>(rnn.mModelConfig.mConvSectionLayout) << "\n";
+            if (rnn.mModelConfig.hasConvSections())
+            {
+                auto const dims = rnn.mModelConfig.getConvSectionDims();
+                sstring << "  convSectionDims:[";
+                for (SizeType32 i = 0; i < RnnModelConfig::kNumConvSections; ++i)
+                {
+                    sstring << dims[i];
+                    if (i + 1 < RnnModelConfig::kNumConvSections)
+                        sstring << ",";
+                }
+                sstring << "]\n";
+            }
             sstring << "  convStateDataType:" << static_cast<int32_t>(rnn.mConvStateDataType) << "\n";
             sstring << "  ssmStateDataType:" << static_cast<int32_t>(rnn.mSsmStateDataType) << "\n";
         }
@@ -345,7 +396,7 @@ private:
     friend class tensorrt_llm::executor::Serialization;
     ModelConfig mModelConfig;
     ParallelConfig mParallelConfig;
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     AttentionConfig mAttentionConfig;
     bool mEnableBlockReuse{false};
     bool mEnablePartialReuse{false};

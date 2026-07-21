@@ -1593,17 +1593,19 @@ def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> 
     weight_lists_flat = [w for weights in weight_lists for w in weights]
 
     for w in weight_lists_flat:
-        w_param = get_attr_by_name(gm, w.target)
-        if w_param is not None:
-            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
-            owner_param = get_attr_by_name(owner_module, param_name)
-            if owner_param is w_param:
-                gm.delete_submodule(owner_module_path)
-            else:
-                # param w is not owned by owner_module, skip
-                continue
-        else:
+        # Experts may share an owning container (e.g. nn.ParameterList): deleting it for the
+        # first expert removes its siblings too, so later targets resolve to a missing attr.
+        try:
+            w_param = get_attr_by_name(gm, w.target)
+        except AttributeError:
             continue
+        if w_param is None:
+            continue
+        owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+        owner_param = get_attr_by_name(owner_module, param_name)
+        # delete_submodule requires a non-empty submodule path; root params can't be dropped this way.
+        if owner_param is w_param and owner_module_path:
+            gm.delete_submodule(owner_module_path)
 
 
 def _stack_fp8_moe_weights(
@@ -2297,7 +2299,15 @@ def _stack_nvfp4_cutlass_moe_weights(
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        # Free per-layer to avoid accumulating ~ per_layer_weight_bytes across all MoE layers.
+        # Only pass weight lists; scales/alphas live as buffers under the same submodules and
+        # are removed together when delete_submodule(...) drops the owning module.
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
@@ -2854,7 +2864,15 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        # Free per-layer to avoid accumulating ~ per_layer_weight_bytes across all MoE layers.
+        # Only pass weight lists; scales/alphas live as buffers under the same submodules and
+        # are removed together when delete_submodule(...) drops the owning module.
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
         fused_key_counter += 1
 
     eliminate_dead_code(gm)

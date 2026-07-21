@@ -28,7 +28,7 @@ from torch.export import Dim
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op, set_op_args
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
 
 _skip_reason = "Requires NVFP4 (Blackwell+) and TRT-LLM ops"
@@ -390,3 +390,45 @@ def test_nvfp4_swiglu_does_not_match_non_swiglu():
     assert _count_ops(gm_result, torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear) == 2, (
         "Original NVFP4 linear ops should be unchanged"
     )
+
+
+@pytest.mark.skipif(_skip_condition, reason=_skip_reason)
+def test_nvfp4_swiglu_pattern_propagates_layer_type():
+    """Regression guard for the Qwen3.5-MoE NVFP4 accuracy bug.
+
+    The SwiGLU matcher collapses the three NVFP4 linears into one
+    ``torch_nvfp4_swiglu_mlp`` op. It must carry the constituents' ``layer_type`` hint onto
+    that fused op so the downstream hint-driven sharder (``apply_sharding_hints`` /
+    ``shard_layers``) can still exclude (replicate) the shared expert. Before the fix the
+    fused op carried no ``layer_type`` and the fail-open whitelist TP-sharded it, corrupting
+    the shared-expert output.
+
+    ``layer_type`` is attached as a kwarg here exactly as ``quantize_nvfp4_linear_from_config``
+    does in production (the matcher ignores it for matching but it must survive the rewrite).
+    """
+    torch.manual_seed(0)
+    model = NVFP4SwiGLUMLP().to("cuda")
+    x = torch.randn(2, 128, device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Tag every NVFP4 linear with a layer_type hint (as the quantization transform does).
+    for n in gm.graph.nodes:
+        if is_op(n, torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear):
+            set_op_args(n, layer_type="shared_expert")
+    gm.recompile()
+
+    gm_matched = InferenceOptimizer(
+        None,
+        {"match_nvfp4_swiglu_pattern": {"stage": "pattern_matcher"}},
+    )(None, gm)
+
+    swiglu_nodes = [
+        n
+        for n in gm_matched.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.torch_nvfp4_swiglu_mlp.default)
+    ]
+    assert len(swiglu_nodes) == 1, f"expected 1 torch_nvfp4_swiglu_mlp, got {len(swiglu_nodes)}"
+
+    [lt] = extract_op_args(swiglu_nodes[0], "layer_type")
+    assert lt == "shared_expert", f"layer_type was not propagated onto the fused op: got {lt!r}"

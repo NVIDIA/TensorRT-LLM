@@ -7,8 +7,8 @@ from collections.abc import Mapping
 from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from pprint import pprint
 from types import MethodType, NoneType
-from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
-                    Sequence, Tuple, Union, _type_repr)
+from typing import (Annotated, Any, Callable, ClassVar, Dict, List, Literal,
+                    Optional, Sequence, Tuple, Union, _type_repr)
 
 import docstring_parser
 import pydantic.main
@@ -16,6 +16,7 @@ import pytest
 import torch
 import transformers
 import yaml
+from annotated_types import Gt
 from pydantic import BaseModel
 
 import tensorrt_llm
@@ -24,7 +25,7 @@ from tensorrt_llm import LLM, DisaggregatedParams
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)

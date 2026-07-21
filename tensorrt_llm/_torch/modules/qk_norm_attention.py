@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,13 +19,17 @@ from typing import Optional
 import torch
 from transformers import PretrainedConfig
 
+from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.interface import PositionalEmbeddingParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
+from ..modules.fused_ops.fused_qk_norm_rope_gate import (
+    fused_qkv_gemma_rmsnorm_rope_gate, fused_sigmoid_mul)
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..utils import is_torch_compiling
 
 
 # Move out from this class
@@ -169,8 +173,10 @@ class QKNormRoPEAttention(Attention):
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
         self.skip_rope = skip_rope
-        if use_gemma_rms_norm:
-            assert fuse_qk_norm_rope is False, "fused_qk_norm_rope is not supported for gemma rms norm."
+        # Gemma-style RMSNorm (scale by (1 + weight)) is supported by the fused
+        # qk_norm_rope kernel via the use_gemma flag threaded through below.
+        self.use_gemma_rms_norm = use_gemma_rms_norm
+        self._fuse_qk_norm_rope_gate = False
 
         # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb
         # will be skipped in the overridden apply_rope.
@@ -212,6 +218,87 @@ class QKNormRoPEAttention(Attention):
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
+    def _get_qk_norm_rotary_dim(self) -> int:
+        partial_rotary_factor = getattr(self.pretrained_config,
+                                        "partial_rotary_factor", 1.0)
+        return int(self.head_dim * partial_rotary_factor)
+
+    def _can_use_fused_qk_norm_rope_gate(
+            self, qkv: torch.Tensor,
+            position_ids: Optional[torch.Tensor]) -> bool:
+        if not self._fuse_qk_norm_rope_gate or is_torch_compiling():
+            return False
+        if torch.version.hip is not None or qkv.device.type != "cuda":
+            return False
+        if qkv.dim() != 2 or qkv.stride(-1) != 1:
+            return False
+        if qkv.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if position_ids is None or position_ids.dim() > 3:
+            return False
+        if position_ids.dtype not in (torch.int32, torch.int64):
+            return False
+        use_mrope = position_ids.dim() == 3
+        if use_mrope and not (getattr(
+                self.pos_embd_params, "mrope_interleaved", False) and getattr(
+                    self.pos_embd_params, "mrope_section", None) is not None
+                              and position_ids.shape[0] == 3):
+            return False
+        expected_positions = qkv.shape[0] * (3 if use_mrope else 1)
+        if position_ids.numel() != expected_positions:
+            return False
+        if not (self.attn_output_gate and self.fuse_qk_norm_rope
+                and self.is_qk_norm and self.use_gemma_rms_norm
+                and not self.skip_rope):
+            return False
+        if self.pos_embd_params is None or self.pos_embd_params.rope is None:
+            return False
+        if not self.pos_embd_params.is_neox or self.rotary_emb is None:
+            return False
+        rope = self.pos_embd_params.rope
+        if rope.scale_type not in (RotaryScalingType.none,
+                                   RotaryScalingType.mrope):
+            return False
+        if rope.scale != 1.0:
+            return False
+        rotary_dim = self._get_qk_norm_rotary_dim()
+        return (rotary_dim == rope.dim and rotary_dim > 0
+                and rotary_dim <= self.head_dim and rotary_dim % 2 == 0)
+
+    def preprocess_qkv(self, qkv, position_ids):
+        """Fuse gate split + gemma QK norm + RoPE into a single Triton kernel
+        when supported; otherwise fall back to the generic unfused path."""
+        if not self._can_use_fused_qk_norm_rope_gate(qkv, position_ids):
+            return super().preprocess_qkv(qkv, position_ids)
+        use_mrope = position_ids.dim() == 3
+        positions = position_ids.reshape(
+            3, -1) if use_mrope else position_ids.reshape(-1)
+        qkv, gate = fused_qkv_gemma_rmsnorm_rope_gate(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.rotary_emb.rotary_cos_sin,
+            positions.contiguous(),
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self._get_qk_norm_rotary_dim(),
+            tuple(self.pos_embd_params.mrope_section) if use_mrope else None,
+        )
+        return qkv, None, None, gate
+
+    def apply_output_gate(self, attention_output, gate):
+        if (self._fuse_qk_norm_rope_gate and not is_torch_compiling()
+                and torch.version.hip is None
+                and attention_output.device.type == "cuda"
+                and attention_output.dim() == 2
+                and attention_output.stride(-1) == 1 and gate.dim() in (2, 3)
+                and gate.stride(-1) == 1
+                and gate.numel() == attention_output.numel()):
+            return fused_sigmoid_mul(attention_output, gate, inplace=True)
+        return super().apply_output_gate(attention_output, gate)
+
     def apply_qk_norm(self, q, k):
 
         def q_l2norm():
@@ -237,18 +324,36 @@ class QKNormRoPEAttention(Attention):
         factor, low, high, attention_factor = compute_yarn_parameters(
             self.pretrained_config)
 
-        partial_rotary_factor = self.pretrained_config.partial_rotary_factor if hasattr(
-            self.pretrained_config, "partial_rotary_factor") else 1.0
-        rotary_dim = int(self.head_dim * partial_rotary_factor)
+        rotary_dim = self._get_qk_norm_rotary_dim()
+
+        # Interleaved mRoPE: position_ids is 3D [3, ...] (temporal/height/width)
+        # and each rotary half-dim picks a section per
+        # MRotaryEmbedding.apply_interleaved_rope. Fall back to plain RoPE for
+        # 2D/1D position_ids (e.g. dummy requests), mirroring the unfused path.
+        mrope_section = getattr(self.pos_embd_params, "mrope_section", None)
+        use_mrope = bool(
+            getattr(self.pos_embd_params, "mrope_interleaved", False)
+        ) and mrope_section is not None and position_ids.dim() == 3
+        if use_mrope:
+            # [3, num_tokens] row-major (sec*num_tokens + token); the upstream 3D
+            # position_ids may be a non-contiguous view, and the op requires
+            # contiguous, so force it here.
+            position_ids_arg = position_ids.reshape(3, -1).contiguous().to(
+                torch.int32)
+            mrope_section1, mrope_section2 = mrope_section[1], mrope_section[2]
+        else:
+            position_ids_arg = position_ids.reshape(-1).contiguous().to(
+                torch.int32)
+            mrope_section1, mrope_section2 = 0, 0
 
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
             self.num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight,
-            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
-            position_ids.view(-1), factor, low, high, attention_factor,
-            self.is_qk_norm)
+            self.k_norm.weight, self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox, position_ids_arg, factor, low, high,
+            attention_factor, self.is_qk_norm, self.use_gemma_rms_norm,
+            use_mrope, mrope_section1, mrope_section2)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

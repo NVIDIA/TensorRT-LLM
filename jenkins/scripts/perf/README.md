@@ -15,6 +15,9 @@ jenkins/scripts/perf/
     submit.py                # Local submit script (aggregated and disaggregated)
     slurm_install.sh         # Build wheel + pip install inside container
     slurm_run.sh             # Run pytest inside container
+    run_disagg.sh            # Config-driven wrapper: read .conf, generate slurm_launch.sh, sbatch
+    configs/                 # Per-cluster / per-case .conf files consumed by run_disagg.sh
+      example.conf           # Reference template — copy and tweak
   perf_utils.py              # Shared utilities (regression detection, baseline, charts, OpenSearch queries)
   get_pre_merge_html.py      # Pre-merge HTML report with history, baseline, and threshold
   perf_sanity_triage.py      # Query/update OpenSearch data and send Slack notifications
@@ -60,6 +63,164 @@ Used by the **CI pipeline** (called from `jenkins/L0_Test.groovy`'s
 `runLLMTestlistWithSbatch`). Only supports **disaggregated** mode. It receives a
 script prefix and srun args from the CI pipeline and combines them with disagg-specific
 environment variables and hardware configuration to generate `slurm_launch.sh`.
+
+## Running Local Tests with `run_disagg.sh`
+
+`local/run_disagg.sh` is a config-driven wrapper around `local/submit.py`. It reads a
+single `.conf` file, applies defaults, generates one `slurm_launch.sh` per test, and
+submits each via `sbatch`. Despite the historical name, it supports **both** aggregated
+and disaggregated runs — the runtime mode (and the right draft template) is derived
+automatically from each `test_id`.
+
+### Quick Start
+
+Run this on a SLURM login node:
+
+```bash
+cd ${YOUR_TRTLLM_PATH}/jenkins/scripts/perf/local
+
+# 1. Copy the example and edit it for your cluster + test case
+cp configs/example.conf configs/mycluster.conf
+$EDITOR configs/mycluster.conf
+
+# 2. Submit (one sbatch per entry in test_ids)
+bash run_disagg.sh -c configs/mycluster.conf
+
+# 3. Watch — logs and outputs are under $work_dir as printed by the script
+squeue -u $USER
+```
+
+`bash run_disagg.sh -h` prints the inline header plus a list of available `.conf`
+files under `configs/`.
+
+### Config File Reference
+
+The `.conf` file is `source`d as bash. Variables not set in the file fall back to
+defaults inside `run_disagg.sh`. Anything `export`ed in the shell before invoking the
+script takes precedence over both.
+
+All examples below use placeholders like `${YOUR_TRTLLM_PATH}` — replace with your
+own absolute paths.
+
+#### Paths
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `trtllm` | recommended | Login-node path to your TensorRT-LLM checkout. The container must be able to see it via `mounts`. Example: `${YOUR_TRTLLM_PATH}`. |
+| `work_dir` | no | One run goes in one work dir; created if missing. Holds `slurm_launch.sh`, `test_list.txt`, `slurm-<jobid>.out`, `report.xml`, and per-role logs. Default: `$HOME/perf_runs/disagg_<timestamp>`. Keeping it under `$trtllm` lets a single mount of the source tree cover it. |
+| `llm_models_path` | yes | Host path to the model weights tree. Must be reachable inside the container via `mounts`. Example: `${YOUR_MODELS_PATH}/llm-models`. |
+| `mounts` | recommended | Comma-separated `host:container` bind-mount pairs. Every path the container touches at runtime — source tree, wheel, work_dir, models — must be reachable through one of these. Recommended: `"$trtllm:$trtllm,$llm_models_path:$llm_models_path"`. |
+
+#### SLURM
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `partition` | **yes** | — | SLURM partition. Script errors if left as the `CHANGE_ME` placeholder. |
+| `account` | no | `coreai_comparch_trtllm` | SLURM billing account. |
+| `job_name` | no | `disagg_test` | Base job name. For multi-test runs, each sub-job is suffixed with `_<idx>`. |
+| `time_limit` | no | `02:00:00` | `HH:MM:SS` SLURM wall-time. |
+
+#### Docker image (pick ONE of two modes)
+
+| Mode | `image` | `image_var` | Behavior |
+|------|---------|-------------|----------|
+| (a) — pinned | non-empty | ignored | `image` used verbatim. Reproducible, recommended for benchmarking. |
+| (b) — auto-resolve | empty / unset | used as key name | Resolved from `${YOUR_TRTLLM_PATH}/jenkins/current_image_tags.properties` by `image_var=` key. |
+
+- `image` — Full image URI (mode a). URIs beginning with `urm.nvidia.com/` are
+  auto-rewritten to enroot form (`urm.nvidia.com#`); the script is a no-op if you
+  already passed the enroot form.
+- `image_var` — Key in `current_image_tags.properties` (mode b). Common keys:
+  `LLM_DOCKER_IMAGE` (x86 — H100 / B200), `LLM_SBSA_DOCKER_IMAGE` (SBSA — GB200).
+  Default: `LLM_DOCKER_IMAGE`.
+
+Do **not** expect setting both `image` and `image_var` to "combine" — `image` always
+wins when set.
+
+#### Test selection
+
+- `test_ids` (preferred) — Bash array of full pytest IDs. Each entry is submitted as
+  its own `sbatch`. With >1 entry, each lands in its own subdir under `$work_dir`
+  named `<idx>_<test-slug>`.
+- `test_id` (legacy) — Single test string. Equivalent to a 1-element `test_ids`.
+
+Test-ID format:
+
+```
+perf/test_perf_sanity.py::test_e2e[<runtime>-<mode>-<yaml-stem>[-<server-cfg>]]
+```
+
+- `<runtime>` = `disagg` | `aggr`
+- `<mode>` (disagg) = `e2e` | `gen_only` | `ctx_only`
+- `<yaml-stem>` matches a YAML file in `tests/scripts/perf-sanity/disaggregated/`
+  (or `aggregated/`)
+- `<server-cfg>` — only for normal aggregated tests — the `name:` field of one of
+  the YAML's `server_configs` entries
+
+`run_disagg.sh` errors out if any entry still contains the literal placeholder
+`CHANGE_ME`.
+
+#### Install mode
+
+- `install_mode` — `wheel` (default) or `source`.
+  - `wheel`: container does `pip install <wheel_path>`.
+  - `source`: container does `pip install -e .` against the mounted `$trtllm`.
+    `wheel_path` is ignored in this mode.
+- `wheel_path` — Local `.whl` file. **Required when `install_mode=wheel`** (must
+  exist; script errors otherwise). Must follow PEP 427 naming
+  (`tensorrt_llm-<ver>-<py>-<abi>-<plat>.whl`); pip rejects malformed names. Find
+  the exact name via:
+  ```bash
+  ls ${YOUR_TRTLLM_PATH}/build/tensorrt_llm-*.whl
+  ```
+  Keeping it under `$trtllm/build` lets the single `$trtllm` mount cover it.
+
+#### Optional flags (leave unset = disabled)
+
+- `build_wheel_flag` — Set to `"--build-wheel"` to build the wheel inside the
+  container before installing. Works with either `install_mode`.
+- `capture_nsys_flag` — Set to `"--capture-nsys"` to wrap the worker pytest in
+  `nsys profile`. Profiles land in `$work_dir/nsys.*.<rank>.qdrep` (per-role for
+  disagg, per-rank for aggregated).
+
+#### Cluster compatibility
+
+- `strip_sbatch_opts` — Comma-separated `#SBATCH` directives to comment out in the
+  generated `slurm_launch.sh`, for clusters whose SLURM version / configuration
+  doesn't accept them. Default in `run_disagg.sh`: `--segment`. Why these may need
+  stripping:
+  - `--segment` — newer SLURM topology option, missing on older clusters (e.g.,
+    EOS).
+  - `--gres` — EOS doesn't register GPUs as a `gres` at all.
+  - `--gpus-per-node` — SLURM translates this into a `gres` request internally,
+    which also fails on EOS for the same reason.
+
+  Recommended:
+  | Cluster | `strip_sbatch_opts` |
+  |---------|---------------------|
+  | EOS | `"--segment,--gres,--gpus-per-node"` |
+  | B200 / GB200 modern clusters | `"--segment"` (or `""` if even `--segment` works) |
+
+### Multi-Test Work Directory Layout
+
+For a `test_ids` array with more than one entry:
+
+```
+$work_dir/
+├── 00_<slug-of-test-0>/
+│   ├── slurm_launch.sh
+│   ├── slurm-<jobid>.out
+│   ├── install.log
+│   ├── (disagg only) gen_server_*.log, ctx_server_*.log, disagg_server.log
+│   ├── test_list.txt
+│   └── report.xml
+├── 01_<slug-of-test-1>/
+│   └── ...
+└── ...
+```
+
+Each sub-job is submitted independently — one bad `test_id` does not stop the rest.
+The script exits non-zero if any `submit.py` or `sbatch` invocation failed.
 
 ## Shared Utilities
 
@@ -109,9 +270,16 @@ and benchmark srun steps never see MPI flags.
 **Where MPI is configured:**
 - `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` — `--mpi=pmix` on
   ctx/gen srun commands only
-- `jenkins/scripts/perf/local/submit.py` — `--mpi=pmi2` for aggregated mode only,
+- `jenkins/scripts/perf/local/submit.py` — `--mpi=pmix` for aggregated mode only,
   no MPI flag for disaggregated mode (handled by the draft template)
-- `jenkins/L0_Test.groovy` — `--mpi=pmi2` for non-disagg multi-node only
+- `jenkins/L0_Test.groovy` — `--mpi=pmix` for non-disagg multi-node only
+
+> The DLFW base image (PyTorch 26.03+) ships an Open MPI build with PMIx support
+> only and **no classic PMI-2**. Under `--mpi=pmi2` srun exposes a PMI-2 server
+> but no PMIx server, so OMPI's `pmix3x_client` fails with
+> `OPAL ERROR: Unreachable in pmix3x_client.c at line 111` and aborts in
+> `MPI_Init_thread`. `--mpi=pmix` matches what the disagg path has always used
+> and works against the new OMPI build.
 
 ### Key Rules
 

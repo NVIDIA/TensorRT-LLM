@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, cast
 
@@ -183,6 +183,31 @@ class UncommittedPage(Page):
         block.storage[self.life_cycle] = rawref.ref(committed_page)
         return committed_page
 
+    def convert_to_ssm_committed(
+        self, block: Block, ready_event: CachedCudaEvent, num_tokens_in_block: int
+    ) -> "SsmCommittedPage":
+        """
+        Moves the slot to a new committed SSM page and add the new page to the block.
+        The uncommitted page becomes invalid.
+        """
+        assert not self.scheduled_for_eviction
+        assert block.storage[self.life_cycle] is None
+        assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
+        self.ready_event = ready_event
+        committed_page = SsmCommittedPage(
+            self.manager,
+            block,
+            self.life_cycle,
+            self.cache_level,
+            self,
+            self.priority,
+            num_tokens_in_block,
+        )
+        assert not self.has_valid_slot and self.ready_event is CachedCudaEvent.NULL
+        assert committed_page.has_valid_slot
+        block.storage[self.life_cycle] = rawref.ref(committed_page)
+        return committed_page
+
     def __del__(self) -> None:
         def check_page(p: "BlockPage") -> bool:
             return p is None or isinstance(p.page, CommittedPage)
@@ -203,7 +228,20 @@ class UncommittedPage(Page):
 
 @dataclass(slots=True)
 class CommittedPage(Page):
+    """A committed page is immutable — all access after commit is read-only.
+
+    We intentionally do not add a separate read_event to track read completion.
+    The inherited Slot.ready_event serves double duty: after commit or migration it
+    represents write completion; after _UniqPageLock is destroyed it is set to the
+    merged finish events of all prior readers. This means a new reader may
+    unnecessarily wait for a prior reader (read-after-read on immutable data), but
+    this is functionally correct, only occurs when the lock is fully released between
+    reuses, and saves one event field per committed page — a worthwhile tradeoff given
+    the potentially huge number of committed pages in the system.
+    """
+
     block: rawref.ref["Block"]
+    planned_drop_count: int
     __rawref__: rawref.ref["CommittedPage"]
 
     def is_committed(self) -> bool:
@@ -219,6 +257,7 @@ class CommittedPage(Page):
         priority: Priority,
     ):
         self.block = rawref.ref(block)
+        self.planned_drop_count = 0
         self.__rawref__ = rawref.NULL
         Page.__init__(
             self,
@@ -237,13 +276,33 @@ class CommittedPage(Page):
         block = self.block()
         # block may be None when rebase happens, i.e. another block with the same key is committed,
         # replacing it, but the page is still used by a _KVCache.
-        if block is not None:
-            block.unset_page(
+        if block is not None and block.unlink_page(self.life_cycle, self):
+            Block.clear_stale_blocks_after_page_unlink(
+                block,
                 self.life_cycle,
                 self.manager._life_cycles.get_life_cycle(self.life_cycle),
             )
         Page.__del__(self)
         self.__rawref__.invalidate()
+
+
+@dataclass(slots=True)
+class SsmCommittedPage(CommittedPage):
+    num_tokens_in_block: int
+
+    def __init__(
+        self,
+        storage: "StorageManager",
+        block: Block,
+        life_cycle: LifeCycleId,
+        cache_level: CacheLevel,
+        slot: Slot,
+        priority: Priority,
+        num_tokens_in_block: int,
+    ):
+        assert num_tokens_in_block > 0
+        self.num_tokens_in_block = num_tokens_in_block
+        CommittedPage.__init__(self, storage, block, life_cycle, cache_level, slot, priority)
 
 
 @dataclass(slots=True)
@@ -333,6 +392,9 @@ class _UniqPageLock:
         page = self.page
         if not NDEBUG:
             assert_critical(page.cache_level == CacheLevel(0) and not page.scheduled_for_eviction)
+        # Set ready_event to the merged finish events of all readers. For committed (read-only)
+        # pages, this means the next reader will wait for prior reads to complete, which is
+        # unnecessary but correct. See the CommittedPage docstring for rationale.
         page.ready_event = merge_events(self.finish_events)
         assert self.holder is not None
         self.holder._lock = None
@@ -441,7 +503,11 @@ class BatchedLockTarget(NamedTuple):
 
 
 def batched_lock_to_gpu(
-    kv_cache: "_KVCache", tasks: Sequence[BatchedLockTarget]
+    kv_cache: "_KVCache",
+    tasks: Sequence[BatchedLockTarget],
+    migration_recorder: Callable[[Sequence[Page], Sequence[Slot], CacheLevel, CacheLevel], None]
+    | None = None,
+    drop_recorder: Callable[[Sequence[Page], CacheLevel], None] | None = None,
 ) -> list["_SharedPageLock"]:
     "Lock pages after migrating all pages to GPU. If migration fails, no locking happens."
     storage = kv_cache.manager._storage
@@ -457,13 +523,18 @@ def batched_lock_to_gpu(
         requirements[lc2pg[t.life_cycle]] += 1
 
     try:
-        storage.prepare_free_slots(GPU_LEVEL, requirements)
+        storage.prepare_free_slots(GPU_LEVEL, requirements, migration_recorder, drop_recorder)
         partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue
             storage._batched_migrate(
-                pg_idx, GPU_LEVEL, lvl, [p.page for p in part], update_src=True
+                pg_idx,
+                GPU_LEVEL,
+                lvl,
+                [p.page for p in part],
+                update_src=True,
+                migration_recorder=migration_recorder,
             )
     except Exception:
         for t, e in zip(tasks, scheduled_for_eviction):

@@ -14,14 +14,14 @@ server_configs:
       quant_config:
         quant_algo: NVFP4
         dynamic: true
-      attention:
+      attention_config:
         backend: TRTLLM
-      parallel:
+      parallel_config:
         parallel_vae_size: 8
-        dit_cfg_size: 2
-        dit_ulysses_size: 4
-      cuda_graph:
-        enable_cuda_graph: false
+        cfg_size: 2
+        ulysses_size: 4
+      cuda_graph_config:
+        enable: false
     client_configs:
       - name: 1280x720_81f_40s_con1_i2v
         prompt: A cat walks through a field of flowers

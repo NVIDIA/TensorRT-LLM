@@ -113,6 +113,24 @@ def capture_server():
     server.shutdown()
 
 
+def _assert_llm_api_config_capture(params):
+    """Assert that the public LLM entrypoint populated config telemetry."""
+    assert "llmApiConfigJson" in params
+    assert "llmApiConfigMetaJson" in params
+
+    config = json.loads(params["llmApiConfigJson"])
+    meta = json.loads(params["llmApiConfigMetaJson"])
+
+    assert config["tensor_parallel_size"] == 1
+    assert config["pipeline_parallel_size"] == 1
+    # Sensitive identifiers must never be captured.
+    assert "model" not in config
+    assert "tokenizer" not in config
+    assert meta["args_class"] == "TorchLlmArgs"
+    assert meta["capture_succeeded"] is True
+    assert meta["captured_field_count"] > 0
+
+
 # ---------------------------------------------------------------------------
 # E2E test
 # ---------------------------------------------------------------------------
@@ -226,11 +244,13 @@ class TestE2ECapture:
         assert set(features.keys()) == expected_keys
 
         # Schema version
-        assert payload["eventSchemaVer"] == "0.1"
+        assert payload["eventSchemaVer"] == "0.2"
 
         # Disagg fields present (may be empty strings)
         assert "disaggRole" in params
         assert "deploymentId" in params
+
+        _assert_llm_api_config_capture(params)
 
     def test_cli_serve_context_e2e(self, capture_server, monkeypatch):
         """Verify CLI_SERVE context flows through to the captured payload."""
@@ -261,3 +281,4 @@ class TestE2ECapture:
         payload = CaptureHandler.captured_payloads[0]
         params = payload["events"][0]["parameters"]
         assert params["ingressPoint"] == "cli_serve"
+        _assert_llm_api_config_capture(params)

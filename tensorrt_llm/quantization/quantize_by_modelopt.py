@@ -29,7 +29,6 @@ import torch
 from accelerate.hooks import remove_hook_from_module
 from datasets import load_dataset
 from modelopt.torch.utils import print_rank_0
-from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.utils.data import DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
@@ -37,7 +36,6 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
 
 from .._utils import get_hf_rope_theta, release_gc, str_dtype_to_torch
 from ..logger import logger
-from ..mapping import Mapping
 from .image_processing import MllamaImageProcessor
 from .mode import QuantAlgo
 
@@ -500,6 +498,17 @@ def get_model_type(model):
     return None
 
 
+def _is_cnn_dailymail_local_repo(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+    # The loader only uses the "3.0.0" config.
+    if os.path.isdir(os.path.join(path, "3.0.0")):
+        return True
+    if os.path.isfile(os.path.join(path, "cnn_dailymail.py")):
+        return True
+    return False
+
+
 def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                          tokenizer=None,
                          batch_size=1,
@@ -526,7 +535,11 @@ def get_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                    split="train",
                                    trust_remote_code=True)
         dataset = dataset.select(range(calib_size))
-    elif "cnn_dailymail" in dataset_name_or_dir:
+    elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
+            dataset_name_or_dir):
+        # Bare "cnn_dailymail" id is rejected by newer huggingface_hub; use the namespaced repo.
+        if dataset_name_or_dir == "cnn_dailymail":
+            dataset_name_or_dir = "abisee/cnn_dailymail"
         dataset = load_dataset(
             dataset_name_or_dir,
             name="3.0.0",
@@ -705,73 +718,6 @@ def quantize_model(model, quant_cfg, calib_dataloader, batch_size, qformat,
         "Quantization done. Total time used: {:.2f} s.".format(end_time -
                                                                start_time))
     return model
-
-
-def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
-                          num_medusa_heads, num_medusa_layers, max_draft_len,
-                          medusa_hidden_act, medusa_model_dir,
-                          quant_medusa_head):
-
-    with open(f"{medusa_model_dir}/config.json", "r") as fp:
-        medusa_config = json.load(fp)
-
-    num_medusa_heads_from_config = medusa_config.get('medusa_num_heads',
-                                                     num_medusa_heads)
-    num_medusa_layers = medusa_config.get('medusa_num_layers',
-                                          num_medusa_layers)
-    if num_medusa_heads is None:
-        num_medusa_heads = num_medusa_heads_from_config
-
-    assert max_draft_len > 0, "should have max_draft_len > 0"
-
-    world_size = tp_size * pp_size
-    # Process for each rank
-    for rank in range(world_size):
-        mapping = Mapping(world_size=world_size,
-                          rank=rank,
-                          tp_size=tp_size,
-                          pp_size=pp_size)
-        # 1. Load medusa weight for each rank
-        from tensorrt_llm.models.medusa.weight import load_medusa_hf
-        medusa_weights = load_medusa_hf(medusa_path=medusa_model_dir,
-                                        num_medusa_heads=num_medusa_heads,
-                                        num_medusa_layers=num_medusa_layers,
-                                        mapping=mapping,
-                                        dtype="float16")
-        # 2. Load base model safetensors (after quant)
-        base_model_weights = load_file(
-            f"{base_model_output_dir}/rank{rank}.safetensors")
-
-        # 3. Combine and save weight
-        base_model_weights.update(medusa_weights)
-        save_file(base_model_weights,
-                  f"{base_model_output_dir}/rank{rank}.safetensors")
-
-    # 4. Add medusa config into config.json
-    with open(f"{base_model_output_dir}/config.json", 'r') as f:
-        base_model_config = json.load(f)
-        f.close()
-
-    with open(f"{base_model_output_dir}/config.json", 'w') as f:
-        base_model_config['architecture'] = "MedusaForCausalLM"
-        base_model_config['quantization']['exclude_modules'] = [
-            'lm_head',
-            '*router',
-            '*vocab_embedding',
-            '*position_embedding',
-            '*block_embedding',
-        ]
-        if not quant_medusa_head:
-            base_model_config['quantization']['exclude_modules'].append(
-                '*medusa_heads*')
-
-        base_model_config['max_draft_len'] = max_draft_len
-        base_model_config['num_medusa_heads'] = num_medusa_heads
-        base_model_config['num_medusa_layers'] = num_medusa_layers
-        json.dump(base_model_config, f, indent=4)
-
-    torch.cuda.empty_cache()
-    logger.info("Combine medusa heads' weight, done.")
 
 
 def quantize_and_export(*,
@@ -1067,28 +1013,6 @@ def quantize_and_export(*,
                 with open(f"{export_path}/config.json", "w") as f:
                     json.dump(tensorrt_llm_config, f, indent=4)
 
-            # Workaround for combining medusa head
-            # TODO: move these integration into modelopt to avoid redundant reading and writing
-            if medusa_model_dir is not None:
-                combine_medusa_weight(tp_size, pp_size, export_path,
-                                      num_medusa_heads, num_medusa_layers,
-                                      max_draft_len, medusa_hidden_act,
-                                      medusa_model_dir, quant_medusa_head)
-
-            # Workaround for mllama
-            if model_type == 'mllama':
-                from tensorrt_llm.models.mllama.config import MLLaMAConfig
-                config = MLLaMAConfig.from_hugging_face(
-                    model_dir,
-                    dtype=dtype,
-                )
-                for key, value in config.to_dict().items():
-                    if key not in tensorrt_llm_config:
-                        tensorrt_llm_config[key] = value
-
-                with open(f"{export_path}/config.json", "w") as f:
-                    json.dump(tensorrt_llm_config, f, indent=4)
-
         end_time = time.time()
         logger.info(
             "Quantized model exported to {} \nTotal time used {:.2f} s.".format(
@@ -1140,7 +1064,11 @@ def get_nemo_calib_dataloader(dataset_name_or_dir="cnn_dailymail",
                                split="train",
                                trust_remote_code=True)
         text_column = "text"
-    elif "cnn_dailymail" in dataset_name_or_dir:
+    elif "cnn_dailymail" in dataset_name_or_dir or _is_cnn_dailymail_local_repo(
+            dataset_name_or_dir):
+        # Bare "cnn_dailymail" id is rejected by newer huggingface_hub; use the namespaced repo.
+        if dataset_name_or_dir == "cnn_dailymail":
+            dataset_name_or_dir = "abisee/cnn_dailymail"
         dataset = load_dataset(dataset_name_or_dir,
                                name="3.0.0",
                                split="train",

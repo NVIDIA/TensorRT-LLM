@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -16,6 +16,8 @@
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
+add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -33,9 +35,14 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
-  add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
-  remove_compile_definition(mixtureOfExpertsInternalTest
-                            USING_OSS_CUTLASS_MOE_GEMM)
+  # The internal-path variant includes headers (quantization.h) that only ship
+  # with the internal cutlass kernels sources; the prebuilt tarball provides the
+  # library and a reduced header set only.
+  if(INTERNAL_CUTLASS_KERNELS_PATH)
+    add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+    remove_compile_definition(mixtureOfExpertsInternalTest
+                              USING_OSS_CUTLASS_MOE_GEMM)
+  endif()
 endif()
 
 add_gtest(ropeTest ropeTest.cu)
@@ -94,6 +101,12 @@ add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_gtest(moeLoraPointerExpandTest moeLoraPointerExpandTest.cu)
+  add_gtest(moeLoraProblemBuilderTest moeLoraProblemBuilderTest.cu)
+  add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
+endif()
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)

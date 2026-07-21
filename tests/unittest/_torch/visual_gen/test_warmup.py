@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.visual_gen.config import CompilationConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+from tensorrt_llm.visual_gen.args import CompilationConfig, VisualGenArgs
 
 
 class TestCompilationConfig:
@@ -52,43 +52,43 @@ class TestVisualGenArgsWarmup:
     """CompilationConfig integration with VisualGenArgs."""
 
     def test_default_warmup(self):
-        args = VisualGenArgs(checkpoint_path="/tmp/model")
-        assert isinstance(args.compilation, CompilationConfig)
-        assert args.compilation.resolutions is None
-        assert args.compilation.num_frames is None
+        args = VisualGenArgs(model="/tmp/model")
+        assert isinstance(args.compilation_config, CompilationConfig)
+        assert args.compilation_config.resolutions is None
+        assert args.compilation_config.num_frames is None
 
     def test_warmup_from_dict(self):
         args = VisualGenArgs(
-            checkpoint_path="/tmp/model",
-            compilation={"resolutions": [(480, 832)], "num_frames": [33, 81]},
+            model="/tmp/model",
+            compilation_config={"resolutions": [(480, 832)], "num_frames": [33, 81]},
         )
-        assert args.compilation.resolutions == [(480, 832)]
-        assert args.compilation.num_frames == [33, 81]
+        assert args.compilation_config.resolutions == [(480, 832)]
+        assert args.compilation_config.num_frames == [33, 81]
 
     def test_warmup_from_yaml(self, tmp_path):
         yaml_path = tmp_path / "config.yml"
         yaml_path.write_text(
-            "checkpoint_path: /tmp/model\n"
-            "compilation:\n"
+            "model: /tmp/model\n"
+            "compilation_config:\n"
             "  resolutions:\n"
             "    - [480, 832]\n"
             "    - [720, 1280]\n"
             "  num_frames: [33, 81]\n"
         )
         args = VisualGenArgs.from_yaml(yaml_path)
-        assert len(args.compilation.resolutions) == 2
-        assert args.compilation.num_frames == [33, 81]
+        assert len(args.compilation_config.resolutions) == 2
+        assert args.compilation_config.num_frames == [33, 81]
 
     def test_warmup_pickle_roundtrip(self):
         import pickle
 
         args = VisualGenArgs(
-            checkpoint_path="/tmp/model",
-            compilation=CompilationConfig(resolutions=[(480, 832)], num_frames=[33]),
+            model="/tmp/model",
+            compilation_config=CompilationConfig(resolutions=[(480, 832)], num_frames=[33]),
         )
         restored = pickle.loads(pickle.dumps(args))
-        assert restored.compilation.resolutions == [(480, 832)]
-        assert restored.compilation.num_frames == [33]
+        assert restored.compilation_config.resolutions == [(480, 832)]
+        assert restored.compilation_config.num_frames == [33]
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +102,8 @@ class _BaseStubPipeline(BasePipeline):
 
     def __init__(self, warmup_cfg):
         self._warmed_up_shapes = set()
-        self.model_config = MagicMock()
-        self.model_config.compilation = warmup_cfg or CompilationConfig()
+        self.pipeline_config = MagicMock()
+        self.pipeline_config.compilation = warmup_cfg or CompilationConfig()
 
     def forward(self, *args, **kwargs):
         pass

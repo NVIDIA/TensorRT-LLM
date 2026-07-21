@@ -33,12 +33,20 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
     dist = MagicMock()
     dist.tp_rank = tp_rank
     dist.tp_size = tp_size
+    # ADP scheduling assumes ``enable_attention_dp=True``, so ``dp_size``
+    # mirrors ``tp_size`` (see ``Mapping.dp_size``).
+    dist.mapping.dp_size = tp_size
     dist.has_cp_helix = has_cp_helix
     return dist
 
 
 def _make_request_item(
-    req_id, num_tokens=10, target_dp_rank=None, attention_dp_relax=True, lora_task_id=None
+    req_id,
+    num_tokens=10,
+    target_dp_rank=None,
+    attention_dp_relax=True,
+    lora_task_id=None,
+    cache_salt=None,
 ):
     """Create a mock RequestQueueItem for testing."""
     item = MagicMock()
@@ -50,6 +58,7 @@ def _make_request_item(
     item.request = MagicMock()
     item.request.py_scheduling_params = scheduling_params
     item.request.input_token_ids = list(range(num_tokens))
+    item.request.cache_salt = cache_salt
     if lora_task_id is not None:
         lora_config = MagicMock()
         lora_config.task_id = lora_task_id
@@ -63,14 +72,15 @@ def _mock_kv_cache_manager(probe_results=None):
     """Create mock KV cache manager with configurable probe results.
 
     Args:
-        probe_results: dict mapping (tuple(input_tokens), lora_task_id) -> match_length.
+        probe_results: dict mapping (tuple(input_tokens), lora_task_id, cache_salt)
+            -> match_length.
             If None, all probes return 0.
     """
     mgr = MagicMock()
     probe_results = probe_results or {}
 
-    def mock_probe(input_tokens, lora_task_id=None):
-        key = (tuple(input_tokens), lora_task_id)
+    def mock_probe(input_tokens, lora_task_id=None, cache_salt=None):
+        key = (tuple(input_tokens), lora_task_id, cache_salt)
         return probe_results.get(key, 0)
 
     mgr.probe_prefix_match_length = Mock(side_effect=mock_probe)
@@ -117,8 +127,8 @@ class TestKVCacheAwareADPRouter:
         tokens_a = list(range(100))
         tokens_b = list(range(50))
         probe_results = {
-            (tuple(tokens_a[:-1]), None): 64,
-            (tuple(tokens_b[:-1]), None): 0,
+            (tuple(tokens_a[:-1]), None, None): 64,
+            (tuple(tokens_b[:-1]), None, None): 0,
         }
 
         dist = _mock_dist(tp_rank=0, tp_size=1)
@@ -136,7 +146,7 @@ class TestKVCacheAwareADPRouter:
     def test_gather_prefix_matches_two_ranks(self):
         tokens_a = list(range(100))
         probe_results = {
-            (tuple(tokens_a[:-1]), None): 64,
+            (tuple(tokens_a[:-1]), None, None): 64,
         }
 
         dist = _mock_dist(tp_rank=0, tp_size=2)
@@ -156,7 +166,7 @@ class TestKVCacheAwareADPRouter:
     def test_gather_prefix_matches_with_lora(self):
         tokens_a = list(range(100))
         probe_results = {
-            (tuple(tokens_a[:-1]), 42): 64,
+            (tuple(tokens_a[:-1]), 42, None): 64,
         }
 
         dist = _mock_dist(tp_rank=0, tp_size=1)
@@ -167,6 +177,24 @@ class TestKVCacheAwareADPRouter:
         req_a = _make_request_item(1, num_tokens=100, lora_task_id=42)
         router.gather_prefix_matches([req_a])
         assert router._all_ranks_prefix_matches[0] == {1: 64}
+
+    def test_gather_prefix_matches_with_cache_salt(self):
+        tokens_a = list(range(100))
+        probe_results = {
+            (tuple(tokens_a[:-1]), None, "tenant-a"): 64,
+        }
+
+        dist = _mock_dist(tp_rank=0, tp_size=1)
+        dist.tp_allgather = Mock(side_effect=lambda x: [x])
+        mgr = _mock_kv_cache_manager(probe_results)
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+
+        req_a = _make_request_item(1, num_tokens=100, cache_salt="tenant-a")
+        router.gather_prefix_matches([req_a])
+        assert router._all_ranks_prefix_matches[0] == {1: 64}
+        mgr.probe_prefix_match_length.assert_called_once_with(
+            tokens_a[:-1], None, cache_salt="tenant-a"
+        )
 
     def test_gather_prefix_matches_empty(self):
         dist = _mock_dist(tp_rank=0, tp_size=1)
@@ -389,6 +417,120 @@ class TestKVCacheAwareADPRouter:
         assert result[1][0].id == 2
 
 
+# ---- Cold-start warmup tests for KVCacheAwareADPRouter ----
+
+
+class TestKVCacheAwareADPRouterWarmup:
+    """Cold-start round-robin warmup behaviour."""
+
+    def _make_router(self, tp_size):
+        dist = _mock_dist(tp_rank=0, tp_size=tp_size)
+        mgr = _mock_kv_cache_manager()
+        return KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, cold_start_warmup=True)
+
+    def _no_match(self, tp_size, req_ids):
+        return [{rid: 0 for rid in req_ids} for _ in range(tp_size)]
+
+    def _zero_states(self, tp_size):
+        return [
+            RankState(rank=r, num_active_requests=0, num_active_tokens=0) for r in range(tp_size)
+        ]
+
+    def test_pending_initialised_in_ctor(self):
+        """``cold_start_warmup=True`` should populate ``_pending_warmup_ranks`` from dist.mapping.dp_size."""
+        router = self._make_router(tp_size=4)
+        assert router._pending_warmup_ranks == {0, 1, 2, 3}
+
+    def test_disabled_by_default(self):
+        """Default ``cold_start_warmup=False`` leaves the pending set empty."""
+        dist = _mock_dist(tp_rank=0, tp_size=4)
+        mgr = _mock_kv_cache_manager()
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+        assert router._pending_warmup_ranks == set()
+
+    def test_first_batch_round_robins_across_ranks(self):
+        """First tp_size relaxed requests dispatch to ranks 0..tp_size-1."""
+        tp_size = 4
+        router = self._make_router(tp_size=tp_size)
+        router._all_ranks_prefix_matches = self._no_match(tp_size, range(tp_size))
+        reqs = [_make_request_item(i, num_tokens=10) for i in range(tp_size)]
+        result, _ = router.route_requests(
+            self._zero_states(tp_size), reqs, max_num_active_requests=100
+        )
+        # Each rank gets exactly one request, in id order (smallest-first).
+        for r in range(tp_size):
+            assert len(result[r]) == 1
+            assert result[r][0].id == r
+        assert router._pending_warmup_ranks == set()
+
+    def test_warmup_persists_across_single_request_batches(self):
+        """Low-traffic sequential arrivals still cover every rank."""
+        tp_size = 3
+        router = self._make_router(tp_size=tp_size)
+        for batch in range(tp_size):
+            router._all_ranks_prefix_matches = self._no_match(tp_size, [batch])
+            result, _ = router.route_requests(
+                self._zero_states(tp_size),
+                [_make_request_item(batch, num_tokens=10)],
+                max_num_active_requests=100,
+            )
+            assert len(result[batch]) == 1
+            assert result[batch][0].id == batch
+        assert router._pending_warmup_ranks == set()
+
+    def test_strict_request_consumes_warmup_slot(self):
+        """A strict ``target_dp_rank`` discards that rank from the pending set,
+        so a relaxed follow-up in the same batch skips it."""
+        tp_size = 4
+        router = self._make_router(tp_size=tp_size)
+        router._all_ranks_prefix_matches = self._no_match(tp_size, [0, 1])
+        strict = _make_request_item(
+            req_id=0, num_tokens=10, target_dp_rank=2, attention_dp_relax=False
+        )
+        relaxed = _make_request_item(req_id=1, num_tokens=10)
+        result, _ = router.route_requests(
+            self._zero_states(tp_size), [strict, relaxed], max_num_active_requests=100
+        )
+        # Strict lands on its requested rank.
+        assert [r.id for r in result[2]] == [0]
+        # Relaxed picks the smallest still-pending rank (0), NOT rank 2 again.
+        assert [r.id for r in result[0]] == [1]
+        assert router._pending_warmup_ranks == {1, 3}
+
+    def test_cap_saturation_keeps_rank_pending(self):
+        """A saturated warmup pick stays in ``_pending_warmup_ranks`` so a
+        later routing call can still seed it once load drops."""
+        tp_size = 2
+        router = self._make_router(tp_size=tp_size)
+        router._all_ranks_prefix_matches = self._no_match(tp_size, [0])
+        # Rank 0 already at the cap (max_num_active_requests=1).
+        states = [
+            RankState(rank=0, num_active_requests=1, num_active_tokens=10),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+        ]
+        router.route_requests(
+            states, [_make_request_item(0, num_tokens=10)], max_num_active_requests=1
+        )
+        assert 0 in router._pending_warmup_ranks
+
+    def test_empty_pending_disables_warmup(self):
+        """Once pending is empty, routing reverts to pure scoring."""
+        tp_size = 2
+        router = self._make_router(tp_size=tp_size)
+        # Drain the warmup set to simulate a fully warmed router.
+        router._pending_warmup_ranks = set()
+        # Req 1 has a cache hit only on rank 1; scoring (not warmup) should
+        # send it there.
+        router._all_ranks_prefix_matches = [{1: 0}, {1: 80}]
+        result, _ = router.route_requests(
+            self._zero_states(tp_size),
+            [_make_request_item(1, num_tokens=100)],
+            max_num_active_requests=100,
+        )
+        assert result[0] == []
+        assert [r.id for r in result[1]] == [1]
+
+
 # ---- Tests for V1 KVCacheManager.probe_prefix_match_length ----
 
 
@@ -449,3 +591,24 @@ class TestProbeOnV1KVCacheManager:
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=list(range(200)))
         assert result == 192  # 3 blocks * 64 tokens/block
         mgr.impl.analyze_prefix_reuse.assert_called_once()
+
+    def test_cache_salt_uses_cpp_request_cache_salt_kwarg(self):
+        """Salted probes must construct the C++ request with cache_salt."""
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+        mgr = Mock(spec=KVCacheManager)
+        mgr.enable_block_reuse = True
+        mgr.impl = Mock()
+        mgr.impl.is_variable_window = False
+        mock_summary = Mock()
+        mock_summary.reusable_blocks_all = 1
+        mgr.impl.analyze_prefix_reuse = Mock(return_value=mock_summary)
+        mgr.tokens_per_block = 64
+
+        result = KVCacheManager.probe_prefix_match_length(
+            mgr, input_tokens=list(range(128)), cache_salt="tenant-a"
+        )
+
+        assert result == 64
+        dummy_req = mgr.impl.analyze_prefix_reuse.call_args.args[1]
+        assert dummy_req.cache_salt == "tenant-a"

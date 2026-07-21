@@ -30,6 +30,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek import (
     DeepSeekV3RotaryEmbedding,
     DeepSeekV3YarnRotaryEmbedding,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla import (
+    _compute_rotary_cos_sin_from_config,
+)
 
 
 class MockDeepSeekConfig(PretrainedConfig):
@@ -146,6 +149,49 @@ class TestDeepSeekV3RotaryEmbedding:
 
         assert cos.shape == (max_pos, dim)
         assert sin.shape == (max_pos, dim)
+
+    def test_fused_mla_yarn_config_fallback_matches_model_rope(self):
+        """The fused MLA RoPE fallback must match the model's YaRN table."""
+        dim = 64
+        max_pos = 128
+        config = MockDeepSeekConfig()
+        config.qk_rope_head_dim = dim
+        config.max_position_embeddings = max_pos
+        config.rope_scaling = {
+            "type": "yarn",
+            "factor": 40.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        }
+
+        rope = DeepSeekV3YarnRotaryEmbedding(
+            dim,
+            max_pos,
+            base=config.rope_theta,
+            scaling_factor=config.rope_scaling["factor"],
+            original_max_position_embeddings=config.rope_scaling[
+                "original_max_position_embeddings"
+            ],
+            beta_fast=config.rope_scaling["beta_fast"],
+            beta_slow=config.rope_scaling["beta_slow"],
+            mscale=config.rope_scaling["mscale"],
+            mscale_all_dim=config.rope_scaling["mscale_all_dim"],
+        )
+
+        x = torch.empty(1, 1, 1, dim, dtype=torch.float32)
+        cos, sin = rope(x)
+        expected = torch.stack([cos.float(), sin.float()], dim=-1).reshape(1, -1)
+
+        class Factory:
+            def _get_model_config(self):
+                return config, None
+
+        actual = _compute_rotary_cos_sin_from_config(Factory()).cpu()
+        assert torch.equal(actual, expected)
+        torch.testing.assert_close(actual, expected, atol=3e-7, rtol=1e-4)
 
 
 class TestDeepSeekV3MLP:

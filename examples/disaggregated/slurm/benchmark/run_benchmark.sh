@@ -127,7 +127,8 @@ if [ "${ucx_warmup_requests}" -gt 0 ]; then
         --host ${hostname} \
         --port ${port} \
         --ignore-eos \
-        --non-streaming
+        --non-streaming \
+        --trust-remote-code
     echo "UCX warmup done"
 fi
 

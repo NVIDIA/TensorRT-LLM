@@ -27,6 +27,8 @@ Key Features:
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import compute_probs_from_logits
+
 
 class DynamicTreeOpsConverter:
     """
@@ -55,20 +57,16 @@ class DynamicTreeOpsConverter:
         self.K = dynamic_tree_max_topK
         self.depth = max_draft_len
 
-        # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_op
-        N = max_total_draft_tokens + 1  # tokens_per_gen_step (includes root)
+        # Pre-allocated output buffers for verify_dynamic_tree_greedy_out_packed_op
         max_path_len = max_draft_len + 1
-        self._verify_predicts_buf = torch.zeros(
-            max_batch_size * N, dtype=torch.int64, device=device
-        )
         self._verify_accept_index_buf = torch.zeros(
-            max_batch_size, max_path_len, dtype=torch.int64, device=device
+            max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
         self._verify_accept_token_num_buf = torch.zeros(
-            max_batch_size, dtype=torch.int64, device=device
+            max_batch_size, dtype=torch.int32, device=device
         )
         self._verify_accept_token_buf = torch.zeros(
-            max_batch_size, max_path_len, dtype=torch.int64, device=device
+            max_batch_size, max_path_len, dtype=torch.int32, device=device
         )
 
         # Pre-allocated output buffers for verify_dynamic_tree_rejection_out
@@ -139,12 +137,19 @@ class DynamicTreeOpsConverter:
                 Use bit-packed mask for memory efficiency.
         """
         bs = topk_score_indices.shape[0]
+        if bs == 0:
+            return
         # +1 because num_draft_tokens includes root node in SGLang's convention
         num_draft_tokens = topk_score_indices.shape[1] + 1
         tree_mask_mode = 2 if use_packed_mask else 1  # QLEN_ONLY_BITPACKING / QLEN_ONLY
-        # Packed layout: last dim is int32 row stride (may exceed ceil(N/32) if padded).
-        # Non-packed path ignores this (bool [bs,N,N] still has a last dim).
-        num_int32_per_row = tree_mask.shape[-1]
+
+        # Actual buffer row stride (int32s); kernel otherwise computes ceil(num_draft_tokens / 32).
+        num_int32_per_row = tree_mask.shape[-1] if use_packed_mask else 0
+
+        # CUDA kernel indexes as ptr[bid * draftTokenNum + tid], so dim1 must equal num_draft_tokens.
+        assert positions.shape[-1] == num_draft_tokens, (
+            f"positions dim1 ({positions.shape[-1]}) != num_draft_tokens ({num_draft_tokens})"
+        )
 
         # The CUDA builder writes only active tree links/bits. Clear the reused
         # work buffers first so stale slot/tree state cannot leak into this tree.
@@ -177,38 +182,17 @@ class DynamicTreeOpsConverter:
                 f"num_draft_tokens={num_draft_tokens}"
             ) from e
 
-    def verify_dynamic_tree_greedy_out(
+    def verify_dynamic_tree_greedy_out_packed(
         self,
         candidates: torch.Tensor,
-        retrieve_index: torch.Tensor,
-        retrieve_next_token: torch.Tensor,
-        retrieve_next_sibling: torch.Tensor,
+        retrieve_packed: torch.Tensor,
         target_predict: torch.Tensor,
         num_gens: int,
         num_spec_step: int,
         tree_valid: torch.Tensor = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        In-place verify using pre-allocated output buffers (CUDA graph friendly).
-
-        Args:
-            candidates: [num_gens, N] int64 candidate tokens.
-            retrieve_index: [num_gens, N] int32 retrieval indices.
-            retrieve_next_token: [num_gens, N] int32 next token indices.
-            retrieve_next_sibling: [num_gens, N] int32 next sibling indices.
-            target_predict: [num_gens, N] int64 target predictions.
-            num_gens: Number of generation requests.
-            num_spec_step: Number of speculative steps.
-            tree_valid: [num_gens] bool per-request flag.  When False the
-                kernel early-returns with acceptTokenNum=0 (first-gen /
-                dummy requests).  None means all trees are valid.
-
-        Returns:
-            Tuple of (predicts, accept_index, accept_token_num, accept_token)
-            as slices of pre-allocated buffers.
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """In-place verify with int32 token tensors and packed int32 retrieve layout."""
         N = candidates.size(1)
-        predicts = self._verify_predicts_buf[: num_gens * N]
         accept_index = self._verify_accept_index_buf[:num_gens]
         accept_token_num = self._verify_accept_token_num_buf[:num_gens]
         accept_token = self._verify_accept_token_buf[:num_gens]
@@ -216,14 +200,12 @@ class DynamicTreeOpsConverter:
         if tree_valid is None:
             tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
 
+        retrieve_packed_contig = retrieve_packed[:, :N, :].contiguous()
         try:
-            torch.ops.trtllm.verify_dynamic_tree_greedy_out_op(
+            torch.ops.trtllm.verify_dynamic_tree_greedy_out_packed_op(
                 candidates,
-                retrieve_index,
-                retrieve_next_token,
-                retrieve_next_sibling,
+                retrieve_packed_contig,
                 target_predict,
-                predicts,
                 accept_index,
                 accept_token_num,
                 accept_token,
@@ -232,103 +214,73 @@ class DynamicTreeOpsConverter:
             )
         except Exception as e:
             raise RuntimeError(
-                f"verify_dynamic_tree_greedy_out_op failed: {e}\n"
-                f"Inputs: num_gens={num_gens}, N={N}, "
-                f"num_spec_step={num_spec_step}"
+                f"verify_dynamic_tree_greedy_out_packed_op failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={N}, num_spec_step={num_spec_step}"
             ) from e
 
-        return predicts, accept_index, accept_token_num, accept_token
+        return accept_index, accept_token_num, accept_token
 
-    def verify_dynamic_tree_rejection_from_logits_out(
+    def verify_dynamic_tree_rejection_out(
         self,
-        candidates: torch.Tensor,
-        draft_logits_tree: torch.Tensor,
+        draft_tokens: torch.Tensor,
         target_logits_tree: torch.Tensor,
-        draft_prob_indices: torch.Tensor,
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         tree_valid: torch.Tensor,
         temperatures: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
-        skip_temperature: bool,
         num_gens: int,
         num_spec_step: int,
         seed: int | torch.Tensor = 0,
         offset: int | torch.Tensor = 0,
-        d2t: torch.Tensor | None = None,
-        skip_all_sampling_params: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Tree-aware rejection sampling from logits (three CUDA ops).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dynamic tree rejection sampling.
 
-        This path keeps draft/target logits as inputs, computes unique draft
-        and target probabilities with separate CUDA ops, then runs the tree
-        rejection kernel as a third CUDA op. `draft_prob_indices` maps each
-        tree position to its shared draft-prob row. `tree_valid` guards
-        first-gen and dummy requests that do not have a usable tree yet.
+        Computes target probabilities from logits, then runs the target-only
+        rejection kernel. No draft probabilities are needed.
+        `tree_valid` guards first-gen and dummy requests without a valid tree.
         """
         accept_index = self._rej_accept_index_buf[:num_gens]
         accept_token = self._rej_accept_token_buf[:num_gens]
         accept_tok_num = self._rej_accept_token_num_buf[:num_gens]
         seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
         offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
-        num_draft_tokens = candidates.shape[1]
         if num_gens <= 0:
             raise ValueError(f"num_gens must be positive, got {num_gens}")
-        if draft_logits_tree.shape[0] % num_gens != 0:
+        if target_logits_tree.shape[0] % num_gens != 0:
             raise ValueError(
-                f"draft_logits_tree rows ({draft_logits_tree.shape[0]}) must be divisible by "
-                f"num_gens ({num_gens})"
+                "target_logits_tree rows must be divisible by num_gens, got "
+                f"{target_logits_tree.shape[0]} and {num_gens}"
             )
-        num_draft_prob_rows = draft_logits_tree.shape[0] // num_gens
-        target_vocab_size = target_logits_tree.shape[-1]
+        # draft_tokens has shape [num_gens, N-1]; derive total tree nodes N from target_logits_tree.
+        num_draft_tokens = target_logits_tree.shape[0] // num_gens
 
         if tree_valid is None:
-            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
+            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=draft_tokens.device)
         tree_valid = tree_valid.contiguous()
 
-        if top_k is None:
-            top_k_max = 0
-        else:
-            enabled_top_k = top_k[(top_k > 0) & (top_k < target_vocab_size)]
-            top_k_max = int(enabled_top_k.max().item()) if enabled_top_k.numel() > 0 else 0
+        # Expand per-request sampling params to per-tree-position (num_gens * N rows).
+        temps_exp = temperatures.repeat_interleave(num_draft_tokens)
+        top_k_exp = top_k.repeat_interleave(num_draft_tokens) if top_k is not None else None
+        top_p_exp = top_p.repeat_interleave(num_draft_tokens) if top_p is not None else None
+
+        # Compute target probs using the shared linear-path interface (FlashInfer fast
+        # path when available, sort-based fallback otherwise). Returns dense full-vocab
+        # probs [num_gens * N, vocab_size]; no sparse support indices needed.
+        target_probs_flat = compute_probs_from_logits(
+            target_logits_tree,
+            temps_exp,
+            top_k_exp,
+            top_p_exp,
+        )
+        vocab_size = target_probs_flat.shape[-1]
+        target_probs_tree = target_probs_flat.reshape(num_gens, num_draft_tokens, vocab_size)
 
         try:
-            draft_probs_tree = torch.ops.trtllm.compute_draft_probs_for_dynamic_tree_rejection_op(
-                draft_logits_tree,
-                temperatures,
-                num_draft_prob_rows,
-                target_vocab_size,
-                top_k,
-                top_p,
-                skip_temperature,
-                d2t=d2t,
-                top_k_max=top_k_max,
-                skip_all_sampling_params=skip_all_sampling_params,
-            )
-
-            (
-                target_probs_tree,
-                target_support_indices,
-                target_support_lengths,
-            ) = torch.ops.trtllm.compute_target_probs_for_dynamic_tree_rejection_op(
-                target_logits_tree,
-                temperatures,
-                num_draft_tokens,
-                top_k,
-                top_p,
-                skip_temperature,
-                top_k_max=top_k_max,
-                skip_all_sampling_params=skip_all_sampling_params,
-            )
-
             torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(
-                candidates,
-                draft_probs_tree,
+                draft_tokens,
                 target_probs_tree,
-                target_support_indices,
-                target_support_lengths,
-                draft_prob_indices,
                 retrieve_next_token,
                 retrieve_next_sibling,
                 tree_valid,
@@ -341,10 +293,9 @@ class DynamicTreeOpsConverter:
             )
         except Exception as e:
             raise RuntimeError(
-                f"dynamic tree rejection op chain failed: {e}\n"
-                f"Inputs: num_gens={num_gens}, N={candidates.shape[1]}, "
-                f"draft_vocab={draft_logits_tree.shape[-1]}, "
+                f"dynamic tree rejection target-only op chain failed: {e}\n"
+                f"Inputs: num_gens={num_gens}, N={draft_tokens.shape[1] + 1}, "
                 f"target_vocab={target_logits_tree.shape[-1]}, num_spec_step={num_spec_step}"
             ) from e
 
-        return target_support_indices, accept_index, accept_tok_num, accept_token
+        return accept_index, accept_tok_num, accept_token

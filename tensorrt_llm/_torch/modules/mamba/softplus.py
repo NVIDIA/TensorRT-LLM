@@ -1,7 +1,7 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/softplus.py
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 #
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,10 +26,13 @@ if TRITON3:
 
     @triton.jit
     def softplus(dt):
-        return tl.math.log(tl.math.exp(dt) + 1)
+        dt_clamped = tl.minimum(dt, 20.0)
+        return tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt_clamped) + 1),
+                        dt)
 
 else:
 
     @triton.jit
     def softplus(dt):
-        return tl.math.log1p(tl.exp(dt))
+        dt_clamped = tl.minimum(dt, 20.0)
+        return tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt_clamped)), dt)

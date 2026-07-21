@@ -46,15 +46,14 @@ from transformers.models.starcoder2.configuration_starcoder2 import Starcoder2Co
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
-class Starcoder2RotaryEmbedding(nn.Module):
+class Starcoder2RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for Starcoder2.
 
-    Precomputes and caches cos/sin values for the full max_position_embeddings.
-    Returns values indexed by position_ids to enable export.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(
@@ -75,18 +74,9 @@ class Starcoder2RotaryEmbedding(nn.Module):
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_ad_cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached tables — slicing by position_ids happens downstream in attention.
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
-        )
+        return build_rope_cos_sin_cache(self.inv_freq, self.max_position_embeddings, x)
 
 
 class Starcoder2MLP(nn.Module):

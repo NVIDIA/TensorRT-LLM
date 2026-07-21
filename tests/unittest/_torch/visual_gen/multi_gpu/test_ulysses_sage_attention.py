@@ -37,13 +37,19 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-    from tensorrt_llm._torch.visual_gen.config import (
-        SageAttentionConfig,
-        create_attention_metadata_state,
-    )
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
+
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     MODULES_AVAILABLE = True
     ATTENTION_META_DICT = threading.local()
@@ -106,12 +112,13 @@ def run_test_in_distributed(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, "nccl", test_fn, port),
-        nprocs=world_size,
-        join=True,
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, "nccl", test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 
@@ -136,11 +143,11 @@ def _logic_sage_ulysses_forward(rank, world_size, *, sage_attn_qk_int8: bool):
         layer_idx=0,
         num_heads=num_heads // world_size,
         head_dim=head_dim,
-        sage_attention_config=SageAttentionConfig(
-            num_elts_per_blk_q=1,
-            num_elts_per_blk_k=blk_k,
-            num_elts_per_blk_v=1,
-            qk_int8=sage_attn_qk_int8,
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
+            q_block_size=1,
+            k_block_size=blk_k,
+            v_block_size=1,
         ),
         attention_metadata_state=ATTENTION_META_DICT.metadata,
     )
@@ -195,11 +202,11 @@ def _logic_sage_ulysses_vs_reference(
         layer_idx=0,
         num_heads=num_heads // world_size,
         head_dim=head_dim,
-        sage_attention_config=SageAttentionConfig(
-            num_elts_per_blk_q=1,
-            num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
-            num_elts_per_blk_v=1,
-            qk_int8=sage_attn_qk_int8,
+        quant_attention_config=QuantAttentionConfig(
+            qk_dtype="int8" if sage_attn_qk_int8 else "fp8",
+            q_block_size=1,
+            k_block_size=sage_attn_num_elts_per_blk_k,
+            v_block_size=1,
         ),
         attention_metadata_state=ATTENTION_META_DICT.metadata,
     )

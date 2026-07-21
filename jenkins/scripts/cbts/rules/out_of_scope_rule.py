@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,6 +38,8 @@ from .base import PRInputs, Rule, RuleResult
 #   consumed by any L0 pipeline.
 # - tests/integration/defs/.test_durations : pytest-split timing cache;
 #   used at runtime, doesn't affect test selection.
+# - tests/integration/defs/.test_durations_* : per-cluster timing caches
+#   (e.g. .test_durations_aws_dfw); same rationale as above.
 # - tests/integration/defs/agg_unit_mem_df.csv : per-(gpu, case)
 #   pytest-xdist parallel_factor table consumed by test_unittests.py;
 #   tunes worker count only, no impact on which tests run or their

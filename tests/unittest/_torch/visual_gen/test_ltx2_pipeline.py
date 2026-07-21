@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
 """Integration tests for LTX2 pipelines.
 
 Tests cover:
@@ -13,6 +16,7 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 import gc
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,20 +24,34 @@ import torch.nn.functional as F
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import (
+from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages as ltx2_two_stages
+from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
+from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
+from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
     CacheDiTConfig,
-    DiffusionModelConfig,
-    PipelineComponent,
+    CudaGraphConfig,
+    TorchCompileConfig,
     VisualGenArgs,
 )
-from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2_FORCE_ONE_STAGE_ENV
-from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
+# Skip non-transformer components.  ``skip_components`` is an internal
+# escape hatch on ``PipelineLoader.load`` used by unit tests to focus on
+# the transformer; LTX-2 native components (audio_vae, vocoder,
+# connectors, video_encoder) load from the checkpoint automatically.
+SKIP_COMPONENTS = [
+    PipelineComponent.TEXT_ENCODER,
+    PipelineComponent.TOKENIZER,
+    PipelineComponent.VAE,
+    PipelineComponent.SCHEDULER,
+]
+
 
 _LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
+_GEMMA3_DEFAULT = os.path.join(str(llm_models_root(check=True)), "gemma", "gemma-3-12b-it")
 
 
 CHECKPOINT_PATH_BF16 = os.environ.get(
@@ -44,17 +62,20 @@ CHECKPOINT_PATH_FP8 = os.environ.get(
     "LTX2_MODEL_PATH_FP8",
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
 )
+GEMMA3_PATH = os.environ.get("LTX2_TEXT_ENCODER_PATH", _GEMMA3_DEFAULT)
 
-# Skip non-transformer components.  VisualGenArgs.skip_components is a
-# List[PipelineComponent] validated by Pydantic; LTX2-native components
-# (audio_vae, vocoder, connectors, video_encoder) will load from the
-# checkpoint automatically.
-SKIP_COMPONENTS = [
-    PipelineComponent.TEXT_ENCODER,
-    PipelineComponent.TOKENIZER,
-    PipelineComponent.VAE,
-    PipelineComponent.SCHEDULER,
-]
+
+def _ltx2_pipeline_config(**overrides):
+    """Build pipeline_config with the Gemma3 text_encoder_path LTX-2 needs.
+
+    LTX-2's tokenizer + text encoder are loaded from a separate Gemma
+    directory (not the diffusion checkpoint), so every full-pipeline
+    load needs ``text_encoder_path`` set. Tests can pass extra keys via
+    ``overrides`` (e.g. ``spatial_upsampler_path`` for two-stage).
+    """
+    cfg = {"text_encoder_path": GEMMA3_PATH}
+    cfg.update(overrides)
+    return cfg
 
 
 def _write_minimal_ltx2_native_checkpoint(tmp_path):
@@ -183,16 +204,14 @@ class TestLTX2Quantization:
     def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline_config=_ltx2_pipeline_config(),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
 
-        assert pipeline.model_config.quant_config.quant_algo is not None
+        assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
         quant_count = 0
         found_fp8 = False
@@ -241,22 +260,22 @@ class TestLTX2FP8NumericalCorrectness:
         """
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
         args_bf16 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
         args_fp8 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         linear_bf16, layer_name = _find_first_quantizable_linear(pipeline_bf16.transformer)
         linear_fp8, _ = _find_first_quantizable_linear(pipeline_fp8.transformer)
@@ -318,12 +337,12 @@ class TestLTX2FP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_bf16 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
+        pipeline_bf16 = PipelineLoader(args_bf16).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
         print(f"\n[BF16] Transformer memory: {bf16_model_mem:.2f} GB")
@@ -334,13 +353,13 @@ class TestLTX2FP8Memory:
         torch.cuda.reset_peak_memory_stats()
 
         args_fp8 = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
+            model=CHECKPOINT_PATH_BF16,
             quant_config={"quant_algo": "FP8", "dynamic": True},
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
+        pipeline_fp8 = PipelineLoader(args_fp8).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
 
         fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
         print(f"[FP8] Transformer memory: {fp8_model_mem:.2f} GB")
@@ -371,13 +390,13 @@ class TestLTX2AttentionBackend:
         """
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
         args_baseline = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend="VANILLA"),
+            model=CHECKPOINT_PATH_BF16,
+            attention_config=AttentionConfig(backend="VANILLA"),
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
+        pipeline_baseline = PipelineLoader(args_baseline).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_baseline = pipeline_baseline.transformer
 
         video_input, audio_input, text_cache_baseline = _get_ltx2_transformer_inputs(
@@ -398,13 +417,13 @@ class TestLTX2AttentionBackend:
 
         print("[Attention Backend Test] Loading TRTLLM transformer...")
         args_trtllm = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            attention=AttentionConfig(backend="TRTLLM"),
+            model=CHECKPOINT_PATH_BF16,
+            attention_config=AttentionConfig(backend="TRTLLM"),
+            pipeline_config=_ltx2_pipeline_config(),
         )
-        pipeline_trtllm = PipelineLoader(args_trtllm).load(skip_warmup=True)
+        pipeline_trtllm = PipelineLoader(args_trtllm).load(
+            skip_warmup=True, skip_components=SKIP_COMPONENTS
+        )
         transformer_trtllm = pipeline_trtllm.transformer
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
@@ -529,6 +548,58 @@ class TestLTX2BatchSupport:
 class TestTwoStageLoRAHelpers:
     """Test LoRA delta loading and application without checkpoints."""
 
+    def test_bf16_weight_snapshot_gate_uses_cuda_free_memory(self, monkeypatch):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            _should_save_bf16_weights,
+        )
+
+        gib = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (116 * gib, 180 * gib))
+        assert _should_save_bf16_weights()
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (115 * gib, 180 * gib))
+        assert not _should_save_bf16_weights()
+
+        def _raise_mem_query_error(device=None):
+            raise RuntimeError("mem_get_info failed")
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", _raise_mem_query_error)
+        assert not _should_save_bf16_weights()
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        assert not _should_save_bf16_weights()
+
+    def test_bf16_weight_snapshot_saved_when_requested(self):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            _apply_lora_deltas,
+            _restore_lora_state,
+            _subtract_dense_lora_deltas,
+        )
+
+        linear = torch.nn.Linear(32, 32, bias=False).bfloat16()
+        original_weight = linear.weight.data.clone()
+        deltas = {"weight": torch.randn(32, 32) * 0.1}
+
+        applied, saved_state, snapshot_required = _apply_lora_deltas(
+            linear,
+            deltas,
+            sign=1.0,
+            save_bf16_weights=True,
+        )
+
+        assert applied == 1
+        assert snapshot_required == 1
+        assert "weight" in saved_state
+        assert torch.allclose(saved_state["weight"], original_weight)
+        assert not torch.allclose(linear.weight.data, original_weight)
+
+        removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
+        assert removed == 0
+
+        _restore_lora_state(linear, saved_state)
+        assert torch.allclose(linear.weight.data, original_weight)
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_apply_and_remove_deltas_bf16(self):
         """Merge then unmerge in BF16 should leave weights approximately unchanged."""
@@ -546,7 +617,7 @@ class TestTwoStageLoRAHelpers:
 
         applied, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 1, "Expected one parameter to be modified"
-        assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+        assert saved_state == {}, "BF16 weights should not be snapshotted by default"
         assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight), (
             "Weights should have changed after applying delta"
@@ -589,7 +660,7 @@ class TestTwoStageLoRAHelpers:
         rounds = 10
         for _ in range(rounds):
             _, saved_state, snapshot_required = _apply_lora_deltas(model, deltas, sign=1.0)
-            assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+            assert saved_state == {}, "BF16 weights should not be snapshotted by default"
             assert snapshot_required == 0
             _subtract_dense_lora_deltas(model, deltas, saved_state)
 
@@ -597,8 +668,8 @@ class TestTwoStageLoRAHelpers:
         assert drift < 0.1, f"bf16 drift after {rounds} rounds too large: {drift:.2e}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dense_lora_state_not_saved_and_subtract_restores(self):
-        """Dense weights are restored by subtraction without snapshot storage."""
+    def test_fp32_state_not_saved_and_subtract_restores(self):
+        """FP32 weights restore by subtraction, even when BF16 snapshots are enabled."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
             _subtract_dense_lora_deltas,
@@ -609,16 +680,21 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"weight": torch.randn(32, 32, device=device) * 0.1}
-        _, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
+        _, saved_state, snapshot_required = _apply_lora_deltas(
+            linear,
+            deltas,
+            sign=1.0,
+            save_bf16_weights=True,
+        )
 
-        assert saved_state == {}, "Dense FP32 weights should not be snapshotted"
+        assert saved_state == {}, "FP32 weights should not use the BF16 snapshot path"
         assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight)
 
         removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
         assert removed == 1
         assert torch.allclose(linear.weight.data, original_weight), (
-            "Dense LoRA subtraction should restore weights"
+            "FP32 LoRA subtraction should restore weights"
         )
 
 
@@ -746,7 +822,7 @@ class TestTwoStagePipelineVariantResolution:
         )
 
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
@@ -763,7 +839,7 @@ class TestTwoStagePipelineVariantResolution:
 
         monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
@@ -779,7 +855,7 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {}
 
         result = LTX2Pipeline.resolve_variant(config)
@@ -792,7 +868,7 @@ class TestTwoStagePipelineVariantResolution:
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
-        config.pretrained_config._name_or_path = ""
+        config.primary_pretrained_config._name_or_path = ""
         config.extra_attrs = {"spatial_upsampler_path": "/fake/upsampler.safetensors"}
 
         result = LTX2Pipeline.resolve_variant(config)
@@ -815,8 +891,8 @@ class TestLTX2ForceOneStageEnv:
         upsampler_path.touch()
         lora_path.touch()
 
-        args = VisualGenArgs(checkpoint_path=str(checkpoint_path))
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        args = VisualGenArgs(model=str(checkpoint_path))
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert LTX2Pipeline.resolve_variant(config) is LTX2TwoStagesPipeline
         assert config.extra_attrs["spatial_upsampler_path"] == str(upsampler_path)
@@ -832,8 +908,8 @@ class TestLTX2ForceOneStageEnv:
         upsampler_path.touch()
         lora_path.touch()
 
-        args = VisualGenArgs(checkpoint_path=str(checkpoint_path))
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        args = VisualGenArgs(model=str(checkpoint_path))
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
         assert "spatial_upsampler_path" not in config.extra_attrs
@@ -848,11 +924,13 @@ class TestLTX2ForceOneStageEnv:
         checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
 
         args = VisualGenArgs(
-            checkpoint_path=str(checkpoint_path),
-            spatial_upsampler_path="/fake/upsampler.safetensors",
-            distilled_lora_path="/fake/lora.safetensors",
+            model=str(checkpoint_path),
+            pipeline_config={
+                "spatial_upsampler_path": "/fake/upsampler.safetensors",
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
         )
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
         assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
@@ -867,17 +945,92 @@ class TestLTX2ForceOneStageEnv:
         checkpoint_path = _write_minimal_ltx2_native_checkpoint(tmp_path)
 
         args = VisualGenArgs(
-            checkpoint_path=str(checkpoint_path),
-            cache=CacheDiTConfig(),
-            spatial_upsampler_path="/fake/upsampler.safetensors",
-            distilled_lora_path="/fake/lora.safetensors",
+            model=str(checkpoint_path),
+            cache_config=CacheDiTConfig(),
+            pipeline_config={
+                "spatial_upsampler_path": "/fake/upsampler.safetensors",
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
         )
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
+        config = DiffusionPipelineConfig.from_pretrained(str(checkpoint_path), args=args)
 
         assert config.cache_backend == "cache_dit"
         assert config.extra_attrs["spatial_upsampler_path"] == "/fake/upsampler.safetensors"
         assert config.extra_attrs["distilled_lora_path"] == "/fake/lora.safetensors"
         assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
+
+
+class TestTwoStageLoRALoadingOverlap:
+    """Test two-stage LoRA load orchestration without loading checkpoints."""
+
+    def test_load_standard_components_overlaps_lora_with_base_components(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            LTX2TwoStagesPipeline,
+        )
+
+        events = []
+        lora_deltas = {"linear.weight": torch.ones(1)}
+
+        class FakeFuture:
+            def result(self):
+                events.append("lora_result")
+                return lora_deltas
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                assert max_workers == 1
+
+            def submit(self, fn, *args):
+                events.append("lora_submit")
+                assert fn is pipeline_ltx2_two_stages._load_lora_deltas
+                assert args == (
+                    "/fake/lora.safetensors",
+                    pipeline.transformer,
+                    pipeline._TRANSFORMER_PREFIX,
+                )
+                return FakeFuture()
+
+            def shutdown(self, wait=True):
+                events.append(f"shutdown:{wait}")
+
+        def fake_base_load(self, checkpoint_dir, device, skip_components=None, **kwargs):
+            events.append("base_load")
+            assert checkpoint_dir == "/fake/checkpoint"
+            assert device == torch.device("cpu")
+
+        monkeypatch.setattr(pipeline_ltx2_two_stages, "ThreadPoolExecutor", FakeExecutor)
+        monkeypatch.setattr(
+            pipeline_ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            lambda device=None: None,
+        )
+        monkeypatch.setattr(LTX2Pipeline, "load_standard_components", fake_base_load)
+
+        class FakeTransformer:
+            def named_modules(self):
+                return []
+
+            def named_parameters(self):
+                return []
+
+        pipeline = LTX2TwoStagesPipeline.__new__(LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = SimpleNamespace(
+            torch_dtype=torch.float32,
+            extra_attrs={
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
+        )
+        pipeline.model_config = pipeline.pipeline_config
+        pipeline.transformer = FakeTransformer()
+
+        pipeline.load_standard_components("/fake/checkpoint", torch.device("cpu"))
+
+        assert events == ["lora_submit", "base_load", "lora_result", "shutdown:True"]
+        assert pipeline._distilled_lora_deltas is lora_deltas
 
 
 class TestTwoStageUpsamplerBuildingBlocks:
@@ -1035,6 +1188,335 @@ def ltx2_two_stage_assets_exist():
     return True
 
 
+class TestLTX2TwoStageLoRAHelpers:
+    """Test LTX-2 two-stage distilled LoRA helpers without model loading."""
+
+    def test_bf16_snapshot_gate_uses_preload_memory(self, monkeypatch):
+        """Pre-load memory is the whole-pipeline budget and wins over current memory."""
+        queried_devices = []
+
+        def fake_get_free_gpu_memory_gib(device=None):
+            queried_devices.append(device)
+            return 1.0
+
+        monkeypatch.setattr(
+            ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            fake_get_free_gpu_memory_gib,
+        )
+
+        assert ltx2_two_stages._should_save_bf16_weights(
+            device="cuda:1",
+            preload_free_gib=120.0,
+            threshold_gib=115.0,
+        )
+        assert not ltx2_two_stages._should_save_bf16_weights(
+            device="cuda:1",
+            preload_free_gib=110.0,
+            threshold_gib=115.0,
+        )
+        assert queried_devices == []
+
+    def test_bf16_snapshot_gate_fallback_passes_device(self, monkeypatch):
+        """Fallback free-memory query must target the transformer's CUDA device."""
+        queried_devices = []
+
+        def fake_get_free_gpu_memory_gib(device=None):
+            queried_devices.append(device)
+            return 116.0
+
+        monkeypatch.setattr(
+            ltx2_two_stages,
+            "_get_free_gpu_memory_gib",
+            fake_get_free_gpu_memory_gib,
+        )
+
+        assert ltx2_two_stages._should_save_bf16_weights(
+            device="cuda:1",
+            preload_free_gib=None,
+            threshold_gib=115.0,
+        )
+        assert queried_devices == ["cuda:1"]
+
+    def test_two_stage_cuda_graph_key_includes_lora_state(self):
+        """Original and merged LoRA bindings must not share CUDA graph keys."""
+        lora_state = {"value": "original"}
+        runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
+            ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
+            lambda: lora_state["value"],
+        )
+
+        original_key = runner.get_graph_key(torch.empty(1, 2))
+        lora_state["value"] = "merged"
+        merged_key = runner.get_graph_key(torch.empty(1, 2))
+
+        assert original_key != merged_key
+        assert original_key[-1] == ("ltx2_two_stage_lora_state", "original")
+        assert merged_key[-1] == ("ltx2_two_stage_lora_state", "merged")
+
+    def test_two_stage_cuda_graph_setup_uses_pipeline_config(self):
+        """CUDA graph setup runs before the two-stage model_config is assigned."""
+
+        class TinyTransformer:
+            def forward(self, *args, **kwargs):
+                return args, kwargs
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+
+        assert not hasattr(pipeline, "model_config")
+
+        pipeline._setup_cuda_graphs()
+
+        runner = pipeline._cuda_graph_runners["transformer"]
+        assert isinstance(runner, ltx2_two_stages._LTX2TwoStageCUDAGraphRunner)
+        assert runner._lora_state_getter() == "original"
+        assert pipeline.transformer.forward.__wrapped__.__self__ is pipeline.transformer
+
+    def test_cuda_graph_rejects_nonpersistent_lora_bindings(self):
+        """CUDA graph is valid only when distilled LoRA uses persistent bindings."""
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = SimpleNamespace(
+            cuda_graph=SimpleNamespace(enable=True),
+        )
+        pipeline._distilled_lora_deltas = {"proj.weight": torch.ones(1)}
+        pipeline._distilled_lora_weight_cache = None
+
+        with pytest.raises(RuntimeError, match="requires persistent LoRA weights"):
+            pipeline._assert_cuda_graph_safe_lora_bindings()
+
+        pipeline._distilled_lora_weight_cache = object()
+        pipeline._assert_cuda_graph_safe_lora_bindings()
+
+        pipeline.pipeline_config.cuda_graph.enable = False
+        pipeline._distilled_lora_weight_cache = None
+        pipeline._assert_cuda_graph_safe_lora_bindings()
+
+    def test_persistent_bf16_cache_reuses_weight_storage(self):
+        """Persistent BF16 cache swaps between the same original and merged tensors."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.tensor(
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        dtype=torch.bfloat16,
+                    )
+                )
+
+        module = TinyModule()
+        original = module.weight.detach().clone()
+        delta = torch.full_like(module.weight, 0.5)
+
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"weight": delta},
+        )
+        assert cache.applied_count == 1
+        assert cache.precision_counts() == {"bf16": 1}
+
+        original_ptr = module.weight.data_ptr()
+        cache.bind_merged()
+        merged_ptr = module.weight.data_ptr()
+        assert merged_ptr != original_ptr
+        assert torch.allclose(module.weight, original + delta)
+
+        cache.bind_original()
+        assert module.weight.data_ptr() == original_ptr
+        assert torch.equal(module.weight, original)
+
+        cache.bind_merged()
+        assert module.weight.data_ptr() == merged_ptr
+        assert torch.allclose(module.weight, original + delta)
+
+        cache.bind_original()
+        assert module.weight.data_ptr() == original_ptr
+        assert torch.equal(module.weight, original)
+
+    def test_persistent_fp8_cache_reuses_weight_and_scale_storage(self):
+        """Persistent FP8 cache swaps both quantized weight and scale storage."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Module()
+                bf16_weight = torch.tensor(
+                    [[1.0, 2.0], [3.0, 4.0]],
+                    dtype=torch.bfloat16,
+                )
+                weight_scale = torch.tensor(0.25, dtype=torch.float32)
+                self.proj.weight = torch.nn.Parameter(
+                    (bf16_weight.float() / weight_scale).to(torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+                self.proj.weight_scale = torch.nn.Parameter(
+                    weight_scale,
+                    requires_grad=False,
+                )
+
+        module = TinyModule()
+        original_weight = module.proj.weight.detach().clone()
+        original_scale = module.proj.weight_scale.detach().clone()
+        original_bf16 = ltx2_two_stages._dequantize_fp8_weight(
+            original_weight,
+            original_scale,
+        )
+        delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"proj.weight": delta},
+        )
+        assert cache.applied_count == 1
+        assert cache.precision_counts() == {"fp8": 1}
+
+        original_weight_ptr = module.proj.weight.data_ptr()
+        original_scale_ptr = module.proj.weight_scale.data_ptr()
+        cache.bind_merged()
+        merged_weight_ptr = module.proj.weight.data_ptr()
+        merged_scale_ptr = module.proj.weight_scale.data_ptr()
+        assert merged_weight_ptr != original_weight_ptr
+        assert merged_scale_ptr != original_scale_ptr
+        assert module.proj.weight.dtype == torch.float8_e4m3fn
+        merged_bf16 = ltx2_two_stages._dequantize_fp8_weight(
+            module.proj.weight,
+            module.proj.weight_scale,
+        )
+        assert torch.allclose(
+            merged_bf16,
+            original_bf16 + delta,
+            atol=1e-1,
+            rtol=1e-1,
+        )
+
+        cache.bind_original()
+        assert module.proj.weight.data_ptr() == original_weight_ptr
+        assert module.proj.weight_scale.data_ptr() == original_scale_ptr
+        assert torch.equal(module.proj.weight, original_weight)
+        assert torch.equal(module.proj.weight_scale, original_scale)
+
+        cache.bind_merged()
+        assert module.proj.weight.data_ptr() == merged_weight_ptr
+        assert module.proj.weight_scale.data_ptr() == merged_scale_ptr
+
+        cache.bind_original()
+        assert module.proj.weight.data_ptr() == original_weight_ptr
+        assert module.proj.weight_scale.data_ptr() == original_scale_ptr
+
+    def test_persistent_fp4_cache_swaps_quant_method_and_weight_storage(self, monkeypatch):
+        """Persistent FP4 cache binds merged BF16 weight and restores packed state."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = Linear(
+                    2,
+                    2,
+                    bias=False,
+                    dtype=torch.bfloat16,
+                    skip_create_weights_in_init=True,
+                    reduce_output=False,
+                )
+                self.linear.weight = torch.nn.Parameter(
+                    torch.zeros((2, 1), dtype=torch.uint8),
+                    requires_grad=False,
+                )
+                self.linear.weight_scale = torch.nn.Parameter(
+                    torch.ones((128, 4), dtype=torch.uint8),
+                    requires_grad=False,
+                )
+                self.linear.weight_scale_2 = torch.nn.Parameter(
+                    torch.ones((), dtype=torch.float32),
+                    requires_grad=False,
+                )
+                self.linear.quant_method = object()
+
+        module = TinyModule()
+        original_quant_method = module.linear.quant_method
+        original_weight_ptr = module.linear.weight.data_ptr()
+        original_weight = module.linear.weight.detach().clone()
+        delta = torch.full((2, 2), 0.5, dtype=torch.bfloat16)
+
+        def fake_dequantize_fp4_weight(
+            packed_weight,
+            interleaved_scale,
+            weight_scale_2,
+            out_features,
+            in_features,
+        ):
+            assert packed_weight.data_ptr() == original_weight_ptr
+            assert out_features == 2
+            assert in_features == 2
+            return torch.ones((2, 2), dtype=torch.bfloat16)
+
+        monkeypatch.setattr(
+            ltx2_two_stages,
+            "_dequantize_fp4_weight",
+            fake_dequantize_fp4_weight,
+        )
+
+        cache = ltx2_two_stages._PersistentLoRAWeightCache.build(
+            module,
+            {"linear.weight": delta},
+        )
+        assert cache.applied_count == 1
+        assert cache.precision_counts() == {"fp4": 1}
+
+        cache.bind_merged()
+        merged_weight_ptr = module.linear.weight.data_ptr()
+        assert merged_weight_ptr != original_weight_ptr
+        assert module.linear.weight.dtype == torch.bfloat16
+        assert torch.equal(module.linear.weight, torch.ones_like(delta) + delta)
+        assert isinstance(module.linear.quant_method, ltx2_two_stages.UnquantizedLinearMethod)
+
+        cache.bind_original()
+        assert module.linear.weight.data_ptr() == original_weight_ptr
+        assert torch.equal(module.linear.weight, original_weight)
+        assert module.linear.quant_method is original_quant_method
+
+        cache.bind_merged()
+        assert module.linear.weight.data_ptr() == merged_weight_ptr
+        cache.bind_original()
+        assert module.linear.weight.data_ptr() == original_weight_ptr
+
+    def test_apply_lora_deltas_rolls_back_dense_weights_on_failure(self):
+        """A later merge failure must not leave earlier dense weights LoRA-merged."""
+
+        class TinyModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.good = torch.nn.Parameter(
+                    torch.tensor(
+                        [[1.0, 2.0], [3.0, 4.0]],
+                        dtype=torch.bfloat16,
+                    )
+                )
+                self.bad = torch.nn.Parameter(torch.zeros((2, 1), dtype=torch.bfloat16))
+
+        module = TinyModule()
+        original_good = module.good.detach().clone()
+        deltas = {
+            "good": torch.full_like(module.good, 0.5),
+            "bad": torch.ones((2, 2), dtype=torch.bfloat16),
+        }
+
+        with pytest.raises(RuntimeError, match=r"missing bad\.weight_scale"):
+            ltx2_two_stages._apply_lora_deltas(
+                module,
+                deltas,
+                sign=1.0,
+                save_bf16_weights=False,
+            )
+
+        assert torch.equal(module.good, original_good)
+
+
 class TestLTX2TwoStagePipelineLoading:
     """Test two-stage pipeline loading via PipelineLoader."""
 
@@ -1046,15 +1528,14 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            spatial_upsampler_path=UPSAMPLER_PATH,
-            distilled_lora_path=LORA_PATH,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(
+                spatial_upsampler_path=UPSAMPLER_PATH,
+                distilled_lora_path=LORA_PATH,
+            ),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             assert isinstance(pipeline, LTX2TwoStagesPipeline), (
                 f"Expected LTX2TwoStagesPipeline, got {type(pipeline).__name__}"
@@ -1080,15 +1561,14 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            spatial_upsampler_path=UPSAMPLER_PATH,
-            distilled_lora_path=LORA_PATH,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(
+                spatial_upsampler_path=UPSAMPLER_PATH,
+                distilled_lora_path=LORA_PATH,
+            ),
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             applied, saved_state, snapshot_required = _apply_lora_deltas(
                 pipeline.transformer,
@@ -1101,7 +1581,7 @@ class TestLTX2TwoStagePipelineLoading:
             print(f"\n[Two-Stage] LoRA apply rate: {match_rate:.1f}% ({applied}/{total})")
             assert match_rate > 99.0, f"Expected >99% LoRA match rate, got {match_rate:.1f}%"
 
-            assert saved_state == {}, "BF16 checkpoint should not snapshot dense weights"
+            assert saved_state == {}, "BF16 checkpoint should not snapshot weights by default"
             assert snapshot_required == 0
 
             # Verify dense unmerge by subtraction
@@ -1127,19 +1607,18 @@ class TestLTX2TwoStagePipelineLoading:
         )
 
         args = VisualGenArgs(
-            checkpoint_path=CHECKPOINT_PATH_BF16,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            spatial_upsampler_path=UPSAMPLER_PATH,
-            distilled_lora_path=LORA_PATH,
+            model=CHECKPOINT_PATH_BF16,
+            pipeline_config=_ltx2_pipeline_config(
+                spatial_upsampler_path=UPSAMPLER_PATH,
+                distilled_lora_path=LORA_PATH,
+            ),
             quant_config={"quant_algo": quant_algo, "dynamic": True},
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_COMPONENTS)
         try:
             assert isinstance(pipeline, LTX2TwoStagesPipeline)
-            assert pipeline.model_config.quant_config.quant_algo is not None
+            assert pipeline.pipeline_config.quant_config.quant_algo is not None
 
             quant_count = sum(
                 1

@@ -208,6 +208,72 @@ def submit_dwdp_job(config, log_dir, dry_run):
     with open(os.path.join(log_dir, "allocations.json"), "w") as f:
         json.dump(allocations, f, indent=2)
 
+    # Placement summary: emitted up-front for audit/debug. Surfaces both the
+    # SLURM launcher path that will be used (block vs arbitrary, decided by
+    # divisibility of num_ctx_gpus by gpus_per_node) and where every CTX
+    # server, GEN server, and DWDP group physically lands. Cross-node DWDP
+    # groups and cross-node GEN TP allreduces are explicitly called out so
+    # they aren't a silent surprise when reading benchmark logs.
+    _num_ctx_gpus = ctx_num * ctx_world_size
+    _is_divisible_layout = _num_ctx_gpus % gpus_per_node == 0
+    _num_dwdp_groups = ctx_num // dwdp_size if dwdp_size > 0 else 1
+    print("=" * 72)
+    print("[DWDP launch summary]")
+    print(
+        f"  Total GPU: {_num_ctx_gpus + gen_num * gen_world_size}    "
+        f"Total nodes: {total_nodes}    "
+        f"Launcher path: {'block' if _is_divisible_layout else 'arbitrary'}    "
+        f"(num_ctx_gpus % gpus_per_node = {_num_ctx_gpus % gpus_per_node})"
+    )
+    print(f"  CTX servers: {ctx_num}  (TP={ctx_world_size} each)")
+    print(f"  GEN servers: {gen_num}  (TP={gen_world_size} each)")
+    _per_node = {}
+    for _role in ("CTX", "GEN"):
+        for _sid in sorted(allocations.get(_role, {}).keys()):
+            for _host, _gpus in allocations[_role][_sid]["nodes"].items():
+                _per_node.setdefault(_host, []).append((_role, _sid, _gpus))
+    print("  Per-node placement:")
+    for _host in sorted(_per_node.keys()):
+        _ctxs = [(s, g) for r, s, g in _per_node[_host] if r == "CTX"]
+        _gens = [(s, g) for r, s, g in _per_node[_host] if r == "GEN"]
+        _parts = []
+        if _ctxs:
+            _parts.append(
+                f"CTX {[s for s, _ in _ctxs]} (GPU {sorted(sum([g for _, g in _ctxs], []))})"
+            )
+        if _gens:
+            _parts.append(
+                f"GEN {[s for s, _ in _gens]} (GPU {sorted(sum([g for _, g in _gens], []))})"
+            )
+        _shared = "  [CTX/GEN sharing node]" if _ctxs and _gens else ""
+        print(f"    {_host}: {' + '.join(_parts)}{_shared}")
+    if _num_dwdp_groups and dwdp_size:
+        print(f"  DWDP groups (dwdp_size={dwdp_size}, num_groups={_num_dwdp_groups}):")
+        for _g in range(_num_dwdp_groups):
+            _members = list(range(_g * dwdp_size, (_g + 1) * dwdp_size))
+            _member_nodes = set()
+            for _c in _members:
+                if _c in allocations.get("CTX", {}):
+                    _member_nodes.update(allocations["CTX"][_c]["nodes"].keys())
+            _span = (
+                "intra-node"
+                if len(_member_nodes) == 1
+                else f"cross-node ({len(_member_nodes)} nodes via MNNVL fabric)"
+            )
+            print(f"    group {_g} = CTX {_members}    {_span}")
+    if gen_num and gen_world_size > 1:
+        _gen_nodes = set()
+        for _sid in allocations.get("GEN", {}):
+            _gen_nodes.update(allocations["GEN"][_sid]["nodes"].keys())
+        if len(_gen_nodes) == 1:
+            print(f"  GEN TP={gen_world_size}: intra-node (NVLink allreduce)")
+        else:
+            print(
+                f"  GEN TP={gen_world_size}: cross-node "
+                f"({len(_gen_nodes)} nodes; allreduce uses MNNVL fabric)"
+            )
+    print("=" * 72)
+
     server_config = convert_allocations_to_server_config(allocations)
     with open(os.path.join(log_dir, "server_config_base.yaml"), "w") as f:
         yaml.dump(server_config, f)
@@ -231,19 +297,7 @@ def submit_dwdp_job(config, log_dir, dry_run):
         mpi_config_base_path,
     )
 
-    ctx_node_list = []
-    for sid in sorted(allocations.get("CTX", {}).keys()):
-        for node in allocations["CTX"][sid]["nodes"]:
-            if node not in ctx_node_list:
-                ctx_node_list.append(node)
-    gen_node_list = []
-    for sid in sorted(allocations.get("GEN", {}).keys()):
-        for node in allocations["GEN"][sid]["nodes"]:
-            if node not in gen_node_list:
-                gen_node_list.append(node)
-    mpi_nodelist = ctx_node_list + gen_node_list
     total_mpi_tasks = ctx_num * ctx_world_size + gen_num * gen_world_size
-    mpi_num_nodes = len(mpi_nodelist)
     num_ctx_gpus = ctx_num * ctx_world_size
     worker_env_var = env_config.get("worker_env_var", "")
     ctx_worker_env_var = env_config.get("ctx_worker_env_var", "")
@@ -255,28 +309,106 @@ def submit_dwdp_job(config, log_dir, dry_run):
         f" {gen_worker_env_var}" if gen_worker_env_var else ""
     )
 
-    cmd = [
-        "srun -l",
-        f"--nodelist {','.join(mpi_nodelist)}",
-        f"-N {mpi_num_nodes}",
-        f"--ntasks {total_mpi_tasks}",
-        f"--ntasks-per-node {gpus_per_node}",
-        f"--container-image {env_config['container_image']}",
-        f"--container-name {container_name}",
-        f"--container-mounts {container_mount_str}",
-        "--no-container-mount-home --mpi=pmix --overlap",
-        f"bash {os.path.join(script_dir, 'start_worker_dwdp.sh')}",
-        mpi_config_path,
-        str(slurm_config["numa_bind"]).lower(),
-        log_dir,
-        str(profiling_config["nsys_on"]).lower(),
-        f"'{profiling_config['ctx_profile_range']}'",
-        f"'{profiling_config['gen_profile_range']}'",
-        str(num_ctx_gpus),
-        f"'{dwdp_ctx_worker_env_var}'",
-        f"'{dwdp_gen_worker_env_var}'",
-        f"&> {log_dir}/3_output_workers.log &",
-    ]
+    # Dual-path launcher: pick block vs arbitrary distribution based on
+    # whether ``num_ctx_gpus`` aligns with ``gpus_per_node``.
+    #
+    # * Divisible (num_ctx_gpus % gpus_per_node == 0):
+    #   CTX servers fill whole nodes, GEN starts on a fresh node, no
+    #   CTX/GEN node sharing.  Use the legacy block-distribution srun
+    #   (``--nodelist + -N + --ntasks-per-node``).  start_worker_dwdp.sh
+    #   sets CUDA_VISIBLE_DEVICES from SLURM_LOCALID since rank-to-gpu
+    #   mapping is implicit from block dist.
+    #
+    # * Non-divisible:
+    #   CTX and GEN may share a physical node (compact packing).
+    #   Block distribution can't express the resulting per-node task
+    #   counts (e.g. 4+2 / 2+4), so we fall back to SLURM_HOSTFILE +
+    #   --distribution=arbitrary, plus per-rank gpu_map_*.txt for
+    #   start_worker_dwdp.sh to look up CUDA_VISIBLE_DEVICES by
+    #   SLURM_PROCID.  This path mirrors PR #13888's compact_packing
+    #   mechanism upstream.
+    #
+    # Empirically (see refactor PR perf table), the block path runs
+    # 14-15% faster per-CTX-GPU than the arbitrary path on the same
+    # physical placement; the arbitrary path's cost is inherent to
+    # SLURM/PMIX behaviour under --distribution=arbitrary and not
+    # specific to this launcher.  So we use it only when needed.
+    is_divisible_layout = num_ctx_gpus % gpus_per_node == 0
+
+    if is_divisible_layout:
+        # ---- Block-distribution path (perf-optimal) ----
+        ctx_node_list = []
+        for sid in sorted(allocations.get("CTX", {}).keys()):
+            for node in allocations["CTX"][sid]["nodes"]:
+                if node not in ctx_node_list:
+                    ctx_node_list.append(node)
+        gen_node_list = []
+        for sid in sorted(allocations.get("GEN", {}).keys()):
+            for node in allocations["GEN"][sid]["nodes"]:
+                if node not in gen_node_list and node not in ctx_node_list:
+                    gen_node_list.append(node)
+        mpi_nodelist = ctx_node_list + gen_node_list
+        mpi_num_nodes = len(mpi_nodelist)
+
+        cmd = [
+            "srun -l",
+            f"--nodelist {','.join(mpi_nodelist)}",
+            f"-N {mpi_num_nodes}",
+            f"--ntasks {total_mpi_tasks}",
+            f"--ntasks-per-node {gpus_per_node}",
+            f"--container-image {env_config['container_image']}",
+            f"--container-name {container_name}",
+            f"--container-mounts {container_mount_str}",
+            "--no-container-mount-home --mpi=pmix --overlap",
+            f"bash {os.path.join(script_dir, 'start_worker_dwdp.sh')}",
+            mpi_config_path,
+            str(slurm_config["numa_bind"]).lower(),
+            log_dir,
+            str(profiling_config["nsys_on"]).lower(),
+            f"'{profiling_config['ctx_profile_range']}'",
+            f"'{profiling_config['gen_profile_range']}'",
+            str(num_ctx_gpus),
+            f"'{dwdp_ctx_worker_env_var}'",
+            f"'{dwdp_gen_worker_env_var}'",
+            f"&> {log_dir}/3_output_workers.log &",
+        ]
+    else:
+        # ---- Arbitrary-distribution path (functional for non-divisible) ----
+        hostfile_base = os.path.join(log_dir, "hostfile_mpi_worker_base.txt")
+        gpu_map_base = os.path.join(log_dir, "gpu_map_mpi_worker_base.txt")
+        hostfile_runtime = os.path.join(log_dir, "hostfile_mpi_worker.txt")
+        with open(hostfile_base, "w") as hf, open(gpu_map_base, "w") as gm:
+            rank = 0
+            for server_type in ("CTX", "GEN"):
+                for server_id in sorted(allocations.get(server_type, {}).keys()):
+                    inst = allocations[server_type][server_id]
+                    for host, gpus in inst["nodes"].items():
+                        for gpu in gpus:
+                            hf.write(f"{host}\n")
+                            gm.write(f"{rank} {host} {gpu}\n")
+                            rank += 1
+
+        cmd = [
+            f"SLURM_HOSTFILE={hostfile_runtime}",
+            "srun -l",
+            f"--ntasks {total_mpi_tasks}",
+            "--distribution=arbitrary",
+            f"--container-image {env_config['container_image']}",
+            f"--container-name {container_name}",
+            f"--container-mounts {container_mount_str}",
+            "--no-container-mount-home --mpi=pmix --overlap",
+            f"bash {os.path.join(script_dir, 'start_worker_dwdp.sh')}",
+            mpi_config_path,
+            str(slurm_config["numa_bind"]).lower(),
+            log_dir,
+            str(profiling_config["nsys_on"]).lower(),
+            f"'{profiling_config['ctx_profile_range']}'",
+            f"'{profiling_config['gen_profile_range']}'",
+            str(num_ctx_gpus),
+            f"'{dwdp_ctx_worker_env_var}'",
+            f"'{dwdp_gen_worker_env_var}'",
+            f"&> {log_dir}/3_output_workers.log &",
+        ]
     start_server_cmds.append(" ".join(cmd))
 
     # Generate start server commands

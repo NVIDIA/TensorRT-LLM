@@ -37,7 +37,11 @@ import torch.nn.functional as F
 from diffusers import WanTransformer3DModel as HFWanTransformer3DModel
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    DiffusionPipelineConfig,
+    VisualGenArgs,
+)
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -88,6 +92,7 @@ WAN21_I2V_480P_PATH = _checkpoint(
 COS_SIM_THRESHOLD = 0.99
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
+WAN_TIMESTEP_SCALE = 1000.0
 
 
 # ============================================================================
@@ -99,6 +104,11 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     a = a.reshape(-1).float()
     b = b.reshape(-1).float()
     return F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
+
+
+def _normalize_wan_timestep(timestep: torch.Tensor) -> torch.Tensor:
+    """Convert HF/Diffusers WAN timestep scale to TRT-LLM normalized forward input."""
+    return timestep.to(torch.float32) / WAN_TIMESTEP_SCALE
 
 
 def _load_models(checkpoint_dir: str):
@@ -117,12 +127,10 @@ def _load_models(checkpoint_dir: str):
         .eval()
     )
 
-    args = VisualGenArgs(
-        checkpoint_path=checkpoint_dir,
-        device=DEVICE,
-        dtype="bfloat16",
-    )
-    model_config = DiffusionModelConfig.from_pretrained(checkpoint_dir, args=args)
+    args = VisualGenArgs(model=checkpoint_dir)
+    model_config = DiffusionPipelineConfig.from_pretrained(checkpoint_dir, args=args).model_configs[
+        "transformer"
+    ]
     our_model = WanTransformer3DModel(model_config=model_config).to(DEVICE).eval()
 
     # Initialize our model with the exact same weights as the HF model.
@@ -274,7 +282,11 @@ class TestWanUnit:
         )
         hs, ts, enc = _transformer_inputs(str(self.DEVICE))
         with torch.inference_mode():
-            out = model(hidden_states=hs, timestep=ts, encoder_hidden_states=enc)
+            out = model(
+                hidden_states=hs,
+                timestep=_normalize_wan_timestep(ts),
+                encoder_hidden_states=enc,
+            )
         assert out.shape == hs.shape
 
     @torch.no_grad()
@@ -321,7 +333,11 @@ class TestWanUnit:
             hf_out = hf(
                 hidden_states=hs, timestep=ts, encoder_hidden_states=enc, return_dict=False
             )[0].float()
-            trt_out = trtllm(hidden_states=hs, timestep=ts, encoder_hidden_states=enc).float()
+            trt_out = trtllm(
+                hidden_states=hs,
+                timestep=_normalize_wan_timestep(ts),
+                encoder_hidden_states=enc,
+            ).float()
 
         torch.testing.assert_close(trt_out, hf_out, atol=0.4, rtol=0.4)
 
@@ -377,7 +393,7 @@ class TestWanT2VTransformerCorrectness:
 
             our_out = our_model(
                 hidden_states=hidden_states,
-                timestep=timestep,
+                timestep=_normalize_wan_timestep(timestep),
                 encoder_hidden_states=encoder_hidden_states,
             )
 
@@ -453,7 +469,7 @@ class TestWanI2VTransformerCorrectness:
 
             our_out = our_model(
                 hidden_states=hidden_states,
-                timestep=timestep,
+                timestep=_normalize_wan_timestep(timestep),
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds,
             )

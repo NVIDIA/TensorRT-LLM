@@ -39,9 +39,8 @@ if(NIXL_ROOT)
   # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
-  # Link against CUDA
+  # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
-  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cuda_driver)
 
   set(NIXL_ENABLED TRUE)
 else()

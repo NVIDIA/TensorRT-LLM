@@ -41,7 +41,6 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm", "MultimodalEncoder"),
     ("tensorrt_llm", "logger"),
     # -- llmapi --
-    ("tensorrt_llm.llmapi", "BuildConfig"),
     ("tensorrt_llm.llmapi", "CapacitySchedulerPolicy"),
     ("tensorrt_llm.llmapi", "DynamicBatchConfig"),
     ("tensorrt_llm.llmapi", "KvCacheConfig"),
@@ -52,6 +51,7 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm.tokenizer", "TOKENIZER_ALIASES"),
     ("tensorrt_llm.llmapi.llm_args", "KvCacheConnectorConfig"),
     ("tensorrt_llm.llmapi.llm_args", "TorchLlmArgs"),
+    ("tensorrt_llm.llmapi.llm_args", "BaseLlmArgs"),
     ("tensorrt_llm.llmapi.llm_utils", "update_llm_args_with_extra_options"),
     ("tensorrt_llm.llmapi.tokenizer", "tokenizer_factory"),
     ("tensorrt_llm.llmapi.disagg_utils", "get_global_disagg_request_id"),
@@ -71,15 +71,15 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm.inputs.utils", "load_image"),
     # -- bindings --
     ("tensorrt_llm.bindings.internal.batch_manager", "LlmRequest"),
-    # -- _torch / visual_gen --
-    ("tensorrt_llm._torch.visual_gen", "VisualGenArgs"),
+    # -- visual_gen (public configs) --
+    ("tensorrt_llm", "VisualGenArgs"),
+    ("tensorrt_llm.visual_gen", "CudaGraphConfig"),
+    ("tensorrt_llm.visual_gen", "ParallelConfig"),
+    ("tensorrt_llm.visual_gen", "TeaCacheConfig"),
+    ("tensorrt_llm.visual_gen", "TorchCompileConfig"),
+    ("tensorrt_llm.visual_gen", "AttentionConfig"),
+    # -- _torch / visual_gen (internals) --
     ("tensorrt_llm._torch.visual_gen", "PipelineLoader"),
-    ("tensorrt_llm._torch.visual_gen", "CudaGraphConfig"),
-    ("tensorrt_llm._torch.visual_gen", "ParallelConfig"),
-    ("tensorrt_llm._torch.visual_gen", "PipelineConfig"),
-    ("tensorrt_llm._torch.visual_gen", "TeaCacheConfig"),
-    ("tensorrt_llm._torch.visual_gen", "TorchCompileConfig"),
-    ("tensorrt_llm._torch.visual_gen.config", "AttentionConfig"),
     ("tensorrt_llm._torch.visual_gen.executor", "DiffusionRequest"),
     ("tensorrt_llm._torch.visual_gen.output", "PipelineOutput"),
     ("tensorrt_llm._torch.visual_gen.pipeline", "BasePipeline"),

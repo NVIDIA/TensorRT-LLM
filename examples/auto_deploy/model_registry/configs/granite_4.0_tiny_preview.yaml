@@ -5,7 +5,8 @@
 # Uses flashinfer attention backend (trtllm backend produces garbled output with muP scaling)
 # dtype is missing from config for this model, so we provide it explicitly.
 attn_backend: flashinfer
-max_batch_size: 16
+cuda_graph_config:
+  max_batch_size: 16
 kv_cache_config:
   free_gpu_memory_fraction: 0.5
 model_kwargs:

@@ -37,15 +37,15 @@ Tested on Ubuntu 24.04.
 Before the pre-built Python wheel can be installed via `pip`, a few
 prerequisites must be put into place:
 
-Install CUDA Toolkit 13.1 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+Install CUDA Toolkit 13.2 following the [CUDA Installation Guide for Linux](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
 and make sure `CUDA_HOME` environment variable is properly set.
 
-The `cuda-compat-13-1` package may be required depending on your system's NVIDIA GPU
+The `cuda-compat-13-2` package may be required depending on your system's NVIDIA GPU
 driver version. For additional information, refer to the [CUDA Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html).
 
 ```bash
 # By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
-pip3 install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+pip3 install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
 sudo apt-get -y install libopenmpi-dev
 
@@ -64,11 +64,18 @@ image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-l
 
 Once all prerequisites are in place, TensorRT LLM can be installed as follows:
 
+Before installing the latest version, uninstall any previous CUTLASS DSL installation as described in the
+[CUTLASS DSL installation guide](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html#installation):
+
+```bash
+pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13
+```
+
 ```bash
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
 ```
 
-> **Note:** The TensorRT LLM wheel on PyPI is built with PyTorch 2.10.0. This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a more recent PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
+> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
 >
 > ```bash
 > # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container

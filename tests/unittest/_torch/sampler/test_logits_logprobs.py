@@ -7,8 +7,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.pyexecutor.sampling_utils import top_k_top_p_sampling_batch
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import _StrategyImpls
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import _StrategyImpls
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
@@ -91,13 +90,11 @@ def llm(
         yield llm
 
 
-@pytest.fixture(scope="module", params=[False, True])
-def simple_llm(request) -> LLM:
-    disable_flashinfer_sampling = request.param
+@pytest.fixture(scope="module")
+def simple_llm() -> LLM:
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         max_batch_size=8,
-        disable_flashinfer_sampling=disable_flashinfer_sampling,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
     return llm
@@ -359,6 +356,92 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
                     )
 
         print(f"{'=' * 80}\n")
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_logprobs_simple_format(simple_llm: LLM):
+    """When ``logprobs_simple_format=True`` and ``prompt_logprobs_simple_format=True``
+    with the corresponding K==0, the per-token logprobs are returned as a flat
+    ``list[float]`` instead of the default ``list[dict[int, Logprob]]`` and the
+    numeric values match the dict-format path within tolerance."""
+
+    prompt = "The future of AI is"
+    common_kwargs = dict(max_tokens=8, temperature=0.0)
+
+    dict_params = SamplingParams(logprobs=0, prompt_logprobs=0, **common_kwargs)
+    simple_params = SamplingParams(
+        logprobs=0,
+        prompt_logprobs=0,
+        logprobs_simple_format=True,
+        prompt_logprobs_simple_format=True,
+        **common_kwargs,
+    )
+
+    [dict_out] = list(simple_llm.generate([prompt], sampling_params=dict_params))
+    [simple_out] = list(simple_llm.generate([prompt], sampling_params=simple_params))
+
+    dict_gen_logprobs = dict_out.outputs[0].logprobs
+    simple_gen_logprobs = simple_out.outputs[0].logprobs
+
+    # Simple format must be list[float]; dict format must remain list[dict].
+    assert all(isinstance(x, float) for x in simple_gen_logprobs), (
+        f"Expected list[float], got element types: {[type(x) for x in simple_gen_logprobs]}"
+    )
+    assert all(isinstance(x, dict) for x in dict_gen_logprobs)
+
+    for token_id, lp_simple, lp_dict in zip(
+        dict_out.outputs[0].token_ids, simple_gen_logprobs, dict_gen_logprobs, strict=True
+    ):
+        torch.testing.assert_close(
+            torch.tensor(lp_simple, dtype=torch.float32),
+            torch.tensor(lp_dict[token_id].logprob, dtype=torch.float32),
+            atol=1e-4,
+            rtol=0,
+        )
+
+    dict_prompt_logprobs = dict_out.outputs[0].prompt_logprobs
+    simple_prompt_logprobs = simple_out.outputs[0].prompt_logprobs
+    assert all(isinstance(x, float) for x in simple_prompt_logprobs)
+    assert all(isinstance(x, dict) for x in dict_prompt_logprobs)
+    prompt_token_ids = dict_out.prompt_token_ids[1:] + dict_out.outputs[0].token_ids[:1]
+    for token_id, lp_simple, lp_dict in zip(
+        prompt_token_ids, simple_prompt_logprobs, dict_prompt_logprobs, strict=True
+    ):
+        torch.testing.assert_close(
+            torch.tensor(lp_simple, dtype=torch.float32),
+            torch.tensor(lp_dict[token_id].logprob, dtype=torch.float32),
+            atol=1e-4,
+            rtol=0,
+        )
+
+
+def test_logprobs_simple_format_validation():
+    """``SamplingParams`` rejects incompatible combinations of the simple-format
+    flag with non-zero / unset ``logprobs`` and with beam search."""
+    SamplingParams(max_tokens=4, logprobs=0, logprobs_simple_format=True)
+    SamplingParams(max_tokens=4, prompt_logprobs=0, prompt_logprobs_simple_format=True)
+
+    with pytest.raises(ValueError, match=r"logprobs_simple_format=True requires logprobs == 0"):
+        SamplingParams(max_tokens=4, logprobs=2, logprobs_simple_format=True)
+    with pytest.raises(ValueError, match=r"logprobs_simple_format=True requires logprobs == 0"):
+        SamplingParams(max_tokens=4, logprobs=None, logprobs_simple_format=True)
+    with pytest.raises(
+        ValueError, match=r"prompt_logprobs_simple_format=True requires prompt_logprobs == 0"
+    ):
+        SamplingParams(max_tokens=4, prompt_logprobs=3, prompt_logprobs_simple_format=True)
+    with pytest.raises(
+        ValueError, match=r"prompt_logprobs_simple_format=True requires prompt_logprobs == 0"
+    ):
+        SamplingParams(max_tokens=4, prompt_logprobs=None, prompt_logprobs_simple_format=True)
+    with pytest.raises(ValueError, match="beam search"):
+        SamplingParams(
+            max_tokens=4,
+            logprobs=0,
+            logprobs_simple_format=True,
+            use_beam_search=True,
+            best_of=2,
+            n=2,
+        )
 
 
 @pytest.mark.parametrize("logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
@@ -689,20 +772,15 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                 topp = topp if topp is not None else 1.0
                 temperature = temperature if temperature is not None else 1.0
 
-                # perform maksing top-k top-p
-                if simple_llm.args.disable_flashinfer_sampling:
-                    _, probs = top_k_top_p_sampling_batch(
-                        logits_for_token, top_k=topk, top_p=topp, temperature=temperature
-                    )
-                else:
-                    _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
-                        logits_for_token,
-                        group_logit_indices=None,
-                        top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
-                        top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
-                        temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
-                        generator=None,
-                    )
+                # perform masking top-k top-p via the flashinfer strategy impl
+                _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
+                    logits_for_token,
+                    group_logit_indices=None,
+                    top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
+                    top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
+                    temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
+                    generator=None,
+                )
 
             if temperature != 0:
                 logits_for_token /= temperature

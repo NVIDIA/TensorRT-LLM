@@ -13,15 +13,15 @@ server_configs:
       quant_config:
         quant_algo: FP8
         dynamic: true
-      attention:
+      attention_config:
         backend: VANILLA
-      parallel:
-        dit_cfg_size: 1
-        dit_ulysses_size: 4
-      cache:
+      parallel_config:
+        cfg_size: 1
+        ulysses_size: 4
+      cache_config:
         cache_backend: teacache
-      cuda_graph:
-        enable_cuda_graph: false
+      cuda_graph_config:
+        enable: false
     client_configs:
       - name: 1024x1024_1f_50s_con1
         prompt: A cat holding a sign that says hello world

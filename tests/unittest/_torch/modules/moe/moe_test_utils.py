@@ -42,12 +42,17 @@ from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.modules.fused_moe import (
     CuteDslFusedMoE,
     CutlassFusedMoE,
+    MarlinFusedMoE,
     TRTLLMGenFusedMoE,
 )
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl import (
+    is_megamoe_cute_dsl_runtime_available,
+)
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -65,7 +70,16 @@ class MoeBackendType(str, Enum):
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
-    MEGAMOE = "MEGAMOE_DEEPGEMM"
+    # Two MegaMoE variants live side by side: the DeepGemm path and the
+    # CuteDSL path. Keep both keys explicit so ``value -> member`` lookup
+    # and grep are unambiguous (avoid an asymmetric pair where one variant
+    # has an alias and the other does not). The legacy
+    # ``MoeBackendType.MEGAMOE`` alias was removed; all call sites must
+    # spell out the variant explicitly.
+    MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
+    MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
+    CUTE_DSL_B12X = "CUTE_DSL_B12X"
+    MARLIN = "MARLIN"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -76,7 +90,10 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
         MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
-        MoeBackendType.MEGAMOE: MegaMoEDeepGemm,
+        MoeBackendType.MEGAMOE_DEEPGEMM: MegaMoEDeepGemm,
+        MoeBackendType.MEGAMOE_CUTEDSL: MegaMoECuteDsl,
+        MoeBackendType.CUTE_DSL_B12X: CuteDslB12xFusedMoE,
+        MoeBackendType.MARLIN: MarlinFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -285,6 +302,44 @@ def should_skip_trtllm(
             "not covered by the partial blacklist "
             "[tileN=32, configIndex=5] in PR #13964 head 5629e0dff9; "
             "see the comment above for reproduction."
+        )
+
+    # [nvbug 6165866] The same uninitialized-trtllm-gen-scratch IMA cascade
+    # described above also poisons the whole `-k "TRTLLM"` pytest process on
+    # Blackwell (both SM100/B200 and SM103/B300) through two broader case
+    # families. They are skipped here (in addition to the specific SM103 case
+    # above) so the single-process run stays clean until the kernel is fixed.
+    # See https://nvbugspro.nvidia.com/bug/6165866
+    #
+    # (1) quant=None (BF16): the flashinfer BF16 GEMM
+    #     (`bmm_Bfloat16_..._sm100f`, trtllm_batched_gemm_runner.cu:305) is the
+    #     cascade victim once a block-scale case has run earlier in the same
+    #     process. Minimal repro (reproduces on both SM100 and SM103):
+    #       e60_k4_h2048_i1408-seq=1-quant=None,
+    #       e60_k4_h2048_i1408-seq=1-quant=FP8_BLOCK_SCALES,
+    #       e60_k4_h2048_i1408-seq=1-quant=W4A8_MXFP4_FP8,
+    #       then e8_k1_h512_i512-seq=1-quant=None  -> IMA on the last case.
+    #
+    # (2) e128 W4A16_MXFP4 (all seq / plain+gptoss): the four e128 shape
+    #     (num_experts=128, top_k=4, hidden=intermediate=2880) W4A16_MXFP4
+    #     cases poison each other (the SM103 gptoss-seq8 case above is one of
+    #     them; on SM100 the first observed FAIL is e128-seq1-W4A16_MXFP4).
+    is_e128_w4a16_mxfp4 = (
+        quant_algo == QuantAlgo.W4A16_MXFP4
+        and model_config is not None
+        and model_config.num_experts == 128
+        and model_config.top_k == 4
+        and model_config.hidden_size == 2880
+        and model_config.intermediate_size == 2880
+    )
+    if get_sm_version() in (100, 103) and (quant_algo is None or is_e128_w4a16_mxfp4):
+        return (
+            "[nvbug 6165866] TRTLLM-Gen MoE on Blackwell (SM100/SM103) hits a "
+            "CUDA illegal memory access that cascades across the whole pytest "
+            "process; the quant=None (flashinfer BF16 GEMM victim) and e128 "
+            "W4A16_MXFP4 (self-cascading tileN=32 tactic) families are skipped "
+            "until the kernel is fixed. "
+            "See https://nvbugspro.nvidia.com/bug/6165866"
         )
 
     # Routing method compatibility check (used by test_moe_module.py)
@@ -674,19 +729,24 @@ def should_skip_cutlass(
     if backend_type != MoeBackendType.CUTLASS:
         return None
 
-    # TP per-shard alignment: W8A16, NVFP4, and W4A8_AWQ require 128-aligned
-    # per-shard intermediate_size. W8A16 fails in preprocess_weights_for_mixed_gemm
-    # (num_rows % rows_per_tile != 0). NVFP4 pads to 128-alignment
-    # (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but zero-padding +
-    # blockwise quantization interaction causes ~6-7% mismatch.
+    # TP per-shard alignment: W8A16, NVFP4, W4A8_AWQ, and MXFP8 require
+    # 128-aligned per-shard intermediate_size. W8A16 fails in
+    # preprocess_weights_for_mixed_gemm (num_rows % rows_per_tile != 0). NVFP4
+    # pads to 128-alignment (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but
+    # zero-padding + blockwise quantization interaction causes ~6-7% mismatch.
     # W4A8_AWQ (WInt4AFP8FusedMoEMethod) requires K dimensions to be multiples
     # of 128 on SM90 for interleave factor selection (quantization.py:1310-1324).
+    # MXFP8 (MXFP8CutlassFusedMoEMethod) hard-asserts
+    # intermediate_size_per_partition % 128 == 0 in create_weights for its
+    # int32 UE8M0 SF packing, so a non-128-aligned per-shard intermediate
+    # raises AssertionError.
     # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
     if moe_tp_size > 1 and model_config is not None:
         tp_alignment_quants = {
             QuantAlgo.W8A16,
             QuantAlgo.NVFP4,
             QuantAlgo.W4A8_AWQ,
+            QuantAlgo.MXFP8,
         }
         # FP8_BLOCK_SCALES has this issue only on Hopper (SM90)
         if torch.cuda.get_device_capability(0) == (9, 0):
@@ -816,7 +876,7 @@ def should_skip_densegemm(
     return None
 
 
-def should_skip_megamoe(
+def should_skip_megamoe_deepgemm(
     backend_type: MoeBackendType,
     quant_algo: Optional[QuantAlgo] = None,
     dtype: Optional[torch.dtype] = None,
@@ -826,8 +886,13 @@ def should_skip_megamoe(
     parallel_mode: Optional[str] = None,
     swiglu_gptoss_style: bool = False,
 ) -> Optional[str]:
-    """Check MegaMoE-specific constraints for the generic MoE test matrix."""
-    if backend_type != MoeBackendType.MEGAMOE:
+    """Check MegaMoEDeepGemm-specific constraints for the generic MoE test matrix.
+
+    For MegaMoECuteDsl use :func:`should_skip_megamoe_cutedsl`; the two
+    backends share the FUSED_COMM contract but have different quant/shape
+    constraints (W4A8_MXFP4_MXFP8 + 512-aligned vs NVFP4 + 32-aligned).
+    """
+    if backend_type != MoeBackendType.MEGAMOE_DEEPGEMM:
         return None
 
     if not torch.cuda.is_available():
@@ -859,6 +924,114 @@ def should_skip_megamoe(
                 f"MegaMoEDeepGemm requires 512-aligned hidden/intermediate sizes "
                 f"for DeepGEMM TMA-packed SF rows "
                 f"(got h={hidden_size}, i={intermediate_size})"
+            )
+
+    return None
+
+
+def should_skip_cute_dsl_b12x(
+    backend_type: MoeBackendType,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+) -> Optional[str]:
+    """Check CuteDslB12xFusedMoE constraints not covered by can_implement().
+
+    can_implement() already gates SM version, quant_algo, dtype_activation, and
+    swiglu_gptoss_style. This helper covers the additional EP / alltoall hard
+    rejects enforced in __init__ (b12x has no expert-parallel dispatch/combine
+    kernel).
+    """
+    if backend_type != MoeBackendType.CUTE_DSL_B12X:
+        return None
+
+    if comm_method is not None or parallel_mode is not None:
+        return (
+            "CuteDslB12xFusedMoE rejects expert parallelism / alltoall; "
+            f"got comm_method={comm_method}, parallel_mode={parallel_mode}."
+        )
+    if moe_tp_size != 1:
+        return f"CuteDslB12xFusedMoE requires ep_size=1; got moe_tp_size={moe_tp_size}."
+    return None
+
+
+def should_skip_megamoe_cutedsl(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    dtype: Optional[torch.dtype] = None,
+    model_config: "MoeModelConfig" = None,
+    comm_method: Optional[str] = None,
+    moe_tp_size: int = 1,
+    parallel_mode: Optional[str] = None,
+    swiglu_gptoss_style: bool = False,
+) -> Optional[str]:
+    """Check MegaMoECuteDsl-specific constraints for the generic MoE test matrix.
+
+    Mirrors :func:`should_skip_megamoe_deepgemm` but applies to the
+    CuteDSL variant: NVFP4 + bfloat16 + 32-aligned hidden + 16-aligned
+    intermediate. Multi-rank coverage runs through the kernel's own
+    cuMem-based symmetric-memory provider (``MegaMoeSymmMemProvider``)
+    rather than the host ``Communication.dispatch`` strategies, so the
+    only sanctioned ``comm_method`` value here is the explicit
+    ``IGNORE`` sentinel used by the EPLB / dedicated MegaMoE multi-GPU
+    test paths. ``DEP`` and ``TEP`` parallel modes are accepted (EPLB
+    requires EP-shard routing); TP modes shard intermediate which
+    would break the per-slot weight layout.
+    """
+    if backend_type != MoeBackendType.MEGAMOE_CUTEDSL:
+        return None
+
+    if not torch.cuda.is_available():
+        return "MegaMoECuteDsl requires CUDA"
+
+    ok, reason = is_megamoe_cute_dsl_runtime_available()
+    if not ok:
+        return f"MegaMoECuteDsl runtime symbols missing: {reason}"
+
+    # Host-side comm methods (NVLINK_*, DEEPEP, allgather/reducescatter)
+    # are not compatible with the fused-comm kernel; the only acceptable
+    # comm_method here is the explicit IGNORE sentinel used by the
+    # EPLB / dedicated MegaMoE multi-GPU test paths (mirrors DG).
+    if comm_method is not None and comm_method != "IGNORE":
+        return (
+            "MegaMoECuteDsl uses an in-kernel cuMem symmetric-memory "
+            f"provider; cannot force host comm_method={comm_method}. "
+            "Use comm_method=IGNORE for MegaMoECuteDsl multi-GPU tests."
+        )
+
+    if parallel_mode is not None and parallel_mode not in ("DEP", "TEP"):
+        return f"MegaMoECuteDsl is EP-only; got parallel_mode={parallel_mode}"
+
+    if quant_algo != QuantAlgo.NVFP4:
+        return f"MegaMoECuteDsl only supports NVFP4 (got quant_algo={quant_algo})."
+
+    if dtype is not None and dtype != torch.bfloat16:
+        return f"MegaMoECuteDsl only supports bfloat16 activations (got dtype={dtype})."
+
+    if swiglu_gptoss_style:
+        return "MegaMoECuteDsl does not support swiglu_gptoss_style"
+
+    if moe_tp_size != 1:
+        return f"MegaMoECuteDsl is EP-only (got moe_tp_size={moe_tp_size})"
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+        # ProblemDesc.__post_init__ in upstream mega_runner.py:312-339:
+        # hidden % (2 * Nvfp4BlockSize=16) == 0 -> hidden % 32 == 0.
+        # expand_intermediate % (2 * Fc1GateUpInterleave=16) == 0 ->
+        # intermediate % 16 == 0 (since expand_intermediate = 2 *
+        # intermediate in the TRT-LLM convention).
+        if hidden_size % 32 != 0:
+            return (
+                f"MegaMoECuteDsl requires hidden_size % 32 == 0 (NVFP4 "
+                f"SF leg alignment); got hidden_size={hidden_size}"
+            )
+        if intermediate_size % 16 != 0:
+            return (
+                f"MegaMoECuteDsl requires intermediate_size % 16 == 0 "
+                f"(Fc1GateUpInterleave); got "
+                f"intermediate_size={intermediate_size}"
             )
 
     return None
@@ -970,8 +1143,16 @@ def supports_autotuner_capture(
     Returns:
         True if autotuner capture/replay is supported, False otherwise
     """
-    # DEEPGEMM and MEGAMOE do not support autotuner capture
-    if backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.MEGAMOE):
+    # DEEPGEMM, both MegaMoE backends, CUTE_DSL_B12X, and MARLIN do not support
+    # autotuner capture (fused kernels own dispatch+combine, b12x has its own
+    # dispatch/replay state).
+    if backend_type in (
+        MoeBackendType.DEEPGEMM,
+        MoeBackendType.MEGAMOE_DEEPGEMM,
+        MoeBackendType.MEGAMOE_CUTEDSL,
+        MoeBackendType.CUTE_DSL_B12X,
+        MoeBackendType.MARLIN,
+    ):
         return False
 
     if use_flashinfer:
@@ -1013,7 +1194,14 @@ def get_quick_skip_reason(
         can_impl_kwargs = {"dtype_activation": dtype}
         if swiglu_gptoss_style:
             can_impl_kwargs["swiglu_gptoss_style"] = swiglu_gptoss_style
-        if backend_type == MoeBackendType.MEGAMOE and model_config is not None:
+        if (
+            backend_type
+            in (
+                MoeBackendType.MEGAMOE_DEEPGEMM,
+                MoeBackendType.MEGAMOE_CUTEDSL,
+            )
+            and model_config is not None
+        ):
             can_impl_kwargs["hidden_size"] = model_config.hidden_size
             can_impl_kwargs["intermediate_size"] = model_config.intermediate_size
         can_impl, skip_reason = backend_cls.can_implement(quant_algo, **can_impl_kwargs)
@@ -1043,13 +1231,21 @@ def get_quick_skip_reason(
             lambda: should_skip_densegemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
             ),
-            lambda: should_skip_megamoe(
+            lambda: should_skip_megamoe_deepgemm(
                 backend_type,
                 quant_algo=quant_algo,
                 dtype=dtype,
                 model_config=model_config,
                 swiglu_gptoss_style=swiglu_gptoss_style,
             ),
+            lambda: should_skip_megamoe_cutedsl(
+                backend_type,
+                quant_algo=quant_algo,
+                dtype=dtype,
+                model_config=model_config,
+                swiglu_gptoss_style=swiglu_gptoss_style,
+            ),
+            lambda: should_skip_cute_dsl_b12x(backend_type),
         ]
         for check in skip_checks:
             skip_reason = check()
@@ -1230,6 +1426,8 @@ def should_skip_to_accelerate_ci(
     Rules applied (in order):
     0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
        unquantized coverage enabled.
+    0a. MARLIN backend: only NVFP4 on Hopper (SM90); skip all other
+        quant_algo / architecture combinations.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -1263,6 +1461,16 @@ def should_skip_to_accelerate_ci(
         and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
     ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
+
+    # --- Rule 0a: MARLIN backend only runs NVFP4 on Hopper (SM90) ---
+    if backend_type == MoeBackendType.MARLIN:
+        from tensorrt_llm._utils import get_sm_version
+
+        if quant_algo != QuantAlgo.NVFP4:
+            return f"[CI accel] MARLIN only tests NVFP4 in CI (got {quant_algo})"
+        sm_version = get_sm_version()
+        if sm_version != 90:
+            return f"[CI accel] MARLIN only runs on Hopper (SM90) in CI (got SM{sm_version})"
 
     # Any e256-class model_config triggers CI Rule-1 minimal coverage:
     # the full dtype x seq_len x swiglu x routing matrix on e256 models
