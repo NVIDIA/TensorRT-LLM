@@ -60,6 +60,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "llama_v3.1_nemotron_ultra_253b",
     "llama_v3.1_nemotron_ultra_253b_fp8",
     "kimi_k2_nvfp4",
+    "kimi_k2.5_fp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
@@ -204,9 +205,11 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Average time-to-first-token \[TTFT\] \(ms\):\s+([\d\.]+)"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
     re.compile(r"Average time-per-output-token \[TPOT\] \(ms\):\s+([\d\.]+)"),
+    # AutoDeploy builds its KVCacheManager from the same shared C++ class (see
+    # tensorrt_llm/_torch/auto_deploy/shim/interface.py), so its post-resize
+    # capacity also logs this line (max() below picks that final value).
     PerfMetricType.KV_CACHE_SIZE:
-    re.compile(r".*(?:Allocated ([\d\.]+) GiB for max tokens in paged KV cache|"
-               r"Final KV cache size after resize: ([\d\.]+) GiB).*"),
+    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
     PerfMetricType.PER_USER_OUTPUT_THROUGHPUT:
     re.compile(
         r"Per User Output Throughput \[w\/ ctx\] \(tps\/user\):\s+([\d\.]+)"),
@@ -247,6 +250,9 @@ AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Median E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.P99_INFERENCE_TIME:
     re.compile(r"P99 E2EL \(ms\):\s+(-?[\d\.]+)"),
+    # Printed by the shared C++ KVCacheManager on server startup, same as trtllm-bench.
+    PerfMetricType.KV_CACHE_SIZE:
+    re.compile(r".*Allocated ([\d\.]+) GiB for max tokens in paged KV cache.*"),
 }
 
 # (Relative threshold, Absolute threshold) for all metric types
@@ -837,28 +843,25 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
-        # Mirror the skip_less_mpi_world_size fixture: when mpi_world_size == 1
-        # we are on a single node (workers spawn within the test) so use the
-        # local device count; otherwise the launcher already sized the world
-        # across nodes, so trust mpi_world_size as the cluster total.
-        try:
-            mpi_world_size = get_mpi_world_size()
-        except Exception:
-            mpi_world_size = 1
-        try:
-            device_count = get_device_count()
-        except Exception:
-            device_count = None
+        # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
+        # auto-detection for multi-node setups.
+        total_gpus = int(os.environ["TRTLLM_TOTAL_GPU_COUNT"]
+                         ) if "TRTLLM_TOTAL_GPU_COUNT" in os.environ else None
+        if total_gpus is None:
+            try:
+                mpi_world_size = get_mpi_world_size()
+            except Exception:
+                mpi_world_size = 1
+            try:
+                device_count = get_device_count()
+            except Exception:
+                device_count = None
 
-        if mpi_world_size == 1:
-            total_gpus = device_count
-        else:
-            total_gpus = mpi_world_size
+            total_gpus = device_count if mpi_world_size == 1 else mpi_world_size
 
         if total_gpus is not None and self.num_gpus > total_gpus:
             pytest.skip(
-                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available "
-                f"(mpi_world_size={mpi_world_size}, device_count={device_count})"
+                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available"
             )
 
     def get_model_family(self) -> str:
@@ -1068,7 +1071,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
         data_cmd = []
-        prepare_data_script = os.path.join(self._llm_root, "benchmarks", "cpp",
+        prepare_data_script = os.path.join(self._llm_root, "benchmarks",
                                            "prepare_dataset.py")
 
         if self._config.model_name in MODEL_PATH_DICT.keys():
@@ -1681,22 +1684,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if result_state != "valid":
                 errors.append(self.get_error())
 
-        if self._config.runtime == 'serve':
-            print_info("Starting serve server")
-            outputs = self.run_ex(commands=commands,
-                                  cmd_idx=self._current_cmd_idx,
-                                  full_test_name="start_server",
-                                  metric_type=None,
-                                  venv=llm_venv,
-                                  gpu_clock_lock=gpu_clock_lock,
-                                  session_data_writer=session_data_writer,
-                                  output_dir=output_dir,
-                                  outputs=outputs,
-                                  original_test_name="start_server")
-            result_state = self.get_result_state()
-            result_states[self._current_cmd_idx] = result_state
-            if result_state != "valid":
-                errors.append(self.get_error())
+        # Note: unlike 'bench', 'serve' has no separate setup step here. The
+        # server is started as part of processing the first metric below
+        # (KV_CACHE_SIZE, cmd_idx=0) so that its startup log is captured and
+        # can be parsed, instead of being discarded as a setup command.
 
         try:
             for metric in metrics:
@@ -1788,7 +1779,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             cmd_idx = 0
 
         if self._config.runtime == "serve":
-            builder_metrics = []
+            # No engine build step, but the server start command (cmd_idx=0)
+            # still emits the KV cache size, so collect it like trtllm-bench does.
+            builder_metrics = [PerfMetricType.KV_CACHE_SIZE]
             print_info(
                 f"Skip building process for {self._config.model_name} as serve handles model loading"
             )

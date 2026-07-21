@@ -8,6 +8,8 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
@@ -19,7 +21,6 @@ from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
 # Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
 # the window buffer so the allreduce needs no extra copy).  On by default
@@ -714,10 +715,6 @@ class AllReduce(nn.Module):
         # read it here and stash the values as class-level attributes that
         # AllReduceRunner.forward can use during the autotuner warm-up phase.
         extra_attrs = get_model_extra_attrs()
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-            _init_gb10_nccl_symmetric_workaround
-        _init_gb10_nccl_symmetric_workaround()
-
         if extra_attrs:
             from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
                 AllReduceRunner

@@ -55,6 +55,11 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
+
 // Whether PDL is enabled for MoE Renormalize routing kernel.
 // Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
 // Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
@@ -110,6 +115,9 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
+// Opt-in for disaggregated KV transfer in-flight cancellation and fail-closed transfer-buffer quarantine.
+bool getEnvDisaggEnableInflightCancel();
+
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 
@@ -138,6 +146,8 @@ bool getEnvKVCacheTransferUseSyncBuffer();
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+bool getEnvKVCachePoolUseFabricMemory();
 
 uint16_t getEnvNixlPort();
 

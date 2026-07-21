@@ -1,9 +1,11 @@
+import json
+import struct
 import types
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
@@ -130,6 +132,70 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
+    shard_name = "model-00001-of-00001.safetensors"
+    header = {
+        _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: {
+            "dtype": tensor_dtype,
+            "shape": tensor_shape,
+            "data_offsets": [0, 0],
+        }
+    }
+    encoded_header = json.dumps(header).encode("utf-8")
+
+    with open(checkpoint_dir / shard_name, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded_header)))
+        f.write(encoded_header)
+
+    with open(checkpoint_dir / "model.safetensors.index.json", "w") as f:
+        json.dump({"weight_map": {_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: shard_name}}, f)
+
+
+@pytest.mark.parametrize(
+    "tensor_dtype,tensor_shape,expected_layout,expected_is_base",
+    [
+        pytest.param("I8", [2048, 2048], "mxfp4", False, id="mxfp4"),
+        pytest.param("U8", [2048, 2048], "nvfp4", False, id="nvfp4"),
+        pytest.param("F8_E4M3", [2048, 4096], None, True, id="base-fp8"),
+    ],
+)
+def test_deepseek_v4_base_checkpoint_detection(
+    tmp_path, tensor_dtype, tensor_shape, expected_layout, expected_is_base
+):
+    _write_safetensors_header(tmp_path, tensor_dtype, tensor_shape)
+
+    assert ModelConfig._detect_deepseek_v4_routed_moe_layout(str(tmp_path)) == expected_layout
+    assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
+
+
+def test_deepseek_v4_missing_compress_ratios_raises(tmp_path, monkeypatch):
+    """DeepSeek-V4 load must fail fast with a clear error when neither the
+    checkpoint config nor a user ``sparse_attention_config`` provides
+    ``compress_ratios``.
+
+    Regression test: previously ``compress_ratios`` could stay ``None`` and the
+    internal normalization comprehension raised an opaque
+    ``TypeError: 'NoneType' object is not iterable`` mid-load.
+    """
+    from tensorrt_llm._torch import model_config as model_config_module
+    from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
+
+    pretrained_config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        compress_ratios=None,
+        num_hidden_layers=4,
+    )
+
+    # Avoid touching the filesystem for the HF config load; the empty tmp_path
+    # makes the real ``_is_deepseek_v4_base_checkpoint`` probe return False.
+    monkeypatch.setattr(
+        model_config_module, "load_pretrained_config", lambda *args, **kwargs: pretrained_config
+    )
+
+    with pytest.raises(ValueError, match="compress_ratios"):
+        ModelConfig.from_pretrained(str(tmp_path))
 
 
 def test_model_config_sets_is_encoder_decoder_from_pretrained_config():

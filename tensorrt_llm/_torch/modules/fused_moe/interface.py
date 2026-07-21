@@ -283,6 +283,7 @@ class MoE(nn.Module):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
@@ -301,6 +302,12 @@ class MoE(nn.Module):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        # Uniform-across-experts scalar variant of swiglu_limit, consumed by
+        # FP8 paths (DeepGEMM Triton kernel, TRTLLMGen FP8 separate-activation
+        # kernel) that don't actually need a per-expert tensor. Distinct from
+        # `swiglu_limit` (kept for NVFP4 fused-activation cubins that *do*
+        # consume per-expert values via fc31_alpha rescaling).
+        self.swiglu_limit_scalar = swiglu_limit_scalar
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
         self.activation_type = int(activation_type)
@@ -330,19 +337,15 @@ class MoE(nn.Module):
         self.ep_size = model_config.mapping.moe_ep_size
         self.ep_rank = model_config.mapping.moe_ep_rank
 
-        # Non-divisible EP gate. Backends opt in via the class attribute
-        # ``_supports_non_divisible_ep``. Default is to reject so that any backend
-        # whose dispatch/combine paths still assume uniform partitioning fails fast
-        # with a clear error instead of silently using a wrong local-expert range.
-        if (self.num_experts % self.ep_size != 0
-                and not type(self)._supports_non_divisible_ep):
-            raise ValueError(
-                f"{type(self).__name__} does not support non-divisible EP: "
-                f"num_experts ({self.num_experts}) must be divisible by "
-                f"ep_size ({self.ep_size}). Override "
-                f"`_supports_non_divisible_ep = True` on the subclass after "
-                f"verifying the kernel/comm path handles ceil/floor partitioning."
-            )
+        # Non-divisible EP divisibility is gated inside _init_load_balancer()
+        # because the correct quantity to check depends on whether EPLB is
+        # active (num_slots vs num_experts), and num_slots is only known
+        # after the load balancer config is consulted.
+        #
+        # When init_load_balancer=False (the wrapper path, e.g. ConfigurableMoE
+        # creating an inner backend), the wrapper is responsible for the
+        # divisibility contract and we skip the check entirely — the wrapper's
+        # own _init_load_balancer will gate it.
 
         self.moe_backend = model_config.moe_backend
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -544,6 +547,17 @@ class MoE(nn.Module):
             assert self._supports_load_balancer()
             assert self.use_dp and self.parallel_size > 1, "Load Balancer should be only used with ADP and EP > 1"
             assert moe_load_balancer_config is not None
+            # EPLB provides uniform slot partition: every rank holds exactly
+            # num_slots // ep_size slots, regardless of (num_experts % ep_size).
+            # All backend kernels see uniform local-slot counts, so the
+            # non-divisible-EP opt-in is irrelevant here. We only need
+            # num_slots to divide ep_size for the slot partition to be uniform.
+            if moe_load_balancer_config.num_slots % self.ep_size != 0:
+                raise ValueError(
+                    f"{type(self).__name__}: with EPLB enabled, num_slots "
+                    f"({moe_load_balancer_config.num_slots}) must be divisible "
+                    f"by ep_size ({self.ep_size}) so each rank holds the same "
+                    f"number of slots.")
             top_k = self.routing_method.experts_per_token
             self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
 
@@ -591,6 +605,20 @@ class MoE(nn.Module):
             assert len(
                 self.initial_local_expert_ids) == self.expert_size_per_partition
         else:
+            # No EPLB: each rank gets a ceil/floor slice of num_experts.
+            # Only backends that have validated their dispatch/combine paths
+            # for the ceil/floor partition may opt in; others fail fast with
+            # an actionable error pointing at EPLB as the simpler escape.
+            if (self.num_experts % self.ep_size != 0
+                    and not type(self)._supports_non_divisible_ep):
+                raise ValueError(
+                    f"{type(self).__name__} does not support non-divisible EP: "
+                    f"num_experts ({self.num_experts}) must be divisible by "
+                    f"ep_size ({self.ep_size}). Enable EPLB with num_slots "
+                    f"divisible by ep_size, or override "
+                    f"`_supports_non_divisible_ep = True` on the subclass "
+                    f"after verifying the kernel/comm path handles ceil/floor "
+                    f"partitioning.")
             # Fallback: ceil/floor distribution across ranks.
             # Ranks 0..remainder-1 each hold (base+1) experts; remaining ranks hold base.
             _size, _start, _end = _compute_ep_partition(self.num_experts,
@@ -827,8 +855,18 @@ class MoE(nn.Module):
         """
         raise NotImplementedError
 
-    def post_load_weights(self):
-        pass
+    def transform_weights(self) -> None:
+        if getattr(self, "_weights_transformed", False):
+            return
+        self.quant_method.transform_weights(self)
+        self._weights_transformed = True
+
+    def cache_derived_state(self) -> None:
+        self.quant_method.cache_derived_state(self)
+
+    def post_load_weights(self) -> None:
+        self.transform_weights()
+        self.cache_derived_state()
 
     def process_weights_after_loading(self):
         """
@@ -1060,6 +1098,12 @@ class MoE(nn.Module):
     def has_w4a16_mxfp4(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a16_mxfp4(
+        )
+
+    @property
+    def has_mxfp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8(
         )
 
     @property

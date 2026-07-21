@@ -10,8 +10,8 @@ corresponds exactly to a test name, it naturally matches that test as well.
 Example usage::
 
    python scripts/test_to_stage_mapping.py --tests \\
-       "triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]"
-   python scripts/test_to_stage_mapping.py --tests gpt_ib_ptuning
+       "unittest/_torch/sampler/test_beam_search.py"
+   python scripts/test_to_stage_mapping.py --tests test_beam_search
    python scripts/test_to_stage_mapping.py --stages \\
        A100X-Triton-Post-Merge-1
 

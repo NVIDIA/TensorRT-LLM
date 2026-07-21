@@ -108,6 +108,51 @@ def test_update_quant_config_from_compressed_tensors_parses_fp8_channel():
     assert quant_config.exclude_modules == ["lm_head"]
 
 
+def test_update_quant_config_from_compressed_tensors_parses_scheme_named_group():
+    # Some compressed-tensors checkpoints (e.g. NIM fp8 packaging) key
+    # config_groups by the scheme name ("FP8_DYNAMIC") instead of "group_0".
+    # The single group must still parse rather than raising KeyError: 'group_0'.
+    config = _compressed_tensors_config(
+        weights={
+            "num_bits": 8,
+            "strategy": "channel",
+        },
+        input_activations={
+            "num_bits": 8,
+            "strategy": "token",
+        },
+        ignore=["lm_head"],
+    )
+    groups = config["config_groups"]
+    groups["FP8_DYNAMIC"] = groups.pop("group_0")  # re-key: scheme name, not group_0
+
+    quant_config = QuantConfig()
+    update_quant_config_from_compressed_tensors(quant_config, config)
+
+    assert quant_config.quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+    assert quant_config.exclude_modules == ["lm_head"]
+
+
+def test_update_quant_config_from_compressed_tensors_rejects_ambiguous_groups():
+    # Multiple groups, none named "group_0" -> ambiguous which to apply globally.
+    config = _compressed_tensors_config(
+        weights={
+            "num_bits": 8,
+            "strategy": "channel",
+        },
+        input_activations={
+            "num_bits": 8,
+            "strategy": "token",
+        },
+    )
+    group = config["config_groups"].pop("group_0")
+    config["config_groups"]["FP8_DYNAMIC"] = group
+    config["config_groups"]["FP8_STATIC"] = dict(group)
+
+    with pytest.raises(ValueError, match="exactly one config group"):
+        update_quant_config_from_compressed_tensors(QuantConfig(), config)
+
+
 @pytest.mark.parametrize(
     "weights,input_activations,error_match",
     [

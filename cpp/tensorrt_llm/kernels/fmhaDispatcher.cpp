@@ -53,13 +53,14 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     // The exception will fall back to fmha v2.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
     , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
+    , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
 {
     if (mUseTllmGen)
     {
         auto [dataTypeK, dataTypeV] = unpack_kv_data_type(mFixedParams.dataTypeKv);
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV, mFixedParams.dataTypeOut,
-                mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0, mFixedParams.sageBlockSizeV));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, dataTypeK, dataTypeV,
+            mFixedParams.dataTypeOut, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
+            mFixedParams.sageBlockSizeV, mFixedParams.fusesDsv4InvRopeFp8Quant));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -128,7 +129,7 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = (qkvLayout == QkvLayout::PagedKv) ? mFixedParams.numTokensPerBlock : 0;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
-        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
         // the kernel is supported.
         tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
@@ -140,6 +141,7 @@ bool FmhaDispatcher::isSupported()
                 = (mFixedParams.useSparseMLA && mFixedParams.headSizeV == mFixedParams.headSize)
                 ? SparseType::DynamicTokenSparse
                 : SparseType::StaticTokenSparse;
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = mFixedParams.fusesDsv4InvRopeFp8Quant;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             // Generation-style kernels on long KV can pick MultiCtasKv cubins
@@ -220,6 +222,12 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.oSfScalePtr = runnerParams.oSfScalePtr;
         tllmRunnerParams.oPtr = runnerParams.outputPtr;
         tllmRunnerParams.oSfPtr = runnerParams.outputSfPtr;
+        if (runnerParams.dsv4EpilogueFusion.enabled)
+        {
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = true;
+            tllmRunnerParams.mDsv4EpilogueFusion.cosSinCache = runnerParams.dsv4EpilogueFusion.cosSinCache;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleBufM = runnerParams.dsv4EpilogueFusion.scaleBufM;
+        }
         // The sequence lengths for K/V.
         tllmRunnerParams.seqLensKvPtr = reinterpret_cast<int const*>(runnerParams.kvSeqLenPtr);
         // Assume same headDim for Qk and V here.
@@ -247,7 +255,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
-        tllmRunnerParams.mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+        tllmRunnerParams.mMultiProcessorCount = mMultiProcessorCount;
         tllmRunnerParams.mSfStartTokenIdx = 0;
         // SageAttention scaling factors.
         tllmRunnerParams.sageAttnSfsQPtr = runnerParams.qScalePtr;

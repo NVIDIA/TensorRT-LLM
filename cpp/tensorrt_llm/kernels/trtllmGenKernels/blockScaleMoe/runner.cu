@@ -670,6 +670,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     activationData.topK = args.top_k;
     activationData.numTokens = args.num_tokens;
     activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
+    // For DeepSeek FP8 the activation runs as a separate kernel rather than
+    // fused into the FC1 GEMM cubin; forward the scalar swiglu_limit so it
+    // can honor swiglu_limit (uniform across experts; see DevKernel.h note).
+    activationData.swigluLimit = args.gemm1_clamp_limit_value;
+    activationData.hasSwigluLimit = args.has_gemm1_clamp_limit_value;
 
     activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
 

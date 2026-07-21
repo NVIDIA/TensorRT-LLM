@@ -1,8 +1,12 @@
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
+import os
 import random
 import time
 import uuid
+
+# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
+os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -59,12 +63,17 @@ class KvCacheConfigV2:
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
+    kv_cache_event_hash_algo: str = "auto"
 
     max_gpu_total_bytes: Optional[int] = None
     enable_partial_reuse: bool = False
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
     disk_prefetch_num_reqs: int = 4
+    pool_ratio: Optional[List[float]] = None
+    avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
 
@@ -501,7 +510,15 @@ def get_block_data(
     """Unified block data retrieval for both V1 and V2 KVCacheManager."""
     if use_v2:
         layer_grouping = kv_cache_manager.impl.layer_grouping
-        local_layer_indices = layer_grouping[layer_group_id]
+        # Read layers in ascending global-layer order so this verification does
+        # not depend on the KV-cache manager's internal layer_grouping order
+        # (an implementation detail, not an API contract). The merge below packs
+        # ranks at ascending layer offsets, so the per-rank stack must also be
+        # ascending by global layer.
+        local_layer_indices = sorted(
+            layer_grouping[layer_group_id],
+            key=lambda lid: kv_cache_manager.pp_layers[lid],
+        )
 
         all_layer_data = []
         for local_layer_idx in local_layer_indices:

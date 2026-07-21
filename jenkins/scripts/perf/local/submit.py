@@ -250,25 +250,43 @@ def get_hardware_config(config, runtime_mode, benchmark_mode, test_name=None):
         }
 
 
+def _join_env(*parts):
+    """Space-join non-empty env-var strings (drops falsy entries)."""
+    return " ".join(p for p in parts if p)
+
+
 def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
     """Get worker / server / benchmark env vars from the yaml.
 
     Aggregated yaml stores env vars per server config under
     `server_configs[i].server_env_var`. Disaggregated yaml stores them at the
-    top-level `environment.{worker,server,benchmark}_env_var`.
+    top-level `environment.{worker,server,benchmark}_env_var`, plus optional
+    `environment.{ctx,gen}_worker_env_var` for role-specific extras (appended
+    to the shared `worker_env_var`).
 
     ctx_only is a hybrid: the launch path is aggregated, but the yaml is the
     disagg one, so the agg launch's "server_env_var" comes from
-    `environment.worker_env_var`.
+    `environment.worker_env_var` (merged with ctx-side extras when present).
 
-    Returns: {worker_env_var, server_env_var, benchmark_env_var}.
+    Returns: {worker_env_var (shared, back-compat),
+              ctx_worker_env_var, gen_worker_env_var,
+              server_env_var, benchmark_env_var}.
     """
     env = config.get("environment", {}) or {}
+    common = env.get("worker_env_var", "") or ""
+    ctx_extra = env.get("ctx_worker_env_var", "") or ""
+    gen_extra = env.get("gen_worker_env_var", "") or ""
+    ctx_env = _join_env(common, ctx_extra)
+    gen_env = _join_env(common, gen_extra)
     if runtime_mode == "aggregated":
         if benchmark_mode == "ctx_only":
             return {
-                "worker_env_var": env.get("worker_env_var", "") or "",
-                "server_env_var": env.get("worker_env_var", "") or "",
+                "worker_env_var": common,
+                "ctx_worker_env_var": ctx_env,
+                "gen_worker_env_var": gen_env,
+                # ctx_only launches through the aggregated single-pytest path;
+                # the ctx-merged env is what actually runs.
+                "server_env_var": ctx_env,
                 "benchmark_env_var": env.get("benchmark_env_var", "") or "",
             }
         agg_server_env_var = ""
@@ -278,11 +296,15 @@ def get_env_config(config, runtime_mode, benchmark_mode=None, server_name=None):
                 break
         return {
             "worker_env_var": "",
+            "ctx_worker_env_var": "",
+            "gen_worker_env_var": "",
             "server_env_var": agg_server_env_var,
             "benchmark_env_var": "",
         }
     return {
-        "worker_env_var": env.get("worker_env_var", "") or "",
+        "worker_env_var": common,
+        "ctx_worker_env_var": ctx_env,
+        "gen_worker_env_var": gen_env,
         "server_env_var": env.get("server_env_var", "") or "",
         "benchmark_env_var": env.get("benchmark_env_var", "") or "",
     }
@@ -368,7 +390,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmi2
+    # Single-GPU aggregated jobs run one process without MPI -- drop --mpi=pmix
     is_single_gpu_aggr = (
         is_aggr and hardware_config is not None and hardware_config.get("total_gpus") == 1
     )
@@ -376,7 +398,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
     if args.mpi_type:
         lines.append(f"--mpi={args.mpi_type}")
     elif is_aggr and not is_single_gpu_aggr:
-        lines.append("--mpi=pmi2")
+        lines.append("--mpi=pmix")
 
     return lines
 
@@ -561,7 +583,7 @@ def main():
         "--mpi-type",
         default="",
         help="MPI type for srun (e.g. pmix, pmi2). If not set, aggregated runs default to"
-        " --mpi=pmi2; non-aggregated runs omit --mpi entirely.",
+        " --mpi=pmix; non-aggregated runs omit --mpi entirely.",
     )
     parser.add_argument(
         "--disagg-server-port",
@@ -633,6 +655,7 @@ def main():
     # Detect GPU type from config metadata
     supported_gpus = config.get("metadata", {}).get("supported_gpus", [])
     is_b200 = "B200" in supported_gpus
+    is_gb300 = "GB300" in supported_gpus
 
     # Create timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -785,19 +808,22 @@ def main():
     server_env_vars = ""
     benchmark_env_var = ""
     if runtime_mode == "disaggregated":
-        # Build worker env vars (split into ctx and gen for role-specific settings)
-        common_worker_env_var = env_config.get("worker_env_var", "")
+        # Build worker env vars (split into ctx and gen for role-specific
+        # settings). get_env_config already merged the shared worker_env_var
+        # with any per-role ctx_worker_env_var / gen_worker_env_var from yaml.
+        ctx_worker_env_var = env_config.get("ctx_worker_env_var", "")
+        gen_worker_env_var = env_config.get("gen_worker_env_var", "")
         ctx_worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{ctx_tllm_profile_start_stop}' "
             f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
-            f"{common_worker_env_var}"
+            f"{ctx_worker_env_var}"
         )
         gen_worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{gen_tllm_profile_start_stop}' "
             f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
             f"HF_HOME=/tmp/hf_home "
-            f"{common_worker_env_var}"
+            f"{gen_worker_env_var}"
         )
         server_env_vars = env_config.get("server_env_var", "")
         benchmark_env_var = env_config.get("benchmark_env_var", "")
@@ -817,10 +843,12 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
-        if is_b200:
+        if is_gb300:
+            ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
+        elif is_b200:
             ucx_tls_cmd = "export UCX_TLS=^ib &&"
         else:
-            ucx_tls_cmd = "unset UCX_TLS &&"
+            ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
         script_prefix_lines.extend(
             [
                 f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',

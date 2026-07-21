@@ -11,6 +11,7 @@ from openai.types.chat import \
     ChatCompletionContentPartParam as OpenAIChatCompletionContentPartParam
 from openai.types.chat import (ChatCompletionContentPartTextParam,
                                ChatCompletionMessageParam)
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from transformers import AutoConfig
 from typing_extensions import Required
 
@@ -270,6 +271,109 @@ def parse_chat_message_content(
     return result
 
 
+# The below 2 models are for tau2-bench workarounds (see `_parse_fallback_tool_calls` for details).
+class _FallbackFunctionCall(BaseModel):
+    """Lenient, typed view of a tool call's `function` for the fallback path."""
+    model_config = ConfigDict(extra="allow")
+
+    name: str | None = None
+    arguments: str | dict[str, Any] | None = None
+
+
+class _FallbackToolCall(BaseModel):
+    """Lenient, typed view of a single tool call for the fallback path."""
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = None
+    type: str | None = None
+    function: _FallbackFunctionCall
+
+
+_FALLBACK_TOOL_CALLS_ADAPTER = TypeAdapter(list[_FallbackToolCall])
+
+
+def _format_tool_call_error(errors: list[dict[str, Any]]) -> str:
+    """Render the first Pydantic error for fallback tool calls as a client-facing message."""
+    err = errors[0]
+    loc = err.get("loc", ())
+    index = loc[0] if loc and isinstance(loc[0], int) else 0
+    error_type = err.get("type", "")
+    # Path within the tool call, after the leading list index.
+    field = ".".join(str(p) for p in loc[1:])
+    target = f"tool_calls[{index}].{field}" if field else f"tool_calls[{index}]"
+
+    if error_type == "missing":
+        return f"{target} is required."
+    # Pydantic's default message for these leaks the internal model name, so phrase the "value must
+    # be an object" case explicitly.
+    if error_type in ("model_type", "dict_type", "model_attributes_type"):
+        return f"{target} must be an object."
+    return f"{target} is invalid: {err.get('msg', 'validation error')}"
+
+
+def _validate_fallback_tool_calls(
+        tool_calls: list[Any]) -> list[dict[str, Any]]:
+    """Re-validate raw, Pydantic-rejected tool calls from the openai_server through the model above.
+
+    This keeps the tau2-bench leniency that motivated the raw-JSON fallback while restoring type
+    safety: malformed input raises `ValueError` (mapped to HTTP 400 by the server) instead of
+    crashing the handler with an opaque `KeyError` / `TypeError`/ `JSONDecodeError` from unvalidated
+    dicts.
+    """
+    try:
+        validated = _FALLBACK_TOOL_CALLS_ADAPTER.validate_python(tool_calls)
+    except ValidationError as e:
+        raise ValueError(_format_tool_call_error(e.errors())) from e
+    # `exclude_unset` preserves the caller's original shape (e.g. omitted `id` / `type` are not
+    # re-introduced), while `extra="allow"` keeps any additional fields the client sent.
+    return [tc.model_dump(exclude_unset=True) for tc in validated]
+
+
+def _normalize_tool_call_arguments(index: int, item: Any) -> dict[str, Any]:
+    """Normalize `function.arguments` to the internal dict form."""
+    item = dict(item)
+    item["function"] = dict(item["function"])
+
+    arguments = item["function"].get("arguments")
+    if arguments is None:
+        item["function"]["arguments"] = {}
+    elif isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"tool_calls[{index}].function.arguments must be valid JSON."
+            ) from e
+        if not isinstance(arguments, dict):
+            raise ValueError(
+                f"tool_calls[{index}].function.arguments must be a JSON object."
+            )
+        item["function"]["arguments"] = arguments
+    elif isinstance(arguments, dict):
+        item["function"]["arguments"] = arguments
+    else:
+        raise ValueError(
+            f"tool_calls[{index}].function.arguments must be an object.")
+    return item
+
+
+def _parse_fallback_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
+    """Parse raw tool-call lists accepted only by the tau2-bench fallback path.
+
+    `openai_server.py` first attempts strict OpenAI request validation. Some tau2-bench requests
+    send tool calls in a shape that fails that strict model, so the server falls back to parsing the
+    raw JSON payload and passes a plain list here. Because that list has skipped Pydantic
+    validation, keep the compatibility workaround contained in this helper and re-apply the minimum
+    checks we rely on: each tool call and `function` must be object-shaped, malformed inputs should
+    become client-facing `ValueError`s, and `function.arguments` must normalize to a JSON object.
+    """
+    tool_calls = _validate_fallback_tool_calls(tool_calls)
+    return [
+        _normalize_tool_call_arguments(index, item)
+        for index, item in enumerate(tool_calls)
+    ]
+
+
 # Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
 def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
@@ -282,25 +386,16 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
 
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
-        # Materialize Pydantic v2 ValidatorIterator (single-use) to a list.
-        if not isinstance(tool_calls, list):
+        if isinstance(tool_calls, list):
+            result["tool_calls"] = _parse_fallback_tool_calls(tool_calls)
+        else:
+            # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
+            # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
             tool_calls = list(tool_calls)
-
-        result["tool_calls"] = []
-        for item in tool_calls:
-            # Bypass pydantic check to WAR `tau2-bench-telecom` ill-format tool_call.
-            item = dict(item)
-            if "function" in item:
-                item["function"] = dict(item["function"])
-
-            if content := item["function"].get("arguments"):
-                if isinstance(content, str):
-                    item["function"]["arguments"] = json.loads(content)
-                else:
-                    item["function"]["arguments"] = content
-            else:
-                item["function"]["arguments"] = {}
-            result["tool_calls"].append(item)
+            result["tool_calls"] = [
+                _normalize_tool_call_arguments(index, item)
+                for index, item in enumerate(tool_calls)
+            ]
 
     return result
 
@@ -387,6 +482,9 @@ def parse_chat_messages_coroutines(
 
         # Track placeholders added for this message only.
         msg_placeholder_counts = {}
+        # Snapshot the tracker's item_order length so we can slice off just
+        # the entries this message contributed.
+        item_order_start = len(mm_data_tracker.item_order())
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
                 placeholder = mm_data_tracker.add_data(
@@ -411,13 +509,19 @@ def parse_chat_messages_coroutines(
                     msg_placeholder_counts,
                     mm_data_tracker.placeholder_modalities())
             else:
+                msg_item_order = mm_data_tracker.item_order()[item_order_start:]
                 parsed_msg["content"] = add_multimodal_placeholders(
-                    type(model_config).model_type, parsed_msg["content"],
-                    msg_placeholder_counts)
+                    type(model_config).model_type,
+                    parsed_msg["content"],
+                    msg_placeholder_counts,
+                    item_order=msg_item_order,
+                )
         mm_placeholder_counts.append(msg_placeholder_counts)
 
-    return conversation, mm_data_tracker.retrieve_all_async(
-    ), mm_placeholder_counts
+    # ``item_order`` is populated synchronously by ``add_data``, so it can
+    # be returned directly (not through the coroutine).
+    return (conversation, mm_data_tracker.retrieve_all_async(),
+            mm_placeholder_counts, mm_data_tracker.item_order())
 
 
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):

@@ -4,23 +4,134 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 from utils.llm_data import llm_models_root
-from utils.util import skip_blackwell
+from utils.util import skip_blackwell, skip_num_gpus_less_than
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor._util import \
+    _derive_draft_max_attention_window
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+    _extend_full_attention_windows_for_spec_decode
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    draft_pretrained_config = SimpleNamespace(num_hidden_layers=3)
+
+    max_attention_window = _derive_draft_max_attention_window(
+        kv_cache_config=kv_cache_config,
+        draft_pretrained_config=draft_pretrained_config,
+        max_seq_len=131072,
+        num_draft_layers=3,
+    )
+
+    assert max_attention_window is None
+
+
+def test_eagle3_draft_kv_cache_uses_draft_layer_types_for_swa() -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    draft_pretrained_config = SimpleNamespace(
+        sliding_window=512,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+
+    max_attention_window = _derive_draft_max_attention_window(
+        kv_cache_config=kv_cache_config,
+        draft_pretrained_config=draft_pretrained_config,
+        max_seq_len=4096,
+        num_draft_layers=3,
+    )
+
+    assert max_attention_window == [512, 4096, 512]
+
+
+def test_eagle3_draft_kv_cache_rejects_multiple_sliding_window_sizes() -> None:
+    # The derivation assumes a single scalar sliding_window per model. A future
+    # draft config exposing multiple distinct sliding sizes must fail loudly
+    # rather than silently collapse every sliding layer to one size.
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    draft_pretrained_config = SimpleNamespace(
+        sliding_window=[512, 1024],
+        layer_types=["sliding_attention", "full_attention"],
+    )
+
+    with pytest.raises(NotImplementedError):
+        _derive_draft_max_attention_window(
+            kv_cache_config=kv_cache_config,
+            draft_pretrained_config=draft_pretrained_config,
+            max_seq_len=4096,
+            num_draft_layers=3,
+        )
+
+
+def test_eagle3_target_kv_cache_extends_full_window_for_spec_decode() -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    spec_config = Eagle3DecodingConfig(max_draft_len=3,
+                                       speculative_model="draft")
+
+    _extend_full_attention_windows_for_spec_decode(
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+        net_max_seq_len=131072,
+        model_engine_max_seq_len=131080,
+    )
+
+    assert kv_cache_config.max_attention_window == [128, 131080]
+
+
+@skip_num_gpus_less_than(1)
+def test_eagle3_one_model_capture_uses_real_token_count() -> None:
+    # maybe_capture_hidden_states routes through inplace_slice_copy, a CUDA-only
+    # custom op, so this test runs on GPU. It verifies that the capture is bounded
+    # by the real scheduled token count (num_capture_tokens) and not self.num_tokens.
+    #
+    # prepare() decrements self.num_tokens to the attention-DP subseq shape while
+    # leaving num_capture_tokens at the real (unpadded) count. Simulate that
+    # post-prepare state: if the capture wrongly used self.num_tokens it would drop
+    # the draft-verification rows (regressing the acceptance rate); if it wrongly
+    # used the padded input it would overrun the buffer.
+    spec_metadata = Eagle3OneModelSpecMetadata(
+        max_num_requests=1,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        num_layers=36,
+        hidden_size=2,
+        max_num_tokens=4,
+        dtype=torch.float32,
+        layers_to_capture={23},
+    )
+    assert spec_metadata.hidden_states is not None
+    spec_metadata.hidden_states.fill_(-1)
+    # Real scheduled count is 4; num_tokens is decremented below it by prepare().
+    spec_metadata.num_capture_tokens = 4
+    spec_metadata.num_tokens = 1
+
+    # 6 rows simulate CUDA-graph padding beyond the 4 scheduled tokens.
+    hidden_states = torch.arange(12, dtype=torch.float32,
+                                 device="cuda").reshape(6, 2)
+    residual = torch.ones_like(hidden_states)
+    spec_metadata.maybe_capture_hidden_states(23, hidden_states, residual)
+    torch.cuda.synchronize()
+
+    # All 4 real tokens captured (not truncated to num_tokens=1), padding dropped.
+    assert torch.equal(spec_metadata.hidden_states[:4, :2],
+                       hidden_states[:4] + residual[:4])
+    assert spec_metadata.hidden_states.shape == (4, 2)
 
 
 @pytest.fixture(scope="function")
@@ -56,6 +167,7 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     mock_kv_cache_manager = MagicMock()
     mock_kv_cache_manager.tokens_per_block = 32
     mock_kv_cache_manager.num_pools = 1
+    mock_kv_cache_manager.num_attention_op_pools = mock_kv_cache_manager.num_pools
     mock_kv_cache_manager.max_blocks_per_seq = 16
     mock_kv_cache_manager.max_batch_size = num_seqs
     mock_kv_cache_manager.max_seq_len = 512  # Large enough to hold our test sequences
@@ -93,6 +205,81 @@ def test_kv_lens_runtime_with_eagle3_one_model():
     expected_kv_lens_with_extra = actual_kv_lengths + num_extra_kv_tokens
     assert torch.equal(kv_lens_internal, expected_kv_lens_with_extra), \
         f"kv_lens should be {expected_kv_lens_with_extra.tolist()}, but got {kv_lens_internal.tolist()}"
+
+
+def _make_mock_kv_cache_manager(num_seqs: int) -> MagicMock:
+    mock_kv_cache_manager = MagicMock()
+    mock_kv_cache_manager.tokens_per_block = 32
+    mock_kv_cache_manager.num_pools = 1
+    mock_kv_cache_manager.num_attention_op_pools = 1
+    mock_kv_cache_manager.max_blocks_per_seq = 16
+    mock_kv_cache_manager.max_batch_size = num_seqs
+    mock_kv_cache_manager.max_seq_len = 512
+    mock_kv_cache_manager.copy_batch_block_offsets = MagicMock()
+    return mock_kv_cache_manager
+
+
+@pytest.mark.parametrize("spec_signal", [
+    None, "num_extra_kv_tokens", "is_spec_decoding_enabled",
+    "has_speculative_draft_tokens", "draft_kv_cache_manager"
+])
+def test_block_offsets_staging_width_spec_gate(spec_signal):
+    """prepare() caps the staged block-table width by the batch's max KV
+    length only on the non-speculative path.
+
+    Any speculative-decoding signal must disable the cap (max_blocks=None):
+    spec kernels address block columns past the host kv_lens snapshot
+    (device-side kv_lens advances in draft/tree sub-steps, draft-token blocks
+    are allocated ahead), so a host-derived cap leaves columns they
+    dereference unstaged. Regression test for the EAGLE3 warmup illegal
+    memory access.
+    """
+    num_seqs = 3
+    prompt_lens = [50, 100, 75]
+    seq_lens_q = [1, 1, 1]
+    num_cached_tokens_per_seq = [
+        prompt_lens[i] - seq_lens_q[i] for i in range(num_seqs)
+    ]
+
+    mock_kv_cache_manager = _make_mock_kv_cache_manager(num_seqs)
+    metadata_kwargs = dict(
+        max_num_requests=num_seqs,
+        max_num_tokens=sum(seq_lens_q),
+        kv_cache_manager=mock_kv_cache_manager,
+    )
+    mock_draft_manager = None
+    if spec_signal == "draft_kv_cache_manager":
+        mock_draft_manager = _make_mock_kv_cache_manager(num_seqs)
+        metadata_kwargs["draft_kv_cache_manager"] = mock_draft_manager
+
+    attn_metadata = TrtllmAttentionMetadata(**metadata_kwargs)
+    if spec_signal == "is_spec_decoding_enabled":
+        attn_metadata.is_spec_decoding_enabled = True
+    elif spec_signal == "has_speculative_draft_tokens":
+        attn_metadata.runtime_features.has_speculative_draft_tokens = True
+
+    attn_metadata.request_ids = list(range(1, num_seqs + 1))
+    attn_metadata.prompt_lens = prompt_lens
+    attn_metadata._seq_lens = torch.tensor(seq_lens_q, dtype=torch.int32)
+    attn_metadata._seq_lens_kv = torch.tensor(seq_lens_q, dtype=torch.int32)
+    attn_metadata.kv_cache_params = KVCacheParams(
+        use_cache=True,
+        num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+        num_extra_kv_tokens=(7 if spec_signal == "num_extra_kv_tokens" else 0))
+
+    attn_metadata.prepare()
+
+    if spec_signal is None:
+        # Non-speculative: capped at ceil(max kv len / tokens_per_block).
+        expected_max_blocks = -(-max(prompt_lens) //
+                                mock_kv_cache_manager.tokens_per_block)
+    else:
+        expected_max_blocks = None
+    call_kwargs = mock_kv_cache_manager.copy_batch_block_offsets.call_args.kwargs
+    assert call_kwargs["max_blocks"] == expected_max_blocks
+    if mock_draft_manager is not None:
+        draft_kwargs = mock_draft_manager.copy_batch_block_offsets.call_args.kwargs
+        assert draft_kwargs["max_blocks"] is None
 
 
 @pytest.mark.parametrize(
@@ -696,13 +883,10 @@ def test_multi_eagle3(use_one_model: bool):
             load_format="dummy",
         )
 
-        spec_config = Eagle3DecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=eagle_model_dir,
-            # Llama 3 does not support one model eagle.
-            eagle3_one_model=use_one_model,
-            num_eagle_layers=2,
-            load_format="dummy")
+        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=use_one_model,
+                                           load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
@@ -830,6 +1014,12 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.high_cuda_memory
 @skip_blackwell
+# Opt out of MPI session reuse: the XQA JIT cubin registry is process-global
+# (DecoderXQARunner::getResourceGlobal) and its lookup key does not include
+# q_seq_len / is_spec_dec_tree, so running the dynamic-tree and non-dynamic-tree
+# variants in one worker process launches a cubin compiled for the other
+# config's q_seq_len -> CUDA_ERROR_INVALID_VALUE on Hopper.
+@pytest.mark.private_mpi_session
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                                                use_cuda_graph: bool):

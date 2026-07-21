@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 # ---------------------------------------------------------------------------
 # State value constants
@@ -75,6 +75,7 @@ def make_ctx_request(
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
     req.context_current_position = 0
+    req.expect_snapshot_points = []
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
     req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
@@ -104,13 +105,18 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
 
 
 def make_disagg_request(
-    request_id, context_remaining_length=100, lora_task_id=None, num_draft_tokens=0
+    request_id,
+    context_remaining_length=100,
+    lora_task_id=None,
+    num_draft_tokens=0,
+    prompt_len=None,
 ):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
     req.state_value = DISAGG_GEN_INIT
     req.context_remaining_length = context_remaining_length
+    req.prompt_len = prompt_len if prompt_len is not None else context_remaining_length
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
@@ -152,6 +158,7 @@ def make_kv_cache_manager(
     tokens_per_block=64,
     prepare_context_fn=None,
     resize_context_fn=None,
+    prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
 ):
     mgr = Mock()
@@ -159,6 +166,7 @@ def make_kv_cache_manager(
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
+    mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
@@ -173,16 +181,17 @@ def make_peft_cache_manager(max_device_pages, pages_per_task=1):
 
 
 def make_scheduler(
-    kv_cache_manager,
-    max_batch_size=100,
-    max_num_tokens=1024,
-    ctx_chunk_config=None,
-    peft_cache_manager=None,
-    scheduler_capacity=None,
-    no_schedule_until_state=None,
-    no_schedule_after_state=None,
-    cross_kv_cache_manager=None,
-):
+    kv_cache_manager: Mock,
+    max_batch_size: int = 100,
+    max_num_tokens: int | None = 1024,
+    ctx_chunk_config: tuple | None = None,
+    peft_cache_manager: Mock | None = None,
+    scheduler_capacity: int | None = None,
+    no_schedule_until_state: LlmRequestState | None = None,
+    no_schedule_after_state: LlmRequestState | None = None,
+    cross_kv_cache_manager: Mock | None = None,
+    enable_prefix_aware_scheduling: bool = True,
+) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -205,6 +214,7 @@ def make_scheduler(
             ctx_chunk_config=ctx_chunk_config,
             peft_cache_manager=peft_cache_manager,
             scheduler_capacity=scheduler_capacity,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             **kwargs,
         )
 
@@ -579,7 +589,7 @@ class TestKVCacheFailuresCtx:
     def test_ctx_resize_fail_then_smaller_ctx(self):
         call_count = [0]
 
-        def resize_fn(req, n):
+        def resize_fn(req, n, history_length=None):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 
@@ -1203,7 +1213,7 @@ class TestDisagg:
         assert ids(out.generation_requests) == [0, 1]
         assert ids(out.fitting_disagg_gen_init_requests) == [2]
 
-    def test_disagg_gated_by_prepare_context(self):
+    def test_disagg_gated_by_prepare_disagg_gen_init(self):
         """Disagg is limited by KV cache / IndexMapper, not batch budget."""
         call_count = [0]
 
@@ -1211,7 +1221,7 @@ class TestDisagg:
             call_count[0] += 1
             return call_count[0] <= 2  # first 2 succeed, rest fail
 
-        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [make_disagg_request(i) for i in range(4)]
         out = sched.schedule_request(reqs, set())
@@ -1236,33 +1246,45 @@ class TestDisagg:
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [0, 1]
 
-    def test_disagg_prepare_context_fails_skips(self):
-        """prepare_context failure skips the request, loop continues."""
+    def test_disagg_prepare_disagg_gen_init_fails_skips(self):
+        """prepare_disagg_gen_init failure skips the request, loop continues."""
         call_count = [0]
 
         def prepare_fn(req):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 
-        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [make_disagg_request(0), make_disagg_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
 
-    def test_disagg_resize_context_fails_skips(self):
-        """resize_context failure skips the request, loop continues."""
-        call_count = [0]
+    def test_disagg_uses_prepare_disagg_gen_init_api(self):
+        """Scheduler routes disagg through prepare_disagg_gen_init (not
+        prepare_context/resize_context).  The single-call API encapsulates
+        the SWA history pre-declaration internally."""
+        called = []
+
+        def prepare_disagg_fn(req):
+            called.append(req.py_request_id)
+            return True
 
         def resize_fn(req, n):
-            call_count[0] += 1
-            return call_count[0] > 1  # first fails, second succeeds
+            raise AssertionError("resize_context must not be called for disagg")
 
-        mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
+        def prepare_ctx_fn(req):
+            raise AssertionError("prepare_context must not be called for disagg")
+
+        mgr = make_kv_cache_manager(
+            prepare_disagg_gen_init_fn=prepare_disagg_fn,
+            prepare_context_fn=prepare_ctx_fn,
+            resize_context_fn=resize_fn,
+        )
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [make_disagg_request(0), make_disagg_request(1)]
-        out = sched.schedule_request(reqs, set())
-        assert ids(out.fitting_disagg_gen_init_requests) == [1]
+        sched.schedule_request(reqs, set())
+        assert called == [0, 1]
 
     def test_disagg_exceeds_max_batch_size(self):
         """Disagg count can exceed max_batch_size since it bypasses budget."""
@@ -1323,7 +1345,7 @@ class TestDisagg:
         assert ids(out.context_requests) == []
 
     def test_disagg_prepare_fail_continues_to_next_disagg(self):
-        """prepare_context failure for one disagg does not stop other disaggs."""
+        """prepare_disagg_gen_init failure for one disagg does not stop other disaggs."""
         call_count = [0]
 
         def selective_prepare(req):
@@ -1331,7 +1353,7 @@ class TestDisagg:
             # Fail for request 0 and 2, succeed for 1 and 3
             return req.request_id in (1, 3)
 
-        mgr = make_kv_cache_manager(prepare_context_fn=selective_prepare)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=selective_prepare)
         sched = make_scheduler(mgr, max_num_tokens=200)
         reqs = [make_disagg_request(i) for i in range(4)]
         out = sched.schedule_request(reqs, set())
@@ -1345,13 +1367,13 @@ class TestDisagg:
                   DISAGG_GENERATION_TRANS_IN_PROGRESS (value=9).
           Iter 2: TRANS_IN_PROGRESS (9) is invisible to both the disagg branch
                   (checks ==8) and state gating ([10,14)), so budget resets to
-                  0. New disagg_gen_init passes budget → prepare_context called
-                  again → IndexMapper would crash in production.
+                  0. New disagg_gen_init passes budget → prepare_disagg_gen_init
+                  called again → IndexMapper would crash in production.
 
-        This test counts prepare_context calls across two iterations. With
-        scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
-        correct implementation should cap total prepare_context calls to 2
-        (the IndexMapper capacity). The bug allows 4.
+        This test counts prepare_disagg_gen_init calls across two iterations.
+        With scheduler_capacity=2 (simulating IndexMapper=3 slots, 1 dummy), a
+        correct implementation should cap total prepare_disagg_gen_init calls to
+        2 (the IndexMapper capacity). The bug allows 4.
         """
         prepare_count = [0]
 
@@ -1359,7 +1381,7 @@ class TestDisagg:
             prepare_count[0] += 1
             return True
 
-        mgr = make_kv_cache_manager(prepare_context_fn=counting_prepare)
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=counting_prepare)
         sched = make_scheduler(mgr, max_num_tokens=200, scheduler_capacity=2)
 
         # Iteration 1: two disagg_gen_init requests
@@ -1381,7 +1403,7 @@ class TestDisagg:
         out2 = sched.schedule_request(all_active, set())
 
         # BUG: budget resets to 0, TRANS_IN_PROGRESS not counted, so
-        # both new disagg pass → prepare_context called 4 times total.
+        # both new disagg pass → prepare_disagg_gen_init called 4 times total.
         # In production, this would crash IndexMapper (only 3 slots = 2+1 dummy).
         assert ids(out2.fitting_disagg_gen_init_requests) == [2, 3]
         assert prepare_count[0] == 4  # <-- proves the overflow
@@ -1434,6 +1456,91 @@ class TestChunkedContext:
         # has_chunking manifests in sorting behavior — non-last chunks before last
         # We verify indirectly: the request should be scheduled
         assert len(out.context_requests) == 1
+
+    def test_force_chunk_uses_expected_snapshot_points(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(0, context_remaining_length=1176)
+        req.expect_snapshot_points = [256, 512, 768, 1024, 1176]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+
+    def test_force_chunk_defaults_to_remaining_context_without_snapshot_points(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(0, context_remaining_length=1176)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 1176
+
+    def test_force_chunk_uses_next_expected_snapshot_point(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(
+            0,
+            context_remaining_length=920,
+            prompt_len=1176,
+            is_first_context_chunk=False,
+            is_last_context_chunk=False,
+        )
+        req.context_current_position = 256
+        req.expect_snapshot_points = [256, 512, 768, 1024, 1176]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 256
+
+    def test_force_chunk_allows_prompt_end_shorter_than_unit_size(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(0, context_remaining_length=150)
+        req.expect_snapshot_points = [150]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 150
+
+    def test_force_chunk_allows_snapshot_point_shorter_than_unit_size(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(
+            0,
+            context_remaining_length=1176,
+            is_last_context_chunk=False,
+        )
+        req.expect_snapshot_points = [150]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 150
 
     def test_multiple_ctx_share_budget(self):
         """Two ctx requests share the budget."""
@@ -1981,6 +2088,44 @@ class TestPrepareBeforeBudget:
         req = make_ctx_request(0, context_remaining_length=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
+
+    def test_prefix_aware_scheduling_disabled_charges_pre_reuse_tokens(self) -> None:
+        """Actual KV resize uses post-reuse length, but scheduler budget uses the pre-reuse length."""
+        resize_calls: list[int] = []
+
+        def prepare_with_reuse(req: Mock) -> bool:
+            req.context_remaining_length = 500
+            return True
+
+        def track_resize(req: Mock, num_tokens: int) -> bool:
+            resize_calls.append(num_tokens)
+            return True
+
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=prepare_with_reuse,
+            resize_context_fn=track_resize,
+        )
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            enable_prefix_aware_scheduling=False,
+        )
+        req = make_ctx_request(0, context_remaining_length=1000)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert resize_calls == [500]
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_with_reuse)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            enable_prefix_aware_scheduling=False,
+        )
+        gen = make_gen_request(1)
+        ctx = make_ctx_request(2, context_remaining_length=1000)
+        out = sched.schedule_request([gen, ctx], set())
+        assert ids(out.generation_requests) == [1]
+        assert ids(out.context_requests) == []
 
 
 # ===========================================================================

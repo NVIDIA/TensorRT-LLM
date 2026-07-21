@@ -312,18 +312,12 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
         offset += cur
 
     # ---- Reconstruction and deserialization ----
-    # Validate the received byte count and unpickle.
     if rank == root:
-        # Root already has `serialized`
-        if len(serialized) != total_size:
-            raise RuntimeError(
-                f"Data size mismatch at root: expected {total_size}, got {len(serialized)}"
-            )
-        try:
-            return pickle.loads(serialized)  # nosec B301
-        except Exception as e:
-            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+        # Root already holds `obj`; rebuilding it from its own serialized bytes
+        # would be a needless deep copy.
+        return obj
     else:
+        # Validate the received byte count and unpickle.
         if len(dst_buf) != total_size:
             raise RuntimeError(
                 f"Data size mismatch at rank {rank}: expected {total_size}, got {len(dst_buf)}"
@@ -1246,7 +1240,28 @@ def init_pp_comm(mapping):
     global _pp_comm
     if mpi_disabled():
         _pp_comm = PPCommTorch(mapping)
+    elif isinstance(_pp_comm, PPCommNCCL) and \
+            _pp_comm.mapping.world_size == mapping.world_size:
+        # Reuse the existing world NCCL communicator across LLM instances that
+        # share the same worker processes (e.g. a reused MpiPoolSession). The
+        # underlying comm depends only on (world_size, rank) -- it is a world
+        # communicator, independent of the pp/tp/ep layout -- so only the
+        # routing mapping needs refreshing. Recreating it would drop the old
+        # comm and trigger a collective ncclCommDestroy at an unsynchronized
+        # point during the next model build, which can deadlock on reused
+        # workers. Single-LLM (production) runs are unaffected: _pp_comm starts
+        # as None, so the first call still constructs a fresh PPCommNCCL.
+        _pp_comm.mapping = mapping
     else:
+        if _pp_comm is not None:
+            # Rebinding drops the old comm; its ncclCommDestroy runs at an
+            # unsynchronized point and can deadlock on reused worker processes
+            # (see the reuse branch above). Surface it instead of hanging
+            # silently -- pools sharing workers must keep one world_size.
+            logger.warning(
+                "init_pp_comm: replacing existing PP comm (world_size "
+                f"{_pp_comm.mapping.world_size} -> {mapping.world_size}) on a "
+                "live process; this can deadlock on reused MPI workers.")
         _pp_comm = PPCommNCCL(mapping)
     init_helix_cp_comm(mapping)
 

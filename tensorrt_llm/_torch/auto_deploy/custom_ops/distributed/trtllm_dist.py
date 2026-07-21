@@ -185,6 +185,9 @@ def trtllm_fused_allreduce_residual_rmsnorm(
         residual=residual,
         norm_weight=norm_weight,
         eps=eps,
+        # PDL early trigger: fire launch-completion before the reduce loop so the
+        # next projection GEMM's weight-load prologue overlaps the AR tail (matches PT).
+        trigger_completion_at_end=False,
     )
     return trtllm_allreduce(
         tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
@@ -223,6 +226,7 @@ def trtllm_fused_allreduce_residual_rmsnorm_quant_nvfp4(
         norm_weight=norm_weight,
         scale=scale,
         eps=eps,
+        trigger_completion_at_end=False,  # PDL early trigger (see RESIDUAL_RMS_NORM above)
     )
     quant_fp4, scale_factor, residual_out = trtllm_allreduce(
         tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
@@ -269,6 +273,7 @@ def trtllm_fused_allreduce_residual_rmsnorm_out_quant_nvfp4(
         norm_weight=norm_weight,
         scale=scale,
         eps=eps,
+        trigger_completion_at_end=False,  # PDL early trigger (see RESIDUAL_RMS_NORM above)
     )
     norm_out, quant_fp4, scale_factor, residual_out = trtllm_allreduce(
         tensor, ReduceOp.SUM, strategy=strategy, all_reduce_params=all_reduce_params
