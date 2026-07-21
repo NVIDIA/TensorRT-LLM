@@ -132,7 +132,7 @@ class HfWeightMapper(BaseWeightMapper):
             # From Yijing: this might be a bug, repeat_interleave does:
             # repeat_interleave([1, 2, 3], 2) -> [1, 1, 2, 2, 3, 3]
             # this is not how we usually slice tensors for tensor parallelism.
-            # This bug is not triggered yet since most of not all LLM attention modules
+            # This bug is not triggered yet since most if not all of LLM attention modules
             # have no bias.
             return weight.repeat_interleave(reps)
 
