@@ -561,9 +561,10 @@
     {
       "allowed_values": [
         "all_reusable",
-        "per_request"
+        "per_request",
+        "per_conversation"
       ],
-      "annotation": "Literal['all_reusable', 'per_request']",
+      "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_policy"
