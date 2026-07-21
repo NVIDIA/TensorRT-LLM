@@ -1568,7 +1568,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             from .utils import append_mla_latent_cache
             append_mla_latent_cache(
                 metadata.kv_cache_manager,
-                self.get_local_layer_idx(metadata),
+                # NOTE: get_buffers / get_batch_cache_indices take the GLOBAL
+                # layer index (they map through layer_offsets internally).
+                # Passing the local offset double-maps and breaks hybrid
+                # models whose KV manager covers a masked layer subset (e.g.
+                # Kimi K3); identical for dense-attention models.
+                self.layer_idx,
                 metadata.request_ids,
                 metadata.seq_lens.tolist(),
                 metadata.kv_cache_params.num_cached_tokens_per_seq,

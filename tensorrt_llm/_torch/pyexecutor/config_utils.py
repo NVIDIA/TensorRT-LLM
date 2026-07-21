@@ -17,7 +17,52 @@ def is_gemma4_hybrid(config):
 
 
 def is_hybrid_linear(config):
-    return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+    return is_nemotron_hybrid(config) or is_qwen3_hybrid(config) or \
+        is_kimi_linear(config)
+
+
+def is_kimi_linear(config):
+    """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
+
+    Handles both the flattened text config (model_type "kimi_linear") and the
+    composite VLM config (model_type "kimi_k3" with a nested text_config).
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type == "kimi_linear":
+        return getattr(config, "linear_attn_config", None) is not None
+    if model_type == "kimi_k3":
+        text_config = getattr(config, "text_config", None)
+        return text_config is not None and is_kimi_linear(text_config)
+    return False
+
+
+def get_kimi_linear_layer_masks(config):
+    """Return (full_attention_layer_mask, kda_layer_mask) for Kimi K3.
+
+    The config's ``linear_attn_config`` carries 1-indexed ``kda_layers`` and
+    ``full_attn_layers`` lists; every decoder layer must be exactly one of
+    the two.
+    """
+    lin = config.linear_attn_config
+    kda_layers = set(lin["kda_layers"])
+    full_attn_layers = set(lin["full_attn_layers"])
+    full_mask, kda_mask = [], []
+    for layer_idx in range(config.num_hidden_layers):
+        is_kda = (layer_idx + 1) in kda_layers
+        is_full = (layer_idx + 1) in full_attn_layers
+        if is_kda == is_full:
+            raise ValueError(
+                f"Kimi K3 layer {layer_idx} (1-indexed {layer_idx + 1}) must "
+                f"be exactly one of KDA / full attention; got is_kda={is_kda} "
+                f"is_full={is_full}")
+        kda_mask.append(is_kda)
+        full_mask.append(is_full)
+    return full_mask, kda_mask
+
+
+def get_kimi_linear_num_attention_layers(config):
+    full_mask, _ = get_kimi_linear_layer_masks(config)
+    return sum(full_mask)
 
 
 def _coerce_torch_dtype(dtype):
@@ -253,6 +298,26 @@ def _qwen3_hybrid_layer_masks(config, layer_mask):
     return new_full_attn, new_mamba
 
 
+def _kimi_linear_layer_masks(config, layer_mask):
+    full_attn, kda = get_kimi_linear_layer_masks(config)
+    if layer_mask is None:
+        return full_attn, kda
+
+    if len(layer_mask) < len(full_attn):
+        raise ValueError(
+            "layer_mask is shorter than the Kimi K3 hybrid layer pattern")
+    base_len = len(full_attn)
+    new_full_attn, new_kda = [], []
+    for i, include in enumerate(layer_mask):
+        if i < base_len:
+            new_full_attn.append(full_attn[i] and include)
+            new_kda.append(kda[i] and include)
+        else:
+            new_full_attn.append(include)
+            new_kda.append(False)
+    return new_full_attn, new_kda
+
+
 def extract_mamba_kv_cache_params(
     config,
     layer_mask: Optional[List[bool]] = None,
@@ -293,6 +358,24 @@ def extract_mamba_kv_cache_params(
         head_dim = config.linear_value_head_dim
         full_attn_mask, mamba_mask = _qwen3_hybrid_layer_masks(
             config, layer_mask)
+    elif is_kimi_linear(config):
+        # Kimi K3 KDA (Kimi Delta Attention) state, mapped onto the Mamba
+        # cache-manager parametrization (see PythonMambaCacheManager):
+        #   conv_dim = head_dim*num_heads + 2*n_groups*state_size
+        #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
+        #   ssm state shape = [num_heads, head_dim, state_size]
+        #            = [H, V, K] fp32 delta-rule recurrent state.
+        # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
+        # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
+        # window of `short_conv_kernel_size` columns.
+        lin = config.linear_attn_config
+        state_size = lin["head_dim"]
+        conv_kernel = lin["short_conv_kernel_size"] + 1
+        num_heads = lin["num_heads"]
+        n_groups = lin["num_heads"]
+        head_dim = lin["head_dim"]
+        full_attn_mask, mamba_mask = _kimi_linear_layer_masks(
+            config, layer_mask)
     else:
         raise ValueError(
             f"{type(config).__name__} is not a supported hybrid Mamba config")
@@ -317,6 +400,15 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
                                  or resolve_hf_torch_dtype(config)
                                  or torch.bfloat16)
+    if is_kimi_linear(config) and mamba_ssm_cache_dtype != torch.float32:
+        # The KDA delta-rule recurrent state must be kept in fp32 for
+        # numerical parity with the HF reference (fla chunk/fused_recurrent
+        # KDA kernels carry the state in fp32).
+        logger.info(
+            f"Kimi K3: overriding mamba_ssm_cache_dtype "
+            f"{mamba_ssm_cache_dtype} -> torch.float32 (KDA recurrent state "
+            "must be fp32)")
+        mamba_ssm_cache_dtype = torch.float32
 
     return MambaKVCacheParams(
         state_size=state_size,
@@ -443,6 +535,36 @@ def load_pretrained_config(model_name_or_path: str,
             model_name_or_path, **kwargs)
         _normalize_qwen35_vl_config(model_config,
                                     inner_arch="Qwen3_5ForCausalLM")
+    elif model_type in ("kimi_k3", "kimi_linear"):
+        # Kimi K3: the checkpoint ships a composite VLM config
+        # (model_type "kimi_k3" with text/vision sub-configs). TRT-LLM runs
+        # the text model only, so flatten to the in-tree KimiLinearConfig
+        # (this also avoids trust_remote_code for the config).
+        import os as _os
+
+        from tensorrt_llm._torch.configs import KimiLinearConfig
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        model_config = KimiLinearConfig.from_dict(text_dict)
+        model_config.architectures = ["KimiLinearForCausalLM"]
+        # Debug knob: truncate the model to the first N layers (the layer
+        # schedule lists are filtered consistently). Used for reduced-GPU
+        # bring-up; extra checkpoint layers are ignored at load time.
+        layers_override = _os.environ.get("KIMI_K3_NUM_LAYERS_OVERRIDE")
+        if layers_override:
+            n = int(layers_override)
+            assert 0 < n <= model_config.num_hidden_layers
+            model_config.num_hidden_layers = n
+            lin = dict(model_config.linear_attn_config)
+            lin["kda_layers"] = [l for l in lin["kda_layers"] if l <= n]
+            lin["full_attn_layers"] = [
+                l for l in lin["full_attn_layers"] if l <= n
+            ]
+            model_config.linear_attn_config = lin
+            logger.warning(
+                f"KIMI_K3_NUM_LAYERS_OVERRIDE={n}: truncating Kimi K3 to the "
+                f"first {n} decoder layers "
+                f"({len(lin['kda_layers'])} KDA / "
+                f"{len(lin['full_attn_layers'])} MLA)")
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
