@@ -59,6 +59,39 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_offsets: torch.Tensor
     beam_idx_arange: torch.Tensor
     beam_gen_lengths: torch.Tensor
+    # --- Candidate-Beams-Array (CBA) state, present only for requests using
+    # exhaustive early_stopping modes (early_stopping != 1); see
+    # beam_search_sampling_batch_cba.
+    end_ids: Optional[torch.Tensor] = None
+    """[max_num_sequences] int32, per-slot end token id (< 0: no end token)."""
+    stop_past_tokens: Optional[torch.Tensor] = None
+    """[max_stop_word_length, max_num_sequences, max_beam_width] int32, the
+    finish handler's rolling stop-word window (FinishReasonsHandler store).
+    The CBA path reorders its beam axis by the step's predecessor beams so
+    the handler's stop-word matching stays correct across beam swaps. When
+    None (tests without stop words), the reorder is skipped — multi-token
+    stop-word matching would then be unreliable across beam swaps."""
+    prompt_lens: Optional[torch.Tensor] = None
+    """[max_num_sequences] int32, per-slot prompt length."""
+    original_tokens: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width, max_seq_len] int32, uncorrected
+    per-slot tokens (see BeamSearchStore.original_tokens); read together with
+    ``cache_indirection`` to snapshot finished paths into the CBA."""
+    cba_tokens: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width, max_seq_len] int32, finished-beam
+    path snapshots (generated tokens, BEAM_SEARCH_PAD_TOKEN padded)."""
+    cba_cum_log_probs: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width] float32, raw cumulative log-probs."""
+    cba_normed_scores: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width] float32, length-normalized scores
+    (-inf: empty entry)."""
+    cba_lengths: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width] int32, generated lengths."""
+    batch_dones: Optional[torch.Tensor] = None
+    """[max_num_sequences] bool, per-slot beam-search termination verdict."""
+    max_seq_len: int = 0
+    """Maximum sequence length (prompt + generated), used by the
+    best-attainable-score bound of the "never" early-stopping modes."""
 
 
 def top_k_top_p_sampling_batch(
@@ -397,6 +430,282 @@ def beam_search_sampling_batch(
         :, :beam_width_out
     ]
     return next_tokens, softmax
+
+
+def beam_search_sampling_batch_cba(
+    logits: torch.Tensor,
+    *,
+    beam_width_in: int,
+    beam_width_out: int,
+    beam_search_args: BeamSearchMetadata,
+    temperature: float | None,
+    early_stopping: int,
+    length_penalty: "torch.Tensor | float | None" = None,
+    diversity_rate: "torch.Tensor | float | None" = None,
+    topk_fn: Optional[TopkFn] = None,
+    return_probs: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Beam-search step with a candidate-beams array (CBA) for the exhaustive
+    early_stopping modes (``early_stopping != 1``), mirroring the C++
+    ``beamSearchKernels`` workflow:
+
+    - The top ``2 * beam_width`` expansion candidates (ranked by raw
+      cumulative log-prob, plus the optional diversity adjustment — the
+      length penalty does NOT enter candidate ranking, matching the C++
+      kernel) are split by end-token: end-token candidates ranked within the
+      top ``beam_width`` are inserted into the CBA, which keeps the best
+      ``beam_width`` finished paths seen so far by length-normalized score
+      (path snapshots are taken eagerly since the work tree is rewritten by
+      later steps). All beam slots then continue with the best non-end
+      candidates, so exploration never narrows.
+    - Stop words (any length) follow the C++ stop-criteria split: the finish
+      handler detects them after the step and latches a per-beam finish
+      reason; at the START of the next step this op harvests the latched
+      beams into the CBA (their paths are complete, including the stop word)
+      and masks their rows so the freed slots refill with active candidates —
+      the torch equivalent of the C++ kernel coercing a finished beam into a
+      top-ranked end-token candidate.
+    - A request is done when the CBA is full and the best active candidate's
+      attainable normalized score cannot beat the worst CBA entry.
+      ``early_stopping == 0`` bounds attainability with the current length;
+      any other value bounds it with ``max_seq_len`` when
+      ``length_penalty > 0`` (HF's "never"), following the C++ kernel. The
+      verdict is published by marking every beam slot finished, which drives
+      the regular stop machinery.
+
+    Requires the CBA fields of ``BeamSearchMetadata`` to be set.
+    """
+    args = beam_search_args
+    assert (
+        args.end_ids is not None
+        and args.prompt_lens is not None
+        and args.original_tokens is not None
+        and args.cba_tokens is not None
+        and args.cba_cum_log_probs is not None
+        and args.cba_normed_scores is not None
+        and args.cba_lengths is not None
+        and args.batch_dones is not None
+    ), "CBA metadata is required for early_stopping != 1"
+    assert logits.dim() == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
+    batch_size, vocab_size = logits.size()
+    batch_size = batch_size // beam_width_in
+    num_beams = beam_width_out
+    device = logits.device
+    slots = args.seq_slots
+
+    logits = logits.view(batch_size, beam_width_in, vocab_size)
+    if temperature is not None and temperature != 0:
+        logits = logits / max(temperature, 1e-5)
+    softmax: Optional[torch.Tensor] = None
+    if return_probs:
+        softmax = torch.softmax(logits, dim=-1)
+    _update_cache_indirection_buffer(args.cache_indirection_buffer, args.cache_indirection, slots)
+    assert batch_size == slots.size(0)
+
+    logprobs = torch.log_softmax(logits, dim=-1)
+    # Beams latched finished by the finish handler after the previous step
+    # are harvested into the CBA below; mask their rows so the freed slots
+    # refill with active candidates from the other beams. Only STOP_WORDS
+    # latches can reach this point: LENGTH fires on all beams at once (their
+    # lengths are uniform here) and the END_ID flood below is all-beams too —
+    # either way the request stops that same step, so there is no next step
+    # to harvest them (finalize handles those paths instead).
+    harvest_mask = args.finished_beams[slots, :beam_width_in] != FinishReason.NOT_FINISHED.value
+    logprobs = logprobs.masked_fill(harvest_mask.unsqueeze(-1), float("-inf"))
+    logprobs += args.cum_log_probs.unsqueeze(-1)[slots, :beam_width_in]
+
+    # --- Top 2K candidates by raw score (+ diversity), two-stage. Each
+    # source beam contributes at most one end-token candidate (single end
+    # id), so the 2K candidates always contain at least K non-end ones for
+    # the beam slots (harvested beams' rows are all -inf and count as
+    # active fillers via the isfinite guard below).
+    topk_fn = topk_fn or _torch_topk
+    stage1_k = min(2 * num_beams, vocab_size)
+    # The global top-k cannot exceed the pooled stage-1 candidates (relevant
+    # only for tiny test vocabularies).
+    num_candidates = min(2 * num_beams, beam_width_in * stage1_k)
+    per_beam_vals, per_beam_tokens = topk_fn(
+        logprobs.view(batch_size * beam_width_in, vocab_size), stage1_k
+    )
+    per_beam_vals = per_beam_vals.view(batch_size, beam_width_in, stage1_k)
+    per_beam_tokens = per_beam_tokens.view(batch_size, beam_width_in, stage1_k)
+    keys = per_beam_vals
+    if not isinstance(diversity_rate, torch.Tensor) and not diversity_rate:
+        diversity_rate = None
+    if diversity_rate is not None:
+        rate = (
+            diversity_rate.view(-1, 1, 1)
+            if isinstance(diversity_rate, torch.Tensor)
+            else diversity_rate
+        )
+        keys = keys + rate * args.beam_idx_arange[:beam_width_in].view(1, -1, 1)
+    _, selected = torch.topk(keys.view(batch_size, -1), k=num_candidates, sorted=True, dim=-1)
+    cand_cum = per_beam_vals.view(batch_size, -1).gather(1, selected)
+    cand_pred = (selected // stage1_k).to(torch.int32)
+    cand_tok = per_beam_tokens.view(batch_size, -1).gather(1, selected).to(torch.int32)
+
+    end_ids = args.end_ids[slots].view(-1, 1)
+    # -inf candidates (from harvested rows) must count as slot fillers, not
+    # end candidates, to preserve the >= K actives invariant even when every
+    # beam was harvested at once.
+    is_end = (cand_tok == end_ids) & torch.isfinite(cand_cum)
+    cand_rank = torch.arange(num_candidates, device=device).view(1, -1)
+
+    # --- Beam slots continue with the first K non-end candidates (>= K of
+    # them exist among the 2K selected: at most one finite end-token
+    # candidate per source beam).
+    active_mask = ~is_end
+    active_pos = torch.cumsum(active_mask.to(torch.int32), dim=1) - 1
+    take = active_mask & (active_pos < num_beams)
+    # masked_select flattens row-major and every row contributes exactly K
+    # entries, so the reshape below is exact.
+    slot_pred = cand_pred[take].view(batch_size, num_beams)
+    slot_tok = cand_tok[take].view(batch_size, num_beams)
+    slot_cum = cand_cum[take].view(batch_size, num_beams)
+
+    # --- CBA insertion: merge end-token candidates (rank < K) with the
+    # existing entries and keep the best K by normalized score. This is
+    # equivalent to the C++ replace-min loop (which maintains the best K
+    # finished paths seen so far).
+    if not isinstance(length_penalty, torch.Tensor) and not length_penalty:
+        length_penalty = None
+    gen_lens = (args.seq_lens - args.prompt_lens[slots]).view(-1, 1)  # current generated count
+    cand_len = gen_lens + 1  # finished candidates include the end token
+    if length_penalty is not None:
+        exponent = (
+            length_penalty.view(-1, 1)
+            if isinstance(length_penalty, torch.Tensor)
+            else length_penalty
+        )
+        new_normed = cand_cum / cand_len.to(cand_cum.dtype).pow(exponent)
+    else:
+        new_normed = cand_cum
+    neg_inf = float("-inf")
+    eligible = is_end & (cand_rank < num_beams)
+    new_normed = new_normed.masked_fill(~eligible, neg_inf)
+
+    # Snapshot candidate paths (generated tokens) through the cache
+    # indirection; the work tree is rewritten by later steps, so this must
+    # happen at insertion time. Shapes: [batch, num_candidates, snap_len].
+    snap_len = args.cba_tokens.size(-1)
+    max_prompt_plus = args.cache_indirection.size(-1)
+    step_idx = args.prompt_lens[slots].view(-1, 1) + torch.arange(snap_len, device=device).view(
+        1, -1
+    )
+    step_idx_c = step_idx.clamp(max=max_prompt_plus - 1)
+    ind = args.cache_indirection[slots, :beam_width_in]  # [bs, bw_in, attn]
+    ind_at = torch.gather(
+        ind, 2, step_idx_c.unsqueeze(1).expand(-1, beam_width_in, -1).long()
+    )  # source beam per (beam, step)
+    orig = args.original_tokens[slots, :beam_width_in]
+    tok_at = torch.gather(orig, 2, step_idx_c.unsqueeze(1).expand(-1, beam_width_in, -1).long())
+    parent_exp = cand_pred.long().unsqueeze(-1).expand(-1, -1, snap_len)
+    # Indirection entries beyond the current length are uninitialized; the
+    # resulting lanes are masked below, but the intermediate gather index must
+    # be clamped in-bounds first.
+    src_beam = torch.gather(ind_at.long(), 1, parent_exp).clamp_(0, beam_width_in - 1)
+    new_paths = torch.gather(tok_at, 1, src_beam)  # [bs, 2K, snap_len]
+    t_valid = torch.arange(snap_len, device=device).view(1, 1, -1) < gen_lens.view(-1, 1, 1)
+    new_paths = new_paths.masked_fill(~t_valid, BEAM_SEARCH_PAD_TOKEN)
+    end_pos = gen_lens.view(-1, 1, 1).expand(-1, num_candidates, 1).clamp(max=snap_len - 1).long()
+    new_paths.scatter_(2, end_pos, cand_tok.unsqueeze(-1).to(new_paths.dtype))
+
+    # Harvested beams (stop-word finishes latched after the previous step):
+    # their recorded tokens already include the terminating stop word, so the
+    # snapshot is the beam's own path (parent = itself) at the current length.
+    # (same OOB caveat as src_beam above: clamp uninitialized indirection)
+    harvest_paths = torch.gather(tok_at, 1, ind_at.long().clamp(0, beam_width_in - 1))
+    harvest_paths = harvest_paths.masked_fill(~t_valid, BEAM_SEARCH_PAD_TOKEN)
+    harvest_cum = args.cum_log_probs[slots, :beam_width_in]
+    if length_penalty is not None:
+        harvest_normed = harvest_cum / gen_lens.to(harvest_cum.dtype).pow(exponent)
+    else:
+        harvest_normed = harvest_cum
+    harvest_normed = harvest_normed.masked_fill(~harvest_mask, neg_inf)
+
+    all_normed = torch.cat([args.cba_normed_scores[slots], new_normed, harvest_normed], dim=1)
+    top_normed, top_i = torch.topk(all_normed, k=num_beams, sorted=True, dim=-1)
+    all_cum = torch.cat([args.cba_cum_log_probs[slots], cand_cum, harvest_cum], dim=1)
+    all_len = torch.cat(
+        [
+            args.cba_lengths[slots],
+            cand_len.expand(-1, num_candidates),
+            gen_lens.expand(-1, beam_width_in),
+        ],
+        dim=1,
+    )
+    all_tokens = torch.cat([args.cba_tokens[slots], new_paths, harvest_paths], dim=1)
+    merged_cum = all_cum.gather(1, top_i)
+    merged_len = all_len.gather(1, top_i)
+    merged_tokens = all_tokens.gather(1, top_i.unsqueeze(-1).expand(-1, -1, snap_len))
+    args.cba_normed_scores[slots] = top_normed
+    args.cba_cum_log_probs[slots] = merged_cum
+    args.cba_lengths[slots] = merged_len
+    args.cba_tokens[slots] = merged_tokens
+
+    # --- Done verdict (C++ batchDones): CBA full, and the best candidate's
+    # attainable normalized score cannot beat the worst kept entry.
+    cba_full = top_normed[:, num_beams - 1] > neg_inf
+    best_cum = cand_cum[:, 0]
+    if length_penalty is not None:
+        if early_stopping != 0:
+            # HF "never": bound with the maximum attainable length. The C++
+            # kernel applies this only for length_penalty > 0; non-positive
+            # penalties make longer sequences unattractive, so the current
+            # length is the correct bound there as well.
+            lp_pos = length_penalty > 0
+            max_gen = (args.max_seq_len - args.prompt_lens[slots]).view(-1)
+            bound_len = torch.where(
+                torch.as_tensor(lp_pos, device=device).expand(batch_size),
+                max_gen,
+                cand_len.view(-1),
+            )
+        else:
+            bound_len = cand_len.view(-1)
+        best_attainable = best_cum / bound_len.to(best_cum.dtype).pow(length_penalty)
+    else:
+        best_attainable = best_cum
+    done = cba_full & (top_normed[:, num_beams - 1] >= best_attainable)
+    args.batch_dones[slots] = done
+    # Publish through the regular stop machinery: a done request has all its
+    # beam slots marked finished (the slots themselves only ever carry active
+    # beams in CBA mode, so this cannot clash with a real end-token finish).
+    # NOT_FINISHED == 0, so the verdict maps directly onto the finish reason.
+    args.finished_beams[slots, :num_beams] = (
+        done.view(-1, 1).to(torch.int32) * FinishReason.END_ID.value
+    ).expand(-1, num_beams)
+
+    # --- Beam-slot state updates (same contract as beam_search_sampling_batch).
+    args.predecessor_beams[slots, :num_beams] = slot_pred
+    if args.stop_past_tokens is not None:
+        # Reorder the finish handler's rolling stop-word window to follow the
+        # beam swap, so multi-token stop-word matching (which appends this
+        # step's tokens to the window after this op) compares against the
+        # correct per-beam history.
+        window = args.stop_past_tokens[:, slots, :beam_width_in]
+        args.stop_past_tokens[:, slots, :num_beams] = torch.gather(
+            window,
+            2,
+            slot_pred.long().unsqueeze(0).expand(window.size(0), -1, -1),
+        )
+    cache_indirection = args.cache_indirection[slots, :num_beams]
+    cache_indirection_buffer = args.cache_indirection_buffer[slots, :beam_width_in]
+    torch.gather(
+        cache_indirection_buffer,
+        dim=1,
+        index=slot_pred.unsqueeze(2).expand(-1, -1, cache_indirection.size(2)),
+        out=cache_indirection,
+    )
+    index = args.seq_lens.view(-1, 1, 1).expand(-1, num_beams, 1)
+    src = args.beam_idx_arange[:num_beams].view(1, num_beams, 1).expand(batch_size, num_beams, 1)
+    cache_indirection.scatter_(2, index, src)
+    args.cache_indirection[slots, :num_beams] = cache_indirection
+
+    old_cum_log_probs = args.cum_log_probs[slots].view(-1)
+    offset_pred = slot_pred + args.seq_offsets[: slot_pred.size(0)].unsqueeze(1)
+    args.new_log_probs[slots, :num_beams] = slot_cum - old_cum_log_probs[offset_pred]
+    args.cum_log_probs[slots, :num_beams] = slot_cum
+    return slot_tok, softmax
 
 
 def get_rejected_indices(

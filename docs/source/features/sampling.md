@@ -154,9 +154,10 @@ Parameter Configuration:
   descend from the single strongest beam. The default (`0.0`) disables the adjustment.
 - `early_stopping`: Controls when beam search stops. With the default (`1`), generation ends as
   soon as `best_of` finished candidates exist. The exhaustive modes (`0`, and other values for
-  intermediate heuristics) keep searching while an unfinished beam could still outscore the
-  finished candidates; these modes are only supported by the C++ `TRTLLMSampler` — the default
-  `TorchSampler` rejects them.
+  intermediate heuristics) keep a pool of finished candidates and continue searching while an
+  unfinished beam could still outscore the worst of them (`0` bounds attainability with the
+  current length; other values with the maximum length when `length_penalty > 0`). With the
+  default `TorchSampler`, the exhaustive modes do not support `logprobs` yet.
 
 The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:
 

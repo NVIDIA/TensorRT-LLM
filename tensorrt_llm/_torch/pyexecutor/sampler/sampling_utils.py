@@ -45,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     Fusions,
     StrategyMetadata,
     beam_search_sampling_batch,
+    beam_search_sampling_batch_cba,
     get_rejected_indices,
     greedy_search_sampling_batch,
     sample_rejected,
@@ -62,6 +63,7 @@ __all__ = [
     "Fusions",
     "StrategyMetadata",
     "beam_search_sampling_batch",
+    "beam_search_sampling_batch_cba",
     "get_rejected_indices",
     "greedy_search_sampling_batch",
     "sample_rejected",
@@ -86,7 +88,7 @@ TopK: TypeAlias = tuple[Literal["top_k"], int, float]
 TopP: TypeAlias = tuple[Literal["top_p"], float, float]
 TopKTopP: TypeAlias = tuple[Literal["top_k_top_p"], int, float, float]
 Greedy: TypeAlias = tuple[Literal["greedy"], None]
-BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, int, float, float, float]
+BeamSearch: TypeAlias = tuple[Literal["beam_search"], int, int, float, float, float, int]
 GREEDY: Greedy = ("greedy", None)
 
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
@@ -114,6 +116,9 @@ class UtilsSamplingParams:
             normalized as cum_log_prob / length**length_penalty. 0 disables.
         beam_search_diversity_rate: Beam-search diversity adjustment; adds
             rate * source_beam_index to the candidate ranking score. 0 disables.
+        early_stopping: Beam-search stopping mode: 1 stops as soon as
+            beam_width finished candidates exist (default); 0 and other values
+            are the exhaustive modes backed by the candidate-beams array.
     """
 
     temperature: Optional[float]
@@ -127,6 +132,7 @@ class UtilsSamplingParams:
     top_p_reset_ids: Optional[int] = None
     length_penalty: Optional[float] = None
     beam_search_diversity_rate: Optional[float] = None
+    early_stopping: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -194,6 +200,7 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
             temperature,
             params.length_penalty or 0.0,
             params.beam_search_diversity_rate or 0.0,
+            1 if params.early_stopping is None else params.early_stopping,
         )
 
     # NB: not greedy, hence top_p != 0 if specified
@@ -268,20 +275,34 @@ def sample(
             temperature,
             length_penalty,
             beam_search_diversity_rate,
+            early_stopping,
         ):
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata), (
                 "BeamSearchMetadata is required for beam_search_sampling_batch"
             )
-            tokens, softmax = beam_search_sampling_batch(
-                logits,
-                beam_width_in=cast(int, beam_width_in),
-                beam_width_out=cast(int, beam_width_out),
-                beam_search_args=group_metadata,
-                temperature=cast(float, temperature),
-                length_penalty=cast(float, length_penalty),
-                diversity_rate=cast(float, beam_search_diversity_rate),
-                return_probs=return_probs,
-            )
+            if cast(int, early_stopping) != 1:
+                tokens, softmax = beam_search_sampling_batch_cba(
+                    logits,
+                    beam_width_in=cast(int, beam_width_in),
+                    beam_width_out=cast(int, beam_width_out),
+                    beam_search_args=group_metadata,
+                    temperature=cast(float, temperature),
+                    early_stopping=cast(int, early_stopping),
+                    length_penalty=cast(float, length_penalty),
+                    diversity_rate=cast(float, beam_search_diversity_rate),
+                    return_probs=return_probs,
+                )
+            else:
+                tokens, softmax = beam_search_sampling_batch(
+                    logits,
+                    beam_width_in=cast(int, beam_width_in),
+                    beam_width_out=cast(int, beam_width_out),
+                    beam_search_args=group_metadata,
+                    temperature=cast(float, temperature),
+                    length_penalty=cast(float, length_penalty),
+                    diversity_rate=cast(float, beam_search_diversity_rate),
+                    return_probs=return_probs,
+                )
     return tokens, softmax, cast(float, temperature)
 
 
@@ -774,12 +795,14 @@ class _StrategyImpls:
             temperature: torch.Tensor,
             length_penalty: Optional[torch.Tensor],
             diversity_rate: Optional[torch.Tensor],
+            early_stopping: int,
         ):
             self._beam_width_in = beam_width_in
             self._beam_width_out = beam_width_out
             self._temperature = temperature
             self._length_penalty = length_penalty
             self._diversity_rate = diversity_rate
+            self._early_stopping = early_stopping
 
         @override
         @classmethod
@@ -801,7 +824,16 @@ class _StrategyImpls:
             diversity_rate: Optional[torch.Tensor] = None
             if any(dr != 0.0 for dr in diversity_rates):
                 diversity_rate = cls._make_tensor(diversity_rates, torch.float32, cuda_device)
-            return cls(beam_width_in, beam_width_out, temperature, length_penalty, diversity_rate)
+            # early_stopping is part of the grouping key, hence unique per group.
+            (early_stopping,) = set(strat[6] for strat in narrowed_strats)
+            return cls(
+                beam_width_in,
+                beam_width_out,
+                temperature,
+                length_penalty,
+                diversity_rate,
+                early_stopping,
+            )
 
         @override
         def sample(
@@ -815,6 +847,19 @@ class _StrategyImpls:
             assert group_metadata is not None and isinstance(group_metadata, BeamSearchMetadata)
             temperature = self._temperature.repeat_interleave(self._beam_width_in)
             logits = self._prepare_logits_with_temperature(logits, group_logit_indices, temperature)
+            if self._early_stopping != 1:
+                return beam_search_sampling_batch_cba(
+                    logits,
+                    beam_width_in=self._beam_width_in,
+                    beam_width_out=self._beam_width_out,
+                    beam_search_args=group_metadata,
+                    temperature=None,
+                    early_stopping=self._early_stopping,
+                    length_penalty=self._length_penalty,
+                    diversity_rate=self._diversity_rate,
+                    topk_fn=flashinfer.topk_op,
+                    return_probs=self.computes_probs(),
+                )
             return beam_search_sampling_batch(
                 logits,
                 beam_width_in=self._beam_width_in,
@@ -843,7 +888,7 @@ _STRATEGY_KEY_TYPE: TypeAlias = (
     | Literal["top_p"]
     | Literal["top_k_top_p"]
     | Literal["greedy"]
-    | tuple[Literal["beam_search"], int, int]
+    | tuple[Literal["beam_search"], int, int, int]
 )
 
 
@@ -863,8 +908,11 @@ class FlashInferGroupedStrategySampler:
                 | ("greedy", None)
             ):
                 return cast(_STRATEGY_KEY_TYPE, strategy[0])
-            case ("beam_search", beam_width_in, beam_width_out, _, _, _):
-                return cast(_STRATEGY_KEY_TYPE, (strategy[0], beam_width_in, beam_width_out))
+            case ("beam_search", beam_width_in, beam_width_out, _, _, _, early_stopping):
+                return cast(
+                    _STRATEGY_KEY_TYPE,
+                    (strategy[0], beam_width_in, beam_width_out, early_stopping),
+                )
             case _:
                 raise NotImplementedError("Unsupported strategy encountered")
 
@@ -873,7 +921,7 @@ class FlashInferGroupedStrategySampler:
         strategy_key: _STRATEGY_KEY_TYPE,
     ) -> Type[StrategyMetadata] | None:
         match strategy_key:
-            case ("beam_search", _, _):
+            case ("beam_search", _, _, _):
                 return BeamSearchMetadata
             case "top_p" | "top_k_top_p":
                 return TopPDecayMetadata
@@ -912,7 +960,7 @@ class FlashInferGroupedStrategySampler:
                     strategy_impl_cls = _StrategyImpls.TemperatureOnlyWithProbs
                 case "greedy":
                     strategy_impl_cls = _StrategyImpls.GreedyWithProbs
-                case ("beam_search", beam_width_in_key, _):
+                case ("beam_search", beam_width_in_key, _, _):
                     beam_width_in = beam_width_in_key
                     strategy_impl_cls = _StrategyImpls.BeamSearchWithProbs
                 case _:
@@ -929,7 +977,7 @@ class FlashInferGroupedStrategySampler:
                     strategy_impl_cls = _StrategyImpls.TemperatureOnlySampleOnly
                 case "greedy":
                     strategy_impl_cls = _StrategyImpls.GreedySampleOnly
-                case ("beam_search", beam_width_in_key, _):
+                case ("beam_search", beam_width_in_key, _, _):
                     beam_width_in = beam_width_in_key
                     strategy_impl_cls = _StrategyImpls.BeamSearchSampleOnly
                 case _:
