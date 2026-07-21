@@ -993,6 +993,7 @@ private:
     float* permuted_token_final_scales_{};
 
     int64_t* expert_first_token_offset_{};
+    int64_t* gemm_expert_first_token_offset_{};
 
     void* glu_inter_result_{};
     void* fc2_result_{};

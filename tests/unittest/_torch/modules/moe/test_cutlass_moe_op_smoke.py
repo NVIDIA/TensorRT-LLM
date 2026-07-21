@@ -178,3 +178,54 @@ def test_cutlass_moe_op_run_moe_no_lora_matches_fused_moe_op():
     )[0]
 
     torch.testing.assert_close(out, ref, rtol=5e-2, atol=1e-2)
+
+
+@requires_cuda_and_op
+def test_cutlass_fp8_block_scale_ep_rank_with_no_tokens_returns_zeros():
+    """An EP rank with no selected local experts must not enter block-scale GEMM empty."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_tokens, hidden_size, inter_size = 8, 128, 128
+    local_experts, top_k = 32, 8
+    ep_size, ep_rank = 8, 7
+
+    torch.manual_seed(2)
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    w3_w1_weight = torch.randn(
+        local_experts, 2 * inter_size, hidden_size, dtype=dtype, device=device
+    ).to(torch.float8_e4m3fn)
+    w2_weight = torch.randn(local_experts, hidden_size, inter_size, dtype=dtype, device=device).to(
+        torch.float8_e4m3fn
+    )
+    fc1_scales = torch.ones(local_experts, 2 * inter_size // 128, hidden_size // 128, device=device)
+    fc2_scales = torch.ones(local_experts, hidden_size // 128, inter_size // 128, device=device)
+
+    # Rank 7 owns global experts [224, 256); route every token to [0, 8).
+    topk_ids = (
+        torch.arange(top_k, dtype=torch.int32, device=device).expand(num_tokens, -1).contiguous()
+    )
+    topk_scores = torch.full((num_tokens, top_k), 1.0 / top_k, dtype=torch.float32, device=device)
+
+    def run_moe(ep_size: int, ep_rank: int):
+        return torch.ops.trtllm.fused_moe(
+            input=x,
+            token_selected_experts=topk_ids,
+            token_final_scales=topk_scores,
+            fc1_expert_weights=w3_w1_weight,
+            fc1_expert_biases=None,
+            fc2_expert_weights=w2_weight,
+            fc2_expert_biases=None,
+            output_dtype=dtype,
+            quant_scales=[fc1_scales, fc2_scales],
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            use_deepseek_fp8_block_scale=True,
+            tune_max_num_tokens=num_tokens,
+        )[0]
+
+    # Copying the offsets for GEMM must preserve a rank with local work.
+    torch.testing.assert_close(run_moe(ep_size=8, ep_rank=0), run_moe(ep_size=1, ep_rank=0))
+
+    for _ in range(3):
+        out = run_moe(ep_size=ep_size, ep_rank=ep_rank)
+        torch.testing.assert_close(out, torch.zeros_like(out))
