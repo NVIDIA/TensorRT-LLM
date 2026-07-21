@@ -14,11 +14,9 @@
 # limitations under the License.
 r"""Audit a CBTS touch DB (`cbts_touchmap.sqlite`) — format, scale, and coverage completeness.
 
-Standalone: pull the sqlite locally and run this to see whether the data is
-trustworthy before relying on it for selection. Reports the format (stage
-prefix, schema_version, collection commit), scale, per-stage known counts, the
-per-test footprint distribution, and the tests whose capture looks incomplete
-(same heuristic the selector uses, so the "untrusted" set matches).
+Reports the format (stage prefix, schema_version, collection commit), scale,
+per-stage known counts, the per-test footprint distribution, and the tests
+whose capture looks incomplete (the same heuristic the selector uses).
 
 Example::
 
@@ -81,10 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     db = TouchDB.open(args.db)
     known = db.known_tests()
     stages = db.known_by_stage()
-    footprint = {
-        row[0]: row[1]
-        for row in db._conn.execute("SELECT test, COUNT(*) FROM touch WHERE test!='' GROUP BY test")
-    }
+    footprint = db.per_test_footprint()
 
     print(f"=== CBTS coverage DB audit: {args.db} ===\n")
 
@@ -122,20 +117,22 @@ def main(argv: list[str] | None = None) -> int:
     untrusted = db.untrusted_tests(
         _WORKER_SENTINEL, _LAUNCH_MARKERS, _SERVING_PATH_MARKERS, args.min_funcs
     )
-    worker = db.tests_touching_file(_WORKER_SENTINEL)
 
     def reason(test: str) -> str:
         if any(m in test for m in _SERVING_PATH_MARKERS):
             return "disagg-path (servers uninstrumented)"
-        if test not in worker:
-            return "worker-lost (drove inference, no py_executor)"
-        return f"near-empty (<{args.min_funcs} funcs)"
+        if footprint[test] < args.min_funcs:
+            return f"near-empty (<{args.min_funcs} funcs)"
+        return "worker-lost (drove inference, no py_executor)"
 
     print("\n## Coverage completeness")
-    print(
-        f"  per-test footprint (functions entered): min={min(footprint.values())} "
-        f"max={max(footprint.values())}  (few funcs => likely lost subprocess capture)"
-    )
+    if footprint:
+        print(
+            f"  per-test footprint (functions entered): min={min(footprint.values())} "
+            f"max={max(footprint.values())}  (few funcs => likely lost subprocess capture)"
+        )
+    else:
+        print("  per-test footprint: none (no test != '' rows — no usable per-test coverage)")
     trusted_fp = [footprint[t] for t in known if t not in untrusted]
     untrusted_fp = [footprint[t] for t in untrusted]
     if trusted_fp and untrusted_fp:
@@ -163,11 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         for t in sorted(untrusted):
             print(f"  [{footprint[t]:>5} funcs] {t}\n      -> {reason(t)}")
 
-    # -- HEAD coverage gap on instrumented stages --
-    # Cases that render on a stage the DB *does* cover, yet have no DB row (a new/
-    # renamed test, or one the producer never captured) -> the selector can never
-    # skip them. Cases only on non-instrumented stages (disagg, multi-GPU) are
-    # excluded: coverage never narrows those, so their absence is expected.
+    # -- HEAD coverage gap: cases on an instrumented stage with no DB row --
     if args.test_db and Path(args.test_db).is_dir() and Path(args.groovy).is_file():
         yaml_index = YAMLIndex.load(Path(args.test_db))
         all_stages = parse_stages_from_groovy(Path(args.groovy), include_post_merge=True)

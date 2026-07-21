@@ -774,10 +774,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Coverage audit-first (shadow): download the latest merged touch DB and
-        // log its health + this HEAD's coverage gap. Diagnostic only — the
-        // decision below does NOT consume it (coverage selection stays off until
-        // the enforce step lands); the same download will feed selection then.
+        // Shadow audit: download the latest merged touch DB and log its health + HEAD coverage gap (diagnostic only).
         _cbtsCoverageAudit(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
@@ -848,16 +845,13 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Download the latest merged touch DB and run coverage_audit.py on it, logging
-// the DB's health + this HEAD's coverage gap. Best-effort and side-effect free:
-// it never changes the CBTS decision. Uses the same Artifactory artifact the
-// enforce step will later feed to the selector, so this validates the data path.
+// Download the latest merged touch DB and run coverage_audit.py on it; best-effort, never changes the CBTS decision.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
         def covDir = "${LLM_ROOT}/cbts_cov"
         def url = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url",
+            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url || true",
             returnStdout: true,
         ).trim()
         if (!url) {
@@ -865,7 +859,7 @@ def _cbtsCoverageAudit(pipeline)
             return
         }
         sh "mkdir -p ${covDir}"
-        // wget via the CI's proven retrying path (large artifact); extract the sqlite.
+        // wget the tarball (retrying) and extract the sqlite.
         trtllm_utils.llmExecStepWithRetry(pipeline, script:
             "wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
             "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")

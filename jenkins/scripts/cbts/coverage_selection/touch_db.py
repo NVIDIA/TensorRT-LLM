@@ -13,8 +13,7 @@
 # limitations under the License.
 """Read-only accessor for the merged CBTS touch DB (`cbts_touchmap.sqlite`).
 
-Implements the TOUCH_DB_CONTRACT.md queries, plus the two real-data details
-the contract text predates:
+Implements the TOUCH_DB_CONTRACT.md queries. Two real-data details:
   - the `test` column is `<stage>/<nodeid>` (stage-prefixed);
   - unit tests are recorded wrapped as
     `test_unittests.py::test_unittests_v2[<inner>]`, while test-db YAML lists
@@ -30,29 +29,13 @@ from typing import Optional
 
 from blocks import normalize_test_id
 
-# §3 producer canon(): keep the tail from the first `tensorrt_llm/` segment.
+# Canonicalize an absolute co_filename to the DB `file` form (`tensorrt_llm/...`).
 _CANON_RE = re.compile(r"(tensorrt_llm/.*)$")
 
 # A DB test value is `<stage>/<nodeid>`; unit tests wrap the inner entry.
 _UNITTEST_WRAP_RE = re.compile(r"::test_unittests_v2\[(?P<inner>.+)\]$")
 
-# Coverage-completeness heuristic (interim, until the producer emits a per-test
-# completeness/outcome signal). A test whose worker/server subprocess coverage
-# was lost looks "clean but empty"; skipping it for an executor change would be
-# an escape. `untrusted_tests()` uses these to force such tests to always run.
-# They live here (not in the selector) so the audit tool and the selector share
-# one source of truth for what "untrusted" means.
-#
-# A test that drove model execution but is missing the executor worker
-# (`_WORKER_SENTINEL`) had its worker/server subprocess capture lost. Two ways
-# to identify "drove execution", both footprint-independent:
-#   - `_LAUNCH_MARKERS` `(file, qualname_substring)`: a call-based signal — the
-#     LLM-API path enters `LLM.generate` / `GenerationExecutor.generate`.
-#   - `_SERVING_PATH_MARKERS` nodeid substrings: for disagg, whose coordinator
-#     runs no disagg-specific product code (only generic param validators — no
-#     clean call marker exists) and whose ctx/gen servers run in uninstrumented
-#     trtllm-serve subprocesses; identify it by nodeid path instead.
-# `_MIN_FUNCS` is a last-resort catch-all for any other near-empty capture.
+# Completeness-heuristic constants consumed by `untrusted_tests()`.
 _WORKER_SENTINEL = "tensorrt_llm/_torch/pyexecutor/py_executor.py"
 _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
     ("tensorrt_llm/llmapi/llm.py", "generate"),
@@ -69,11 +52,7 @@ def canon(path: str) -> str:
 
 
 def split_stage(test: str) -> tuple[str, str]:
-    """Split a DB `test` value `<stage>/<nodeid>` into `(stage, nodeid)`.
-
-    Stage names carry no `/`; a nodeid always does (`dir/file.py::...`), so the
-    first `/` is the boundary. Returns `("", test)` when there is no `/`.
-    """
+    """Split a DB `test` value `<stage>/<nodeid>` into `(stage, nodeid)`; `("", test)` if no `/`."""
     stage, sep, nodeid = test.partition("/")
     return (stage, nodeid) if sep else ("", test)
 
@@ -91,9 +70,8 @@ def unwrap_unittest(nodeid: str) -> Optional[str]:
 def db_key(entry: str) -> Optional[str]:
     """Map a test-db YAML `tests:` entry to the DB nodeid form, or None if not 1:1.
 
-    The inverse of `unwrap_unittest`: unit tests wrap as
-    `test_unittests.py::test_unittests_v2[<inner>]`, and a `-k` keyword entry
-    expands to many nodeids at runtime (no single DB key) -> None.
+    Unit tests wrap as `test_unittests.py::test_unittests_v2[<inner>]`; a `-k`
+    keyword entry expands to many nodeids (no single DB key) -> None.
     """
     e = normalize_test_id(entry)
     if e.startswith("unittest/"):
@@ -132,14 +110,17 @@ class TouchDB:
     # -- meta (every key optional; read with a default) --
 
     def meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        try:
+            row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        except sqlite3.OperationalError:
+            return default
         return row[0] if row is not None else default
 
     def schema_version(self) -> Optional[str]:
         return self.meta("schema_version")
 
     def collection_commit(self) -> Optional[str]:
-        """Commit the DB was collected at, for staleness gating (absent today)."""
+        """Commit the DB was collected at, or None if not recorded."""
         return self.meta("commit") or self.meta("collection_commit")
 
     # -- reverse lookup (the core of selection); always `test != ''` --
@@ -178,6 +159,15 @@ class TouchDB:
             row[0] for row in self._conn.execute("SELECT DISTINCT test FROM touch WHERE test!=''")
         }
 
+    def per_test_footprint(self) -> dict[str, int]:
+        """`{test -> functions entered}` over all stage-prefixed tests."""
+        return {
+            row[0]: row[1]
+            for row in self._conn.execute(
+                "SELECT test, COUNT(*) FROM touch WHERE test!='' GROUP BY test"
+            )
+        }
+
     def instrumented_stages(self) -> set[str]:
         """Stage names the DB has data for — the stages coverage may narrow."""
         return {stage for stage, _ in map(split_stage, self.known_tests()) if stage}
@@ -200,7 +190,7 @@ class TouchDB:
             for row in self._conn.execute("SELECT file, qualname FROM touch WHERE test=?", (test,))
         ]
 
-    # -- coverage-completeness heuristic (interim, until the producer signals it) --
+    # -- coverage-completeness heuristic --
 
     def untrusted_tests(
         self,
@@ -211,12 +201,10 @@ class TouchDB:
     ) -> set[str]:
         """Stage-prefixed tests whose per-test capture looks incomplete (must always run).
 
-        Untrusted when the test drove model execution/serving but is missing the
-        executor `worker_file` (its worker/server process was not captured) —
-        identified either by entering a `launch_markers` `(file, qualname_substring)`
-        (call-based) or by a `serving_path_markers` nodeid substring (path-based,
-        for disagg) — OR when it entered fewer than `min_funcs` functions total
-        (a near-empty capture, last resort).
+        Flags a test that drove execution/serving but is missing `worker_file` —
+        matched by a `launch_markers` `(file, qualname_substring)` call or a
+        `serving_path_markers` nodeid substring — or that entered fewer than
+        `min_funcs` functions total.
         """
         drove_execution: set[str] = set()
         for file, qual_substr in launch_markers:

@@ -13,22 +13,16 @@
 # limitations under the License.
 """Resolve and fetch the latest merged CBTS touch DB from Artifactory.
 
-The producer's post-merge `Test Coverage` stage merges every stage's PY_START
-files into `cbts_touchmap.sqlite`, tars it as `cbts_pystart_report.tar.gz`
-(sqlite at the tar root plus `cbts_report/`), and uploads it to
-`<ARTIFACT_BASE>/<build>/cbts-coverage/` (see L0_MergeRequest.groovy Test
-Coverage stage; ARTIFACT_BASE mirrors L0_Test.groovy UPLOAD_PATH).
+The tarball is uploaded per post-merge run to
+`<ARTIFACT_BASE>/<build>/cbts-coverage/cbts_pystart_report.tar.gz` (sqlite at
+the tar root plus `cbts_report/`).
 
-`latest_tarball_url()` finds the newest post-merge build that actually has the
-tarball: it reads the latest build number from the Jenkins REST API (the only
-in-repo precedent, get_image_key_to_tag.py) then walks builds down, probing
-Artifactory with a 1-byte ranged GET until one exists — a build can be SUCCESS
-yet upload nothing (no PY_START files -> early return), so `lastSuccessfulBuild`
-alone is wrong.
+`latest_tarball_url()` reads the newest build number from the Jenkins REST API,
+then walks builds down, probing Artifactory with a 1-byte ranged GET until it
+finds one whose tarball exists.
 
 Two entry points for the Groovy wiring:
-  * `--print-url` — resolve and print the tarball URL only (no 1 GB download),
-    so the caller can `wget` it through the CI's proven download path.
+  * `--print-url` — resolve and print the tarball URL only (no download).
   * `--dest DIR` — download + extract, printing the local sqlite path.
 """
 
@@ -44,19 +38,16 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-# Base for the merged artifact — mirrors L0_Test.groovy UPLOAD_PATH
-# (`sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}`) for the
-# main-branch L0_PostMerge job. Reads resolve through the virtual repo, same as
-# the cbts_test_db download in L0_Test.groovy.
+# Merged-artifact base for the main-branch L0_PostMerge job.
 ARTIFACT_BASE = "sw-tensorrt-generic/llm-artifacts/LLM/main/L0_PostMerge"
 TARBALL_NAME = "cbts_pystart_report.tar.gz"
 SQLITE_NAME = "cbts_touchmap.sqlite"
 
 _URM = "https://urm.nvidia.com/artifactory"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
-# How far back to walk when recent builds have no tarball (keeps a bounded probe).
+# Max builds to walk back when recent builds have no tarball.
 _MAX_PROBE = 50
-# Per-request timeout so one stalled endpoint can't hang the whole probe walk.
+# Per-request timeout in seconds.
 _TIMEOUT = 15
 
 
@@ -66,24 +57,19 @@ def _get(url: str) -> tuple[Optional[int], Optional[bytes]]:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         return e.code, None
-    except Exception as e:  # noqa: BLE001 — network best-effort; caller falls back
+    except Exception as e:  # noqa: BLE001
         print(f"[artifact] error fetching {url}: {e}", file=sys.stderr)
         return None, None
 
 
 def _exists(url: str) -> bool:
-    """True if the artifact exists — a 1-byte ranged GET (works where HEAD may not).
-
-    HEAD is not guaranteed on Artifactory; the proven precedent uses GET. `Range:
-    bytes=0-0` keeps the body ~1 byte (not the full 1 GB); a present artifact
-    answers 206 (or 200 if the range is ignored).
-    """
+    """True if the artifact exists — a 1-byte ranged GET; 200/206 means present."""
     req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             return resp.status in (200, 206)
-    except urllib.error.HTTPError as e:
-        return e.code in (200, 206)
+    except urllib.error.HTTPError:
+        return False
     except Exception as e:  # noqa: BLE001
         print(f"[artifact] error probing {url}: {e}", file=sys.stderr)
         return False
@@ -142,8 +128,7 @@ def extract_touch_db(tarball: Path | str, dest_dir: Path | str) -> Optional[Path
 def fetch_latest_touch_db(dest_dir: Path | str, url: Optional[str] = None) -> Optional[Path]:
     """Download + extract the latest post-merge touch DB; return local sqlite Path or None.
 
-    `url` pins an explicit tarball (skips latest-build resolution). Best-effort:
-    any failure returns None so the caller falls back to coverage-off.
+    `url` pins an explicit tarball (skips latest-build resolution); any failure returns None.
     """
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -154,10 +139,10 @@ def fetch_latest_touch_db(dest_dir: Path | str, url: Optional[str] = None) -> Op
     try:
         with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp, open(tarball, "wb") as f:
             shutil.copyfileobj(resp, f)
+        return extract_touch_db(tarball, dest_dir)
     except Exception as e:  # noqa: BLE001
-        print(f"[artifact] download failed {url}: {e}", file=sys.stderr)
+        print(f"[artifact] download/extract failed {url}: {e}", file=sys.stderr)
         return None
-    return extract_touch_db(tarball, dest_dir)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
