@@ -42,6 +42,7 @@ from tensorrt_llm.evaluate.lm_eval_tasks.aime.utils import (
     remove_boxed,
     strip_string,
 )
+from tensorrt_llm.evaluate.post_processing import extract_inkling_content
 from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -721,3 +722,92 @@ def test_mode_cot_included_in_example_format():
     finally:
         # Restore module state for other tests running in the same session.
         _reload_mmmu_pro_utils(None)
+
+
+# ===========================================================================
+# extract_inkling_content — Inkling typed-content channel extraction
+# ===========================================================================
+#
+# ``extract_inkling_content`` is the offline analog of SGLang's
+# ``--reasoning-parser inkling`` (``InklingDetector`` in
+# ``sglang/srt/parser/reasoning_parser.py``). It must return ONLY the visible
+# ``<|content_text|>`` channel and drop the ``<|content_thinking|>`` reasoning
+# channel, so GSM8K/MMLU flexible-extract scores the model's answer rather than
+# the trailing number of its chain-of-thought. These tests pin the extraction to
+# SGLang's ``normal_text`` semantics case-for-case.
+
+_CT = "<|content_text|>"
+_CTH = "<|content_thinking|>"
+_EM = "<|end_message|>"
+_MM = "<|message_model|>"
+_CES = "<|content_model_end_sampling|>"
+
+
+def test_inkling_content_only():
+    """A single visible content-text block returns exactly that text."""
+    assert extract_inkling_content(
+        f"{_CT}The answer is 42.{_EM}") == "The answer is 42."
+
+
+def test_inkling_thinking_then_content():
+    """Reasoning is dropped; only the visible content-text is kept.
+
+    Full realistic block sequence: a thinking block, then a
+    ``<|message_model|>`` header, then the visible content-text answer, closed
+    by ``<|end_message|>`` and the sampling-end token.
+    """
+    text = (f"{_CTH}Let me compute 6*7=42.{_EM}"
+            f"{_MM}{_CT}42{_EM}{_CES}")
+    assert extract_inkling_content(text) == "42"
+
+
+def test_inkling_thinking_only_returns_empty():
+    """Markers present but NO content-text -> empty visible content.
+
+    This is the SGLang ``InklingDetector`` contract: a generation that stays
+    inside the ``<|content_thinking|>`` block (e.g. it looped / was truncated
+    before emitting an answer) has ``normal_text == ""``. The extractor must
+    NOT leak the reasoning text, otherwise flexible-extract would harvest the
+    reasoning's trailing number as if it were the answer.
+    """
+    assert extract_inkling_content(
+        f"{_CTH}unfinished reasoning says 12") == ""
+
+
+def test_inkling_reasoning_loop_with_trailing_number_returns_empty():
+    """A looping/truncated thinking block with trailing numbers -> empty.
+
+    Directly guards the scoring bug: without the reasoning channel dropped, GSM8K
+    flexible-extract would grab ``15`` (or ``14``) from the chain-of-thought and
+    score a non-answer as a visible answer.
+    """
+    text = f"{_CTH}so 3+4=7 and then 7*2=14 hmm actually 15"
+    assert extract_inkling_content(text) == ""
+
+
+def test_inkling_truncated_content_is_kept():
+    """A content-text block truncated before its closing marker is kept."""
+    assert extract_inkling_content(
+        f"{_CT}The answer is 4") == "The answer is 4"
+
+
+def test_inkling_no_markers_passthrough():
+    """Non-Inkling text (no markers) is returned unchanged.
+
+    Guarantees every other model/benchmark is byte-for-byte untouched when the
+    ``inkling`` post-processor is not selected or special tokens were skipped.
+    """
+    raw = "The answer is 42."
+    assert extract_inkling_content(raw) == raw
+
+
+def test_inkling_multi_block_content_concatenated():
+    """Multiple visible content-text runs are concatenated in order."""
+    text = (f"{_CT}Part A. {_EM}{_MM}{_CT}Part B.{_EM}")
+    assert extract_inkling_content(text) == "Part A. Part B."
+
+
+def test_inkling_content_then_thinking_keeps_only_content():
+    """Out-of-order blocks: content kept, later reasoning dropped."""
+    assert extract_inkling_content(
+        f"{_CT}Answer: 5{_CTH}wait no") == "Answer: 5"

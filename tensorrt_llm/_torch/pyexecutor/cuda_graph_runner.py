@@ -132,6 +132,8 @@ class CUDAGraphRunner:
         # tensor reallocation from invalidating addresses baked into existing
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
+        # Gates the once-only "first replay" hard-path log (see replay()).
+        self._replay_logged = False
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -443,6 +445,14 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
+        # Hard-path evidence: an explicit, greppable record that the production
+        # runtime actually CAPTURED a real CUDA graph for this decode key (not a
+        # silent fallback to eager). Emitted from the worker rank during warmup,
+        # so it survives the TP>1 proxy layout where the driver process cannot
+        # introspect the engine's graph store directly.
+        logger.info(
+            f"[cuda-graph] CAPTURED generation graph key={key} "
+            f"total_captured={len(self.graphs)}")
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
@@ -474,6 +484,15 @@ class CUDAGraphRunner:
             static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         self.graphs[key].replay()
+        # Hard-path evidence (logged once): prove the captured graph was actually
+        # REPLAYED on the decode path rather than the runtime silently falling
+        # back to eager. Gated by a flag so a long generation logs a single line,
+        # not one per decode step.
+        if not self._replay_logged:
+            logger.info(
+                f"[cuda-graph] REPLAYED generation graph key={key} "
+                f"(first replay; total_captured={len(self.graphs)})")
+            self._replay_logged = True
         output_ref = self.graph_outputs[key]
 
         return output_ref

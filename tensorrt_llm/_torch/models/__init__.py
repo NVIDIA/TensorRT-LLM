@@ -29,6 +29,8 @@ from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
+from .modeling_inkling import (InklingForCausalLM,
+                               InklingForConditionalGeneration)
 from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
@@ -83,6 +85,8 @@ __all__ = [
     "Gemma4ForConditionalGeneration",
     "Gemma4UnifiedForConditionalGeneration",
     "HCXVisionForCausalLM",
+    "InklingForCausalLM",
+    "InklingForConditionalGeneration",
     "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",

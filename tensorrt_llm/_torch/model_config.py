@@ -384,12 +384,21 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
-        quant_config.kv_cache_quant_algo = (
-            QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
-            json_quant_configs.get('kv_cache_quant_algo') is not None else None)
+        def _algo_or_none(value):
+            # modelopt hf_quant_config.json may spell "no quantization" as JSON
+            # null (-> None) OR as the string "none"/"null" (e.g. the Inkling
+            # NVFP4 checkpoint uses ``"kv_cache_quant_algo": "none"``); both must
+            # map to None rather than QuantAlgo("none"), which is not a member.
+            if value is None or (isinstance(value, str)
+                                 and value.strip().lower() in ("none", "null",
+                                                               "")):
+                return None
+            return QuantAlgo(value)
+
+        quant_config.quant_algo = _algo_or_none(
+            json_quant_configs.get('quant_algo'))
+        quant_config.kv_cache_quant_algo = _algo_or_none(
+            json_quant_configs.get('kv_cache_quant_algo'))
         quant_config.group_size = json_quant_configs.get('group_size', None)
         quant_config.exclude_modules = json_quant_configs.get(
             'exclude_modules', None)

@@ -99,6 +99,10 @@ class ResourceManagerType(enum.Enum):
     SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
     SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
+    # Per-request short-conv state pool for the Inkling text tower (four causal
+    # short convolutions per decoder layer), carried with the KV-cache request
+    # lifetime; see modeling_inkling.InklingConvStateManager.
+    CONV_STATE_MANAGER = "CONV_STATE_MANAGER"
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:

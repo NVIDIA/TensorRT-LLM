@@ -7,6 +7,10 @@ from tensorrt_llm._torch.configs.gemma4_unified import (
     Gemma4UnifiedTextConfig,
     Gemma4UnifiedVisionConfig,
 )
+from tensorrt_llm._torch.configs.inkling import (
+    InklingConfig,
+    InklingTextConfig,
+)
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 
 
@@ -41,6 +45,8 @@ def _register_custom_configs_with_transformers() -> None:
         "gemma4_unified_text": Gemma4UnifiedTextConfig,
         "gemma4_unified_vision": Gemma4UnifiedVisionConfig,
         "gemma4_unified_audio": Gemma4UnifiedAudioConfig,
+        "inkling_mm_model": InklingConfig,
+        "inkling_text": InklingTextConfig,
     }
     # Cosmos3Config resolves vision sub-configs via ``qwen3_vl_vision``; that
     # alias is only present in newer transformers releases.
@@ -63,5 +69,7 @@ __all__ = [
     "Gemma4UnifiedConfig",
     "Gemma4UnifiedTextConfig",
     "Gemma4UnifiedVisionConfig",
+    "InklingConfig",
+    "InklingTextConfig",
     "LagunaConfig",
 ]

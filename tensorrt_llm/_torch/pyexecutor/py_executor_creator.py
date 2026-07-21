@@ -40,7 +40,7 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear
+from .config_utils import is_hybrid_linear, is_inkling
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -970,6 +970,19 @@ def create_py_executor(
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
+        # Inkling: register the per-request short-conv state pool as a
+        # request-lifetime resource manager (Design Choice 5). It shares the KV
+        # cache's request lifetime -- the ResourceManager container calls its
+        # free_resources per completed request -- and the model fetches the pool
+        # from it each forward via the `resource_manager` kwarg.
+        if is_inkling(model_engine.model.model_config.pretrained_config):
+            from tensorrt_llm._torch.models.modeling_inkling import \
+                InklingConvStateManager
+            conv_device = torch.device('cuda', torch.cuda.current_device())
+            resources[ResourceManagerType.CONV_STATE_MANAGER] = \
+                InklingConvStateManager(model_engine.model.model_config,
+                                        max_batch_size, conv_device,
+                                        model_engine.dtype)
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,

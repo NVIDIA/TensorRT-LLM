@@ -89,6 +89,14 @@ enum class RoutingMethodType : int64_t
     DeepSeekV4 = 7,
     // Unspecified
     Unspecified = 8,
+    // Inkling: sigmoid gate + additive-bias top-k + log-sigmoid renorm with a
+    // shared-expert sink, scaled by route_scale*global_scale. This routing is
+    // computed EXTERNALLY in torch (InklingMoeRoutingMethod.apply) and passed in
+    // as precomputed (topk_ids, topk_weights); the kernel runs ONLY the permute +
+    // fp4 block-scale GEMM + deterministic finalize (no routing/renorm in CUDA).
+    // Additive / decoupled: does NOT map onto SigmoidRenorm=6. Keep in sync with
+    // the Python enum in tensorrt_llm/_torch/modules/fused_moe/routing.py.
+    InklingSinkRenorm = 9,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -110,6 +118,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::MiniMax2: return "MiniMax2";
     case RoutingMethodType::SigmoidRenorm: return "SigmoidRenorm";
     case RoutingMethodType::DeepSeekV4: return "DeepSeekV4";
+    case RoutingMethodType::InklingSinkRenorm: return "InklingSinkRenorm";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }

@@ -161,3 +161,89 @@ def strip_thinking_and_extract_mmmu_answer(text: str) -> str:
     answer extraction.
     """
     return extract_mmmu_answer(strip_thinking(text))
+
+
+# --- Inkling typed-content channel extraction --------------------------------
+# Inkling does not wrap reasoning in ``<think>`` text tags. Instead it emits a
+# sequence of typed content blocks delimited by SPECIAL TOKENS, e.g.:
+#     <|content_thinking|>reasoning<|end_message|>
+#     <|message_model|><|content_text|>visible answer<|end_message|>
+#     <|content_model_end_sampling|>
+# Reasoning must be routed out and only the ``<|content_text|>`` (visible)
+# channel scored — exactly what SGLang's ``InklingDetector`` /
+# ``--reasoning-parser inkling`` does online. For offline lm-eval scoring we
+# need the generation detokenized WITHOUT ``skip_special_tokens`` so these
+# markers survive; ``extract_inkling_content`` then returns only the visible
+# content-text so GSM8K/MMLU flexible-extract scores the answer, not the
+# chain-of-thought (whose trailing numbers otherwise poison last-number
+# extraction, e.g. "**5 cars** ... first 15 minutes" -> wrongly extracts 15).
+_INK_CONTENT_THINKING = "<|content_thinking|>"
+_INK_CONTENT_TEXT = "<|content_text|>"
+_INK_END_MESSAGE = "<|end_message|>"
+_INK_CONTENT_MODEL_END_SAMPLING = "<|content_model_end_sampling|>"
+# Any special token that opens a new (non content-text) block or closes one; a
+# content-text run ends at the first of these.
+_INK_CONTROL_TOKENS = (
+    _INK_CONTENT_THINKING,
+    _INK_CONTENT_TEXT,
+    _INK_END_MESSAGE,
+    _INK_CONTENT_MODEL_END_SAMPLING,
+    "<|message_model|>",
+    "<|message_system|>",
+    "<|message_user|>",
+    "<|message_tool|>",
+    "<|content_invoke_tool_json|>",
+    "<|content_invoke_tool_text|>",
+    "<|content_xml|>",
+)
+_INK_CONTROL_RE = re.compile("|".join(re.escape(t) for t in _INK_CONTROL_TOKENS))
+
+
+def extract_inkling_content(text: str) -> str:
+    """Return only the visible ``<|content_text|>`` channel from Inkling output.
+
+    Mirrors SGLang's ``InklingDetector``: ``<|content_thinking|>`` blocks are
+    reasoning (dropped) and ``<|content_text|>`` blocks are visible content
+    (kept). Concatenates all content-text runs and returns them stripped.
+
+    Requires the generation to be detokenized with ``skip_special_tokens=False``
+    so the channel markers are present. If no Inkling markers are found (e.g.
+    special tokens were skipped, or a non-Inkling model), the input is returned
+    unchanged so behavior for every other model/benchmark is untouched.
+    """
+    if _INK_CONTENT_TEXT not in text and _INK_CONTENT_THINKING not in text:
+        return text
+
+    content_parts: list[str] = []
+    kind = None  # None | "content" | "reasoning" | "other"
+    pos = 0
+    for m in _INK_CONTROL_RE.finditer(text):
+        segment = text[pos:m.start()]
+        if kind == "content" and segment:
+            content_parts.append(segment)
+        token = m.group(0)
+        pos = m.end()
+        if token == _INK_CONTENT_TEXT:
+            kind = "content"
+        elif token == _INK_CONTENT_THINKING:
+            kind = "reasoning"
+        else:
+            # <|end_message|>, <|content_model_end_sampling|>, any <|message_*|>
+            # header, or a tool/xml content marker -> close the current block.
+            kind = "other"
+    # Trailing text after the last control token (e.g. generation stopped at the
+    # sampling-end token mid content-text, so there is no closing marker).
+    if kind == "content" and pos < len(text):
+        content_parts.append(text[pos:])
+
+    # Mirror SGLang's ``InklingDetector``: the visible channel is the
+    # concatenation of ``<|content_text|>`` runs ONLY. When Inkling markers are
+    # present but no content-text was emitted (e.g. the generation looped or was
+    # truncated inside the ``<|content_thinking|>`` block and never produced an
+    # answer), SGLang routes everything to ``reasoning_text`` and returns an empty
+    # ``normal_text``. We must return the empty visible content here too: falling
+    # back to the stripped reasoning text would let a truncated / looping
+    # chain-of-thought be scored as if it were the model's answer (its trailing
+    # number would be harvested by GSM8K/MMLU flexible-extract) — exactly the
+    # failure the reasoning channel is meant to exclude.
+    return "".join(content_parts).strip()

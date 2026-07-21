@@ -252,6 +252,13 @@ class RoutingMethodType(IntEnum):
     DeepSeekV4 = 7,
     # Unspecified
     Unspecified = 8,
+    # InklingSinkRenorm: Sigmoid gate + additive-bias TopK + log-sigmoid renorm
+    # with a shared-expert sink (route_scale*global_scale). Routing is precomputed
+    # in torch (InklingMoeRoutingMethod) and passed to the trtllm-gen block-scale
+    # MoE kernel as (topk_ids, topk_weights); the kernel runs only the fp4 GEMM +
+    # deterministic finalize. Keep in sync with the C++ enum in
+    # cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h.
+    InklingSinkRenorm = 9,
 
 
 class BaseMoeRoutingMethod(nn.Module):
@@ -965,6 +972,15 @@ ROUTING_METHOD_TYPE_TO_CLASS: Dict[RoutingMethodType,
                                        SigmoidRenormMoeRoutingMethod,
                                        RoutingMethodType.DeepSeekV4:
                                        DeepSeekV4MoeRoutingMethod,
+                                       # Inkling routing is precomputed in torch
+                                       # and passed to the kernel as topk_ids /
+                                       # topk_weights, so this mapping is only used
+                                       # to synthesize a throwaway autotuner dummy
+                                       # topk of the right shape/dtype (a plain
+                                       # renorm topk suffices; the real per-token
+                                       # routing values are never taken from here).
+                                       RoutingMethodType.InklingSinkRenorm:
+                                       RenormalizeMoeRoutingMethod,
                                    }
 
 

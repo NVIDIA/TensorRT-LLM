@@ -20,6 +20,22 @@ def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
 
 
+def is_inkling(config):
+    """True for the Inkling checkpoint (top-level multimodal or text sub-config).
+
+    Inkling is a RoPE-free hybrid-attention decoder whose local (sliding-window)
+    layers carry 16 KV heads and global layers 8, so the paged KV cache needs the
+    per-layer ``num_kv_heads`` geometry that only ``KVCacheManagerV2`` allocates.
+    Accepts either the top-level ``inkling_mm_model`` config (runtime model
+    registration) or the ``inkling_text`` sub-config (the text tower the KV cache
+    is actually sized from)."""
+    model_type = getattr(config, "model_type", None)
+    if model_type in ("inkling_mm_model", "inkling_text"):
+        return True
+    text_config = getattr(config, "text_config", None)
+    return getattr(text_config, "model_type", None) == "inkling_text"
+
+
 def _coerce_torch_dtype(dtype):
     """Normalize dtype values from HF configs into torch dtype objects.
 
@@ -380,6 +396,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     kimi_k2="DeepseekV3Config",
     glm_moe_dsa="DeepseekV3Config",
     laguna="LagunaConfig",
+    inkling_mm_model="InklingConfig",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 

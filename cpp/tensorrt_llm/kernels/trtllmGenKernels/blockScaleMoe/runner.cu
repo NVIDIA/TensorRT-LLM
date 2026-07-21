@@ -387,6 +387,69 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         moe::dev::routing::routingCustom::run(routingData, stream);
     }
+    else if (routingMethodType == RoutingMethodType::InklingSinkRenorm)
+    {
+        // Inkling: routing (sigmoid gate + additive-bias top-k + log-sigmoid
+        // renorm with a shared-expert sink, scaled by route_scale*global_scale) is
+        // computed EXTERNALLY in torch (InklingMoeRoutingMethod.apply) and passed
+        // in as precomputed (expertIds, expertWeights). This branch therefore does
+        // ONLY the shared post-topK pipeline (permute + histogram + grouped-GEMM
+        // launch config) -- routingCustom::run detects mPtrTopKIds != nullptr and
+        // takes the permute-only path (RoutingCustom.cu), so NO score->topK routing
+        // and NO renorm semantics run in CUDA. Requires precomputed ids: the
+        // integrated (raw-scores) path is intentionally unsupported for Inkling.
+        TLLM_CHECK_WITH_INFO(expertIds != nullptr,
+            "InklingSinkRenorm routing requires precomputed topk ids (separated routing).");
+        TLLM_CHECK_WITH_INFO(expertWeights != nullptr,
+            "InklingSinkRenorm routing requires precomputed topk weights (separated routing).");
+        moe::dev::routing::routingCustom::Data routingData;
+
+        //
+        // Config
+        //
+        routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+        routingData.mDtypeInput = dtypeRoutingLogits;
+        routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
+        // Preprocess/postprocess are overridden to None by the post-topK pipeline
+        // whenever mPtrTopKIds is set; declare them explicitly for clarity.
+        routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::None;
+        routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::None;
+
+        // Precomputed routing -> no raw-score topK.
+        routingData.mPtrScores = nullptr;
+        //
+        // Outputs
+        //
+        routingData.mPtrTopKPacked = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        // Precomputed topk weights are used verbatim by the finalize combine.
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
+        //
+        // Grouped Gemm Launch Config Buffers
+        //
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        //
+        // Inputs
+        //
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routing::routingCustom::run(routingData, stream);
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method %s of enum %d",

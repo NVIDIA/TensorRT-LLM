@@ -47,8 +47,8 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
 from .config_utils import (extract_mamba_kv_cache_params, is_gemma4_hybrid,
-                           is_hybrid_linear, is_mla, is_nemotron_hybrid,
-                           is_qwen3_hybrid)
+                           is_hybrid_linear, is_inkling, is_mla,
+                           is_nemotron_hybrid, is_qwen3_hybrid)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
@@ -79,10 +79,11 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
-    # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
-    # require KVCacheManagerV2 for per-layer buffer sizes.
+    # Models with per-layer head_dim / num_kv_heads (e.g. Gemma4 hybrid
+    # attention, or Inkling's local 16 / global 8 KV-head split) require
+    # KVCacheManagerV2 for per-layer buffer sizes.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
-                or is_gemma4_hybrid(config))
+                or is_gemma4_hybrid(config) or is_inkling(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -414,6 +415,17 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                if is_inkling(config):
+                    # Inkling's per-layer KV-head split (local 16 / global 8)
+                    # is the same structural V2 requirement as Gemma4's
+                    # per-layer head_dim: V1's unified pool would coerce it to
+                    # a single value, changing per-layer KV byte sizes -- a
+                    # correctness bug, not just efficiency. Fail loudly rather
+                    # than silently produce wrong outputs.
+                    raise NotImplementedError(
+                        f"Inkling hybrid attention requires KVCacheManagerV2, "
+                        f"which is not yet supported with {incompat_str}. "
+                        f"Disable these features to run Inkling.")
                 # Plain V2 (explicitly enabled or selected by a model default):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -523,6 +535,18 @@ class KvCacheCreator:
         # worst-case dummy batch, so there is no multimodal dummy request here.
         requests = []
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
+        # These dummy warmup requests must pass the same token-range check real
+        # requests do (PyExecutor._validate_token_range ->
+        # request.check_token_id_range against lm_head.num_embeddings). When a
+        # model's input-embedding vocab is padded ABOVE its (unpadded) output/head
+        # vocab -- e.g. Inkling: embed 201024 vs lm_head 200058 -- sampling dummy
+        # ids up to the padded vocab_size lands in the padded gap and fails
+        # KV-cache capacity estimation with "Token ID out of range". Bound the
+        # dummy range to the head so the warmup batch is always a valid request.
+        lm_head = getattr(self._model_engine.model, "lm_head", None)
+        head_vocab = getattr(lm_head, "num_embeddings", None)
+        if head_vocab:
+            vocab_size = min(vocab_size, head_vocab)
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
@@ -1744,10 +1768,24 @@ def _create_kv_cache_manager(
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
+    # Inkling: the KV cache is sized from the text tower. The top-level
+    # inkling_mm_model config carries the decoder geometry in ``text_config``, so
+    # route the whole sizing path through it (hidden_size / num_attention_heads /
+    # head_dim / num_hidden_layers / vocab_size all live there).
+    _is_inkling = is_inkling(config)
+    if _is_inkling:
+        config = getattr(config, "text_config", config)
+
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
         config, 'num_key_value_heads', num_attention_heads)
+    if _is_inkling:
+        # Hybrid per-layer geometry: local (sliding-window) layers use 16 KV
+        # heads, global layers 8; head_dim is uniform (128). V2 divides each by
+        # tp_size and allocates the paged pool per layer accordingly (the generic
+        # V2 branch below consumes this list directly).
+        num_key_value_heads = config.num_kv_heads_per_layer()
     if not isinstance(head_dim, int):
         head_dim = getattr(config, "head_dim", None)
     if not isinstance(head_dim, int):

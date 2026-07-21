@@ -95,6 +95,14 @@ class ModelLoader:
 
         hf_kv_cache_quant_algo = hf_quant_config.pop("kv_cache_quant_algo",
                                                      None)
+        # modelopt hf_quant_config.json may spell "no KV-cache quantization" as
+        # JSON null OR the string "none"/"null" (the Inkling NVFP4 checkpoint
+        # uses ``"kv_cache_quant_algo": "none"``); both mean an unquantized KV
+        # cache -> None, not QuantAlgo("none") (which is not a member). Mirrors
+        # the same normalization in ModelConfig.load_modelopt_quant_config.
+        if isinstance(hf_kv_cache_quant_algo, str) and \
+                hf_kv_cache_quant_algo.strip().lower() in ("none", "null", ""):
+            hf_kv_cache_quant_algo = None
         if hf_kv_cache_quant_algo is not None:
             hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
             if explicit_kv_cache_quant_algo is not None:

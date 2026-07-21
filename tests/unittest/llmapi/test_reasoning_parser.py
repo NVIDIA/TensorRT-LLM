@@ -798,3 +798,59 @@ def test_gemma4_reasoning_parser_finish_unterminated_reasoning():
     result = parser.finish()
     assert result.content == ""
     assert result.reasoning_content == "<chan"
+
+
+# --- Inkling typed-content channel reasoning parser --------------------------
+INK_MM = "<|message_model|>"
+INK_CT = "<|content_text|>"
+INK_CH = "<|content_thinking|>"
+INK_EM = "<|end_message|>"
+INK_END = "<|content_model_end_sampling|>"
+
+
+@pytest.mark.parametrize(("text", "content", "reasoning"), [
+    # Canonical thinking-then-answer turn: only the content_text is visible.
+    (f"{INK_CH}3+4=7{INK_EM}{INK_MM}{INK_CT}The answer is 7{INK_EM}{INK_END}",
+     "The answer is 7", "3+4=7"),
+    # Answer-only (no thinking block).
+    (f"{INK_CT}42{INK_EM}", "42", ""),
+    # Thinking-only turn (looped / no answer emitted): visible content is EMPTY,
+    # NOT the reasoning text -- a truncated chain-of-thought must not be scored
+    # as the answer (matches SGLang InklingDetector routing everything to
+    # reasoning_text with empty normal_text).
+    (f"{INK_CH}reasoning only, no answer{INK_EM}{INK_END}",
+     "", "reasoning only, no answer"),
+    # Truncated mid-thinking (generation hit the token cap): still empty content.
+    (f"{INK_CH}looping 12 13 14", "", "looping 12 13 14"),
+    # No Inkling markers at all -> passthrough as visible content (non-Inkling /
+    # already-stripped output is untouched).
+    ("plain text no markers", "plain text no markers", ""),
+    # Multiple content_text blocks concatenate.
+    (f"{INK_CT}Step 1{INK_EM}{INK_MM}{INK_CT} Step 2{INK_EM}",
+     "Step 1 Step 2", ""),
+])
+def test_inkling_reasoning_parser(text: str, content: str, reasoning: str):
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    result = parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning
+
+
+def test_inkling_reasoning_parser_registered_needs_raw_special_tokens():
+    """The parser must be registered and declare needs_raw_special_tokens so the
+    OpenAI server keeps <|content_*|> delimiters in the decoded text."""
+    assert "inkling" in ReasoningParserFactory.keys()
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    assert getattr(parser, "needs_raw_special_tokens", False) is True
+
+
+def test_inkling_reasoning_parser_stream_across_deltas():
+    """Streaming parse across deltas, including a control token split over two
+    deltas, must reconstruct the same visible content as the full parse."""
+    parser = ReasoningParserFactory.create_reasoning_parser("inkling")
+    # Split the <|content_text|> marker across two deltas to exercise the
+    # partial-control holdback.
+    deltas = [f"{INK_CH}think a{INK_EM}{INK_MM}<|content_te", "xt|>ANS 5", INK_END]
+    content = "".join(parser.parse_delta(d).content for d in deltas)
+    content += parser.finish().content
+    assert content == "ANS 5"
