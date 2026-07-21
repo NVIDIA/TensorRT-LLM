@@ -81,6 +81,10 @@ class HypothesisTestingParams:
     # Free-text provenance for the reference row (e.g. an externally
     # published score to compare against); printed in the report only.
     reference_note: Optional[str] = None
+    # Explicit pass/fail cutoff. When set, it replaces the hypothesis-test
+    # threshold computed from sigma/alpha — use for benchmark-style floors
+    # where a fixed, human-readable gate is preferred.
+    threshold_override: Optional[float] = None
     theta: float = field(init=False)
     threshold: float = field(init=False)
 
@@ -89,12 +93,15 @@ class HypothesisTestingParams:
                                    sigma=self.sigma,
                                    alpha=self.alpha,
                                    beta=self.beta)
-        self.threshold = compute_threshold(
-            self.num_samples,
-            self.ref_accuracy,
-            sigma=self.sigma,
-            alpha=self.alpha,
-            higher_is_better=self.higher_is_better)
+        if self.threshold_override is not None:
+            self.threshold = self.threshold_override
+        else:
+            self.threshold = compute_threshold(
+                self.num_samples,
+                self.ref_accuracy,
+                sigma=self.sigma,
+                alpha=self.alpha,
+                higher_is_better=self.higher_is_better)
 
     def report(self, accuracy: Optional[float] = None) -> str:
         metric_name = self.metric_name.upper()
@@ -198,7 +205,8 @@ class AccuracyTask:
             num_samples=entry.get("num_samples", self.NUM_SAMPLES),
             higher_is_better=entry.get("higher_is_better",
                                        self.HIGHER_IS_BETTER),
-            reference_note=entry.get("reference_note"))
+            reference_note=entry.get("reference_note"),
+            threshold_override=entry.get("threshold"))
 
     def evaluate(self,
                  llm: Union[PyTorchLLM, AutoDeployLLM],

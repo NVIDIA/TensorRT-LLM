@@ -1,20 +1,23 @@
 # GSM8K under the InferenceMAX protocol (chat template + thinking + 12288-token
 # generation budget, strict "#### N" extraction) — see GSM8KInferenceMax in
 # accuracy_core.py. References measured on 4x B200 (TP4/EP4, 2026-07-21), full
-# 1319-sample split. For context, the published InferenceMAX vLLM B200 FP4 band
-# for MiniMax-M3 is 94.84-96.06 (spec-off) / 95.15-96.06 (Eagle3); identical
-# configs there scatter up to ~1 point between runs.
+# 1319-sample split. All rows gate at a uniform explicit floor of 94.0
+# (InferenceMAX-style): measured run-to-run SD is 0.26 and lm-eval's per-run
+# stderr is 0.58, so the floor keeps >2-sigma headroom below the weakest
+# reference while staying far above the published InferenceMAX gate (90.0).
 nvidia/MiniMax-M3-NVFP4:
   # Reference sparse-attention path (triton), BF16 KV cache, no spec decoding.
   # Matches the serve-based measurement of the same config exactly.
   - quant_algo: MIXED_PRECISION
     accuracy: 95.53
+    threshold: 94.0
     reference_note: "published vLLM B200 FP4 spec-off mean 95.46 [94.84-95.91]
       n=13 (inferencex.semianalysis.com, 2026-07)"
   # MSA path (fmha_sm100), FP8 KV cache, no spec decoding.
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.68
+    threshold: 94.0
     reference_note: "published vLLM B200 FP4 spec-off mean 95.46 [94.84-95.91]
       n=13 (inferencex.semianalysis.com, 2026-07)"
   # MSA path + one-model Eagle3 + CUDA graphs + overlap (mean of 3 runs:
@@ -22,5 +25,6 @@ nvidia/MiniMax-M3-NVFP4:
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: Eagle3
     accuracy: 95.35
+    threshold: 94.0
     reference_note: "published vLLM B200 FP4 Eagle3 mean 95.49 [95.15-96.06]
       n=8 (inferencex.semianalysis.com, 2026-07)"
