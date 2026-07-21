@@ -195,12 +195,36 @@ class TestClassicFrontendProxyEndToEnd:
         )
         return proxy, worker_ingress, hmac_key, result_addrs
 
+    @staticmethod
+    def _stop_dispatch_thread(proxy, result_addrs, hmac_key):
+        """End the dispatch thread the way the worker does at engine teardown.
+
+        The worker fans a per-lane None sentinel to every frontend (see
+        notify_proxy_threads_to_quit). Frontend shutdown deliberately leaves
+        the thread to process teardown, which the threadleak checker would
+        report as a leak.
+        """
+        import zmq
+
+        from tensorrt_llm.executor.ipc import FusedIpcQueue
+
+        worker_lane = FusedIpcQueue(
+            (result_addrs[proxy._frontend_id], hmac_key),
+            is_server=False,
+            fuse_message=False,
+            socket_type=zmq.PUSH,
+            name="fake_worker_shutdown_lane",
+        )
+        worker_lane.put(None)
+        proxy.dispatch_result_thread.join(timeout=10)
+        assert not proxy.dispatch_result_thread.is_alive()
+
     def test_submit_namespaces_and_shutdown_never_sends_sentinel(self):
         from tensorrt_llm.executor.request import CancellingRequest, GenerationRequest
         from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmpdir)
+            proxy, worker_ingress, hmac_key, result_addrs = self._make_proxy_and_fake_worker(tmpdir)
 
             # Attributes read by OpenAIServer at init must exist (a missing
             # _resource_governor_queue crashed all siblings in the first e2e).
@@ -223,6 +247,7 @@ class TestClassicFrontendProxyEndToEnd:
             assert not worker_ingress.poll(1), (
                 "an attached frontend must never send the engine-shutdown sentinel"
             )
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
 
     def test_check_health_and_submit_reflect_fatal_error(self):
         from tensorrt_llm.executor.request import GenerationRequest
@@ -273,3 +298,5 @@ class TestClassicFrontendProxyEndToEnd:
             while client_id in proxy._results and time.time() < deadline:
                 time.sleep(0.01)
             assert client_id not in proxy._results
+
+            self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
