@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -62,6 +62,7 @@ class TestConfig:
     request_timeout: int = 180
     heartbeat_interval_sec: Optional[int] = None
     inactive_timeout_sec: Optional[int] = None
+    post_stress_recovery_timeout: Optional[int] = None
 
     def __str__(self):
         return self.test_desc
@@ -106,6 +107,455 @@ _FATAL_LOG_PATTERNS = (
 
 _ACCURACY_CLIENT_TIMEOUT_GRACE_SECS = 60
 _ACCURACY_PROCESS_TIMEOUT_SECS = 1_200
+# The proxy can spend up to 10 seconds in bounded request cleanup after its
+# request deadline; reserve another 5 seconds before AIPerf cancels the client
+# request, then 5 seconds for recording the terminal result.
+_AIPERF_CLIENT_TIMEOUT_GRACE_SECS = 15
+_AIPERF_TERMINAL_OBSERVATION_GRACE_SECS = 5
+_RECOVERY_PROBE_INTERVAL_SECS = 5
+_RECOVERY_PROBE_MIN_SUCCESSES = 6
+_RECOVERY_PROBE_ROUNDS_PER_WORKER = 3
+_RECOVERY_PROBE_OUTPUT_TOKENS = 32
+_RECOVERY_PROBE_PROMPT = "Assess service recovery readiness. " * 64
+
+
+def _raise_if_process_stopped(processes, phase: str) -> None:
+    stopped_processes = [
+        proc for proc in processes if proc.process.poll() is not None
+    ]
+    if not stopped_processes:
+        return
+
+    details = [
+        f"{proc.log_path or 'process'} (rc={proc.process.poll()})"
+        for proc in stopped_processes
+    ]
+    raise RuntimeError(f"Disaggregated process exited during {phase}: "
+                       f"{details}")
+
+
+def wait_for_disagg_recovery(server_url: str, model_path: str, timeout: int,
+                             request_timeout: int, required_successes: int,
+                             workers, disagg_server) -> None:
+    """Wait until fresh requests can traverse the disaggregated path.
+
+    A client-side 504 is terminal for the caller, but with in-flight KV
+    cancellation disabled a worker may still own that request until its
+    transfer finishes naturally. Starting the full accuracy phase immediately
+    can therefore turn its requests into another timeout burst.
+
+    This is deliberately a behavioral readiness gate, not an assertion that
+    every internal queue is empty. Existing worker gauges omit asynchronous KV
+    transfers and can report zero during precisely this drain period. Several
+    consecutive cache-distinct probes, with a target scaled to the worker
+    count, demonstrate that nontrivial new work can again traverse context
+    transfer and generation before GSM8K starts. This does not prove that each
+    worker is idle or selected; the accuracy phase remains the authoritative
+    recovery check.
+    """
+    import requests as http_requests
+
+    if timeout <= 0:
+        raise ValueError("post_stress_recovery_timeout must be positive")
+    if request_timeout <= 0:
+        raise ValueError("recovery probe request_timeout must be positive")
+    if required_successes <= 0:
+        raise ValueError("recovery probe required_successes must be positive")
+
+    deadline = time.monotonic() + timeout
+    start_time = time.monotonic()
+    consecutive_successes = 0
+    attempt = 0
+    last_outcome = "probe not attempted"
+    probe_url = f"{server_url}/v1/completions"
+    probe_run_id = time.monotonic_ns()
+    monitored_processes = [*workers, disagg_server]
+
+    while time.monotonic() < deadline:
+        _raise_if_process_stopped(monitored_processes, "recovery")
+
+        attempt += 1
+        probe_prompt = (f"Recovery probe {probe_run_id}-{attempt}. " +
+                        _RECOVERY_PROBE_PROMPT)
+        probe_body = {
+            "model": model_path,
+            "prompt": probe_prompt,
+            "max_tokens": _RECOVERY_PROBE_OUTPUT_TOKENS,
+            "temperature": 0.0,
+            "stream": False,
+            "ignore_eos": True,
+        }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        per_attempt_timeout = min(request_timeout, remaining)
+        probe_start = time.monotonic()
+        try:
+            response = http_requests.post(probe_url,
+                                          json=probe_body,
+                                          timeout=per_attempt_timeout)
+            probe_latency = time.monotonic() - probe_start
+            if time.monotonic() >= deadline:
+                last_outcome = (
+                    f"probe completed after the {timeout}s recovery deadline")
+                break
+            if response.status_code == 200:
+                payload = response.json()
+                choices = payload.get("choices") if isinstance(payload,
+                                                               dict) else None
+                if not isinstance(choices, list) or not choices:
+                    raise ValueError(
+                        "successful recovery probe returned no choices")
+                first_choice = choices[0]
+                if (not isinstance(first_choice, dict)
+                        or not isinstance(first_choice.get("text"), str)
+                        or not first_choice["text"].strip()):
+                    raise ValueError(
+                        "successful recovery probe returned no generated text")
+                usage = payload.get("usage")
+                if (not isinstance(usage, dict)
+                        or usage.get("completion_tokens")
+                        != _RECOVERY_PROBE_OUTPUT_TOKENS):
+                    raise ValueError(
+                        "successful recovery probe did not generate exactly "
+                        f"{_RECOVERY_PROBE_OUTPUT_TOKENS} tokens")
+                consecutive_successes += 1
+                last_outcome = (f"HTTP 200 in {probe_latency:.1f}s, "
+                                f"streak={consecutive_successes}/"
+                                f"{required_successes}")
+            else:
+                consecutive_successes = 0
+                body = response.text.replace("\n", " ")[:300]
+                last_outcome = (f"HTTP {response.status_code} in "
+                                f"{probe_latency:.1f}s: {body}")
+        except (http_requests.RequestException, ValueError) as error:
+            consecutive_successes = 0
+            probe_latency = time.monotonic() - probe_start
+            last_outcome = (f"{type(error).__name__} after "
+                            f"{probe_latency:.1f}s: {error}")
+
+        elapsed = time.monotonic() - start_time
+        logger.info(f"Post-stress recovery probe {attempt}: "
+                    f"elapsed={elapsed:.1f}s, {last_outcome}")
+        _raise_if_process_stopped(monitored_processes, "recovery")
+        if consecutive_successes >= required_successes:
+            logger.info("Disaggregated service recovered after "
+                        f"{elapsed:.1f}s and {attempt} probe(s)")
+            return
+
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(_RECOVERY_PROBE_INTERVAL_SECS, remaining))
+
+    raise TimeoutError(
+        f"Disaggregated service did not recover within {timeout}s after "
+        f"{attempt} probe(s); last outcome: {last_outcome}")
+
+
+def remove_stale_aiperf_terminal_records(artifact_dir: str) -> None:
+    records_path = os.path.join(artifact_dir, "profile_export.jsonl")
+    try:
+        os.remove(records_path)
+    except FileNotFoundError:
+        pass
+
+
+def validate_aiperf_terminal_records(artifact_dir: str, expected_count: int,
+                                     client_timeout: int) -> None:
+    """Require one terminal AIPerf record for every profiled request.
+
+    The stress phase intentionally allows overload errors and injected client
+    cancellations, so this validates terminal accounting rather than imposing
+    a success-rate SLO. The follow-on accuracy phase validates recovery and
+    semantic correctness.
+    """
+    if expected_count <= 0:
+        raise ValueError("expected AIPerf record count must be positive")
+    if client_timeout <= 0:
+        raise ValueError("AIPerf client timeout must be positive")
+
+    records_path = os.path.join(artifact_dir, "profile_export.jsonl")
+    if not os.path.isfile(records_path):
+        raise AssertionError(
+            f"AIPerf terminal-record export is missing: {records_path}")
+
+    status_counts = Counter()
+    request_ids = set()
+    cancelled_count = 0
+    record_count = 0
+    max_terminal_latency = 0.0
+    max_terminal_latency_allowed = (client_timeout +
+                                    _AIPERF_TERMINAL_OBSERVATION_GRACE_SECS)
+    with open(records_path, "r", encoding="utf-8") as records_file:
+        for line_number, line in enumerate(records_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise AssertionError(
+                    f"Invalid AIPerf record at {records_path}:{line_number}: "
+                    f"{error}") from error
+            if not isinstance(record, dict):
+                raise AssertionError(
+                    f"AIPerf record {line_number} is not an object")
+
+            metadata = record.get("metadata")
+            if not isinstance(metadata, dict):
+                raise AssertionError(
+                    f"AIPerf record {line_number} has no metadata")
+            request_id = metadata.get("x_request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise AssertionError(
+                    f"AIPerf record {line_number} has no request ID")
+            request_end_ns = metadata.get("request_end_ns")
+            if not isinstance(request_end_ns, int) or request_end_ns <= 0:
+                raise AssertionError(
+                    f"AIPerf record {line_number} is not terminal")
+            request_start_ns = metadata.get("request_start_ns")
+            if not isinstance(request_start_ns, int) or request_start_ns <= 0:
+                raise AssertionError(
+                    f"AIPerf record {line_number} has no request start time")
+            terminal_latency = (request_end_ns - request_start_ns) / 1e9
+            if (terminal_latency < 0
+                    or terminal_latency > max_terminal_latency_allowed):
+                raise AssertionError(
+                    f"AIPerf record {line_number} terminalized in "
+                    f"{terminal_latency:.3f}s, outside the allowed range "
+                    f"[0, {max_terminal_latency_allowed}]s")
+            max_terminal_latency = max(max_terminal_latency, terminal_latency)
+            if request_id in request_ids:
+                raise AssertionError(
+                    f"AIPerf request ID {request_id} appears more than once")
+            request_ids.add(request_id)
+
+            error = record.get("error")
+            if error is None:
+                status_counts["success"] += 1
+            elif isinstance(error, dict):
+                status_counts[f"error:{error.get('code', 'unknown')}"] += 1
+            else:
+                status_counts["error:malformed"] += 1
+            if metadata.get("was_cancelled") is True:
+                cancelled_count += 1
+            record_count += 1
+
+    logger.info("AIPerf terminal accounting: "
+                f"records={record_count}/{expected_count}, "
+                f"cancelled={cancelled_count}, "
+                f"max_latency={max_terminal_latency:.3f}s, "
+                f"statuses={dict(status_counts)}")
+    if record_count != expected_count:
+        raise AssertionError(
+            "AIPerf did not produce exactly one terminal record per profiled "
+            f"request: expected={expected_count}, actual={record_count}, "
+            f"statuses={dict(status_counts)}")
+
+
+def test_validate_aiperf_terminal_records(tmp_path):
+    records_path = tmp_path / "profile_export.jsonl"
+
+    with pytest.raises(ValueError, match="record count"):
+        validate_aiperf_terminal_records(str(tmp_path), 0, client_timeout=195)
+    with pytest.raises(ValueError, match="client timeout"):
+        validate_aiperf_terminal_records(str(tmp_path), 1, client_timeout=0)
+
+    def make_record(request_id,
+                    start_ns=1_000_000_000,
+                    end_ns=2_000_000_000,
+                    error=None,
+                    cancelled=False):
+        return {
+            "metadata": {
+                "x_request_id": request_id,
+                "request_start_ns": start_ns,
+                "request_end_ns": end_ns,
+                "was_cancelled": cancelled,
+            },
+            "error": error,
+        }
+
+    def write_records(records):
+        records_path.write_text("".join(f"{json.dumps(record)}\n"
+                                        for record in records),
+                                encoding="utf-8")
+
+    valid_records = [
+        make_record("success"),
+        make_record("cancelled", error={"code": 499}, cancelled=True),
+    ]
+    write_records(valid_records)
+    validate_aiperf_terminal_records(str(tmp_path), 2, client_timeout=195)
+
+    write_records([
+        make_record("bounded-cleanup", end_ns=(1 + 190) * 1_000_000_000),
+    ])
+    validate_aiperf_terminal_records(str(tmp_path), 1, client_timeout=195)
+
+    with pytest.raises(AssertionError, match="expected=3"):
+        validate_aiperf_terminal_records(str(tmp_path), 3, client_timeout=195)
+
+    write_records([valid_records[0], valid_records[0]])
+    with pytest.raises(AssertionError, match="appears more than once"):
+        validate_aiperf_terminal_records(str(tmp_path), 2, client_timeout=195)
+
+    write_records([make_record("nonterminal", end_ns=None)])
+    with pytest.raises(AssertionError, match="is not terminal"):
+        validate_aiperf_terminal_records(str(tmp_path), 1, client_timeout=195)
+
+    write_records([
+        make_record("late", end_ns=(1 + 201) * 1_000_000_000),
+    ])
+    with pytest.raises(AssertionError, match="outside the allowed range"):
+        validate_aiperf_terminal_records(str(tmp_path), 1, client_timeout=195)
+
+    records_path.write_text("{invalid json\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="Invalid AIPerf record"):
+        validate_aiperf_terminal_records(str(tmp_path), 1, client_timeout=195)
+
+    remove_stale_aiperf_terminal_records(str(tmp_path))
+    assert not records_path.exists()
+    with pytest.raises(AssertionError, match="export is missing"):
+        validate_aiperf_terminal_records(str(tmp_path), 1, client_timeout=195)
+
+
+def test_wait_for_disagg_recovery(monkeypatch):
+    import requests as http_requests
+
+    class FakeProcess:
+
+        def __init__(self, return_code=None):
+            self.return_code = return_code
+
+        def poll(self):
+            return self.return_code
+
+    class FakeWrapper:
+
+        def __init__(self, return_code=None):
+            self.process = FakeProcess(return_code)
+            self.log_path = "fake.log"
+
+    class FakeResponse:
+
+        def __init__(self, status_code, completion_tokens=32):
+            self.status_code = status_code
+            self.text = "error" if status_code != 200 else ""
+            self.completion_tokens = completion_tokens
+
+        def json(self):
+            return {
+                "choices": [{
+                    "text": "generated output"
+                }],
+                "usage": {
+                    "completion_tokens": self.completion_tokens,
+                },
+            }
+
+    responses = [
+        FakeResponse(504),
+        FakeResponse(200, completion_tokens=31),
+        FakeResponse(200),
+        FakeResponse(200),
+    ]
+    observed_prompts = []
+
+    def post(_url, json, timeout):
+        assert timeout > 0
+        observed_prompts.append(json["prompt"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(http_requests, "post", post)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    workers = [FakeWrapper(), FakeWrapper()]
+    disagg_server = FakeWrapper()
+    with pytest.raises(ValueError, match="post_stress_recovery_timeout"):
+        wait_for_disagg_recovery("http://server",
+                                 "model",
+                                 timeout=0,
+                                 request_timeout=1,
+                                 required_successes=1,
+                                 workers=workers,
+                                 disagg_server=disagg_server)
+    with pytest.raises(ValueError, match="request_timeout"):
+        wait_for_disagg_recovery("http://server",
+                                 "model",
+                                 timeout=1,
+                                 request_timeout=0,
+                                 required_successes=1,
+                                 workers=workers,
+                                 disagg_server=disagg_server)
+    with pytest.raises(ValueError, match="required_successes"):
+        wait_for_disagg_recovery("http://server",
+                                 "model",
+                                 timeout=1,
+                                 request_timeout=1,
+                                 required_successes=0,
+                                 workers=workers,
+                                 disagg_server=disagg_server)
+
+    wait_for_disagg_recovery("http://server",
+                             "model",
+                             timeout=2,
+                             request_timeout=1,
+                             required_successes=2,
+                             workers=workers,
+                             disagg_server=disagg_server)
+    assert len(observed_prompts) == 4
+    assert len(set(observed_prompts)) == 4
+
+    with pytest.raises(RuntimeError, match="exited during recovery"):
+        wait_for_disagg_recovery("http://server",
+                                 "model",
+                                 timeout=1,
+                                 request_timeout=1,
+                                 required_successes=1,
+                                 workers=[FakeWrapper(return_code=1)],
+                                 disagg_server=disagg_server)
+
+
+def test_wait_for_disagg_recovery_rejects_post_deadline_response(monkeypatch):
+    import requests as http_requests
+
+    class FakeProcess:
+
+        def poll(self):
+            return None
+
+    class FakeWrapper:
+        process = FakeProcess()
+        log_path = "fake.log"
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [{
+                    "text": "generated output"
+                }],
+                "usage": {
+                    "completion_tokens": _RECOVERY_PROBE_OUTPUT_TOKENS,
+                },
+            }
+
+    def slow_post(_url, json, timeout):
+        del json, timeout
+        time.sleep(0.02)
+        return FakeResponse()
+
+    monkeypatch.setattr(http_requests, "post", slow_post)
+    with pytest.raises(TimeoutError, match="deadline"):
+        wait_for_disagg_recovery("http://server",
+                                 "model",
+                                 timeout=0.005,
+                                 request_timeout=1,
+                                 required_successes=1,
+                                 workers=[FakeWrapper()],
+                                 disagg_server=FakeWrapper())
 
 
 def scan_logs_for_fatal_errors(processes):
@@ -148,7 +598,7 @@ def build_worker_diag(workers, disagg_server):
     string if all workers are healthy.
     """
     all_procs = list(workers) + [disagg_server]
-    crashed = _crashed_workers(workers)
+    crashed = _crashed_workers(all_procs)
     fatal = scan_logs_for_fatal_errors(all_procs)
     diag = ""
     if crashed:
@@ -2356,29 +2806,31 @@ def get_config_for_benchmark(model_root, backend):
     return serve_config
 
 
-def run_disaggregated_aiperf(config_file,
-                             model_path,
-                             server_start_timeout=1200,
-                             input_tokens=128,
-                             output_tokens=100,
-                             input_tokens_stddev=0,
-                             output_tokens_stddev=0,
-                             concurrency=1,
-                             endpoint_type='chat',
-                             request_count=None,
-                             warmup_request_count=10,
-                             streaming=True,
-                             random_seed=100,
-                             accuracy_test=False,
-                             threshold=0.8,
-                             cancellation_rate=None,
-                             cancellation_delay=None,
-                             env=None,
-                             cwd=None,
-                             request_timeout=180,
-                             heartbeat_interval_sec: int | None = None,
-                             inactive_timeout_sec: int | None = None,
-                             accuracy_concurrency: Optional[int] = None):
+def run_disaggregated_aiperf(
+        config_file,
+        model_path,
+        server_start_timeout=1200,
+        input_tokens=128,
+        output_tokens=100,
+        input_tokens_stddev=0,
+        output_tokens_stddev=0,
+        concurrency=1,
+        endpoint_type='chat',
+        request_count=None,
+        warmup_request_count=10,
+        streaming=True,
+        random_seed=100,
+        accuracy_test=False,
+        threshold=0.8,
+        cancellation_rate=None,
+        cancellation_delay=None,
+        env=None,
+        cwd=None,
+        request_timeout=180,
+        heartbeat_interval_sec: int | None = None,
+        inactive_timeout_sec: int | None = None,
+        accuracy_concurrency: Optional[int] = None,
+        post_stress_recovery_timeout: Optional[int] = None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2403,14 +2855,25 @@ def run_disaggregated_aiperf(config_file,
         heartbeat_interval_sec: Optional worker heartbeat interval override
         inactive_timeout_sec: Optional worker inactivity timeout override
         accuracy_concurrency: Optional concurrency override for the accuracy phase
+        post_stress_recovery_timeout: Optional bounded wait for fresh requests
+            to succeed before the accuracy phase
     """
     cleanup_output_files()
     if accuracy_concurrency is not None and accuracy_concurrency <= 0:
         raise ValueError("accuracy_concurrency must be positive")
+    if request_timeout <= 0:
+        raise ValueError("request_timeout must be positive")
+    if (post_stress_recovery_timeout is not None
+            and post_stress_recovery_timeout <= 0):
+        raise ValueError("post_stress_recovery_timeout must be positive")
 
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
+    artifact_dir = os.path.join(cwd or ".", "benchmark-results")
+    aiperf_client_timeout = (request_timeout +
+                             _AIPERF_CLIENT_TIMEOUT_GRACE_SECS)
+    remove_stale_aiperf_terminal_records(artifact_dir)
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
@@ -2421,7 +2884,6 @@ def run_disaggregated_aiperf(config_file,
                              inactive_timeout_sec=inactive_timeout_sec)
 
     server_host = config.get("hostname", "localhost")
-    artifact_dir = os.path.join(cwd or ".", "benchmark-results")
 
     try:
         # Wait for server to be ready
@@ -2449,6 +2911,8 @@ def run_disaggregated_aiperf(config_file,
         aiperf_cmd.extend([
             '--url',
             f'{server_host}:{server_port}',
+            '--request-timeout-seconds',
+            str(aiperf_client_timeout),
             '--synthetic-input-tokens-mean',
             str(input_tokens),
             '--synthetic-input-tokens-stddev',
@@ -2503,6 +2967,15 @@ def run_disaggregated_aiperf(config_file,
                    env=env,
                    poll_procs=all_worker_procs + [disagg_server.process])
 
+        if request_count is not None:
+            validate_aiperf_terminal_records(artifact_dir, request_count,
+                                             aiperf_client_timeout)
+
+        # This phase intentionally overloads the service and injects client
+        # cancellations. Its contract is bounded client terminality rather than
+        # a request-success SLO; the accuracy phase below verifies that the
+        # service recovers and remains semantically correct afterward.
+
         # Catch cases where aiperf finished but the disagg cluster was unhealthy
         # during the run (e.g. context-side hangs, KV transfer timeouts) which
         # would otherwise be swallowed because aiperf records 500s as completed.
@@ -2519,6 +2992,20 @@ def run_disaggregated_aiperf(config_file,
 
         if accuracy_test:
             accuracy_server_url = f"http://{server_host}:{server_port}"
+            if post_stress_recovery_timeout is not None:
+                required_probe_successes = (max(
+                    _RECOVERY_PROBE_MIN_SUCCESSES,
+                    _RECOVERY_PROBE_ROUNDS_PER_WORKER *
+                    max(len(ctx_workers), len(gen_workers))))
+                wait_for_disagg_recovery(
+                    accuracy_server_url,
+                    model_path=model_path,
+                    timeout=post_stress_recovery_timeout,
+                    request_timeout=(request_timeout +
+                                     _ACCURACY_CLIENT_TIMEOUT_GRACE_SECS),
+                    required_successes=required_probe_successes,
+                    workers=[*ctx_workers, *gen_workers],
+                    disagg_server=disagg_server)
             # Keep lm-eval retries from recreating the stress burst while
             # uncancelled AIPerf backend work finishes naturally.
             resolved_accuracy_concurrency = (concurrency if accuracy_concurrency
@@ -2537,6 +3024,15 @@ def run_disaggregated_aiperf(config_file,
                 process_timeout=_ACCURACY_PROCESS_TIMEOUT_SECS,
                 max_gen_toks=256,
                 max_length=4096)
+
+            _raise_if_process_stopped(
+                [*ctx_workers, *gen_workers, disagg_server], "accuracy")
+            cluster_diag = build_worker_diag([*ctx_workers, *gen_workers],
+                                             disagg_server)
+            if cluster_diag:
+                raise AssertionError(
+                    "Disaggregated cluster became unhealthy during the "
+                    f"accuracy phase: {cluster_diag}")
 
             if not accuracy_test_result:
                 raise AssertionError(
@@ -2690,11 +3186,18 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
             logger.warning(f"stderr: {result.stderr}")
             return False, accuracy_value
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as error:
         duration = int(time.time() - test_start_time)
         logger.warning("Accuracy test subprocess timed out after "
                        f"{duration} seconds (watchdog={process_timeout}, "
                        f"per_request={request_timeout})")
+        for stream_name, partial_output in (("stdout", error.stdout),
+                                            ("stderr", error.stderr)):
+            if partial_output:
+                if isinstance(partial_output, bytes):
+                    partial_output = partial_output.decode(errors="replace")
+                logger.warning(f"Partial lm_eval {stream_name}:\n"
+                               f"{partial_output[-20_000:]}")
         return False, accuracy_value
     except Exception as e:
         logger.warning(f"Error during accuracy test: {str(e)}")
@@ -2885,7 +3388,8 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
                             cancellation_delay=0.5,
                             accuracy_concurrency=32,
                             heartbeat_interval_sec=5,
-                            inactive_timeout_sec=10),
+                            inactive_timeout_sec=10,
+                            post_stress_recovery_timeout=1_800),
                  marks=(pytest.mark.skip_less_device(2), skip_no_hopper)),
     pytest.param(TestConfig(model_path='GLM-5-NVFP4',
                             test_desc='glm5_nvfp4_tp4_ep4_dp_stress',
@@ -2904,7 +3408,8 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
         cancellation_delay=0.5,
         accuracy_concurrency=32,
         heartbeat_interval_sec=5,
-        inactive_timeout_sec=10),
+        inactive_timeout_sec=10,
+        post_stress_recovery_timeout=1_800),
                  marks=(pytest.mark.skip_less_device(8), skip_pre_hopper)),
 ],
                          ids=lambda x: x.test_desc)
@@ -2981,7 +3486,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
         cwd=llm_venv.get_working_directory(),
         request_timeout=test_config.request_timeout,
         heartbeat_interval_sec=(test_config.heartbeat_interval_sec),
-        inactive_timeout_sec=(test_config.inactive_timeout_sec))
+        inactive_timeout_sec=(test_config.inactive_timeout_sec),
+        post_stress_recovery_timeout=(test_config.post_stress_recovery_timeout))
 
 
 def run_cancel_stress_test(server_url: str,

@@ -1,3 +1,6 @@
+disaggregated/test_disaggregated.py::test_validate_aiperf_terminal_records
+disaggregated/test_disaggregated.py::test_wait_for_disagg_recovery
+disaggregated/test_disaggregated.py::test_wait_for_disagg_recovery_rejects_post_deadline_response
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-deepseek_r1_v2_fp4_stress]
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-deepseek_r1_v2_fp4_mtp_stress]
 disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_trtllm_stress]
