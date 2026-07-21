@@ -43,6 +43,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_T2I_PARAMS,
+    _crop_video_frames,
+    _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
@@ -51,7 +53,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
     _condition_pixel_frame_count,
-    _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -656,7 +657,6 @@ class TestCosmos3V2V:
             video=video,
             num_frames=NUM_FRAMES,
             condition_video_latent_indexes=[0, 1],
-            condition_video_keep="first",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
@@ -668,9 +668,9 @@ class TestCosmos3V2V:
 
     def test_v2v_tensor_reference_smoke(self, cosmos3_pipeline):
         """The V2V reference arrives as a decoded uint8 [T, H, W, C] tensor
-        (the ``video`` extra-param contract); the worker crops the conditioning
-        window and VAE-encodes. Mirrors what the offline example and serve feed
-        the pipeline."""
+        (the ``video`` extra-param contract, cropped by the coordinator's
+        reducer in real requests); the worker VAE-encodes it, capping/padding
+        to the latent window in ``_prepare_latents_v2v``."""
         from tensorrt_llm.inputs.media_io import frames_to_tensor
 
         video = frames_to_tensor(_make_test_video(NUM_FRAMES))
@@ -681,17 +681,17 @@ class TestCosmos3V2V:
             video=video,
             num_frames=NUM_FRAMES,
             condition_video_latent_indexes=[0, 1],
-            condition_video_keep="first",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
 
     def test_v2v_keep_last_smoke(self, cosmos3_pipeline):
         """condition_video_keep="last" pins the tail of the input, not the head.
 
-        The input is longer than the conditioning window and color-coded
-        (dark head, bright tail), so this exercises the full-decode +
-        tail-slice path and asserts behavior: frame 0 of the output is a
-        pinned VAE round-trip of the bright tail frames.
+        ``keep`` is consumed by the coordinator-side reducer
+        (``_crop_video_frames``), so this test composes reducer + forward the
+        way a real request flows. The input is longer than the conditioning
+        window and color-coded (dark head, bright tail); frame 0 of the output
+        must be a pinned VAE round-trip of the bright tail frames.
         """
         dark = PIL.Image.new("RGB", (WIDTH, HEIGHT), (40, 40, 40))
         bright = PIL.Image.new("RGB", (WIDTH, HEIGHT), (230, 230, 230))
@@ -699,13 +699,14 @@ class TestCosmos3V2V:
         video = frames_to_tensor(
             [dark.copy() for _ in range(NUM_FRAMES)] + [bright.copy() for _ in range(5)]
         )
+        video = _crop_video_frames(video, {"condition_video_keep": "last"})
+        assert video.shape[0] == 5
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
             video=video,
             num_frames=NUM_FRAMES,
             condition_video_latent_indexes=[0, 1],
-            condition_video_keep="last",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         first_frame_mean = result.video[0, 0].float().mean().item()
@@ -824,7 +825,6 @@ class TestCosmos3Audio:
             enable_audio=True,
             video=frames_to_tensor(_make_test_video(NUM_FRAMES)),
             condition_video_latent_indexes=[0, 1],
-            condition_video_keep="first",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         _assert_valid_audio(result.audio, result.audio_sample_rate)

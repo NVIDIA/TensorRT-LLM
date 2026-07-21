@@ -393,15 +393,20 @@ def is_decodable_video_file(path) -> bool:
 
 
 def is_decodable_image_bytes(data) -> bool:
-    """True when ``data`` holds still-image content (anything PIL opens).
+    """True when ``data`` holds still-image content PIL can fully decode.
 
-    In-memory counterpart of :func:`is_decodable_image_file` — header-only probe, no
-    pixel decode, no filesystem.
+    In-memory counterpart of :func:`is_decodable_image_file`, but strict:
+    ``Image.open`` is lazy, so this also decodes the pixels (``load``) —
+    a truncated file passes a header-only probe and would then 500 at the
+    worker's load instead of 400ing at the boundary.
     """
     try:
-        with Image.open(BytesIO(data)):
+        with Image.open(BytesIO(data)) as image:
+            image.load()
             return True
-    except UnidentifiedImageError:
+    except OSError:
+        # ``UnidentifiedImageError`` (bad header) subclasses ``OSError``;
+        # truncated files raise plain ``OSError`` from ``load``.
         return False
 
 
@@ -473,6 +478,130 @@ def decode_video_frames_from_bytes(data, max_frames: Optional[int] = None) -> Li
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 
 
+# Longest video, in frames, a client may request as *output*; used by the
+# serve's ``num_frames`` cap (``openai_protocol``).
+MAX_VIDEO_FRAMES = 7200
+
+# Hard budget for *decoded* video bytes when reading a reference. Bounds both
+# the preallocated buffer and total accumulation, whatever the resolution —
+# a frame count alone is no guard (7200 frames is ~18.5 GiB at 720p). The
+# canonical 189-frame 720p reference is ~0.5 GiB, so this allows 2x headroom.
+MAX_DECODED_VIDEO_BYTES = 1 << 30  # 1 GiB
+
+
+class DecodedVideoTooLargeError(ValueError):
+    """Decoded reference exceeds ``MAX_DECODED_VIDEO_BYTES``.
+
+    A ``ValueError`` subclass so boundary handlers still map it to a client
+    error (400), while letting its actionable message pass through instead of
+    being folded into generic "undecodable content" handling.
+    """
+
+
+def _decode_capture_to_tensor(
+    cv2, capture, max_frames: Optional[int], src_repr: str
+) -> torch.Tensor:
+    """Drain an opened ``VideoCapture`` straight into a uint8 [T, H, W, C] tensor.
+
+    Streams frames into one preallocated array, so with accurate container
+    metadata peak memory is a single copy of the video — roughly half of the
+    decode-to-PIL-list-then-``np.stack`` route. Unknown or misreported lengths
+    take the spill paths below, whose ``stack``/``concatenate`` transients can
+    reach ~2-3x the decoded size — still bounded, since everything is capped
+    by ``MAX_DECODED_VIDEO_BYTES``
+    measured against real frame sizes: the preallocation (the declared frame
+    count is container metadata, not evidence) and the total decoded
+    accumulation (streams that exceed the budget raise instead of growing
+    without bound). Misreported lengths degrade gracefully: extra frames spill
+    to a side list, an over-declared buffer is trimmed, and an unknown length
+    falls back to list-and-stack.
+    """
+    if not capture.isOpened():
+        raise ValueError(f"Could not open video from {src_repr}.")
+    declared = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    buffer = None
+    overflow = []
+    count = 0
+    decoded_bytes = 0
+    while max_frames is None or count < max_frames:
+        ok, frame = capture.read()
+        if not ok:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        decoded_bytes += rgb.nbytes
+        if decoded_bytes > MAX_DECODED_VIDEO_BYTES:
+            raise DecodedVideoTooLargeError(
+                f"Video from {src_repr} exceeds the decoded-size budget of "
+                f"{MAX_DECODED_VIDEO_BYTES >> 20} MiB at frame {count}; trim or "
+                "downscale the reference."
+            )
+        if buffer is None and declared > 0:
+            # Size the preallocation from the declared count, clamped to the
+            # byte budget using the actual frame size (an over-declared buffer
+            # is virtual until written; the trim below drops the excess).
+            capacity = min(declared, MAX_DECODED_VIDEO_BYTES // max(rgb.nbytes, 1))
+            if max_frames is not None:
+                capacity = min(capacity, max_frames)
+            if capacity > 0:
+                buffer = np.empty((capacity, *rgb.shape), dtype=np.uint8)
+        if buffer is not None and count < buffer.shape[0]:
+            buffer[count] = rgb
+        else:
+            overflow.append(rgb)
+        count += 1
+
+    if count == 0:
+        raise ValueError(f"Video contains no frames ({src_repr}).")
+    if buffer is None:
+        return torch.from_numpy(np.stack(overflow))
+    filled = min(count, buffer.shape[0])
+    if overflow:
+        return torch.from_numpy(np.concatenate([buffer[:filled], np.stack(overflow)]))
+    if filled < buffer.shape[0]:
+        # Over-declared container: trim without keeping the oversized buffer.
+        return torch.from_numpy(buffer[:filled].copy())
+    return torch.from_numpy(buffer)
+
+
+def decode_video_tensor(path, max_frames: Optional[int] = None) -> torch.Tensor:
+    """Decode a video file into a uint8 ``[T, H, W, C]`` RGB tensor.
+
+    Tensor-native counterpart of :func:`decode_video_frames` — streams into a
+    single buffer instead of materializing PIL frames first.
+    """
+    cv2 = _get_cv2()
+    capture = cv2.VideoCapture(str(path))
+    try:
+        return _decode_capture_to_tensor(cv2, capture, max_frames, f"'{path}'")
+    finally:
+        capture.release()
+
+
+def decode_video_tensor_from_bytes(data, max_frames: Optional[int] = None) -> torch.Tensor:
+    """Decode raw video bytes into a uint8 ``[T, H, W, C]`` RGB tensor.
+
+    In-memory when this OpenCV build has a stream-buffered backend; otherwise
+    the bytes spill to an auto-deleted tempfile. Raises ``ValueError`` when the
+    bytes are not a decodable video.
+    """
+    cv2 = _get_cv2()
+    backend = _select_cv2_stream_buffered_backend()
+    if backend is None:
+        with tempfile.NamedTemporaryFile() as spill:
+            spill.write(data)
+            spill.flush()
+            return decode_video_tensor(spill.name, max_frames=max_frames)
+
+    # cv2 keeps a non-owning view into the buffer; hold it until release().
+    buffer = BytesIO(bytes(data))
+    capture = cv2.VideoCapture(buffer, backend, [])
+    try:
+        return _decode_capture_to_tensor(cv2, capture, max_frames, f"<{len(data)} bytes>")
+    finally:
+        capture.release()
+
+
 def frames_to_tensor(frames: List["Image.Image"]) -> torch.Tensor:
     """Stack PIL frames into a uint8 ``[T, H, W, C]`` RGB CPU tensor.
 
@@ -512,7 +641,7 @@ def load_video_frames_tensor(source, max_frames: Optional[int] = None) -> torch.
     if is_decodable_image_file(path):
         return frames_to_tensor([Image.open(path)])
     if is_decodable_video_file(path):
-        return frames_to_tensor(decode_video_frames(path, max_frames=max_frames))
+        return decode_video_tensor(path, max_frames=max_frames)
     raise ValueError(
         f"Video reference must be a decodable video, a decodable image, or a "
         f"directory of frame images; got undecodable {path}"

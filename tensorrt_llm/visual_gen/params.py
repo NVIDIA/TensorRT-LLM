@@ -113,6 +113,39 @@ _GENERATION_CONFIG_FIELDS: tuple = (
 )
 
 
+def reduce_visual_gen_params(
+    params: VisualGenParams,
+    extra_param_specs: Dict[str, Any],
+) -> VisualGenParams:
+    """Apply spec-declared transport reducers to ``extra_params`` values.
+
+    Runs once in the coordinator, before the request is deep-copied and
+    serialized, so oversized payloads (e.g. a full V2V reference when only
+    the conditioning window is consumed) shrink before they hit the copy /
+    ZMQ / per-rank broadcast path. Reducers are semantics-preserving by
+    contract — the worker behaves identically with or without them.
+
+    Never mutates ``params``: returns it unchanged when nothing reduces,
+    otherwise a shallow copy carrying a new ``extra_params`` dict.
+    """
+    if not params.extra_params:
+        return params
+    reduced: Dict[str, Any] = {}
+    for key, value in params.extra_params.items():
+        spec = extra_param_specs.get(key)
+        reducer = getattr(spec, "reducer", None) if spec is not None else None
+        if reducer is None or value is None:
+            continue
+        new_value = reducer(value, params.extra_params)
+        if new_value is not value:
+            reduced[key] = new_value
+    if not reduced:
+        return params
+    out = params.model_copy()
+    out.extra_params = {**params.extra_params, **reduced}
+    return out
+
+
 def validate_visual_gen_params(
     params: VisualGenParams,
     *,

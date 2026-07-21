@@ -911,6 +911,31 @@ class TestVideoGenerationSync:
         assert resp.status_code == 400
         assert "neither a decodable image" in resp.text
 
+    def test_sync_video_oversized_reference_400_with_message(
+        self, video_client, tmp_path, monkeypatch
+    ):
+        """A reference over the decoded-byte budget gets an HTTP 400 whose body
+        carries the actionable size message (not the generic undecodable one)."""
+        cv2 = _require_opencv()
+        from tensorrt_llm.inputs import media_io
+
+        monkeypatch.setattr(media_io, "MAX_DECODED_VIDEO_BYTES", 100)
+        ref_path = tmp_path / "ref.mp4"
+        writer = cv2.VideoWriter(str(ref_path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
+        try:
+            for _ in range(4):
+                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+        finally:
+            writer.release()
+        with open(ref_path, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos/generations",
+                data={"prompt": "x"},
+                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+            )
+        assert resp.status_code == 400
+        assert "decoded-size budget" in resp.text
+
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
             "/v1/videos/generations",

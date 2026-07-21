@@ -37,7 +37,7 @@ from pydantic import (BaseModel, ConfigDict, Field, PositiveInt,
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.inputs.media_io import MAX_VIDEO_FRAMES, MediaModality
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
@@ -1695,7 +1695,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
     # The numbers are generous (a minute of video at 120 fps) so common
     # workloads pass; clients that need larger budgets can lift the cap
     # at deployment time.
-    num_frames: Optional[int] = Field(default=None, gt=0, le=7200)
+    num_frames: Optional[int] = Field(default=None, gt=0, le=MAX_VIDEO_FRAMES)
     seconds: Optional[float] = Field(default=None, gt=0, le=60.0)
     frame_rate: Optional[float] = Field(default=None,
                                         alias="fps",
