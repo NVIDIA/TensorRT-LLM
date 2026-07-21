@@ -147,7 +147,10 @@ class MLP(nn.Module):
 
         x_up = self.up_proj(x)
 
-        if self._use_fused_relu2_quant:
+        # Weight loading may replace the quantization method after
+        # create_weights(), so do not rely on the cached eligibility alone.
+        if (self._use_fused_relu2_quant
+                and is_static_nvfp4_input_eligible(self.down_proj)):
             x_act = self._fused_relu2_quant(x_up)
         else:
             x_act = self.activation(x_up)

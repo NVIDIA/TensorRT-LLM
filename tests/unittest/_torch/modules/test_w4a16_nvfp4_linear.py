@@ -189,7 +189,10 @@ def test_get_quant_method_returns_w4a16_nvfp4_linear_method():
 def test_w4a16_nvfp4_mlp_disables_relu2_fp4_fusion_without_input_scale():
     model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4))
 
-    with patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=121):
+    with (
+        patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=121),
+        patch("torch.ops.trtllm.fused_relu2_quantize", create=True),
+    ):
         mlp = MLP(
             hidden_size=32,
             intermediate_size=64,
@@ -204,6 +207,64 @@ def test_w4a16_nvfp4_mlp_disables_relu2_fp4_fusion_without_input_scale():
     assert mlp.down_proj.has_nvfp4
     assert mlp.down_proj.input_scale is None
     assert not mlp._use_fused_relu2_quant
+
+
+def test_nvfp4_mlp_enables_relu2_fp4_fusion_with_static_input_scale():
+    model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4))
+
+    with (
+        patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=121),
+        patch("torch.ops.trtllm.fused_relu2_quantize", create=True),
+    ):
+        mlp = MLP(
+            hidden_size=32,
+            intermediate_size=64,
+            bias=False,
+            activation=relu2,
+            dtype=torch.bfloat16,
+            config=model_config,
+            reduce_output=False,
+        )
+        mlp.create_weights()
+
+    assert mlp.down_proj.input_scale is not None
+    assert mlp._use_fused_relu2_quant
+
+
+def test_w4a16_nvfp4_mlp_rechecks_relu2_fp4_fusion_before_forward():
+    model_config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4))
+
+    with (
+        patch("tensorrt_llm._torch.modules.mlp.get_sm_version", return_value=121),
+        patch("torch.ops.trtllm.fused_relu2_quantize", create=True),
+    ):
+        mlp = MLP(
+            hidden_size=32,
+            intermediate_size=64,
+            bias=False,
+            activation=relu2,
+            dtype=torch.bfloat16,
+            config=model_config,
+            reduce_output=False,
+        )
+        mlp.create_weights()
+
+    # Simulate eligibility cached before weight loading replaced the linear
+    # method with W4A16, whose high-precision activation has no input_scale.
+    mlp._use_fused_relu2_quant = True
+    x_up = torch.tensor([[-2.0, 3.0]], dtype=torch.bfloat16)
+    with (
+        patch.object(mlp.up_proj, "forward", return_value=x_up),
+        patch.object(mlp.down_proj, "forward", side_effect=lambda x: x),
+        patch.object(
+            MLP,
+            "_fused_relu2_quant",
+            side_effect=AssertionError("missing input_scale must use unfused ReLU2"),
+        ),
+    ):
+        output = mlp(torch.empty((1, 32), dtype=torch.bfloat16))
+
+    torch.testing.assert_close(output, relu2(x_up))
 
 
 def test_w4a16_nvfp4_linear_uses_high_precision_activation_without_fp4_quantize():
