@@ -4,6 +4,8 @@ import enum
 import math
 import os
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Union
 
@@ -2956,19 +2958,52 @@ def _mxfp8_cutlass_op_available() -> bool:
                    ) and torch.cuda.get_device_capability()[0] >= 10
 
 
+_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
+    "flashinfer_mxfp8_autotune_active", default=False)
+_FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
+    "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+
+
+@contextmanager
+def flashinfer_mxfp8_autotune():
+    """Tune FlashInfer MXFP8 tactics while enabling auto-dispatched calls."""
+    from flashinfer.autotuner import autotune
+
+    token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
+    try:
+        with autotune():
+            yield
+    finally:
+        _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
+
+
+@contextmanager
+def flashinfer_mxfp8_decode_graph_capture():
+    """Enable auto-dispatched FlashInfer calls only for decode graph capture."""
+    token = _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
+
+
 class MXFP8LinearMethod(LinearMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32) x dynamic MXFP8 activations (W8A8).
 
-    Two execution paths share a common loader:
+    Three execution paths share a common loader:
       - Reference (no CUTLASS op compiled): dequantize the weight to compute
         dtype and run F.linear. Slow but correct -- used to seed M1 tests and
         as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
+      - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
+        with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
+        while tuning or capturing decode CUDA graphs; eager execution remains
+        on the native TensorRT-LLM op.
 
-    The path is selected at create_weights time via _mxfp8_cutlass_op_available;
-    the weight_scale tensor's layout matches the chosen path (2D [O,K/32] for
-    the reference, 1D padded swizzled for CUTLASS) so apply() stays branchless.
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
+    ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
+    compiled backends consume the same 1D padded swizzled scale layout.
     """
     BLOCK_SIZE = 32
     # Swizzled-SF layout padding (matches W4A8MXFP4FP8: rows->128, cols/SFblock->4).
@@ -2978,6 +3013,64 @@ class MXFP8LinearMethod(LinearMethodBase):
     def __init__(self):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
+        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        if self.backend not in ("trtllm", "flashinfer", "auto"):
+            raise ValueError("TRTLLM_MXFP8_GEMM_BACKEND must be 'trtllm', "
+                             f"'flashinfer', or 'auto', got {self.backend!r}")
+        self._flashinfer_mxfp8 = None
+        self._flashinfer_autotuned = False
+        if self.backend == "flashinfer":
+            self._load_flashinfer(required=True)
+        elif self.backend == "auto" and not self._load_flashinfer(
+                required=False):
+            self.backend = "trtllm"
+
+    @property
+    def uses_flashinfer(self) -> bool:
+        return self.backend in ("flashinfer", "auto")
+
+    @property
+    def needs_flashinfer_autotune(self) -> bool:
+        return self.uses_flashinfer and self._flashinfer_mxfp8 is not None
+
+    def _load_flashinfer(self, *, required: bool) -> bool:
+        if not self.use_cutlass:
+            if required:
+                raise RuntimeError(
+                    "FlashInfer MXFP8 GEMM requires the TensorRT-LLM MXFP8 "
+                    "quantization ops on Blackwell")
+            return False
+        try:
+            from flashinfer import mm_mxfp8
+        except ImportError as error:
+            if required:
+                raise RuntimeError(
+                    "TRTLLM_MXFP8_GEMM_BACKEND=flashinfer requires the "
+                    "pinned flashinfer-python package") from error
+            logger.warning_once(
+                "FlashInfer MXFP8 is unavailable; using the native "
+                "TensorRT-LLM GEMM backend.",
+                key="flashinfer_mxfp8_unavailable")
+            return False
+        self._flashinfer_mxfp8 = mm_mxfp8
+        return True
+
+    def enable_flashinfer_auto(self) -> bool:
+        """Enable graph-only FlashInfer dispatch unless the user overrode it."""
+        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+            return self.backend == "auto"
+        if not self._load_flashinfer(required=False):
+            return False
+        self.backend = "auto"
+        return True
+
+    def mark_flashinfer_autotuned(self) -> None:
+        self._flashinfer_autotuned = True
+
+    def disable_flashinfer_auto(self) -> None:
+        if self.backend == "auto":
+            self.backend = "trtllm"
+            self._flashinfer_autotuned = False
 
     @classmethod
     def _swizzled_scale_size(cls, out_features: int, in_features: int) -> int:
@@ -3023,15 +3116,36 @@ class MXFP8LinearMethod(LinearMethodBase):
             # the CUTLASS block-scaled e4m3xe4m3 GEMM.
             act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
                 input.contiguous(), True)
-            # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
-            global_scale = torch.ones([1],
-                                      dtype=torch.float32,
-                                      device=input.device)
-            output = torch.ops.trtllm.mxfp8_mxfp8_gemm(act_e4m3, act_sf,
-                                                       module.weight,
-                                                       module.weight_scale,
-                                                       global_scale,
-                                                       module.dtype)
+            use_flashinfer = self.backend == "flashinfer" or (
+                self.backend == "auto" and
+                (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
+                 (self._flashinfer_autotuned
+                  and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get())))
+            if use_flashinfer:
+                flashinfer_mxfp8 = self._flashinfer_mxfp8
+                assert flashinfer_mxfp8 is not None
+                output = flashinfer_mxfp8(
+                    act_e4m3,
+                    module.weight.t(),
+                    act_sf,
+                    module.weight_scale,
+                    out_dtype=module.dtype,
+                    use_8x4_sf_layout=False,
+                    backend="cutlass",
+                )
+            else:
+                # globalScale is the alpha multiplier; pure MXFP8xMXFP8 uses 1.0.
+                global_scale = torch.ones([1],
+                                          dtype=torch.float32,
+                                          device=input.device)
+                output = torch.ops.trtllm.mxfp8_mxfp8_gemm(
+                    act_e4m3,
+                    act_sf,
+                    module.weight,
+                    module.weight_scale,
+                    global_scale,
+                    module.dtype,
+                )
             if bias is not None:
                 output = output + bias
         else:

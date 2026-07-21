@@ -81,6 +81,7 @@ from .modeling_utils import DecoderModel, ModelConfig, filter_weights, register_
 # and flash SDPA does not accept attn_mask.
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
+
 # ---------------------------------------------------------------------------
 # Config normalization helpers
 # ---------------------------------------------------------------------------
@@ -1865,6 +1866,10 @@ class MiniMaxM3Model(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # The executor owns the authoritative CUDA-graph configuration. Mark
+        # this model as eligible here and let the executor enable the automatic
+        # FlashInfer MXFP8 path only when its decode graph runner is active.
+        self._use_flashinfer_mxfp8_decode_graph_default = True
         # Final norm is a plain (non-Gemma) RMSNorm for the same reason as the
         # layer-boundary norms (see MiniMaxM3DecoderLayer.__init__): it doubles
         # as the last layer's next_layer_layernorm, so the last MoE/MLP output
