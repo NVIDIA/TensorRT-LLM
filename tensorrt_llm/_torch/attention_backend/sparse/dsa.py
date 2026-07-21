@@ -3100,6 +3100,21 @@ class DSATrtllmAttention(TrtllmAttention):
         )
 
 
+def derive_indexer_k_cache_layer_mask(
+    sparse_attention_config: "SparseAttentionConfig",
+    pretrained_config,
+    num_layers: int,
+) -> List[bool]:
+    return [
+        bool(
+            getattr(
+                sparse_attention_config.to_sparse_params(
+                    pretrained_config=pretrained_config, layer_idx=layer_idx),
+                "is_full_indexer_layer", True))
+        for layer_idx in range(num_layers)
+    ]
+
+
 class DSACacheManager(KVCacheManager):
     """KV cache manager for DSA with additional indexer K-cache pools."""
 
@@ -3146,6 +3161,14 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
+        from tensorrt_llm._torch.speculative import get_num_spec_layers
+        total_num_layers = (len(layer_mask)
+                            if layer_mask is not None else num_layers)
+        if spec_config is not None and layer_mask is None:
+            total_num_layers += get_num_spec_layers(spec_config)
+        indexer_k_cache_layer_mask = derive_indexer_k_cache_layer_mask(
+            sparse_attention_config, pretrained_config, total_num_layers)
+
         super().__init__(
             kv_cache_config,
             kv_cache_type,
@@ -3166,6 +3189,7 @@ class DSACacheManager(KVCacheManager):
             indexer_k_cache_quant_block_size=128,
             indexer_k_cache_index_head_dim=self.index_head_dim,
             indexer_k_cache_use_fp4=self.use_fp4,
+            indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
             **kwargs,
         )
         self.num_blocks = self.blocks_in_primary_pool
@@ -3173,11 +3197,20 @@ class DSACacheManager(KVCacheManager):
         # Indexer K cache pool for DSA attention
         # Shape: [num_blocks, self.tokens_per_block * (index_head_dim + scale_size)]
         # Non-interleaved layout: [fp8_tok0 | fp8_tok1 | ... | scale_tok0 | scale_tok1 | ...]
-        # Store FP8-quantized k values from the indexer
+        # Store FP8-quantized k values from the indexer.
+        # One entry per local layer; None for shared-indexer layers, which own
+        # no row in the masked indexer pool (the C++ binding raises if asked).
+        local_mask = self.indexer_k_cache_local_layer_mask
         self.indexer_k_cache_pool_per_layer = [
-            self.get_indexer_k_cache_pool_data(layer_idx)
-            for layer_idx in range(self.num_local_layers)
+            self.get_indexer_k_cache_pool_data(local_offset)
+            if local_mask[local_offset] else None
+            for local_offset in range(self.num_local_layers)
         ]
+        num_full = sum(local_mask)
+        if num_full < self.num_local_layers:
+            logger.info(
+                f"[DSACacheManager] Indexer k-cache: {num_full} of "
+                f"{self.num_local_layers} local layers own an indexer k-cache.")
 
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
@@ -3185,8 +3218,11 @@ class DSACacheManager(KVCacheManager):
         data_bytes = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
         per_token_size = data_bytes + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
-        return self.indexer_k_cache_pool_per_layer[layer_offset].view(
-            self.num_blocks, block_size, 1, per_token_size)
+        pool = self.indexer_k_cache_pool_per_layer[layer_offset]
+        assert pool is not None, (
+            f"Layer {layer_idx} is a shared-indexer layer and owns no indexer "
+            f"k-cache; only full-indexer layers may access it.")
+        return pool.view(self.num_blocks, block_size, 1, per_token_size)
 
     def get_batch_indexer_k_cache_indices(
             self, request_ids: List[int]) -> List[List[int]]:
@@ -3241,12 +3277,23 @@ class DSACacheManager(KVCacheManager):
         # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
         mem_per_token *= num_attention_layers * head_dim
 
+        if num_layers is not None:
+            num_indexer_layers = max(num_layers, 1)
+        else:
+            local_layer_ids = mapping.pp_layers(
+                model_config.get_num_attention_layers())
+            num_indexer_layers = sum(
+                1 for layer_id in local_layer_ids if getattr(
+                    sparse_attention_config.to_sparse_params(
+                        pretrained_config=config, layer_idx=layer_id),
+                    "is_full_indexer_layer", True))
+
         # Indexer K cache: physically allocated as raw UINT8 in
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
         # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
         # the latent above). The data-portion byte count already reflects fp8 vs
         # fp4 via indexer_data_dim.
-        indexer_bytes_per_token = num_attention_layers * (
+        indexer_bytes_per_token = num_indexer_layers * (
             indexer_data_dim + index_head_dim // quant_block_size * 4)
         mem_per_token += indexer_bytes_per_token
         return mem_per_token
@@ -3274,9 +3321,17 @@ class DSACacheManager(KVCacheManager):
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
         # 1 byte/element here -- it is NOT scaled by the KV cache dtype (unlike
         # the latent above). Under FP4 the indexer data portion is halved (two
-        # E2M1 codes per byte); the scale bytes are unchanged.
+        # E2M1 codes per byte); the scale bytes are unchanged. Only
+        # full-indexer local layers own a row in the masked indexer pool, so
+        # shared layers (cross-layer indexer sharing) contribute no bytes.
         indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
-        indexer_bytes_per_token = sum(self.num_kv_heads_per_layer) * (
+        local_mask = self.indexer_k_cache_local_layer_mask
+        if local_mask is not None:
+            num_indexer_layers = sum(kv_heads for kv_heads, has_indexer in zip(
+                self.num_kv_heads_per_layer, local_mask) if has_indexer)
+        else:
+            num_indexer_layers = sum(self.num_kv_heads_per_layer)
+        indexer_bytes_per_token = num_indexer_layers * (
             indexer_data_dim + self.index_head_dim // self.quant_block_size * 4)
         cache_size_bytes_per_token += indexer_bytes_per_token
 

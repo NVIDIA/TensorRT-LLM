@@ -59,6 +59,9 @@ TargetRanksInfo targetIRanks(
 TargetRanksInfo targetIRanksForRnn(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
+TargetRanksInfo targetIRanksForIndexerKCache(
+    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
+
 /**
  * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
  *

@@ -243,7 +243,7 @@ public:
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {});
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, std::vector<SizeType32> const& indexerLayerNumPerPP = {});
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
@@ -251,10 +251,11 @@ public:
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        std::vector<SizeType32> const& rnnLayerNumPerPP = {})
+        std::vector<SizeType32> const& rnnLayerNumPerPP = {}, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP,
+            indexerLayerNumPerPP)
     {
     }
 

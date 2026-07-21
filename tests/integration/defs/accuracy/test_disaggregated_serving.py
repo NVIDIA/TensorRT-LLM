@@ -2352,7 +2352,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
-    def test_nvfp4_nixl_python(self, use_kv_cache_manager_v2):
+    def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
             "enable_block_reuse": False,
@@ -2360,7 +2360,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
-            "transceiver_runtime": "PYTHON",
         }
         moe_config = {"backend": "CUTEDSL"}
         speculative_config = {

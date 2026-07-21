@@ -1566,10 +1566,13 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     bool hasIndexerKCache = true;
     texec::SizeType32 indexerDimPerHead = 96;
     texec::SizeType32 indexerKCacheQuantBlockSize = 128;
+    bool indexerKCacheUseFp4 = false;
+    // Masked indexer pool: fewer indexer layers than attention layers.
+    std::vector<texec::SizeType32> indexerLayerNumPerPP{1};
 
     CacheState state{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tp, pp, cp, attentionLayerNumPerPP, dataType,
         attentionType, kvFactor, enableAttentionDP, dpRank, dpSize, enableBlockReuse, enablePartialReuse,
-        hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+        hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize, indexerKCacheUseFp4, indexerLayerNumPerPP};
 
     std::ostringstream oss;
     texec::Serialization::serialize(state, oss);
@@ -1591,4 +1594,8 @@ TEST(SerializeUtilsTest, CacheStateIndexerKCache)
     EXPECT_EQ(state.getHasIndexerKCache(), state2.getHasIndexerKCache());
     EXPECT_EQ(state.getIndexerDimPerHead(), state2.getIndexerDimPerHead());
     EXPECT_EQ(state.getIndexerKCacheQuantBlockSize(), state2.getIndexerKCacheQuantBlockSize());
+    EXPECT_EQ(state.getIndexerKCacheUseFp4(), state2.getIndexerKCacheUseFp4());
+    EXPECT_EQ(state.getIndexerLayerNumPerPP(), state2.getIndexerLayerNumPerPP());
+    EXPECT_EQ(state.getIndexerLayerNumPerPP(), indexerLayerNumPerPP);
+    EXPECT_EQ(state, state2);
 }

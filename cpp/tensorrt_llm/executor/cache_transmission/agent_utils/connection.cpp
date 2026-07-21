@@ -562,6 +562,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                     auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
 
                     std::optional<std::pair<size_t, size_t>> kvOffsetRatio;
+                    std::optional<std::pair<size_t, size_t>> indexerOffsetRatio;
                     std::optional<std::pair<size_t, size_t>> rnnOffsetRatio;
                     std::vector<std::pair<size_t, size_t>> offsetRatios;
                     offsetRatios.reserve(bufferDescs.size());
@@ -572,7 +573,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         switch (kind)
                         {
                         case batch_manager::BufferKind::kKV:
-                        case batch_manager::BufferKind::kKV_INDEXER:
                         {
                             if (!kvOffsetRatio)
                             {
@@ -583,6 +583,24 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                                 kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
                             }
                             offsetRatios.push_back(*kvOffsetRatio);
+                            break;
+                        }
+                        case batch_manager::BufferKind::kKV_INDEXER:
+                        {
+                            if (!indexerOffsetRatio)
+                            {
+                                // The indexer K cache pass runs in "indexer layer space": with a
+                                // masked indexer pool (per-layer indexer mask) the receiver
+                                // slices its recv buffer at indexer-layer prefix offsets, so the
+                                // write offset must use the indexer layer counts (identical to
+                                // the attention counts for dense models).
+                                auto indexerTargetInfo = targetIRanksForIndexerKCache(mCacheState,
+                                    requestInfo.getTransState().getCacheState().value(),
+                                    requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, indexerTargetInfo, "IndexerK", remoteAgentName);
+                                indexerOffsetRatio = computeSendOffsetRatio(indexerTargetInfo, connectionIdx);
+                            }
+                            offsetRatios.push_back(*indexerOffsetRatio);
                             break;
                         }
                         case batch_manager::BufferKind::kRNN:
