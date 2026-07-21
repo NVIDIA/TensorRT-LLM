@@ -11,16 +11,20 @@ import torch
     reason="TriAttention CuTe score kernel requires SM100",
 )
 @pytest.mark.parametrize(
-    "tokens_per_block,page_permutation,valid_lens",
+    "tokens_per_block,page_permutation,valid_lens,num_freqs,num_q_heads",
     [
         # The originally validated geometry: 128-token pages, identity table.
-        (128, [0, 1], None),
-        # Production page size: a 64-token compute tile spans two pages, so a
-        # shuffled physical-page table catches any fragment/page mix-up.
-        (32, [3, 1, 4, 7, 5, 0, 2, 6], None),
+        (128, [0, 1], None, 32, 8),
+        # GPT-OSS geometry: 32-token pages; a 64-token compute tile spans two
+        # pages, so a shuffled physical-page table catches fragment mix-ups.
+        (32, [3, 1, 4, 7, 5, 0, 2, 6], None, 32, 8),
         # Ragged tails land mid-tile: the second page fragment of the last
         # tile is clamped, and scores past the valid length are unspecified.
-        (32, [3, 1, 4, 7, 5, 0, 2, 6], [250, 198]),
+        (32, [3, 1, 4, 7, 5, 0, 2, 6], [250, 198], 32, 8),
+        # Qwen3 geometry: 128-element K rows (64 frequencies) and GQA group
+        # 4, which rides the MMA tile N=8 with zeroed padding columns.
+        (32, [3, 1, 4, 7, 5, 0, 2, 6], None, 64, 4),
+        (32, [3, 1, 4, 7, 5, 0, 2, 6], [250, 198], 64, 4),
     ],
 )
 def test_cute_score_matches_torch_mean_oracle(
@@ -28,6 +32,8 @@ def test_cute_score_matches_torch_mean_oracle(
     tokens_per_block: int,
     page_permutation: list,
     valid_lens: "list | None",
+    num_freqs: int,
+    num_q_heads: int,
 ) -> None:
     pytest.importorskip("cutlass")
     monkeypatch.setenv("TRTLLM_TRIATTENTION_CUTE_SCORE", "1")
@@ -39,8 +45,6 @@ def test_cute_score_matches_torch_mean_oracle(
     torch.manual_seed(20260720)
     device = torch.device("cuda")
     seq_len = 256
-    num_q_heads = 8
-    num_freqs = 32
     num_pages = seq_len // tokens_per_block
     assert sorted(page_permutation) == list(range(num_pages))
     pool = (

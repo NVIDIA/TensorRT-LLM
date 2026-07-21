@@ -155,8 +155,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             )
         if tokens_per_block not in (32, 128):
             raise ValueError("TriAttention CuTe score requires 32- or 128-token pages")
-        if num_q_heads % num_kv_heads or num_q_heads // num_kv_heads != N:
-            raise ValueError("TriAttention CuTe score requires GQA group 8")
+        if num_q_heads % num_kv_heads or num_q_heads // num_kv_heads not in (4, 8):
+            raise ValueError("TriAttention CuTe score requires GQA group 4 or 8")
         if score_start % tokens_per_block:
             raise ValueError("TriAttention CuTe score requires page-aligned score_start")
         if page_shards not in (2, 3):
@@ -762,7 +762,16 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             coefficient_kind = feature // self.num_freqs
             frequency = feature % self.num_freqs
             mean_offset = req_id * self.num_freqs + frequency
-            q_head = kv_head * self.group_size + qg
+            # GQA groups below the minimum MMA tile N=8 ride padded
+            # columns: they read the group's first head (any valid
+            # address) and force zero coefficients, so the padded score
+            # columns come out zero and land in scratch rows the adapter
+            # never gathers.
+            qg_read = qg
+            if cutlass.const_expr(self.group_size < N):
+                if qg_read >= self.group_size:
+                    qg_read = cutlass.Int32(0)
+            q_head = kv_head * self.group_size + qg_read
             calib_offset = (layer_id * self.num_q_heads + q_head) * self.num_freqs + frequency
             qr = cutlass.Float32(q_real[calib_offset])
             qi = cutlass.Float32(q_imag[calib_offset])
@@ -776,6 +785,9 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                 value = scale * (qr * msin + qi * mcos)
             else:
                 value = scale * cutlass.Float32(mlr_coef[calib_offset])
+            if cutlass.const_expr(self.group_size < N):
+                if qg >= self.group_size:
+                    value = cutlass.Float32(0.0)
             raw_k_block = feature // 16
             magnitude_k_block = frequency // 16
             if coefficient_kind < 2:
@@ -974,79 +986,84 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             True,
                         )
                 raw_tma_pipeline.consumer_wait(raw_tma_consumer_state)
-                frequency = lane_idx
-                # Issue several independent token loads before consuming
-                # any of them.  This bounded RMEM window is unchanged; the
-                # optional half-page staging only switches its K source
-                # from global to the single raw shared buffer.
-                for token_base in cutlass.range(
-                    0,
-                    CTA_M // (THREADS // 32),
-                    self.prefetch_depth,
-                    unroll_full=not self.compact_token_loop,
-                ):
-                    staged_real = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
-                    staged_imag = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
-                    for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
-                        token_round = token_base + prefetch_index
-                        token = warp_idx + token_round * (THREADS // 32)
-                        staged_real[prefetch_index] = cutlass.Float32(
-                            cpasync_raw_k_0[
-                                (
-                                    (token, frequency % 16),
-                                    0,
-                                    frequency // 16,
-                                    0,
-                                )
-                            ]
-                        )
-                        staged_imag[prefetch_index] = cutlass.Float32(
-                            cpasync_raw_k_0[
-                                (
-                                    (token, frequency % 16),
-                                    0,
-                                    frequency // 16,
-                                    1,
-                                )
-                            ]
-                        )
-
-                    for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
-                        token_round = token_base + prefetch_index
-                        token = warp_idx + token_round * (THREADS // 32)
-                        real = staged_real[prefetch_index]
-                        imag = staged_imag[prefetch_index]
-                        norm2 = real * real + imag * imag
-                        if cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "approx_ftz"):
-                            magnitude = cute.math.sqrt(
-                                norm2,
-                                approx=self.sqrt_mode == "approx",
-                                ftz=self.magnitude_sqrt_ftz,
+                # Each of the 32 lanes stages one frequency per pass; 64-
+                # frequency heads take two passes.
+                for freq_rep in cutlass.range_constexpr(self.num_freqs // 32):
+                    frequency = lane_idx + 32 * freq_rep
+                    # Issue several independent token loads before consuming
+                    # any of them.  This bounded RMEM window is unchanged; the
+                    # optional half-page staging only switches its K source
+                    # from global to the single raw shared buffer.
+                    for token_base in cutlass.range(
+                        0,
+                        CTA_M // (THREADS // 32),
+                        self.prefetch_depth,
+                        unroll_full=not self.compact_token_loop,
+                    ):
+                        staged_real = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
+                        staged_imag = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
+                        for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
+                            token_round = token_base + prefetch_index
+                            token = warp_idx + token_round * (THREADS // 32)
+                            staged_real[prefetch_index] = cutlass.Float32(
+                                cpasync_raw_k_0[
+                                    (
+                                        (token, frequency % 16),
+                                        0,
+                                        frequency // 16,
+                                        0,
+                                    )
+                                ]
                             )
-                        elif cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "fastmath"):
-                            # cutlass 4.5 renamed the approximate-sqrt control
-                            # to ``fastmath``; map the measured approx choice
-                            # onto it to preserve the authored behavior.
-                            magnitude = cute.math.sqrt(norm2, fastmath=self.sqrt_mode == "approx")
-                        else:
-                            # DSLs with neither spelling get the plain (IEEE)
-                            # sqrt, which is strictly MORE accurate than the
-                            # measured approx choice above; the unit test's
-                            # 5e-3 oracle tolerance absorbs the difference.
-                            magnitude = cute.math.sqrt(norm2)
-                        magnitude_fp16_0 = cutlass.Float16(magnitude)
-                        magnitude_fp16_1 = cutlass.Float16(
-                            magnitude - cutlass.Float32(magnitude_fp16_0)
-                        )
-                        magnitude_k_block_fp16 = frequency // 16
-                        magnitude_coord_fp16 = (
-                            (token, frequency % 16),
-                            0,
-                            magnitude_k_block_fp16,
-                            0,
-                        )
-                        sMagnitudeFp16A0[magnitude_coord_fp16] = magnitude_fp16_0
-                        sMagnitudeFp16A1[magnitude_coord_fp16] = magnitude_fp16_1
+                            staged_imag[prefetch_index] = cutlass.Float32(
+                                cpasync_raw_k_0[
+                                    (
+                                        (token, frequency % 16),
+                                        0,
+                                        frequency // 16,
+                                        1,
+                                    )
+                                ]
+                            )
+
+                        for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
+                            token_round = token_base + prefetch_index
+                            token = warp_idx + token_round * (THREADS // 32)
+                            real = staged_real[prefetch_index]
+                            imag = staged_imag[prefetch_index]
+                            norm2 = real * real + imag * imag
+                            if cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "approx_ftz"):
+                                magnitude = cute.math.sqrt(
+                                    norm2,
+                                    approx=self.sqrt_mode == "approx",
+                                    ftz=self.magnitude_sqrt_ftz,
+                                )
+                            elif cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "fastmath"):
+                                # cutlass 4.5 renamed the approximate-sqrt control
+                                # to ``fastmath``; map the measured approx choice
+                                # onto it to preserve the authored behavior.
+                                magnitude = cute.math.sqrt(
+                                    norm2, fastmath=self.sqrt_mode == "approx"
+                                )
+                            else:
+                                # DSLs with neither spelling get the plain (IEEE)
+                                # sqrt, which is strictly MORE accurate than the
+                                # measured approx choice above; the unit test's
+                                # 5e-3 oracle tolerance absorbs the difference.
+                                magnitude = cute.math.sqrt(norm2)
+                            magnitude_fp16_0 = cutlass.Float16(magnitude)
+                            magnitude_fp16_1 = cutlass.Float16(
+                                magnitude - cutlass.Float32(magnitude_fp16_0)
+                            )
+                            magnitude_k_block_fp16 = frequency // 16
+                            magnitude_coord_fp16 = (
+                                (token, frequency % 16),
+                                0,
+                                magnitude_k_block_fp16,
+                                0,
+                            )
+                            sMagnitudeFp16A0[magnitude_coord_fp16] = magnitude_fp16_0
+                            sMagnitudeFp16A1[magnitude_coord_fp16] = magnitude_fp16_1
 
                 cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.barrier()
@@ -1124,10 +1141,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
                 acc_pipeline.consumer_wait(acc_consumer_state)
                 output_offset = (
-                    kv_head * self.group_size * self.sum_seq
-                    + out_base
-                    + page_start
-                    + page_half * CTA_M
+                    kv_head * N * self.sum_seq + out_base + page_start + page_half * CTA_M
                 )
                 page_output = cute.make_tensor(
                     output.iterator + output_offset,
@@ -1136,7 +1150,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         stride=(
                             1,
                             self.sum_seq,
-                            self.group_size * self.sum_seq,
+                            N * self.sum_seq,
                         ),
                     ),
                 )

@@ -548,13 +548,10 @@ class _FixedScoreGroup:
         any unsupported geometry this returns without importing the CuTe
         module, and every launch keeps using the compiled C++ score ops.
 
-        Geometry reality check: the supported contract below (SM100 exactly,
-        BF16 pools, 128-token pages, 64-element K rows / 32 frequencies,
-        8 query heads per KV head) matches none of the current production
-        models (Qwen3 uses 128-element K rows, 32-token pages, and 4 query
-        heads per KV head; GPT-OSS uses 32-token pages), so today the kernel
-        fires only on the synthetic unit-test geometry. This wiring exists to
-        validate the kernel end to end while wider geometry support lands.
+        Supported contract: SM100 exactly, BF16 pools, 32- or 128-token
+        pages, 32 or 64 frequencies (head size 64/128), and 4 or 8 query
+        heads per KV head — this covers the Qwen3 and GPT-OSS production
+        geometries as well as the original validation shape.
         """
         if self._cute_score_attempted:
             return
@@ -570,10 +567,12 @@ class _FixedScoreGroup:
             and kv_factor == 2
             and tokens_per_block in (32, 128)
             and num_freqs in (32, 64)
-            and num_q_heads == num_kv_heads * 8
+            and num_q_heads % num_kv_heads == 0
+            and num_q_heads // num_kv_heads in (4, 8)
             and int(anchor.stride(-1)) == 1
-            # The kernel computes flat score offsets in 32-bit arithmetic.
-            and num_q_heads * max_segments * self.seq_len < 2**31
+            # The kernel computes flat score offsets in 32-bit arithmetic;
+            # group-4 geometries pad the head axis to the MMA tile N=8.
+            and num_kv_heads * 8 * max_segments * self.seq_len < 2**31
         )
         if not supported:
             return
@@ -587,8 +586,11 @@ class _FixedScoreGroup:
             # decode window from that scratch into ``self.output``. All
             # buffers below are persistent because the compiled kernel
             # captures their device pointers.
+            # The kernel writes one scratch row per padded head column
+            # (GQA group below 8 pads up to the MMA tile); the gather in
+            # ``launch`` reads only the real heads.
             scratch = torch.empty(
-                num_q_heads * max_segments * self.seq_len,
+                num_kv_heads * 8 * max_segments * self.seq_len,
                 dtype=torch.float32,
                 device=device,
             )
@@ -724,19 +726,40 @@ class _FixedScoreGroup:
                 # past a request's valid width carry unscored scratch data,
                 # matching the C++ op, whose consumers mask by valid width.
                 num_q_heads = int(self.geometry_args[0])
+                num_kv_heads = int(self.geometry_args[1])
+                group_size = num_q_heads // num_kv_heads
+                # The scratch head axis is padded to the MMA tile N=8 per
+                # KV head; slicing the view to the real group size skips
+                # the zero padding columns.
                 source = (
-                    self._cute_scratch[: num_q_heads * num_segments * self.seq_len]
-                    .view(num_q_heads, request_count, self.num_layers, self.seq_len)
-                    .permute(1, 2, 0, 3)
+                    self._cute_scratch[: num_kv_heads * 8 * num_segments * self.seq_len]
+                    .view(num_kv_heads, 8, request_count, self.num_layers, self.seq_len)[
+                        :, :group_size
+                    ]
+                    .permute(2, 3, 0, 1, 4)
                 )
-                columns = (
-                    token_starts_device[:request_count].to(torch.int64).view(-1, 1, 1, 1)
-                    + self._cute_gather_columns
-                )
+                columns = token_starts_device[:request_count].to(torch.int64).view(
+                    -1, 1, 1, 1, 1
+                ) + self._cute_gather_columns.view(1, 1, 1, 1, -1)
                 columns = columns.clamp_(max=self.seq_len - 1).expand(
-                    request_count, self.num_layers, num_q_heads, self.output_width
+                    request_count,
+                    self.num_layers,
+                    num_kv_heads,
+                    group_size,
+                    self.output_width,
                 )
-                torch.gather(source, 3, columns, out=output)
+                torch.gather(
+                    source,
+                    4,
+                    columns,
+                    out=output.view(
+                        request_count,
+                        self.num_layers,
+                        num_kv_heads,
+                        group_size,
+                        self.output_width,
+                    ),
+                )
                 return output
         _launch_tri_score_perhead(
             self,
