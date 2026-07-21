@@ -109,18 +109,6 @@ def _uninstall_wait_stream_hook() -> None:
             _original_wait_stream = None
 
 
-def _weak_ref_if_tensor(value: Any) -> Any:
-    if torch.is_tensor(value):
-        return make_weak_ref(value)
-    if isinstance(value, tuple):
-        return tuple(_weak_ref_if_tensor(item) for item in value)
-    if isinstance(value, list):
-        return [_weak_ref_if_tensor(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _weak_ref_if_tensor(item) for key, item in value.items()}
-    return value
-
-
 def _copy_output(destination: Any, source: Any) -> Any:
     if torch.is_tensor(destination) and torch.is_tensor(source):
         destination.copy_(source)
@@ -174,9 +162,15 @@ def eager_on_graph(enable: bool) -> Callable[[Callable], Callable]:
             capture._end_current_segment()
             output = inner(*args, **kwargs)
 
-            captured_args = tuple(_weak_ref_if_tensor(arg) for arg in args)
-            captured_kwargs = {key: _weak_ref_if_tensor(value) for key, value in kwargs.items()}
-            captured_output = _weak_ref_if_tensor(output)
+            # 看下attn的参数
+            def make_weak_ref_with_str_none(x):
+                if isinstance(x, (str, None)):
+                    return x
+                return make_weak_ref(x)
+
+            captured_args = tuple(make_weak_ref_with_str_none(arg) for arg in args)
+            captured_kwargs = {key: make_weak_ref_with_str_none(value) for key, value in kwargs.items()}
+            captured_output = make_weak_ref_with_str_none(output)
 
             def replay_fn() -> Any:
                 new_output = inner(*captured_args, **captured_kwargs)

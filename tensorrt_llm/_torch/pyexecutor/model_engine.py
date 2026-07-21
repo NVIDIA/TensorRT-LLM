@@ -73,7 +73,8 @@ from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
-                     set_per_request_piecewise_cuda_graph_flag,
+                     get_per_request_prefill_cuda_graph_flag,
+                     set_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
 from .breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from .config_utils import is_mla
@@ -826,10 +827,6 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
         self.breakable_cuda_graph_runner = None
         if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
-            if self.spec_config is not None:
-                raise ValueError(
-                    "breakable prefill CUDA graph does not support speculative decoding"
-                )
             decoder_model = (self.model if isinstance(
                 self.model, DecoderModelForCausalLM) else getattr(
                     self.model, "llm", None))
@@ -837,8 +834,7 @@ class PyTorchModelEngine(ModelEngine):
                 raise ValueError(
                     "breakable prefill CUDA graph requires a decoder model body"
                 )
-            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
-                decoder_model.model, decoder_model.logits_processor)
+            self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(decoder_model.model)
 
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
@@ -5124,22 +5120,11 @@ class PyTorchModelEngine(ModelEngine):
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
 
-        has_multimodal_input = any(
-            param.multimodal_data and any(
-                key != 'mrope_config' for key in param.multimodal_data)
-            for param in multimodal_params_list)
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
-        if (self.prefill_cuda_graph_backend
-                == PrefillCudaGraphBackend.BREAKABLE
-                and (bool(lora_params) or has_multimodal_input)):
-            padded_num_tokens = total_num_tokens
-            can_run_prefill_cuda_graph = False
-        else:
-            padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
-                total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
-        set_per_request_piecewise_cuda_graph_flag(
-            can_run_prefill_cuda_graph and self.prefill_cuda_graph_backend
-            == PrefillCudaGraphBackend.PIECEWISE)
+        (padded_num_tokens, can_run_prefill_cuda_graph,
+         attn_all_rank_num_tokens) = self._get_padding_params(
+             total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
+        set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != total_num_tokens else None
 
         virtual_num_tokens = total_num_tokens
@@ -5414,9 +5399,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = self._get_padding_params(
             num_tokens, attn_metadata.num_contexts, attn_all_rank_num_tokens)
-        set_per_request_piecewise_cuda_graph_flag(
-            can_run_prefill_cuda_graph and self.prefill_cuda_graph_backend
-            == PrefillCudaGraphBackend.PIECEWISE)
+        set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
         if self.enable_attention_dp:
@@ -5898,6 +5881,7 @@ class PyTorchModelEngine(ModelEngine):
         maybe_graph: bool = False,
         promoted_context_request_ids: frozenset[int] = frozenset()
     ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
+        set_per_request_prefill_cuda_graph_flag(False)
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
             cp_type = self.mapping.cp_config['cp_type']
             if CpType.STAR == cp_type:
@@ -6553,16 +6537,6 @@ class PyTorchModelEngine(ModelEngine):
             self._prepare_inputs_event.record()
 
             breakable_runner = self.breakable_cuda_graph_runner
-            has_multimodal_input = any(
-                param.multimodal_data and any(
-                    key != 'mrope_config' for key in param.multimodal_data)
-                for param in inputs.get('multimodal_params', ()))
-            breakable_request_eligible = (
-                breakable_runner is not None
-                and scheduled_requests.num_context_requests > 0
-                and spec_metadata is None and not gather_context_logits
-                and not inputs.get('lora_params')
-                and not has_multimodal_input)
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
 
@@ -6573,20 +6547,19 @@ class PyTorchModelEngine(ModelEngine):
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
                 if not can_run_graph:
-                    if (breakable_runner is not None
-                            and breakable_runner.is_capturing):
-                        return breakable_runner.capture_model_body(
-                            forward_step)
+                    if (breakable_runner is not None and breakable_runner.is_capturing):
+                        return breakable_runner.capture_model_body(forward_step)
 
                     num_tokens = inputs['input_ids'].shape[0]
                     can_run_breakable_graph = (
-                        breakable_request_eligible
+                        breakable_runner is not None
+                        and get_per_request_prefill_cuda_graph_flag()
                         and breakable_runner.has_graph(num_tokens))
                     if can_run_breakable_graph and not breakable_runner.is_warming_up:
                         outputs = breakable_runner.execute(
                             num_tokens, forward_step)
                     else:
-                        # PCG or real eager
+                        # real eager or BCG warmup or PCG
                         outputs = forward_step()
                 else:
                     needs_capture = self.cuda_graph_runner.needs_capture(key)
