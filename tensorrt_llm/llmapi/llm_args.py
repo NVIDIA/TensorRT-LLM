@@ -3466,10 +3466,11 @@ class MambaStateConfig(StrictBaseModel):
     """Configuration for reusable Mamba recurrent-state snapshots."""
 
     periodic_snapshot_interval: NonNegativeInt = Field(
-        default=256,
+        default=0,
         description=
         "The number of tokens between periodic snapshots in the Mamba "
-        "prefix cache. Set to 0 to disable periodic snapshots.")
+        "prefix cache. Periodic snapshots are disabled by default; set this "
+        "to a positive value to enable them.")
 
     additional_snapshot_offsets_from_start: List[_StrictPositiveInt] = Field(
         default_factory=list,

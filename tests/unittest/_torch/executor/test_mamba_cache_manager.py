@@ -157,6 +157,7 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
         use_kv_cache_manager_v2=use_v2,
     )
 
@@ -252,6 +253,7 @@ def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
             _hybrid_model_config(),
             KvCacheConfig(
                 enable_block_reuse=True,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
                 use_kv_cache_manager_v2=True,
             ),
         )
@@ -266,7 +268,10 @@ def test_hybrid_cache_manager_factory_v2_preference_does_not_select_v2(
     assert (
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
-            KvCacheConfig(use_kv_cache_manager_v2=False),
+            KvCacheConfig(
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+                use_kv_cache_manager_v2=False,
+            ),
         )
         is CppMambaHybridCacheManager
     )
@@ -377,7 +382,10 @@ def test_hybrid_cache_manager_factory_rejects_mixed_override_with_reuse(
     with pytest.raises(ValueError, match=expected_error):
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
-            KvCacheConfig(enable_block_reuse=True),
+            KvCacheConfig(
+                enable_block_reuse=True,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+            ),
         )
 
 
@@ -1036,7 +1044,7 @@ def test_v2_hybrid_estimator_accounts_for_ssm_slot_attention_bound(
         max_batch_size=4,
         kv_cache_config=KvCacheConfig(),
         spec_config=spec_config,
-    ) == (12, expected_intercept)
+    ) == (11, expected_intercept)
 
 
 def test_v2_hybrid_estimator_reserves_attention_for_each_lineage(monkeypatch):

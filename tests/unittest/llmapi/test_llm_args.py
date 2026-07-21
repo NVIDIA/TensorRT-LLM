@@ -641,7 +641,7 @@ def test_MambaStateConfig_defaults_use_independent_lists():
     first = MambaStateConfig()
     second = MambaStateConfig()
 
-    assert first.periodic_snapshot_interval == 256
+    assert first.periodic_snapshot_interval == 0
     first.additional_snapshot_offsets_from_start.append(128)
     first.additional_snapshot_offsets_from_end.append(0)
 

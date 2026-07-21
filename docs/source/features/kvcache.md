@@ -79,10 +79,14 @@ scheduler_config:
 Hybrid Mamba models must retain the recurrent Mamba state together with the
 attention KV prefix. Snapshot policy is grouped under
 `kv_cache_config.mamba_state_config`. `periodic_snapshot_interval` controls
-periodic boundaries; set it to `0` to disable them. The interval is accepted
-through this nested configuration in the Python API. YAML/JSON configuration
-files also accept the deprecated `kv_cache_config.mamba_state_cache_interval`
-key and migrate it to the nested field while loading. The prototype
+periodic boundaries. They are disabled by default; set the interval to a
+positive value to enable them. The interval is accepted through this nested
+configuration in the Python API. YAML/JSON configuration files also accept the
+deprecated `kv_cache_config.mamba_state_cache_interval` key and migrate it to
+the nested field while loading. Enabling block reuse for a hybrid Mamba model
+requires either a positive periodic interval or an explicit V2 snapshot offset;
+otherwise, configuration validation rejects the unsupported reuse policy. The
+prototype
 `additional_snapshot_offsets_from_start` and
 `additional_snapshot_offsets_from_end` options add fixed boundaries. Start
 offsets count tokens from the beginning of the prompt. End offsets count
