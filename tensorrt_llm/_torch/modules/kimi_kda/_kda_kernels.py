@@ -2,12 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kernel dispatch for the in-tree KDA module.
 
-The optimized ``KDA_prefill`` (CuTe / cuTile + Triton chunked prefill) and
-``KDA_decode`` (fused CUDA C++ single-token decode) kernels live in the
-NVIDIA+Moonshot internal collaboration collection at
-``exisiting_optimization_work/`` and are Blackwell sm_100 only. They are not
-open-sourced; the KDA module imports them via env-configurable paths so the
-production tree carries no source copies.
+The optimized ``KDA_prefill`` (CuTe / cuTile + Triton chunked prefill) kernel
+lives in the NVIDIA+Moonshot internal collaboration collection at
+``exisiting_optimization_work/``. The fused CUDA C++ single-token decode
+kernel is source-integrated and exposed through a native TensorRT-LLM Torch
+op.
 
 On sm_100 with the optimization tree available the dispatch runs the
 optimized kernels. On any other arch (or when the optimization tree is
@@ -31,6 +30,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from . import _kda_decode
+
 try:
     from tensorrt_llm._utils import get_sm_version as _tllm_get_sm_version
 except Exception:  # pragma: no cover — source-loader stub path
@@ -40,9 +41,8 @@ except Exception:  # pragma: no cover — source-loader stub path
 KIMI_KDA_OPTIMIZED_KERNEL_ENV = "KIMI_KDA_OPTIMIZED_KERNEL_DIR"
 """Environment variable pointing at the ``exisiting_optimization_work`` root.
 
-The KDA module resolves the ``KDA_prefill/benchmark`` and ``KDA_decode``
-sub-directories from this root. If unset the module falls back to the FLA
-reference path.
+The KDA module resolves the ``KDA_prefill/benchmark`` sub-directory from this
+root. If unset the module falls back to the FLA reference path.
 """
 
 
@@ -122,32 +122,6 @@ def _load_fla_chunk_kda() -> ModuleType:
 
 
 # ---------------------------------------------------------------------------
-# KDA_decode kernel loading (fused CUDA extension).
-# ---------------------------------------------------------------------------
-
-_DECODE_MODULE: Optional[ModuleType] = None
-
-
-def _load_decode_module(root: str) -> ModuleType:
-    global _DECODE_MODULE
-    if _DECODE_MODULE is not None:
-        return _DECODE_MODULE
-
-    decode_dir = os.path.join(root, "KDA_decode")
-    if not os.path.isdir(decode_dir):
-        raise FileNotFoundError(
-            f"KDA_decode dir not found at {decode_dir}. "
-            f"Set {KIMI_KDA_OPTIMIZED_KERNEL_ENV} to point at "
-            "exisiting_optimization_work/."
-        )
-    if decode_dir not in sys.path:
-        sys.path.insert(0, decode_dir)
-    module = importlib.import_module("kda_decode_fusion_cuda")
-    _DECODE_MODULE = module
-    return module
-
-
-# ---------------------------------------------------------------------------
 # Dispatch API used by the KimiKDALinearAttention module.
 # ---------------------------------------------------------------------------
 
@@ -180,12 +154,10 @@ class KDAKernelDispatch:
             self.kernel_path = "fla"
             self.optimization_root: Optional[str] = None
             self._prefill_module: Optional[ModuleType] = None
-            self._decode_module: Optional[ModuleType] = None
         else:
             self.kernel_path = "optimized"
             self.optimization_root = root
             self._prefill_module = None
-            self._decode_module = None
 
     def get_prefill_source(self) -> str:
         if self.kernel_path == "optimized":
@@ -196,9 +168,7 @@ class KDAKernelDispatch:
 
     def get_decode_source(self) -> str:
         if self.kernel_path == "optimized":
-            module = _load_decode_module(self.optimization_root)
-            self._decode_module = module
-            return module.__file__
+            return _kda_decode.__file__ or "<kimi_kda._kda_decode>"
         return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
 
     def prefill_chunk_kda(
@@ -303,18 +273,4 @@ class KDAKernelDispatch:
                 "decode_kda called on non-optimized path; use FLA path via "
                 "the module's fallback handling instead."
             )
-        module = _load_decode_module(self.optimization_root)
-        self._decode_module = module
-        return module.run_kda_decode_fusion_cuda(**kwargs)
-
-    def precompile_decode(self, verbose: bool = False) -> None:
-        """Trigger the KDA_decode extension JIT build early.
-
-        On the FLA fallback path this is a no-op.
-        """
-        if self.kernel_path != "optimized":
-            return
-        module = _load_decode_module(self.optimization_root)
-        self._decode_module = module
-        if hasattr(module, "precompile_kda_decode_fusion_extension"):
-            module.precompile_kda_decode_fusion_extension(verbose=verbose)
+        return _kda_decode.run_kda_decode_fusion_cuda(**kwargs)

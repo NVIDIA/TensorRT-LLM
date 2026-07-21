@@ -22,8 +22,7 @@ Environment (the sbatch launcher sets everything up):
   KIMI_K3_TP                   tensor_parallel_size == EP width (default 16;
                                896 % TP must be 0)
   KIMI_K3_FUSED_MOE            1 (default) = private flashinfer SiTU MXFP4
-                               fused MoE (env from setup_snapshot_env.sh
-                               required); 0 = slow reference dequant loop
+                               fused MoE; 0 = slow reference dequant loop
   KIMI_K3_NUM_LAYERS_OVERRIDE  truncate to first N layers (debug; skips
                                output-quality assertions)
 Exit code 0 = PASS, 1 = FAIL.
@@ -57,6 +56,10 @@ def main() -> int:
     print(f"[sanity] ckpt={ckpt} tp(EP)={tp} truncated={truncated} "
           f"fused_moe={os.environ.get('KIMI_K3_FUSED_MOE', '0')}")
 
+    extra = {}
+    if os.environ.get("KIMI_K3_ALLREDUCE_STRATEGY"):
+        # Debug knob: e.g. NCCL to bypass the custom/AUTO allreduce path.
+        extra["allreduce_strategy"] = os.environ["KIMI_K3_ALLREDUCE_STRATEGY"]
     llm = LLM(
         model=ckpt,
         tensor_parallel_size=tp,
@@ -76,6 +79,7 @@ def main() -> int:
             # path requiring num_heads % 64 == 0; K3 has 96 query heads).
             tokens_per_block=64,
         ),
+        **extra,
     )
 
     prompts = [p for p, _ in PROMPTS_AND_CHECKS]

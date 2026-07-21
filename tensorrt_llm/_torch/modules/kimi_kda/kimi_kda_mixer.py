@@ -275,9 +275,6 @@ class KimiKDALinearAttention(nn.Module):
     def decode_kernel_source(self) -> str:
         return self._dispatch.get_decode_source()
 
-    def precompile_decode(self, verbose: bool = False) -> None:
-        self._dispatch.precompile_decode(verbose=verbose)
-
     # ------------------------------------------------------------------
     # Prefill entry (Goal 2.1 pass path).
     # ------------------------------------------------------------------
@@ -542,8 +539,11 @@ class KimiKDALinearAttention(nn.Module):
             cs_k_tile = cs_k_grouped[:, tile_idx, :, :].contiguous()
             cs_v_tile = cs_v_grouped[:, tile_idx, :, :].contiguous()
 
-            A_log_tile = A_log_grouped[tile_idx, :].contiguous()
-            dt_bias_tile = dt_bias_grouped[tile_idx, :].contiguous()
+            # The in-tree decode op requires fp32 A_log/dt_bias (and fp32
+            # onorm_weight); in a bf16-cast module these params are bf16,
+            # so upcast the (tiny) tiles at the call boundary.
+            A_log_tile = A_log_grouped[tile_idx, :].contiguous().float()
+            dt_bias_tile = dt_bias_grouped[tile_idx, :].contiguous().float()
 
             state_tile_view = state_grouped[:, tile_idx, :, :, :]
             state_tile = state_tile_view.clone().contiguous()

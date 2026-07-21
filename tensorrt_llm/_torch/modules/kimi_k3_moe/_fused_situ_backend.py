@@ -39,8 +39,7 @@ EP: the kernel natively supports a contiguous local expert slice via
 passed unchanged in ``topk_idx`` and tokens whose experts are all
 remote contribute zeros to the output (caller allreduces partials).
 
-Environment requirements (see ``scripts/moe_fast/RESULTS.md`` and
-``setup_snapshot_env.sh`` for the full story):
+Environment requirements:
 
 * ``FLASHINFER_PRIVATE_CUBIN_DIR`` must point at the SiTU pool
   **before** ``import flashinfer`` (jit_env snapshots it at import).
