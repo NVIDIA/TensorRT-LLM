@@ -242,13 +242,17 @@ def beam_candidate_topk(
     """
     batch_size, beam_width_in, vocab_size = logprobs.shape
     topk_fn = topk_fn or _torch_topk
+    # Clamps are only relevant for tiny test vocabularies: stage 1 cannot
+    # exceed the vocab, the global top-k cannot exceed the pooled candidates.
+    stage1_k = min(beam_width_out, vocab_size)
+    beam_width_out = min(beam_width_out, beam_width_in * stage1_k)
     # Stage 1: raw per-beam top-k (the per-beam adjustments are constant
     # along the vocab axis, so raw ordering == adjusted ordering).
     per_beam_vals, per_beam_tokens = topk_fn(
-        logprobs.view(batch_size * beam_width_in, vocab_size), beam_width_out
+        logprobs.view(batch_size * beam_width_in, vocab_size), stage1_k
     )
-    per_beam_vals = per_beam_vals.view(batch_size, beam_width_in, beam_width_out)
-    per_beam_tokens = per_beam_tokens.view(batch_size, beam_width_in, beam_width_out)
+    per_beam_vals = per_beam_vals.view(batch_size, beam_width_in, stage1_k)
+    per_beam_tokens = per_beam_tokens.view(batch_size, beam_width_in, stage1_k)
     # Stage 2: adjust only the survivors and pick the global top-k.
     keys = per_beam_vals
     if diversity_rate is not None:
@@ -276,9 +280,9 @@ def beam_candidate_topk(
         # token), so the power is always well-defined.
         penalty_factor = cand_gen_lengths.to(logprobs.dtype).pow(exponent)
         keys = keys / penalty_factor.unsqueeze(-1)
-    _, selected = torch.topk(keys.view(batch_size, -1), k=beam_width_out, sorted=True, dim=-1)
+    _, selected = topk_fn(keys.view(batch_size, -1), beam_width_out)
     sorted_logprobs = per_beam_vals.view(batch_size, -1).gather(1, selected)
-    predecessor_beams = (selected // beam_width_out).to(torch.int32)
+    predecessor_beams = (selected // stage1_k).to(torch.int32)
     tokens = per_beam_tokens.view(batch_size, -1).gather(1, selected).to(torch.int32)
     return sorted_logprobs, predecessor_beams, tokens
 
@@ -347,33 +351,25 @@ def beam_search_sampling_batch(
     if not isinstance(diversity_rate, torch.Tensor) and not diversity_rate:
         diversity_rate = None  # scalar 0 (or None) disables the adjustment
     cand_gen_lengths: Optional[torch.Tensor] = None
-    if length_penalty is not None or diversity_rate is not None:
-        if length_penalty is not None:
-            # Candidate generated length: active beams grow by one token this
-            # step, finished beams keep their frozen length (they only append
-            # pads).
-            gen_lengths = beam_search_args.beam_gen_lengths[
-                beam_search_args.seq_slots, :beam_width_in
-            ]
-            cand_gen_lengths = gen_lengths + (~finished_beams_mask).to(gen_lengths.dtype)
-        # Rank by the adjusted score; keep raw cum_log_probs for storage.
-        sorted_logprobs, predecessor_beam, next_tokens = beam_candidate_topk(
-            logprobs,
-            beam_width_out=beam_width_out,
-            length_penalty=length_penalty,
-            cand_gen_lengths=cand_gen_lengths,
-            diversity_rate=diversity_rate,
-            source_beam_indices=beam_search_args.beam_idx_arange,
-            topk_fn=topk_fn,
-        )
-    else:
-        logprobs = logprobs.view(batch_size, beam_width_in * vocab_size)
-        sorted_logprobs, sorted_indices = (topk_fn or _torch_topk)(logprobs, beam_width_out)
-        # torch.topk over the flattened candidates yields flat indices;
-        # split them into (source beam, token id).
-        flat_indices = sorted_indices.to(torch.int32)
-        predecessor_beam = flat_indices // vocab_size
-        next_tokens = flat_indices % vocab_size
+    if length_penalty is not None:
+        # Candidate generated length: active beams grow by one token this
+        # step, finished beams keep their frozen length (they only append
+        # pads).
+        gen_lengths = beam_search_args.beam_gen_lengths[beam_search_args.seq_slots, :beam_width_in]
+        cand_gen_lengths = gen_lengths + (~finished_beams_mask).to(gen_lengths.dtype)
+    # Rank by the (optionally adjusted) score; keep raw cum_log_probs for
+    # storage. The two-stage selection is used even without adjustments: it is
+    # equivalent to a flat top-k there, and faster with the radix backend
+    # (more, shorter rows parallelize better).
+    sorted_logprobs, predecessor_beam, next_tokens = beam_candidate_topk(
+        logprobs,
+        beam_width_out=beam_width_out,
+        length_penalty=length_penalty,
+        cand_gen_lengths=cand_gen_lengths,
+        diversity_rate=diversity_rate,
+        source_beam_indices=beam_search_args.beam_idx_arange,
+        topk_fn=topk_fn,
+    )
 
     if cand_gen_lengths is not None:
         beam_search_args.beam_gen_lengths[beam_search_args.seq_slots, :beam_width_out] = (
@@ -520,29 +516,16 @@ def beam_search_sampling_batch_cba(
     # the beam slots (harvested beams' rows are all -inf and count as
     # active fillers via the isfinite guard below).
     topk_fn = topk_fn or _torch_topk
-    stage1_k = min(2 * num_beams, vocab_size)
-    # The global top-k cannot exceed the pooled stage-1 candidates (relevant
-    # only for tiny test vocabularies).
-    num_candidates = min(2 * num_beams, beam_width_in * stage1_k)
-    per_beam_vals, per_beam_tokens = topk_fn(
-        logprobs.view(batch_size * beam_width_in, vocab_size), stage1_k
-    )
-    per_beam_vals = per_beam_vals.view(batch_size, beam_width_in, stage1_k)
-    per_beam_tokens = per_beam_tokens.view(batch_size, beam_width_in, stage1_k)
-    keys = per_beam_vals
     if not isinstance(diversity_rate, torch.Tensor) and not diversity_rate:
         diversity_rate = None
-    if diversity_rate is not None:
-        rate = (
-            diversity_rate.view(-1, 1, 1)
-            if isinstance(diversity_rate, torch.Tensor)
-            else diversity_rate
-        )
-        keys = keys + rate * args.beam_idx_arange[:beam_width_in].view(1, -1, 1)
-    _, selected = torch.topk(keys.view(batch_size, -1), k=num_candidates, sorted=True, dim=-1)
-    cand_cum = per_beam_vals.view(batch_size, -1).gather(1, selected)
-    cand_pred = (selected // stage1_k).to(torch.int32)
-    cand_tok = per_beam_tokens.view(batch_size, -1).gather(1, selected).to(torch.int32)
+    cand_cum, cand_pred, cand_tok = beam_candidate_topk(
+        logprobs,
+        beam_width_out=2 * num_beams,
+        diversity_rate=diversity_rate,
+        source_beam_indices=args.beam_idx_arange,
+        topk_fn=topk_fn,
+    )
+    num_candidates = cand_cum.size(1)
 
     end_ids = args.end_ids[slots].view(-1, 1)
     # -inf candidates (from harvested rows) must count as slot fillers, not
@@ -624,7 +607,7 @@ def beam_search_sampling_batch_cba(
     harvest_normed = harvest_normed.masked_fill(~harvest_mask, neg_inf)
 
     all_normed = torch.cat([args.cba_normed_scores[slots], new_normed, harvest_normed], dim=1)
-    top_normed, top_i = torch.topk(all_normed, k=num_beams, sorted=True, dim=-1)
+    top_normed, top_i = topk_fn(all_normed, num_beams)
     all_cum = torch.cat([args.cba_cum_log_probs[slots], cand_cum, harvest_cum], dim=1)
     all_len = torch.cat(
         [

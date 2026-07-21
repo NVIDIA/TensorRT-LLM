@@ -97,6 +97,21 @@ Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSe
 BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 
+def topk_op(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-k over the last dim of a 2D tensor.
+
+    Drop-in for ``torch.topk(values, k, dim=-1, sorted=True)``; dispatches on
+    row width: flashinfer's radix-select kernel is O(n) and much faster than
+    torch.topk on large rows (e.g. vocab-sized logits), while torch.topk wins
+    on small rows where the radix kernel's fixed per-call cost dominates. The
+    10k crossover follows flashinfer's own guidance (``flashinfer.top_k``
+    docstring).
+    """
+    if values.size(-1) > 10000:
+        return flashinfer.radix_topk_op(values, k)
+    return torch.topk(values, k=k, dim=-1, sorted=True)
+
+
 @dataclass(frozen=True, kw_only=True)
 class UtilsSamplingParams:
     """Subset of tensorrt_llm::runtime::SamplingConfig supported by sampling_utils.
@@ -857,7 +872,7 @@ class _StrategyImpls:
                     early_stopping=self._early_stopping,
                     length_penalty=self._length_penalty,
                     diversity_rate=self._diversity_rate,
-                    topk_fn=flashinfer.topk_op,
+                    topk_fn=topk_op,
                     return_probs=self.computes_probs(),
                 )
             return beam_search_sampling_batch(
@@ -869,9 +884,9 @@ class _StrategyImpls:
                 length_penalty=self._length_penalty,
                 diversity_rate=self._diversity_rate,
                 # TorchSampler hard-depends on flashinfer (enforced in its
-                # constructor); topk_op picks flashinfer's radix top-k for
+                # constructor); topk_op (above) picks flashinfer's radix top-k for
                 # vocab-sized rows (~5x faster than torch.topk).
-                topk_fn=flashinfer.topk_op,
+                topk_fn=topk_op,
                 return_probs=self.computes_probs(),
             )
 

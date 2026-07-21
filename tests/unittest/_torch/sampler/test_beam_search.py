@@ -975,9 +975,9 @@ def test_beam_candidate_topk_equivalence(length_penalty, diversity_rate,
 def test_topk_op_beam_parity():
     """The flashinfer path of topk_op must match torch.topk on beam-search-shaped
     inputs, including -inf-dominated rows (finished beams)."""
-    from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import topk_op
     from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
         beam_candidate_topk
+    from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import topk_op
 
     torch.manual_seed(11)
     bs, bw, vocab, k = 8, 4, 152064, 4
