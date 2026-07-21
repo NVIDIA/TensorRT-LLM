@@ -71,6 +71,7 @@ _ASYNC_READY_CANCELLED_EPOCH_ATTR = "_trtllm_async_ready_cancelled_epoch"
 _MAX_RETIRED_CONSENSUS_REQUESTS = 65536
 _STARTUP_ROLLBACK_TIMEOUT_S = 30.0
 _CONSENSUS_STARTUP_CLOSE_TIMEOUT_S = 1.0
+_ASYNC_READY_MAX_IDLE_SLEEP_S = 0.01
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -93,6 +94,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        publish_disaggregated_params: bool = True,
     ):
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
@@ -102,6 +104,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
+        self._publish_disaggregated_params = publish_disaggregated_params
         # Initialize optional consensus state without adding a collective to
         # the default-off startup path. Explicit opt-in is negotiated later by
         # piggybacking on the existing endpoint exchange.
@@ -127,6 +130,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._shutdown_worker_complete = False
         self._shutdown_worker_event: Optional[threading.Event] = None
         self._shutdown_deferred_errors: list[tuple[str, Exception]] = []
+        self._async_ready_idle_wakeup = threading.Event()
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
@@ -424,6 +428,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if worker_event is not None and not worker_event.is_set():
             return worker_event
         self._shutdown = True
+        self._async_ready_idle_wakeup.set()
         shutdown_errors: list[tuple[str, Exception]] = []
 
         def run_shutdown_step(name: str, callback: Callable[[], None]) -> None:
@@ -857,11 +862,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         while len(epochs) > _MAX_RETIRED_CONSENSUS_REQUESTS:
             epochs.popitem(last=False)
 
-    def _progress_async_consensus(self) -> None:
+    def _progress_async_consensus(self) -> bool:
         coordinator = self._async_consensus
         if coordinator is None:
-            return
-        for event in coordinator.poll():
+            return False
+        events = coordinator.poll()
+        for event in events:
             if event.kind == ConsensusEventKind.TERMINAL_COMMIT:
                 published_epoch = self._async_terminal_published.get(event.request_id)
                 if published_epoch != event.epoch:
@@ -889,6 +895,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._apply_async_ready_abort_finalize(event)
             else:
                 raise RuntimeError(f"unhandled asynchronous consensus event: {event}")
+        return bool(events)
 
     def _apply_async_ready_prepare(self, event: ConsensusEvent) -> None:
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)
@@ -1735,6 +1742,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or any(key[0] == rid for key in self._async_ready_aborted)
         )
         if getattr(self, "_async_peer_ready_consensus_enabled", False) and readiness_owned:
+            self._async_ready_idle_wakeup.set()
             cancelled_req = (
                 waiting_req
                 if waiting_req is not None
@@ -1827,12 +1835,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # broadcasts REQUEST_DATA to all ctx DP ranks.  The actual ctx_dp_rank
         # is stamped into ContextPhaseParams by respond_and_send_async() after
         # the prefill is scheduled.
+        if not self._publish_disaggregated_params:
+            return {}
         ctx_dp_rank = None if self._mapping.enable_attention_dp else self._dp_rank
         return {
             "ctx_dp_rank": ctx_dp_rank,
             "ctx_info_endpoint": [self._context_info_endpoint]
             if self._context_info_endpoint
             else None,
+            # The instance name is a per-transceiver UUID broadcast across the
+            # worker group.  The generation-first coordinator uses it only to
+            # reject unowned/estimation-lifetime endpoint metadata; it is not
+            # forwarded in an inference request.
+            **(
+                {"ctx_endpoint_generation": self._instance_name}
+                if self._async_peer_ready_consensus_enabled
+                else {}
+            ),
         }
 
     def exclude_context_requests_from_readiness(self, requests: List[LlmRequest]) -> None:
@@ -1980,6 +1999,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _prepare_context_requests_async(self) -> None:
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)
+        published = False
         for rid in list(self._wait_reqs):
             if rid in self._async_ready_published:
                 continue
@@ -1989,9 +2009,28 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             coordinator.publish_ready(rid, epoch)
             self._async_ready_published[rid] = epoch
             self._record_async_transition("ready_vote", rid, epoch)
+            published = True
         # Poll again so the PP-last coordinator can begin prepare immediately
         # after recording its local vote.
-        self._progress_async_consensus()
+        progressed = self._progress_async_consensus()
+        if published or progressed or not self._wait_reqs or self._shutdown:
+            return
+
+        # Native REQUEST_DATA ingress is asynchronous.  A missing/stale peer
+        # endpoint otherwise turns the executor loop into a tight poll that can
+        # issue millions of legacy status collectives while making no request
+        # progress.  Yield for one bounded configured poll interval; peer-info
+        # completeness remains the sole READY predicate above.  Cancellation
+        # and shutdown are re-observed on the next iteration within this cap.
+        sleep_s = min(
+            max(0.0, self.kv_transfer_poll_interval_ms / 1000.0),
+            _ASYNC_READY_MAX_IDLE_SLEEP_S,
+        )
+        if sleep_s:
+            self._async_ready_idle_wakeup.clear()
+            if self._shutdown or not self._wait_reqs:
+                return
+            self._async_ready_idle_wakeup.wait(sleep_s)
 
     def _check_compatible(self):
         if self._mapping.cp_size != 1:

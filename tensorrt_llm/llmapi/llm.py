@@ -163,7 +163,6 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
-        self._disaggregated_params: Optional[dict] = None
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend
@@ -327,10 +326,11 @@ class BaseLLM:
     @property
     @set_api_status("beta")
     def disaggregated_params(self) -> dict:
-        if self._disaggregated_params is None:
-            self._disaggregated_params = self._executor.get_disaggregated_params(
-            ) if self._executor else {}
-        return self._disaggregated_params
+        # Worker initialization has an internal KV-capacity estimation phase.
+        # Never freeze the first RPC result: only the current, final executor
+        # owns endpoints that may be advertised to a generation-first peer.
+        return self._executor.get_disaggregated_params(
+        ) if self._executor else {}
 
     @staticmethod
     def _is_token_id_list(value: Any) -> bool:

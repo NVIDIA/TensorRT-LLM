@@ -2211,6 +2211,7 @@ def create_py_executor_instance(
     peft_cache_config: Optional[PeftCacheConfig] = None,
     scheduler_config: Optional[SchedulerConfig] = None,
     cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
+    publish_disaggregated_params: bool = True,
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
@@ -2537,7 +2538,8 @@ def create_py_executor_instance(
 
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        cache_transceiver_config, mamba_cache_manager,
+        publish_disaggregated_params)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

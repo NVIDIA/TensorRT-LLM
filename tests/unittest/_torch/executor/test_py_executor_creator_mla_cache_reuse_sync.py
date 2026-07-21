@@ -88,7 +88,7 @@ class _DummyPyExecutor:
 class _DummyKvCacheCreator:
     """Mock KV cache creator that builds a dummy KV cache manager with reuse settings."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, estimate=False, **kwargs):
         """Initialize with KV cache configuration.
 
         Args:
@@ -97,10 +97,19 @@ class _DummyKvCacheCreator:
         self._max_seq_len = kwargs["max_seq_len"]
         self._kv_cache_config = kwargs["kv_cache_config"]
         self._execution_stream = kwargs["execution_stream"]
+        self._estimate = estimate
 
     def try_prepare_estimation(self):
-        """Skip estimation phase (no-op)."""
-        return False
+        """Return whether the mocked two-phase estimation path is active."""
+        return self._estimate
+
+    def configure_kv_cache_capacity(self, _py_executor):
+        """Accept the memory-accounting executor in the estimation path."""
+
+    @staticmethod
+    def teardown_managers(resources):
+        """Remove the temporary manager before final allocation."""
+        resources.pop(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     def build_managers(self, resources, estimating_kv_cache):
         """Build KV cache manager with reuse configuration.
@@ -209,6 +218,8 @@ def _run_create_py_executor(
     enable_flash_mla=False,
     model_max_seq_len=128,
     enable_chunked_prefill=False,
+    estimate_kv_cache=False,
+    return_publish_flags=False,
 ):
     """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
@@ -224,6 +235,8 @@ def _run_create_py_executor(
         enable_flash_mla: Whether to emulate the FlashMLA block-size override.
         model_max_seq_len: Effective sequence length reported by the model engine.
         enable_chunked_prefill: Whether to request MLA chunked prefill support.
+        estimate_kv_cache: Whether to exercise two-phase KV cache estimation.
+        return_publish_flags: Whether to return endpoint-publication flags.
 
     Returns:
         Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
@@ -264,7 +277,11 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "is_mla", lambda _: True)
     monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: False)
     monkeypatch.setattr(py_executor_creator, "get_sm_version", lambda: sm_version)
-    monkeypatch.setattr(py_executor_creator, "KvCacheCreator", _DummyKvCacheCreator)
+    monkeypatch.setattr(
+        py_executor_creator,
+        "KvCacheCreator",
+        lambda **kwargs: _DummyKvCacheCreator(estimate=estimate_kv_cache, **kwargs),
+    )
 
     monkeypatch.setattr(py_executor_creator.torch.cuda, "mem_get_info", lambda: (2 << 30, 4 << 30))
     monkeypatch.setattr(py_executor_creator.torch.cuda, "empty_cache", lambda: None)
@@ -286,7 +303,10 @@ def _run_create_py_executor(
 
     monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
 
+    publish_flags = []
+
     def _create_py_executor_instance(**kwargs):
+        publish_flags.append(kwargs["publish_disaggregated_params"])
         return _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
@@ -306,11 +326,28 @@ def _run_create_py_executor(
         ResourceManagerType.KV_CACHE_MANAGER
     )
 
-    return (
+    result = (
         kv_cache_manager.enable_block_reuse,
         py_executor.model_engine.attn_runtime_features.cache_reuse,
         py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
+    return publish_flags if return_publish_flags else result
+
+
+def test_kv_estimation_keeps_transceiver_but_suppresses_temporary_endpoint(
+    monkeypatch,
+):
+    publish_flags = _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        estimate_kv_cache=True,
+        return_publish_flags=True,
+    )
+
+    # Both executor lifetimes are constructed, preserving transceiver memory
+    # accounting.  Only the final serving lifetime may publish its endpoints.
+    assert publish_flags == [False, True]
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):

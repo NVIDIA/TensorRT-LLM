@@ -205,6 +205,7 @@ def _make_transceiver(
     transceiver._shutdown_worker_complete = False
     transceiver._shutdown_worker_event = None
     transceiver._shutdown_deferred_errors = []
+    transceiver._async_ready_idle_wakeup = threading.Event()
     transceiver._sender_future_timeout_ms = 123
     transceiver.kv_transfer_poll_interval_ms = 10
     # Attributes read by check_context_transfer_status before it processes sessions.
@@ -1470,6 +1471,81 @@ def test_async_peer_ready_activates_only_from_authoritative_schedule() -> None:
     transceiver._progress_async_consensus()
     assert not transceiver._async_ready_activated
     assert 31 not in transceiver._async_ready_published
+
+
+def test_async_peer_ready_wait_uses_bounded_interruptible_backoff(monkeypatch) -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    transceiver._wait_reqs[37] = _FakeRequest(request_id=37)
+    transceiver.kv_transfer_poll_interval_ms = 5000
+    wait = Mock(return_value=False)
+    monkeypatch.setattr(transceiver._async_ready_idle_wakeup, "wait", wait)
+
+    transceiver._prepare_context_requests_async()
+
+    wait.assert_called_once_with(transceiver_module._ASYNC_READY_MAX_IDLE_SLEEP_S)
+    assert 37 not in transceiver._async_ready_published
+
+
+def test_async_peer_ready_progress_does_not_backoff(monkeypatch) -> None:
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=38)
+    transceiver._wait_reqs[38] = req
+    transceiver._async_ready_published[38] = 0
+    coordinator.events.append(
+        ConsensusEvent(
+            ConsensusEventKind.READY_PREPARE,
+            38,
+            0,
+            ConsensusOutcome.READY,
+        )
+    )
+    wait = Mock(return_value=False)
+    monkeypatch.setattr(transceiver._async_ready_idle_wakeup, "wait", wait)
+
+    transceiver._prepare_context_requests_async()
+
+    wait.assert_not_called()
+    assert (38, 0) in transceiver._async_ready_prepared
+
+
+def test_async_peer_ready_shutdown_skips_backoff(monkeypatch) -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    transceiver._wait_reqs[39] = _FakeRequest(request_id=39)
+    transceiver._shutdown = True
+    wait = Mock(return_value=False)
+    monkeypatch.setattr(transceiver._async_ready_idle_wakeup, "wait", wait)
+
+    transceiver._prepare_context_requests_async()
+
+    wait.assert_not_called()
+
+
+def test_estimation_transceiver_never_publishes_endpoint_metadata() -> None:
+    transceiver = _make_transceiver({})
+    transceiver._publish_disaggregated_params = False
+    transceiver._mapping = SimpleNamespace(enable_attention_dp=False)
+    transceiver._dp_rank = 0
+    transceiver._context_info_endpoint = "tcp://profiling:1234"
+    transceiver._instance_name = "profiling-generation"
+    transceiver._async_peer_ready_consensus_enabled = False
+
+    assert transceiver.get_disaggregated_params() == {}
+
+    transceiver._publish_disaggregated_params = True
+    assert transceiver.get_disaggregated_params() == {
+        "ctx_dp_rank": 0,
+        "ctx_info_endpoint": ["tcp://profiling:1234"],
+    }
+
+    transceiver._async_peer_ready_consensus_enabled = True
+    assert transceiver.get_disaggregated_params() == {
+        "ctx_dp_rank": 0,
+        "ctx_info_endpoint": ["tcp://profiling:1234"],
+        "ctx_endpoint_generation": "profiling-generation",
+    }
 
 
 def test_async_peer_ready_follower_stays_hidden_until_schedule_arrives() -> None:
