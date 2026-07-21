@@ -1136,26 +1136,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                         kv_cache_dtype_byte_size)
 
 
-def calc_context_stop_positions(prompt_len: int,
-                                tokens_per_block: int,
-                                mamba_state_cache_interval: int,
-                                save_last_snapshot: bool = False) -> list[int]:
-    """Compute token positions at which mamba state snapshots should be saved.
-
-    Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length (and optionally the last block-aligned position).
-    """
-    stop_positions = list(
-        range(mamba_state_cache_interval, prompt_len,
-              mamba_state_cache_interval))
-    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
-    if save_last_snapshot and (last_ckpt not in stop_positions):
-        stop_positions.append(last_ckpt)
-    if prompt_len not in stop_positions:
-        stop_positions.append(prompt_len)
-    return stop_positions
-
-
 @triton.jit
 def _promote_mamba_state_kernel(
     src_ptr,
@@ -1366,6 +1346,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
             )
+            # PP ranks replay the same scheduling decisions, so a rank without
+            # local Mamba layers must still publish the configured boundaries.
+            self.kv_cache_config = kv_cache_config
+            self.linear_attention_metadata = LinearAttentionMetadata()
+            self.linear_attention_metadata.states_snapshot_interval = (
+                kv_cache_config.mamba_state_cache_interval
+                if kv_cache_config.enable_block_reuse else 0)
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
@@ -1908,7 +1895,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # request, so no additional capping is required here.
         interval = (self.linear_attention_metadata.states_snapshot_interval
                     if self.linear_attention_metadata is not None else 0)
-        if interval and interval > 0:
+        # Attention-only PP ranks keep the interval so every rank publishes
+        # identical scheduling boundaries, but they have no recurrent-state
+        # pool whose capacity should constrain their attention KV cache.
+        if self.local_num_mamba_layers > 0 and interval and interval > 0:
             stats = self.impl.get_kv_cache_stats()
             rs_free = stats.num_free_blocks_per_window_size.get(
                 LinearCacheType.RECURRENT_STATES.value, 0)
@@ -2073,38 +2063,23 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return indices
         return self.cuda_state_indices
 
-    def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
-        """Compute the next prefill chunk size for a context request when block reuse is enabled.
-
-        When kv_cache_config.enable_block_reuse is True, context prefill must stop exactly at
-        the positions returned by calc_context_stop_positions (mamba_state_cache_interval boundaries
-        and block boundaries). This returns the chunk_size to use for the next prefill step so
-        that the next stop position is not exceeded.
-
-        Args:
-            request: Context request with prompt_len and context_current_position set.
-
-        Returns:
-            Number of tokens to prefill in the next step (0 if context is already complete).
-        """
-        prompt_len = request.prompt_len
-        current = request.context_current_position
-        if current >= prompt_len:
-            return 0
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        """Set reusable Mamba snapshot boundaries before scheduling."""
         if not self.kv_cache_config.enable_block_reuse:
-            assert current == 0, (
-                "Expected context_current_position to be 0 when block reuse is "
-                f"disabled, but got {current}")
-            return prompt_len - current
-        step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(prompt_len,
-                                                     self.tokens_per_block,
-                                                     step)
-        stop_positions = sorted(set(stop_positions))
-        for pos in stop_positions:
-            if pos > current:
-                return pos - current
-        return prompt_len - current
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        interval = self.linear_attention_metadata.states_snapshot_interval
+        if interval is None or interval <= 0:
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        for request in requests:
+            request.expect_snapshot_points = list(
+                range(interval, request.prompt_len + 1, interval))
 
     def _setup_states(self) -> None:
         # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
