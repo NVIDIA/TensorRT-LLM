@@ -2264,8 +2264,6 @@ def pytest_configure(config):
             "Warning: --periodic-junit requires --output-dir to be set. "
             "Periodic reporting disabled.")
 
-    _get_s3_output().register_plugin(config)
-
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
                                   config):

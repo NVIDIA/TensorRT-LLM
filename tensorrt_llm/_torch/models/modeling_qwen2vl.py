@@ -154,7 +154,14 @@ def _prepare_qwen_vl_mrope_config(
         if len(delta_tensors) != num_seq_slots:
             raise RuntimeError(
                 "Missing MRoPE position deltas for seq-slot cache update")
-        deltas = torch.cat(delta_tensors, dim=0)
+        # `delta_tensors` originate from per-request `multimodal_data` and may
+        # be CPU-resident when the owning model's `multimodal_data_device_paths`
+        # does not cover `mrope_config.*` (or a path skips the engine's H2D
+        # move), while the seq-slot cache and `seq_slots` live on the model
+        # device. `index_copy_` requires all tensors on the same device.
+        deltas = torch.cat(delta_tensors,
+                           dim=0).to(device=mrope_position_deltas_cache.device,
+                                     non_blocking=True)
         mrope_position_deltas_cache.index_copy_(0, seq_slots, deltas)
 
     if position_ids is not None \
