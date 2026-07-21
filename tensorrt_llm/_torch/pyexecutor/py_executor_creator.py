@@ -1016,6 +1016,11 @@ def create_py_executor(
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
+            # The estimation executor must retain the transceiver's registered
+            # memory so KV-capacity accounting matches the final runtime.  It
+            # is not, however, a serving lifetime: never let its temporary
+            # endpoints escape through get_disaggregated_params().
+            publish_disaggregated_params=not estimating_kv_cache,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
             max_num_sequences=max_num_seq_slots,

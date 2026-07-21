@@ -138,6 +138,129 @@ def _make_completion_response(
     )
 
 
+@pytest.mark.asyncio
+async def test_generation_first_refreshes_final_endpoint_and_strips_generation():
+    service = _make_service("generation_first")
+    request = CompletionRequest(model="model", prompt=[1, 2, 3])
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=42)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=(
+            "ctx:8000",
+            {
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_info_endpoint": ["tcp://stale:1000"],
+                        "ctx_endpoint_generation": "stale-generation",
+                    }
+                }
+            },
+        )
+    )
+    service._ctx_router.get_runtime_server_info = AsyncMock(
+        return_value={
+            "disaggregated_params": {
+                "ctx_dp_rank": 0,
+                "ctx_info_endpoint": ["tcp://final:2000"],
+                "ctx_endpoint_generation": "final-generation",
+            }
+        }
+    )
+    captured_gen_request = None
+
+    async def send_gen(gen_request, **_kwargs):
+        nonlocal captured_gen_request
+        captured_gen_request = gen_request
+        return _make_completion_response("done", "length", context_only=False)
+
+    service._gen_client = SimpleNamespace(send_request=AsyncMock(side_effect=send_gen))
+    service._ctx_client = SimpleNamespace(send_request=AsyncMock(return_value=None))
+
+    await service._send_disagg_request_gen_first(request)
+
+    service._ctx_router.get_runtime_server_info.assert_awaited_once_with(
+        "ctx:8000", require_generation=True
+    )
+    assert captured_gen_request.disaggregated_params.ctx_info_endpoint == "tcp://final:2000"
+    assert not hasattr(captured_gen_request.disaggregated_params, "ctx_endpoint_generation")
+
+
+@pytest.mark.asyncio
+async def test_generation_first_flags_off_uses_valid_cached_endpoint():
+    service = _make_service("generation_first")
+    request = CompletionRequest(model="model", prompt=[1, 2, 3])
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=45)
+    service._ctx_router.get_next_server = AsyncMock(
+        return_value=(
+            "ctx:8000",
+            {
+                "server_info": {
+                    "disaggregated_params": {
+                        "ctx_info_endpoint": ["tcp://legacy:1000"],
+                    }
+                }
+            },
+        )
+    )
+    service._ctx_router.get_runtime_server_info = AsyncMock()
+    service._ctx_client = SimpleNamespace(send_request=AsyncMock(return_value=None))
+    service._gen_client = SimpleNamespace(
+        send_request=AsyncMock(
+            return_value=_make_completion_response("done", "length", context_only=False)
+        )
+    )
+
+    await service._send_disagg_request_gen_first(request)
+
+    service._ctx_router.get_runtime_server_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_generation_first_refresh_failure_releases_ctx_reservation():
+    service = _make_service("generation_first")
+    request = CompletionRequest(model="model", prompt=[1, 2, 3])
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=43)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:8000", {"server_info": {}}))
+    service._ctx_router.get_runtime_server_info = AsyncMock(side_effect=RuntimeError("not final"))
+    service._ctx_router.finish_request = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="not final"):
+        await service._send_disagg_request_gen_first(request)
+
+    service._ctx_router.finish_request.assert_awaited_once_with(request, success=False, req_id=43)
+
+
+@pytest.mark.asyncio
+async def test_generation_first_cancelled_refresh_still_releases_reservation():
+    service = _make_service("generation_first")
+    request = CompletionRequest(model="model", prompt=[1, 2, 3])
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=44)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:8000", {"server_info": {}}))
+    refresh_started = asyncio.Event()
+
+    async def refresh(*_args, **_kwargs):
+        refresh_started.set()
+        await asyncio.Event().wait()
+
+    service._ctx_router.get_runtime_server_info = AsyncMock(side_effect=refresh)
+    cleanup_finished = asyncio.Event()
+
+    async def finish(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        cleanup_finished.set()
+
+    service._ctx_router.finish_request = AsyncMock(side_effect=finish)
+
+    service_task = asyncio.create_task(service._send_disagg_request_gen_first(request))
+    await refresh_started.wait()
+    service_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await service_task
+
+    await asyncio.wait_for(cleanup_finished.wait(), timeout=1.0)
+    service._ctx_router.finish_request.assert_awaited_once_with(request, success=False, req_id=44)
+
+
 def _make_chat_response(
     finish_reason: str,
     disagg_request_id: int = 42,
