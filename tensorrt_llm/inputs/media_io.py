@@ -38,7 +38,7 @@ import soundfile
 import torch
 from blake3 import blake3
 from packaging.version import Version
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 from tensorrt_llm.logger import logger
@@ -362,15 +362,20 @@ def _get_cv2():
 
 
 def is_decodable_image_file(path) -> bool:
-    """True when ``path`` holds still-image content (anything PIL opens).
+    """True when ``path`` holds still-image content PIL can fully decode.
 
-    Header-only probe: identifies the container without decoding pixels.
-    Lets callers classify a reference by content instead of by file suffix.
+    Strict, like :func:`is_decodable_image_bytes`: ``Image.open`` is lazy,
+    so this also decodes the pixels (``load``) — a truncated file passes a
+    header-only probe and then fails at the actual load, far from the cause.
+    Non-image content is still rejected cheaply at the header parse.
     """
     try:
-        with Image.open(path):
+        with Image.open(path) as image:
+            image.load()
             return True
-    except UnidentifiedImageError:
+    except OSError:
+        # ``UnidentifiedImageError`` (bad header) subclasses ``OSError``;
+        # truncated files raise plain ``OSError`` from ``load``.
         return False
 
 
@@ -395,10 +400,10 @@ def is_decodable_video_file(path) -> bool:
 def is_decodable_image_bytes(data) -> bool:
     """True when ``data`` holds still-image content PIL can fully decode.
 
-    In-memory counterpart of :func:`is_decodable_image_file`, but strict:
-    ``Image.open`` is lazy, so this also decodes the pixels (``load``) —
-    a truncated file passes a header-only probe and would then 500 at the
-    worker's load instead of 400ing at the boundary.
+    In-memory counterpart of :func:`is_decodable_image_file`, equally
+    strict: ``Image.open`` is lazy, so this also decodes the pixels
+    (``load``) — a truncated file passes a header-only probe and would
+    then 500 at the worker's load instead of 400ing at the boundary.
     """
     try:
         with Image.open(BytesIO(data)) as image:

@@ -1670,11 +1670,19 @@ class VideoGenerationRequest(OpenAIBaseModel):
         default=None,
         description=(
             "Optional image or video reference that guides generation. "
-            "Content is classified by decoding, not by extension or "
-            "content-type: images (anything PIL reads) condition "
-            "image-to-video; videos (anything OpenCV reads) condition "
-            "video-to-video on models that support it. JSON requests "
-            "carry base64 bytes; multipart requests upload the file."),
+            "Content is classified by decoding it — filename and MIME "
+            "metadata are not used for routing (JSON requests carry bare "
+            "base64 with no such metadata): Pillow must fully load an "
+            "image; OpenCV must open a video and return decodable "
+            "frames. Images condition image-to-video; videos condition "
+            "video-to-video on models that support it. Tested formats: "
+            "PNG (image/png) and JPEG (image/jpeg) images; MPEG-4 Part 2 "
+            "video in MP4 (video/mp4) and Motion JPEG in AVI "
+            "(video/x-msvideo). Other containers, codecs, profiles, and "
+            "pixel formats depend on the installed decoder backend and "
+            "are not guaranteed. Video references exceeding 1 GiB after "
+            "RGB decoding are rejected. JSON requests carry base64 "
+            "bytes; multipart requests upload the file."),
     )
 
     # Resolution
