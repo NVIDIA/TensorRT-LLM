@@ -5272,6 +5272,7 @@ class GvrTopKKernel:
         num_candidates: int,
         max_seq_len: Optional[int] = None,
         num_sms: Optional[int] = None,
+        has_block_max: bool = False,
     ) -> dict:
         """Pick the launch-shape ctor kwargs for ``(dtype, BS, N)``.
 
@@ -5305,6 +5306,16 @@ class GvrTopKKernel:
         # op's auto-pick): N < 64K -> 1 (sync unrecouped); tiny grid at
         # large N -> 8; single-wave -> 4/2; multi-wave -> 1.
         if n_row < 65536:
+            cluster_size = 1
+        elif has_block_max and n_row >= 200_000:
+            # Block-skip sweet spot is cs == 1 with a large per-CTA slice:
+            # the compact list + rung tightening (cs1-only) beat the
+            # row-split configs outright once the bounds prune the scan
+            # (cold protocol, real data: BS1 1.18x, BS64 2.14x, BS1024
+            # 4.16x vs this policy's stock picks; splitting shrinks each
+            # CTA's slice below the skip break-even and disables
+            # tightening). Below 200k the wrapper drops block_max anyway
+            # (skip_min_n gate) and the stock picks apply.
             cluster_size = 1
         elif num_rows <= 4 and n_row >= 131072:
             cluster_size = 8

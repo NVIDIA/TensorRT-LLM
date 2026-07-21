@@ -420,6 +420,12 @@ def gvr_topk_decode(
     # the gate (A/B probes).
     if block_max is not None and skip_min_n is not None and logits.shape[1] < skip_min_n:
         block_max = None
+    # K > 512 at tiny batch: the acceptance band is proportionally tighter
+    # (kC/K = 6 vs 10), the bounds prune less, and the row-split configs
+    # win outright (cold protocol, pro 262k BS1: skip 21.3-21.6us at
+    # cs1/cs8 vs stock cs8 19.7us) -> keep the stock path.
+    if block_max is not None and num_rows < 8 and top_k > 512:
+        block_max = None
     enable_block_skip = block_max is not None
     if enable_block_skip:
         assert (
