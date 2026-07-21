@@ -424,8 +424,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
     SizeType32 const numKvPools = static_cast<SizeType32>(kvWindowSizes.size());
 
-    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%lu",
-        allWindowSizes.size(), numKvPools, numPools, llmRequest.has_value() ? (*llmRequest)->mRequestId : 0);
+    TLLM_LOG_DEBUG("CacheFormatter::format: allWindowSizes=%zu, kvWindowSizes=%d, numPools=%d, requestId=%s",
+        allWindowSizes.size(), numKvPools, numPools,
+        llmRequest.has_value() ? std::to_string((*llmRequest)->mRequestId).c_str() : "<request-free>");
 
     bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
     if (layerWise)
