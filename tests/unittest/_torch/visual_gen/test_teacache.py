@@ -19,8 +19,13 @@ from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
-from tensorrt_llm._torch.visual_gen.cache.teacache import TeaCacheBackend
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    TeaCacheBackend,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm.visual_gen.args import TeaCacheConfig
@@ -299,6 +304,61 @@ class TestTeaCacheAcceleratorRefresh:
     def test_no_backends_is_noop(self):
         acc = self._make_accelerator([])
         acc.refresh(10)  # should not raise
+
+
+class _TupleTransformer(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        return_dict: bool = False,
+    ) -> tuple[torch.Tensor]:
+        assert not return_dict
+        return (hidden_states + 1,)
+
+
+def _identity_timestep_embedding(
+    _module: torch.nn.Module,
+    timestep: torch.Tensor,
+    **_kwargs,
+) -> torch.Tensor:
+    return timestep
+
+
+def test_teacache_preserves_tuple_output_on_cache_miss_and_hit() -> None:
+    transformer = _TupleTransformer()
+    register_extractor_from_config(
+        ExtractorConfig(
+            model_class_name=transformer.__class__.__name__,
+            timestep_embed_fn=_identity_timestep_embedding,
+            forward_params=["hidden_states", "timestep", "return_dict"],
+            return_dict_default=False,
+        )
+    )
+    backend = TeaCacheBackend(
+        TeaCacheConfig(
+            coefficients=[0.0, 0.0],
+            teacache_thresh=0.2,
+            use_ret_steps=False,
+        )
+    )
+    backend.enable(transformer)
+    backend.refresh(num_inference_steps=4)
+
+    hidden_states = torch.zeros(1, 8, 4)
+    timestep = torch.ones(1, 4)
+    try:
+        cache_miss = transformer(hidden_states, timestep, return_dict=False)
+        cache_hit = transformer(hidden_states, timestep, return_dict=False)
+        cache_stats = backend.get_stats()
+    finally:
+        backend.disable(transformer)
+
+    assert isinstance(cache_miss, tuple)
+    assert isinstance(cache_hit, tuple)
+    torch.testing.assert_close(cache_miss[0], hidden_states + 1)
+    torch.testing.assert_close(cache_hit[0], hidden_states + 1)
+    assert cache_stats["cached"] == 1
 
 
 class TestFlux2TeacacheTable:
