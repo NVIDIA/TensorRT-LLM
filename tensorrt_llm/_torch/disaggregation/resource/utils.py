@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from typing import Dict, List, Set
@@ -10,7 +24,7 @@ from .page import AttentionLayerGroup, KVCachePageTable, MambaLayerGroup, Physic
 
 
 def get_pool_bytes(pool: PhysicalPool) -> int:
-    """Total bytes across all slots in this pool."""
+    """Total transferable payload bytes across all slots in this pool."""
     return pool.slot_bytes * pool.num_slots
 
 
@@ -18,7 +32,8 @@ def get_slot_address(pool: PhysicalPool, slot_id: int) -> int:
     """Base address of *slot_id*."""
     if slot_id >= pool.num_slots:
         raise ValueError(f"slot_id {slot_id} >= num_slots {pool.num_slots}")
-    return pool.base_address + slot_id * pool.slot_bytes
+    assert pool.slot_stride_bytes is not None
+    return pool.base_address + slot_id * pool.slot_stride_bytes
 
 
 # -------------------------------------------------------------------------
@@ -117,9 +132,22 @@ def get_unique_pool_memory_descs(
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if isinstance(lg, MambaLayerGroup):
-            num_mamba_layers = len(lg.mamba_layer_offsets)
-            for pool in [lg.conv_states, lg.ssm_states]:
-                pool_size = num_mamba_layers * pool.num_slots * pool.slot_bytes
+            is_v2_layout = (
+                lg.conv_layer_slot0_addresses is not None
+                or lg.ssm_layer_slot0_addresses is not None
+            )
+            if is_v2_layout:
+                pools_and_sizes = [
+                    (pool, get_pool_bytes(pool))
+                    for pool in page_table.pool_groups[int(lg.pool_group_idx)].pools
+                ]
+            else:
+                num_mamba_layers = len(lg.mamba_layer_offsets)
+                pools_and_sizes = [
+                    (pool, num_mamba_layers * pool.num_slots * pool.slot_bytes)
+                    for pool in [lg.conv_states, lg.ssm_states]
+                ]
+            for pool, pool_size in pools_and_sizes:
                 pool_key = (pool.base_address, pool_size)
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter

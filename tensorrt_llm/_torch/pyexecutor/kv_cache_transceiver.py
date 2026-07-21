@@ -16,7 +16,8 @@ from tensorrt_llm.mapping import Mapping
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
-                                  MixedMambaHybridCacheManager)
+                                  MixedMambaHybridCacheManager,
+                                  V2MambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -157,14 +158,33 @@ def create_kv_cache_transceiver(
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
 
-    # Select transceiver implementation based on transceiver_runtime
+    # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
-    # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
-        # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+    # transceiver_runtime == "PYTHON" -> use Python transceiver.
+    #
+    # V2MambaHybridCacheManager is backed by the Python KVCacheManagerV2 core,
+    # not the C++ BaseKVCacheManager binding required by CacheTransceiverCpp.
+    is_v2_mamba_hybrid = isinstance(mamba_cache_manager,
+                                    V2MambaHybridCacheManager)
+    use_python_transceiver = (
+        cache_transceiver_config.transceiver_runtime == "PYTHON")
+
+    if is_v2_mamba_hybrid and not use_python_transceiver:
+        raise ValueError(
+            "V2MambaHybridCacheManager requires transceiver_runtime='PYTHON' "
+            "with backend='NIXL'; it cannot use the C++ transceiver.")
+
+    if use_python_transceiver:
+        if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
             raise ValueError(
-                f"Python transceiver currently only supports NIXL or DEFAULT backend, "
+                "transceiver_runtime='PYTHON' cannot drive "
+                "CppMambaHybridCacheManager (C++ pool backed). Use "
+                "transceiver_runtime='CPP', or select the V2 manager "
+                "with use_kv_cache_manager_v2=True.")
+        # DEFAULT has already been resolved above, so Python must see NIXL.
+        if cache_transceiver_config.backend != "NIXL":
+            raise ValueError(
+                f"Python transceiver currently only supports the NIXL backend, "
                 f"got {cache_transceiver_config.backend}. "
                 f"Please use transceiver_runtime='CPP' for MPI, UCX, or MOONCAKE backends."
             )

@@ -9,6 +9,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -46,12 +49,16 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
     KvCacheConfig,
     MambaStateConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
 )
-from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
+from tensorrt_llm.llmapi.llm_utils import (
+    _resolve_kv_cache_manager_v2_auto,
+    _resolve_transceiver_runtime_auto,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, LayerId
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
@@ -240,6 +247,7 @@ def test_qwen3_gdn_replay_falls_back_for_v2_manager(monkeypatch):
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_v2["use_replay_state_update"] is False
     assert "model_type" not in captured_v2
+    assert captured_v2["conv_state_layout"] == "q_k_v"
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
@@ -357,6 +365,93 @@ def test_hybrid_cache_manager_factory_routes_explicit_snapshots_to_v2(
     )
 
 
+@pytest.mark.parametrize("backend", ["NIXL", "DEFAULT"])
+def test_hybrid_cache_manager_factory_routes_explicit_v2_disagg(monkeypatch, backend):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    for env_var in (
+        "TRTLLM_USE_NIXL_KVCACHE",
+        "TRTLLM_USE_UCX_KVCACHE",
+        "TRTLLM_USE_MOONCAKE_KVCACHE",
+        "TRTLLM_USE_MPI_KVCACHE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    assert (
+        get_kv_cache_manager_cls(
+            _hybrid_model_config(),
+            KvCacheConfig(
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+                use_kv_cache_manager_v2=True,
+            ),
+            is_disagg=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime="PYTHON"
+            ),
+        )
+        is V2MambaHybridCacheManager
+    )
+
+
+def test_hybrid_cache_manager_factory_rejects_python_v1_disagg_reuse(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    with pytest.raises(ValueError, match="requires use_kv_cache_manager_v2=True"):
+        get_kv_cache_manager_cls(
+            _hybrid_model_config(),
+            KvCacheConfig(
+                enable_block_reuse=True,
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+                use_kv_cache_manager_v2=False,
+            ),
+            is_disagg=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL",
+                transceiver_runtime="PYTHON",
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "runtime", "backend_env"),
+    [
+        ("DEFAULT", "PYTHON", "TRTLLM_USE_UCX_KVCACHE"),
+        ("UCX", "PYTHON", None),
+        ("NIXL", "auto", None),
+        ("NIXL", None, None),
+        ("NIXL", "CPP", None),
+        ("UCX", None, None),
+    ],
+)
+def test_hybrid_cache_manager_factory_rejects_unsupported_v2_disagg_route(
+    monkeypatch, backend, runtime, backend_env
+):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    for env_var in (
+        "TRTLLM_USE_NIXL_KVCACHE",
+        "TRTLLM_USE_UCX_KVCACHE",
+        "TRTLLM_USE_MOONCAKE_KVCACHE",
+        "TRTLLM_USE_MPI_KVCACHE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    if backend_env is not None:
+        monkeypatch.setenv(backend_env, "1")
+
+    with pytest.raises(ValueError, match="requires transceiver_runtime='PYTHON'"):
+        get_kv_cache_manager_cls(
+            _hybrid_model_config(),
+            KvCacheConfig(
+                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+                use_kv_cache_manager_v2=True,
+            ),
+            is_disagg=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend=backend, transceiver_runtime=runtime
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("env_name", "env_value", "expected_error"),
     [
@@ -413,35 +508,52 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
                 use_kv_cache_manager_v2=use_v2,
             ),
             is_disagg=True,
-            cache_transceiver_config=SimpleNamespace(transceiver_runtime="PYTHON"),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
         )
         is MixedMambaHybridCacheManager
     )
 
 
-@pytest.mark.parametrize("enable_block_reuse", [False, True])
-@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
-def test_hybrid_cache_manager_factory_rejects_v2_disagg(
-    monkeypatch, enable_block_reuse, transceiver_runtime
-):
-    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
-    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
-    transceiver_config = (
-        None
-        if transceiver_runtime is None
-        else SimpleNamespace(transceiver_runtime=transceiver_runtime)
+def test_hybrid_models_resolve_auto_to_python_transceiver(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
+
+    for env_var in (
+        "TRTLLM_USE_NIXL_KVCACHE",
+        "TRTLLM_USE_UCX_KVCACHE",
+        "TRTLLM_USE_MOONCAKE_KVCACHE",
+        "TRTLLM_USE_MPI_KVCACHE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+        )
+        _resolve_transceiver_runtime_auto(llm_args, model_cls)
+        assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
+    manager = object.__new__(V2MambaHybridCacheManager)
+    manager.local_num_mamba_layers = 0
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._kv_cache_manager = manager
+    transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
+    transceiver._page_table = SimpleNamespace(layer_groups=[])
+    request = SimpleNamespace(
+        is_generation_only_request=lambda: False,
+        prompt_len=0,
+        py_request_id=123,
     )
 
-    with pytest.raises(ValueError, match="V2.*not supported with disaggregated"):
-        get_kv_cache_manager_cls(
-            _hybrid_model_config(),
-            KvCacheConfig(
-                enable_block_reuse=enable_block_reuse,
-                use_kv_cache_manager_v2=True,
-            ),
-            is_disagg=True,
-            cache_transceiver_config=transceiver_config,
-        )
+    kv_slice = transceiver._create_kv_slice(request)
+
+    assert kv_slice.mamba_state_index is None
 
 
 @pytest.mark.parametrize(
@@ -1453,6 +1565,7 @@ def _build_v2_hybrid_with_mamba_layer(
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
+    conv_state_layout="x_b_c",
 ):
     """Construct a real V2MambaHybridCacheManager."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -1496,6 +1609,7 @@ def _build_v2_hybrid_with_mamba_layer(
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
+        conv_state_layout=conv_state_layout,
     )
 
 
@@ -1837,6 +1951,47 @@ def test_v2_hybrid_swa_scratch_keeps_ssm_placeholder_rows():
         assert mgr.num_attention_op_pools == mgr.num_local_layers
         assert mgr.kv_cache_pool_mapping.shape[0] == mgr.num_local_layers
         assert mgr.kv_cache_pool_pointers[0, 0].item() != 0
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
+    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
+    try:
+        page_table = build_page_table_from_manager(mgr)
+
+        assert len(page_table.layer_groups) == mgr.impl._storage.num_life_cycles
+        assert isinstance(page_table.layer_groups[0], MambaLayerGroup)
+        assert isinstance(page_table.layer_groups[1], AttentionLayerGroup)
+
+        requests = mgr.add_dummy_requests([123], token_nums=[64], is_gen=False)
+        assert len(requests) == 1
+        attention_blocks = list(
+            mgr.kv_cache_map[123].get_aggregated_page_indices(1, valid_only=True)
+        )
+        assert attention_blocks
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        conv_state_layout="q_k_v",
+    )
+    try:
+        page_table = build_page_table_from_manager(mgr)
+        mamba_group = page_table.layer_groups[0]
+
+        assert isinstance(mamba_group, MambaLayerGroup)
+        d_conv_m1 = mgr.conv_state_shape[1]
+        conv_elem_size = mgr.all_conv_states[0].element_size()
+        assert mamba_group.conv_section_bytes == [
+            dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
+        ]
+        assert mgr.conv_section_dims == [8, 8, 32]
     finally:
         mgr.shutdown()
 

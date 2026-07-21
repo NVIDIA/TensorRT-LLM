@@ -17,8 +17,8 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional,
-                    Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
+                    Optional, Tuple, Union)
 
 import torch
 import triton
@@ -2466,8 +2466,12 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
         is_draft: bool = False,
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
+        conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         **kwargs,
     ) -> None:
+        if conv_state_layout not in ("x_b_c", "q_k_v"):
+            raise ValueError(
+                f"Unsupported convolution state layout: {conv_state_layout!r}")
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -2518,18 +2522,42 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
         if self.local_num_mamba_layers > 0:
             tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
             d_inner = mamba_head_dim * mamba_num_heads
-            conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
+            grouped_state_dim = mamba_n_groups * mamba_d_state
+            conv_dim = d_inner + 2 * grouped_state_dim
             nheads = mamba_num_heads
             assert nheads % tp_size == 0, "mamba_num_heads must be divisible by tp_size"
             assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
+            if kwargs.get("is_disagg",
+                          False) and grouped_state_dim % tp_size != 0:
+                raise ValueError(
+                    "Disaggregated Mamba transfer requires each convolution "
+                    "state section to be divisible by tp_size")
             if use_replay_state_update:
                 assert mamba_n_groups % tp_size == 0, \
                     "replay state update requires mamba_n_groups divisible by tp_size"
             self._n_groups_per_rank = mamba_n_groups // tp_size
+            d_inner_local = d_inner // tp_size
+            grouped_state_dim_local = grouped_state_dim // tp_size
             conv_dim = conv_dim // tp_size
             nheads = nheads // tp_size
             self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
             self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
+            # TP-mismatch disaggregated transfers must split the flat
+            # convolution state at its true semantic boundaries. Mamba2 stores
+            # [x | B | C], while GDN stores [Q | K | V]. The large section is
+            # therefore first for Mamba2 and last for GDN.
+            if conv_state_layout == "x_b_c":
+                self.conv_section_dims = [
+                    d_inner_local,
+                    grouped_state_dim_local,
+                    grouped_state_dim_local,
+                ]
+            else:
+                self.conv_section_dims = [
+                    grouped_state_dim_local,
+                    grouped_state_dim_local,
+                    d_inner_local,
+                ]
             self.ssm_count = math.prod(self.ssm_state_shape)
             self.conv_count = math.prod(self.conv_state_shape)
             self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
@@ -2541,6 +2569,7 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
             self._n_groups_per_rank = 0
             self.conv_state_shape = []
             self.ssm_state_shape = []
+            self.conv_section_dims = []
             self.ssm_count = 0
             self.conv_count = 0
             self.ssm_bytes = 0
