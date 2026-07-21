@@ -575,6 +575,16 @@ class _FixedScoreGroup:
             and num_kv_heads * 8 * max_segments * self.seq_len < 2**31
         )
         if not supported:
+            warnings.warn(
+                "TriAttention CuTe score not engaged despite "
+                "TRTLLM_TRIATTENTION_CUTE_SCORE=1: "
+                f"capability={torch.cuda.get_device_capability(anchor.device)}, "
+                f"dtype={anchor.dtype}, kv_factor={kv_factor}, "
+                f"tokens_per_block={tokens_per_block}, num_freqs={num_freqs}, "
+                f"heads={num_q_heads}q/{num_kv_heads}kv, "
+                f"stride={int(anchor.stride(-1))}, "
+                f"offset_audit={num_kv_heads * 8 * max_segments * self.seq_len}"
+            )
             return
         device = anchor.device
         try:
@@ -714,7 +724,22 @@ class _FixedScoreGroup:
             # outside CUDA graph capture. Default off: one attribute check.
             self.prepare_cute_score(mean_cos, mean_sin)
             runner = self._cute_score_runner
+            if runner is not None and not runner.supports(request_count):
+                missed = getattr(self, "_cute_supports_warned", set())
+                if request_count not in missed:
+                    missed.add(request_count)
+                    self._cute_supports_warned = missed
+                    warnings.warn(
+                        f"TriAttention CuTe score compiled variants miss "
+                        f"request_count={request_count}; falling back to the C++ "
+                        f"score op for this round"
+                    )
             if runner is not None and runner.supports(request_count):
+                if not getattr(self, "_cute_engaged_logged", False):
+                    self._cute_engaged_logged = True
+                    warnings.warn(
+                        f"TriAttention CuTe score engaged (request_count={request_count})"
+                    )
                 # Stage per-segment valid lengths (segment = request x layer).
                 torch.index_select(
                     valid_seq_lens,
