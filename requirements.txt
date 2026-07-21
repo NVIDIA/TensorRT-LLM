@@ -30,7 +30,7 @@ nvidia-modelopt[torch]~=0.37.0
 # torch 2.11.0+cu130 depends on nvidia-nccl-cu13==2.28.9
 nvidia-nccl-cu13>=2.28.9,<=2.30.4
 # NcclEP uses nccl4py's nccl.ep package without changing the NCCL wheel constraint.
-nccl4py>=0.3
+nccl4py>=0.3.1,<0.4
 nvidia-cuda-nvrtc
 transformers==5.5.4
 prometheus_client
