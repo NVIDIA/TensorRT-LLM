@@ -44,15 +44,22 @@ def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
 
 
 def _launched_draft_compaction(draft_protected_tails):
-    """Build target and draft pools with distinct head counts, then compact."""
+    """Build target and draft pools with distinct head counts, then compact.
+
+    The compact op ships only the pipelined bf16 kernels, so the pools use
+    the supported production geometry (bf16, 32-token pages, head_dim 64).
+    Pool payloads are a shifted ``arange % 251`` ramp: every value is exact
+    in bf16 and any wrong page/plane/head/token move lands on a different
+    byte pattern, so the equality checks below stay conclusive.
+    """
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     target_kv_heads = 2
     draft_kv_heads = 4
     prompt_len = 2
     decode_keep_count = 4
-    tokens_per_block = 4
-    head_dim = 16
+    tokens_per_block = 32
+    head_dim = 64
     target_protected_tails = [2, 1]
     valid_seq_lens = [10, 9]
 
@@ -60,22 +67,34 @@ def _launched_draft_compaction(draft_protected_tails):
     draft_tables = torch.tensor([[1, 0, 2], [5, 4, 3]], dtype=torch.int32, device=device)
     target_pools = [
         (
-            torch.arange(
-                6 * 2 * target_kv_heads * tokens_per_block * head_dim,
-                dtype=torch.float32,
-                device=device,
-            ).view(6, 2, target_kv_heads, tokens_per_block, head_dim)
-            + layer * 100_000.0
+            (
+                torch.arange(
+                    6 * 2 * target_kv_heads * tokens_per_block * head_dim,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                + layer * 37
+            )
+            % 251
         )
+        .view(6, 2, target_kv_heads, tokens_per_block, head_dim)
+        .to(torch.bfloat16)
         for layer in range(2)
     ]
     draft_pool = (
-        torch.arange(
-            6 * 2 * draft_kv_heads * tokens_per_block * head_dim,
-            dtype=torch.float32,
-            device=device,
-        ).view(6, 2, draft_kv_heads, tokens_per_block, head_dim)
-        + 900_000.0
+        (
+            (
+                torch.arange(
+                    6 * 2 * draft_kv_heads * tokens_per_block * head_dim,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                + 149
+            )
+            % 251
+        )
+        .view(6, 2, draft_kv_heads, tokens_per_block, head_dim)
+        .to(torch.bfloat16)
     )
     assert target_pools[0].shape[2] != draft_pool.shape[2]
     initial_target = [pool.clone() for pool in target_pools]

@@ -373,34 +373,46 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
 
 @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
 def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode):
+    # The compact op ships only the pipelined bf16 kernels: pools use the
+    # supported geometry (bf16, 32-token pages, head_dim 64), and the kept
+    # ordinals are spread across all three pages per request so the moves
+    # still cross page boundaries. The bf16-exact ``arange % 251`` payload
+    # keeps every wrong-move byte pattern distinguishable.
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     num_layers = 2
     num_kv_heads = 2
     prompt_len = 2
     decode_keep_count = 4
-    seq_len = 10
-    tokens_per_block = 4
+    seq_len = 80
+    tokens_per_block = 32
     pages_per_request = 3
-    head_dim = 16
+    head_dim = 64
     protected_tails = [2, 1]
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
     initial_pools = [
         (
-            torch.arange(
-                6 * 2 * num_kv_heads * tokens_per_block * head_dim,
-                dtype=torch.float32,
-                device=device,
-            ).view(6, 2, num_kv_heads, tokens_per_block, head_dim)
-            + layer * 100_000.0
+            (
+                torch.arange(
+                    6 * 2 * num_kv_heads * tokens_per_block * head_dim,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                + layer * 37
+            )
+            % 251
         )
+        .view(6, 2, num_kv_heads, tokens_per_block, head_dim)
+        .to(torch.bfloat16)
         for layer in range(num_layers)
     ]
     pools = [pool.clone() for pool in initial_pools]
 
     # Kept ordinals are decode-only but hold absolute positions; the pinned
     # prompt tokens never appear in the selection rectangle.
-    union_decode = torch.tensor([[2, 4, 7, 9], [3, 5, 6, 8]], dtype=torch.int64, device=device)
+    union_decode = torch.tensor(
+        [[16, 32, 56, 72], [24, 40, 48, 64]], dtype=torch.int64, device=device
+    )
     if eviction_mode == "union":
         keep = union_decode
         selection_rows = 1
@@ -418,7 +430,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
                 keep[request, row] = torch.tensor(
                     sorted(
                         {
-                            2 + ((request + row + offset * 2) % 8)
+                            2 + ((request + row + offset * 2) % 8) * 8
                             for offset in range(decode_keep_count)
                         }
                     ),
@@ -490,12 +502,14 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
     request_count = 2
     num_layers = 2
     num_kv_heads = 2
-    seq_len = 10
+    # bf16 pools in the compact op's supported geometry; three 32-token pages
+    # per request with a 80-token sequence keep the moves page-crossing.
+    seq_len = 80
     decode_keep_count = 3
     prompt_lens = [2, 5]
     protected_tails = [2, 1]
-    tokens_per_block = 4
-    head_dim = 16
+    tokens_per_block = 32
+    head_dim = 64
     decode_widths = [seq_len - prompt_len for prompt_len in prompt_lens]
     width = max(decode_widths)
 
@@ -521,13 +535,18 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
     initial_pools = [
         (
-            torch.arange(
-                6 * 2 * num_kv_heads * tokens_per_block * head_dim,
-                dtype=torch.float32,
-                device=device,
-            ).view(6, 2, num_kv_heads, tokens_per_block, head_dim)
-            + layer * 100_000.0
+            (
+                torch.arange(
+                    6 * 2 * num_kv_heads * tokens_per_block * head_dim,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                + layer * 37
+            )
+            % 251
         )
+        .view(6, 2, num_kv_heads, tokens_per_block, head_dim)
+        .to(torch.bfloat16)
         for layer in range(num_layers)
     ]
     cohort_pools = [pool.clone() for pool in initial_pools]
@@ -592,8 +611,12 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     num_layers = 3
     seq_len = 8
     keep_count = 2
-    tokens_per_block = 4
-    head_dim = 16
+    # bf16 pools in the compact op's supported geometry. The scored tokens
+    # all live in each table's first entry, but the two tables still map the
+    # two storage groups onto different physical pages, which is what the
+    # layer-order alignment below depends on.
+    tokens_per_block = 32
+    head_dim = 64
     num_freqs = head_dim // 2
     dense_layers = [0, 1, 2]
     dense_groups = [[0, 2], [1]]
@@ -613,12 +636,19 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     pools = []
     for layer, (table, values) in enumerate(zip(layer_tables, score_values)):
         pool = (
-            torch.arange(
-                2 * 2 * tokens_per_block * head_dim,
-                dtype=torch.float32,
-                device=device,
-            ).view(2, 2, 1, tokens_per_block, head_dim)
-            + layer * 10_000
+            (
+                (
+                    torch.arange(
+                        2 * 2 * tokens_per_block * head_dim,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    + layer * 37
+                )
+                % 251
+            )
+            .view(2, 2, 1, tokens_per_block, head_dim)
+            .to(torch.bfloat16)
         )
         for token, value in enumerate(values):
             page = int(table[0, token // tokens_per_block])
@@ -701,14 +731,24 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         zip(initial_pools, pools, layer_tables)
     ):
         pages = table[0].to(torch.long)
-        before = before_pool[pages].permute(1, 2, 0, 3, 4).reshape(2, 1, seq_len, head_dim)
+        # The logical view spans both pages (2 * tokens_per_block slots); the
+        # scored sequence occupies its first seq_len positions.
+        before = before_pool[pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, head_dim)
         after = after_pool[pages].permute(1, 2, 0, 3, 4).reshape_as(before)
         selected = expected_keep[0, layer].to(torch.long)
         assert torch.equal(after[:, :, :keep_count], before.index_select(2, selected))
 
 
 def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
-    """Run two real eviction rounds through one live V2 cache."""
+    """Run two real eviction rounds through one live V2 cache.
+
+    The cache uses the compact op's supported geometry (bf16, 32-token
+    pages, head_dim 64): the request spans three pages so that compacting to
+    two pages still releases one physical page for reuse. Token scores are
+    tracked in a host-side mirror and the expected keep sets are derived
+    from it, replacing the hand-written score tables of the old 4-token-page
+    fixture.
+    """
     import tensorrt_llm
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
@@ -721,12 +761,13 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     device = torch.device("cuda", torch.cuda.current_device())
     request_id = 7
     prompt_len = 2
-    seq_len = 10
+    seq_len = 66
     protected_tail = 2
-    compacted_capacity = 8
-    tokens_per_block = 4
-    head_dim = 16
+    compacted_capacity = 34
+    tokens_per_block = 32
+    head_dim = 64
     num_freqs = head_dim // 2
+    keep_count = compacted_capacity - prompt_len - protected_tail
     manager = KVCacheManagerV2(
         KvCacheConfig(
             max_tokens=seq_len + protected_tail,
@@ -742,7 +783,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         max_seq_len=seq_len + protected_tail,
         max_batch_size=2,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        dtype=tensorrt_llm.bindings.DataType.HALF,
+        dtype=tensorrt_llm.bindings.DataType.BF16,
         vocab_size=128,
     )
 
@@ -780,18 +821,34 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             pages = page_ids(request_id)
             page = pages[token // tokens_per_block]
             offset = token % tokens_per_block
+            # Shifted mod-251 ramp: bf16-exact and distinct per token, so the
+            # byte comparisons below catch any wrong move.
             payload = (
-                torch.arange(2 * head_dim, dtype=torch.float16, device=device)
+                ((torch.arange(2 * head_dim, dtype=torch.int32, device=device) + token * 37) % 251)
                 .reshape(2, head_dim)
-                .add_(token * 64)
+                .to(torch.bfloat16)
             )
             payload[0, 0] = score
             payload[0, num_freqs] = 0
             pool[page, :, 0, offset].copy_(payload)
 
-        first_scores = [0, 0, 8, 1, 7, 2, 6, 3, 5, 4, 9, 0]
-        for token, score in enumerate(first_scores):
-            write_token(token, score)
+        # Host-side mirror of each physical position's score; expected keep
+        # sets are derived from it. Scores are distinct within the decode
+        # window (7 is invertible mod 64 and the window spans one residue
+        # cycle), so the selection is tie-free and deterministic.
+        token_scores = [0] * (seq_len + protected_tail)
+        for token in range(seq_len + protected_tail):
+            token_scores[token] = (token * 7) % 64 + 1
+            write_token(token, token_scores[token])
+
+        def expected_keep() -> torch.Tensor:
+            decode = token_scores[prompt_len:seq_len]
+            order = sorted(range(len(decode)), key=lambda index: (-decode[index], index))
+            return torch.tensor(
+                sorted(prompt_len + index for index in order[:keep_count]),
+                dtype=torch.long,
+                device=device,
+            )
 
         q_real = torch.zeros(1, 1, num_freqs, dtype=torch.float32, device=device)
         q_imag = torch.zeros_like(q_real)
@@ -822,7 +879,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         keep_set_selector = _BatchedUnionKeepSetSelector(
             rows=1,
             width=seq_len - prompt_len,
-            keep_count=compacted_capacity - prompt_len - protected_tail,
+            keep_count=keep_count,
             dtype=torch.float32,
             device=device,
             max_requests=1,
@@ -847,7 +904,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             page_table_slots=score_staging.representative_slots,
             request_count=1,
             prompt_offsets=score_staging.token_starts_device[:1],
-            decode_keep_count=compacted_capacity - prompt_len - protected_tail,
+            decode_keep_count=keep_count,
             swa_window=None,
             protected_tail_capacity=protected_tail,
         )
@@ -888,11 +945,10 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             return selected, after
 
         initial_pages = page_ids(request_id)
+        expected_first_keep = expected_keep()
         first_keep, first_compacted = evict_once()
-        assert torch.equal(
-            first_keep,
-            torch.tensor([2, 4, 6, 8], dtype=torch.long, device=device),
-        )
+        assert torch.equal(first_keep, expected_first_keep)
+        # The compacted cache spans two of the original three pages.
         retained_pages = page_ids(request_id)
         assert torch.equal(retained_pages, initial_pages[:2])
         released_page = initial_pages[2:]
@@ -909,18 +965,21 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         assert torch.equal(page_ids(request_id)[:2], retained_pages)
         assert torch.equal(page_ids(request_id)[2:], released_page)
         # The first protected tail becomes confirmed input to round two. Only
-        # later generated tokens and the next protected tail are written here.
-        write_token(8, 10)
-        write_token(9, 4.5)
-        write_token(10, 11)
-        write_token(11, 0.5)
-        assert torch.equal(snapshot(8), first_compacted)
+        # later generated tokens and the next protected tail are written
+        # here. Mirror the physical relayout, then give the fresh tokens a
+        # disjoint higher score band (11 invertible mod 64 over a shorter
+        # window) so round two must select differently from round one.
+        survivors = list(range(prompt_len)) + first_keep.tolist() + [seq_len, seq_len + 1]
+        token_scores[:compacted_capacity] = [token_scores[source] for source in survivors]
+        for token in range(compacted_capacity, seq_len + protected_tail):
+            token_scores[token] = (token * 11) % 64 + 100
+        assert torch.equal(snapshot(compacted_capacity), first_compacted)
+        for token in range(compacted_capacity, seq_len + protected_tail):
+            write_token(token, token_scores[token])
 
+        expected_second_keep = expected_keep()
         second_keep, _ = evict_once()
-        assert torch.equal(
-            second_keep,
-            torch.tensor([2, 3, 6, 8], dtype=torch.long, device=device),
-        )
+        assert torch.equal(second_keep, expected_second_keep)
         assert not torch.equal(second_keep, first_keep)
 
         created = manager.add_dummy_requests([9], [tokens_per_block])
@@ -936,22 +995,26 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
 
 
 def test_eager_compaction_rebases_masked_swa_window_and_tail():
+    # bf16 pools in the compact op's supported geometry (32-token pages,
+    # head_dim 64); the kept ordinals and valid lengths span all three pages
+    # per request so the dense and SWA moves stay page-crossing.
     device = torch.device("cuda", torch.cuda.current_device())
     dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
     swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
     initial_pools = [
-        torch.arange(6 * 2 * 1 * 4 * 16, dtype=torch.float32, device=device).view(6, 2, 1, 4, 16),
-        torch.arange(6 * 2 * 1 * 4 * 16, dtype=torch.float32, device=device).view(6, 2, 1, 4, 16)
-        + 1000.0,
+        ((torch.arange(6 * 2 * 1 * 32 * 64, dtype=torch.int32, device=device) + layer * 37) % 251)
+        .view(6, 2, 1, 32, 64)
+        .to(torch.bfloat16)
+        for layer in range(2)
     ]
     pools = [pool.clone() for pool in initial_pools]
     # Decode-only kept ordinals holding absolute positions past the prompt.
     keep = torch.tensor(
-        [[2, 4, 5, 7], [2, 3, 5, 6]],
+        [[16, 32, 40, 56], [16, 24, 40, 48]],
         dtype=torch.int64,
         device=device,
     )
-    valid_seq_lens = torch.tensor([8, 7], dtype=torch.int32, device=device)
+    valid_seq_lens = torch.tensor([64, 56], dtype=torch.int32, device=device)
     protected_tails = [2, 1]
     compaction = BatchedKVCacheCompaction(
         eviction_mode="union",
@@ -979,9 +1042,9 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
     ):
         dense_pages = dense_tables[request].to(torch.long)
         swa_pages = swa_tables[request].to(torch.long)
-        dense_before = initial_pools[0][dense_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 16)
+        dense_before = initial_pools[0][dense_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 64)
         dense_after = pools[0][dense_pages].permute(1, 2, 0, 3, 4).reshape_as(dense_before)
-        swa_before = initial_pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 16)
+        swa_before = initial_pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape(2, 1, -1, 64)
         swa_after = pools[1][swa_pages].permute(1, 2, 0, 3, 4).reshape_as(swa_before)
         tail = torch.arange(
             valid_seq_len,
@@ -1024,9 +1087,11 @@ def test_cache_families_read_the_staged_move_offsets_rows():
     device = torch.device("cuda", torch.cuda.current_device())
     dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
     swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
+    # bf16 pools in the compact op's supported geometry; this test only
+    # constructs the compaction, so the contents stay zero.
     pools = [
-        torch.zeros(6, 2, 1, 4, 16, dtype=torch.float32, device=device),
-        torch.zeros(6, 2, 1, 4, 16, dtype=torch.float32, device=device),
+        torch.zeros(6, 2, 1, 32, 64, dtype=torch.bfloat16, device=device),
+        torch.zeros(6, 2, 1, 32, 64, dtype=torch.bfloat16, device=device),
     ]
     keep = torch.tensor([[2, 4, 5, 7], [2, 3, 5, 6]], dtype=torch.int32, device=device)
     staged_rows = torch.zeros(2, 3, dtype=torch.int32, device=device)

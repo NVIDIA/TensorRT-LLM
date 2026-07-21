@@ -353,9 +353,14 @@ def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buff
     own keep buffer."""
     device = torch.device("cuda", torch.cuda.current_device())
     request_count, num_kv_heads, keep_count, width = 2, 2, 4, 16
-    tokens_per_block, head_dim = 4, 8
+    # BatchedKVCacheCompaction admits only bf16 pools in the compact op's
+    # supported geometry (32/128-token pages, head_dim 64/128).
+    tokens_per_block, head_dim = 32, 64
     pools = [
-        torch.zeros(6, 2, num_kv_heads, tokens_per_block, head_dim, device=device) for _ in range(2)
+        torch.zeros(
+            6, 2, num_kv_heads, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
+        )
+        for _ in range(2)
     ]
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
 
