@@ -18,7 +18,7 @@ import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from typing import Any, List
 
 import psutil
 import safetensors
