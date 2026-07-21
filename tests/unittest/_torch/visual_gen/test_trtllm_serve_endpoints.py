@@ -452,6 +452,57 @@ class TestImageGeneration:
         assert params.guidance_scale == 7.5
         assert params.negative_prompt == "blurry"
 
+    def test_image_generation_with_single_reference(self, image_client):
+        encoded_reference = _b64_white_png_1x1()
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Turn this into a watercolor painting",
+                "response_format": "b64_json",
+                "input_reference": encoded_reference,
+            },
+        )
+        assert resp.status_code == 200
+        assert image_client.mock_gen.last_params.image == base64.b64decode(encoded_reference)
+
+    def test_image_generation_with_multiple_references(self, image_client):
+        encoded_references = [_b64_white_png_1x1(), _b64_white_png_1x1()]
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Combine the subject and style references",
+                "response_format": "b64_json",
+                "input_reference": encoded_references,
+            },
+        )
+        assert resp.status_code == 200
+        assert image_client.mock_gen.last_params.image == [
+            base64.b64decode(reference) for reference in encoded_references
+        ]
+
+    def test_image_generation_rejects_invalid_reference_base64(self, image_client):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Invalid reference",
+                "input_reference": "not-base64",
+            },
+        )
+        assert resp.status_code == 400
+        _assert_llm_envelope(resp.json(), code=400, message_contains="input_reference[0]")
+
+    @pytest.mark.parametrize("input_reference", [[], [_b64_white_png_1x1()] * 11])
+    def test_image_generation_rejects_invalid_reference_count(self, image_client, input_reference):
+        resp = image_client.post(
+            "/v1/images/generations",
+            json={
+                "prompt": "Invalid reference count",
+                "input_reference": input_reference,
+            },
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="input_reference")
+
     def test_image_generation_url_returns_fetchable_urls(self, image_client):
         """``response_format='url'`` writes each generated image to
         media storage and surfaces a server-relative HTTP URL pointing
@@ -684,10 +735,9 @@ class TestImageGeneration:
 class TestImageEdit:
     """``/v1/images/edits`` returns 501 NotImplemented in the current release.
 
-    No in-tree pipeline implements image editing: Flux/Flux2 are
-    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-    video, not edited images. Restore the full happy-path coverage when an
-    edit-capable pipeline lands.
+    Reference-image conditioning uses ``/v1/images/generations``. This route
+    remains reserved for mask-based editing until an edit-capable pipeline
+    lands.
     """
 
     def test_image_edit_returns_not_implemented(self, image_client):

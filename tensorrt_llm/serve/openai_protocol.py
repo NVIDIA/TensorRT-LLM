@@ -1541,6 +1541,10 @@ def to_llm_conversation_params(
 # Diffusion API Protocol Classes
 # ============================================================================
 
+_Base64Image = Annotated[str, Field(min_length=1)]
+_Base64ImageList = Annotated[List[_Base64Image],
+                             Field(min_length=1, max_length=10)]
+
 
 class ImageGenerationRequest(OpenAIBaseModel):
     """OpenAI-compatible image generation request.
@@ -1566,6 +1570,13 @@ class ImageGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
+    input_reference: Optional[Union[_Base64Image, _Base64ImageList]] = Field(
+        default=None,
+        description=
+        ("Optional base64-encoded reference image or list of up to 10 reference images for "
+         "conditioning. This is a TensorRT-LLM extension to the OpenAI image generations API."
+         ),
+    )
 
     # Resolution. ``size`` is OpenAI-shaped; ``width`` + ``height`` are an
     # equivalent structured alternative. Exactly one of width/height is

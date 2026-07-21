@@ -2536,12 +2536,11 @@ class OpenAIServer(_VideoRoutesMixin):
     async def openai_image_edit(self, raw_request: Request) -> Response:
         """OpenAI-compatible image editing endpoint — returns HTTP 501.
 
-        No in-tree pipeline implements image editing today: Flux/Flux2 are
-        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
-        video, not edited images. The route is registered so callers get an
-        honest NotImplemented signal instead of a 404. The request body is
-        not parsed because no schema is committed for this endpoint yet —
-        bring a typed request model back when an edit-capable pipeline lands.
+        No in-tree pipeline implements mask-based image editing today. FLUX.2
+        reference-image conditioning is available through
+        ``POST /v1/images/generations`` using ``input_reference``. The route
+        remains registered so callers get an honest NotImplemented signal
+        instead of a 404.
         """
         return self._create_not_supported_error(
             "Image editing is not supported by any in-tree pipeline yet.")
