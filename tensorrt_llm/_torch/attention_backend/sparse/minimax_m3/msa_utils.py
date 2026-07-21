@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from .common import _INIT_SCORE, _LOCAL_SCORE, write_kv_slots
+from .common import write_kv_slots
 
 # fmha_sm100 ships only head_dim 128 variants and the MiniMax-M3 checkpoint
 # selects topk 16. Callers enforce these early so a misconfiguration fails
@@ -195,34 +195,10 @@ def select_blocks_from_maxscore(
     [total_q, num_kv_heads, topk] int32 ascending block ids with -1 tail
     padding.
     """
-    num_kv_heads, n_blocks, total_q = max_score_kv.shape
-    device = max_score_kv.device
-    scores = max_score_kv.permute(2, 0, 1).to(torch.float32).clone()
-    block_ids = torch.arange(n_blocks, device=device, dtype=torch.long)
-    nvb = n_valid_blocks.to(device=device, dtype=torch.long)
-
-    if init_blocks > 0:
-        init_mask = block_ids.view(1, 1, -1) < init_blocks
-        scores = torch.where(init_mask, torch.full_like(scores, _INIT_SCORE), scores)
-    if local_blocks > 0:
-        local_start = (nvb - local_blocks).clamp_min(0)
-        local_mask = (block_ids.view(1, -1) >= local_start.view(-1, 1)) & (
-            block_ids.view(1, -1) < nvb.view(-1, 1)
-        )
-        scores = torch.where(local_mask.unsqueeze(1), torch.full_like(scores, _LOCAL_SCORE), scores)
-    block_valid = block_ids.view(1, -1) < nvb.view(-1, 1)
-    scores = scores.masked_fill(~block_valid.unsqueeze(1), float("-inf"))
-
-    k = min(topk, n_blocks)
-    vals, idx = scores.topk(k=k, dim=-1)
-    idx = torch.where(vals != float("-inf"), idx, torch.full_like(idx, -1))
-    sort_key = torch.where(idx < 0, torch.full_like(idx, n_blocks), idx)
-    sort_key, _ = torch.sort(sort_key, dim=-1)
-    idx = torch.where(sort_key >= n_blocks, torch.full_like(sort_key, -1), sort_key)
-    if k < topk:
-        pad = torch.full((total_q, num_kv_heads, topk - k), -1, dtype=idx.dtype, device=device)
-        idx = torch.cat([idx, pad], dim=-1)
-    return idx.to(torch.int32)
+    nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    return torch.ops.trtllm.minimax_m3_select_blocks(
+        max_score_kv, nvb, topk, init_blocks, local_blocks
+    )
 
 
 __all__ = [
