@@ -18,11 +18,6 @@ l0_dgx_b200:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync[cpp]
-  # ------------- Encoder-decoder TP tests ---------------
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-tp2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-tp2-t5-small]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-off-greedy-tp2-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-tp2-bart-large-cnn]
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
@@ -48,6 +43,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_block_reuse]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_mtp3_gdn_replay_tep4
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_4gpus_static_eplb[moe_backend=CUTEDSL]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_trtllm-torch_compile=True]
