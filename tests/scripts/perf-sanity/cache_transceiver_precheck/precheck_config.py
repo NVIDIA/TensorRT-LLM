@@ -40,7 +40,10 @@ PRECHECK_DEFAULTS = {
     # Measured requests per (peer, request_length) after warmup.
     "num_requests": 2,
     "warmup_requests": 1,
-    # Upper bound on concurrently in-flight transfer pairs per chunk.
+    # Upper bound on concurrently in-flight transfer pairs. The n_pairs
+    # dp-rank pairings are processed in batches ("chunks") of at most this
+    # many -- see chunks() for the term's exact meaning (it is NOT token
+    # chunking).
     "max_concurrent_pairs": 8,
     # signal.alarm / hang-detector budget for one chunk of transfers.
     "chunk_timeout_s": 180,
@@ -319,7 +322,13 @@ def max_owned_per_chunk(plan, role):
 
 
 def chunks(plan):
-    """Pair indices grouped into concurrency-bounded chunks."""
+    """Pair indices grouped into concurrency-bounded chunks.
+
+    A "chunk" is the batch of TRANSFER PAIRS in flight at once (at most
+    max_concurrent_pairs of the n_pairs dp-rank pairings) -- NOT token/data
+    chunking. It bounds the synthetic KV pool size and gives the per-chunk
+    alarm a precise target while still exercising concurrent transfers.
+    """
     pairs = list(range(plan["n_pairs"]))
     size = plan["chunk_size"]
     return [pairs[i : i + size] for i in range(0, len(pairs), size)]
