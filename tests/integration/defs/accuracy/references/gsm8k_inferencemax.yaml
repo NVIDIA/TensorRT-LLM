@@ -12,8 +12,9 @@ nvidia/MiniMax-M3-NVFP4:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 95.30
-  # MSA path + one-model Eagle3 + CUDA graphs (serve-based repeats of the
-  # same config: 95.38 / 95.45 / 95.60).
+  # MSA path + one-model Eagle3 + CUDA graphs + overlap. Mean of 10 in-process
+  # runs (94.62-95.53, SD 0.26); serve-based repeats of the same config at
+  # concurrency 64 run ~0.4 higher (95.38-95.60).
   - quant_algo: MIXED_PRECISION
     spec_dec_algo: Eagle3
-    accuracy: 95.22
+    accuracy: 95.01
