@@ -4154,6 +4154,12 @@ class PyExecutor:
                 # collective fires every iter regardless of future restructuring.
                 self._handle_kv_transfer_timeouts_synced()
 
+                # Flush outside ``if can_queue`` as well: buffered responses
+                # (e.g. non-fatal error responses from _handle_errors) must
+                # still reach the client when no rank can queue a batch, and
+                # all DP ranks must enter the tp_gather in lockstep.
+                self._flush_pending_transfer_responses()
+
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
@@ -6524,7 +6530,26 @@ class PyExecutor:
                 request for request in self.active_requests
                 if request not in requests
             ]
-        self._enqueue_responses(list(error_responses.items()))
+        if is_fatal or not (self.enable_attention_dp
+                            and self.dist.world_size != 1):
+            # Drain any previously buffered responses along with the error
+            # responses: on the fatal path the executor loop exits before
+            # reaching the next _flush_pending_transfer_responses point, so
+            # anything left in the buffer would never be delivered and the
+            # client would wait until its own timeout.
+            pending = self._pending_transfer_responses
+            self._pending_transfer_responses = []
+            self._enqueue_responses(pending + list(error_responses.items()))
+        else:
+            # Under attention DP, _enqueue_responses performs a tp_gather
+            # that every rank must enter in the same order. Non-fatal errors
+            # (e.g. a failed disagg KV transfer) are observed by a single
+            # rank, so enqueueing here would pair this rank's gather against
+            # a different collective on its peers — typically the per-step
+            # tp_allgather(batch_size) — corrupting both sides. Buffer the
+            # responses instead; every rank flushes the buffer together at
+            # _flush_pending_transfer_responses.
+            self._pending_transfer_responses.extend(error_responses.items())
         for request in failed_requests:
             self._terminate_request(request)
 
@@ -6643,7 +6668,7 @@ class PyExecutor:
                             # enqueueing garbage responses.
                             raise RuntimeError(
                                 f"_enqueue_responses: TP collective desync — "
-                                f"gathered a {type(resp).__name__} ({resp!r}) "
+                                f"gathered a {type(resp).__name__} "
                                 f"instead of a response list. A peer rank "
                                 f"entered a different collective (e.g. "
                                 f"tp_allgather(batch_size)); check for "
