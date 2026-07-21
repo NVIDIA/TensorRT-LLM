@@ -849,11 +849,11 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     provisional top-k: recover the top-k threshold
     from the provisional selection, count the strictly greater scores, then
     emit the kept ordinals in increasing order, rebased by the row's pinned
-    prompt length. With ``HAS_PACK`` the same program then continues with the
-    ``_pack_compaction_sources_kernel`` work for the packed rows this
-    selection row feeds: the kept ordinals it just wrote, followed by the
-    request's protected tail, plus the SWA rows (latest window) under the
-    same conditions as the standalone kernel. Union selection has one row per
+    prompt length. With ``HAS_PACK`` the same program then packs the move
+    sources for the packed rows this selection row feeds: the kept ordinals
+    it just wrote, followed by the request's protected tail, plus the SWA
+    rows (latest window) under the
+    same conditions as the retired standalone kernel. Union selection has one row per
     request feeding every KV head's packed row, so that single program writes
     all of them. ``HAS_PACK=False`` compiles the second half away, leaving
     exactly the settle stage; ``HAS_SETTLE=False`` compiles the first half
