@@ -46,7 +46,7 @@ SQLITE_NAME = "cbts_touchmap.sqlite"
 _URM = "https://urm.nvidia.com/artifactory"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
 # Max builds to walk back when recent builds have no tarball.
-_MAX_PROBE = 50
+_MAX_PROBE = 10
 # Per-request timeout in seconds.
 _TIMEOUT = 15
 
