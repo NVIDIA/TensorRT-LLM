@@ -59,6 +59,7 @@ from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                    MoeLoadBalancerIterContext)
+from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -806,6 +807,12 @@ class PyTorchModelEngine(ModelEngine):
 
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
 
+        # Cache for enc-dec cross-attention stable generation steps.
+        # Populated on the first CUDA-graph generation step; cleared whenever
+        # the batch composition changes (new encoder request arrives).
+        self._cross_attn_stable_cached_tokens: Optional[List[int]] = None
+        self._cross_attn_stable_request_ids: Optional[List[int]] = None
+
     def register_forward_pass_callable(self, callable: Callable):
         self.forward_pass_callable = callable
 
@@ -1150,13 +1157,31 @@ class PyTorchModelEngine(ModelEngine):
         if not is_enc_dec and not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
+            # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
+            # for Mamba hybrid models. Runs regardless of enable_autotuner,
+            # since MambaHybridCacheManager skips _general_warmup and the
+            # default autotuner shape is single-seq / no-initstates. Safe
+            # no-op for non-Mamba models.
+            self._run_mamba_hybrid_warmup(resource_manager)
+            log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
             # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        # Warm up every graph shape before capturing any graph. Attention
+        # kernels can switch implementations at smaller batch sizes and require
+        # a larger workspace, so the first pass grows the workspace to its
+        # maximum size. The second pass runs the final per-shape warmup and
+        # captures without resizing the workspace.
         with self.cuda_graph_runner.allow_capture():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
+                self._run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
+            self.cuda_graph_runner.padding_dummy_requests = {}
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
@@ -1491,6 +1516,145 @@ class PyTorchModelEngine(ModelEngine):
         clear_memory_buffers()
         torch.cuda.empty_cache()
 
+    def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager):
+        """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
+
+        Mamba hybrid models (e.g. Nemotron 3 Super 120B, Nemotron-Nano-12B-v2)
+        skip ``_general_warmup`` because ``can_run_general_warmup`` is False
+        when the KV cache manager is a ``MambaHybridCacheManager``. The default
+        ``_run_autotuner_warmup`` then issues a single ``least_requests=True``
+        prefill = 1 sequence with ``num_cached_tokens_per_seq = 0``, which only
+        compiles the ``num_seqs == 1`` / ``HAS_INITSTATES=False`` variants of
+        the SSD kernels. The first real serve iteration with chunked prefill
+        and multiple context requests then triggers autotune of the missing
+        variants mid-inference, producing a ~30 s stall / large P99 spike.
+
+        This method runs two extra forward passes to compile those variants
+        during warmup:
+
+        1. ``least_requests=False`` — splits ``curr_max_num_tokens`` into many
+           short sequences, forcing the multi-seq path of
+           ``cu_seqlens_to_chunk_indices_offsets_triton`` and its
+           ``_cu_seqlens_triton_kernel``.
+        2. ``least_requests=False`` inside
+           ``Mamba2Metadata.force_initial_states_for_warmup()`` — same as (1)
+           plus the ``HAS_INITSTATES=True`` variants of
+           ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
+           ``_chunk_state_varlen_kernel``.
+
+        Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
+        the autotuner is enabled so op-level (M,N,K) caches also get primed
+        for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
+        """
+        if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        if kv_cache_manager is None or not isinstance(kv_cache_manager,
+                                                      MambaHybridCacheManager):
+            return
+
+        token_num_upper_bound = min(self.max_num_tokens,
+                                    self.batch_size * (self.max_seq_len - 1))
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
+        if curr_max_num_tokens < 4:
+            return
+
+        # Cap the multi-seq warmup token count so we don't fill the KV cache
+        # to the brim. The autotuner warmup that ran just before this uses
+        # ``least_requests=True`` (few long sequences) which fits comfortably
+        # even when ``curr_max_num_tokens`` is close to the block ceiling.
+        # ``least_requests=False`` instead spreads the token budget across
+        # ``batch_size`` short sequences; when each sequence's length lands
+        # exactly on a block boundary AND the KV cache has ``num_extra_kv_tokens``
+        # or ``num_extra_decoding_steps`` > 0 (e.g. spec decoding cases),
+        # ``add_token`` needs to allocate one extra block per sequence, which
+        # ``_create_warmup_request``'s ``blocks_to_use`` estimate doesn't
+        # account for. On a small KV pool (e.g. Qwen3.5 hybrid with DFlash spec
+        # decoding on a single H100: 259 blocks total, ``max_num_tokens=8192``
+        # nearly saturates it), that extra per-sequence block overflows the
+        # pool and crashes with "Can't allocate new blocks for window size N".
+        # The point of this warmup is only to trigger ``num_seqs > 1`` +
+        # ``HAS_INITSTATES=True`` kernel variants — a modest token budget
+        # achieves that with plenty of block headroom.
+        WARMUP_TOKEN_CAP = 4096
+        capped_num_tokens = min(curr_max_num_tokens, WARMUP_TOKEN_CAP)
+
+        logger.info(
+            "Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
+
+        # (num_tokens, num_gen_requests, least_requests, force_initstates)
+        mamba_warmup_shapes = [
+            (capped_num_tokens, 0, False, False),
+            (capped_num_tokens, 0, False, True),
+        ]
+
+        autotuner_enabled = self.llm_args.enable_autotuner
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        autotune_ctx = (autotune(cache_path=cache_path)
+                        if autotuner_enabled else contextlib.nullcontext())
+
+        with self.no_cuda_graph(), autotune_ctx:
+            for (num_tokens_i, num_gen_requests_i, least_req_i,
+                 force_init_i) in mamba_warmup_shapes:
+                init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
+                            if force_init_i else contextlib.nullcontext())
+                try:
+                    with init_ctx:
+                        warmup_request = self._create_warmup_request(
+                            resource_manager,
+                            num_tokens_i,
+                            num_gen_requests_i,
+                            least_requests=least_req_i)
+                        with self._release_batch_context(
+                                warmup_request, resource_manager) as batch:
+                            if batch is None and self.mapping.tp_size <= 1:
+                                continue
+                            self._assert_all_tp_ranks_have_warmup_batch(
+                                batch, num_tokens_i)
+                            if batch is None:
+                                continue
+                            spec_resource_manager = resource_manager.get_resource_manager(
+                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                            if self.is_draft_model and isinstance(
+                                    spec_resource_manager,
+                                    Eagle3ResourceManager):
+                                spec_resource_manager.is_first_draft = True
+
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+
+                            if autotuner_enabled:
+                                AutoTuner.get().cache_pp_recv()
+                                AutoTuner.get().cache_pp_send()
+                                AutoTuner.get().clean_pp_flag()
+
+                            torch.cuda.synchronize()
+                except (torch.OutOfMemoryError, RuntimeError) as e:
+                    # Catch both OOM and RuntimeError. C++ KV cache block
+                    # allocation ("Can't allocate new blocks for window size
+                    # N") surfaces as RuntimeError, not torch.OutOfMemoryError.
+                    # This warmup is a pure perf optimization: if a shape
+                    # doesn't fit for any reason, log and skip; the model then
+                    # JIT-compiles the missing kernel variants lazily on the
+                    # first real request (i.e. the pre-fix behavior).
+                    logger.warning(f"Mamba hybrid warmup skipped for shape "
+                                   f"num_tokens={num_tokens_i}, "
+                                   f"num_gen_requests={num_gen_requests_i}, "
+                                   f"force_initstates={force_init_i}: "
+                                   f"{type(e).__name__}: {e}")
+                    # Mirror _general_warmup_impl: an OOM between dispatch()
+                    # and combine() leaves MoE A2A state in ``dispatched``,
+                    # tripping ``dispatch called twice`` on the next forward.
+                    self._reset_moe_alltoall_state()
+                    torch.cuda.empty_cache()
+
+        clear_memory_buffers()
+        torch.cuda.empty_cache()
+
     def _compute_dynamic_draft_len_mapping(self) -> Optional[Dict[int, int]]:
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.
 
@@ -1591,23 +1755,27 @@ class PyTorchModelEngine(ModelEngine):
                 for draft_len in draft_lengths]
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
-        """Captures CUDA graphs for various batch sizes and draft lengths."""
+        """Warm up or capture CUDA graphs for the configured graph shapes."""
         if not (self.cuda_graph_runner.enabled
                 or self._torch_compile_piecewise_cuda_graph):
             return
 
         self._capture_generation_cuda_graphs(resource_manager)
-        self._capture_piecewise_cuda_graphs(resource_manager)
+        # Piecewise graphs have separate capture machinery and do not use the
+        # whole-model attention workspace. Capture them only on the second pass.
+        if not self.cuda_graph_runner.is_warmup_only:
+            self._capture_piecewise_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self,
                                         resource_manager: ResourceManager):
-        """Captures CUDA graphs for pure generation steps."""
+        """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
             return
 
-        logger.info(
-            f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
-        )
+        operation = ("warmup"
+                     if self.cuda_graph_runner.is_warmup_only else "capture")
+        logger.info(f"Running CUDA graph {operation} for "
+                    f"{len(self._cuda_graph_batch_sizes)} batch sizes.")
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
@@ -1615,7 +1783,7 @@ class PyTorchModelEngine(ModelEngine):
         cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                         reverse=True)
 
-        # Determine which graphs to capture
+        # Determine which graph shapes to process.
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
@@ -1742,7 +1910,7 @@ class PyTorchModelEngine(ModelEngine):
                                     f"not enough KV cache space.")
                                 continue
                             logger.info(
-                                f"Run generation-only CUDA graph warmup ({label}) "
+                                f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}")
                             self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
@@ -2698,6 +2866,34 @@ class PyTorchModelEngine(ModelEngine):
             return list(self.dist.tp_allgather(num_ctx_requests))
         return None
 
+    def _sync_group_all_greedy_sample(self, spec_metadata) -> None:
+        """All-gather the per-rank greedy flags and store the group AND.
+
+        Why the sampling-path choice must be group-uniform under
+        ADP + LM-head TP is documented on the anchor,
+        ``SpecMetadata.group_all_greedy_sample``. Local contract: called once
+        per iteration, right after ``update_is_all_greedy_sample`` and BEFORE
+        the CUDA graph key is built. The gate is pure config (identical on
+        every rank), so ranks also agree on whether the exchange happens; the
+        gather spans the whole TP group, a superset of any LM-head-TP
+        subgroup. A dedicated host all-gather rather than a piggyback on the
+        ``all_rank_num_tokens`` exchange, which runs in ``_prepare_inputs`` --
+        after the graph key, too late for the key to see the synced value.
+        """
+        # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
+        # Mapping.__init__), so ADP needs no separate check here.
+        if not (self.mapping.enable_lm_head_tp_in_adp
+                and spec_metadata.use_rejection_sampling):
+            return
+        local_flag = bool(spec_metadata.is_all_greedy_sample)
+        all_flags = self.dist.tp_allgather(local_flag)
+        spec_metadata.group_all_greedy_sample = all(all_flags)
+        # Also overwrite the live flag directly: this iteration's scan already
+        # ran (update_is_all_greedy_sample just returned) and the CUDA graph
+        # key reads the flag next -- the stored override only takes effect on
+        # the NEXT rescan (populate), which is after key selection.
+        spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
     def _set_spec_metadata_all_rank_num_tokens(
             self,
             spec_metadata: SpecMetadata,
@@ -2868,12 +3064,45 @@ class PyTorchModelEngine(ModelEngine):
             skip_cross_kv_projection = True
 
         if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
-            cross_attn_metadata = attn_metadata.update_cross_metadata(
-                encoder_seq_lens=encoder_seq_lens,
-                cross_kv_cache_manager=cross_kv_cache_manager,
-                encoder_num_cached_tokens_per_seq=
-                encoder_num_cached_tokens_per_seq,
+            # Fast path for stable CUDA-graph generation steps: the encoder
+            # KV lengths (kv_lens_cuda) and the frozen prompt lengths
+            # (prompt_lens_cuda) are identical across all generation steps
+            # for a fixed batch. Skip the expensive torch.tensor() allocations
+            # and H2D copies inside prepare() when nothing has changed.
+            is_stable_gen_step = (
+                new_encoder_tokens == 0  # pure generation, no new cross-KV
+                and self._cross_attn_stable_cached_tokens
+                == encoder_num_cached_tokens_per_seq
+                and self._cross_attn_stable_request_ids
+                == attn_metadata.request_ids  # same batch and row order
             )
+            if is_stable_gen_step:
+                cross_attn_metadata = attn_metadata.cross
+                # Only refresh the decoder-side Python references that the
+                # kernel reads; these are pointer-level updates with no alloc.
+                cross_attn_metadata._seq_lens = attn_metadata.seq_lens
+                cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
+                cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
+                cross_attn_metadata.request_ids = attn_metadata.request_ids
+                cross_attn_metadata.num_contexts = attn_metadata.num_contexts
+            else:
+                cross_attn_metadata = attn_metadata.update_cross_metadata(
+                    encoder_seq_lens=encoder_seq_lens,
+                    cross_kv_cache_manager=cross_kv_cache_manager,
+                    encoder_num_cached_tokens_per_seq=
+                    encoder_num_cached_tokens_per_seq,
+                )
+                cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    # Record this stable state for future fast-path use.
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(
+                        attn_metadata.request_ids)
+                else:
+                    # Batch changed (new encoder request); reset cache.
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
         else:
             cross_attn_metadata = attn_metadata.create_cross_metadata(
                 cross_kv_cache_manager=cross_kv_cache_manager,
@@ -2883,7 +3112,18 @@ class PyTorchModelEngine(ModelEngine):
             )
             if attn_metadata.is_cuda_graph:
                 attn_metadata.cross = cross_attn_metadata
-        cross_attn_metadata.prepare()
+                if new_encoder_tokens == 0:
+                    self._cross_attn_stable_cached_tokens = list(
+                        encoder_num_cached_tokens_per_seq)
+                    self._cross_attn_stable_request_ids = list(
+                        attn_metadata.request_ids)
+                else:
+                    self._cross_attn_stable_cached_tokens = None
+                    self._cross_attn_stable_request_ids = None
+            else:
+                self._cross_attn_stable_cached_tokens = None
+                self._cross_attn_stable_request_ids = None
+            cross_attn_metadata.prepare()
 
         return {
             "encoder_hidden_states": packed_encoder_hidden_states,
@@ -5556,7 +5796,17 @@ class PyTorchModelEngine(ModelEngine):
             torch.cuda.empty_cache()
 
         self._run_autotuner_warmup_encoder()
+        # Warm up every encoder graph shape before capturing any graph. Some
+        # attention kernels switch implementations at smaller shapes and need
+        # a larger workspace, so the first pass grows the workspace to its
+        # maximum size. The second pass runs the final per-shape warmup and
+        # captures without resizing the workspace.
         with self.encoder_cuda_graph_runner.allow_capture():
+            self.encoder_cuda_graph_runner.is_warmup_only = True
+            try:
+                self._run_cuda_graph_warmup_encoder()
+            finally:
+                self.encoder_cuda_graph_runner.is_warmup_only = False
             self._run_cuda_graph_warmup_encoder()
 
         # Pre-populate the memory pool with max-shape allocations to reduce
@@ -5606,14 +5856,14 @@ class PyTorchModelEngine(ModelEngine):
         AutoTuner.get().print_profiling_cache()
 
     def _run_cuda_graph_warmup_encoder(self) -> None:
-        """Captures whole-model CUDA graphs for the encode-only path."""
+        """Warm up or capture whole-model encode-only CUDA graphs."""
         if not self.encoder_cuda_graph_runner.enabled:
             return
 
         self._capture_encoder_cuda_graphs()
 
     def _capture_encoder_cuda_graphs(self) -> None:
-        """Capture whole-model encoder CUDA graphs for all feasible keys.
+        """Warm up or capture encoder CUDA graphs for all feasible keys.
 
         Feasibility filter (also used in source):
           nt >= prev_sl + bs   (enough tokens for this sl bucket)
@@ -5629,8 +5879,9 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens_list = sorted(self._cuda_graph_num_tokens)
         seq_lens_list = sorted(self._cuda_graph_seq_lens)
 
-        num_captured = 0
-        logger.info("Capturing encoder CUDA graphs ...")
+        operation = "warmup" if runner.is_warmup_only else "capture"
+        num_processed = 0
+        logger.info(f"Running encoder CUDA graph {operation} ...")
         for bs in batch_sizes:
             if bs > self.batch_size:
                 continue
@@ -5649,13 +5900,14 @@ class PyTorchModelEngine(ModelEngine):
                     if inputs is None:
                         continue
 
-                    logger.info(f"Encoder CUDA graph capture: "
+                    logger.info(f"Encoder CUDA graph {operation}: "
                                 f"bs={bs}, nt={nt}, sl={sl}")
                     self.encoder_forward(inputs)
                     torch.cuda.synchronize()
-                    num_captured += 1
+                    num_processed += 1
 
-        logger.info(f"Captured {num_captured} encoder CUDA graph(s).")
+        logger.info(f"Completed encoder CUDA graph {operation} for "
+                    f"{num_processed} graph shape(s).")
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -5708,7 +5960,9 @@ class PyTorchModelEngine(ModelEngine):
                         return self._forward_step(model_inputs,
                                                   **forward_kwargs)
 
-                if self.encoder_cuda_graph_runner.needs_capture(key):
+                needs_capture = self.encoder_cuda_graph_runner.needs_capture(
+                    key)
+                if needs_capture:
 
                     def forward_fn(
                             capture_inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -5718,16 +5972,20 @@ class PyTorchModelEngine(ModelEngine):
                             return self._forward_step(capture_inputs,
                                                       **forward_kwargs)
 
-                    self.encoder_cuda_graph_runner.capture(
+                    capture_outputs = self.encoder_cuda_graph_runner.capture(
                         key, forward_fn, {
                             **model_inputs, "_forward_kwargs": forward_kwargs
                         })
 
-                with MoeLoadBalancerIterContext(moe_load_balancer):
-                    graph_outputs = self.encoder_cuda_graph_runner.replay(
-                        key, {
-                            **model_inputs, "_forward_kwargs": forward_kwargs
-                        })
+                if self.encoder_cuda_graph_runner.is_warmup_only:
+                    graph_outputs = capture_outputs
+                else:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        graph_outputs = self.encoder_cuda_graph_runner.replay(
+                            key, {
+                                **model_inputs, "_forward_kwargs":
+                                forward_kwargs
+                            })
 
             # Return a clone to avoid sharing data_ptr with the static buffers.
             outputs = {}
@@ -5852,6 +6110,7 @@ class PyTorchModelEngine(ModelEngine):
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(
                     padded_requests.all_requests())
+                self._sync_group_all_greedy_sample(spec_metadata)
 
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_requests,
@@ -5901,7 +6160,8 @@ class PyTorchModelEngine(ModelEngine):
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
                 else:
-                    if self.cuda_graph_runner.needs_capture(key):
+                    needs_capture = self.cuda_graph_runner.needs_capture(key)
+                    if needs_capture:
 
                         def capture_forward_fn(inputs: Dict[str, Any]):
                             with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -5913,13 +6173,16 @@ class PyTorchModelEngine(ModelEngine):
                         def capture_postprocess_fn(inputs: Dict[str, Any]):
                             self._postprocess_inputs(inputs)
 
-                        self.cuda_graph_runner.capture(
+                        capture_outputs = self.cuda_graph_runner.capture(
                             key,
                             capture_forward_fn,
                             inputs,
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
+                    if self.cuda_graph_runner.is_warmup_only:
+                        outputs = capture_outputs
+                    elif needs_capture:
                         # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
@@ -6185,7 +6448,7 @@ class PyTorchModelEngine(ModelEngine):
         encoder_attn_metadata.num_contexts = len(encoder_requests)
         encoder_attn_metadata.max_seq_len = self.max_seq_len
         encoder_attn_metadata.request_ids = request_ids
-        encoder_attn_metadata.prepare()
+        encoder_attn_metadata.prepare_encoder_only()
 
         encoder_input_ids_t = torch.tensor(encoder_input_ids,
                                            dtype=torch.int,
