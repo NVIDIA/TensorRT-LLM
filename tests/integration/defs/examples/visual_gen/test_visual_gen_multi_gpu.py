@@ -37,6 +37,8 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     WAN22_LPIPS_SEED,
     WAN22_LPIPS_WIDTH,
     _assert_lpips_below_threshold,
+    _cleanup_cuda,
+    _disable_inductor_compile_worker_quiesce,
     _golden_media_path,
     _lpips_model_path,
     _run_lpips_eval,
@@ -271,6 +273,7 @@ def _run_wan22_multinode_slurm_rank(tmp_path):
         )
 
     _ensure_slurm_external_launch_env()
+    _disable_inductor_compile_worker_quiesce()
     _parallel_config(**WAN22_LPIPS_MULTINODE_PARALLEL).validate_world_size(world_size)
     model_path = _lpips_model_path("Wan2.2-T2V-A14B-Diffusers")
     _skip_if_missing(model_path, "Wan 2.2 checkpoint", is_dir=True)
@@ -331,6 +334,13 @@ def _run_wan22_multinode_slurm_rank(tmp_path):
     finally:
         if visual_gen is not None:
             visual_gen.shutdown()
+            # shutdown() joins rank 0's in-client worker thread with a bounded
+            # timeout; 16-rank dist teardown can outlast it and trip
+            # pytest-threadleak, so wait for the thread explicitly.
+            worker_thread = getattr(visual_gen.executor, "_ext_worker_thread", None)
+            if worker_thread is not None and worker_thread.is_alive():
+                worker_thread.join(timeout=120)
+        _cleanup_cuda()
 
 
 def _run_wan22_multinode_slurm_parent():
