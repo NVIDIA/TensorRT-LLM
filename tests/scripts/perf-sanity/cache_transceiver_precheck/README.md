@@ -36,7 +36,7 @@ layers) is read from the real model's `config.json` under `$LLM_MODELS_ROOT`.
     # optional overrides (defaults in precheck_config.PRECHECK_DEFAULTS):
     # request_lengths: [1024, 8192]
     # num_requests: 2
-    # chunk_timeout_s: 180
+    # wave_timeout_s: 180
     # wireup_timeout_s: 1800     # first-rep NIXL agent wire-up allowance
     # step_timeout_s: 2700       # external srun timeout (default derives from topology)
   ```
@@ -52,7 +52,7 @@ The first rep of the schedule (the warmup rep) additionally budgets
 path pays a one-time serialized `fetchRemoteMD` metadata exchange per
 (receiver rank, ctx rank) agent pair, and cold cross-rack fetches were
 measured at 100-170s each — real serving absorbs this as slow first requests,
-so the precheck does too. Later reps run under the tight `chunk_timeout_s`,
+so the precheck does too. Later reps run under the tight `wave_timeout_s`,
 which is what actually catches hangs. Set `PRECHECK_DEBUG=1` in the worker
 env to raise the C++/Python transceiver log levels when debugging a stall.
 

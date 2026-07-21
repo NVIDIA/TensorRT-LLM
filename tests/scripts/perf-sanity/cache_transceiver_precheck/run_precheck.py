@@ -27,9 +27,10 @@ minutes instead of after a full model bring-up.
 
 Vocabulary: a PAIR is one dp-rank-to-dp-rank transfer pairing (n_pairs =
 max of the two sides' dp sizes, so every dp rank is exercised); a REP is one
-repetition of all pairs (1 warmup + num_requests measured); a CHUNK is the
-batch of pairs in flight at once (at most max_concurrent_pairs) -- NOT
-token/data chunking.
+repetition of all pairs (1 warmup + num_requests measured); a WAVE is the
+batch of pairs in flight at once (at most max_concurrent_pairs). "Wave" is
+used instead of "chunk" on purpose -- it would otherwise collide with
+chunked prefill (splitting a request's tokens), which is unrelated.
 
 Asymmetric parallelism (e.g. ctx dep4 -> gen dep16, ctx pp8 -> gen tp32) is
 supported: the fill pattern is seeded per (request, GLOBAL layer) and is
@@ -317,7 +318,7 @@ def build_kv_cache_manager(kv_shape, plan, side, mapping, max_req_len, use_v2):
 
     tpb = plan["tokens_per_block"]
     padded_len = ((max_req_len + tpb - 1) // tpb) * tpb
-    owned = pcfg.max_owned_per_chunk(plan, side["role"])
+    owned = pcfg.max_owned_per_wave(plan, side["role"])
     max_tokens = owned * padded_len + 2 * tpb  # concurrent pairs + headroom
 
     # Real MLA serving uses SELFKONLY (kv_factor=1: one latent plane, no V) —
@@ -636,7 +637,7 @@ def parse_python_bandwidth_gbps(csv_dir):
 
 
 # --------------------------------------------------------------------------- #
-# Chunk execution
+# Wave execution
 # --------------------------------------------------------------------------- #
 class PrecheckRunner:
     """One MPI world = one ctx or gen server instance."""
@@ -741,7 +742,7 @@ class PrecheckRunner:
         # preference on this path -> C++), so read the effective runtime back.
         self.runtime = cache_cfg.transceiver_runtime or "CPP"
 
-    # ---- per-chunk transfer logic -------------------------------------------
+    # ---- per-wave transfer logic -------------------------------------------
     def _pair_rid(self, peer_idx, li, rep, pair):
         ctx_idx = self.server_idx if self.is_ctx else peer_idx
         gen_idx = peer_idx if self.is_ctx else self.server_idx
@@ -749,10 +750,10 @@ class PrecheckRunner:
         seq = (li * total_reps + rep) * self.plan["n_pairs"] + pair
         return make_rid(ctx_idx, gen_idx, self.plan["num_ctx_servers"], seq)
 
-    def _owned(self, chunk):
-        return pcfg.owned_pairs(self.plan, self.role, self.mapping.tp_rank, chunk)
+    def _owned(self, wave):
+        return pcfg.owned_pairs(self.plan, self.role, self.mapping.tp_rank, wave)
 
-    def ctx_run_chunk(self, peer_idx, li, req_len, rep, chunk):
+    def ctx_run_wave(self, peer_idx, li, req_len, rep, wave):
         """Fill + send owned pairs.
 
         Returns {pair: context_phase_params} on the leader (params from each
@@ -760,7 +761,7 @@ class PrecheckRunner:
         """
         import tensorrt_llm
 
-        owned = self._owned(chunk)
+        owned = self._owned(wave)
         reqs, local_err = {}, None
         try:
             for pair in owned:
@@ -794,7 +795,7 @@ class PrecheckRunner:
         if self.is_leader and reason is None:
             for d in gathered:
                 params_by_pair.update(d or {})
-            missing = [p for p in chunk if p not in params_by_pair]
+            missing = [p for p in wave if p not in params_by_pair]
             if missing:
                 reason = f"missing context_phase_params for pairs {missing}"
 
@@ -803,8 +804,8 @@ class PrecheckRunner:
             raise _TransferError(f"ctx send setup failed: {reason}")
         return params_by_pair, reqs
 
-    def ctx_finish_chunk(self, reqs):
-        """Wait for all in-flight sends of this chunk, then free."""
+    def ctx_finish_wave(self, reqs):
+        """Wait for all in-flight sends of this wave, then free."""
         import tensorrt_llm
 
         t0 = time.monotonic()
@@ -822,14 +823,14 @@ class PrecheckRunner:
             self._free_all(reqs)
         states = {p: str(r.state) for p, r in reqs.items()}
         tensorrt_llm.logger.info(
-            f"[ctx{self.server_idx} r{self.rank}] chunk sends finished in "
+            f"[ctx{self.server_idx} r{self.rank}] wave sends finished in "
             f"{time.monotonic() - t0:.1f}s states={states}"
         )
         reason = self._consensus_error(local_err)
         if reason is not None:
             raise _TransferError(f"ctx transfer failed: {reason}")
 
-    def gen_run_chunk(self, peer_idx, li, req_len, rep, chunk, params_by_pair):
+    def gen_run_wave(self, peer_idx, li, req_len, rep, wave, params_by_pair):
         """Receive + verify owned pairs. Returns (ok, mismatch_detail).
 
         Warmup reps skip the (CPU-heavy) byte verification: their result is
@@ -839,7 +840,7 @@ class PrecheckRunner:
 
         import tensorrt_llm
 
-        owned = self._owned(chunk)
+        owned = self._owned(wave)
         reqs, local_err = {}, None
         try:
             for pair in owned:
@@ -867,7 +868,7 @@ class PrecheckRunner:
                 _wait_gen_complete(self.xcvr, req, self.runtime, self.llm_request_state)
             if reqs:
                 tensorrt_llm.logger.info(
-                    f"[gen{self.server_idx} r{self.rank}] chunk recvs finished in "
+                    f"[gen{self.server_idx} r{self.rank}] wave recvs finished in "
                     f"{time.monotonic() - t0:.1f}s"
                 )
             torch.cuda.synchronize()  # receive may land on a side stream
@@ -928,13 +929,13 @@ class PrecheckRunner:
 
 
 def _schedule(plan):
-    """Deterministic (li, req_len, rep, chunk) schedule both sides iterate."""
+    """Deterministic (li, req_len, rep, wave) schedule both sides iterate."""
     out = []
     total_reps = plan["warmup_requests"] + plan["num_requests"]
     for li, req_len in enumerate(plan["request_lengths"]):
         for rep in range(total_reps):
-            for chunk in pcfg.chunks(plan):
-                out.append((li, req_len, rep, chunk))
+            for wave in pcfg.waves(plan):
+                out.append((li, req_len, rep, wave))
     return out
 
 
@@ -949,11 +950,11 @@ def hello_timeout_s(plan, num_peers):
     return plan["rendezvous_timeout_s"] + num_peers * (300 + plan["wireup_timeout_s"])
 
 
-def chunk_timeout_s(plan, li, rep):
-    """Per-chunk budget: the first rep additionally pays the one-time NIXL
+def wave_timeout_s(plan, li, rep):
+    """Per-wave budget: the first rep additionally pays the one-time NIXL
     agent wire-up (see PRECHECK_DEFAULTS['wireup_timeout_s'])."""
     extra = plan["wireup_timeout_s"] if (li == 0 and rep == 0) else 0
-    return plan["chunk_timeout_s"] + extra
+    return plan["wave_timeout_s"] + extra
 
 
 # --------------------------------------------------------------------------- #
@@ -966,16 +967,16 @@ def chunk_timeout_s(plan, li, rep):
 #   gen leader                                ctx leader
 #    | -- hello {fingerprint} --------------> |  yaml mismatch -> abort
 #    | <---------------- welcome ------------ |
-#    | -- go {li, rep, chunk} --------------> |  every rank posts its sends
+#    | -- go {li, rep, wave} --------------> |  every rank posts its sends
 #    | <----- params {pair: ctx_phase} ------ |  (from the owning dp ranks)
 #    |   ...KV transfer + byte verification.. |
 #    |        (repeat per schedule entry)     |
 #    | -- done (deferred: after ALL peers) -> |  ctx exits only now
 #    | <------------------ bye -------------- |
 #
-# A "chunk" here is a batch of TRANSFER PAIRS in flight at once (at most
+# A "wave" here is a batch of TRANSFER PAIRS in flight at once (at most
 # max_concurrent_pairs of the n_pairs dp-rank pairings) -- NOT token/data
-# chunking. It bounds the tiny synthetic KV pool and gives the per-chunk
+# chunking. It bounds the tiny synthetic KV pool and gives the per-wave
 # alarm a precise target, while still exercising concurrent transfers.
 # --------------------------------------------------------------------------- #
 def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
@@ -1006,8 +1007,8 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
         raise _TransferError(f"handshake with gen_{peer_idx} failed: {msg[:1]}")
     leader_reply(("welcome", {"fingerprint": plan["fingerprint"]}))
 
-    for li, req_len, rep, chunk in _schedule(plan):
-        arm(f"gen_{peer_idx} len={req_len} rep={rep}", seconds=chunk_timeout_s(plan, li, rep))
+    for li, req_len, rep, wave in _schedule(plan):
+        arm(f"gen_{peer_idx} len={req_len} rep={rep}", seconds=wave_timeout_s(plan, li, rep))
         msg = leader_recv()
         if msg[0] == "abort":
             raise _PeerAbort(f"gen_{peer_idx} aborted: {msg[1]}")
@@ -1016,13 +1017,13 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
                 f"schedule desync with gen_{peer_idx}: expected li={li} rep={rep}, got {msg}"
             )
         try:
-            params_by_pair, reqs = runner.ctx_run_chunk(peer_idx, li, req_len, rep, chunk)
+            params_by_pair, reqs = runner.ctx_run_wave(peer_idx, li, req_len, rep, wave)
         except _TransferError as e:
             leader_reply(("abort", str(e)))
             raise
         # JSON object keys are strings; the gen side converts back to int.
         leader_reply(("params", {str(p): params_to_wire(v) for p, v in params_by_pair.items()}))
-        runner.ctx_finish_chunk(reqs)
+        runner.ctx_finish_wave(reqs)
 
     # The gen defers "done" until it has finished the schedules of ALL its
     # ctx peers, so every ctx instance stays alive for the whole precheck --
@@ -1085,26 +1086,26 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
         if reply[0] != "welcome":
             raise _TransferError(f"unexpected handshake reply from ctx_{peer_idx}: {reply[:1]}")
-        # Established sessions are dedicated: chunk replies are prompt. The
-        # ZMQ timeout is only a backstop under the per-chunk alarm, so it
+        # Established sessions are dedicated: wave replies are prompt. The
+        # ZMQ timeout is only a backstop under the per-wave alarm, so it
         # includes the first-rep wire-up allowance unconditionally.
         if runner.is_leader:
             zmq, _ = runner._zmq()
             sock.setsockopt(
                 zmq.RCVTIMEO,
-                (plan["chunk_timeout_s"] + plan["wireup_timeout_s"] + 30) * 1000,
+                (plan["wave_timeout_s"] + plan["wireup_timeout_s"] + 30) * 1000,
             )
 
         case_ok = {}
-        for li, req_len, rep, chunk in _schedule(plan):
-            arm(f"ctx_{peer_idx} len={req_len} rep={rep}", seconds=chunk_timeout_s(plan, li, rep))
+        for li, req_len, rep, wave in _schedule(plan):
+            arm(f"ctx_{peer_idx} len={req_len} rep={rep}", seconds=wave_timeout_s(plan, li, rep))
             reply = runner._leader_send_recv(
-                sock, ("go", {"li": li, "rep": rep, "chunk": chunk[0]}), key
+                sock, ("go", {"li": li, "rep": rep, "wave": wave[0]}), key
             )
             if reply[0] == "abort":
                 raise _TransferError(f"ctx_{peer_idx} aborted: {reply[1]}")
             params_by_pair = {int(p): params_from_wire(v) for p, v in reply[1].items()}
-            ok, detail = runner.gen_run_chunk(peer_idx, li, req_len, rep, chunk, params_by_pair)
+            ok, detail = runner.gen_run_wave(peer_idx, li, req_len, rep, wave, params_by_pair)
             if rep >= plan["warmup_requests"]:
                 prev_ok, prev_detail = case_ok.get(req_len, (True, ""))
                 case_ok[req_len] = (prev_ok and ok, prev_detail or detail)
@@ -1197,14 +1198,14 @@ def _install_watchdog(runner, plan, rank):
     # are serialized across sessions); per-cell alarms are the tighter bound
     # for actual transfer work.
     hang_detector = HangDetector(
-        timeout=hello_timeout_s(plan, runner.side["num_peers"]) + plan["chunk_timeout_s"] + 60,
+        timeout=hello_timeout_s(plan, runner.side["num_peers"]) + plan["wave_timeout_s"] + 60,
         on_detected=_on_hang,
     )
     hang_detector.start()
 
     def arm(what, seconds=None):
         current_cell["what"] = what
-        signal.alarm(seconds or plan["chunk_timeout_s"])
+        signal.alarm(seconds or plan["wave_timeout_s"])
         hang_detector.checkpoint()
 
     def disarm():
