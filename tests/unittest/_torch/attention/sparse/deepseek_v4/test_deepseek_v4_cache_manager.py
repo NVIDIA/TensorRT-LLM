@@ -41,7 +41,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BatchDesc, KVCacheDesc, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
 _RequestCache = Dict[
@@ -982,6 +982,28 @@ class TestDeepseekV4CacheManager:
                     atol=1e-5,
                     msg=f"Mismatch for layer {layer_idx}, attention type {attn_type.name} (scales)",
                 )
+
+    def test_max_num_tokens_is_used_by_base_config(self):
+        max_batch_size = 2
+        max_seq_len = 1024
+        max_input_len = 127
+        max_num_tokens = max_batch_size * (max_input_len + 1)
+        cache_manager, _ = self._create_deepseek_v4_cache_manager(
+            tokens_per_block=self.tokens_per_block,
+            max_batch_size=max_batch_size,
+            max_seq_len=max_seq_len,
+            max_input_len=max_input_len,
+            compress_ratios=[1, 4],
+            dtype=DataType.BF16,
+            compressor_dtype=DataType.FLOAT,
+        )
+
+        assert cache_manager.kv_cache_manager_py_config.typical_step == BatchDesc(
+            [
+                KVCacheDesc(capacity=max_num_tokens, history_length=0),
+                KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1),
+            ]
+        )
 
     def test_indexer_cache_layout_default(self):
         """DeepSeek-V4 defaults to FP4 indexer K cache on Blackwell+."""

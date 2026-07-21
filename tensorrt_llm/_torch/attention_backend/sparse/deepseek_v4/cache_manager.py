@@ -262,6 +262,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             mapping=mapping,
             dtype=dtype,
+            max_num_tokens=max_num_tokens,
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
