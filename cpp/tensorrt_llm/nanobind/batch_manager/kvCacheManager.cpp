@@ -660,6 +660,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .value("SELFKONLY", tbk::CacheType::kSELFKONLY);
 
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
+        .def("set_retention_clock", &tbk::KVCacheManager::setRetentionClock, nb::arg("now_ns"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
                  std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
                  std::vector<SizeType32> const&, tensorrt_llm::DataType, SizeType32, int64_t, SizeType32, SizeType32,

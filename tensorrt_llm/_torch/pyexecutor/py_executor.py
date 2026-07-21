@@ -594,6 +594,8 @@ class PyExecutor:
         self._disk_onboard_active = bool(
             _kvc is not None and getattr(_kvc, "disk_cache_size", None)
             and int(os.environ.get("TLLM_KV_DISK_READERS", "0") or "0") > 0)
+        self._disk_tier_active = bool(
+            _kvc is not None and getattr(_kvc, "disk_cache_size", None))
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
@@ -2612,6 +2614,7 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._sync_retention_clock()
                     self.resource_manager.prepare_resources(scheduled_batch)
                     self._park_requests_awaiting_onboard(scheduled_batch)
 
@@ -3173,6 +3176,19 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _sync_retention_clock(self):
+        """All ranks anchor and evaluate retention against the same timestamp."""
+        if not self._disk_tier_active:
+            return
+        kv = getattr(self, "kv_cache_manager", None)
+        if kv is None or not hasattr(kv, "set_retention_clock"):
+            return
+        now_ns = time.time_ns()
+        if self.dist.tp_size > 1 and not self.enable_attention_dp:
+            now_ns = self.dist.tp_allreduce(
+                now_ns if self.dist.tp_rank == 0 else 0, op=ReduceOp.MAX)
+        kv.set_retention_clock(now_ns)
 
     def _park_requests_awaiting_onboard(self, scheduled_batch):
         """Hold context requests whose detached disk-onboard reads have not landed out of this forward.
@@ -4097,6 +4113,7 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._sync_retention_clock()
                     self.resource_manager.prepare_resources(scheduled_batch)
                     self._park_requests_awaiting_onboard(scheduled_batch)
 
@@ -4574,6 +4591,7 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._sync_retention_clock()
                     self.resource_manager.prepare_resources(scheduled_batch)
                     self._park_requests_awaiting_onboard(scheduled_batch)
 

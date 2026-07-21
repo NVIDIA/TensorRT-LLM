@@ -492,9 +492,9 @@ public:
         mRetentionExpiry = mRetentionExpiry ? std::max(*mRetentionExpiry, expiry) : expiry;
     }
 
-    [[nodiscard]] bool isRetainedNow() const
+    [[nodiscard]] bool isRetainedNow(std::chrono::steady_clock::time_point::duration now) const
     {
-        return mRetentionExpiry.has_value() && *mRetentionExpiry > std::chrono::steady_clock::now().time_since_epoch();
+        return mRetentionExpiry.has_value() && *mRetentionExpiry > now;
     }
 
     [[nodiscard]] std::optional<std::chrono::steady_clock::time_point::duration> getRetentionExpiry() const
@@ -515,12 +515,12 @@ public:
             = mPendingRetentionDuration ? std::max(*mPendingRetentionDuration, duration) : duration;
     }
 
-    //! \brief Anchor a pending retention duration to now (called when the block is committed / made reusable).
-    void commitRetention()
+    //! \brief Anchor a pending retention duration to \p now (called when the block is committed / made reusable).
+    void commitRetention(std::chrono::steady_clock::time_point::duration now)
     {
         if (mPendingRetentionDuration)
         {
-            markRetained(std::chrono::steady_clock::now().time_since_epoch() + *mPendingRetentionDuration);
+            markRetained(now + *mPendingRetentionDuration);
             mPendingRetentionDuration = std::nullopt;
         }
     }
@@ -1527,6 +1527,11 @@ public:
         return mDiskDeadlines.size();
     }
 
+    void setRetentionClock(std::chrono::steady_clock::time_point::duration now)
+    {
+        mRetentionNow = now;
+    }
+
 private:
     //! Disk-tier displacement order among retained blocks: exact earliest deadline;
     //! among equal deadlines, first-spilled first. Block release and eviction walk chains
@@ -1551,6 +1556,9 @@ private:
 
     std::set<DiskDeadline> mDiskDeadlines;
     std::uint64_t mDiskSpillSeq{0};
+
+    // Retention decisions use this rank-consistent clock (leader-broadcast each iteration).
+    std::chrono::steady_clock::time_point::duration mRetentionNow{0};
 
     // ---- Unstaged async store: reserved host-block pool (env TLLM_KV_DISK_RESERVED_BLOCKS, 0 = off) ----
     // Target set from the environment in allocatePools. A spill hands out a reserved free host slot
@@ -2217,6 +2225,14 @@ public:
             total += manager.getDiskDeadlineCount();
         }
         return total;
+    }
+
+    void setRetentionClock(std::chrono::steady_clock::time_point::duration now)
+    {
+        for (auto& [windowSize, manager] : mWindowBlockManagers)
+        {
+            manager.setRetentionClock(now);
+        }
     }
 
 private:
@@ -2921,6 +2937,12 @@ public:
     void refreshBlocks() override
     {
         mBlockManager.refreshBlocks();
+    }
+
+    void setRetentionClock(std::int64_t nowNs)
+    {
+        mBlockManager.setRetentionClock(std::chrono::duration_cast<std::chrono::steady_clock::time_point::duration>(
+            std::chrono::nanoseconds(nowNs)));
     }
 
     void flushIterationEvents() override

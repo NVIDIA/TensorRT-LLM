@@ -10817,6 +10817,11 @@ VecTokens iotaTokens(TokenIdType first, SizeType32 count)
 
 // Adds a sequence; diskTtl set => the request carries a disk retention TTL.
 // Returns the pair; prepopulated length is readable via req->getContextCurrentPosition().
+std::chrono::steady_clock::time_point::duration retentionTick(std::int64_t ms)
+{
+    return std::chrono::duration_cast<std::chrono::steady_clock::time_point::duration>(std::chrono::milliseconds(ms));
+}
+
 DiskTierSeq addDiskTierSequence(BlockManager& blockManager, LlmRequest::RequestIdType id, VecTokens tokens,
     std::optional<std::chrono::milliseconds> diskTtl)
 {
@@ -10962,9 +10967,10 @@ TEST_F(KVCacheManagerTest, DiskTierExpiryAtSpillTest)
         = makeDiskTierBlockManager(stream, dir.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/8);
     auto& blockManager = *blockManagerPtr;
 
+    blockManager.setRetentionClock(retentionTick(1000));
     auto seqP = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::chrono::milliseconds(50));
     releaseDiskTierSequence(blockManager, seqP);
-    std::this_thread::sleep_for(std::chrono::milliseconds(120)); // TTL dead before eviction
+    blockManager.setRetentionClock(retentionTick(1200)); // TTL dead before eviction
     churnOnce(blockManager, 1, 100);
     EXPECT_EQ(blockManager.getNumDiskSpills(), 0u);
     EXPECT_GE(blockManager.getNumDiskGateDropped(), 2u);
@@ -10993,10 +10999,10 @@ TEST_F(KVCacheManagerTest, DiskTierRetentionAnchoredAtCommitTest)
             << "retention deadline stamped at allocation instead of deferred to commit";
     }
 
-    // Commit to the reuse tree -> the deadline is anchored at ~now + ttl for the committed blocks.
-    auto const before = std::chrono::steady_clock::now().time_since_epoch();
+    // Commit to the reuse tree -> the deadline is anchored at the retention clock + ttl.
+    auto const t0 = retentionTick(5000);
+    blockManager.setRetentionClock(t0);
     blockManager.storeContextBlocks(*s.seq, *s.req);
-    auto const after = std::chrono::steady_clock::now().time_since_epoch();
 
     std::size_t stamped = 0;
     for (auto const bid : blockIds)
@@ -11005,8 +11011,7 @@ TEST_F(KVCacheManagerTest, DiskTierRetentionAnchoredAtCommitTest)
         if (expiry.has_value())
         {
             ++stamped;
-            EXPECT_GE(*expiry, before + ttl); // clock started at commit, not earlier at allocation
-            EXPECT_LE(*expiry, after + ttl);
+            EXPECT_EQ(*expiry, t0 + ttl); // clock started at commit, not earlier at allocation
         }
     }
     EXPECT_GT(stamped, 0u) << "commit did not anchor any retention deadline";
@@ -11022,13 +11027,14 @@ TEST_F(KVCacheManagerTest, DiskTierReuseRestampTest)
     auto& blockManager = *blockManagerPtr;
 
     // Short-TTL cold, then immediate re-send with a long TTL: pure reuse path.
+    blockManager.setRetentionClock(retentionTick(1000));
     auto seqA = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::chrono::milliseconds(50));
     releaseDiskTierSequence(blockManager, seqA);
     auto seqA2 = addDiskTierSequence(blockManager, 1, iotaTokens(0, 16), std::chrono::milliseconds(60000));
     EXPECT_GE(seqA2.req->getContextCurrentPosition(), 12); // reused, not recomputed
     releaseDiskTierSequence(blockManager, seqA2);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(120)); // past the ORIGINAL 50 ms TTL
+    blockManager.setRetentionClock(retentionTick(1200)); // past the ORIGINAL 50 ms TTL
     churnOnce(blockManager, 2, 100);
     // Without the reuse re-stamp the blocks are expired and gated; with it they spill.
     EXPECT_GE(blockManager.getNumDiskSpills(), 2u);
@@ -11036,7 +11042,7 @@ TEST_F(KVCacheManagerTest, DiskTierReuseRestampTest)
     // Control: same shape, no re-send. Expires and is gated.
     auto seqB = addDiskTierSequence(blockManager, 3, iotaTokens(200, 16), std::chrono::milliseconds(50));
     releaseDiskTierSequence(blockManager, seqB);
-    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    blockManager.setRetentionClock(retentionTick(1400)); // past seqB's TTL
     auto const spillsBefore = blockManager.getNumDiskSpills();
     churnOnce(blockManager, 4, 300);
     EXPECT_EQ(blockManager.getNumDiskSpills(), spillsBefore);
@@ -11109,12 +11115,13 @@ TEST_F(KVCacheManagerTest, DiskTierProtectEvictsExpiredTest)
         stream, dir.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/2, /*protectUnexpired=*/true);
     auto& blockManager = *blockManagerPtr;
 
+    blockManager.setRetentionClock(retentionTick(1000));
     auto seqA = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::chrono::milliseconds(50));
     releaseDiskTierSequence(blockManager, seqA);
     churnOnce(blockManager, 1, 100);
     auto const spillsFilled = blockManager.getNumDiskSpills();
     EXPECT_GE(spillsFilled, 2u);
-    std::this_thread::sleep_for(std::chrono::milliseconds(120)); // A's disk blocks now expired
+    blockManager.setRetentionClock(retentionTick(1200)); // A's disk blocks now expired
 
     // New victim: the expired blocks ARE evictable even in protect mode => it spills.
     auto seqB = addDiskTierSequence(blockManager, 2, iotaTokens(200, 16), std::chrono::milliseconds(600000));
@@ -11474,4 +11481,29 @@ TEST_F(KVCacheManagerTest, DiskTierDeadlineEntryLeakTest)
     }
     EXPECT_LE(blockManager.getDiskDeadlineCount(),
         static_cast<std::size_t>(64)); // never more entries than disk slots; leaked entries grow past it
+}
+
+// Retention decisions must be identical across TP ranks: anchors and expiry checks use the
+// injected rank-consistent clock, not each rank's wall clock. Two managers driven with the
+// identical op sequence but different real-time pacing must agree on the gate outcome.
+TEST_F(KVCacheManagerTest, DiskTierRetentionClockConsistencyTest)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    DiskTierDir dirA, dirB;
+    auto bmA = makeDiskTierBlockManager(stream, dirA.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/8);
+    auto bmB = makeDiskTierBlockManager(stream, dirB.str(), /*retainedOnly=*/true, /*prim=*/4, /*sec=*/2, /*disk=*/8);
+    for (auto* bm : {bmA.get(), bmB.get()})
+    {
+        bm->setRetentionClock(retentionTick(1000));
+        auto s = addDiskTierSequence(*bm, 1, iotaTokens(0, 16), std::chrono::milliseconds(150));
+        releaseDiskTierSequence(*bm, s);
+        if (bm == bmB.get())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300)); // real-time skew between ranks
+        }
+        bm->setRetentionClock(retentionTick(1100));                      // same logical instant on both, inside the TTL
+        churnOnce(*bm, 2, 100); // retained-only gate decides spill-vs-drop here
+    }
+    EXPECT_EQ(bmA->getDiskDeadlineCount(), bmB->getDiskDeadlineCount());
+    EXPECT_GT(bmA->getDiskDeadlineCount(), 0u);
 }

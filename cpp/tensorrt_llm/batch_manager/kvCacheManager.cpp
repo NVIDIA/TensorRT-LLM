@@ -1375,7 +1375,7 @@ BlockPtr WindowBlockManager::claimDiskTarget()
     // so getFreeBlock returns empties first and a retained block only when nothing cheaper
     // (empty slot or unmarked cached block) remains.
     auto candidate = std::get<0>(mEvictionPolicy->getFreeBlock(kDiskLevel));
-    if (!candidate->isRetainedNow())
+    if (!candidate->isRetainedNow(mRetentionNow))
     {
         mEvictionPolicy->claimBlock(candidate);
         return candidate;
@@ -1398,7 +1398,7 @@ BlockPtr WindowBlockManager::claimDiskTarget()
         }
         // Protect mode: earliest deadline still future => all live => refuse.
         // (Expired blocks sort first, so any would have been evicted above.)
-        if (mDiskProtectUnexpired && it->block->isRetainedNow())
+        if (mDiskProtectUnexpired && it->block->isRetainedNow(mRetentionNow))
         {
             return nullptr;
         }
@@ -1409,7 +1409,7 @@ BlockPtr WindowBlockManager::claimDiskTarget()
         return block;
     }
     // Heap drained by stale entries; refuse if the remaining candidate is still live.
-    if (mDiskProtectUnexpired && candidate->isRetainedNow())
+    if (mDiskProtectUnexpired && candidate->isRetainedNow(mRetentionNow))
     {
         return nullptr;
     }
@@ -1444,7 +1444,7 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     {
         return victim; // disk tier off, nothing reusable to keep, or disk full: same as before
     }
-    if (mDiskRetainedOnly && !victim->isRetainedNow())
+    if (mDiskRetainedOnly && !victim->isRetainedNow(mRetentionNow))
     {
         ++mDiskGateDropped;
         if (mDiskGateDropped == 1 || mDiskGateDropped % 10000 == 0)
@@ -1479,7 +1479,7 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         auto const* e = std::getenv("TLLM_KV_DISK_DROP_ON_PRESSURE");
         return e && std::atoi(e) != 0;
     }();
-    if (kDropOnPressure && !victim->isRetainedNow() && mTransferManager->diskWriteQueueFull())
+    if (kDropOnPressure && !victim->isRetainedNow(mRetentionNow) && mTransferManager->diskWriteQueueFull())
     {
         ++mDiskWritePressureDropped;
         if (mDiskWritePressureDropped == 1 || mDiskWritePressureDropped % 10000 == 0)
@@ -1518,7 +1518,7 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     }
     victim->swapDiskResidency(diskTarget); // victim's identity now disk-resident, tree intact
     victim->setDurationMs(std::nullopt);   // keep it out of the eviction policy's expiring-block machinery
-    if (victim->isRetainedNow())
+    if (victim->isRetainedNow(mRetentionNow))
     {
         // Parked at max priority: displacement order among retained blocks is decided by
         // mDiskDeadlines (exact deadline, suffix-first within a chain), not queue order.
@@ -2271,7 +2271,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
         {
             // Reused blocks bypass getFreeBlock, so the disk-retention stamp must also
             // happen here; markRetained max-merges, keeping the later deadline.
-            claimed.block->markRetained(std::chrono::steady_clock::now().time_since_epoch() + *diskRetentionMs);
+            claimed.block->markRetained(mRetentionNow + *diskRetentionMs);
         }
         onboardBlock(sequence, claimed.block, claimResult.mode, claimResult.directory);
         addBlockToAllBeams(claimed.block, sequence);
@@ -3115,7 +3115,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     // Blocks are now committed to the reuse tree: anchor any pending retention duration to now.
     for (auto const& b : storedBlocks)
     {
-        b->commitRetention();
+        b->commitRetention(mRetentionNow);
     }
 
     if (mEventManager)

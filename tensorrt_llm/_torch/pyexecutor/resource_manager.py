@@ -1502,6 +1502,9 @@ class KVCacheManager(BaseResourceManager):
         Always True for requests with no in-flight disk read, so it is cheap for the common case."""
         return self.impl.are_blocks_ready(request.py_request_id)
 
+    def set_retention_clock(self, now_ns: int) -> None:
+        self.impl.set_retention_clock(now_ns)
+
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:
             value = self.impl.get_kv_cache_stats(
