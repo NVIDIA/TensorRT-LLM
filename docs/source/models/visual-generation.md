@@ -65,7 +65,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^5]: Qwen-Image ships a native BF16 implementation with per-module numerical parity against `diffusers.QwenImagePipeline` (cosine similarity >= 0.999 on the full 20B transformer) and supports `trtllm-serve` / `/v1/images/generations`. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.
 
-[^6]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, rejects TeaCache and Cache-DiT, and requires the combined target/reference token count to be divisible across sequence-parallel ranks. Other parallel and CUDA Graph combinations remain under qualification.
+[^6]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, including TeaCache and Cache-DiT. Sequence-parallel configurations require the combined target/reference token count to be divisible across ranks. Other parallel and CUDA Graph combinations remain under qualification.
 
 ## Quick Start
 
@@ -87,11 +87,10 @@ corresponding dimension; without references, the FLUX.2 fallback remains 1024×1
 TensorRT-LLM retains its existing FLUX.2 guidance default of `3.5`; Diffusers defaults to `4.0`,
 so pass `--guidance_scale 4.0` to the example when matching an otherwise-default Diffusers request.
 
-TeaCache and Cache-DiT remain available for FLUX.2 text-to-image requests but are not supported
-when reference images are present. Reference-image generation is currently qualified on one GPU;
-sequence-parallel configurations additionally require the combined target and reference token count
-to divide evenly across ranks, and fail early otherwise. Other parallel and CUDA graph combinations
-remain under qualification.
+TeaCache and Cache-DiT support FLUX.2 requests with or without reference images. Reference-image
+generation is currently qualified on one GPU; sequence-parallel configurations additionally require
+the combined target and reference token count to divide evenly across ranks, and fail early otherwise.
+Other parallel and CUDA graph combinations remain under qualification.
 
 ### Usage with `trtllm-serve`
 

@@ -182,4 +182,4 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 
 [^vg1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
-[^vg2]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, rejects TeaCache, and requires the combined target/reference token count to be divisible across sequence-parallel ranks. Other parallel and CUDA Graph combinations remain under qualification.
+[^vg2]: FLUX.2 matrix entries describe text-only requests. Reference-image conditioning is qualified on one GPU, including TeaCache and Cache-DiT. Sequence-parallel configurations require the combined target/reference token count to be divisible across ranks. Other parallel and CUDA Graph combinations remain under qualification.
