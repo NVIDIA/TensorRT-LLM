@@ -58,182 +58,17 @@
     <script src="_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
     <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
-
-
 
 
 
 const initStyles = () => {
     const defaultStyle = document.createElement('style');
-    defaultStyle.textContent = `pre.mermaid {
-    /* Same as .mermaid-container > pre */
-    display: block;
-    width: 100%;
-}
-
-pre.mermaid > svg {
-    /* Same as .mermaid-container > pre > svg */
-    height: 500px;
-    width: 100%;
-    max-width: 100% !important;
-}`;
+    defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
     document.head.appendChild(defaultStyle);
 
     const fullscreenStyle = document.createElement('style');
-    fullscreenStyle.textContent = `.mermaid-container {
-    display: flex;
-    flex-direction: row;
-    width: 100%;
-}
-
-.mermaid-container > pre {
-    display: block;
-    width: 100%;
-}
-
-.mermaid-container > pre > svg {
-    height: 500px;
-    width: 100%;
-    max-width: 100% !important;
-}
-
-.mermaid-fullscreen-btn {
-    width: 28px;
-    height: 28px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.3);
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.2s;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-    font-size: 14px;
-    line-height: 1;
-    padding: 0;
-    color: #333;
-}
-
-.mermaid-fullscreen-btn:hover {
-    opacity: 100% !important;
-    background: rgba(255, 255, 255, 1);
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-btn.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.3);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-btn.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal {
-    display: none;
-    position: fixed !important;
-    top: 0 !important;
-    left: 0 !important;
-    width: 95vw;
-    height: 100vh;
-    background: rgba(255, 255, 255, 0.98);
-    z-index: 9999;
-    padding: 20px;
-    overflow: auto;
-}
-
-.mermaid-fullscreen-modal.dark-theme {
-    background: rgba(0, 0, 0, 0.98);
-}
-
-.mermaid-fullscreen-modal.active {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen {
-    position: relative;
-    width: 95vw;
-    height: 90vh;
-    max-width: 95vw;
-    max-height: 90vh;
-    background: white;
-    border-radius: 8px;
-    padding: 20px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
-    overflow: auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen.dark-theme {
-    background: #1a1a1a;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);
-}
-
-.mermaid-container-fullscreen pre.mermaid {
-    width: 100%;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-
-.mermaid-container-fullscreen .mermaid svg {
-    height: 100% !important;
-    width: 100% !important;
-    cursor: grab;
-}
-
-.mermaid-fullscreen-close {
-    position: fixed !important;
-    top: 20px !important;
-    right: 20px !important;
-    width: 40px;
-    height: 40px;
-    background: rgba(255, 255, 255, 0.95);
-    border: 1px solid rgba(0, 0, 0, 0.2);
-    border-radius: 50%;
-    cursor: pointer;
-    z-index: 10000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    transition: all 0.2s;
-    font-size: 24px;
-    line-height: 1;
-    color: #333;
-}
-
-.mermaid-fullscreen-close:hover {
-    background: white;
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
-    transform: scale(1.1);
-}
-
-.mermaid-fullscreen-close.dark-theme {
-    background: rgba(50, 50, 50, 0.95);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    color: #e0e0e0;
-}
-
-.mermaid-fullscreen-close.dark-theme:hover {
-    background: rgba(60, 60, 60, 1);
-    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);
-}
-
-.mermaid-fullscreen-modal .mermaid-fullscreen-btn {
-    display: none !important;
-}`;
+    fullscreenStyle.textContent = ".mermaid-container {\n    position: relative;\n    display: flex;\n    flex-direction: row;\n    width: 100%;\n}\n\n.mermaid-container > pre {\n    display: block;\n    width: 100%;\n}\n\n.mermaid-container > pre > svg {\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}\n\n.mermaid-fullscreen-btn {\n    position: absolute;\n    width: 28px;\n    height: 28px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.3);\n    border-radius: 4px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);\n    font-size: 14px;\n    line-height: 1;\n    padding: 0;\n    color: #333;\n}\n\n.mermaid-fullscreen-btn:hover {\n    opacity: 100% !important;\n    background: rgba(255, 255, 255, 1);\n    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-btn.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.3);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-btn.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal {\n    display: none;\n    position: fixed !important;\n    top: 0 !important;\n    left: 0 !important;\n    width: 95vw;\n    height: 100vh;\n    background: rgba(255, 255, 255, 0.98);\n    z-index: 9999;\n    padding: 20px;\n    overflow: auto;\n}\n\n.mermaid-fullscreen-modal.dark-theme {\n    background: rgba(0, 0, 0, 0.98);\n}\n\n.mermaid-fullscreen-modal.active {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen {\n    position: relative;\n    width: 95vw;\n    height: 90vh;\n    max-width: 95vw;\n    max-height: 90vh;\n    background: white;\n    border-radius: 8px;\n    padding: 20px;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);\n    overflow: auto;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen.dark-theme {\n    background: #1a1a1a;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);\n}\n\n.mermaid-container-fullscreen pre.mermaid {\n    width: 100%;\n    height: 100%;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen .mermaid svg {\n    height: 100% !important;\n    width: 100% !important;\n    cursor: grab;\n}\n\n.mermaid-fullscreen-close {\n    position: fixed !important;\n    top: 20px !important;\n    right: 20px !important;\n    width: 40px;\n    height: 40px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.2);\n    border-radius: 50%;\n    cursor: pointer;\n    z-index: 10000;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);\n    transition: all 0.2s;\n    font-size: 24px;\n    line-height: 1;\n    color: #333;\n}\n\n.mermaid-fullscreen-close:hover {\n    background: white;\n    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-close.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.2);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-close.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal .mermaid-fullscreen-btn {\n    display: none !important;\n}";
     document.head.appendChild(fullscreenStyle);
 }
 
@@ -280,6 +115,13 @@ let modalContent = null;
 let previousScrollOffset = [window.scrollX, window.scrollY];
 let _lazyObserver = null;
 let _renderQueue = Promise.resolve();
+let closeModal = () => {};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal?.classList.contains('active')) {
+        closeModal();
+    }
+});
 
 // Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
 // so this is safe to call both for the initial batch and for diagrams that
@@ -376,8 +218,10 @@ const runMermaid = async (rerun) => {
                                     el.removeAttribute('data-mermaid-deferred');
                                     // Apply zoom to the now-rendered diagram, matching
                                     // the decoration visible diagrams receive.
-                                    if ("False" === "True") {
-                                        addZoomToSvgs(d3.selectAll(""));
+                                    if (false) {
+                                        addZoomToSvgs(d3.selectAll("").select(function() {
+                                            return this.querySelector("svg");
+                                        }));
                                     }
                                 } catch (e) {
                                     console.error("Mermaid deferred rendering failed:", e);
@@ -398,10 +242,12 @@ const runMermaid = async (rerun) => {
     const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
     const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
 
-    if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
+    if (false) {
+        const mermaids_to_add_zoom = 0 === -1 ? mermaids_active.length : 0;
         if(mermaids_to_add_zoom > 0) {
-            var svgs = d3.selectAll("");
+            var svgs = d3.selectAll("").select(function() {
+                return this.querySelector("svg");
+            });
             // Wait until every active (visible) diagram has rendered. Deferred
             // diagrams are excluded, so a fixed d3_node_count that counts a
             // hidden diagram no longer loops forever waiting for its SVG.
@@ -418,7 +264,7 @@ const runMermaid = async (rerun) => {
     }
 
     // Stop here if not adding fullscreen capability
-    if ("True" !== "True") return;
+    if (!true) return;
 
     if (modal !== null ) {
         // Destroy existing modal
@@ -441,7 +287,7 @@ const runMermaid = async (rerun) => {
     modalContent = modal.querySelector('.mermaid-container-fullscreen');
     const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
 
-    const closeModal = () => {
+    closeModal = () => {
         modal.classList.remove('active');
         modalContent.innerHTML = '';
         document.body.style.overflow = ''
@@ -452,12 +298,6 @@ const runMermaid = async (rerun) => {
     modal.addEventListener('click', (e) => {
         if (e.target === modal) closeModal();
     });
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            closeModal();
-        }
-    });
-
     document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
         if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
             mermaidDiv.closest('.mermaid-fullscreen-modal')) {
@@ -477,8 +317,8 @@ const runMermaid = async (rerun) => {
         const fullscreenBtn = document.createElement('button');
         fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
         fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
-        fullscreenBtn.textContent = '⛶';
-        fullscreenBtn.style.opacity = '50%';
+        fullscreenBtn.textContent = "\u26f6";
+        fullscreenBtn.style.opacity = "50%";
 
         // Calculate dynamic position based on diagram's margin and padding
         const diagramStyle = window.getComputedStyle(mermaidDiv);
@@ -490,7 +330,7 @@ const runMermaid = async (rerun) => {
         fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
 
         fullscreenBtn.addEventListener('click', () => {
-            previousScrollOffset = [window.scroll, window.scrollY];
+            previousScrollOffset = [window.scrollX, window.scrollY];
             const clone = mermaidDiv.cloneNode(true);
             modalContent.innerHTML = '';
             modalContent.appendChild(clone);
@@ -502,9 +342,9 @@ const runMermaid = async (rerun) => {
                 svg.style.width = '100%';
                 svg.style.height = 'auto';
                 svg.style.maxWidth = '100%';
-                svg.style.sdisplay = 'block';
+                svg.style.display = 'block';
 
-                if ("False" === "True") {
+                if (false) {
                     setTimeout(() => {
                         const g = svg.querySelector('g');
                         if (g) {
@@ -527,8 +367,11 @@ const runMermaid = async (rerun) => {
     });
 };
 
+
+
 const load = async () => {
     initStyles();
+
 
     await runMermaid(true);
 
@@ -538,10 +381,8 @@ const load = async () => {
             darkTheme = newDarkTheme;
             console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
             await mermaid.initialize(
-                {...JSON.parse(
-                    `{"startOnLoad": false}`
-                ),
-                ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+                {...{"startOnLoad": false},
+                ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
                 }
             );
             await runMermaid(true);
@@ -566,10 +407,8 @@ const load = async () => {
 
 console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
 mermaid.initialize(
-    {...JSON.parse(
-        `{"startOnLoad": false}`
-    ),
-    ...{ darkMode: darkTheme, theme: darkTheme ? 'dark' : 'default' },
+    {...{"startOnLoad": false},
+    ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
     }
 );
 
@@ -579,7 +418,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -593,7 +432,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc21" />
+  <meta name="docsearch:version" content="1.3.0rc22" />
   
     
     <script src="_static/searchtools.js"></script>
@@ -971,6 +810,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
@@ -1007,6 +847,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
@@ -2868,6 +2709,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.__init__">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.__init__">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.__init__">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.__init__">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
@@ -2951,6 +2794,8 @@ window.runMermaid = runMermaid;</script>
 <h2 id="A">A</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.abandon">abandon() (tensorrt_llm.llmapi.MpiCommSession method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.abort">abort() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 
       <ul>
@@ -2965,6 +2810,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.acceptance_rate_threshold">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.acceptance_rate_threshold">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.acceptance_rate_threshold">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.acceptance_rate_threshold">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
@@ -2993,6 +2840,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.acceptance_rate_window_size">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.acceptance_rate_window_size">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.acceptance_rate_window_size">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.acceptance_rate_window_size">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
@@ -3029,10 +2878,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.additional_model_outputs">additional_model_outputs (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulingParams.agent_hierarchy">agent_hierarchy (tensorrt_llm.llmapi.SchedulingParams attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulingParams.agent_hierarchy">agent_hierarchy (tensorrt_llm.llmapi.SchedulingParams attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.algorithm">algorithm (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig attribute)</a>
 
       <ul>
@@ -3053,6 +2902,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
@@ -3147,10 +2998,10 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.batching_wait_iters">batching_wait_iters (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType">BatchingType (class in tensorrt_llm.llmapi)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_search_diversity_rate">beam_search_diversity_rate (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_width_array">beam_width_array (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -3164,6 +3015,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.bit_length">bit_length() (tensorrt_llm.llmapi.DisaggScheduleStyle method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.block_reuse_policy">block_reuse_policy (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.block_size">block_size (tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/additional.html#tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms.build_custom_args_for_linear">build_custom_args_for_linear() (tensorrt_llm._torch.auto_deploy.transform.library.fusion.FuseFineGrainedFP8Gemms method)</a>
 
@@ -3304,6 +3157,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.construct">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.construct">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.construct">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.construct">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -3403,6 +3258,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.copy">(tensorrt_llm.llmapi.DFlashDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.copy">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.copy">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.copy">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
@@ -3516,6 +3373,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.decoding_type">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.decoding_type">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.decoding_type">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.decoding_type">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -3596,6 +3455,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.dict">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.dict">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.dict">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.dict">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
@@ -3653,6 +3514,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.disable_finalize_fusion">disable_finalize_fusion (tensorrt_llm.llmapi.MoeConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_mm_encoder">disable_mm_encoder (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler">disable_overlap_scheduler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.disagg_request_id">disagg_request_id (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
@@ -3698,6 +3561,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -3726,6 +3591,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig">DraftTargetDecodingConfig (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.Config">DraftTargetDecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig">DSparkDecodingConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.Config">DSparkDecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.dtype">dtype (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 
@@ -3974,6 +3843,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.Config.extra">(tensorrt_llm.llmapi.DraftTargetDecodingConfig.Config attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.Config.extra">(tensorrt_llm.llmapi.DSparkDecodingConfig.Config attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.Config.extra">(tensorrt_llm.llmapi.DynamicBatchConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.Config.extra">(tensorrt_llm.llmapi.Eagle3DecodingConfig.Config attribute)</a>
@@ -4151,6 +4022,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.from_orm">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.from_orm">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.from_orm">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.from_orm">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -4409,10 +4282,10 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.get_context_phase_params">get_context_phase_params() (tensorrt_llm.llmapi.DisaggregatedParams method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_encoder_runtime_sizes">get_encoder_runtime_sizes() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_executor_config">get_executor_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig.get_indices_block_size">get_indices_block_size() (tensorrt_llm.llmapi.DeepSeekSparseAttentionConfig method)</a>
@@ -4487,6 +4360,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.get_runtime_tokens_per_gen_step">(tensorrt_llm.llmapi.DFlashDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.get_runtime_tokens_per_gen_step">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.get_runtime_tokens_per_gen_step">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.get_runtime_tokens_per_gen_step">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
@@ -4637,6 +4512,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.INFLIGHT">INFLIGHT (tensorrt_llm.llmapi.BatchingType attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.init_multimodal_config">init_multimodal_config() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
+</li>
       <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.kvcache.InitializeCache">InitializeCache (class in tensorrt_llm._torch.auto_deploy.transform.library.kvcache)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/cache_init.html#tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache.InitializeCausalConvCache">InitializeCausalConvCache (class in tensorrt_llm._torch.auto_deploy.transform.library.ssm_cache)</a>
@@ -4675,6 +4552,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.DFlashDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.DSparkDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
@@ -4866,6 +4745,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.json">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.json">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.json">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.json">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
@@ -5022,6 +4903,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.load_format">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.load_format">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.load_format">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.load_format">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -5163,9 +5046,15 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.mamba_state_cache_interval">mamba_state_cache_interval (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.markov_head_type">markov_head_type (tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.markov_rank">markov_rank (tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.mask_token_id">mask_token_id (tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.mask_token_id">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.mask_token_id">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
 </li>
       </ul></li>
@@ -5224,6 +5113,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_concurrency">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -5251,6 +5142,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_draft_len">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
@@ -5323,6 +5216,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
@@ -5459,6 +5354,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_computed_fields">(tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
@@ -5526,6 +5423,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_config">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_config">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_config">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_config">(tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
 </li>
@@ -5595,6 +5494,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_construct">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_construct">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_construct">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_construct">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -5662,6 +5563,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_copy">(tensorrt_llm.llmapi.DFlashDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_copy">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_copy">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_copy">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
@@ -5731,6 +5634,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_dump">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_dump">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_dump">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_dump">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
@@ -5799,6 +5704,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_dump_json">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_dump_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
@@ -5866,6 +5773,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_extra">(tensorrt_llm.llmapi.DFlashDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_extra">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_extra">(tensorrt_llm.llmapi.DSparkDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_extra">(tensorrt_llm.llmapi.DynamicBatchConfig property)</a>
 </li>
@@ -5937,6 +5846,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_fields">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_fields">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_fields">(tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_fields">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
@@ -6005,6 +5916,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.DSparkDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_fields_set">(tensorrt_llm.llmapi.DynamicBatchConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_fields_set">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
@@ -6072,6 +5985,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_json_schema">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -6143,6 +6058,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_parametrized_name">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -6210,6 +6127,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_post_init">(tensorrt_llm.llmapi.DFlashDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_post_init">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_post_init">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_post_init">(tensorrt_llm.llmapi.DynamicBatchConfig method)</a>
 </li>
@@ -6279,6 +6198,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_rebuild">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_rebuild">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -6346,6 +6267,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_validate">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_validate">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_validate">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_validate">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -6415,6 +6338,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_validate_json">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.model_validate_json">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -6482,6 +6407,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.model_validate_strings">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -6644,6 +6571,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
@@ -6690,8 +6619,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4LinearQuantizationFromConfig">NVFP4LinearQuantizationFromConfig (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
 </li>
       <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.NVFP4QuantizationFromGraph">NVFP4QuantizationFromGraph (class in tensorrt_llm._torch.auto_deploy.transform.library.quantization)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv48nvinfer1">nvinfer1 (C++ type)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -6753,6 +6680,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.parse_file">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.parse_file">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.parse_file">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.parse_file">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -6822,6 +6751,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.parse_obj">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.parse_obj">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.parse_obj">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.parse_obj">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -6889,6 +6820,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.parse_raw">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.parse_raw">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.parse_raw">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.parse_raw">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -7130,6 +7063,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.relaxed_topk">relaxed_topk (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AsyncLLM.release">release() (tensorrt_llm.llmapi.AsyncLLM method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.release_exit_joins">release_exit_joins() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.removeprefix">removeprefix() (tensorrt_llm.llmapi.BatchingType method)</a>
 
@@ -7406,6 +7341,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.schema">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.schema">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.schema">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.schema">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -7473,6 +7410,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.schema_json">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.schema_json">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.schema_json">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.schema_json">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -7545,6 +7484,8 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.DFlashDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
 </li>
@@ -7632,6 +7573,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.DSparkDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
@@ -7661,6 +7604,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.speculative_model">(tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.speculative_model">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.speculative_model">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.speculative_model">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
@@ -7768,6 +7713,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.supports_backend">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.supports_backend">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.supports_backend">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.supports_backend">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
@@ -7814,7 +7761,11 @@ window.runMermaid = runMermaid;</script>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.target_layer_ids">target_layer_ids (tensorrt_llm.llmapi.DFlashDecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.target_layer_ids">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="features/auto_deploy/transforms/pattern_matcher.html#tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization.target_op">target_op() (tensorrt_llm._torch.auto_deploy.transform.library.quantization.FineGrainedFP8LinearQuantization method)</a>
 
       <ul>
@@ -7843,7 +7794,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.tensor_parallel_size">tensor_parallel_size (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">tensorrt_llm (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[36]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[37]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[38]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[39]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[40]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[41]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[42]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">tensorrt_llm (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[6]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[36]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[37]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[38]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[39]</a>
 </li>
       <li>
     tensorrt_llm._torch.auto_deploy.transform.graph_module_visualizer
@@ -7870,7 +7821,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm13batch_manager16kv_cache_managerE">tensorrt_llm::batch_manager::kv_cache_manager (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">tensorrt_llm::executor (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[7]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">tensorrt_llm::executor (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executorE">[6]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor21AdditionalModelOutputE">tensorrt_llm::executor::AdditionalModelOutput (C++ class)</a>
 </li>
@@ -8338,42 +8289,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor6detail9toITensorERK6Tensor">tensorrt_llm::executor::detail::toITensor (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executorE">tensorrt_llm::executor::disagg_executor (C++ type)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestratorE">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator (C++ class)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator21awaitContextResponsesERKNSt8optionalINSt6chrono12millisecondsEEENSt8optionalIiEE">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::awaitContextResponses (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator24awaitGenerationResponsesERKNSt8optionalINSt6chrono12millisecondsEEENSt8optionalIiEE">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::awaitGenerationResponses (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator10canEnqueueEv">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::canEnqueue (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator26DisaggExecutorOrchestratorERKNSt6vectorINSt10filesystem4pathEEERKNSt6vectorINSt10filesystem4pathEEERKNSt6vectorIN8executor14ExecutorConfigEEERKNSt6vectorIN8executor14ExecutorConfigEEEbb">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::DisaggExecutorOrchestrator (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator14enqueueContextERKNSt6vectorIN5texec7RequestEEENSt8optionalIiEEb">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::enqueueContext (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator17enqueueGenerationERKNSt6vectorIN5texec7RequestEEERKNSt6vectorI6IdTypeEENSt8optionalIiEEb">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::enqueueGeneration (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator19getContextExecutorsEv">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::getContextExecutors (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator15getGenExecutorsEv">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::getGenExecutors (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestrator5mImplE">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::mImpl (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor26DisaggExecutorOrchestratorD0Ev">tensorrt_llm::executor::disagg_executor::DisaggExecutorOrchestrator::~DisaggExecutorOrchestrator (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithIdE">tensorrt_llm::executor::disagg_executor::ResponseWithId (C++ struct)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithId3gidE">tensorrt_llm::executor::disagg_executor::ResponseWithId::gid (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithIdaSERK14ResponseWithId">tensorrt_llm::executor::disagg_executor::ResponseWithId::operator= (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithIdaSERR14ResponseWithId">[1]</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithId8responseE">tensorrt_llm::executor::disagg_executor::ResponseWithId::response (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithId14ResponseWithIdERK14ResponseWithId">tensorrt_llm::executor::disagg_executor::ResponseWithId::ResponseWithId (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithId14ResponseWithIdERKN12tensorrt_llm8executor8ResponseE6IdType">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithId14ResponseWithIdERR14ResponseWithId">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithId14ResponseWithIdERRN12tensorrt_llm8executor8ResponseE6IdType">[3]</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor15disagg_executor14ResponseWithIdD0Ev">tensorrt_llm::executor::disagg_executor::ResponseWithId::~ResponseWithId (C++ function)</a>
-</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22DisServingRequestStatsE">tensorrt_llm::executor::DisServingRequestStats (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor22DisServingRequestStats11kvCacheSizeE">tensorrt_llm::executor::DisServingRequestStats::kvCacheSize (C++ member)</a>
@@ -8435,40 +8350,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor11EagleConfigeqERK11EagleConfig">tensorrt_llm::executor::EagleConfig::operator== (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor11EagleConfig14useDynamicTreeEv">tensorrt_llm::executor::EagleConfig::useDynamicTree (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8ExecutorE">tensorrt_llm::executor::Executor (C++ class)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor14awaitResponsesERK6IdTypeRKNSt8optionalINSt6chrono12millisecondsEEE">tensorrt_llm::executor::Executor::awaitResponses (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor14awaitResponsesERKNSt6vectorI6IdTypeEERKNSt8optionalINSt6chrono12millisecondsEEE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor14awaitResponsesERKNSt8optionalINSt6chrono12millisecondsEEE">[2]</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor13cancelRequestE6IdType">tensorrt_llm::executor::Executor::cancelRequest (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8Executor18canEnqueueRequestsEv">tensorrt_llm::executor::Executor::canEnqueueRequests (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor14enqueueRequestERK7Request">tensorrt_llm::executor::Executor::enqueueRequest (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor15enqueueRequestsERKNSt6vectorI7RequestEE">tensorrt_llm::executor::Executor::enqueueRequests (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorENSt10shared_ptrI5ModelEENSt10shared_ptrI5ModelEERK14ExecutorConfig">tensorrt_llm::executor::Executor::Executor (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorENSt10shared_ptrI5ModelEERK14ExecutorConfig">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorERK10BufferViewRKNSt6stringE9ModelTypeRK14ExecutorConfigRKNSt8optionalINSt3mapINSt6stringE6TensorEEEE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorERK10BufferViewRKNSt6stringERK10BufferViewRKNSt6stringE9ModelTypeRK14ExecutorConfig">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorERK8Executor">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorERKNSt10filesystem4pathE9ModelTypeRK14ExecutorConfig">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorERKNSt10filesystem4pathERKNSt10filesystem4pathE9ModelTypeRK14ExecutorConfig">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8ExecutorERR8Executor">[7]</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8Executor22getKVCacheEventManagerEv">tensorrt_llm::executor::Executor::getKVCacheEventManager (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor21getLatestDebugTensorsEv">tensorrt_llm::executor::Executor::getLatestDebugTensors (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor23getLatestIterationStatsEv">tensorrt_llm::executor::Executor::getLatestIterationStats (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor21getLatestRequestStatsEv">tensorrt_llm::executor::Executor::getLatestRequestStats (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8Executor20getNumResponsesReadyERKNSt8optionalI6IdTypeEE">tensorrt_llm::executor::Executor::getNumResponsesReady (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8Executor13isParticipantEv">tensorrt_llm::executor::Executor::isParticipant (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor5mImplE">tensorrt_llm::executor::Executor::mImpl (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8ExecutoraSERK8Executor">tensorrt_llm::executor::Executor::operator= (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8ExecutoraSERR8Executor">[1]</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8Executor8shutdownEv">tensorrt_llm::executor::Executor::shutdown (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8ExecutorD0Ev">tensorrt_llm::executor::Executor::~Executor (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor14ExecutorConfigE">tensorrt_llm::executor::ExecutorConfig (C++ class)</a>
 </li>
@@ -8968,7 +8849,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState13AttentionType4kMLAE">tensorrt_llm::executor::kv_cache::CacheState::AttentionType::kMLA (C++ enumerator)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN8nvinfer18DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32b">tensorrt_llm::executor::kv_cache::CacheState::CacheState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE11ModelConfigRKN7runtime11WorldConfigERKNSt6vectorI10SizeType32EEN8nvinfer18DataTypeE13AttentionTypeibbb10SizeType3210SizeType32b">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateENSt6vectorI10SizeType32EE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN8nvinfer18DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32b">[2]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32b">tensorrt_llm::executor::kv_cache::CacheState::CacheState (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateE11ModelConfigRKN7runtime11WorldConfigERKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibbb10SizeType3210SizeType32b">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState10CacheStateENSt6vectorI10SizeType32EE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32RKNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeE13AttentionTypeibiibbb10SizeType3210SizeType32b">[2]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState18getAttentionConfigEv">tensorrt_llm::executor::kv_cache::CacheState::getAttentionConfig (C++ function)</a>
 </li>
@@ -9100,7 +8981,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState14RnnModelConfigeqERK14RnnModelConfig">tensorrt_llm::executor::kv_cache::CacheState::RnnModelConfig::operator== (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState12setRnnConfigE14RnnModelConfigNSt6vectorI10SizeType32EEN8nvinfer18DataTypeEN8nvinfer18DataTypeE">tensorrt_llm::executor::kv_cache::CacheState::setRnnConfig (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10CacheState12setRnnConfigE14RnnModelConfigNSt6vectorI10SizeType32EEN12tensorrt_llm8DataTypeEN12tensorrt_llm8DataTypeE">tensorrt_llm::executor::kv_cache::CacheState::setRnnConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10CacheState8toStringEv">tensorrt_llm::executor::kv_cache::CacheState::toString (C++ function)</a>
 </li>
@@ -9331,6 +9212,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache14TransferStatusE">tensorrt_llm::executor::kv_cache::TransferStatus (C++ class)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus11isCompletedEv">tensorrt_llm::executor::kv_cache::TransferStatus::isCompleted (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache14TransferStatus7releaseEv">tensorrt_llm::executor::kv_cache::TransferStatus::release (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache14TransferStatus4waitE7int64_t">tensorrt_llm::executor::kv_cache::TransferStatus::wait (C++ function)</a>
 </li>
@@ -10766,7 +10649,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm3mpiE">tensorrt_llm::mpi (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">tensorrt_llm::runtime (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[4]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[5]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[6]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[36]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">tensorrt_llm::runtime (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[4]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[5]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[6]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[34]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffersE">tensorrt_llm::runtime::AllReduceBuffers (C++ class)</a>
 </li>
@@ -10786,7 +10669,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14BufferDataTypeE">tensorrt_llm::runtime::BufferDataType (C++ class)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14BufferDataType14BufferDataTypeEN8nvinfer18DataTypeEbb">tensorrt_llm::runtime::BufferDataType::BufferDataType (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14BufferDataType14BufferDataTypeEN12tensorrt_llm8DataTypeEbb">tensorrt_llm::runtime::BufferDataType::BufferDataType (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime14BufferDataType11getDataTypeEv">tensorrt_llm::runtime::BufferDataType::getDataType (C++ function)</a>
 </li>
@@ -10806,43 +10689,43 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14BufferDataType9mUnsignedE">tensorrt_llm::runtime::BufferDataType::mUnsigned (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime14BufferDataTypecvN8nvinfer18DataTypeEEv">tensorrt_llm::runtime::BufferDataType::operator nvinfer1::DataType (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime14BufferDataTypecvN12tensorrt_llm8DataTypeEEv">tensorrt_llm::runtime::BufferDataType::operator tensorrt_llm::DataType (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManagerE">tensorrt_llm::runtime::BufferManager (C++ class)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8allocateE10MemoryTypeN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::allocate (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8allocateE10MemoryTypeNSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8allocateE10MemoryTypeN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::allocate (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8allocateE10MemoryTypeNSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager13BufferManagerE13CudaStreamPtrb">tensorrt_llm::runtime::BufferManager::BufferManager (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager4copyEPKvR7IBuffer">tensorrt_llm::runtime::BufferManager::copy (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager4copyEPKvR7IBuffer10MemoryType">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager4copyERK7IBufferPv">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager4copyERK7IBufferPv10MemoryType">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager4copyERK7IBufferR7IBuffer">[4]</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime13BufferManager8copyFromE10IBufferPtrRKNSt6vectorI1TEE10MemoryType">tensorrt_llm::runtime::BufferManager::copyFrom (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime13BufferManager8copyFromE10ITensorPtrP1TN8nvinfer14DimsE10MemoryType">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime13BufferManager8copyFromE10ITensorPtrRKNSt6vectorI1TEEN8nvinfer14DimsE10MemoryType">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8copyFromERK7IBuffer10MemoryType">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8copyFromERK7ITensor10MemoryType">[4]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime13BufferManager8copyFromE10IBufferPtrRKNSt6vectorI1TEE10MemoryType">tensorrt_llm::runtime::BufferManager::copyFrom (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime13BufferManager8copyFromE10ITensorPtrP1TN12tensorrt_llm4DimsE10MemoryType">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0ENK12tensorrt_llm7runtime13BufferManager8copyFromE10ITensorPtrRKNSt6vectorI1TEEN12tensorrt_llm4DimsE10MemoryType">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8copyFromERK7IBuffer10MemoryType">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager8copyFromERK7ITensor10MemoryType">[4]</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager3cpuEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::cpu (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager3cpuENSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager3cpuEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::cpu (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager3cpuENSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager14CudaMemPoolPtrE">tensorrt_llm::runtime::BufferManager::CudaMemPoolPtr (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager13CudaStreamPtrE">tensorrt_llm::runtime::BufferManager::CudaStreamPtr (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager11emptyBufferE10MemoryTypeN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::emptyBuffer (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager11emptyBufferE10MemoryTypeN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::emptyBuffer (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager11emptyTensorE10MemoryTypeN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::emptyTensor (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager11emptyTensorE10MemoryTypeN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::emptyTensor (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager9getStreamEv">tensorrt_llm::runtime::BufferManager::getStream (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager3gpuEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::gpu (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager3gpuENSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager3gpuEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::gpu (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager3gpuENSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7gpuSyncEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::gpuSync (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7gpuSyncENSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7gpuSyncEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::gpuSync (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7gpuSyncENSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10IBufferPtrE">tensorrt_llm::runtime::BufferManager::IBufferPtr (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7ipcNvlsENSt3setIiEEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::ipcNvls (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7ipcNvlsENSt3setIiEEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::ipcNvls (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10ITensorPtrE">tensorrt_llm::runtime::BufferManager::ITensorPtr (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10kBYTE_TYPEE">tensorrt_llm::runtime::BufferManager::kBYTE_TYPE (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7managedEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::managed (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7managedENSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7managedEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::managed (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager7managedENSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager14memoryPoolFreeEv">tensorrt_llm::runtime::BufferManager::memoryPoolFree (C++ function)</a>
 </li>
@@ -10858,9 +10741,9 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager9mTrimPoolE">tensorrt_llm::runtime::BufferManager::mTrimPool (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager6pinnedEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::pinned (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager6pinnedENSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager6pinnedEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::pinned (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager6pinnedENSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10pinnedPoolEN8nvinfer14DimsEN8nvinfer18DataTypeE">tensorrt_llm::runtime::BufferManager::pinnedPool (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10pinnedPoolENSt6size_tEN8nvinfer18DataTypeE">[1]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10pinnedPoolEN12tensorrt_llm4DimsEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::BufferManager::pinnedPool (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13BufferManager10pinnedPoolENSt6size_tEN12tensorrt_llm8DataTypeE">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime13BufferManager6setMemER7IBuffer7int32_t">tensorrt_llm::runtime::BufferManager::setMem (C++ function)</a>
 </li>
@@ -11080,9 +10963,9 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager12unsafeRemoveE9uintptr_t">tensorrt_llm::runtime::CudaVirtualMemoryManager::unsafeRemove (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I_N8nvinfer18DataTypeE_b_bEN12tensorrt_llm7runtime14DataTypeTraitsE">tensorrt_llm::runtime::DataTypeTraits (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I_N12tensorrt_llm8DataTypeE_b_bEN12tensorrt_llm7runtime14DataTypeTraitsE">tensorrt_llm::runtime::DataTypeTraits (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I_N8nvinfer18DataTypeE_bEN12tensorrt_llm7runtime14DataTypeTraitsI9kDataType9kUnsignedXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;kDataType, kUnsigned, true&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I_N12tensorrt_llm8DataTypeE_bEN12tensorrt_llm7runtime14DataTypeTraitsI9kDataType9kUnsignedXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;kDataType, kUnsigned, true&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsI9kDataType9kUnsignedXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;kDataType, kUnsigned, true&gt;::name (C++ member)</a>
 </li>
@@ -11090,77 +10973,77 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsI9kDataType9kUnsignedXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;kDataType, kUnsigned, true&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I_bEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I_bEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kBOOLE9kUnsignedEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kBOOL, kUnsigned&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kBOOLE9kUnsignedE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kBOOL, kUnsigned&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kBOOLE9kUnsignedE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kBOOL, kUnsigned&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kBOOLE9kUnsignedE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kBOOL, kUnsigned&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kFLOATEEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kFLOAT&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kFLOATEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kFLOAT&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kFLOATEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kFLOAT&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kFLOATEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kFLOAT&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kHALFEEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kHALF&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kHALFEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kHALF&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kHALFEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kHALF&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kHALFEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kHALF&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32, true&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32, true&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EXL1EEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32, true&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32, true&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT32EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT32&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64, true&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64, true&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EXL1EEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64, true&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64, true&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64, true&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT64EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT64&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kINT64EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT64&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kINT8EEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT8&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kINT8EE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT8&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kINT8EE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT8&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kINT8EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT8&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType5kINT8EE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kINT8&gt;::type (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I_bEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kUINT8E9kUnsignedEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kUINT8, kUnsigned&gt; (C++ struct)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I_bEN12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kUINT8E9kUnsignedEE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kUINT8, kUnsigned&gt; (C++ struct)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kUINT8E9kUnsignedE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kUINT8, kUnsigned&gt;::name (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kUINT8E9kUnsignedE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kUINT8, kUnsigned&gt;::name (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kUINT8E9kUnsignedE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kUINT8, kUnsigned&gt;::size (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kUINT8E9kUnsignedE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kUINT8, kUnsigned&gt;::size (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kUINT8E9kUnsignedE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kUINT8, kUnsigned&gt;::type (C++ type)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN12tensorrt_llm8DataType6kUINT8E9kUnsignedE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;tensorrt_llm::DataType::kUINT8, kUnsigned&gt;::type (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoderE">tensorrt_llm::runtime::decoder (C++ type)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoderE">[1]</a>
 </li>
@@ -11282,17 +11165,17 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState26setNumDecodingEngineTokensE10SizeType3210SizeType32">tensorrt_llm::runtime::decoder::DecoderState::setNumDecodingEngineTokens (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState5setupE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfigRK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setup (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState5setupE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32N12tensorrt_llm8DataTypeERK11ModelConfigRK11WorldConfigRK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setup (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState12setupBuffersEN8nvinfer18DataTypeERK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupBuffers (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState12setupBuffersEN12tensorrt_llm8DataTypeERK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupBuffers (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState21setupCacheIndirectionE10SizeType3210SizeType3210SizeType32RK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupCacheIndirection (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState28setupCacheIndirectionBuffersERK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupCacheIndirectionBuffers (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState24setupSpeculativeDecodingERK23SpeculativeDecodingMode10SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfigRK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupSpeculativeDecoding (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState24setupSpeculativeDecodingERK23SpeculativeDecodingMode10SizeType32N12tensorrt_llm8DataTypeERK11ModelConfigRK11WorldConfigRK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupSpeculativeDecoding (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState31setupSpeculativeDecodingBuffersE23SpeculativeDecodingModeN8nvinfer18DataTypeERK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupSpeculativeDecodingBuffers (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState31setupSpeculativeDecodingBuffersE23SpeculativeDecodingModeN12tensorrt_llm8DataTypeERK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::setupSpeculativeDecodingBuffers (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState9TensorPtrE">tensorrt_llm::runtime::decoder::DecoderState::TensorPtr (C++ type)</a>
 </li>
@@ -11300,6 +11183,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput12badWordsLensE">tensorrt_llm::runtime::DecodingInput::badWordsLens (C++ member)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput13badWordsListsE">tensorrt_llm::runtime::DecodingInput::badWordsLists (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput12badWordsPtrsE">tensorrt_llm::runtime::DecodingInput::badWordsPtrs (C++ member)</a>
@@ -11316,8 +11201,6 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput11eagleInputsE">tensorrt_llm::runtime::DecodingInput::eagleInputs (C++ member)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput11EagleInputsE">tensorrt_llm::runtime::DecodingInput::EagleInputs (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13DecodingInput11EagleInputs12acceptedLensE">tensorrt_llm::runtime::DecodingInput::EagleInputs::acceptedLens (C++ member)</a>
@@ -11858,7 +11741,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder16mVocabSizePaddedE">tensorrt_llm::runtime::GptDecoder::mVocabSizePadded (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder5setupERK14SamplingConfig6size_tRK14TensorConstPtrRKNSt8optionalI14DecodingOutputEENSt8optionalIN8nvinfer18DataTypeEEERKNSt8optionalINSt6vectorI14TensorConstPtrEEEERKNSt8optionalINSt6vectorIN8executor23LookaheadDecodingConfigEEEEE">tensorrt_llm::runtime::GptDecoder::setup (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder5setupERK14SamplingConfig6size_tRK14TensorConstPtrRKNSt8optionalI14DecodingOutputEENSt8optionalIN12tensorrt_llm8DataTypeEEERKNSt8optionalINSt6vectorI14TensorConstPtrEEEERKNSt8optionalINSt6vectorIN8executor23LookaheadDecodingConfigEEEEE">tensorrt_llm::runtime::GptDecoder::setup (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder9TensorPtrE">tensorrt_llm::runtime::GptDecoder::TensorPtr (C++ type)</a>
 </li>
@@ -11898,7 +11781,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched13RequestVectorE">tensorrt_llm::runtime::GptDecoderBatched::RequestVector (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfig">tensorrt_llm::runtime::GptDecoderBatched::setup (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N12tensorrt_llm8DataTypeERK11ModelConfigRK11WorldConfig">tensorrt_llm::runtime::GptDecoderBatched::setup (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime17GptDecoderBatched9TensorPtrE">tensorrt_llm::runtime::GptDecoderBatched::TensorPtr (C++ type)</a>
 </li>
@@ -12000,7 +11883,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoderE">tensorrt_llm::runtime::IGptDecoder (C++ class)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder6createERKN8executor12DecodingModeEN8nvinfer18DataTypeE6size_t6size_t6size_t6size_tRKN13BufferManager13CudaStreamPtrERKNSt10shared_ptrIK25SpeculativeDecodingModuleEE">tensorrt_llm::runtime::IGptDecoder::create (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder6createERKN8executor12DecodingModeEN12tensorrt_llm8DataTypeE6size_t6size_t6size_t6size_tRKN13BufferManager13CudaStreamPtrERKNSt10shared_ptrIK25SpeculativeDecodingModuleEE">tensorrt_llm::runtime::IGptDecoder::create (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder16disableLookaheadERKNSt8optionalI14SamplingConfigEE10SizeType3214TensorConstPtr">tensorrt_llm::runtime::IGptDecoder::disableLookahead (C++ function)</a>
 </li>
@@ -12010,7 +11893,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder17getSamplingConfigEv">tensorrt_llm::runtime::IGptDecoder::getSamplingConfig (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder5setupERK14SamplingConfig6size_tRK14TensorConstPtrRKNSt8optionalI14DecodingOutputEENSt8optionalIN8nvinfer18DataTypeEEERKNSt8optionalINSt6vectorI14TensorConstPtrEEEERKNSt8optionalINSt6vectorIN8executor23LookaheadDecodingConfigEEEEE">tensorrt_llm::runtime::IGptDecoder::setup (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder5setupERK14SamplingConfig6size_tRK14TensorConstPtrRKNSt8optionalI14DecodingOutputEENSt8optionalIN12tensorrt_llm8DataTypeEEERKNSt8optionalINSt6vectorI14TensorConstPtrEEEERKNSt8optionalINSt6vectorIN8executor23LookaheadDecodingConfigEEEEE">tensorrt_llm::runtime::IGptDecoder::setup (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11IGptDecoder14TensorConstPtrE">tensorrt_llm::runtime::IGptDecoder::TensorConstPtr (C++ type)</a>
 </li>
@@ -12036,7 +11919,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched13RequestVectorE">tensorrt_llm::runtime::IGptDecoderBatched::RequestVector (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N8nvinfer18DataTypeERK11ModelConfigRK11WorldConfig">tensorrt_llm::runtime::IGptDecoderBatched::setup (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched5setupERKN8executor12DecodingModeE10SizeType3210SizeType32N12tensorrt_llm8DataTypeERK11ModelConfigRK11WorldConfig">tensorrt_llm::runtime::IGptDecoderBatched::setup (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18IGptDecoderBatched9TensorPtrE">tensorrt_llm::runtime::IGptDecoderBatched::TensorPtr (C++ type)</a>
 </li>
@@ -12152,7 +12035,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor17volumeNonNegativeERK5Shape">tensorrt_llm::runtime::ITensor::volumeNonNegative (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor4wrapE9UniquePtrP1TRK5Shape">tensorrt_llm::runtime::ITensor::wrap (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor4wrapE9UniquePtrP1TRK5ShapeNSt6size_tE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor4wrapE9UniquePtrRNSt6vectorI1TEERK5Shape">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor4wrapEPvN8nvinfer18DataTypeERK5Shape">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor4wrapEPvN8nvinfer18DataTypeERK5ShapeNSt6size_tE">[4]</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor4wrapE9UniquePtrP1TRK5Shape">tensorrt_llm::runtime::ITensor::wrap (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor4wrapE9UniquePtrP1TRK5ShapeNSt6size_tE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime7ITensor4wrapE9UniquePtrRNSt6vectorI1TEERK5Shape">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor4wrapEPvN12tensorrt_llm8DataTypeERK5Shape">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensor4wrapEPvN12tensorrt_llm8DataTypeERK5ShapeNSt6size_tE">[4]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensorD0Ev">tensorrt_llm::runtime::ITensor::~ITensor (C++ function)</a>
 </li>
@@ -12193,54 +12076,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15LookaheadModule16mExecutionConfigE">tensorrt_llm::runtime::LookaheadModule::mExecutionConfig (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime15LookaheadModule18setExecutionConfigERKN8executor23LookaheadDecodingConfigE">tensorrt_llm::runtime::LookaheadModule::setExecutionConfig (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffersE">tensorrt_llm::runtime::LookaheadRuntimeBuffers (C++ class)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers18batchSlotsHostCopyE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::batchSlotsHostCopy (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers12cumSumLengthE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::cumSumLength (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers24disableLookaheadDecodingEv">tensorrt_llm::runtime::LookaheadRuntimeBuffers::disableLookaheadDecoding (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers23enableLookaheadDecodingE10SizeType3210SizeType32">tensorrt_llm::runtime::LookaheadRuntimeBuffers::enableLookaheadDecoding (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers23generationLengthsDeviceE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::generationLengthsDevice (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers21generationLengthsHostE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::generationLengthsHost (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers25generationLengthsHostCopyE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::generationLengthsHostCopy (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime23LookaheadRuntimeBuffers18insertInputTensorsER9TensorMapR9TensorMapRK11WorldConfig">tensorrt_llm::runtime::LookaheadRuntimeBuffers::insertInputTensors (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers23LookaheadRuntimeBuffersE10SizeType3210SizeType32RK13BufferManagerRK11ModelConfigRK11WorldConfigRKN8executor14DecodingConfigERK11TllmRuntime">tensorrt_llm::runtime::LookaheadRuntimeBuffers::LookaheadRuntimeBuffers (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers14packedMaskHostE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::packedMaskHost (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers18packedMaskHostCopyE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::packedMaskHostCopy (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers17packedMasksDeviceE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::packedMasksDevice (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers17positionIdsDeviceE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::positionIdsDevice (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers15positionIdsHostE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::positionIdsHost (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers19positionIdsHostCopyE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::positionIdsHostCopy (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers21positionOffsetsDeviceE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::positionOffsetsDevice (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers19positionOffsetsHostE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::positionOffsetsHost (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers23positionOffsetsHostCopyE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::positionOffsetsHostCopy (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers7reshapeE10SizeType3210SizeType3210SizeType32">tensorrt_llm::runtime::LookaheadRuntimeBuffers::reshape (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime23LookaheadRuntimeBuffers13setFromInputsE10SizeType3210SizeType32RK7ITensorRK7ITensorRK24LookaheadDecodingBuffersRK11TllmRuntimeRK11ModelConfigRK11WorldConfig">tensorrt_llm::runtime::LookaheadRuntimeBuffers::setFromInputs (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers9TensorMapE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::TensorMap (C++ type)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers9TensorPtrE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::TensorPtr (C++ type)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23LookaheadRuntimeBuffers15useSpecDecodingE">tensorrt_llm::runtime::LookaheadRuntimeBuffers::useSpecDecoding (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9LoraCacheE">tensorrt_llm::runtime::LoraCache (C++ class)</a>
 </li>
@@ -12430,7 +12265,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime26LoraCachePageManagerConfig16getTotalNumPagesEv">tensorrt_llm::runtime::LoraCachePageManagerConfig::getTotalNumPages (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig26LoraCachePageManagerConfigEN7runtime10MemoryTypeEN8nvinfer18DataTypeE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32">tensorrt_llm::runtime::LoraCachePageManagerConfig::LoraCachePageManagerConfig (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig26LoraCachePageManagerConfigEN7runtime10MemoryTypeEN12tensorrt_llm8DataTypeE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType32">tensorrt_llm::runtime::LoraCachePageManagerConfig::LoraCachePageManagerConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig9mDataTypeE">tensorrt_llm::runtime::LoraCachePageManagerConfig::mDataType (C++ member)</a>
 </li>
@@ -12448,7 +12283,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig14mTotalNumPagesE">tensorrt_llm::runtime::LoraCachePageManagerConfig::mTotalNumPages (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig11setDataTypeERKN8nvinfer18DataTypeE">tensorrt_llm::runtime::LoraCachePageManagerConfig::setDataType (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig11setDataTypeERKN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::LoraCachePageManagerConfig::setDataType (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26LoraCachePageManagerConfig13setInitToZeroEb">tensorrt_llm::runtime::LoraCachePageManagerConfig::setInitToZero (C++ function)</a>
 </li>
@@ -12946,7 +12781,7 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig13mNumLanguagesE">tensorrt_llm::runtime::ModelConfig::mNumLanguages (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig11ModelConfigE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32N8nvinfer18DataTypeE">tensorrt_llm::runtime::ModelConfig::ModelConfig (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig11ModelConfigE10SizeType3210SizeType3210SizeType3210SizeType3210SizeType3210SizeType32N12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::ModelConfig::ModelConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig12ModelVariantE">tensorrt_llm::runtime::ModelConfig::ModelVariant (C++ enum)</a>
 </li>
@@ -13022,13 +12857,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig20setEncoderHiddenSizeE10SizeType32">tensorrt_llm::runtime::ModelConfig::setEncoderHiddenSize (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig21setGemmAllReduceDtypeEN8nvinfer18DataTypeE">tensorrt_llm::runtime::ModelConfig::setGemmAllReduceDtype (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig21setGemmAllReduceDtypeEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::ModelConfig::setGemmAllReduceDtype (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig14setKVCacheTypeE11KVCacheType">tensorrt_llm::runtime::ModelConfig::setKVCacheType (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig13setLayerTypesERKNSt6vectorI9LayerTypeEE">tensorrt_llm::runtime::ModelConfig::setLayerTypes (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig14setLogitsDtypeEN8nvinfer18DataTypeE">tensorrt_llm::runtime::ModelConfig::setLogitsDtype (C++ function)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig14setLogitsDtypeEN12tensorrt_llm8DataTypeE">tensorrt_llm::runtime::ModelConfig::setLogitsDtype (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig14setLoraModulesERKNSt6vectorI10LoraModuleEE">tensorrt_llm::runtime::ModelConfig::setLoraModules (C++ function)</a>
 </li>
@@ -13183,48 +13018,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18PromptTuningParams9TensorPtrE">tensorrt_llm::runtime::PromptTuningParams::TensorPtr (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26pushVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE">tensorrt_llm::runtime::pushVirtualMemoryAllocator (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngineE">tensorrt_llm::runtime::RawEngine (C++ class)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine10getAddressEv">tensorrt_llm::runtime::RawEngine::getAddress (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine13getHostMemoryEv">tensorrt_llm::runtime::RawEngine::getHostMemory (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine23getManagedWeightsMapOptEv">tensorrt_llm::runtime::RawEngine::getManagedWeightsMapOpt (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine7getPathEv">tensorrt_llm::runtime::RawEngine::getPath (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine10getPathOptEv">tensorrt_llm::runtime::RawEngine::getPathOpt (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine7getSizeEv">tensorrt_llm::runtime::RawEngine::getSize (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime9RawEngine7getTypeEv">tensorrt_llm::runtime::RawEngine::getType (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine11mEngineAddrE">tensorrt_llm::runtime::RawEngine::mEngineAddr (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine13mEngineBufferE">tensorrt_llm::runtime::RawEngine::mEngineBuffer (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine11mEnginePathE">tensorrt_llm::runtime::RawEngine::mEnginePath (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine11mEngineSizeE">tensorrt_llm::runtime::RawEngine::mEngineSize (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine18mManagedWeightsMapE">tensorrt_llm::runtime::RawEngine::mManagedWeightsMap (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine5mTypeE">tensorrt_llm::runtime::RawEngine::mType (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine9RawEngineENSt10filesystem4pathE">tensorrt_llm::runtime::RawEngine::RawEngine (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine9RawEngineEPKN8nvinfer111IHostMemoryE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine9RawEngineEPKvNSt6size_tE">[2]</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine20setManagedWeightsMapENSt3mapINSt6stringEN12tensorrt_llm8executor6TensorEEE">tensorrt_llm::runtime::RawEngine::setManagedWeightsMap (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine7setPathENSt10filesystem4pathE">tensorrt_llm::runtime::RawEngine::setPath (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine4TypeE">tensorrt_llm::runtime::RawEngine::Type (C++ enum)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine4Type15AddressWithSizeE">tensorrt_llm::runtime::RawEngine::Type::AddressWithSize (C++ enumerator)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine4Type8FilePathE">tensorrt_llm::runtime::RawEngine::Type::FilePath (C++ enumerator)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9RawEngine4Type10HostMemoryE">tensorrt_llm::runtime::RawEngine::Type::HostMemory (C++ enumerator)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11RequestTypeE">tensorrt_llm::runtime::RequestType (C++ enum)</a>
 </li>
@@ -13419,14 +13212,6 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime25SpeculativeDecodingModuleD0Ev">tensorrt_llm::runtime::SpeculativeDecodingModule::~SpeculativeDecodingModule (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime12StringPtrMapE">tensorrt_llm::runtime::StringPtrMap (C++ type)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10TllmLoggerE">tensorrt_llm::runtime::TllmLogger (C++ class)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10TllmLogger8getLevelEv">tensorrt_llm::runtime::TllmLogger::getLevel (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10TllmLogger3logE8SeverityPKN8nvinfer19AsciiCharE">tensorrt_llm::runtime::TllmLogger::log (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10TllmLogger8setLevelE8Severity">tensorrt_llm::runtime::TllmLogger::setLevel (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9to_stringERK26LoraCachePageManagerConfig">tensorrt_llm::runtime::to_string (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9to_stringERKN9LoraCache21TaskLayerModuleConfigE">[1]</a>
 </li>
@@ -13700,6 +13485,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.DFlashDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.DSparkDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
 </li>
@@ -14938,6 +14725,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.update_forward_refs">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
@@ -15046,6 +14835,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.use_rejection_sampling">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.use_rejection_sampling">(tensorrt_llm.llmapi.DSparkDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.use_rejection_sampling">(tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.use_rejection_sampling">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
@@ -15099,6 +14890,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.validate">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.validate">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.validate">(tensorrt_llm.llmapi.DynamicBatchConfig class method)</a>
 </li>
@@ -15175,6 +14968,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.DFlashDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.DraftTargetDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.DSparkDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.Eagle3DecodingConfig class method)</a>
 </li>
@@ -15256,6 +15051,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_max_concurrency_and_draft_len_schedule_mutually_exclusive">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.validate_max_concurrency_and_draft_len_schedule_mutually_exclusive">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_max_concurrency_and_draft_len_schedule_mutually_exclusive">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.validate_max_concurrency_and_draft_len_schedule_mutually_exclusive">(tensorrt_llm.llmapi.EagleDecodingConfig method)</a>
@@ -15301,6 +15098,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DFlashDecodingConfig.validate_rejection_sampling_config">(tensorrt_llm.llmapi.DFlashDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_rejection_sampling_config">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DSparkDecodingConfig.validate_rejection_sampling_config">(tensorrt_llm.llmapi.DSparkDecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.validate_rejection_sampling_config">(tensorrt_llm.llmapi.Eagle3DecodingConfig method)</a>
 </li>
@@ -15540,9 +15339,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2026.</p>
+  <p>Last updated on July 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
   
 </div></div>
       

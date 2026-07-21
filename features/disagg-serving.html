@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc21" />
+  <meta name="docsearch:version" content="1.3.0rc22" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -461,6 +461,7 @@
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="auto_deploy/transforms/core.html">Core Transform APIs</a></li>
@@ -497,6 +498,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
@@ -682,11 +684,17 @@
 </section>
 <section id="unique-global-request-id">
 <h3>Unique Global Request ID<a class="headerlink" href="#unique-global-request-id" title="Link to this heading">#</a></h3>
-<p>A disaggregated-serving request can provide a unique global request ID via <code class="docutils literal notranslate"><span class="pre">DisaggregatedParams.disagg_request_id</span></code>.
-When this field is a positive integer, the context and generation requests share that value as their internal request ID, which enables end-to-end tracking.
-To avoid collisions with worker-local or warm-up requests, it is recommended to use a value larger than <code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">&lt;&lt;</span> <span class="pre">42</span> <span class="pre">=</span> <span class="pre">4398046511104</span></code>.
-If the field is unset or non-positive, the context and generation requests instead receive separate local sequence IDs, rotating within the range <code class="docutils literal notranslate"><span class="pre">(0,</span> <span class="pre">1&lt;&lt;42)</span></code>, assigned by the respective workers. When <code class="docutils literal notranslate"><span class="pre">disagg_request_id</span></code> is specified, do not route the context and generation requests to the same worker.
-This field is optional at present; however, some forthcoming features will depend on this unique identifier.</p>
+<p>The context and generation phases of one request must share a single request ID: the ctx↔gen KV-cache transfer is keyed by it, so a collision (two in-flight requests with the same ID) corrupts the transfer. This shared ID is carried on <code class="docutils literal notranslate"><span class="pre">DisaggregatedParams.disagg_request_id</span></code>.</p>
+<p>The disaggregated server generates this ID itself as a <strong>snowflake</strong> — a self-contained 64-bit positive integer that is unique without any cross-process coordination. The bit layout is:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="p">[</span> <span class="mi">0</span> <span class="p">(</span><span class="mi">1</span> <span class="n">bit</span><span class="p">)</span> <span class="o">|</span> <span class="n">timestamp_ms</span> <span class="p">(</span><span class="mi">39</span> <span class="n">bits</span><span class="p">)</span> <span class="o">|</span> <span class="n">node_id</span> <span class="p">(</span><span class="mi">8</span> <span class="n">bits</span><span class="p">)</span> <span class="o">|</span> <span class="n">process_id</span> <span class="p">(</span><span class="mi">6</span> <span class="n">bits</span><span class="p">)</span> <span class="o">|</span> <span class="n">counter</span> <span class="p">(</span><span class="mi">10</span> <span class="n">bits</span><span class="p">)</span> <span class="p">]</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">node_id</span></code> (0–255) identifies the node (defaults to a hash of the MAC address; overridable via <code class="docutils literal notranslate"><span class="pre">node_id</span></code> in the disaggregated config).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">process_id</span></code> (0–63) identifies the orchestrator process on that node. In a <a class="reference internal" href="#coordinator-and-worker-fleet"><span class="xref myst">coordinator + worker fleet</span></a> each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the <code class="docutils literal notranslate"><span class="pre">TRTLLM_DISAGG_WORKER_PROCESS_ID</span></code> environment variable (assigned automatically per worker by the launcher).</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">(node_id,</span> <span class="pre">process_id)</span></code> pair therefore makes the ID unique across all orchestrator processes without a shared counter or an extra network round trip — each worker mints its own IDs locally.</p></li>
+</ul>
+<p>Global disaggregated IDs occupy the range <code class="docutils literal notranslate"><span class="pre">[1</span> <span class="pre">&lt;&lt;</span> <span class="pre">40,</span> <span class="pre">2**63)</span></code>; worker-local and warm-up request IDs occupy the disjoint range <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">1</span> <span class="pre">&lt;&lt;</span> <span class="pre">40)</span></code>, so the two never collide. If a client supplies its own positive <code class="docutils literal notranslate"><span class="pre">disagg_request_id</span></code>, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.</p>
 </section>
 </section>
 <section id="usage">
@@ -774,14 +782,14 @@ it would look like:</p>
 <p>When routing requests to the context servers, the disaggregated server will mark the requests as “context-only” to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as “generation-only” to skip the context phase.</p>
 <p>Clients can then send requests to the disaggregated server at <code class="docutils literal notranslate"><span class="pre">localhost:8000</span></code>, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/completions<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
-<span class="s1">        &quot;model&quot;: &quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;,</span>
-<span class="s1">        &quot;prompt&quot;: &quot;NVIDIA is a great company because&quot;,</span>
-<span class="s1">        &quot;max_tokens&quot;: 16,</span>
-<span class="s1">        &quot;temperature&quot;: 0</span>
-<span class="s1">    }&#39;</span><span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;\n&quot;</span>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">curl</span> <span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="n">localhost</span><span class="p">:</span><span class="mi">8000</span><span class="o">/</span><span class="n">v1</span><span class="o">/</span><span class="n">completions</span> \
+    <span class="o">-</span><span class="n">H</span> <span class="s2">&quot;Content-Type: application/json&quot;</span> \
+    <span class="o">-</span><span class="n">d</span> <span class="s1">&#39;{</span>
+        <span class="s2">&quot;model&quot;</span><span class="p">:</span> <span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;prompt&quot;</span><span class="p">:</span> <span class="s2">&quot;NVIDIA is a great company because&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;max_tokens&quot;</span><span class="p">:</span> <span class="mi">16</span><span class="p">,</span>
+        <span class="s2">&quot;temperature&quot;</span><span class="p">:</span> <span class="mi">0</span>
+    <span class="p">}</span><span class="s1">&#39; -w &quot;</span><span class="se">\n</span><span class="s1">&quot;</span>
 </pre></div>
 </div>
 <section id="launching-disaggregated-servers-on-slurm-clusters">
@@ -814,6 +822,106 @@ when routing requests to the generation servers, the disaggregated server will m
 </ul>
 </li>
 </ul>
+</section>
+<section id="coordinator-and-worker-fleet">
+<h3>Coordinator and Worker Fleet<a class="headerlink" href="#coordinator-and-worker-fleet" title="Link to this heading">#</a></h3>
+<p>A single disaggregated server process is itself a single-threaded orchestrator and can become a throughput bottleneck (it terminates every client connection, runs routing, and proxies the ctx→gen hop). To scale the orchestrator on one node without standing up multiple independent instances, <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">disaggregated</span></code> can run a <strong>fleet</strong> of stateless disaggregated-server worker processes behind a shared <strong>coordinator</strong>.</p>
+<p>The two roles split as follows:</p>
+<ul class="simple">
+<li><p><strong>Coordinator</strong> — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (<code class="docutils literal notranslate"><span class="pre">/select</span></code>, <code class="docutils literal notranslate"><span class="pre">/finish</span></code>, <code class="docutils literal notranslate"><span class="pre">/cluster_info</span></code>, <code class="docutils literal notranslate"><span class="pre">/health</span></code>).</p></li>
+<li><p><strong>Fleet workers</strong> — <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> stateless disaggregated servers that share the public port via <code class="docutils literal notranslate"><span class="pre">SO_REUSEPORT</span></code> (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct <code class="docutils literal notranslate"><span class="pre">process_id</span></code> for the <a class="reference internal" href="#unique-global-request-id"><span class="xref myst">global request ID</span></a>.</p></li>
+</ul>
+<p>This is controlled by two fields in the disaggregated config:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">num_workers</span></code> (int, default <code class="docutils literal notranslate"><span class="pre">1</span></code>) — number of disaggregated-server worker processes to run on the public port.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">disagg_coordinator_url</span></code> (str, optional) — URL of an already-running coordinator. When set, this process starts <strong>no</strong> coordinator and its fleet delegates to that external one.</p></li>
+</ul>
+<p>The three resulting topologies:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p><code class="docutils literal notranslate"><span class="pre">num_workers</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">disagg_coordinator_url</span></code></p></th>
+<th class="head"><p>Behavior</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Single self-contained server with an in-process coordinator (the default; unchanged from earlier examples).</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">&gt;</span> <span class="pre">1</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>An <strong>implicit</strong> coordinator starts in this process (on <code class="docutils literal notranslate"><span class="pre">port</span> <span class="pre">-</span> <span class="pre">1</span></code>) and a fleet of <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> delegating servers runs on the public port.</p></td>
+</tr>
+<tr class="row-even"><td><p>any</p></td>
+<td><p>set</p></td>
+<td><p><strong>No</strong> coordinator starts here; a fleet of <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> delegating servers points at the external <code class="docutils literal notranslate"><span class="pre">disagg_coordinator_url</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The fleet is most useful with a <em>stateful</em> router (<code class="docutils literal notranslate"><span class="pre">kv_cache_aware</span></code>, <code class="docutils literal notranslate"><span class="pre">conversation</span></code>) where placement must be globally consistent — that decision is delegated to the coordinator. With a <em>stateless</em> router (<code class="docutils literal notranslate"><span class="pre">round_robin</span></code>, <code class="docutils literal notranslate"><span class="pre">load_balancing</span></code>) each worker simply places locally and no coordinator round-trip occurs.</p>
+</div>
+<section id="example-implicit-coordinator-4-worker-fleet">
+<h4>Example: implicit coordinator + 4-worker fleet<a class="headerlink" href="#example-implicit-coordinator-4-worker-fleet" title="Link to this heading">#</a></h4>
+<p>Extend the <code class="docutils literal notranslate"><span class="pre">disagg_config.yaml</span></code> from the <a class="reference internal" href="#trtllm-serve"><span class="std std-ref">trtllm-serve</span></a> example with <code class="docutils literal notranslate"><span class="pre">num_workers</span></code> and a router type:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">hostname</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">localhost</span>
+<span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8000</span>
+<span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pytorch</span>
+<span class="c1"># Run 4 stateless disaggregated-server workers on port 8000, with an implicit</span>
+<span class="c1"># coordinator started in-process on port 7999 (port - 1).</span>
+<span class="nt">num_workers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="nt">context_servers</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">num_instances</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">  </span><span class="nt">urls</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;localhost:8001&quot;</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;localhost:8002&quot;</span>
+<span class="w">  </span><span class="nt">router</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kv_cache_aware</span>
+<span class="nt">generation_servers</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">num_instances</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">  </span><span class="nt">urls</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;localhost:8003&quot;</span>
+<span class="w">  </span><span class="nt">router</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kv_cache_aware</span>
+</pre></div>
+</div>
+<p>Launch it exactly as before — the coordinator and fleet are started for you:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span class="w"> </span>disagg_config.yaml
+</pre></div>
+</div>
+<p>Clients still send requests to the public endpoint (<code class="docutils literal notranslate"><span class="pre">localhost:8000</span></code>); the fleet transparently delegates routing to the coordinator.</p>
+</section>
+<section id="example-external-coordinator">
+<h4>Example: external coordinator<a class="headerlink" href="#example-external-coordinator" title="Link to this heading">#</a></h4>
+<p>To point a fleet at a coordinator already running elsewhere (for example, one shared across nodes), set <code class="docutils literal notranslate"><span class="pre">disagg_coordinator_url</span></code> and omit the coordinator from this process:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">hostname</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">localhost</span>
+<span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8000</span>
+<span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pytorch</span>
+<span class="nt">num_workers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="nt">disagg_coordinator_url</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;http://coordinator-host:7999&quot;</span>
+<span class="nt">context_servers</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">num_instances</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
+<span class="w">  </span><span class="nt">urls</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;localhost:8001&quot;</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;localhost:8002&quot;</span>
+<span class="w">  </span><span class="nt">router</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kv_cache_aware</span>
+<span class="nt">generation_servers</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">num_instances</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">  </span><span class="nt">urls</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;localhost:8003&quot;</span>
+<span class="w">  </span><span class="nt">router</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kv_cache_aware</span>
+</pre></div>
+</div>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>A fleet worker fails fast if its coordinator is unreachable: on startup it probes the coordinator’s <code class="docutils literal notranslate"><span class="pre">/cluster_info</span></code> with bounded retry (up to <code class="docutils literal notranslate"><span class="pre">--server_start_timeout</span></code> seconds) and exits with an error rather than coming up and returning <code class="docutils literal notranslate"><span class="pre">Cluster</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">ready</span></code> for every request.</p>
+</div>
+</section>
 </section>
 </section>
 <section id="environment-variables">
@@ -961,6 +1069,11 @@ NCCL’s default graph mixing behavior.</p>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multiple-instances">Multiple Instances</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#coordinator-and-worker-fleet">Coordinator and Worker Fleet</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#example-implicit-coordinator-4-worker-fleet">Example: implicit coordinator + 4-worker fleet</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#example-external-coordinator">Example: external coordinator</a></li>
+</ul>
+</li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#environment-variables">Environment Variables</a></li>
@@ -1060,9 +1173,9 @@ NCCL’s default graph mixing behavior.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2026.</p>
+  <p>Last updated on July 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
   
 </div></div>
       

@@ -22,12 +22,6 @@ ___________________
 .. doxygenfile:: cacheCommunicator.h
    :project: TensorRT-LLM
 
-disaggServerUtil.h
-__________________
-
-.. doxygenfile:: disaggServerUtil.h
-   :project: TensorRT-LLM
-
 tensor.h
 ________
 

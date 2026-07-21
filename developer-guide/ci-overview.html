@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc21" />
+  <meta name="docsearch:version" content="1.3.0rc22" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -461,6 +461,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
@@ -497,6 +498,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
@@ -690,8 +692,16 @@ developers understand why the test is disabled.</p>
 <h2>Triggering CI Best Practices<a class="headerlink" href="#triggering-ci-best-practices" title="Link to this heading">#</a></h2>
 <section id="triggering-post-merge-tests">
 <h3>Triggering Post-merge tests<a class="headerlink" href="#triggering-post-merge-tests" title="Link to this heading">#</a></h3>
-<p>When you only need to verify a handful of post-merge tests, avoid the heavy
-<code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span> <span class="pre">--post-merge</span></code> command. Instead, specify exactly which stages to run:</p>
+<p>Full <code class="docutils literal notranslate"><span class="pre">/bot</span> <span class="pre">run</span> <span class="pre">--post-merge</span></code> runs require the <code class="docutils literal notranslate"><span class="pre">ci:</span> <span class="pre">post-merge</span> <span class="pre">approved</span></code> PR
+label because they can consume substantial shared GPU resources. The label is
+intended to be applied by an active member of the
+<code class="docutils literal notranslate"><span class="pre">NVIDIA/trt-llm-ci-approvers</span></code> GitHub team. A GitHub workflow validates the label
+actor and normally removes invalid approvals. This is a best-effort resource
+governance guard, not a strict authorization boundary. The label remains in
+place when new commits are pushed and can be removed manually when the approval
+no longer applies.</p>
+<p>When you only need to verify a handful of post-merge tests, specify exactly
+which stages to run:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--stage-list<span class="w"> </span><span class="s2">&quot;stage-A,stage-B&quot;</span>
 </pre></div>
 </div>
@@ -700,8 +710,13 @@ default pre-merge set:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>/bot<span class="w"> </span>run<span class="w"> </span>--extra-stage<span class="w"> </span><span class="s2">&quot;stage-A,stage-B&quot;</span>
 </pre></div>
 </div>
-<p>Both options accept any stage name defined in <code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. Being
-selective keeps CI turnaround fast and conserves hardware resources.</p>
+<p>Both options accept stage names and wildcard patterns defined in
+<code class="docutils literal notranslate"><span class="pre">jenkins/L0_Test.groovy</span></code>. The broad <code class="docutils literal notranslate"><span class="pre">&quot;*&quot;</span></code> and <code class="docutils literal notranslate"><span class="pre">&quot;*Post-Merge*&quot;</span></code> selectors
+require the same approval label, including when they appear in a comma-separated
+list. Equivalent escaped or repeated-star forms are treated the same. Other
+stage selectors, including explicit stage names and limited patterns such as
+<code class="docutils literal notranslate"><span class="pre">&quot;*PerfSanity*&quot;</span></code>, retain their existing behavior.</p>
+<p>Being selective keeps CI turnaround fast and conserves hardware resources.</p>
 </section>
 <section id="avoiding-unnecessary-disable-fail-fast-usage">
 <h3>Avoiding unnecessary <code class="docutils literal notranslate"><span class="pre">--disable-fail-fast</span></code> usage<a class="headerlink" href="#avoiding-unnecessary-disable-fail-fast-usage" title="Link to this heading">#</a></h3>
@@ -865,9 +880,9 @@ selective keeps CI turnaround fast and conserves hardware resources.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 14, 2026.</p>
+  <p>Last updated on July 20, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
   
 </div></div>
       
