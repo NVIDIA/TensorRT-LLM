@@ -15,10 +15,7 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
     break_graph,
     eager_on_graph,
 )
-from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph import (
-    _copy_output,
-    _weak_ref_if_tensor,
-)
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph.breakable_cuda_graph import _copy_output
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import (
     BreakableCUDAGraphRunner,
     BreakableCUDAGraphRunnerState,
@@ -130,16 +127,6 @@ def test_output_writeback_for_tensor_dict_and_object():
     assert output_object.label == "new"
 
 
-def test_tensor_capture_uses_non_owning_reference():
-    tensor = torch.ones(4, device="cuda")
-    python_ref = weakref.ref(tensor)
-    non_owning = _weak_ref_if_tensor(tensor)
-    assert non_owning.data_ptr() == tensor.data_ptr()
-    del tensor
-    gc.collect()
-    assert python_ref() is None
-
-
 def test_side_stream_is_joined_before_segment_end():
     x = torch.ones(4, device="cuda")
     output = torch.zeros_like(x)
@@ -180,7 +167,7 @@ class _LogitsProcessor(nn.Module):
 def test_runner_warmup_capture_execute_and_shared_output():
     body = _Body().cuda()
     logits_processor = _LogitsProcessor().cuda()
-    runner = BreakableCUDAGraphRunner(body, logits_processor)
+    runner = BreakableCUDAGraphRunner(body)
     counters = {"outer": 0}
     inputs = {}
 
@@ -201,7 +188,7 @@ def test_runner_warmup_capture_execute_and_shared_output():
     assert runner.state == BreakableCUDAGraphRunnerState.IDLE
     assert counters == {"outer": 6}
     assert body.forward_calls == 6
-    assert logits_processor.forward_calls == 4
+    assert logits_processor.forward_calls == 6
     assert runner._shared_output is first_shared_output
 
     original_forward = body.forward
@@ -211,13 +198,13 @@ def test_runner_warmup_capture_execute_and_shared_output():
     torch.testing.assert_close(result["logits"], torch.full((4, 4), 8.0, device="cuda"))
     assert counters == {"outer": 7}
     assert body.forward_calls == 6
-    assert logits_processor.forward_calls == 5
+    assert logits_processor.forward_calls == 7
     assert body.forward == original_forward
 
 
 def test_runner_graph_miss_nested_execute_and_exception_recovery():
     body = _Body().cuda()
-    runner = BreakableCUDAGraphRunner(body, _LogitsProcessor().cuda())
+    runner = BreakableCUDAGraphRunner(body)
     with pytest.raises(KeyError, match="No BCG captured"):
         runner.execute(4, lambda: None)
 
@@ -243,7 +230,7 @@ def test_runner_graph_miss_nested_execute_and_exception_recovery():
 
 
 def test_runner_warmup_exception_restores_idle_state():
-    runner = BreakableCUDAGraphRunner(_Body().cuda(), _LogitsProcessor().cuda())
+    runner = BreakableCUDAGraphRunner(_Body().cuda())
 
     def fail():
         raise ValueError("expected")

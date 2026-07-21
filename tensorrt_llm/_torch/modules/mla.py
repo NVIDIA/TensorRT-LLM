@@ -44,6 +44,7 @@ from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph
 from ..utils import (
     AuxStreamType,
     Fp4QuantizedTensor,
@@ -165,6 +166,9 @@ def mla_custom_op_inplace(
         attn_output=attn_output,
         latent_cache_gen=latent_cache_gen,
     )
+
+
+maybe_bcg_mla_custom_op_inplace = eager_on_graph(True)(mla_custom_op_inplace)
 
 
 def fp8_block_scaling_bmm_out(
@@ -1733,7 +1737,7 @@ class MLA(nn.Module):
             sparse_output_sf = attn_output[2]
 
         if isinstance(hidden_states, Fp4QuantizedTensor):
-            torch.ops.trtllm.mla_custom_op_inplace(
+            maybe_bcg_mla_custom_op_inplace(
                 hidden_states.unquantized_hidden_states,
                 position_ids,
                 self.layer_idx_str,
@@ -1745,7 +1749,7 @@ class MLA(nn.Module):
                 hidden_states.scaling_factor,
             )
         else:
-            torch.ops.trtllm.mla_custom_op_inplace(
+            maybe_bcg_mla_custom_op_inplace(
                 hidden_states,
                 position_ids,
                 self.layer_idx_str,

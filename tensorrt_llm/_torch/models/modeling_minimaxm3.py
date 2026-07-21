@@ -63,6 +63,7 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     ActivationType,
     AuxStreamType,
@@ -659,6 +660,11 @@ def minimax_m3_attn_custom_op_inplace(
         attn_metadata,
         output[:num_tokens],
     )
+
+
+maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(True)(
+    minimax_m3_attn_custom_op_inplace
+)
 
 
 class MiniMaxM3Attention(Attention):
@@ -1321,8 +1327,10 @@ class MiniMaxM3Attention(Attention):
         output = q.new_empty(
             (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
         )
-        if self.register_to_config and is_torch_compiling():
-            minimax_m3_attn_custom_op_inplace(
+        if self.register_to_config and (
+            is_torch_compiling() or is_in_breakable_cuda_graph()
+        ):
+            maybe_bcg_minimax_m3_attn_custom_op_inplace(
                 q,
                 k,
                 v,
