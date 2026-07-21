@@ -810,7 +810,7 @@ def all_gather_ops() -> frozenset:
     selection) flow through as op arguments, not as separate op identities.
 
     The TRT-LLM-backed ops are silently skipped if their custom_ops module
-    failed to register (e.g. in the standalone ``llmc`` package, where
+    failed to register (e.g. in the standalone ``paragraf`` package, where
     ``trtllm_dist`` is not importable).
     """
     return frozenset(
@@ -828,7 +828,7 @@ def all_reduce_ops() -> frozenset:
     """All AllReduce custom op packets recognized by AutoDeploy.
 
     The TRT-LLM-backed op is silently skipped if its custom_ops module
-    failed to register (e.g. in the standalone ``llmc`` package, where
+    failed to register (e.g. in the standalone ``paragraf`` package, where
     ``trtllm_dist`` is not importable).
     """
     return frozenset(

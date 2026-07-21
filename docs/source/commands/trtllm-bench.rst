@@ -23,7 +23,7 @@ Dataset preparation
 prepare_dataset.py
 ^^^^^^^^^^^^^^^^^^
 
-trtllm-bench is designed to work with the `prepare_dataset.py <https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/cpp/prepare_dataset.py>`_ script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
+trtllm-bench is designed to work with the `prepare_dataset.py <https://github.com/NVIDIA/TensorRT-LLM/blob/main/benchmarks/prepare_dataset.py>`_ script, which generates benchmark datasets in the required format. The prepare_dataset script supports:
 
 **Dataset Types:**
 
