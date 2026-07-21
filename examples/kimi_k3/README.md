@@ -48,29 +48,32 @@ per-rank `TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks).
 
 ## Run
 
-The sbatch scripts carry working defaults for the two paths + `IMAGE`
-(tali's golden-prairie workspace on the GB300 cluster) — override any of
-them via the environment for other checkouts.
-
-Sanity (4 greedy prompts, asserts expected content; ~40 min, mostly weight
-loading):
+Preferred entry point: `examples/kimi_k3/run_kimi.py`, which resolves the
+two paths + `IMAGE` from `~/.config/kimi-bringup.ini`. One-time setup:
 
 ```bash
-sbatch --export=ALL examples/kimi_k3/sanity_kimi_k3.sbatch
+cp examples/kimi_k3/kimi-bringup.ini.example ~/.config/kimi-bringup.ini
+$EDITOR ~/.config/kimi-bringup.ini   # point `workspace` at your directory
 ```
 
-Quick 4-GPU pipeline-only sanity (4/93 layers, single tray): add
-`-N1 --gpus=4` and `KIMI_K3_TP=4 KIMI_K3_NUM_LAYERS_OVERRIDE=4`.
-
-GSM8K (full 1319-problem test set via `trtllm-eval`):
+Then:
 
 ```bash
-sbatch --export=ALL examples/kimi_k3/run_gsm8k.sbatch
+examples/kimi_k3/run_kimi.py sanity        # 4-GPU / 4-layer pipeline check (~10 min)
+examples/kimi_k3/run_kimi.py sanity-full   # 16-GPU full sanity (~40 min, mostly weight loading)
+examples/kimi_k3/run_kimi.py gsm8k         # 16-GPU GSM8K, full 1319-problem test set (~3 hr)
 ```
 
-Both default `REPO` to the submit directory — submit from the repo root, or
-set `REPO` explicitly. Partition/account in the `#SBATCH` headers are
-cluster defaults; override on the command line as needed.
+Extra args are forwarded to sbatch; `--dry-run` prints the resolved inputs
+and command without submitting. See `run_kimi.py --help` for the env-var /
+config-key / workspace resolution rules.
+
+The sbatch scripts can also be submitted directly, exporting
+`KIMI_K3_OPT_WORK_DIR`, `KIMI_K3_MODEL_DIR`, and `IMAGE` yourself (they
+have no defaults and fail fast if unset) — see each script's header. Both
+default `REPO` to the submit directory — submit from the repo root, or set
+`REPO` explicitly. Partition/account in the `#SBATCH` headers are cluster
+defaults; override on the command line as needed.
 
 ## Debug knobs
 

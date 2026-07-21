@@ -1,0 +1,28 @@
+# Kimi K3 ("golden prairie") bringup configuration.
+#
+# Copy to ~/.config/kimi-bringup.ini and edit the paths for your workspace:
+#
+#     cp examples/kimi_k3/kimi-bringup.ini.example ~/.config/kimi-bringup.ini
+#
+# run_kimi.py reads this file to resolve the job inputs. Resolution order for
+# each value: environment variable > this file > derived from `workspace`.
+# (Set KIMI_BRINGUP_CONFIG to read a different file.)
+
+[paths]
+# Workspace root. If the three inputs below live in this directory under
+# their standard names, `workspace` alone is enough:
+#
+#   <workspace>/goldenprairie-final-weights_vv1/   HF checkpoint
+#   <workspace>/exisiting_optimization_work/       optimization-work checkout
+#   <workspace>/*.sqsh                             container image (exactly one)
+workspace = /path/to/your/goldenprairie
+
+# Explicit per-input overrides — uncomment any that deviate from the
+# workspace layout above. Environment variable equivalents in parentheses.
+#model_dir = /path/to/goldenprairie-final-weights_vv1        (KIMI_K3_MODEL_DIR)
+#opt_work_dir = /path/to/exisiting_optimization_work         (KIMI_K3_OPT_WORK_DIR)
+#image = /path/to/trtllm-pytorch-26.05-...sbsa...sqsh        (IMAGE)
+
+# FlashInfer JIT / HF cache location; created if missing.
+# Default: <repo>/.kimi_k3_cache  (KIMI_K3_CACHE_DIR)
+#cache_dir = /path/to/.kimi_k3_cache
