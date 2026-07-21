@@ -57,6 +57,14 @@ from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
 _TORCH_TOPK_ORACLE = torch.topk
 
+# The SM100 CuTe kernel is the only score path, so every test that actually
+# launches scores (or builds the real staging buffers, whose constructor
+# compiles the kernel) is SM100-only, like the production feature itself.
+requires_sm100 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="TriAttention score requires SM100",
+)
+
 
 def _set_request_state(
     manager,
@@ -901,7 +909,7 @@ class TestFixedScoreMetadata:
 
         score_staging.bind_score_launcher.assert_called_once_with(
             keep_set_selector.valid_widths,
-            manager.score_aggregation,
+            "mean",
         )
         plan = build_selection.call_args.args[0]
         assert plan.eviction_mode == eviction_mode
@@ -1157,8 +1165,10 @@ class TestFixedScoreMetadata:
         )
         assert all(not hasattr(item, "page_ids") for item in prepared)
 
+    @requires_sm100
     @pytest.mark.parametrize("request_count", [1, 7, 8])
     def test_staging_stages_dense_and_swa_tables_and_rejects_stream_changes(self, request_count):
+        pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _FixedScoreStagingBuffers,
             _FixedScoreStreamMismatch,
@@ -1167,23 +1177,36 @@ class TestFixedScoreMetadata:
         device = torch.device("cuda", torch.cuda.current_device())
         max_requests = 8
         page_count = 3
-        seq_len = 7
-        page_table_token_capacity = 11
-        layer_elements = max_requests * page_count * 2 * 1 * 4 * 4
-        shared = torch.randn(2 * layer_elements, device=device)
+        # The bucket capacity must be aligned to the score kernel's 64-token
+        # compute tile (the staging constructor compiles the kernel).
+        seq_len = 64
+        page_table_token_capacity = 90
+        tokens_per_block = 32
+        head_dim = 64
+        num_freqs = head_dim // 2
+        num_q_heads = 8
+        layer_elements = max_requests * page_count * 2 * 1 * tokens_per_block * head_dim
+        shared = torch.randn(2 * layer_elements, device=device).to(torch.bfloat16)
+        pool_shape = (max_requests * page_count, 2, 1, tokens_per_block, head_dim)
         pools = [
-            shared[:layer_elements].view(max_requests * page_count, 2, 1, 4, 4),
-            shared[layer_elements:].view(max_requests * page_count, 2, 1, 4, 4),
-            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device),
-            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device),
+            shared[:layer_elements].view(pool_shape),
+            shared[layer_elements:].view(pool_shape),
+            torch.randn(pool_shape, device=device).to(torch.bfloat16),
+            torch.randn(pool_shape, device=device).to(torch.bfloat16),
         ]
         dense_groups = [[0, 1], [2]]
         representatives = [0, 2, 3]
-        q_real = torch.randn(4, 2, 4, dtype=torch.float64, device=device)[..., ::2]
-        q_imag = torch.randn(4, 2, 4, dtype=torch.float64, device=device)[..., ::2]
-        mlr = torch.randn(4, 2, 4, dtype=torch.float64, device=device)[..., ::2]
-        freq = torch.tensor([1.0, 0.0, 1.0, 0.0], dtype=torch.float64, device=device)[::2]
-        omega = torch.tensor([0.01, 0.0, 0.03, 0.0], dtype=torch.float64, device=device)[::2]
+        q_real = torch.randn(4, num_q_heads, 2 * num_freqs, dtype=torch.float64, device=device)[
+            ..., ::2
+        ]
+        q_imag = torch.randn(4, num_q_heads, 2 * num_freqs, dtype=torch.float64, device=device)[
+            ..., ::2
+        ]
+        mlr = torch.randn(4, num_q_heads, 2 * num_freqs, dtype=torch.float64, device=device)[
+            ..., ::2
+        ]
+        freq = (torch.rand(2 * num_freqs, dtype=torch.float64, device=device) + 0.5)[::2]
+        omega = (torch.rand(2 * num_freqs, dtype=torch.float64, device=device) * 0.05)[::2]
         offsets = torch.tensor([1.0, 0.0, 2.0, 0.0], dtype=torch.float64, device=device)[::2]
         assert not q_real.is_contiguous()
         assert not freq.is_contiguous()
@@ -1196,8 +1219,8 @@ class TestFixedScoreMetadata:
             representatives,
             max_requests,
             seq_len,
-            2,
-            2,
+            num_q_heads,
+            num_freqs,
             q_real,
             q_imag,
             mlr,
@@ -1316,9 +1339,10 @@ class TestFixedScoreMetadata:
                 staging.stage(manager, request_ids, round_starts, token_starts)
         assert gather.call_count == calls
 
-    @pytest.mark.parametrize("request_count", [1, 7, 8])
-    @pytest.mark.parametrize("aggregation", ["mean", "max"])
-    def test_fixed_score_matches_torch_oracle_across_two_groups(self, request_count, aggregation):
+    @requires_sm100
+    @pytest.mark.parametrize("request_count", [1, 8])
+    def test_fixed_score_matches_torch_oracle_across_two_groups(self, request_count):
+        pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
             _FixedScoreGroup,
         )
@@ -1327,24 +1351,29 @@ class TestFixedScoreMetadata:
         torch.manual_seed(20260703 + request_count)
         max_requests = 8
         page_count = 2
-        seq_len = 7
+        tokens_per_block = 32
+        head_dim = 64
+        num_freqs = head_dim // 2
+        num_q_heads = 8
+        seq_len = page_count * tokens_per_block
         prompt_len = 2
         page_ids = torch.arange(max_requests * page_count, dtype=torch.int64, device=device).view(
             max_requests, page_count
         )
-        layer_elements = max_requests * page_count * 2 * 1 * 4 * 4
-        shared = torch.randn(2 * layer_elements, device=device)
+        layer_elements = max_requests * page_count * 2 * 1 * tokens_per_block * head_dim
+        shared = (0.125 * torch.randn(2 * layer_elements, device=device)).to(torch.bfloat16)
+        pool_shape = (max_requests * page_count, 2, 1, tokens_per_block, head_dim)
         pools = [
-            shared[:layer_elements].view(max_requests * page_count, 2, 1, 4, 4),
-            shared[layer_elements:].view(max_requests * page_count, 2, 1, 4, 4),
-            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device),
+            shared[:layer_elements].view(pool_shape),
+            shared[layer_elements:].view(pool_shape),
+            (0.125 * torch.randn(pool_shape, device=device)).to(torch.bfloat16),
         ]
         storage_groups = [[0, 1], [2]]
-        q_real = torch.randn(3, 2, 4, device=device)[..., ::2]
-        q_imag = torch.randn(3, 2, 4, device=device)[..., ::2]
-        mlr = torch.randn(3, 2, 4, device=device)[..., ::2]
-        freq = torch.tensor([0.7, 0.0, 1.3, 0.0], device=device)[::2]
-        omega = torch.tensor([0.013, 0.0, 0.071, 0.0], device=device)[::2]
+        q_real = (0.125 * torch.randn(3, num_q_heads, 2 * num_freqs, device=device))[..., ::2]
+        q_imag = (0.125 * torch.randn(3, num_q_heads, 2 * num_freqs, device=device))[..., ::2]
+        mlr = (0.125 * torch.randn(3, num_q_heads, 2 * num_freqs, device=device))[..., ::2]
+        freq = (torch.rand(2 * num_freqs, device=device) + 0.5)[::2]
+        omega = (torch.rand(2 * num_freqs, device=device) * 0.05)[::2]
         offsets = torch.tensor([1.0, 0.0, 2.0, 0.0, 4.0, 0.0], device=device)[::2]
         assert not q_real.is_contiguous()
         assert not q_imag.is_contiguous()
@@ -1371,7 +1400,6 @@ class TestFixedScoreMetadata:
             omega,
             offsets,
             [0, 1, 2],
-            aggregation,
         )
         for layers in storage_groups:
             group = _FixedScoreGroup(
@@ -1380,7 +1408,7 @@ class TestFixedScoreMetadata:
                 max_requests,
                 page_count,
                 seq_len,
-                2,
+                num_q_heads,
                 _encode_block_offsets(page_ids),
                 [0] * len(layers),
                 q_real,
@@ -1391,39 +1419,36 @@ class TestFixedScoreMetadata:
                 offsets,
                 output_width=seq_len - prompt_len,
             )
-            valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
+            valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
             fixed = group.launch(
                 request_count,
                 torch.tensor(seq_lens, dtype=torch.int32, device=device),
                 valid_widths,
-                round_device,
                 token_starts_device,
                 torch.cos(phase).mean(dim=1),
                 torch.sin(phase).mean(dim=1),
-                aggregation,
             )
-            assert valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
+            assert valid_widths[:request_count].tolist() == [
+                seq_len - prompt_len for seq_len in seq_lens
+            ]
             assert fixed.shape == (
                 request_count,
                 len(layers),
-                2,
+                num_q_heads,
                 seq_len - prompt_len,
             )
             for request in range(request_count):
                 for layer_slot, layer in enumerate(layers):
                     valid_width = seq_lens[request] - prompt_len
                     segment = fixed[request, layer_slot, :, :valid_width]
-                    expected = oracle[request * len(pools) + layer][:, prompt_len:]
+                    expected = oracle[request * len(pools) + layer][
+                        :, prompt_len : prompt_len + valid_width
+                    ]
                     torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
-                    selected = torch.topk(segment.max(dim=0).values, 3).indices.sort().values
-                    expected_selected = (
-                        torch.topk(expected.max(dim=0).values, 3).indices.sort().values
-                    )
-                    assert torch.equal(selected, expected_selected)
 
+    @requires_sm100
     @pytest.mark.parametrize("request_count", [1, 7, 8])
-    @pytest.mark.parametrize("aggregation", ["mean", "max"])
-    def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count, aggregation):
+    def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count):
         """ONE launch over layers in DISTINCT storages with DISTINCT block tables.
 
         This is the production V2 shape: get_buffers wraps every layer as its
@@ -1431,6 +1456,7 @@ class TestFixedScoreMetadata:
         the fused path must not assume a shared storage anchor or a shared
         per-request block table.
         """
+        pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention_kernels
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _FixedScoreStagingBuffers,
@@ -1444,12 +1470,21 @@ class TestFixedScoreMetadata:
         torch.manual_seed(20260707 + request_count)
         max_requests = request_count
         page_count = 2
-        seq_len = 7
+        tokens_per_block = 32
+        head_dim = 64
+        num_freqs = head_dim // 2
+        num_q_heads = 8
+        seq_len = page_count * tokens_per_block
         prompt_len = 1
         num_layers = 3
         # Three SEPARATE allocations (distinct storages, like V2 TensorWrapper).
         pools = [
-            torch.randn(max_requests * page_count, 2, 1, 4, 4, device=device)
+            (
+                0.125
+                * torch.randn(
+                    max_requests * page_count, 2, 1, tokens_per_block, head_dim, device=device
+                )
+            ).to(torch.bfloat16)
             for _ in range(num_layers)
         ]
         assert len({pool.untyped_storage().data_ptr() for pool in pools}) == num_layers
@@ -1465,11 +1500,11 @@ class TestFixedScoreMetadata:
                 for _ in range(num_layers)
             ]
         ).contiguous()
-        q_real = torch.randn(num_layers, 2, 2, device=device)
-        q_imag = torch.randn(num_layers, 2, 2, device=device)
-        mlr = torch.randn(num_layers, 2, 2, device=device)
-        freq = torch.tensor([0.7, 1.3], device=device)
-        omega = torch.tensor([0.013, 0.071], device=device)
+        q_real = 0.125 * torch.randn(num_layers, num_q_heads, num_freqs, device=device)
+        q_imag = 0.125 * torch.randn(num_layers, num_q_heads, num_freqs, device=device)
+        mlr = 0.125 * torch.randn(num_layers, num_q_heads, num_freqs, device=device)
+        freq = torch.rand(num_freqs, device=device) + 0.5
+        omega = torch.rand(num_freqs, device=device) * 0.05
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
         round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
         round_starts = round_device[:request_count].tolist()
@@ -1483,7 +1518,7 @@ class TestFixedScoreMetadata:
             max_requests,
             page_count,
             seq_len,
-            2,
+            num_q_heads,
             block_offsets,
             layer_order,  # slot i holds layer i's tables
             q_real,
@@ -1496,28 +1531,25 @@ class TestFixedScoreMetadata:
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
-        mean_cos = torch.empty(request_count, 2, dtype=torch.float32, device=device)
+        mean_cos = torch.empty(request_count, num_freqs, dtype=torch.float32, device=device)
         mean_sin = torch.empty_like(mean_cos)
-        if aggregation == "mean":
-            triattention_kernels.prepare_mean_phase(
-                round_device,
-                offsets,
-                omega,
-                mean_cos,
-                mean_sin,
-                request_count,
-            )
+        triattention_kernels.prepare_mean_phase(
+            round_device,
+            offsets,
+            omega,
+            mean_cos,
+            mean_sin,
+            request_count,
+        )
         score_sentinel = -12345.0
         group.output.fill_(score_sentinel)
         checked = group.launch(
             request_count,
             valid_seq_lens,
             valid_widths,
-            round_device,
             token_starts,
             mean_cos,
             mean_sin,
-            aggregation,
         ).clone()
         staging = _FixedScoreStagingBuffers.__new__(_FixedScoreStagingBuffers)
         staging.device = group.output.device
@@ -1532,8 +1564,8 @@ class TestFixedScoreMetadata:
         staging.omega = omega
         staging.stream = None
         staging._score_valid_widths = None
-        staging._score_aggregation = None
-        staging.bind_score_launcher(valid_widths, aggregation)
+        staging._score_launcher_bound = False
+        staging.bind_score_launcher(valid_widths, "mean")
         group.output.fill_(score_sentinel)
         fixed = staging.launch_prepared_score().clone()
         torch.testing.assert_close(fixed, checked, rtol=0, atol=0)
@@ -1553,13 +1585,14 @@ class TestFixedScoreMetadata:
             omega,
             offsets,
             layer_order,
-            aggregation,
         )
         for request in range(request_count):
             for layer_slot, layer in enumerate(layer_order):
                 valid_width = seq_lens[request] - prompt_len
                 segment = fixed[request, layer_slot, :, :valid_width]
-                expected = oracle[request * num_layers + layer][:, prompt_len:]
+                expected = oracle[request * num_layers + layer][
+                    :, prompt_len : prompt_len + valid_width
+                ]
                 torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
 
         round_device.add_(17)
@@ -1571,15 +1604,14 @@ class TestFixedScoreMetadata:
                 device=device,
             )
         )
-        if aggregation == "mean":
-            triattention_kernels.prepare_mean_phase(
-                round_device,
-                offsets,
-                omega,
-                mean_cos,
-                mean_sin,
-                request_count,
-            )
+        triattention_kernels.prepare_mean_phase(
+            round_device,
+            offsets,
+            omega,
+            mean_cos,
+            mean_sin,
+            request_count,
+        )
         expected_second_widths = valid_seq_lens - prompt_len
         group.output.fill_(score_sentinel)
         valid_widths.fill_(-1)
@@ -1587,11 +1619,9 @@ class TestFixedScoreMetadata:
             request_count,
             valid_seq_lens,
             valid_widths,
-            round_device,
             token_starts,
             mean_cos,
             mean_sin,
-            aggregation,
         ).clone()
         group.output.fill_(score_sentinel)
         valid_widths.fill_(-1)

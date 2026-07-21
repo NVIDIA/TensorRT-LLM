@@ -194,12 +194,12 @@ def torch_tri_score_oracle(
     omega,
     offsets,
     layer_indices,
-    aggregation,
 ):
-    """Independent Torch implementation of the paged TriAttention score.
+    """Independent Torch implementation of the paged TriAttention mean score.
 
-    Covers both aggregations (mean and max), GQA head mapping via
-    ``head // group_size``, and the position-independent MLR term.
+    Covers GQA head mapping via ``head // group_size`` and the
+    position-independent MLR term. Mean aggregation only: it is the single
+    production aggregation (max was removed with the C++ score stack).
     """
     scores = []
     num_q_heads = int(q_real.shape[1])
@@ -228,23 +228,9 @@ def torch_tri_score_oracle(
                 key_imag = key[:, num_freqs:]
                 product_real = q_real[layer, head] * key_real + q_imag[layer, head] * key_imag
                 product_imag = q_imag[layer, head] * key_real - q_real[layer, head] * key_imag
-                if aggregation == "mean":
-                    position = (
-                        freq_scale_sq * (product_real * mean_cos - product_imag * mean_sin)
-                    ).sum(dim=-1)
-                else:
-                    position = (
-                        (
-                            freq_scale_sq[None, None, :]
-                            * (
-                                product_real[None] * torch.cos(phase)[:, None, :]
-                                - product_imag[None] * torch.sin(phase)[:, None, :]
-                            )
-                        )
-                        .sum(dim=-1)
-                        .max(dim=0)
-                        .values
-                    )
+                position = (
+                    freq_scale_sq * (product_real * mean_cos - product_imag * mean_sin)
+                ).sum(dim=-1)
                 mlr = (
                     torch.sqrt(key_real.square() + key_imag.square())
                     * mlr_coef[layer, head]

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Correctness coverage for the optional SM100 TriAttention CuTe scorer."""
+"""Correctness coverage for the SM100 TriAttention CuTe scorer (the only score path)."""
 
 import pytest
 import torch
@@ -28,7 +28,6 @@ import torch
     ],
 )
 def test_cute_score_matches_torch_mean_oracle(
-    monkeypatch: pytest.MonkeyPatch,
     tokens_per_block: int,
     page_permutation: list,
     valid_lens: "list | None",
@@ -36,7 +35,6 @@ def test_cute_score_matches_torch_mean_oracle(
     num_q_heads: int,
 ) -> None:
     pytest.importorskip("cutlass")
-    monkeypatch.setenv("TRTLLM_TRIATTENTION_CUTE_SCORE", "1")
 
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
         _FixedScoreGroup,
@@ -98,7 +96,6 @@ def test_cute_score_matches_torch_mean_oracle(
         valid_lens = [seq_len, seq_len]
     valid_seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=device)
     valid_widths = torch.tensor(valid_lens, dtype=torch.int32, device=device)
-    round_starts_device = torch.tensor([seq_len, seq_len + 1], dtype=torch.int32, device=device)
     token_starts_device = torch.zeros(2, dtype=torch.int32, device=device)
     for request_count in (1, 2):
         group.output.fill_(float("nan"))
@@ -106,11 +103,9 @@ def test_cute_score_matches_torch_mean_oracle(
             request_count,
             valid_seq_lens,
             valid_widths,
-            round_starts_device,
             token_starts_device,
             mean_cos,
             mean_sin,
-            "mean",
         )
         assert actual.shape == (request_count, 1, num_q_heads, seq_len)
         for request in range(request_count):
@@ -130,6 +125,5 @@ def test_cute_score_matches_torch_mean_oracle(
             )
 
     torch.cuda.synchronize()
-    # Fails loudly if setup silently fell back to the C++ score ops (whose
-    # scores would also match the oracle here).
+    # The CuTe runner is the only score path; prove setup actually built it.
     assert group._cute_score_runner is not None

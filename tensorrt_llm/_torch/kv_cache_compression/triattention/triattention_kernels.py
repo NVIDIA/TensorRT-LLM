@@ -3,18 +3,15 @@
 """GPU kernels for the TriAttention KV-eviction pipeline.
 
 The production path uses one fixed-shape trig-score launch across all dense
-layers, CuTE-DSL TopK selection, and grouped C++ compaction. This module owns
-the score launcher and its persistent metadata; scoring itself runs through
-the compiled ``trtllm`` CUDA ops (on the mean path ONE folded paged-score
-launch whose CTAs rotate their own coefficients from init-time phase tables;
-on the max path a trigonometric coefficient fold, then the folded paged
-score) for every supported geometry. The
-original Triton score kernel has been deleted;
-the unit tests validate the CUDA ops against an independent PyTorch oracle.
-Selection and compaction live in their respective runtime modules. An
-optional SM100 CuTe-DSL specialization (``triattention_cute_score.py``,
-default off behind ``TRTLLM_TRIATTENTION_CUTE_SCORE=1``) can take over the
-mean-aggregation score launch for one exactly-validated geometry.
+layers, CuTE-DSL TopK selection, and grouped C++ compaction. Scoring runs
+EXCLUSIVELY through the SM100 CuTe-DSL kernel
+(``triattention_cute_score.py``): mean aggregation, BF16 KV pools, head size
+64/128, 32/128-token pages, GQA group 4 or 8. There is deliberately no other
+score path -- any geometry outside that contract raises loudly at setup
+instead of routing to a slower kernel (the original Triton score kernel and
+the C++ CUDA score stack have both been deleted). The unit tests validate
+the CuTe kernel against an independent PyTorch oracle. Selection and
+compaction live in their respective runtime modules.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
@@ -25,8 +22,6 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-import os
-import warnings
 from typing import List
 
 import torch
@@ -109,177 +104,6 @@ def prepare_mean_phase(
     )
 
 
-def _launch_tri_score_perhead(
-    group: "_FixedScoreGroup",
-    request_count: int,
-    num_segments: int,
-    valid_seq_lens: torch.Tensor,
-    valid_widths: torch.Tensor,
-    round_starts_device: torch.Tensor,
-    token_starts_device: torch.Tensor,
-    *,
-    score_aggregation: str,
-    mean_rotate_in_cta: bool = True,
-) -> None:
-    """Prepare the per-round coefficients, then score paged KV via the C++ ops.
-
-    The compiled ``trtllm`` score ops are THE implementation for every
-    geometry this launcher accepts; unsupported inputs fail loudly inside the
-    ops (TORCH_CHECK) instead of routing to another kernel. The unit tests
-    validate them against an independent PyTorch oracle.
-
-    ``mean_rotate_in_cta`` (mean aggregation only, default on) hands the
-    per-round coefficient rotation to the score kernels' own CTA prologue:
-    one launch per round, zero coefficient scratch. The two-launch
-    preparation (standalone rotation kernel writing global tables the score
-    kernels then read) stays selectable because the unit tests prove the two
-    paths produce bit-identical scores — the kernels share one rotation
-    expression — and because geometries whose coefficient block exceeds the
-    score launch's shared-memory bound must fall back to it.
-    """
-    if score_aggregation not in ("mean", "max"):
-        raise ValueError(f"unsupported score aggregation: {score_aggregation}")
-    if not (
-        hasattr(torch.ops.trtllm, "tri_attention_fold_score_coefficients")
-        and hasattr(torch.ops.trtllm, "tri_attention_rotate_mean_score_coefficients")
-        and hasattr(torch.ops.trtllm, "tri_attention_paged_score")
-    ):
-        raise RuntimeError(
-            "this TensorRT-LLM build is missing the TriAttention score ops; rebuild the C++ "
-            "th_common extension (there is deliberately no Triton fallback: a loud failure "
-            "here beats silently scoring through a slower path)"
-        )
-    use_max = score_aggregation == "max"
-    (
-        num_q_heads,
-        num_kv_heads,
-        num_freqs,
-        tokens_per_block,
-        kv_factor,
-        num_offsets,
-        s_page,
-        s_kv_head,
-        s_slot,
-        s_dim,
-    ) = group.geometry_args
-    # Mean aggregation collapses all offsets into one coefficient plane; max
-    # keeps one c_re/c_im plane per offset because max does not commute
-    # through the frequency sum.
-    offset_planes = num_offsets if use_max else 1
-    # Keyword operands of the score op that trigger its in-CTA coefficient
-    # rotation; empty when pre-rotated c_re/c_im planes are passed instead.
-    rotate_in_cta_kwargs: dict = {}
-    if use_max:
-        c_re, c_im, c_mlr = group._fold_coefficient_buffers(offset_planes, with_mlr=True)
-        q_real, q_imag, mlr_coef = group.pointer_middle
-        freq_scale_sq, omega, offsets = group.pointer_tail
-        torch.ops.trtllm.tri_attention_fold_score_coefficients(
-            c_re,
-            c_im,
-            c_mlr,
-            q_real,
-            q_imag,
-            mlr_coef,
-            freq_scale_sq,
-            None,
-            None,
-            omega,
-            offsets,
-            round_starts_device,
-            request_count,
-            group._num_calibrated_layers,
-            num_q_heads,
-            num_freqs,
-            offset_planes,
-            True,
-            # Per-layer dequant scales (quantized pools only, else None): the
-            # fold multiplies them into the coefficient tables so the score op
-            # below reads raw quantized elements at zero hot-loop cost.
-            group._kv_scales,
-        )
-    elif mean_rotate_in_cta:
-        # Production mean path: the score kernels rotate the pre-scaled
-        # calibration query by the tabulated offset-mean phase of each
-        # request's round start in their own CTA prologue (tables built once
-        # at group construction; phase-table design: Fanrong Li, torch-graph
-        # review 2026-07-20). No rotation launch, no per-round coefficient
-        # scratch; c_mlr is the static init-time table. The prologue compiles
-        # the standalone rotation kernel's exact arithmetic, so scores are
-        # bit-identical to the two-launch path below.
-        c_re = None
-        c_im = None
-        c_mlr = group._mlr_fold
-        rotate_in_cta_kwargs = dict(
-            phase_cos=group._phase_cos,
-            phase_sin=group._phase_sin,
-            q_real_scaled=group._q_real_scaled,
-            q_imag_scaled=group._q_imag_scaled,
-            round_starts=round_starts_device,
-            max_position=group._max_position,
-        )
-    else:
-        # Two-launch mean preparation: the standalone rotation kernel writes
-        # global c_re/c_im planes the score kernels then read. Kept callable
-        # as the unit tests' bit-equality reference leg and as the fallback
-        # for coefficient blocks past the score launch's shared-memory bound.
-        c_re, c_im, _ = group._fold_coefficient_buffers(offset_planes, with_mlr=False)
-        c_mlr = group._mlr_fold
-        torch.ops.trtllm.tri_attention_rotate_mean_score_coefficients(
-            c_re,
-            c_im,
-            group._q_real_scaled,
-            group._q_imag_scaled,
-            group._phase_cos,
-            group._phase_sin,
-            round_starts_device,
-            request_count,
-            group._num_calibrated_layers,
-            num_q_heads,
-            num_freqs,
-            group._max_position,
-        )
-    pool_anchor, layer_base_addrs, block_offsets, seg_page_off, seg_req, seg_layer = (
-        group.pointer_prefix
-    )
-    torch.ops.trtllm.tri_attention_paged_score(
-        pool_anchor,
-        layer_base_addrs,
-        block_offsets,
-        seg_page_off,
-        seg_req,
-        seg_layer,
-        valid_seq_lens,
-        valid_widths,
-        token_starts_device,
-        c_re,
-        c_im,
-        c_mlr,
-        group.output,
-        group.output_width,
-        group.num_layers,
-        request_count,
-        group._num_calibrated_layers,
-        num_q_heads,
-        num_kv_heads,
-        num_freqs,
-        tokens_per_block,
-        kv_factor,
-        offset_planes,
-        s_page,
-        s_kv_head,
-        s_slot,
-        s_dim,
-        num_segments,
-        use_max,
-        group._use_vectorized,
-        # Validation-only here (presence must match the pool dtype; the max
-        # fold above or the init-time pre-scaled mean tables already consumed
-        # the values).
-        group._kv_scales,
-        **rotate_in_cta_kwargs,
-    )
-
-
 class _FixedScoreGroup:
     """Persistent score metadata/output for one fixed geometry.
 
@@ -288,12 +112,11 @@ class _FixedScoreGroup:
     uses the native TRT-LLM attention layout and ``page_table_slots`` maps each
     scored layer to its V2 pool slot.
 
-    LIFETIME CONTRACT: the group captures the scored layer pools as raw device
-    addresses (``layer_base_addrs``) and keeps a reference only to the anchor
-    pool (the score op's dtype witness). The caller owns ``layer_pools`` and must
-    keep every scored pool alive for as long as it launches through this group
-    (in production the V2 KV-cache manager does); a dropped pool leaves its
-    address dangling and scores read allocator-recycled memory.
+    LIFETIME: the group retains references to every scored layer pool -- the
+    SM100 CuTe score kernel encodes immutable TMA descriptors from their raw
+    device addresses at compile time, so the pools must stay alive (and stay
+    put) for as long as the group launches. In production the V2 KV-cache
+    manager owns them for the manager's lifetime.
     """
 
     def __init__(
@@ -313,7 +136,6 @@ class _FixedScoreGroup:
         omega: torch.Tensor,
         offsets: torch.Tensor,
         output_width: int,
-        kv_scales: torch.Tensor | None = None,
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
@@ -347,16 +169,10 @@ class _FixedScoreGroup:
             self.num_freqs,
             tokens_per_block,
             kv_factor,
-            int(offsets.numel()),
-            strides[0],
-            strides[2],
-            strides[3],
-            strides[4],
         )
         # Per-layer ABSOLUTE base addresses. Layers may live in distinct
         # storages (V2 TensorWrapper-per-layer); only geometry must be uniform.
         element_size = p0.element_size()
-        bases_16b_aligned = True
         layer_base_addrs = torch.zeros(len(layer_pools), dtype=torch.int64, device=device)
         for layer in layer_indices:
             pool = layer_pools[layer]
@@ -369,114 +185,14 @@ class _FixedScoreGroup:
             address = int(pool.data_ptr())
             if address % element_size:
                 raise ValueError("fixed score layer base is not element-aligned")
-            bases_16b_aligned &= address % 16 == 0
             layer_base_addrs[layer] = address
-        # The score op runs 16-byte 8-frequency K loads when the fixed layout
-        # guarantees aligned rows, and its strided scalar path otherwise.
-        # Audited ONCE here: bases and strides never change for this group.
-        strides_16b_aligned = all(
-            (element_size * stride) % 16 == 0 for stride in (strides[0], strides[2], strides[3])
-        )
-        self._use_vectorized = (
-            p0.dtype in (torch.bfloat16, torch.float16)
-            and self.num_freqs % 8 == 0
-            and strides[4] == 1
-            and bases_16b_aligned
-            and strides_16b_aligned
-        )
-        # Quantized (fp8/int8) pools are FUNCTIONAL-ONLY and scalar-path-only
-        # (the dtype gate above already excludes them from the vectorized
-        # path). Their per-layer dequantization scale is folded into the
-        # score coefficients at launch time, so it must be present up front;
-        # conversely, scales alongside a float pool would double-scale the
-        # coefficients, so that pairing is rejected just as loudly.
-        quantized_pool = p0.dtype in (torch.float8_e4m3fn, torch.int8)
-        if quantized_pool and kv_scales is None:
-            raise ValueError("quantized (fp8/int8) KV pools require per-layer kv_scales")
-        if not quantized_pool and kv_scales is not None:
-            raise ValueError("kv_scales are only valid for quantized (fp8/int8) KV pools")
-        self._kv_scales = (
-            None
-            if kv_scales is None
-            else kv_scales.to(device=device, dtype=torch.float32).contiguous().view(-1)
-        )
         # Calibration tables span every model layer; segments index them by
-        # ABSOLUTE layer id, so the fold covers the full calibrated extent.
+        # ABSOLUTE layer id, so the tables cover the full calibrated extent.
         self._num_calibrated_layers = q_real_LHF.numel() // (int(num_q_heads) * self.num_freqs)
-        # Segment layer ids index the fold tables ON DEVICE where they cannot
-        # be range-checked; validate the extent once here, loudly.
+        # Segment layer ids index the calibration tables ON DEVICE where they
+        # cannot be range-checked; validate the extent once here, loudly.
         if min(layer_indices) < 0 or max(layer_indices) >= self._num_calibrated_layers:
             raise ValueError("scored layer index exceeds the calibrated layer extent")
-        # Init-once tables for the mean-aggregation coefficient rotation
-        # (design: Fanrong Li, torch-graph review 2026-07-20). The
-        # offset-averaged phase of every possible round-start position is
-        # tabulated once, RoPE-style (float64 accumulation, stored fp32):
-        #   phase_cos[pos, f] = freq_scale_sq[f] * mean_o cos((pos + offset_o) * omega_f)
-        #   phase_sin[pos, f] = freq_scale_sq[f] * mean_o sin((pos + offset_o) * omega_f)
-        # and the per-layer KV dequantization scale is pre-multiplied into
-        # the calibration query (identity for float pools). The MLR
-        # coefficient has no position term, so its fold
-        # (kv_scale * freq_scale_sq * mlr) is fully static: the request axis
-        # disappears and nothing about it is recomputed per round. Every
-        # eviction round then gathers one table row per request and rotates
-        # the static query by it -- zero trigonometry at runtime. The score
-        # kernels perform that rotation themselves in an in-CTA prologue by
-        # default; the standalone rotation kernel remains the two-launch
-        # reference flavor (bit-identical scores, proven by the unit tests).
-        #
-        # Positions can legitimately reach the full sequence capacity, so the
-        # table covers [0, seq_len] inclusive. The 64-row floor keeps tiny
-        # synthetic unit-test geometries (whose logical round starts exceed
-        # their physical bucket) inside the table at negligible cost; every
-        # row is exact for its position, and production buckets (the
-        # manager's max sequence length) always exceed the floor.
-        self._max_position = max(int(seq_len), 63) + 1
-        omega64 = omega.view(-1)[: self.num_freqs].to(torch.float64)
-        freq_scale_sq64 = freq_scale_sq.view(-1)[: self.num_freqs].to(torch.float64)
-        positions = torch.arange(self._max_position, dtype=torch.float64, device=device)
-        cos_acc = torch.zeros(
-            self._max_position, self.num_freqs, dtype=torch.float64, device=device
-        )
-        sin_acc = torch.zeros_like(cos_acc)
-        for offset in offsets.to(torch.float64).tolist():
-            angle = (positions + offset).unsqueeze(1) * omega64.unsqueeze(0)
-            cos_acc += torch.cos(angle)
-            sin_acc += torch.sin(angle)
-        phase_scale = freq_scale_sq64.unsqueeze(0) / float(offsets.numel())
-        self._phase_cos = (cos_acc * phase_scale).to(torch.float32).contiguous()
-        self._phase_sin = (sin_acc * phase_scale).to(torch.float32).contiguous()
-        calibration_shape = (self._num_calibrated_layers, int(num_q_heads), self.num_freqs)
-        mlr_fold64 = mlr_coef_LHF.view(calibration_shape).to(torch.float64) * freq_scale_sq64
-        if self._kv_scales is None:
-            # kv_scale is 1.0 for float pools: the pre-scaled query IS the
-            # calibration query (aliased, not copied).
-            self._q_real_scaled = q_real_LHF.view(-1)
-            self._q_imag_scaled = q_imag_LHF.view(-1)
-        else:
-            layer_scales64 = (
-                self._kv_scales[: self._num_calibrated_layers].to(torch.float64).view(-1, 1, 1)
-            )
-            self._q_real_scaled = (
-                (q_real_LHF.view(calibration_shape).to(torch.float64) * layer_scales64)
-                .to(torch.float32)
-                .contiguous()
-                .view(-1)
-            )
-            self._q_imag_scaled = (
-                (q_imag_LHF.view(calibration_shape).to(torch.float64) * layer_scales64)
-                .to(torch.float32)
-                .contiguous()
-                .view(-1)
-            )
-            mlr_fold64 = mlr_fold64 * layer_scales64
-        self._mlr_fold = mlr_fold64.to(torch.float32).contiguous().view(-1)
-        # Folded per-round coefficient tables, allocated on first launch and
-        # keyed by plane count so switching aggregation (mean: one plane;
-        # max: one plane per offset) re-shapes without churn.
-        self._fold_buffers: dict = {}
-        # The anchor pool is passed to the CUDA score op ONLY as its dtype
-        # witness: the op recovers the pool element type from it and never
-        # reads data through it.
         seg_req = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
             self.num_layers
         )
@@ -525,42 +241,44 @@ class _FixedScoreGroup:
             mlr_coef_LHF.view(-1),
         )
         self.pointer_tail = (freq_scale_sq, omega, offsets)
-        # Optional SM100 CuTe mean-score specialization (see
-        # triattention_cute_score.py), compiled by the first
-        # ``prepare_cute_score`` call and default OFF behind the
-        # TRTLLM_TRIATTENTION_CUTE_SCORE environment knob (read once here).
-        # The CuTe runner encodes TMA descriptors from the actual pool
-        # tensors, so pool references are retained ONLY when the knob is on;
-        # the default path keeps the raw-address-only lifetime contract
-        # documented above.
+        # The SM100 CuTe score kernel (see triattention_cute_score.py) is THE
+        # score implementation; it is compiled by the first
+        # ``prepare_cute_score`` call. The runner encodes TMA descriptors from
+        # the actual pool tensors, hence the pool references retained here
+        # (see the LIFETIME note in the class docstring).
         self.seq_len = int(seq_len)
         self._cute_score_runner = None
         self._cute_score_attempted = False
-        cute_score_enabled = os.environ.get("TRTLLM_TRIATTENTION_CUTE_SCORE", "0") == "1"
-        self._cute_layer_pools = list(layer_pools) if cute_score_enabled else None
+        self._cute_layer_pools = list(layer_pools)
         self._cute_layer_indices = [int(layer) for layer in layer_indices]
 
     def prepare_cute_score(self, mean_cos: torch.Tensor, mean_sin: torch.Tensor) -> None:
-        """Compile the optional SM100 CuTe mean-score specialization once.
+        """Compile the SM100 CuTe score kernel once; raise loudly otherwise.
 
         Call this outside CUDA graph capture: compilation allocates memory
-        and synchronizes. With the environment knob unset (the default) or on
-        any unsupported geometry this returns without importing the CuTe
-        module, and every launch keeps using the compiled C++ score ops.
+        and synchronizes. The CuTe kernel is the ONLY score implementation,
+        so an unsupported geometry raises ValueError here and a runner
+        construction failure raises RuntimeError -- there is deliberately no
+        fallback path.
 
         Supported contract: SM100 exactly, BF16 pools, 32- or 128-token
-        pages, 32 or 64 frequencies (head size 64/128), and 4 or 8 query
-        heads per KV head — this covers the Qwen3 and GPT-OSS production
+        pages, 32 or 64 frequencies (head size 64/128), 4 or 8 query heads
+        per KV head, and a bucket capacity (``seq_len``) aligned to the
+        kernel's compute tile — this covers the Qwen3 and GPT-OSS production
         geometries as well as the original validation shape.
         """
         if self._cute_score_attempted:
             return
         self._cute_score_attempted = True
-        if self._cute_layer_pools is None:
-            return
         anchor = self.pointer_prefix[0]
-        num_q_heads, num_kv_heads, num_freqs, tokens_per_block, kv_factor = self.geometry_args[:5]
+        num_q_heads, num_kv_heads, num_freqs, tokens_per_block, kv_factor = self.geometry_args
         max_segments = self.max_requests * self.num_layers
+        # The kernel's epilogue stores full compute tiles (64 tokens, or one
+        # page for 128-token pages) into a scratch whose per-segment stride
+        # is seq_len, without masking the ragged tail of the LAST tile; an
+        # unaligned bucket would silently spill scores into the next
+        # segment's region, so it is rejected here instead.
+        score_tile_tokens = max(64, int(tokens_per_block))
         supported = (
             torch.cuda.get_device_capability(anchor.device) == (10, 0)
             and anchor.dtype == torch.bfloat16
@@ -570,22 +288,24 @@ class _FixedScoreGroup:
             and num_q_heads % num_kv_heads == 0
             and num_q_heads // num_kv_heads in (4, 8)
             and int(anchor.stride(-1)) == 1
+            and self.seq_len % score_tile_tokens == 0
             # The kernel computes flat score offsets in 32-bit arithmetic;
             # group-4 geometries pad the head axis to the MMA tile N=8.
             and num_kv_heads * 8 * max_segments * self.seq_len < 2**31
         )
         if not supported:
-            warnings.warn(
-                "TriAttention CuTe score not engaged despite "
-                "TRTLLM_TRIATTENTION_CUTE_SCORE=1: "
+            raise ValueError(
+                "TriAttention score requires SM100, bf16 KV pools, head size "
+                "64/128, 32/128-token pages, GQA group 4 or 8, and a bucket "
+                "capacity aligned to the score compute tile; got "
                 f"capability={torch.cuda.get_device_capability(anchor.device)}, "
                 f"dtype={anchor.dtype}, kv_factor={kv_factor}, "
                 f"tokens_per_block={tokens_per_block}, num_freqs={num_freqs}, "
                 f"heads={num_q_heads}q/{num_kv_heads}kv, "
                 f"stride={int(anchor.stride(-1))}, "
+                f"seq_len={self.seq_len} (tile {score_tile_tokens}), "
                 f"offset_audit={num_kv_heads * 8 * max_segments * self.seq_len}"
             )
-            return
         device = anchor.device
         try:
             from .triattention_cute_score import TriAttentionCuteScoreRunner
@@ -637,72 +357,43 @@ class _FixedScoreGroup:
                 freq_scale_sq=self.pointer_tail[0],
                 output=scratch,
             )
-            self._cute_scratch = scratch
-            self._cute_seg_seq_len = seg_seq_len
-            self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
-            from tensorrt_llm.logger import logger
-
-            logger.info(
-                f"TriAttention CuTe score enabled: {num_q_heads}q/{num_kv_heads}kv heads, "
-                f"{num_freqs} freqs, {tokens_per_block}-token pages"
-            )
         except (ImportError, RuntimeError, ValueError, AssertionError) as error:
-            warnings.warn(
-                f"TriAttention CuTe score setup failed; using the C++ score ops: {error}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            raise RuntimeError(
+                "TriAttention CuTe score setup failed and no other score path exists"
+            ) from error
+        self._cute_scratch = scratch
+        self._cute_seg_seq_len = seg_seq_len
+        self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
+        from tensorrt_llm.logger import logger
 
-    def _fold_coefficient_buffers(
-        self, offset_planes: int, with_mlr: bool
-    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]":
-        """Return (c_re, c_im, c_mlr) per-round scratch for one plane count.
-
-        Sized on ``max_requests`` so any launch's active ``request_count``
-        fits without reallocation (each launch prepares only its active
-        rows). The production mean path allocates NOTHING here: its score
-        kernels rotate coefficients in-CTA, so only the max aggregation
-        (which also writes a per-round c_mlr) and the two-launch mean
-        reference path (static MLR table, c_re/c_im planes only) ever call
-        this.
-        """
-        key = (offset_planes, with_mlr)
-        buffers = self._fold_buffers.get(key)
-        if buffers is None:
-            elements = (
-                self.max_requests
-                * self._num_calibrated_layers
-                * int(self.geometry_args[0])
-                * self.num_freqs
-            )
-            device = self.output.device
-            c_re = torch.empty(offset_planes * elements, dtype=torch.float32, device=device)
-            c_im = torch.empty_like(c_re)
-            c_mlr = torch.empty(elements, dtype=torch.float32, device=device) if with_mlr else None
-            buffers = (c_re, c_im, c_mlr)
-            self._fold_buffers[key] = buffers
-        return buffers
+        logger.info(
+            f"TriAttention CuTe score enabled: {num_q_heads}q/{num_kv_heads}kv heads, "
+            f"{num_freqs} freqs, {tokens_per_block}-token pages"
+        )
 
     def launch(
         self,
         request_count: int,
         valid_seq_lens: torch.Tensor,
         valid_widths: torch.Tensor,
-        round_starts_device: torch.Tensor,
         token_starts_device: torch.Tensor,
         mean_cos: torch.Tensor,
         mean_sin: torch.Tensor,
-        score_aggregation: str,
-        *,
-        mean_rotate_in_cta: bool = True,
+        aggregation: str = "mean",
     ) -> torch.Tensor:
         """Return decode-only scores as ``[request, layer, head, token]``.
 
-        ``mean_rotate_in_cta=False`` selects the two-launch mean coefficient
-        preparation (standalone rotation kernel + global-table score reads);
-        see ``_launch_tri_score_perhead``. Scores are bit-identical either
-        way — the unit tests compare the two with ``torch.equal``.
+        Runs the SM100 CuTe score kernel (the only score implementation) and
+        writes each request's decode width (``valid_seq_len - token_start``)
+        into ``valid_widths``, which the selection reduce kernels consume.
+        Only mean aggregation exists; ``request_count`` must be one of the
+        precompiled variants (1 or the group capacity).
         """
+        if aggregation != "mean":
+            raise ValueError(
+                f"unsupported score aggregation {aggregation!r}: max aggregation "
+                "was removed with the C++ score stack; only 'mean' exists"
+            )
         if request_count <= 0 or request_count > self.max_requests:
             raise ValueError("request count exceeds fixed score capacity")
         if (
@@ -713,95 +404,71 @@ class _FixedScoreGroup:
         ):
             raise ValueError("score output lengths do not fit the keep-set selector")
         num_segments = request_count * self.num_layers
-        if num_segments > 65535:
-            # Segments sit on the y grid axis (CUDA caps y/z at 65535) so the
-            # unbounded x axis can hold the token tiles of long sequences.
-            raise ValueError("request*layer segment count exceeds the CUDA grid limit")
         output = self.output[:request_count]
-        if score_aggregation == "mean":
-            # Lazy compile covers groups used without their owning workspace
-            # (unit tests); production compiles in the workspace constructor,
-            # outside CUDA graph capture. Default off: one attribute check.
-            self.prepare_cute_score(mean_cos, mean_sin)
-            runner = self._cute_score_runner
-            if runner is not None and not runner.supports(request_count):
-                missed = getattr(self, "_cute_supports_warned", set())
-                if request_count not in missed:
-                    missed.add(request_count)
-                    self._cute_supports_warned = missed
-                    warnings.warn(
-                        f"TriAttention CuTe score compiled variants miss "
-                        f"request_count={request_count}; falling back to the C++ "
-                        f"score op for this round"
-                    )
-            if runner is not None and runner.supports(request_count):
-                if not getattr(self, "_cute_engaged_logged", False):
-                    self._cute_engaged_logged = True
-                    warnings.warn(
-                        f"TriAttention CuTe score engaged (request_count={request_count})"
-                    )
-                # Stage per-segment valid lengths (segment = request x layer).
-                torch.index_select(
-                    valid_seq_lens,
-                    0,
-                    self.pointer_prefix[4][:num_segments],
-                    out=self._cute_seg_seq_len[:num_segments],
-                )
-                runner.launch(request_count, mean_cos, mean_sin)
-                # The kernel wrote full-sequence scores from physical token
-                # zero into its head-major scratch. Gather each request's
-                # decode window (starting at its pinned prompt length) into
-                # the group output so callers see exactly the layout the C++
-                # score ops produce. This costs one extra read+write of the
-                # score volume per round, only on this opt-in path; columns
-                # past a request's valid width carry unscored scratch data,
-                # matching the C++ op, whose consumers mask by valid width.
-                num_q_heads = int(self.geometry_args[0])
-                num_kv_heads = int(self.geometry_args[1])
-                group_size = num_q_heads // num_kv_heads
-                # The scratch head axis is padded to the MMA tile N=8 per
-                # KV head; slicing the view to the real group size skips
-                # the zero padding columns.
-                source = (
-                    self._cute_scratch[: num_kv_heads * 8 * num_segments * self.seq_len]
-                    .view(num_kv_heads, 8, request_count, self.num_layers, self.seq_len)[
-                        :, :group_size
-                    ]
-                    .permute(2, 3, 0, 1, 4)
-                )
-                columns = token_starts_device[:request_count].to(torch.int64).view(
-                    -1, 1, 1, 1, 1
-                ) + self._cute_gather_columns.view(1, 1, 1, 1, -1)
-                columns = columns.clamp_(max=self.seq_len - 1).expand(
-                    request_count,
-                    self.num_layers,
-                    num_kv_heads,
-                    group_size,
-                    self.output_width,
-                )
-                torch.gather(
-                    source,
-                    4,
-                    columns,
-                    out=output.view(
-                        request_count,
-                        self.num_layers,
-                        num_kv_heads,
-                        group_size,
-                        self.output_width,
-                    ),
-                )
-                return output
-        _launch_tri_score_perhead(
-            self,
-            request_count,
-            num_segments,
+        # Lazy compile covers groups used without their owning workspace
+        # (unit tests); production compiles in the workspace constructor,
+        # outside CUDA graph capture.
+        self.prepare_cute_score(mean_cos, mean_sin)
+        runner = self._cute_score_runner
+        if runner is None or not runner.supports(request_count):
+            raise RuntimeError(
+                f"TriAttention CuTe score has no compiled variant for "
+                f"request_count={request_count} (capacity {self.max_requests}) "
+                "and no other score path exists"
+            )
+        # Per-request decode widths for the selection reduce kernels; the
+        # deleted C++ score op used to write these (seq_len - token_start).
+        torch.sub(
+            valid_seq_lens[:request_count],
+            token_starts_device[:request_count],
+            out=valid_widths[:request_count],
+        )
+        # Stage per-segment valid lengths (segment = request x layer).
+        torch.index_select(
             valid_seq_lens,
-            valid_widths,
-            round_starts_device,
-            token_starts_device,
-            score_aggregation=score_aggregation,
-            mean_rotate_in_cta=mean_rotate_in_cta,
+            0,
+            self.pointer_prefix[4][:num_segments],
+            out=self._cute_seg_seq_len[:num_segments],
+        )
+        runner.launch(request_count, mean_cos, mean_sin)
+        # The kernel wrote full-sequence scores from physical token zero into
+        # its head-major scratch. Gather each request's decode window
+        # (starting at its pinned prompt length) into the group output, the
+        # ``[request, layer, head, token]`` layout the selection kernels
+        # read. Columns past a request's valid width carry unscored scratch
+        # data; consumers mask by ``valid_widths``.
+        num_q_heads = int(self.geometry_args[0])
+        num_kv_heads = int(self.geometry_args[1])
+        group_size = num_q_heads // num_kv_heads
+        # The scratch head axis is padded to the MMA tile N=8 per KV head;
+        # slicing the view to the real group size skips the zero padding
+        # columns.
+        source = (
+            self._cute_scratch[: num_kv_heads * 8 * num_segments * self.seq_len]
+            .view(num_kv_heads, 8, request_count, self.num_layers, self.seq_len)[:, :group_size]
+            .permute(2, 3, 0, 1, 4)
+        )
+        columns = token_starts_device[:request_count].to(torch.int64).view(
+            -1, 1, 1, 1, 1
+        ) + self._cute_gather_columns.view(1, 1, 1, 1, -1)
+        columns = columns.clamp_(max=self.seq_len - 1).expand(
+            request_count,
+            self.num_layers,
+            num_kv_heads,
+            group_size,
+            self.output_width,
+        )
+        torch.gather(
+            source,
+            4,
+            columns,
+            out=output.view(
+                request_count,
+                self.num_layers,
+                num_kv_heads,
+                group_size,
+                self.output_width,
+            ),
         )
         return output
 

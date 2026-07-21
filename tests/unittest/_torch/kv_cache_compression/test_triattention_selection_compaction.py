@@ -23,6 +23,14 @@ def _require_cute_topk_op() -> None:
     )
 
 
+# Tests that launch real scores run the SM100 CuTe score kernel -- the only
+# score path -- so they are SM100-only, like the production feature itself.
+requires_sm100 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="TriAttention score requires SM100",
+)
+
+
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
     values = row[:width].tolist()
     selected = sorted(range(width), key=lambda index: (-values[index], index))
@@ -601,16 +609,25 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
         assert torch.equal(cohort_pool, expected_pool)
 
 
+@requires_sm100
 def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     """Keep score and compaction layer axes aligned across interleaved V2 pools."""
+    pytest.importorskip("cutlass")
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         _FixedScoreStagingBuffers,
     )
 
     device = torch.device("cuda", torch.cuda.current_device())
     num_layers = 3
+    # The staged bucket capacity must be aligned to the score kernel's
+    # 64-token compute tile; the request itself stays 8 tokens long.
+    bucket_capacity = 64
     seq_len = 8
     keep_count = 2
+    # GQA group 8 (the smallest CuTe-supported group with one KV head); all
+    # query heads share one zero calibration query and one MLR coefficient,
+    # so every head row carries the same |K|-driven score.
+    num_q_heads = 8
     # bf16 pools in the compact op's supported geometry. The scored tokens
     # all live in each table's first entry, but the two tables still map the
     # two storage groups onto different physical pages, which is what the
@@ -658,7 +675,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         pools.append(pool)
     initial_pools = [pool.clone() for pool in pools]
 
-    q_real = torch.zeros(num_layers, 1, num_freqs, dtype=torch.float32, device=device)
+    q_real = torch.zeros(num_layers, num_q_heads, num_freqs, dtype=torch.float32, device=device)
     q_imag = torch.zeros_like(q_real)
     mlr_coef = torch.zeros_like(q_real)
     mlr_coef[:, :, 0] = 1
@@ -670,8 +687,8 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         dense_layers,
         [0, 1],
         1,
-        seq_len,
-        1,
+        bucket_capacity,
+        num_q_heads,
         num_freqs,
         q_real,
         q_imag,
@@ -692,9 +709,9 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     keep_set_selector = _BatchedPerHeadKeepSetSelector(
         eviction_mode="per_layer_perhead",
         dense_layers=tuple(dense_layers),
-        num_query_heads=1,
+        num_query_heads=num_q_heads,
         num_kv_heads=1,
-        width=seq_len,
+        width=bucket_capacity,
         keep_count=keep_count,
         dtype=torch.float32,
         device=device,
@@ -739,16 +756,18 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         assert torch.equal(after[:, :, :keep_count], before.index_select(2, selected))
 
 
+@requires_sm100
 def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     """Run two real eviction rounds through one live V2 cache.
 
-    The cache uses the compact op's supported geometry (bf16, 32-token
-    pages, head_dim 64): the request spans three pages so that compacting to
-    two pages still releases one physical page for reuse. Token scores are
-    tracked in a host-side mirror and the expected keep sets are derived
-    from it, replacing the hand-written score tables of the old 4-token-page
-    fixture.
+    The cache uses the score and compact kernels' supported geometry (bf16,
+    32-token pages, head_dim 64): the request spans three pages so that
+    compacting to two pages still releases one physical page for reuse.
+    Token scores are tracked in a host-side mirror and the expected keep
+    sets are derived from it, replacing the hand-written score tables of the
+    old 4-token-page fixture.
     """
+    pytest.importorskip("cutlass")
     import tensorrt_llm
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
@@ -761,9 +780,12 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     device = torch.device("cuda", torch.cuda.current_device())
     request_id = 7
     prompt_len = 2
-    seq_len = 66
+    # The bucket capacity equals the confirmed length here and must be
+    # aligned to the score kernel's 64-token compute tile; the protected
+    # tail rides beyond it.
+    seq_len = 64
     protected_tail = 2
-    compacted_capacity = 34
+    compacted_capacity = 36
     tokens_per_block = 32
     head_dim = 64
     num_freqs = head_dim // 2
@@ -850,7 +872,11 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
                 device=device,
             )
 
-        q_real = torch.zeros(1, 1, num_freqs, dtype=torch.float32, device=device)
+        # GQA group 8 (the smallest CuTe-supported group with one KV head);
+        # zero calibration query and a shared MLR coefficient give every
+        # query head the same |K|-driven score.
+        num_q_heads = 8
+        q_real = torch.zeros(1, num_q_heads, num_freqs, dtype=torch.float32, device=device)
         q_imag = torch.zeros_like(q_real)
         mlr_coef = torch.zeros_like(q_real)
         mlr_coef[..., 0] = 1
@@ -863,7 +889,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             [0],
             1,
             seq_len,
-            1,
+            num_q_heads,
             num_freqs,
             q_real,
             q_imag,
@@ -877,16 +903,18 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             page_table_token_capacity=seq_len + protected_tail,
         )
         keep_set_selector = _BatchedUnionKeepSetSelector(
-            rows=1,
+            rows=num_q_heads,
             width=seq_len - prompt_len,
             keep_count=keep_count,
             dtype=torch.float32,
             device=device,
             max_requests=1,
             dense_layers=(0,),
-            num_query_heads=1,
+            num_query_heads=num_q_heads,
             num_kv_heads=1,
-            input_scores=score_staging.fused_group.output.view(1, 1, seq_len - prompt_len),
+            input_scores=score_staging.fused_group.output.view(
+                1, num_q_heads, seq_len - prompt_len
+            ),
             normalize_scores=False,
             prompt_offsets_buffer=score_staging.token_starts_device,
         )

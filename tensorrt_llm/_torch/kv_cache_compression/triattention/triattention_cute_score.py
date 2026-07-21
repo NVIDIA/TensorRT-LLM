@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM100 CuTe-DSL scorer for the TriAttention mean-score path.
 
-This is the production specialization of the final workbench kernel. It
-uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ, and
-producer-only page-ID lookahead. The public integration keeps the compiled
-C++ score ops as the implementation for every geometry outside the exact
-contract validated here.
+This is the production specialization of the final workbench kernel — and
+the ONLY score implementation. It uses split real/imag TMA loads, BF16 and
+FP16 compensated UMMA, sqrt FTZ, and producer-only page-ID lookahead.
+Geometries outside the exact contract validated here raise loudly at setup
+(``_FixedScoreGroup.prepare_cute_score``); there is no fallback path.
 
 Page-table contract: ``page_ids`` is the flattened native block-offset
-staging buffer ([pool_slot, request, K/V plane, block] int32) shared with
-the C++ score op; K-plane entries encode ``physical_page * kv_factor`` and
+staging buffer ([pool_slot, request, K/V plane, block] int32) produced by
+the V2 manager; K-plane entries encode ``physical_page * kv_factor`` and
 are decoded inline (kv_factor == 2), so no per-round conversion pass is
 needed.
 """
@@ -696,10 +696,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                 # buffer ([pool_slot, request, K/V plane, block] int32) and
                 # ``page_off`` points at one request's K plane. K-plane
                 # entries encode ``physical_page * kv_factor`` (kv_factor is
-                # 2 for the interleaved K/V pools this kernel requires); the
-                # C++ score op decodes the same buffer with
-                # ``encoded / kvFactor`` (triAttentionScoreKernels.cu), so
-                # divide by two here as well. V-plane entries are never read.
+                # 2 for the interleaved K/V pools this kernel requires), so
+                # divide by two here. V-plane entries are never read.
                 producer_prefetched_page_id_lane0 = (
                     cutlass.Int32(page_ids[page_off + page_index * self.pages_per_tile]) // 2
                 )

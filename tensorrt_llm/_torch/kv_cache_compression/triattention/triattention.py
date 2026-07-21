@@ -744,10 +744,10 @@ class _FixedScoreStagingBuffers:
             offsets,
             output_width=decode_width,
         )
-        # Compile the optional SM100 CuTe score specialization here, outside
-        # any CUDA graph capture (compilation allocates and synchronizes).
-        # Default off: without TRTLLM_TRIATTENTION_CUTE_SCORE=1 this is a
-        # no-op and scoring stays on the compiled C++ score ops.
+        # Compile the SM100 CuTe score kernel (the only score implementation)
+        # here at workspace construction, outside any CUDA graph capture
+        # (compilation allocates and synchronizes). Unsupported geometry
+        # raises loudly right here rather than mid-round at the score launch.
         self.fused_group.prepare_cute_score(self.mean_cos, self.mean_sin)
         self.copy_done = torch.cuda.Event()
         # First record publishes constructor allocations to the V2 copy stream;
@@ -759,22 +759,25 @@ class _FixedScoreStagingBuffers:
         self.page_tables_active = False
         self.stream = None
         self._score_valid_widths: Optional[torch.Tensor] = None
-        self._score_aggregation: Optional[str] = None
+        self._score_launcher_bound = False
 
-    def bind_score_launcher(self, valid_widths: torch.Tensor, score_aggregation: str) -> None:
-        """Bind the per-row score widths and aggregation for these buffers."""
-        if self._score_aggregation is not None:
+    def bind_score_launcher(self, valid_widths: torch.Tensor, aggregation: str) -> None:
+        """Bind the per-row score widths for these buffers (mean-only)."""
+        if self._score_launcher_bound:
             raise RuntimeError("TriAttention score launcher is already bound")
-        if score_aggregation not in ("mean", "max"):
-            raise ValueError(f"unsupported score aggregation: {score_aggregation}")
+        if aggregation != "mean":
+            raise ValueError(
+                f"unsupported score aggregation {aggregation!r}: max aggregation "
+                "was removed with the C++ score stack; only 'mean' exists"
+            )
         self._score_valid_widths = valid_widths
-        self._score_aggregation = score_aggregation
+        self._score_launcher_bound = True
 
     def launch_prepared_score(self) -> torch.Tensor:
         """Launch the phase and score kernels over these buffers."""
         from .triattention_kernels import prepare_mean_phase
 
-        if self._score_aggregation is None:
+        if not self._score_launcher_bound:
             raise RuntimeError("TriAttention score launcher is not bound")
         stream = torch.cuda.current_stream(self.device)
         if self.stream is None:
@@ -786,30 +789,24 @@ class _FixedScoreStagingBuffers:
             raise _FixedScoreStreamMismatch(
                 "TriAttention score launches must stay on the staging CUDA stream"
             )
-        if self._score_aggregation == "mean" and self.fused_group._cute_score_runner is not None:
-            # mean_cos/mean_sin feed ONLY the opt-in CuTe score runner, whose
-            # compiled kernel captured their device pointers, so they must be
-            # refreshed before it launches. The default C++ mean path rotates
-            # init-time phase tables inside the score kernels' own CTA
-            # prologue instead, so production rounds launch zero phase or
-            # coefficient kernels.
-            prepare_mean_phase(
-                self.round_starts_device,
-                self.offsets,
-                self.omega,
-                self.mean_cos,
-                self.mean_sin,
-                self.max_requests,
-            )
+        # mean_cos/mean_sin feed the CuTe score kernel, whose compiled launch
+        # captured their device pointers, so they must be refreshed from this
+        # round's staged round starts before it runs.
+        prepare_mean_phase(
+            self.round_starts_device,
+            self.offsets,
+            self.omega,
+            self.mean_cos,
+            self.mean_sin,
+            self.max_requests,
+        )
         return self.fused_group.launch(
             self.max_requests,
             self.valid_seq_lens_device,
             self._score_valid_widths,
-            self.round_starts_device,
             self.token_starts_device,
             self.mean_cos,
             self.mean_sin,
-            self._score_aggregation,
         )
 
     def stage(
@@ -1060,7 +1057,6 @@ class TriAttention(BaseKVCacheCompressionManager):
         beta: int = 128,
         model_path: Optional[str] = None,
         calibration_path: Optional[str] = None,
-        score_aggregation: str = "mean",
         eviction_mode: str = "union",
         normalize_scores: bool = True,
         pin_prefill: bool = True,
@@ -1092,7 +1088,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         # All physical moves use the C++ V2 compaction operation.
         # No other compaction path exists.
-        self.score_aggregation = score_aggregation
         # Calibration is the OFFICIAL TriAttention .pt (passed via
         # calibration_path), resolved + converted on the first request
         # (on_request_init). TRT-LLM does NOT compute calibration; model_path is
@@ -1927,6 +1922,13 @@ class TriAttention(BaseKVCacheCompressionManager):
             self.top_B + 2 * self.beta + int(mgr.max_total_draft_tokens or 0),
         )
         seq_capacity = max(needed_page_tokens, int(mgr.max_seq_len))
+        # The CuTe score kernel stores full compute tiles (64 tokens, or one
+        # page for 128-token pages) into a scratch strided by this bucket
+        # capacity, so the capacity must be tile-aligned (its geometry gate
+        # rejects anything else). Rounding up costs at most one tile of
+        # scratch per segment and never changes scoring semantics.
+        score_tile_tokens = max(64, int(mgr.tokens_per_block))
+        seq_capacity = -(-seq_capacity // score_tile_tokens) * score_tile_tokens
         page_table_token_capacity = max(needed_page_tokens, seq_capacity + tail_capacity)
 
         dense_groups = list(layout.storage_groups.values())
@@ -2003,7 +2005,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         provisional.zero_()
         score_staging.bind_score_launcher(
             keep_set_selector.valid_widths,
-            self.score_aggregation,
+            "mean",
         )
         resources = _EvictionBuffers(
             score_staging=score_staging,
