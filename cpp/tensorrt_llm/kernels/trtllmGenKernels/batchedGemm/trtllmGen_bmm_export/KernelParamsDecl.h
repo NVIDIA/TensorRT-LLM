@@ -208,6 +208,26 @@ struct KernelParams
     // The output matrix C. Check "logical" layout of tmaC to see the shape and strides.
     void* ptrC{nullptr};
 
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    //
+    // MoE (Mixture of Experts) finalize parameters for direct register-to-gmem store.
+    //
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Mapping from permuted token index to expanded token index.
+    // Used in MoE finalize to map the batch dimension back to the original token order.
+    // Shape is [numTokens * topK] where topK is the number of experts per token.
+    // Value of -1 indicates an invalid/padded entry that should be skipped.
+    // The dtype is int32_t.
+    int32_t const* permutedIdxToExpandedIdx{nullptr};
+
+    // Expert weights (routing probabilities) for each expanded token.
+    // Used in MoE finalize to scale the output by the expert's routing weight.
+    // Shape is [numTokens * topK].
+    // The dtype matches the output dtype (typically bfloat16 or float16).
+    // Can be nullptr if no expert weighting is needed.
+    void const* expertWeightsPtr{nullptr};
+
     // Inputs and output are MxFp{4,8}, Fp8, NvFp4.
     // The scaling factors to apply to the output - can be used to incorporate input scaling factors
     // as described below: C = SEncC * act(SDecA * SDecB * A * Bl) . (SDecA * SDecB * A * Br)
@@ -317,8 +337,7 @@ struct KernelParams
     //
     // This is used for either:
     //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
-    //   * When the routing scales are applied to the input activations (only when output is not
-    //   transposed). The dtype is Dtype::Bfloat16
+    //   * One-sided per-token scaling. The dtype is Dtype::Bfloat16 by default.
     //
     // if (batchM (A is activations)):
     //     Logical shape is [sum(divUpMul(M[bi], tileM) for bi in B)]
@@ -332,8 +351,7 @@ struct KernelParams
     //
     // This is used for either:
     //   * Per-token scaling factor quantization schemes, such as MetaFP8. The dtype is Dtype::Float32
-    //   * When the routing scales are applied to the input activations (only when output is
-    //   transposed). The dtype is Dtype::Bfloat16
+    //   * One-sided per-token scaling. The dtype is Dtype::Bfloat16 by default.
     //
     // if (batchM (B is weights)):
     //     Logical shape is [B, divUpMul(N, tileN)]
@@ -563,6 +581,14 @@ struct KernelParams
     int rank;
     // The number of peer devices in tensor-parallel group.
     int tpGrpSize;
+    // A barrier that is used to synchronize kernels running on multiple GPUs.
+    // UC is a unicast pointer in local GPU memory.
+    // MC is a multicast pointer to all other GPUs' memory.
+    //
+    // The value must be initialized to zero. The barrier is self-resetting. It
+    // does not have to be reset by another kernel after the grid has ended.
+    uint32_t* ptrMulticastCompletionBarUc;
+    uint32_t* ptrMulticastCompletionBarMc;
 
     //////////////////////////////////////////////////////////////////////////////////////////////////
     //

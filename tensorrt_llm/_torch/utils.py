@@ -61,6 +61,10 @@ class ActType_TrtllmGen(IntEnum):
     Relu2 = 1
     # act = x0 * sigmoid(x0)
     Silu = 2
+    # SiTu gated activation (Kimi K3), gate on x1:
+    #   act = (beta * tanh(x0 / beta)) * (alpha * tanh(x1 / alpha) * sigmoid(x1))
+    # alpha/beta come from the per-expert gemm1_alpha/gemm1_beta runtime buffers.
+    SiTu = 3
 
 
 # IMPORTANT: when adding a new activation type, please update this function.

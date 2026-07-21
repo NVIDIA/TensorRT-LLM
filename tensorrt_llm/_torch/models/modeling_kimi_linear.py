@@ -240,19 +240,27 @@ class KimiK3MoERuntime(nn.Module):
                                     dtype=dtype)
                           if self.ep_size > 1 else None)
 
-        # Fast fused SiTU MoE path (private flashinfer MXFP4 cubins). The
-        # kernel-layout weights are prepared lazily on the first forward
-        # (after load_weights has populated the bank); the bank's packed
-        # buffers are freed afterwards to avoid holding the expert slice
-        # twice. Requires the snapshot flashinfer env (see
-        # kimi_k3_moe/_fused_situ_backend.py) in the launch environment.
+        # Fused SiTU MoE paths. KIMI_K3_FUSED_MOE selects the backend:
+        #   "0" (default) — Python per-expert fallback;
+        #   "1"           — private flashinfer MXFP4 cubins (W4A16, requires the
+        #                   snapshot flashinfer env, see
+        #                   kimi_k3_moe/_fused_situ_backend.py);
+        #   "native"      — in-tree TRTLLM-Gen SiTU op (W4A8 MXFP4xMXFP8,
+        #                   torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner;
+        #                   no external cubin env needed, SM100/SM103 only).
+        # In both fused modes the kernel-layout weights are prepared lazily on
+        # the first forward (after load_weights has populated the bank); the
+        # bank's packed buffers are freed afterwards to avoid holding the
+        # expert slice twice.
         import os as _os
-        self.use_fused_moe = _os.environ.get("KIMI_K3_FUSED_MOE",
-                                             "0") == "1"
+        _fused_mode = _os.environ.get("KIMI_K3_FUSED_MOE", "0")
+        self.use_fused_moe = _fused_mode == "1"
+        self.use_native_fused_moe = _fused_mode == "native"
         self._situ_alpha = float(situ_beta)
         self._situ_linear_beta = float(situ_linear_beta
                                        if situ_linear_beta is not None else 1.0)
         self._fused_weights = None
+        self._native_fused_weights = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
@@ -293,6 +301,45 @@ class KimiK3MoERuntime(nn.Module):
                      "w2_packed", "w2_scales"):
             bank.register_buffer(name, empty.clone())
 
+    def _ensure_native_fused_weights(self) -> None:
+        """Lazily pack the bank's MXFP4 buffers for the in-tree SiTU op."""
+        if self._native_fused_weights is not None:
+            return
+        from ..modules.kimi_k3_moe._moe_kernels import (
+            assert_native_situ_supported, make_situ_alpha_beta,
+            pack_routed_expert_weights)
+        assert_native_situ_supported(
+            hidden_size=self.moe_hidden_size,
+            intermediate_size=self.expert_bank.intermediate_size)
+        bank = self.expert_bank
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        packed = pack_routed_expert_weights(
+            w1_packed=bank.w1_packed,
+            w1_scales=bank.w1_scales,
+            w3_packed=bank.w3_packed,
+            w3_scales=bank.w3_scales,
+            w2_packed=bank.w2_packed,
+            w2_scales=bank.w2_scales,
+            device=device,
+        )
+        packed["gemm1_alpha"], packed["gemm1_beta"] = make_situ_alpha_beta(
+            local_num_experts=self.experts_per_rank,
+            situ_beta=self._situ_alpha,
+            situ_linear_beta=self._situ_linear_beta,
+            device=device,
+        )
+        self._native_fused_weights = packed
+        logger.info(
+            f"[KimiK3MoERuntime] layer {self.layer_idx}: prepared native "
+            f"TRTLLM-Gen SiTU weights for {self.experts_per_rank} local "
+            f"experts (offset {self.expert_lo})")
+        # Free the (now redundant) bank copies of the expert slice.
+        empty = torch.empty(0, dtype=torch.uint8,
+                            device=bank.w1_packed.device)
+        for name in ("w1_packed", "w1_scales", "w3_packed", "w3_scales",
+                     "w2_packed", "w2_scales"):
+            bank.register_buffer(name, empty.clone())
+
     def _moe_infer_local(self, x: torch.Tensor, topk_ids: torch.Tensor,
                          topk_weight: torch.Tensor) -> torch.Tensor:
         """HF ``KimiSparseMoeBlock.moe_infer`` restricted to local experts.
@@ -300,6 +347,30 @@ class KimiK3MoERuntime(nn.Module):
         Tokens routed to non-local experts contribute zeros; the cross-rank
         allreduce in :meth:`forward` completes the sum.
         """
+        if self.use_native_fused_moe:
+            if x.shape[0] == 0:
+                return torch.zeros_like(x)
+            from ..modules.kimi_k3_moe._moe_kernels import \
+                invoke_native_situ_moe
+            self._ensure_native_fused_weights()
+            fw = self._native_fused_weights
+            return invoke_native_situ_moe(
+                hidden_states=x,
+                topk_ids=topk_ids,
+                topk_weights=topk_weight,
+                gemm1_weights=fw["gemm1_weights"],
+                gemm1_weights_scale=fw["gemm1_weights_scale"],
+                gemm2_weights=fw["gemm2_weights"],
+                gemm2_weights_scale=fw["gemm2_weights_scale"],
+                gemm1_alpha=fw["gemm1_alpha"],
+                gemm1_beta=fw["gemm1_beta"],
+                num_experts=self.num_experts,
+                top_k=self.top_k,
+                valid_hidden_size=self.moe_hidden_size,
+                valid_intermediate_size=self.expert_bank.intermediate_size,
+                local_expert_offset=self.expert_lo,
+                local_num_experts=self.experts_per_rank,
+            )
         if self.use_fused_moe:
             if x.shape[0] == 0:
                 return torch.zeros_like(x)
