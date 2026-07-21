@@ -10,13 +10,6 @@ import torch
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="TriAttention CuTe kernels require SM100",
 )
-@pytest.mark.xfail(
-    reason="the fused score kernel misreads every page after the first under "
-    "this environment's cutlass DSL (page-id prefetch drift; page 0 matches "
-    "the oracle to 1e-6, pages 1+ are corrupt) — kept as the repro while the "
-    "kernel/DSL mismatch is resolved upstream",
-    strict=True,
-)
 @pytest.mark.parametrize(
     "score_start,valid_lens",
     [

@@ -714,8 +714,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         if cutlass.dynamic_expr(shard_has_page):
             if warp_idx == self.producer_warp_id:
                 if lane_idx == 0:
-                    producer_prefetched_page_id_lane0 = cutlass.Int32(
-                        page_ids[page_off + page_index]
+                    # The staged K-plane entries encode physical_page *
+                    # kv_factor (2); decode to the pool page index here,
+                    # matching the production score kernel.
+                    producer_prefetched_page_id_lane0 = (
+                        cutlass.Int32(page_ids[page_off + page_index]) // 2
                     )
         tCrRawBf16ASplit = raw_bf16_tiled_mma.make_fragment_A(cpasync_raw_k_0)
         tCrRawBf16B0 = raw_bf16_tiled_mma.make_fragment_B(sRawBf16B0)
@@ -945,8 +948,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                 next_page_start < valid_seq_len
                                 and next_pages_processed < self.max_pages
                             ):
-                                next_page_id_lane0 = cutlass.Int32(
-                                    page_ids[page_off + page_index + self.page_shards]
+                                next_page_id_lane0 = (
+                                    cutlass.Int32(
+                                        page_ids[page_off + page_index + self.page_shards]
+                                    )
+                                    // 2
                                 )
                     producer_prefetched_page_id_lane0 = next_page_id_lane0
 
