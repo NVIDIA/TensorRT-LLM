@@ -264,6 +264,12 @@ class Mamba2Metadata:
                                             dtype=torch.long,
                                             device="cuda")
 
+        # Slots that are reset for prefill sequences.
+        self._reset_pos_cpu = torch.zeros(max_batch_size,
+                                          dtype=torch.long,
+                                          pin_memory=prefer_pinned())
+        self.reset_state_indices = None
+
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
         self.replay_num_decodes = 0
@@ -327,6 +333,9 @@ class Mamba2Metadata:
 
         kv_cache_manager = attn_metadata.kv_cache_manager
         request_ids = attn_metadata.request_ids
+
+        # Recomputed below for prefill batches, None means "no slots to reset".
+        self.reset_state_indices = None
 
         if (kv_cache_manager is not None
                 and hasattr(kv_cache_manager, 'get_state_indices')
@@ -425,6 +434,22 @@ class Mamba2Metadata:
             # Keep a host boolean gate for chunk metadata construction.
             self.use_initial_states = bool(
                 self.has_initial_states_cpu[:num_contexts].any())
+
+            # Select the reset slots on the host mask, stage the positions
+            # through the pinned buffer, then gather the slot ids on-device.
+            # Done once here since it is identical for every GDN layer.
+            reset_pos_cpu = torch.nonzero(
+                ~self.has_initial_states_cpu[:num_contexts], as_tuple=True)[0]
+            num_reset = reset_pos_cpu.numel()
+            if num_reset > 0:
+                self._reset_pos_cpu[:num_reset].copy_(reset_pos_cpu)
+                reset_pos = self._reset_pos_cpu[:num_reset].to(
+                    self.state_indices.device, non_blocking=True)
+                # index_fill_ needs int64 indices.
+                self.reset_state_indices = self.state_indices[:
+                                                              num_contexts].index_select(
+                                                                  0, reset_pos
+                                                              ).to(torch.long)
 
             if self.use_initial_states:
                 _extra = compute_extra_chunks_cpu(attn_metadata.seq_lens,

@@ -1036,14 +1036,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
         if num_prefills > 0:
-            # PyExecutor guarantees prefill requests are placed before decode requests
-            has_initial_states_p = has_initial_states[:num_prefills]
-            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=ssm_states.dtype, device=ssm_states.device
-            )
-            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
-                (), dtype=conv_states.dtype, device=conv_states.device
-            )
+            # Zero conv/ssm cache slots for prefill sequences with no initial
+            # state. Indices are precomputed once per forward in prepare();
+            reset_state_indices = mamba_metadata.reset_state_indices
+            if reset_state_indices is not None:
+                ssm_states.index_fill_(0, reset_state_indices, 0)
+                conv_states.index_fill_(0, reset_state_indices, 0)
 
         is_target_verify = (
             num_decodes > 0
