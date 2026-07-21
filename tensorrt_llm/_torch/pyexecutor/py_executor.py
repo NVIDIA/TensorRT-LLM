@@ -114,6 +114,15 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# Exact-workload, bounded phase tracing for NVBUG 6448152. This is enabled
+# only by the diagnostic perf-sanity YAML and does not alter scheduler or
+# transfer behavior.
+NVBUG_6448152_PHASE_TRACE_ENV_VAR_NAME = \
+    "TRTLLM_NVBUG_6448152_PHASE_TRACE"
+NVBUG_6448152_PHASE_TRACE_MAX_REQUESTS = 1024
+NVBUG_6448152_PHASE_TRACE_MAX_TRANSITIONS = 65536
+NVBUG_6448152_PHASE_TRACE_MAX_CUDA_RECORDS = 64
+
 
 class PPCommTag(IntEnum):
     """
@@ -917,6 +926,23 @@ class PyExecutor:
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
+        self._nvbug_6448152_phase_trace_enabled = os.environ.get(
+            NVBUG_6448152_PHASE_TRACE_ENV_VAR_NAME, "0") == "1"
+        self._nvbug_6448152_phase_trace_request_ids: set[int] = set()
+        self._nvbug_6448152_phase_trace_transitions: set[Tuple[str, int,
+                                                               int]] = set()
+        self._nvbug_6448152_phase_trace_dropped_requests = 0
+        self._nvbug_6448152_phase_trace_dropped_transitions = 0
+        self._nvbug_6448152_phase_trace_counters: Dict[str, int] = {}
+        self._nvbug_6448152_phase_trace_cuda_enqueue_ns: Dict[Tuple[int, int],
+                                                              int] = {}
+        self._nvbug_6448152_phase_trace_cuda_records: Dict[int,
+                                                           Tuple[Tuple[int,
+                                                                       ...],
+                                                                 int,
+                                                                 int]] = {}
+        self._nvbug_6448152_phase_marker(
+            "python_mode", max_requests=NVBUG_6448152_PHASE_TRACE_MAX_REQUESTS)
         cache_transceiver_config = getattr(self.llm_args,
                                            "cache_transceiver_config", None)
         max_tokens_in_buffer = getattr(cache_transceiver_config,
@@ -1075,7 +1101,191 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
+    def _nvbug_6448152_phase_marker(self,
+                                    event: str,
+                                    request_id: Optional[int] = None,
+                                    per_iteration: bool = False,
+                                    transition_iteration: Optional[int] = None,
+                                    **fields) -> None:
+        """Emit one bounded, behavior-neutral phase marker."""
+        if not getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+            return
+
+        if request_id is not None:
+            request_id = int(request_id)
+            if request_id not in self._nvbug_6448152_phase_trace_request_ids:
+                if len(self._nvbug_6448152_phase_trace_request_ids
+                       ) >= NVBUG_6448152_PHASE_TRACE_MAX_REQUESTS:
+                    self._nvbug_6448152_phase_trace_dropped_requests += 1
+                    return
+                self._nvbug_6448152_phase_trace_request_ids.add(request_id)
+            transition = (event, request_id,
+                          (self.iter_counter if transition_iteration is None
+                           else transition_iteration) if per_iteration else -1)
+            if transition in self._nvbug_6448152_phase_trace_transitions:
+                return
+            if len(self._nvbug_6448152_phase_trace_transitions
+                   ) >= NVBUG_6448152_PHASE_TRACE_MAX_TRANSITIONS:
+                self._nvbug_6448152_phase_trace_dropped_transitions += 1
+                return
+            self._nvbug_6448152_phase_trace_transitions.add(transition)
+
+        marker_fields = {
+            "event": event,
+            "world_rank": self.global_rank,
+            "pp_rank": self.dist.pp_rank,
+            "iteration": self.iter_counter,
+            "request_id": request_id if request_id is not None else -1,
+            "monotonic_ns": time.monotonic_ns(),
+            **fields,
+        }
+        payload = " ".join(f"{key}={value}"
+                           for key, value in marker_fields.items())
+        logger.info(f"NVBUG6448152_PHASE {payload}")
+
+    def _nvbug_6448152_phase_context_requests(self,
+                                              event: str,
+                                              requests,
+                                              per_iteration: bool = False,
+                                              **fields) -> None:
+        if not getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+            return
+        for request in requests:
+            if request.is_context_only_request:
+                self._nvbug_6448152_phase_marker(event,
+                                                 request.request_id,
+                                                 per_iteration=per_iteration,
+                                                 **fields)
+
+    def _nvbug_6448152_phase_count(self,
+                                   counter: str,
+                                   value: int = 1,
+                                   **fields) -> None:
+        """Checkpoint aggregate counts only at powers of two."""
+        if (not getattr(self, "_nvbug_6448152_phase_trace_enabled", False)
+                or value <= 0):
+            return
+        count = self._nvbug_6448152_phase_trace_counters.get(counter, 0) + value
+        self._nvbug_6448152_phase_trace_counters[counter] = count
+        if count & (count - 1) == 0:
+            self._nvbug_6448152_phase_marker(f"{counter}_checkpoint",
+                                             **{counter: count}, **fields)
+
+    def _nvbug_6448152_phase_summary(self) -> None:
+        if not getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+            return
+        counter_fields = {
+            f"total_{counter}": value
+            for counter, value in
+            self._nvbug_6448152_phase_trace_counters.items()
+        }
+        self._nvbug_6448152_phase_marker(
+            "python_summary",
+            traced_requests=len(self._nvbug_6448152_phase_trace_request_ids),
+            transitions=len(self._nvbug_6448152_phase_trace_transitions),
+            dropped_requests=self._nvbug_6448152_phase_trace_dropped_requests,
+            dropped_transitions=(
+                self._nvbug_6448152_phase_trace_dropped_transitions),
+            stale_cuda_records=len(
+                self._nvbug_6448152_phase_trace_cuda_records),
+            stale_cuda_enqueues=len(
+                self._nvbug_6448152_phase_trace_cuda_enqueue_ns),
+            **counter_fields)
+        self._nvbug_6448152_phase_trace_cuda_records.clear()
+        self._nvbug_6448152_phase_trace_cuda_enqueue_ns.clear()
+
+    def _nvbug_6448152_phase_record_cuda_enqueue(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        if not getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+            return
+        originating_iteration = self.iter_counter
+        enqueue_monotonic_ns = time.monotonic_ns()
+        for request in scheduled_requests.context_requests:
+            if not request.is_context_only_request:
+                continue
+            request_id = int(request.request_id)
+            self._nvbug_6448152_phase_marker(
+                "cuda_forward_enqueue",
+                request_id,
+                per_iteration=True,
+                transition_iteration=originating_iteration,
+                originating_iteration=originating_iteration,
+                enqueue_monotonic_ns=enqueue_monotonic_ns)
+            if len(self._nvbug_6448152_phase_trace_cuda_enqueue_ns
+                   ) < NVBUG_6448152_PHASE_TRACE_MAX_TRANSITIONS:
+                self._nvbug_6448152_phase_trace_cuda_enqueue_ns[(
+                    request_id, originating_iteration)] = enqueue_monotonic_ns
+            else:
+                self._nvbug_6448152_phase_count(
+                    "cuda_forward_enqueue_records_dropped")
+
+    def _nvbug_6448152_phase_register_cuda_forward(
+            self, scheduled_requests: ScheduledRequests,
+            gpu_forward_end_event) -> None:
+        if not getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+            return
+        request_ids = tuple(
+            int(request.request_id)
+            for request in scheduled_requests.context_requests
+            if request.is_context_only_request)
+        if not request_ids:
+            return
+
+        originating_iteration = self.iter_counter
+        enqueue_monotonic_ns = min(
+            (self._nvbug_6448152_phase_trace_cuda_enqueue_ns.pop(
+                (request_id, originating_iteration), time.monotonic_ns())
+             for request_id in request_ids),
+            default=time.monotonic_ns())
+
+        if gpu_forward_end_event is None:
+            self._nvbug_6448152_phase_count("cuda_forward_event_unavailable",
+                                            requests=len(request_ids))
+            return
+        if len(self._nvbug_6448152_phase_trace_cuda_records
+               ) >= NVBUG_6448152_PHASE_TRACE_MAX_CUDA_RECORDS:
+            self._nvbug_6448152_phase_count("cuda_forward_records_dropped")
+            return
+        self._nvbug_6448152_phase_trace_cuda_records[id(
+            gpu_forward_end_event)] = (request_ids, originating_iteration,
+                                       enqueue_monotonic_ns)
+
+    def _nvbug_6448152_phase_observe_cuda_forward(
+            self, gpu_forward_end_event,
+            gpu_forward_time_ms: Optional[float]) -> None:
+        if (not getattr(self, "_nvbug_6448152_phase_trace_enabled", False)
+                or gpu_forward_end_event is None):
+            return
+        record = self._nvbug_6448152_phase_trace_cuda_records.pop(
+            id(gpu_forward_end_event), None)
+        if record is None:
+            return
+        request_ids, originating_iteration, enqueue_monotonic_ns = record
+        if gpu_forward_time_ms is None:
+            self._nvbug_6448152_phase_count(
+                "cuda_forward_elapsed_unavailable",
+                requests=len(request_ids),
+                originating_iteration=originating_iteration)
+            return
+
+        observation_monotonic_ns = time.monotonic_ns()
+        for request_id in request_ids:
+            self._nvbug_6448152_phase_marker(
+                "cuda_forward_complete",
+                request_id,
+                per_iteration=True,
+                transition_iteration=originating_iteration,
+                originating_iteration=originating_iteration,
+                enqueue_monotonic_ns=enqueue_monotonic_ns,
+                observation_delay_ns=(observation_monotonic_ns -
+                                      enqueue_monotonic_ns),
+                gpu_elapsed_ns=int(gpu_forward_time_ms * 1_000_000))
+
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+        PyExecutor._nvbug_6448152_phase_context_requests(
+            self,
+            "python_global_commit_observed", [request],
+            state=request.state)
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
         if self.kv_cache_transceiver and request in self.active_requests:
             if transfer_failed:
@@ -1691,6 +1901,15 @@ class PyExecutor:
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 self._latest_host_step_time_ms = host_step_time
                 self._latest_prev_device_step_time_ms = prev_device_step_time
+                self._nvbug_6448152_phase_count(
+                    "loop_timing_samples",
+                    host_step_time_ms=host_step_time,
+                    prev_device_step_time_ms=(prev_device_step_time
+                                              if prev_device_step_time
+                                              is not None else -1.0),
+                    prev_device_step_time_valid=int(
+                        prev_device_step_time is not None),
+                    device_timing_lag_loops=1)
 
                 if self.print_log and (log_all_ranks
                                        or self.dist.rank in log_ranks):
@@ -2332,6 +2551,8 @@ class PyExecutor:
         # consumers which interpretation applies.
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
+            self._nvbug_6448152_phase_observe_cuda_forward(
+                batch_state.gpu_forward_end_event, None)
             if batch_state.gpu_forward_events_from_perf_pool:
                 self.perf_manager.release_forward_timing_events(
                     batch_state.gpu_forward_start_event,
@@ -2347,6 +2568,8 @@ class PyExecutor:
         gpu_forward_time_ms = self.perf_manager.try_compute_gpu_elapsed_time_ms(
             batch_state.gpu_forward_start_event,
             batch_state.gpu_forward_end_event)
+        self._nvbug_6448152_phase_observe_cuda_forward(
+            batch_state.gpu_forward_end_event, gpu_forward_time_ms)
         if batch_state.gpu_forward_events_from_perf_pool:
             self.perf_manager.release_forward_timing_events(
                 batch_state.gpu_forward_start_event,
@@ -2381,6 +2604,7 @@ class PyExecutor:
                 gpu_forward_time_ms=gpu_forward_time_ms)
 
     def _executor_loop_cleanup(self):
+        PyExecutor._nvbug_6448152_phase_summary(self)
         # Wake any waiters in await_responses BEFORE potentially-blocking
         # work below. If wait_on_pp_send_handles hangs (e.g. after a
         # crash leaves PP send handles in a bad state), the await loop
@@ -2424,6 +2648,15 @@ class PyExecutor:
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
+            if getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+                for request_id in (
+                        serializable_schedule.context_requests_chunking +
+                        serializable_schedule.context_requests_last_chunk):
+                    self._nvbug_6448152_phase_marker(
+                        "pp_schedule_produce",
+                        request_id,
+                        per_iteration=True,
+                        microbatch_id=microbatch_id)
 
         # Broadcast within first tp+cp group before send/recv chain to other tp+cp groups
         if self.dist.is_first_pp_rank:
@@ -2438,15 +2671,39 @@ class PyExecutor:
 
         # Other ranks receive the schedule result from the previous PP rank.
         if not self.dist.is_first_pp_rank:
+            phase_trace_enabled = getattr(self,
+                                          "_nvbug_6448152_phase_trace_enabled",
+                                          False)
+            recv_started_ns = time.monotonic_ns() if phase_trace_enabled else 0
             with nvtx_range("recv_schedule_from_prev_pp"):
                 serializable_schedule = self.dist.recv_object(
                     self.dist.prev_pp_rank, PPCommTag.SCHEDULE_RESULT)
+            if phase_trace_enabled:
+                recv_duration_ns = time.monotonic_ns() - recv_started_ns
+                for request_id in (
+                        serializable_schedule.context_requests_chunking +
+                        serializable_schedule.context_requests_last_chunk):
+                    self._nvbug_6448152_phase_marker(
+                        "pp_schedule_recv",
+                        request_id,
+                        per_iteration=True,
+                        microbatch_id=microbatch_id,
+                        recv_duration_ns=recv_duration_ns)
 
         # Propagate the schedule result to the next PP rank except the last PP rank.
         if not self.dist.is_last_pp_rank:
             self.wait_on_pp_send_handles(self.send_schedule_handles,
                                          microbatch_id)
             with nvtx_range("send_schedule_to_next_pp"):
+                if getattr(self, "_nvbug_6448152_phase_trace_enabled", False):
+                    for request_id in (
+                            serializable_schedule.context_requests_chunking +
+                            serializable_schedule.context_requests_last_chunk):
+                        self._nvbug_6448152_phase_marker(
+                            "pp_schedule_send",
+                            request_id,
+                            per_iteration=True,
+                            microbatch_id=microbatch_id)
                 self.send_schedule_handles[
                     microbatch_id] = self.dist.isend_object(
                         serializable_schedule, self.dist.next_pp_rank,
@@ -2457,6 +2714,11 @@ class PyExecutor:
                 self.active_requests)
             wait_for_disagg_gen_transfer_progress = (
                 serializable_schedule.wait_for_disagg_gen_transfer_progress)
+        self._nvbug_6448152_phase_context_requests(
+            "pp_schedule_apply",
+            scheduled_batch.context_requests,
+            per_iteration=True,
+            microbatch_id=microbatch_id)
         return (scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
 
@@ -2490,6 +2752,9 @@ class PyExecutor:
         for retry_count in range(self.pp_scheduler_max_retry_count):
             if self.scheduler.can_schedule(scheduled_batch_requests):
                 break
+            self._nvbug_6448152_phase_count(
+                "pp_schedule_retries",
+                scheduled_requests=len(scheduled_batch_requests))
             logger.debug(
                 f"Retrying to run first PP's schedule result ({retry_count + 1}/{self.pp_scheduler_max_retry_count})"
             )
@@ -2689,6 +2954,8 @@ class PyExecutor:
                                 self._update_generation_requests_that_will_complete_next_iteration(
                                     scheduled_batch.generation_requests)
 
+                    self._nvbug_6448152_phase_register_cuda_forward(
+                        scheduled_batch, gpu_forward_end)
                     batch_state = BatchStatePP(
                         scheduled_requests=scheduled_batch,
                         sample_state=sample_state,
@@ -5090,6 +5357,10 @@ class PyExecutor:
 
         new_requests_cur_rank = self._fetch_new_requests(
             self.waiting_queue, self.active_requests)
+        self._nvbug_6448152_phase_context_requests("request_fetch",
+                                                   new_requests_cur_rank)
+        if not new_requests_cur_rank:
+            self._nvbug_6448152_phase_count("request_fetch_idle_iterations")
 
         validated_requests = [
             request for request in new_requests_cur_rank
@@ -5097,6 +5368,8 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        self._nvbug_6448152_phase_context_requests("request_activate",
+                                                   validated_requests)
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -6035,7 +6308,11 @@ class PyExecutor:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
+                    PyExecutor._nvbug_6448152_phase_marker(
+                        self, "python_send_async_submit", req.request_id)
                     self.kv_cache_transceiver.respond_and_send_async(req)
+                    PyExecutor._nvbug_6448152_phase_marker(
+                        self, "python_send_async_return", req.request_id)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
@@ -6221,6 +6498,11 @@ class PyExecutor:
             num_accepted_tokens_device: Optional[torch.Tensor] = None):
         ExpertStatistic.set_iter(self.iter_counter)
 
+        self._nvbug_6448152_phase_context_requests(
+            "forward_entry",
+            scheduled_requests.context_requests,
+            per_iteration=True)
+
         num_ctx_tokens = sum(req.context_chunk_size
                              for req in scheduled_requests.context_requests)
 
@@ -6253,6 +6535,8 @@ class PyExecutor:
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
                                   num_accepted_tokens_device)
+                self._nvbug_6448152_phase_record_cuda_enqueue(
+                    scheduled_requests)
                 self._mark_cross_kv_projection_consumed(scheduled_requests)
 
             # Ensure the default stream waits for execution_stream to complete
@@ -6524,6 +6808,8 @@ class PyExecutor:
             self.executor_request_queue.enqueue_shutdown_request()
 
     def _terminate_request(self, request: LlmRequest):
+        PyExecutor._nvbug_6448152_phase_context_requests(
+            self, "python_cleanup_dispatch", [request], state=request.state)
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -6535,6 +6821,8 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        PyExecutor._nvbug_6448152_phase_context_requests(
+            self, "python_resource_free_enter", [request], state=request.state)
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
@@ -6542,6 +6830,8 @@ class PyExecutor:
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+        PyExecutor._nvbug_6448152_phase_context_requests(
+            self, "python_resource_free_exit", [request], state=request.state)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""

@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/types.h"
+#include <cinttypes>
 #include <cstdint>
 #include <limits>
 #include <sstream>
@@ -73,6 +74,13 @@ namespace
 using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
+
+std::uint64_t monotonicNs()
+{
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
 
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
@@ -352,6 +360,9 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     std::vector<SizeType32> const& rnnLayerNumPerPP)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
 {
+    mPhaseTraceEnabled = common::getBoolEnv("TRTLLM_NVBUG_6448152_PHASE_TRACE");
+    mPhaseTraceWorldRank = worldConfig.getRank();
+    mPhaseTracePpRank = worldConfig.getPipelineParallelRank();
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     TLLM_CHECK_WITH_INFO(mCacheTransceiverConfig.has_value(), "CacheTransceiverConfig is not set.");
     auto const backendType = mCacheTransceiverConfig.value().getBackendType();
@@ -599,10 +610,23 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     }
 
     initializeCommState();
+    logPhaseTrace(
+        "cpp_mode", std::nullopt, mContextTransferCoordinator ? "coordinator_active" : "coordinator_inactive");
 }
 
 CacheTransceiver::~CacheTransceiver()
 {
+    if (mPhaseTraceEnabled)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_PHASE event=cpp_summary world_rank=%d pp_rank=%d request_id=0 request_id_valid=0 "
+            "monotonic_ns=%llu outcome=none status_polls=%llu future_not_ready=%llu sender_futures=%zu "
+            "awaiting_consensus=%zu",
+            mPhaseTraceWorldRank, mPhaseTracePpRank, static_cast<unsigned long long>(monotonicNs()),
+            static_cast<unsigned long long>(mPhaseTraceStatusPolls),
+            static_cast<unsigned long long>(mPhaseTraceFutureNotReady), mSenderFutures.size(),
+            mSenderRequestsAwaitingConsensus.size());
+    }
     // Stop sender/receiver workers while the connection manager and transfer
     // plugin are still alive. The workers can access both during termination.
     mCacheSender.reset();
@@ -614,6 +638,20 @@ CacheTransceiver::~CacheTransceiver()
         std::lock_guard<std::mutex> lock(mDllMutex);
         dllClose(mWrapperLibHandle);
     }
+}
+
+void CacheTransceiver::logPhaseTrace(
+    char const* event, std::optional<LlmRequest::RequestIdType> requestId, char const* outcome) const
+{
+    if (!mPhaseTraceEnabled)
+    {
+        return;
+    }
+    TLLM_LOG_INFO("NVBUG6448152_PHASE event=%s world_rank=%d pp_rank=%d request_id=%" PRIu64
+                  " request_id_valid=%d monotonic_ns=%llu outcome=%s",
+        event, mPhaseTraceWorldRank, mPhaseTracePpRank,
+        requestId.has_value() ? static_cast<std::uint64_t>(requestId.value()) : std::uint64_t{0},
+        requestId.has_value() ? 1 : 0, static_cast<unsigned long long>(monotonicNs()), outcome);
 }
 
 void CacheTransceiver::initializeCommState()
@@ -654,7 +692,9 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         return;
     }
     setContextState(llmRequest.get());
+    logPhaseTrace("cpp_send_async_submit", llmRequest->mRequestId);
     auto future = mCacheSender->sendAsync(llmRequest);
+    logPhaseTrace("cpp_send_async_return", llmRequest->mRequestId);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
@@ -670,7 +710,9 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
+        logPhaseTrace("cpp_send_async_submit", llmRequest->mRequestId);
         auto future = mCacheSender->sendAsync(llmRequest);
+        logPhaseTrace("cpp_send_async_return", llmRequest->mRequestId);
         mSenderFutures.emplace_back(llmRequest, std::move(future));
     }
 }
@@ -829,6 +871,20 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> const& atLeastRequestNum, bool markComplete)
 {
+    if (mPhaseTraceEnabled)
+    {
+        ++mPhaseTraceStatusPolls;
+        if ((mPhaseTraceStatusPolls & (mPhaseTraceStatusPolls - 1)) == 0)
+        {
+            TLLM_LOG_INFO(
+                "NVBUG6448152_PHASE event=status_poll_checkpoint world_rank=%d pp_rank=%d request_id=0 "
+                "request_id_valid=0 monotonic_ns=%llu outcome=none status_polls=%llu sender_futures=%zu "
+                "awaiting_consensus=%zu",
+                mPhaseTraceWorldRank, mPhaseTracePpRank, static_cast<unsigned long long>(monotonicNs()),
+                static_cast<unsigned long long>(mPhaseTraceStatusPolls), mSenderFutures.size(),
+                mSenderRequestsAwaitingConsensus.size());
+        }
+    }
     bool const blockAll = !atLeastRequestNum.has_value();
     bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
     TLLM_CHECK_WITH_INFO(!inflightCancelEnabled || !blockAll,
@@ -853,9 +909,24 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
     for (auto&& [request, future] : mSenderFutures)
     {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        auto const status = future.wait_for(std::chrono::milliseconds(0));
+        if (status == std::future_status::ready)
         {
             contextCompleteRequestIds.push_back(request->mRequestId);
+        }
+        else if (mPhaseTraceEnabled)
+        {
+            ++mPhaseTraceFutureNotReady;
+            if ((mPhaseTraceFutureNotReady & (mPhaseTraceFutureNotReady - 1)) == 0)
+            {
+                TLLM_LOG_INFO(
+                    "NVBUG6448152_PHASE event=future_not_ready_checkpoint world_rank=%d pp_rank=%d request_id=0 "
+                    "request_id_valid=0 monotonic_ns=%llu outcome=none future_not_ready=%llu sender_futures=%zu "
+                    "awaiting_consensus=%zu",
+                    mPhaseTraceWorldRank, mPhaseTracePpRank, static_cast<unsigned long long>(monotonicNs()),
+                    static_cast<unsigned long long>(mPhaseTraceFutureNotReady), mSenderFutures.size(),
+                    mSenderRequestsAwaitingConsensus.size());
+            }
         }
     }
 
@@ -910,10 +981,12 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     auto recordOutcome
         = [&](RequestIdType const requestId, std::shared_ptr<LlmRequest> const& request, bool const failed)
     {
+        logPhaseTrace("local_future_terminal", requestId, failed ? "failed" : "completed");
         recordLocalTransferOutcome(requestId, request, failed, mCompletedSenderRequestIds, mFailedSenderRequestIds,
             mSenderRequestsAwaitingConsensus);
         if (mContextTransferCoordinator)
         {
+            logPhaseTrace("coordinator_vote", requestId, failed ? "failed" : "completed");
             mContextTransferCoordinator->publishLocalOutcome(requestId, failed);
         }
     };
@@ -1081,6 +1154,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             continue;
         }
         requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        logPhaseTrace("coordinator_commit", requestId, "failed");
         requestsStatus.errorRequestIds.insert(requestId);
         mTimedOutSenderIds.erase(requestId);
         mCancelRequestedSenderIds.erase(requestId);
@@ -1095,6 +1169,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             continue;
         }
         requestsStatus.completedRequestIds.insert(requestId);
+        logPhaseTrace("coordinator_commit", requestId, "completed");
         if (markComplete)
         {
             requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);

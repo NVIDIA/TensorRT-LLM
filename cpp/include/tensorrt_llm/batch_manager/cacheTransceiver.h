@@ -28,6 +28,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -305,6 +306,9 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
+    void logPhaseTrace(char const* event, std::optional<LlmRequest::RequestIdType> requestId = std::nullopt,
+        char const* outcome = "none") const;
+
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
     // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
@@ -334,6 +338,11 @@ private:
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
+    bool mPhaseTraceEnabled{false};
+    int mPhaseTraceWorldRank{-1};
+    int mPhaseTracePpRank{-1};
+    std::uint64_t mPhaseTraceStatusPolls{0};
+    std::uint64_t mPhaseTraceFutureNotReady{0};
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
 
