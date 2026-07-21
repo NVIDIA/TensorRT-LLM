@@ -785,12 +785,38 @@ class TestRequestValidation:
             _validate({"condition_video_latent_indexes": []})
         with pytest.raises(ValueError, match="first or last"):
             _validate({"condition_video_keep": "middle"})
+        # No silent float truncation; None elements are a 400, not a TypeError.
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [1.9]})
+        with pytest.raises(ValueError, match="must be integers"):
+            _validate({"condition_video_latent_indexes": [None]})
+        _validate({"condition_video_latent_indexes": [0, 1.0]})  # integral floats OK
+        with pytest.raises(ValueError, match="output_type"):
+            _validate({"output_type": "gif"})
+        _validate({"output_type": "image"})
         with pytest.raises(ValueError, match=r"\[T, H, W, C\]"):
             _validate({"video": torch.zeros(4, 4, 3, dtype=torch.uint8)})  # 3-D
         with pytest.raises(ValueError, match="uint8"):
             _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.float32)})
         with pytest.raises(ValueError, match="CPU tensor"):
             _validate({"video": torch.zeros(3, 4, 4, 3, dtype=torch.uint8, device="meta")})
+
+    def test_validator_type_errors_become_client_errors(self):
+        """A validator raising TypeError (wrong-shaped value it didn't guard)
+        still folds into the 400 message list instead of escaping as a 500."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def touchy(value):
+            len(value)  # TypeError on ints
+
+        specs = {"knob": ExtraParamSchema(type="int", default=None, validator=touchy)}
+        with pytest.raises(ValueError, match="extra_params\\['knob'\\]"):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params={"knob": 3}),
+                declared_defaults={},
+                extra_param_specs=specs,
+            )
 
     def test_spec_validators_survive_pickling(self):
         """Specs travel worker -> coordinator in the READY handshake (pickled
