@@ -305,13 +305,56 @@ class TestInputReferenceMaterialization:
             path = tmp.name
         try:
             writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
-            for _ in range(num_frames):
-                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-            writer.release()
+            try:
+                assert writer.isOpened(), "cv2 VideoWriter failed to open (mp4v in MP4)"
+                for _ in range(num_frames):
+                    writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+            finally:
+                writer.release()
             with open(path, "rb") as f:
                 return f.read()
         finally:
             os.remove(path)
+
+    @staticmethod
+    def _avi_bytes(num_frames: int = 2) -> bytes:
+        """Encode a 16x16 Motion-JPEG-in-AVI clip and return its bytes.
+
+        The second container/codec pair in the documented support contract;
+        ``MJPG`` is built into the opencv wheel like ``mp4v``.
+        """
+        cv2 = pytest.importorskip("cv2")
+        with tempfile.NamedTemporaryFile(suffix=".avi", delete=False) as tmp:
+            path = tmp.name
+        try:
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 4.0, (16, 16))
+            try:
+                assert writer.isOpened(), "cv2 VideoWriter failed to open (MJPG in AVI)"
+                for _ in range(num_frames):
+                    writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+            finally:
+                writer.release()
+            with open(path, "rb") as f:
+                return f.read()
+        finally:
+            os.remove(path)
+
+    def test_multipart_avi_reference_routes_to_video(self, tmp_path):
+        # The AVI/MJPEG contract pair must survive the real boundary, not
+        # just the decode primitive: classified as video by content, routed
+        # to the ``video`` extra param.
+        import torch
+
+        generator = _StubVisualGen()
+        upload = UploadFile(file=BytesIO(self._avi_bytes()), filename="clip.avi")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        params = parse_visual_gen_params(
+            request, "vid-avi", generator, media_storage_path=str(tmp_path)
+        )
+        assert params.image is None
+        video = params.extra_params["video"]
+        assert isinstance(video, torch.Tensor)
+        assert tuple(video.shape) == (2, 16, 16, 3)
 
     def test_multipart_video_reference_routes_to_extra_params_tensor(self, tmp_path):
         import torch
@@ -438,15 +481,38 @@ class TestInputReferenceMaterialization:
         assert list(tmp_path.iterdir()) == []
 
 
+class TestMediaFileProbes:
+    """File-path probes backing the offline producer path (``media_io``)."""
+
+    def test_truncated_image_file_is_not_decodable(self, tmp_path):
+        # Same strictness as the bytes probe: a truncated PNG parses its
+        # header but must not classify as a decodable image — and the video
+        # probe must not rescue it as a one-frame video either.
+        pytest.importorskip("cv2")
+        from tensorrt_llm.inputs.media_io import is_decodable_image_file, is_decodable_video_file
+
+        whole = tmp_path / "whole.png"
+        Image.fromarray(np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)).save(whole)
+        truncated = tmp_path / "truncated.png"
+        truncated.write_bytes(whole.read_bytes()[: whole.stat().st_size // 2])
+
+        assert is_decodable_image_file(whole)
+        assert not is_decodable_image_file(truncated)
+        assert not is_decodable_video_file(truncated)
+
+
 class TestMediaBytesProbes:
     """The in-memory probe/decode primitives the serve boundary runs on."""
 
     def test_is_decodable_image_bytes(self):
         from tensorrt_llm.inputs.media_io import is_decodable_image_bytes
 
-        buf = BytesIO()
-        Image.new("RGB", (4, 4), (1, 2, 3)).save(buf, format="PNG")
-        assert is_decodable_image_bytes(buf.getvalue())
+        # PNG and JPEG are the two image formats in the documented support
+        # contract; both must probe as decodable.
+        for fmt in ("PNG", "JPEG"):
+            buf = BytesIO()
+            Image.new("RGB", (4, 4), (1, 2, 3)).save(buf, format=fmt)
+            assert is_decodable_image_bytes(buf.getvalue()), fmt
         assert not is_decodable_image_bytes(b"definitely not an image")
         # Video bytes are not an image (mp4 has no PIL-openable header).
         assert not is_decodable_image_bytes(TestInputReferenceMaterialization._mp4_bytes())
@@ -474,6 +540,24 @@ class TestMediaBytesProbes:
 
         with pytest.raises(ValueError):
             decode_video_frames_from_bytes(b"not a video at all")
+
+    def test_avi_mjpeg_bytes_decode(self):
+        # Motion-JPEG-in-AVI — the second container/codec pair in the
+        # documented support contract: not an image, decodes as video.
+        pytest.importorskip("cv2")
+        import torch
+
+        from tensorrt_llm.inputs.media_io import (
+            decode_video_tensor_from_bytes,
+            is_decodable_image_bytes,
+        )
+
+        payload = TestInputReferenceMaterialization._avi_bytes()
+        assert not is_decodable_image_bytes(payload)
+        video = decode_video_tensor_from_bytes(payload)
+        assert isinstance(video, torch.Tensor)
+        assert video.dtype == torch.uint8
+        assert tuple(video.shape) == (2, 16, 16, 3)
 
     def test_truncated_image_bytes_are_not_decodable(self):
         # A truncated PNG still opens (the header parses) but cannot decode

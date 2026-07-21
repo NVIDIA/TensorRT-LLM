@@ -287,6 +287,7 @@ You can customize these by:
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
 - `input_reference`: Reference image (I2V/TI2V) or video (V2V), classified by decoding the content — filename and content type are ignored; accepted as base64-encoded string in JSON or as a file in multipart form-data. Undecodable content returns HTTP 400. Video decode requires OpenCV on the server (not bundled — `pip install opencv-python-headless`).
+  - **Supported formats**: reference images are tested with PNG (`image/png`) and JPEG (`image/jpeg`). Reference videos are tested with MPEG-4 Part 2 video in MP4 (`video/mp4`) and Motion JPEG in AVI (`video/x-msvideo`). Filename and MIME metadata are not used for routing. Pillow must fully load an image; OpenCV must open a video and return decodable frames. Other formats depend on the installed decoder backend and are not guaranteed. Video references exceeding 1 GiB after RGB decoding are rejected.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"b64_json"` or `"url"`
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
