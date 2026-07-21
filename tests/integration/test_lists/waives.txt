@@ -400,7 +400,6 @@ perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan22_i2v_a14
 test_doc.py::test_url_validity SKIP (https://nvbugs/6215684)
 test_e2e.py::test_multi_nodes_eval[DeepSeek-R1/DeepSeek-R1-0528-FP4-tp16-mmlu] SKIP (https://nvbugs/6276983)
 test_e2e.py::test_multi_nodes_eval[Kimi-K2-Thinking-NVFP4-tp16-mmlu] SKIP (https://nvbugs/6276983)
-test_e2e.py::test_multi_nodes_eval[MiniMax-M2-tp16-mmlu] SKIP (https://nvbugs/6373532)
 test_e2e.py::test_multi_nodes_eval[MiniMax-M3-tp16-mmlu] SKIP (https://nvbugs/6373561)
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8] SKIP (https://nvbugs/5836830)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[gpt_oss_gqa_hd64_gptj_swa128-ctx-fp8-HND-p32-v1] SKIP (https://nvbugs/6478697)
