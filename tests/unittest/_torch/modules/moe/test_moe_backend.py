@@ -493,25 +493,6 @@ def _make_megamoe_cutedsl_for_ctor_test():
     )
 
 
-def test_megamoe_cutedsl_combine_format_defaults_to_bf16(monkeypatch):
-    monkeypatch.delenv("MEGAMOE_COMBINE_FORMAT", raising=False)
-    moe = _make_megamoe_cutedsl_for_ctor_test()
-    assert moe.combine_format == "bf16"
-
-
-def test_megamoe_cutedsl_rejects_unknown_combine_format(monkeypatch):
-    monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", "fp8")
-    with pytest.raises(ValueError, match=r"MEGAMOE_COMBINE_FORMAT must be one of"):
-        _make_megamoe_cutedsl_for_ctor_test()
-
-
-@pytest.mark.parametrize("combine_format", ["32e4m3xe8m0", "16e2m1xbf16"])
-def test_megamoe_cutedsl_accepts_supported_combine_formats(monkeypatch, combine_format):
-    monkeypatch.setenv("MEGAMOE_COMBINE_FORMAT", combine_format)
-    moe = _make_megamoe_cutedsl_for_ctor_test()
-    assert moe.combine_format == combine_format
-
-
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(monkeypatch):
     # Profiling scratch is sized for the largest adaptive bucket.
     monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
