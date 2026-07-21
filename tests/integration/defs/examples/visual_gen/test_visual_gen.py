@@ -122,6 +122,20 @@ COSMOS3_LPIPS_SEED = 42
 COSMOS3_LPIPS_FRAME_RATE = 24.0
 COSMOS3_LPIPS_THRESHOLD = 0.05
 
+COSMOS3_I2V_4STEP_MODEL_SUBPATH = "Cosmos3-Super-Image2Video-4Step"
+COSMOS3_I2V_4STEP_LPIPS_PROMPT = (
+    "The orange sphere slowly rises while the camera pans right across the scene"
+)
+COSMOS3_I2V_4STEP_LPIPS_NUM_FRAMES = 29
+# Fixed by the distilled checkpoint (scheduler t_list / CFG baked into weights).
+COSMOS3_I2V_4STEP_LPIPS_NUM_INFERENCE_STEPS = 4
+COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE = 1.0
+# Golden is diffusers-produced (cross-stack), not a TRT-LLM self-golden:
+# 0.0563 measured at creation + headroom for ~0.04 cross-host kernel drift
+# (see _preserve_lpips_candidate_on_failure). Provenance:
+# golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json.
+COSMOS3_I2V_4STEP_LPIPS_THRESHOLD = 0.10
+
 # LTX-2 configuration
 LTX2_MODEL_CHECKPOINT_PATH = "LTX-2/ltx-2-19b-dev.safetensors"
 LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -1901,3 +1915,172 @@ def test_cosmos3_t2i_4step_example(_visual_gen_deps, llm_root, llm_venv):
     )
     assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
     assert os.path.getsize(output_path) > 0, f"Example produced an empty image at {output_path}"
+
+
+def _write_cosmos3_i2v_conditioning_image(path):
+    """Deterministic 1280x720 conditioning image for the I2V smoke test.
+
+    Gradient sky plus simple shapes, so I2V has real structure to animate
+    without shipping an asset file.
+    """
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (1280, 720))
+    draw = ImageDraw.Draw(image)
+    for y in range(720):
+        draw.line([(0, y), (1280, y)], fill=(30, 60 + y // 8, 140))
+    draw.ellipse([480, 200, 800, 520], fill=(230, 120, 40), outline=(255, 255, 255), width=6)
+    draw.rectangle([100, 500, 400, 680], fill=(40, 160, 90))
+    draw.polygon([(1000, 600), (1120, 380), (1240, 600)], fill=(200, 200, 60))
+    image.save(path)
+
+
+def test_cosmos3_i2v_4step_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the distilled I2V checkpoint through the recommended invocation.
+
+    Validates the documented deployment for ``Cosmos3-Super-Image2Video-4Step``:
+    the example script with a conditioning image and no config override (the
+    omni defaults — 720p x 189 frames — are the deployed shape). Steps,
+    guidance, and the system-prompt default come from the checkpoint; the run
+    must produce a video.
+    """
+    model_path = _lpips_model_path("Cosmos3-Super-Image2Video-4Step")
+    _skip_if_missing(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_i2v_4step_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    image_path = os.path.join(out_dir, "conditioning.png")
+    _write_cosmos3_i2v_conditioning_image(image_path)
+    output_path = os.path.join(out_dir, "cosmos3_i2v_4step_output.mp4")
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--prompt",
+            "The orange sphere slowly rises while the camera pans right across the scene",
+            "--image_path",
+            image_path,
+            "--output_path",
+            output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
+
+
+def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
+    """Run the distilled I2V pipeline on the deterministic conditioning image.
+
+    VANILLA attention, compile-off. Returns the generated video tensor
+    ``(B, T, H, W, C)``, or ``None`` if generation produced no video.
+    """
+    # Cosmos3 re-reads the guardrail flag in __init__; set it before the pipeline loads.
+    guardrails_env_key = "TRTLLM_DISABLE_COSMOS3_GUARDRAILS"
+    previous_guardrails_env = os.environ.get(guardrails_env_key)
+    os.environ[guardrails_env_key] = "1"
+    try:
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+        from tensorrt_llm.visual_gen.args import (
+            AttentionConfig,
+            CompilationConfig,
+            TorchCompileConfig,
+            VisualGenArgs,
+        )
+
+        model_path = _lpips_model_path(COSMOS3_I2V_4STEP_MODEL_SUBPATH)
+        _skip_if_missing(model_path, "Cosmos3-Super-Image2Video-4Step checkpoint", is_dir=True)
+        _disable_inductor_compile_worker_quiesce()
+        args = VisualGenArgs(
+            model=model_path,
+            compilation_config=CompilationConfig(skip_warmup=True),
+            torch_compile_config=TorchCompileConfig(enable=False),
+            attention_config=AttentionConfig(backend="VANILLA"),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt=COSMOS3_I2V_4STEP_LPIPS_PROMPT,
+                    seed=COSMOS3_LPIPS_SEED,
+                    image=image_path,
+                    height=COSMOS3_LPIPS_HEIGHT,
+                    width=COSMOS3_LPIPS_WIDTH,
+                    num_frames=COSMOS3_I2V_4STEP_LPIPS_NUM_FRAMES,
+                    # Direct forward() calls must pass checkpoint-valid sampling
+                    # values (the signature defaults are the base-checkpoint
+                    # video table, which a distilled checkpoint rejects).
+                    num_inference_steps=COSMOS3_I2V_4STEP_LPIPS_NUM_INFERENCE_STEPS,
+                    guidance_scale=COSMOS3_I2V_4STEP_LPIPS_GUIDANCE_SCALE,
+                    frame_rate=COSMOS3_LPIPS_FRAME_RATE,
+                    # The checkpoint declares default_use_system_prompt=true and
+                    # the golden was generated with it; forward()'s signature
+                    # default is the historical False, so pass it explicitly.
+                    use_system_prompt=True,
+                    use_guardrails=False,
+                )
+            if result is None or result.video is None:
+                return None
+            return result.video.detach().cpu()
+        finally:
+            del pipeline
+            _cleanup_cuda()
+    finally:
+        if previous_guardrails_env is None:
+            os.environ.pop(guardrails_env_key, None)
+        else:
+            os.environ[guardrails_env_key] = previous_guardrails_env
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_cosmos3_i2v_4step_lpips_against_golden(_visual_gen_deps, request, tmp_path):
+    """Quality gate for the distilled I2V checkpoint against a diffusers golden.
+
+    Unlike the self-goldens of the other models, the golden video here was
+    produced by the reference implementation (diffusers modular pipeline,
+    PR #14177, with its per-step SDE noise made generator-seeded) — so this
+    gate checks the denoising trajectory against the reference, not just
+    regression against a past TRT-LLM run. Full provenance:
+    ``golden/visual_gen_lpips/cosmos3_i2v_4step_lpips_golden_video.json``.
+    """
+    image_path = str(tmp_path / "cosmos3_i2v_4step_conditioning.png")
+    _write_cosmos3_i2v_conditioning_image(image_path)
+    generated_path = tmp_path / "cosmos3_i2v_4step_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path,
+        "cosmos3_i2v_4step_lpips_golden_video.mp4",
+        "Cosmos3 I2V-4Step LPIPS golden video",
+    )
+
+    video = _run_cosmos3_i2v_4step_lpips_pipeline(image_path)
+    assert video is not None, "Cosmos3 I2V-4Step LPIPS run produced no video"
+    _save_lpips_video_mp4(video, generated_path, frame_rate=COSMOS3_LPIPS_FRAME_RATE)
+
+    score = _run_lpips_eval(
+        tmp_path,
+        "cosmos3_i2v_4step",
+        "video",
+        COSMOS3_I2V_4STEP_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        COSMOS3_I2V_4STEP_LPIPS_THRESHOLD,
+        generated_path,
+        "cosmos3_i2v_4step_lpips_golden_video.mp4",
+    )
+    _assert_lpips_below_threshold(score, COSMOS3_I2V_4STEP_LPIPS_THRESHOLD)

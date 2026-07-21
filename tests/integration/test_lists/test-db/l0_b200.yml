@@ -266,6 +266,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen.py::test_qwen_image_example
   # - examples/visual_gen/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
@@ -371,6 +372,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
