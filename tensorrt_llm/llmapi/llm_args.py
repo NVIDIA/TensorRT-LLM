@@ -4678,7 +4678,7 @@ class TorchCompileConfig(StrictBaseModel):
         "When torch compile is enabled, userbuffers is enabled by default.")
 
     max_num_streams: PositiveInt = Field(
-        default=1,
+        default=3,
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
 

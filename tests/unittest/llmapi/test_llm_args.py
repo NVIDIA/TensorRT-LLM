@@ -1656,6 +1656,33 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
         assert engine._get_padding_params(129, 1, None) == (256, True, None)
 
+    def test_attention_dp_prefill_graph_uses_all_rank_decision(self):
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            PyTorchModelEngine
+
+        class FakeDist:
+            def __init__(self, decisions):
+                self.decisions = decisions
+
+            def tp_allgather(self, value):
+                del value
+                return self.decisions
+
+        engine = object.__new__(PyTorchModelEngine)
+        engine.enable_attention_dp = True
+        engine.prefill_cuda_graph_backend = PrefillCudaGraphBackend.BREAKABLE
+        engine._prefill_cuda_graph_num_tokens = [128, 256, 512]
+        engine._get_all_rank_ctx_requests = lambda _: [0, 1, 0, 0]
+
+        all_rank_num_tokens = [1, 129, 1, 1]
+        engine.dist = FakeDist([True, True, True, True])
+        assert engine._get_padding_params(
+            1, 0, all_rank_num_tokens) == (256, True, [256] * 4)
+
+        engine.dist = FakeDist([True, False, True, True])
+        assert engine._get_padding_params(
+            1, 0, all_rank_num_tokens) == (1, False, all_rank_num_tokens)
+
     def test_torch_compile_config_capture_num_tokens_default_when_piecewise_enabled(
             self):
         """Default capture set is the powers-of-2 + 256-stride list.

@@ -28,9 +28,8 @@ class BreakableCUDAGraphRunner:
 
     _WARMUP_STEPS = 2
 
-    def __init__(self, layer_model: nn.Module, logits_processor: nn.Module) -> None:
+    def __init__(self, layer_model: nn.Module) -> None:
         self.layer_model = layer_model
-        self.logits_processor = logits_processor
         self._graphs: dict[int, BreakableCUDAGraph] = {}
         self._outputs: dict[int, torch.Tensor] = {}
         self._memory_pool = None
@@ -146,7 +145,6 @@ class BreakableCUDAGraphRunner:
             raise RuntimeError("BCG body capture requested outside capture")
 
         original_body_forward = self.layer_model.forward
-        original_logits_forward = self.logits_processor.forward
         captured_output = None
 
         def capture_forward(*args, **kwargs):
@@ -156,19 +154,13 @@ class BreakableCUDAGraphRunner:
                     original_body_forward(*args, **kwargs))
             return captured_output
 
-        def passthrough_forward(hidden_states, *args, **kwargs):
-            del args, kwargs
-            return hidden_states
-
         self.layer_model.forward = capture_forward
-        self.logits_processor.forward = passthrough_forward
         try:
             outer_forward()
             if captured_output is None:
                 raise RuntimeError("BCG capture did not execute the model body")
             return captured_output
         finally:
-            self.logits_processor.forward = original_logits_forward
             self.layer_model.forward = original_body_forward
 
     def replay(self, num_tokens: int) -> torch.Tensor:

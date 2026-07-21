@@ -117,7 +117,7 @@ def attn_custom_op_inplace(
     )
 
 
-breakable_attn_custom_op_inplace = eager_on_graph(True)(attn_custom_op_inplace)
+maybe_bcg_attn_custom_op_inplace = eager_on_graph(True)(attn_custom_op_inplace)
 
 
 def _helix_zero_kv_mask(
@@ -929,13 +929,11 @@ class Attention(nn.Module):
             if "mrope_position_deltas" in mrope_config:
                 mrope_position_deltas = mrope_config["mrope_position_deltas"]
 
-        use_breakable_cuda_graph = (not is_torch_compiling()
-                                    and is_in_breakable_cuda_graph())
         # Currently only TRTLLM and FLASHINFER support the custom inplace op.
         use_custom_inplace_op = (
             self.register_to_config and
             (self.attn_backend == "TRTLLM" or self.attn_backend == "FLASHINFER")
-            and (is_torch_compiling() or use_breakable_cuda_graph)
+            and (is_torch_compiling() or is_in_breakable_cuda_graph())
             and not self.is_marlin_enabled)
 
         if use_custom_inplace_op:
@@ -943,9 +941,7 @@ class Attention(nn.Module):
             assert len(outputs) == 1 or len(outputs) == 2
             output = outputs[0]
             output_sf = outputs[1] if len(outputs) == 2 else None
-            custom_op = (breakable_attn_custom_op_inplace if
-                         use_breakable_cuda_graph else attn_custom_op_inplace)
-            custom_op(
+            maybe_bcg_attn_custom_op_inplace(
                 q,
                 k,
                 v,
