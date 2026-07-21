@@ -4,7 +4,7 @@
 import copy
 import math
 import re
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -45,7 +45,11 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
-from .modeling_multimodal_mixin import EncoderGroup, MultimodalModelMixin
+from .modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalModelMixin,
+    encode_multimodal_by_groups,
+)
 from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
@@ -1111,17 +1115,34 @@ class Qwen3VisionModelBase(nn.Module):
         # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
         return torch.cat([embeds] + deepstack, dim=1)
 
-    def forward(self, multimodal_params: List[MultimodalParams]):
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """Single source of truth for Qwen3-VL's encoder-batching group.
+
+        One modality-blind ViT handles both image and video (image has
+        `grid_thw.t==1`, video `t>1`), so both modalities share one call.
+        Both the aggregated path (via `Qwen3VLModelBase.mm_encoder_groups`,
+        which delegates here) and the mm-encoder-only `forward` consume this.
+        """
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self.encode_batched,
+                build_batched_input=_qwen3vl_build_batched_input,
+            ),
+        )
+
+    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Standalone mm-encoder-only executor entry.
 
-        The disaggregated MM-encoder path (`_forward_step_mm_encoder_only`)
-        invokes the vision model's `forward()` and expects a list of embedding
-        tensors (it asserts a single element — mixed modality is unsupported
-        there). Build the batched ViT input the same way the encoder group does
-        and run one encode. Mirrors the `forward()` contract that
-        `Qwen2VisionModelBase` still exposes for this path.
+        `_forward_step_mm_encoder_only` invokes this and then splits the
+        returned tensor request-by-request using request-ordered
+        `split_lengths`, so the rows must be in request-then-prompt order.
+        Delegating to `encode_multimodal_by_groups` runs the same
+        modality-batched ViT the aggregated path uses and applies the
+        per-request `mm_item_order` reorder before returning.
         """
-        return [self.encode_batched(**_qwen3vl_build_batched_input(multimodal_params))]
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
 class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
@@ -1135,7 +1156,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         result reordered per-request into prompt order.
         """
         mm_embeds = get_multimodal_embeddings(
-            encoder_forward_fn=self.encode_multimodal_by_groups,
+            encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
             multimodal_params=list(multimodal_params),
         )
         return mm_embeds[0]
@@ -1237,16 +1258,9 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
-            # One modality-blind ViT handles both image and video (image has
-            # `grid_thw.t==1`, video `t>1`). Batching them into a single
-            # encoder call is the whole arithmetic-intensity win.
-            self.mm_encoder_groups = (
-                EncoderGroup(
-                    modalities=("image", "video"),
-                    encoder_fn=self.mm_encoder.encode_batched,
-                    build_batched_input=_qwen3vl_build_batched_input,
-                ),
-            )
+            # Reuse the encoder's own group definition so the aggregated and
+            # mm-encoder-only paths share a single source of truth.
+            self.mm_encoder_groups = self.mm_encoder.mm_encoder_groups
         elif model_config.disable_mm_encoder:
             logger.info(
                 f"{type(self).__name__}: multimodal encoder disabled "
@@ -1409,7 +1423,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             # Raw image/video tensors: run local encoder.
             if has_raw_image_or_video_data and self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.encode_multimodal_by_groups,
+                    encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
                     multimodal_params=mm_multimodal_params,
                 )
             # Raw image/video tensors on a worker with no encoder: bad route.

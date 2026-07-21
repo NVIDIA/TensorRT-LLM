@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Encoder-level tests for Qwen3-VL through the generic mm-encoder-group path.
 
-Constructs a minimal ``MultimodalModelMixin`` with the Qwen3-VL
-``EncoderGroup`` and a stub ``encode_batched`` marker function. Asserts that
+Wires an `EncoderGroup` around a stub `encode_batched` marker function and
+drives the shared `encode_multimodal_by_groups` helper directly. Asserts that
 mixed image+video requests, heterogeneous single-modality batches, and
 cross-request batching all produce prompt-order embeddings via one ViT call.
+The same helper is what `Qwen3VisionModelBase.forward` (the mm-encoder-only
+disagg entrypoint) delegates to, so this suite covers both paths.
 """
 
 from types import SimpleNamespace
@@ -14,7 +16,10 @@ from typing import Optional
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup, MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    EncoderGroup,
+    encode_multimodal_by_groups,
+)
 from tensorrt_llm._torch.models.modeling_qwen3vl import _qwen3vl_build_batched_input
 
 
@@ -24,15 +29,13 @@ def _encode_batched(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch
     return pixel_values.clone().repeat(1, 2)  # widen to hidden=marker_dim*2
 
 
-class _StubModel(MultimodalModelMixin):
-    def __init__(self) -> None:
-        self.mm_encoder_groups = (
-            EncoderGroup(
-                modalities=("image", "video"),
-                encoder_fn=_encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
-            ),
-        )
+_QWEN3VL_ENCODER_GROUPS = (
+    EncoderGroup(
+        modalities=("image", "video"),
+        encoder_fn=_encode_batched,
+        build_batched_input=_qwen3vl_build_batched_input,
+    ),
+)
 
 
 def _param(
@@ -58,7 +61,7 @@ def _patches(marker: int, n: int, dim: int = 2) -> torch.Tensor:
 
 
 def _encode(params: list) -> torch.Tensor:
-    return _StubModel().encode_multimodal_by_groups(params)
+    return encode_multimodal_by_groups(_QWEN3VL_ENCODER_GROUPS, params)
 
 
 def test_image_only_request() -> None:
@@ -173,13 +176,40 @@ def test_heterogeneous_batch_image_only_and_video_only() -> None:
     assert torch.equal(out[:, 0], expected)
 
 
+def test_heterogeneous_batch_video_first_then_image() -> None:
+    """Reviewer's mm-encoder-only regression case: `[video-only req0,
+    image-only req1]`. `_qwen3vl_build_batched_input` concatenates images
+    across requests first, then videos, so without prompt-order reordering
+    the encoder output would be `[img(req1), vid(req0)]` — request-ordered
+    downstream splits would then hand each request the other's rows.
+    Assert the shared helper reorders rows into request order."""
+    out = _encode(
+        [
+            _param(
+                video={
+                    "pixel_values_videos": _patches(20, 8),
+                    "video_grid_thw": torch.tensor([[1, 1, 8]]),
+                },
+                lengths=[8],
+            ),
+            _param(
+                image={
+                    "pixel_values": _patches(10, 5),
+                    "image_grid_thw": torch.tensor([[1, 1, 5]]),
+                },
+                lengths=[5],
+            ),
+        ]
+    )
+    expected = torch.tensor([20.0] * 8 + [10.0] * 5)
+    assert torch.equal(out[:, 0], expected)
+
+
 def test_raw_inputs_route_through_encode_multimodal_by_groups() -> None:
     """Regression: ``Qwen3VLModelBase.forward``'s raw image/video branch
     routes through ``encode_multimodal_by_groups`` (via
-    ``get_multimodal_embeddings``). Confirms the callable used there
-    accepts a bare ``multimodal_params`` list and returns the same
-    prompt-order embedding tensor that direct invocation produces."""
-    stub = _StubModel()
+    ``get_multimodal_embeddings``). Confirms the same callable signature
+    used there returns the expected prompt-order embedding tensor."""
     params = [
         _param(
             image={
@@ -197,9 +227,7 @@ def test_raw_inputs_route_through_encode_multimodal_by_groups() -> None:
             lengths=[5, 3],
         ),
     ]
-    # Same callable signature `get_multimodal_embeddings` invokes at
-    # `modeling_qwen3vl.py`'s raw-MM branch.
-    out = stub.encode_multimodal_by_groups(params)
+    out = encode_multimodal_by_groups(_QWEN3VL_ENCODER_GROUPS, params)
     expected = torch.tensor([22.0] * 5 + [11.0] * 3)
     assert torch.equal(out[:, 0], expected)
 

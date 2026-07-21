@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the generic encoder-group primitives.
 
-Covers the pure helpers behind ``MultimodalModelMixin.encode_multimodal_by_groups``:
+Covers the pure helpers behind ``encode_multimodal_by_groups``:
 
 * ``_lengths_by_modality`` — invert prompt-ordered ``multimodal_embedding_lengths``
   into per-modality per-item lists using ``mm_item_order``.
