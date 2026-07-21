@@ -1,0 +1,1451 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="Scaling Video Generation Across NVL72 rack with TensorRT-LLM" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html" />
+    <link rel="prev" title="Sparse Attention Development Guide" href="../../developer-guide/sparse-attention-development-guide.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc22" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<section id="deepseek-v4-on-nvidia-blackwell-model-specific-and-agentic-workload-optimizations-in-tensorrt-llm">
+<h1>DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM<a class="headerlink" href="#deepseek-v4-on-nvidia-blackwell-model-specific-and-agentic-workload-optimizations-in-tensorrt-llm" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM Team</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="../../torch/adding_new_model.html#introduction"><span class="std std-ref">Introduction</span></a></p></li>
+<li><p><a class="reference internal" href="#part-i-deepseek-v4-model-support-and-optimizations"><span class="xref myst">Part I. DeepSeek-V4 Model Support and Optimizations</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#building-a-production-ready-deepseek-v4-stack"><span class="xref myst">Building a Production-Ready DeepSeek-V4 Stack</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#model-support-and-parallelism"><span class="xref myst">Model support and parallelism</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#hybrid-attention-swa-csa-and-hca"><span class="xref myst">Hybrid attention: SWA, CSA, and HCA</span></a></p></li>
+<li><p><a class="reference internal" href="#compressor-implementation"><span class="xref myst">Compressor implementation</span></a></p></li>
+<li><p><a class="reference internal" href="#beyond-attention-mhc-moe-and-speculative-decoding"><span class="xref myst">Beyond attention: mHC, MoE, and speculative decoding</span></a></p></li>
+<li><p><a class="reference internal" href="#parallelism-and-deployment-notation"><span class="xref myst">Parallelism and deployment notation</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#cache-management-and-runtime-features"><span class="xref myst">Cache management and runtime features</span></a></p></li>
+<li><p><a class="reference internal" href="#precision-strategy-and-accuracy"><span class="xref myst">Precision strategy and accuracy</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#deepseek-v4-performance-optimizations"><span class="xref myst">DeepSeek-V4 Performance Optimizations</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#optimize-the-csahca-hot-path"><span class="xref myst">Optimize the CSA/HCA hot path</span></a></p></li>
+<li><p><a class="reference internal" href="#compressor-and-mhc"><span class="xref myst">Compressor and mHC</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#compressor-optimizations"><span class="xref myst">Compressor optimizations</span></a></p></li>
+<li><p><a class="reference internal" href="#mhc-optimizations"><span class="xref myst">mHC optimizations</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#moe-optimizations"><span class="xref myst">MoE optimizations</span></a></p></li>
+<li><p><a class="reference internal" href="#runtime-optimization"><span class="xref myst">Runtime optimization</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#deepseek-v4-performance-evolution"><span class="xref myst">DeepSeek-V4 Performance Evolution</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#experimental-setup"><span class="xref myst">Experimental setup</span></a></p></li>
+<li><p><a class="reference internal" href="#from-baseline-to-the-latest-measured-curve"><span class="xref myst">From Baseline to the Latest Measured Curve</span></a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#part-ii-agentic-workload-optimizations"><span class="xref myst">Part II. Agentic-Workload Optimizations</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#agentperf-workflow"><span class="xref myst">AgentPerf Workflow</span></a></p></li>
+<li><p><a class="reference internal" href="#lessons-from-deepseek-v32-agentic-workload-optimization"><span class="xref myst">Lessons from DeepSeek-V3.2 Agentic Workload Optimization</span></a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-optimizations-for-agentic-serving"><span class="xref myst">End-to-End Optimizations for Agentic Serving</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#preserve-locality-with-two-level-routing"><span class="xref myst">Preserve locality with two-level routing</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#instance-level-routing-across-context-servers"><span class="xref myst">Instance-level routing across context servers</span></a></p></li>
+<li><p><a class="reference internal" href="#rank-level-routing-within-a-context-server"><span class="xref myst">Rank-level routing within a context server</span></a></p></li>
+<li><p><a class="reference internal" href="#routing-policy-selection"><span class="xref myst">Routing policy selection</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#kv-cache-reuse-optimizations"><span class="xref myst">KV cache reuse optimizations</span></a></p></li>
+<li><p><a class="reference internal" href="#optimize-scheduling-and-remove-end-to-end-overhead"><span class="xref myst">Optimize scheduling and remove end-to-end overhead</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#optimize-host-overhead-for-ctx-and-gen"><span class="xref myst">Optimize host overhead for CTX and GEN</span></a></p></li>
+<li><p><a class="reference internal" href="#optimize-scheduling-orchestration-and-protocol-handling"><span class="xref myst">Optimize scheduling, orchestration, and protocol handling</span></a></p></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#agentperf-results-and-external-validation"><span class="xref myst">AgentPerf Results and External Validation</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#reproduction-and-future-work"><span class="xref myst">Reproduction and Future Work</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#how-to-reproduce"><span class="xref myst">How to reproduce</span></a></p></li>
+<li><p><a class="reference internal" href="#future-work"><span class="xref myst">Future Work</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#conclusion-and-acknowledgments"><span class="xref myst">Conclusion and Acknowledgments</span></a></p></li>
+</ul>
+</section>
+<section id="introduction">
+<h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
+<p>DeepSeek-V4’s hybrid attention, online compression, mHC, and MoE design make production inference a model-and-system co-design problem. This blog follows TensorRT LLM’s optimization journey on NVIDIA Blackwell in two parts: first building and optimizing a production-ready DeepSeek-V4 model stack, then extending the optimization boundary to routing, KV reuse, host efficiency, and control-plane efficiency for agentic workloads. On GB300, the latest measured fixed-shape sweep increased peak output throughput from 984 to 1,618 tokens/s/GPU, a 64.5% improvement, while NVIDIA’s GB300 AA-AgentPerf configurations, run and verified by Artificial Analysis, reached 57.5 concurrency per GPU (CPG) at SLO20 and 19.2 CPG at SLO60.</p>
+</section>
+<section id="part-i-deepseek-v4-model-support-and-optimizations">
+<h2>Part I. DeepSeek-V4 Model Support and Optimizations<a class="headerlink" href="#part-i-deepseek-v4-model-support-and-optimizations" title="Link to this heading">#</a></h2>
+<section id="building-a-production-ready-deepseek-v4-stack">
+<h3>Building a Production-Ready DeepSeek-V4 Stack<a class="headerlink" href="#building-a-production-ready-deepseek-v4-stack" title="Link to this heading">#</a></h3>
+<p>Supporting DeepSeek-V4 required more than registering a new model class. Relative to DeepSeek-V3.2, the model replaces homogeneous sparse attention with a hybrid scheme that interleaves three attention modes across layers, adds an online sequence Compressor with its own persistent state, wraps every attention and MoE block in manifold-constrained hyper-connections (mHC), and updates the MoE routing and checkpoint layout. All of this must compose with the production features users expect from TensorRT LLM: Multi-Token Prediction (MTP), parallel execution, chunked prefill, KV-cache reuse, CUDA Graphs, the overlap scheduler, and disaggregated serving.</p>
+<p>TensorRT LLM implements DeepSeek-V4 as a dedicated PyTorch-backend model, <code class="docutils literal notranslate"><span class="pre">DeepseekV4ForCausalLM</span></code>, together with a DeepSeek-V4 sparse-attention backend and a specialized <code class="docutils literal notranslate"><span class="pre">DeepseekV4CacheManager</span></code>, targeting NVIDIA Blackwell GPUs (SM100+). This section describes that foundation. The performance optimizations built on top of it are covered in <a class="reference internal" href="#deepseek-v4-performance-optimizations"><span class="xref myst"><strong>DeepSeek-V4 Performance Optimizations</strong></span></a>.</p>
+<section id="model-support-and-parallelism">
+<h4>Model support and parallelism<a class="headerlink" href="#model-support-and-parallelism" title="Link to this heading">#</a></h4>
+<p>DeepSeek-V4 is released in two model scales, each with Base and Instruct variants. TensorRT LLM loads both directly from their checkpoint metadata.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Checkpoint family</p></th>
+<th class="head text-right"><p>Total parameters</p></th>
+<th class="head text-right"><p>Activated parameters</p></th>
+<th class="head text-left"><p>Published precision</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>DeepSeek-V4-Flash-Base / -Flash</p></td>
+<td class="text-right"><p>284B</p></td>
+<td class="text-right"><p>13B</p></td>
+<td class="text-left"><p>FP8 mixed / FP4 + FP8 mixed</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>DeepSeek-V4-Pro-Base / -Pro</p></td>
+<td class="text-right"><p>1.6T</p></td>
+<td class="text-right"><p>49B</p></td>
+<td class="text-left"><p>FP8 mixed / FP4 + FP8 mixed</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The implementation reads the attention layout from the checkpoint rather than hard-coding serving assumptions: the per-layer compression-ratio list (Flash begins <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">0,</span> <span class="pre">4,</span> <span class="pre">128,</span> <span class="pre">...]</span></code>, while Pro begins <code class="docutils literal notranslate"><span class="pre">[128,</span> <span class="pre">128,</span> <span class="pre">4,</span> <span class="pre">128,</span> <span class="pre">...]</span></code>, and 0 marks a sliding-window-only layer), the 128-token sliding window, and the Indexer configuration including its Top-K (512 for Flash and 1024 for Pro).</p>
+<section id="hybrid-attention-swa-csa-and-hca">
+<h5>Hybrid attention: SWA, CSA, and HCA<a class="headerlink" href="#hybrid-attention-swa-csa-and-hca" title="Link to this heading">#</a></h5>
+<p>DeepSeek-V4’s largest architectural change is its attention. DeepSeek-V3.2 introduced DeepSeek Sparse Attention (DSA), in which a learned Indexer scores the KV history and a Top-K selector supplies token indices to sparse MLA (see our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md">DeepSeek-V3.2 optimization blog</a>). TensorRT LLM implemented DSA on a general <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.md">sparse-attention framework</a> that separates the algorithm-specific selection logic from the attention backend that consumes the selected indices. DeepSeek-V4 builds on the same separation but adds online compression and interleaves three layer types, determined by each layer’s compression ratio:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Attention mode</p></th>
+<th class="head text-right"><p>Ratio</p></th>
+<th class="head text-left"><p>History visible to each query</p></th>
+<th class="head text-left"><p>Selection and computation</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Sliding Window Attention (SWA)</p></td>
+<td class="text-right"><p>0</p></td>
+<td class="text-left"><p>The latest 128 raw tokens</p></td>
+<td class="text-left"><p>Dense attention inside the window. No Compressor or Indexer.</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Compressed Sparse Attention (CSA)</p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-left"><p>Latest 128 raw tokens + 4× compressed entries from completed compression groups</p></td>
+<td class="text-left"><p>The Indexer scores the compressed entries. Sparse MLA attends to the window plus the Top-K selected entries.</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Heavily Compressed Attention (HCA)</p></td>
+<td class="text-right"><p>128</p></td>
+<td class="text-left"><p>Latest 128 raw tokens + all 128× compressed entries from completed compression groups</p></td>
+<td class="text-left"><p>Dense attention over all completed compressed entries. No Indexer or Top-K stage.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog26_deepseek_v4_hybrid_attention.png" width="100%" alt="DeepSeek-V4 hybrid attention architecture. Panel a shows SWA attending over the latest 128 raw tokens. Panel b shows CSA combining the sliding window with 4× compressed KV entries selected by an Indexer and Top-K stage. Panel c shows HCA combining the sliding window with all 128× compressed KV entries without an Indexer.">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1. DeepSeek-V4 hybrid attention. (a) SWA attends densely within the 128-token sliding window. (b) CSA augments that window with Top-K entries selected from the 4× compressed history. (c) HCA attends to the window and the complete 128× compressed history without an Indexer.</em></sub></p>
+<p>At the kernel boundary, the history is represented as two cache pools, one for the sliding window and one for compressed entries, and a unified dual-pool MLA operator serves all three modes: it processes the sliding window first, then the selected CSA entries or the full HCA compressed stream, and combines both in one online-softmax reduction. An SWA-only layer simply passes an empty second pool. Selected compressed positions are converted from cache-page-local offsets to token-level global addresses before the attention kernel consumes them. Because KV compression makes the attention workload vary by query, TensorRT LLM passes a per-query <code class="docutils literal notranslate"><span class="pre">topk_lens</span></code> vector (<code class="docutils literal notranslate"><span class="pre">sparse_mla_topk_lens</span></code> in the implementation) to the FMHA kernel. It identifies the active SWA-plus-compressed index span within the fixed-width index buffer used for CUDA Graph compatibility.</p>
+<p>Checkpoint-provided attention-sink logits are also remapped and supplied to the backend as an additional softmax sink. This dual-pool design lets the heterogeneous layer types share one attention backend, and extends the sparse-attention framework from DSA’s fine-grained token selection to DeepSeek-V4’s combination of local attention, compressed memory, and optional sparse selection.</p>
+</section>
+<section id="compressor-implementation">
+<h5>Compressor implementation<a class="headerlink" href="#compressor-implementation" title="Link to this heading">#</a></h5>
+<p>The Compressor produces the compressed KV entries that CSA and HCA attend to. It is a token-level, softmax-gated pooling (<a class="reference external" href="https://arxiv.org/abs/2606.19348">DeepSeek-V4 paper</a>): each token’s projected KV entry carries a learned compression-weight vector, a learnable per-position bias is added, and a softmax over the compression window reduces the group to one entry as a weighted sum. For CSA ($m{=}4$), each output pools projected entries from two adjacent $m$-token groups, giving a $2m$-token receptive field. Consecutive outputs overlap by $m$ raw-token positions through separate projection branches. HCA instead uses disjoint $m’$-token windows ($m’{=}128$). On CSA layers the same compression operation is applied a second time to produce the compressed Indexer keys that the Indexer scores for Top-K selection, so a CSA layer maintains two compressed streams: the attention KV entries and the Indexer keys.</p>
+<p>TensorRT LLM implements the Compressor as a fused <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> projection plus dedicated CUDA kernels for prefill reduction, paged decode updates, and cache-write postprocessing. Tokens arrive incrementally: one at a time in decode, and chunk by chunk in chunked prefill, where chunk boundaries rarely align with compression windows. A compression window is often still incomplete when a forward pass ends. TensorRT LLM persists each token’s KV and score projection outputs in FP32 Compressor-state buffers for the still-open windows. Once a window completes, the compression kernels finalize its entry from this state, preserving the semantics of compressing the whole sequence in one pass. Compressed entries are written in the dtype their consumer expects: BF16 or per-tensor FP8 for the main attention cache, and blockwise FP8 or packed MXFP4 for the Indexer-K stream. The kernel fusion work on this path is covered in <a class="reference internal" href="#compressor-and-mhc"><span class="xref myst"><strong>Compressor and mHC</strong></span></a>.</p>
+</section>
+<section id="beyond-attention-mhc-moe-and-speculative-decoding">
+<h5>Beyond attention: mHC, MoE, and speculative decoding<a class="headerlink" href="#beyond-attention-mhc-moe-and-speculative-decoding" title="Link to this heading">#</a></h5>
+<p><strong>mHC hyper-connections</strong> (<a class="reference external" href="https://arxiv.org/abs/2512.24880">mHC paper</a>). mHC widens the residual stream by a factor of 4 and mixes it around every sublayer through three dynamically generated mappings: a <strong>pre-mapping</strong> that reads the sublayer input from the expanded residual, a <strong>residual-mixing</strong> matrix projected onto the manifold of doubly stochastic matrices through 20 Sinkhorn-Knopp iterations, and a <strong>post-mapping</strong> that writes the sublayer output back into the residual streams. TensorRT LLM instantiates two mHC modules per layer (one around attention and one around the MoE block), plus an <strong>HC head</strong> that collapses the expanded residual to a single stream before the language-model head. It fuses adjacent post- and pre-mappings at the attention-to-MoE boundary and, where possible, across consecutive transformer layers.</p>
+<p><strong>MoE.</strong> Both model scales activate six routed experts and one shared expert per token, selecting from 256 routed experts in Flash and 384 in Pro. The first three layers use hash routing, where a checkpoint-provided token-ID-to-expert table maps each input token directly to its experts. Later layers use a learned gate with Sqrt-Softplus affinity scores and a score-correction bias. TensorRT LLM implements both routing modes through a shared interface that supplies the selected experts and routing weights to its configurable MoE backends. TRTLLM-Gen, DeepGEMM, and the standard CuTe DSL fused MoE backend cover the corresponding DeepSeek-V4 precision paths and preserve the checkpoint-defined <code class="docutils literal notranslate"><span class="pre">swiglu_limit</span></code> activation clamp, including the uniform clamp used by the NVFP4 CuTe DSL path. DeepSeek-V4 is also registered with TensorRT LLM’s expert parallel load balancer, allowing supported expert-parallel deployments to rebalance physical expert placement without changing the model’s routing semantics.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog26_deepseek_v4_mhc_moe.png" width="100%" alt="DeepSeek-V4 mHC architecture and MoE routing. Panel a shows the repeated transformer stack with mHC pre- and post-mappings around the attention and MoE blocks, followed by the HC head and language-model head. Panel b shows hash routing through a token-ID embedding table and learned routing through Sqrt-Softplus scores, correction bias, and Top-K expert selection.">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 2. DeepSeek-V4 components beyond attention. (a) mHC wraps the attention and MoE sublayers with pre- and post-mappings, then uses an HC head to collapse the expanded residual stream before the language-model head. (b) The MoE router supports checkpoint-defined hash routing in the first three layers (left) and learned Sqrt-Softplus scoring with correction bias and Top-6 selection in later layers (right).</em></sub></p>
+<p><strong>Speculative decoding.</strong> DeepSeek-V4 checkpoints with next-token prediction layers run MTP speculative decoding through the Eagle-style one-model path. Each MTP module consumes the expanded residual state from the target model or previous MTP module together with the next-token embedding, then runs the same mHC-wrapped attention-and-MoE structure as a target-model layer, using SWA for its attention. TensorRT LLM remaps the MTP weights, shares the embedding and language-model head with the target model, and extends the attention and cache metadata for the configured draft depth. The speculative-decoding performance results reported in this blog use this MTP path. DeepSeek has released dedicated <a class="reference external" href="https://arxiv.org/abs/2607.05147">DSpark</a> checkpoints for DeepSeek-V4. DSpark adds a lightweight sequential head to a parallel draft backbone to model dependencies within a draft block, while performance tuning for this path remains in progress.</p>
+</section>
+<section id="parallelism-and-deployment-notation">
+<h5>Parallelism and deployment notation<a class="headerlink" href="#parallelism-and-deployment-notation" title="Link to this heading">#</a></h5>
+<p>DeepSeek-V4 adopts the same parallel strategies as DeepSeek-R1 and DeepSeek-V3.2: attention data parallelism (ADP) combined with expert parallelism (EP) for throughput-oriented serving, and tensor parallelism (TP) for latency-oriented deployments, with pipeline parallelism available for fitting the largest checkpoints. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md">Tech Blog 3</a> for the performance rationale and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Tech Blog 4</a>/<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md">8</a>/<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md">14</a> for large-scale expert parallelism. Note that with ADP, <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> is a per-rank limit, so benchmark concurrency must be scaled to populate all ranks.</p>
+<p>The rest of this blog uses a compact notation for these combinations. <code class="docutils literal notranslate"><span class="pre">TEP&lt;N&gt;</span></code> shards both attention (TP) and experts (EP) across <code class="docutils literal notranslate"><span class="pre">N</span></code> ranks. <code class="docutils literal notranslate"><span class="pre">DEP&lt;N&gt;</span></code> keeps attention data-parallel (ADP) while distributing experts across <code class="docutils literal notranslate"><span class="pre">N</span></code> ranks. Both compose with disaggregated serving, where context (CTX) and generation (GEN) servers are sized independently. For example, <code class="docutils literal notranslate"><span class="pre">DEP4</span> <span class="pre">(CTX)</span> <span class="pre">+</span> <span class="pre">TEP8</span> <span class="pre">(GEN)</span></code> runs a four-rank DEP context instance alongside an eight-rank TEP generation instance.</p>
+</section>
+</section>
+<section id="cache-management-and-runtime-features">
+<h4>Cache management and runtime features<a class="headerlink" href="#cache-management-and-runtime-features" title="Link to this heading">#</a></h4>
+<p>DeepSeek-V4’s hybrid attention turns the “KV cache” into a collection of states with different shapes and lifetimes. Each attention mode owns a different set of logical cache layers:</p>
+<ul class="simple">
+<li><p>an <strong>SWA</strong> layer owns only its sliding-window KV.</p></li>
+<li><p>a <strong>CSA</strong> layer adds the 4× compressed attention cache, Compressor KV/score state, compressed Indexer-K cache, and Indexer-Compressor KV/score state.</p></li>
+<li><p>an <strong>HCA</strong> layer adds the 128× compressed attention cache and Compressor KV/score state, with no Indexer-side cache.</p></li>
+</ul>
+<p>These tensors differ in dtype, bytes per entry, production rate, and lifetime. Treating them as a uniform KV tensor would either waste memory or give the scheduler an incorrect view of capacity. For the rest of this blog, we group them into two lifecycle categories. The <strong>sliding-window cache</strong> contains SWA’s sliding-window KV and the short-lived Compressor KV/score state used by CSA, HCA, and the CSA Indexer. These buffers are needed only for bounded windows over recent raw-token positions, so older pages can be recycled. The <strong>persistent compressed caches</strong> contain the finalized 4× and 128× compressed attention entries and CSA’s compressed Indexer-K entries. They represent retained history and remain available for attention and prefix reuse, so their storage grows with sequence length at the corresponding compression rate. These terms describe lifecycle categories rather than a one-to-one mapping to physical pools. <code class="docutils literal notranslate"><span class="pre">DeepseekV4CacheManager</span></code> describes every state as a buffer role with an explicit lifecycle and page-indexing mode, then groups compatible buffers into physical memory pools. Sliding-window cache buffers use per-layer page indices. Persistent compressed caches use shared indices across layers with the same compression layout.</p>
+<p>The Compressor breaks two assumptions made by a conventional paged KV cache: its intermediate state is short-lived, and its persistent output grows more slowly than the raw token sequence. TensorRT LLM maps both cases onto existing KV Cache Manager V2 abstractions.</p>
+<p><strong>Short-lived Compressor state.</strong> A raw token’s intermediate state is needed only while a compression window that contains it remains open. Once the last such window is finalized, that token’s intermediate state can be recycled. This lifetime is naturally represented as a sliding window: 128 raw-token positions for HCA, and 8 for CSA because its overlapping Compressor keeps two 4-token groups live. The manager can therefore reuse the existing window-eviction and block-recycling machinery.</p>
+<p><strong>Slow-growing compressed caches.</strong> A compressed stream produces one entry for every $r$ raw tokens. Rather than introduce a second coordinate system, the manager keeps page allocation in raw-token coordinates. For a page covering <code class="docutils literal notranslate"><span class="pre">tokens_per_block</span></code> raw positions, its compressed buffer stores <code class="docutils literal notranslate"><span class="pre">tokens_per_block</span> <span class="pre">/</span> <span class="pre">r</span></code> entries. The page still represents the same interval of the original sequence, but its storage cost reflects the 4× or 128× compression ratio. Allocation, block-table construction, prefix reuse, and capacity accounting can consequently share one page model across all streams.</p>
+<p>The physical pool split is workload-dependent. Fresh prefill creates the greatest pressure on the sliding-window cache, whereas persistent compressed caches grow with sequence length and decode concurrency. When <code class="docutils literal notranslate"><span class="pre">kv_cache_config.pool_ratio</span></code> is not specified, KV Cache Manager V2 derives an initial split from a representative mixed batch: one context request and up to <code class="docutils literal notranslate"><span class="pre">max_batch_size</span> <span class="pre">-</span> <span class="pre">1</span></code> generation requests. <code class="docutils literal notranslate"><span class="pre">kv_cache_config.avg_seq_len</span></code> controls the representative total sequence length of a typical decode request, while additional constraints reserve enough capacity for a maximum-length decode request and a chunked-prefill step. Advanced deployments can override the initial split with <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> (specified in pool-group order and summing to 1.0). An opt-in beta rebalancer, enabled with <code class="docutils literal notranslate"><span class="pre">enable_kv_pool_rebalance</span></code>, can later adjust the split from runtime statistics. It is disabled by default and currently targets a narrower set of aggregated-serving configurations.</p>
+<p>DeepSeek-V4 also enables SWA scratch reuse by default. During prefill, transient sliding-window pages can be recycled across compatible layers instead of being retained as independent long-lived allocations. This reduces the prefill peak that would otherwise dictate the entire pool split. Its performance impact is discussed in <a class="reference internal" href="#runtime-optimization"><span class="xref myst"><strong>Runtime optimization</strong></span></a>.</p>
+<p>With this state model in place, the same attention implementation composes with the runtime features expected in production:</p>
+<ul class="simple">
+<li><p><strong>Chunked prefill.</strong> The Compressor and Indexer carry compressed lengths and open-window state across chunks, preserving the semantics of processing the prompt in one pass.</p></li>
+<li><p><strong>KV-cache reuse.</strong> Prefix reuse restores the attention, Compressor, and Indexer state owned by each layer type, rather than treating the main attention KV as sufficient.</p></li>
+<li><p><strong>CUDA Graphs.</strong> Top-K and Compressor workspaces use graph-safe buffers whose captured shapes remain stable for a given graph batch size.</p></li>
+<li><p><strong>Overlap scheduling.</strong> Cache updates and sparse-attention preparation are designed to avoid host-device synchronizations on the critical path, allowing request preparation to overlap GPU execution.</p></li>
+<li><p><strong>Disaggregated serving.</strong> The V2 transfer path describes cache contents by pool, layer, and buffer role, allowing context workers to transfer every DeepSeek-V4 cache type and generation workers to rebuild their local block tables consistently.</p></li>
+</ul>
+<p>Production support also extends to the API boundary. For Instruct checkpoints, selecting the <code class="docutils literal notranslate"><span class="pre">deepseek_v4</span></code> tokenizer wrapper applies the reference chat format, including thinking controls, tool definitions, and DSML, DeepSeek’s special-token-delimited format for tool calls. Tool results are inserted with <code class="docutils literal notranslate"><span class="pre">&lt;tool_result&gt;</span></code> tags. Matching reasoning and tool parsers turn generated thinking and DSML tool-call blocks back into OpenAI-compatible response fields. Base checkpoints remain completion models and should receive raw prompts without this wrapper.</p>
+</section>
+<section id="precision-strategy-and-accuracy">
+<h4>Precision strategy and accuracy<a class="headerlink" href="#precision-strategy-and-accuracy" title="Link to this heading">#</a></h4>
+<p>DeepSeek-V4 uses three checkpoint-level precision recipes, each mapping low precision to the components where it reduces weight or cache bandwidth while keeping higher precision for stateful reductions and numerically sensitive paths:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Component</p></th>
+<th class="head text-left"><p>FP8 (Base)</p></th>
+<th class="head text-left"><p>MXFP4 (Instruct)</p></th>
+<th class="head text-left"><p>NVFP4 (requantized)</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>MoE routed experts GEMM</p></td>
+<td class="text-left"><p>Blockwise FP8</p></td>
+<td class="text-left"><p>MXFP8 activations × MXFP4 weights</p></td>
+<td class="text-left"><p>NVFP4</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>MoE shared expert GEMM</p></td>
+<td class="text-left"><p>Blockwise FP8</p></td>
+<td class="text-left"><p>MXFP8</p></td>
+<td class="text-left"><p>MXFP8</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Attention QKV/O GEMM</p></td>
+<td class="text-left"><p>Blockwise FP8</p></td>
+<td class="text-left"><p>MXFP8</p></td>
+<td class="text-left"><p>MXFP8</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Indexer Q projection</p></td>
+<td class="text-left"><p>Blockwise FP8</p></td>
+<td class="text-left"><p>MXFP8</p></td>
+<td class="text-left"><p>MXFP8</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Indexer weights projection</p></td>
+<td class="text-left"><p>BF16</p></td>
+<td class="text-left"><p>BF16</p></td>
+<td class="text-left"><p>BF16</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Compressor KV/score linears</p></td>
+<td class="text-left"><p>BF16</p></td>
+<td class="text-left"><p>BF16</p></td>
+<td class="text-left"><p>BF16</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Main attention KV cache</p></td>
+<td class="text-left"><p>BF16 or per-tensor FP8</p></td>
+<td class="text-left"><p>BF16 or per-tensor FP8</p></td>
+<td class="text-left"><p>BF16 or per-tensor FP8</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Indexer K cache</p></td>
+<td class="text-left"><p>Blockwise FP8 or MXFP4</p></td>
+<td class="text-left"><p>Blockwise FP8 or MXFP4</p></td>
+<td class="text-left"><p>Blockwise FP8 or MXFP4</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Compressor state cache</p></td>
+<td class="text-left"><p>FP32</p></td>
+<td class="text-left"><p>FP32</p></td>
+<td class="text-left"><p>FP32</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Apart from the main-transformer routed experts, the NVFP4 checkpoint keeps its tensors identical to the MXFP4 Instruct source. In particular, the MTP subtree retains the Instruct precision recipe. The two FP4 routed-expert formats are distinct recipes served by different kernels. The Instruct checkpoints publish packed MXFP4 routed-expert weights executed with MXFP8 activations and MXFP4 weights, while the main-layer experts in requantized checkpoints such as <code class="docutils literal notranslate"><span class="pre">nvidia/DeepSeek-V4-Pro-NVFP4</span></code> run through the NVFP4 MoE path. On the cache side, FP4 approximately halves the Indexer-K data payload and is TensorRT LLM’s default Indexer-K format for DeepSeek-V4 on Blackwell. The attention projections follow the same philosophy of staying in low precision across kernel boundaries. For eligible context-only sparse MLA batches, query quantization is fused into the Q RMSNorm and RoPE kernels, which write the FP8 Q buffer consumed by attention. Generation and mixed batches use the unfused Q path. For eligible DeepSeek-V4 Pro configurations, inverse RoPE and FP8 quantization are further fused into the FMHA epilogue, while other configurations use the optimized standalone inverse-RoPE and quantization kernel before <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code>. These kernel fusions are discussed further in <a class="reference internal" href="#optimize-the-csahca-hot-path"><span class="xref myst"><strong>Optimize the CSA/HCA hot path</strong></span></a>.</p>
+<p>Accuracy was validated across Flash and Pro checkpoints, the FP8 (Base), MXFP4 (Instruct), and NVFP4 recipes, MTP on and off, FP8 and BF16 KV cache, and aggregated and disaggregated serving, comparing GPQA-Diamond and LiveCodeBench scores against the paper baselines. In this blog, MTP-1 and MTP-3 denote speculative draft lengths of one and three tokens, respectively. Representative GPQA-Diamond results with MTP-3 and FP8 KV cache unless noted:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Configuration</p></th>
+<th class="head text-right"><p>GPQA-Diamond</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>DeepSeek-V4-Flash</p></td>
+<td class="text-right"><p>88.8</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>DeepSeek-V4-Pro</p></td>
+<td class="text-right"><p>89.08</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>DeepSeek-V4-Pro, disaggregated</p></td>
+<td class="text-right"><p>89.39</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>DeepSeek-V4-Pro-NVFP4</p></td>
+<td class="text-right"><p>89.39</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Production readiness also required testing well beyond single-feature correctness: the validation matrix spans CUDA Graph capture, chunked prefill with cached history, MTP, long contexts, high concurrency, disaggregated transfer and shutdown, and memory pressure during loading and autotuning, with model-specific CI covering aggregated and disaggregated serving on Blackwell. This coverage is what turned the initial functional implementation into a stack the subsequent performance work could safely optimize.</p>
+</section>
+</section>
+<section id="deepseek-v4-performance-optimizations">
+<h3>DeepSeek-V4 Performance Optimizations<a class="headerlink" href="#deepseek-v4-performance-optimizations" title="Link to this heading">#</a></h3>
+<p>Building on the production-ready execution stack described above, TensorRT LLM optimizes DeepSeek-V4 across four areas: the CSA/HCA attention hot path, Compressor and mHC, MoE, and runtime execution and memory management. The following sections explain the key techniques in each area, while <a class="reference internal" href="#deepseek-v4-performance-evolution"><span class="xref myst"><strong>DeepSeek-V4 Performance Evolution</strong></span></a> presents their cumulative end-to-end impact under a consistent model workload. Performance numbers cited here are scoped operator measurements or A/B end-to-end comparisons, not cumulative speedups.</p>
+<section id="optimize-the-csa-hca-hot-path">
+<h4>Optimize the CSA/HCA hot path<a class="headerlink" href="#optimize-the-csa-hca-hot-path" title="Link to this heading">#</a></h4>
+<p>CSA and HCA share a dual-pool attention kernel over the 128-token sliding window and compressed history, while CSA additionally runs an Indexer and Top-K selection. TensorRT LLM optimizes this hot path through attention-kernel improvements, low-precision fusion, multi-stream scheduling, and Top-K optimization.</p>
+<p><strong>Sparse MLA kernel optimization.</strong> The dual-pool kernel processes the 128-token sliding window first, then gathers selected CSA entries or streams all HCA entries from the compressed pool. The optimized TRTLLM-Gen kernel skips redundant dense and sliding-window softmax masking on full tiles and issues sparse V loads with less coordinate setup and register spill/reload pressure. On B200 with an FP8 KV cache, the measured FMHA kernel was up to 1.31× faster for CSA prefill and 1.21× faster for HCA generation in the tested shapes. These are operator-level results, and the model-level gain depends on the model’s mix of SWA, CSA, and HCA layers.</p>
+<p><strong>Kernel fusion and low-precision dataflow.</strong> The functional path initially relied on framework or generic operators around attention. TensorRT LLM adds a DeepSeek-V4-specific Q RMSNorm CUDA kernel and extends the MLA RoPE/assignment and FMHA epilogue kernels so that normalization, rotation, and quantization can be fused into their producers. The resulting optimizations are:</p>
+<ul class="simple">
+<li><p><strong>Fused Q RMSNorm, RoPE, and FP8 quantization.</strong> The initial context path used three kernels for Q RMSNorm, RoPE and assignment, and full-Q FP8 quantization. For eligible context-only sparse MLA batches with an FP8 KV cache, TensorRT LLM folds quantization of the 448-dimensional non-RoPE segment into the Q RMSNorm kernel, then folds quantization of the remaining 64-dimensional RoPE segment and BMM-scale generation into the RoPE and assignment kernel. These two producer kernels write directly into the same FP8 Q buffer, eliminating the standalone quantization kernel and the full higher-precision normalized Q tensor. Generation and mixed batches continue to use the unfused path.</p></li>
+<li><p><strong>Standalone inverse-RoPE and FP8 quantization.</strong> DeepSeek-V4 first establishes an FP8-native input path for <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> by combining inverse RoPE and 1×128 blockwise FP8 quantization in a standalone operator. This operator consumes the BF16 output from FMHA and writes E4M3 activations and FP32 scales directly in the layout required by the Blackwell <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> BMM. Replacing the original Triton implementation with a shape-specialized CUDA kernel made the standalone operator 1.6–2.3× faster in kernel-only measurements across 1K–32K tokens on B200. This path remains the fallback when FMHA epilogue fusion is not applicable.</p></li>
+<li><p><strong>FMHA epilogue fusion.</strong> Building on the same FP8 <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> input contract, TensorRT LLM moves inverse RoPE and 1×128 E4M3 quantization into the FMHA correction epilogue for validated DeepSeek-V4 Pro configurations using the FP8 KV cache, sparse MLA, and attention data parallelism. FMHA then writes the E4M3 output and FP32 scales directly in the layout consumed by the <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> BMM, eliminating both the standalone operator launch and the intermediate BF16 output write and read. The <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> BMM remains a separate kernel. This fusion supports context-only and generation-only batches, while mixed batches and unsupported configurations use the standalone path. Relative to the combined time of standard FMHA and the standalone inverse-RoPE and quantization operator, the fused FMHA kernel was up to 1.62× faster for prefill and 1.34× faster for generation in the tested shapes.</p></li>
+<li><p><strong>Others.</strong> For CSA layers with BF16, bias-free <code class="docutils literal notranslate"><span class="pre">q_b</span></code> projection weights, a shape-autotuned CuTe DSL GEMM replaces the generic linear path on supported SM100f systems and falls back when CuTe DSL is unavailable. The optimized attention path also removes a device-to-device copy after FMHA, and FP8 quantization kernels initialize their own scale-buffer padding instead of requiring a separate host-launched <code class="docutils literal notranslate"><span class="pre">zero_()</span></code> operation.</p></li>
+</ul>
+<p><strong>Top-K optimizations.</strong> The CSA Indexer selects hundreds of entries per query, making Top-K particularly visible during long-context decode. TensorRT LLM accelerates it in two complementary ways:</p>
+<ul class="simple">
+<li><p><strong>Top-K kernel optimization.</strong> TensorRT LLM makes the standard Top-K path shape-aware and device-aware. Depending on the compressed sequence length and row count, the dispatcher uses insertion selection, a single-CTA radix kernel, or a multi-CTA split-and-merge implementation. The multi-CTA path exposes enough parallel work for small decode batches, while its launch policy uses the row count, compressed sequence length, configured split threshold, and the GPU’s actual SM count. On B200 with FP32 logits, 196,608 columns, <code class="docutils literal notranslate"><span class="pre">next_n=1</span></code>, and no previous indices, the device-aware policy reduced the K=512 latency at batch size 148 from 384 µs to 112 µs.</p></li>
+<li><p><strong>GVR Top-K.</strong> GVR, introduced in our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.md">GVR technical blog</a>, exploits the overlap between the entries selected by adjacent decode steps. It uses the previous step’s indices as candidates, verifies them against current scores, and refines or falls back when the fast-path conditions are not met. DeepSeek-V4 extends GVR to the Indexer’s 4× compressed coordinate space and to checkpoint-defined Top-K values of 512 for Flash and 1024 for Pro. In kernel-only B300 tests, GVR was 1.40–2.17× faster than the radix-selection baseline for the tested Flash and Pro shapes. An end-to-end Flash test on eight B300 SXM6 GPUs with a 65K-token input, batch size 4, and MTP-3 reported 6.4% higher request throughput.</p></li>
+</ul>
+<p><strong>Multi-stream attention scheduling.</strong> The CSA attention prologue contains the main-attention Compressor, the <code class="docutils literal notranslate"><span class="pre">q_b</span></code> projection, and an Indexer with only a few true dependencies between them. The main-attention Compressor and the query-independent part of the Indexer can start directly from the layer input, while the <code class="docutils literal notranslate"><span class="pre">q_b</span></code> projection and Q RMSNorm wait for the shared projection and <code class="docutils literal notranslate"><span class="pre">q_a</span></code> normalization. TensorRT LLM progressively exposes this parallelism at two levels:</p>
+<ul class="simple">
+<li><p><strong>Initial outer overlap.</strong> The first dependency-aware schedule runs the main-attention Compressor concurrently with the <code class="docutils literal notranslate"><span class="pre">q_b</span></code> projection and Q RMSNorm. It then adds a dedicated stream for the complete Indexer branch, allowing all three branches to make progress before sparse MLA consumes their outputs.</p></li>
+<li><p><strong>Nested Indexer overlap.</strong> Inside the Indexer, query projection, RoPE, and Q quantization form one branch, while the query-independent weight projection, Indexer Compressor, and K-cache update form another. Events synchronize them only when Q scales are needed for weight scaling and when the logits and Top-K kernels require the updated cache.</p></li>
+<li><p><strong>Final schedule with earlier launches.</strong> The refined schedule pre-launches the main-attention Compressor and the query-independent half of the Indexer before the shared <code class="docutils literal notranslate"><span class="pre">kv_a</span></code> projection and Q/KV normalizations. Once normalized Q is available, the query-dependent Indexer work runs on its dedicated stream, while the <code class="docutils literal notranslate"><span class="pre">q_b</span></code> projection and Q RMSNorm are queued after the main-attention Compressor on the Compressor stream. This is the final stream assignment, replacing the earlier three-way outer schedule.</p></li>
+</ul>
+<p>Correctness across streams requires explicit tensor-lifetime tracking. TensorRT LLM calls <code class="docutils literal notranslate"><span class="pre">record_stream()</span></code> on the precomputed Indexer tensors, normalized Q output, and Top-K indices when they move to the consuming stream, preventing the PyTorch caching allocator from reusing their storage before the downstream work completes.</p>
+</section>
+<section id="compressor-and-mhc">
+<h4>Compressor and mHC<a class="headerlink" href="#compressor-and-mhc" title="Link to this heading">#</a></h4>
+<p>The Compressor and mHC introduce repeated chains of small, stateful, and reduction-heavy operations around attention and MoE. The Compressor turns projected KV and scores into persistent paged state and compressed cache entries, while mHC transforms the residual streams at each sublayer boundary. TensorRT LLM optimizes both in two layers: first fuse adjacent operations to remove launches and intermediate tensors, then specialize the fused kernels for DeepSeek-V4 shapes and execution regimes.</p>
+<section id="compressor-optimizations">
+<h5>Compressor optimizations<a class="headerlink" href="#compressor-optimizations" title="Link to this heading">#</a></h5>
+<p>The optimized Compressor pipeline uses fusion at three boundaries:</p>
+<ul class="simple">
+<li><p><strong>KV and score projection.</strong> A single <code class="docutils literal notranslate"><span class="pre">wkv_gate</span></code> projection produces both the KV vectors and their compression scores.</p></li>
+<li><p><strong>Compression and state update.</strong> The prefill and decode kernels write new KV/score state into paged storage and perform the online-softmax reduction when a compression window completes, avoiding separate state-update and reduction passes.</p></li>
+<li><p><strong>Postprocessing and cache write.</strong> One kernel applies RMSNorm, RoPE, the optional Hadamard transform, output quantization, and scatter into the compressed paged cache.</p></li>
+</ul>
+<p><strong>Kernel optimization.</strong> The fused Compressor kernels support the different dtype and cache-layout requirements of both the main-attention Compressor and the Compressor inside the Indexer, including BF16, FP8, and MXFP4 paths. They accept BF16 projection output directly while retaining FP32 state updates and online-softmax accumulation where required, avoiding a full FP32 KV/score intermediate. The reduction kernels are specialized for the 4×-compression decode and MTP regime and the much longer 128×-compression prefill regime, with the latter also reducing newly arrived tokens while writing their paged state to avoid a later readback.</p>
+</section>
+<section id="mhc-optimizations">
+<h5>mHC optimizations<a class="headerlink" href="#mhc-optimizations" title="Link to this heading">#</a></h5>
+<p>DeepSeek-V4 places mHC around both attention and MoE, making the boundary between consecutive sublayers the primary fusion opportunity.</p>
+<p><strong>Kernel fusion.</strong> TensorRT LLM fuses the previous sublayer’s post-mapping with the next sublayer’s pre-mapping into shape-specialized CUDA kernels, with both two-kernel and all-in-one tactics for different token counts. The next sublayer’s input RMSNorm is further folded into the fused mHC epilogue, eliminating a separate launch and an HBM round trip. Because mHC owns the residual connection at the attention-to-MoE boundary, the MoE path also skips separate residual handling.</p>
+<p><strong>Kernel optimization.</strong> No single mHC kernel is optimal across the full range of token counts <code class="docutils literal notranslate"><span class="pre">M</span></code>. TensorRT LLM provides FMA implementations for small-<code class="docutils literal notranslate"><span class="pre">M</span></code> workloads and higher-throughput MMA implementations as <code class="docutils literal notranslate"><span class="pre">M</span></code> grows, with two-kernel and all-in-one variants, multiple tile configurations, and Split-K support. The autotuner evaluates the valid tactics for each workload and selects the best-performing implementation, while pruning choices that are not competitive in the corresponding <code class="docutils literal notranslate"><span class="pre">M</span></code> regime and caching the selected tactic for reuse.</p>
+</section>
+</section>
+<section id="moe-optimizations">
+<h4>MoE optimizations<a class="headerlink" href="#moe-optimizations" title="Link to this heading">#</a></h4>
+<p>Building on the routing design <a class="reference internal" href="#beyond-attention-mhc-moe-and-speculative-decoding"><span class="xref myst">described above</span></a>, TensorRT LLM optimizes DeepSeek-V4’s MoE path through a custom router GEMM, the MXFP8 × MXFP4 DeepGEMM MegaMoE backend, streamlined input preparation, and ongoing NVFP4 MegaMoE integration. These efforts preserve the model’s routing metadata, precision recipe, and checkpoint-defined <code class="docutils literal notranslate"><span class="pre">swiglu_limit</span></code> activation clamp.</p>
+<p><strong>MoE router GEMM optimization.</strong> For the 256-expert Flash shape, the score-based router uses a custom GEMM when it receives one to 16 token rows. The kernel consumes BF16 activations and weights and produces FP32 logits directly, avoiding the full FP32 input and weight casts required by the original linear path. Unsupported shapes, including the 384-expert Pro router, continue to use cuBLAS. In the reported small-shape measurements, router latency decreased from approximately 8 µs to 3 µs.</p>
+<p><strong>MXFP8 × MXFP4 DeepGEMM MegaMoE.</strong> For the W4A8 recipe with MXFP8 activations and MXFP4 weights, the DeepGEMM MegaMoE backend moves dispatch, the first expert GEMM, SwiGLU, the second expert GEMM, and combine into a fused-communication path that uses symmetric memory and in-kernel synchronization. In a 500-request DeepSeek-V4 Flash test on B200 with 1K-token inputs and outputs, TP4, EP4, and attention data parallelism, switching from the TensorRT LLM MoE backend to DeepGEMM MegaMoE increased throughput by 15.3% and reduced latency by 12.7%. TensorRT LLM also fuses the input preparation for this backend: instead of separately quantizing BF16 activations to MXFP8, converting selected expert indices, and copying activations, scales, indices, and routing weights into symmetric buffers, one CUDA kernel performs the quantization and writes all four outputs directly to their final buffers, reducing six GPU operations to one. No separate end-to-end gain is attributed to the preparation change.</p>
+<p><strong>NVFP4 MegaMoE (WIP).</strong> For native NVFP4 checkpoints, TensorRT LLM is integrating the ported <code class="docutils literal notranslate"><span class="pre">Sm100MegaMoEKernel</span></code> as a CuTe DSL execution backend on the SM100f path. The integration covers BF16-to-NVFP4 input quantization, dispatch, the two expert GEMMs, SwiGLU, per-route combine writes with native NVFP4 weights, and a separate reduction of the Top-K route contributions. It also includes symmetric-memory exchange for multi-rank expert parallelism and workload-specific tactic selection through the TensorRT LLM autotuner. The NVFP4 and DeepGEMM MegaMoE paths have separate hardware, quantization, and topology requirements. This precision-specific backend remains under integration and validation.</p>
+</section>
+<section id="runtime-optimization">
+<h4>Runtime optimization<a class="headerlink" href="#runtime-optimization" title="Link to this heading">#</a></h4>
+<p>After the major kernels are optimized, runtime overhead shifts to the boundaries between kernels, repeated metadata and data movement, and transient memory growth during long-context prefill. TensorRT LLM addresses these costs through earlier dependent launches, streamlined input preparation, and workload-aware memory control.</p>
+<p><strong>Programmatic Dependent Launch.</strong> PDL allows a dependent consumer grid to launch before its producer grid fully retires, wait at an explicit dependency point, and continue as soon as the required producer state is ready. TensorRT LLM configures PDL globally for supported DeepGEMM operations and also applies it to the packed 1×128 FP8 quantization, MLA RoPE, sparse-index conversion, sparse FMHA, and fused mHC paths used by DeepSeek-V4. This shortens producer-to-consumer boundaries without changing the model’s dependency graph.</p>
+<p><strong>Metadata preparation.</strong> TensorRT LLM streamlines DeepSeek-V4 attention-metadata preparation by reusing tensors and consolidating the host- and device-side updates required for each step, reducing Python work, kernel launches, and data transfers. The cache manager also builds DeepSeek-V4 block tables on the GPU and uses a dedicated CUDA operator instead of compiling the earlier tensor implementation, reducing host-memory pressure while keeping block-table generation on the device.</p>
+<p><strong>SWA scratch reuse.</strong> A long prefill step produces KV entries for every token in the input chunk, but sliding-window attention retains only the most recent window after the step. Among the new blocks allocated for the current chunk, blocks that will already be outside the final non-rewindable window are needed only by the currently executing layer. TensorRT LLM maps this scratch-eligible range through per-layer block tables to coalesced scratch subpages. Because these per-layer lifetimes do not overlap, the same physical scratch storage can be reused as execution advances across layers. Pre-existing history from earlier chunks remains in the normal KV cache and is never overwritten by scratch reuse. New blocks in the active window also remain in the normal cache, and the tail that MTP may rewind is excluded from scratch storage. As a result, the cache does not retain the full current prefill chunk independently for every compatible SWA layer, reducing long-context prefill memory consumption and leaving more capacity for larger chunks, longer prompts, or higher concurrency.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog26_dsv4_scratch_swa.png" width="100%" alt="SWA scratch reuse during long-context prefill. Scratch-eligible KV blocks produced by the current prefill chunk and falling outside the final retained window reuse the same physical storage across SWA layers, while blocks inside the sliding window remain in the normal KV cache.">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3. SWA scratch reuse during long-context prefill. Scratch-eligible blocks from the current prefill chunk reuse the same physical storage across SWA layers, while the final sliding-window state remains in the normal KV cache.</em></sub></p>
+<p><strong>Bounded Indexer workspace.</strong> During long-context prefill, the Indexer’s MQA-logits transient grows with both the query chunk and compressed history. TensorRT LLM controls this allocation at two levels. An outer heuristic reduces the configured prefill chunk when the compressed KV history crosses long-context thresholds. Within each chunk, query tiling imposes a hard per-call element budget so that only a bounded slice of the logits matrix is materialized at a time. Because logits and Top-K are computed independently for each query row, tiling preserves the exact selection result while enabling very long prompts without reducing the model-wide token budget.</p>
+<p>Together, these runtime optimizations help carry the preceding kernel gains through to the full model. Dependent work starts earlier, recurring host-side metadata work is reduced, and long-context memory follows a bounded working set instead of unchecked temporary growth. The next section, <a class="reference internal" href="#deepseek-v4-performance-evolution"><span class="xref myst"><strong>DeepSeek-V4 Performance Evolution</strong></span></a>, shows how the kernel and runtime improvements accumulate at the full-model level.</p>
+</section>
+</section>
+<section id="deepseek-v4-performance-evolution">
+<h3>DeepSeek-V4 Performance Evolution<a class="headerlink" href="#deepseek-v4-performance-evolution" title="Link to this heading">#</a></h3>
+<p>The preceding <a class="reference internal" href="#deepseek-v4-performance-optimizations"><span class="xref myst"><strong>DeepSeek-V4 Performance Optimizations</strong></span></a> section described the individual attention, Compressor, mHC, MoE, and runtime optimizations. Their real value, however, is whether they move the end-to-end serving frontier after the full system is re-tuned. We therefore tracked a sequence of complete TensorRT LLM Pareto sweeps rather than multiplying speedups from isolated operator benchmarks. Under the same DeepSeek-V4 Pro 8K/1K workload, the maximum observed output throughput increased from 984 to 1,618 tokens/s/GPU between the first validated functional baseline and the latest fully refreshed May 28 snapshot, a <strong>64.5% improvement</strong>. Additional optimizations have since been integrated into the newer DeepSeek-V4 stack, but have not yet been included in a new full Pareto sweep.</p>
+<section id="experimental-setup">
+<h4>Experimental setup<a class="headerlink" href="#experimental-setup" title="Link to this heading">#</a></h4>
+<p>The primary evaluation uses the InferenceX fixed-length 8K/1K workload, with exactly 8K input tokens and 1K output tokens per request. This shape stresses both sides of disaggregated serving: the context workers must process a substantial prompt, while the generation workers execute enough decode steps for sparse attention, MTP, and MoE efficiency to materially affect the result.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Item</p></th>
+<th class="head text-left"><p>Configuration</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Model</p></td>
+<td class="text-left"><p>DeepSeek-V4 Pro, 1.6T total parameters</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Hardware</p></td>
+<td class="text-left"><p>NVIDIA GB300</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Precision</p></td>
+<td class="text-left"><p>Mixed-precision MXFP4 Instruct recipe: MXFP8 activations × MXFP4 weights for routed-expert GEMMs, with component-specific precision elsewhere</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Workload</p></td>
+<td class="text-left"><p>InferenceX, 8K input tokens and 1K output tokens per request</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Serving mode</p></td>
+<td class="text-left"><p>End-to-end disaggregated serving with independently sized context and generation workers</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Sweep</p></td>
+<td class="text-left"><p>TEP4/TEP8 for the latency-oriented end; DEP8/DEP16/DEP32 for the throughput-oriented end; MTP-3 for most latency and mid-frontier points and MTP-1 at the highest-concurrency points</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Metrics</p></td>
+<td class="text-left"><p>Output throughput per concurrent request stream (tokens/s/user) and output throughput per GPU (tokens/s/GPU)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Each curve in Figure 4 is a newly measured system Pareto sweep. A point can therefore change concurrency, MTP depth, parallel strategy, expert placement, and the context-to-generation resource ratio. The curve movement is the meaningful comparison; the peak values should not be interpreted as a component-by-component A/B test at an identical configuration.</p>
+<p><img alt="Four DeepSeek-V4 Pro 8K/1K disaggregated-serving Pareto curves, showing peak output throughput increasing from 984 to 1,618 tokens/s/GPU" src="../../_images/tech_blog26_dsv4_performance_evolution_8k1k.png" /></p>
+<p align="center"><sub><em>Figure 4. DeepSeek-V4 Pro 8K/1K disaggregated serving on GB300, using the mixed-precision MXFP4 Instruct recipe with MXFP8 × MXFP4 routed-expert GEMMs. Each line is a complete TensorRT LLM Pareto sweep from that milestone.</em></sub></p>
+</section>
+<section id="from-baseline-to-the-latest-measured-curve">
+<h4>From Baseline to the Latest Measured Curve<a class="headerlink" href="#from-baseline-to-the-latest-measured-curve" title="Link to this heading">#</a></h4>
+<p>The four curves capture three distinct phases of optimization. The table reports the highest measured tokens/s/GPU on each sweep; because the maximizing configuration changes as the frontier moves, these values summarize system evolution rather than a strict single-configuration waterfall.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Milestone</p></th>
+<th class="head text-right"><p>Peak output throughput (tokens/s/GPU)</p></th>
+<th class="head text-right"><p>Gain from previous</p></th>
+<th class="head text-right"><p>Gain from baseline</p></th>
+<th class="head text-left"><p>Representative changes in this stage</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>April 28: validated baseline</p></td>
+<td class="text-right"><p>984</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-left"><p>Validated end-to-end disaggregated stack under the common model and workload definition</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>May 8: Top-K and Compressor</p></td>
+<td class="text-right"><p>1,167</p></td>
+<td class="text-right"><p>+18.6%</p></td>
+<td class="text-right"><p>+18.6%</p></td>
+<td class="text-left"><p>Small-batch exact Top-K, BF16 Compressor input and fusion, and disaggregated memory/correctness fixes</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>May 18: MegaMoE and EPLB</p></td>
+<td class="text-right"><p>1,505</p></td>
+<td class="text-right"><p>+29.0%</p></td>
+<td class="text-right"><p>+53.0%</p></td>
+<td class="text-left"><p>MegaMoE, EPLB-enabled DEP placements, fused mHC and RMSNorm, and expanded multi-stream attention</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>May 28: attention and runtime refinements</p></td>
+<td class="text-right"><p>1,618</p></td>
+<td class="text-right"><p>+7.5%</p></td>
+<td class="text-right"><p>+64.5%</p></td>
+<td class="text-left"><p>Deeper attention overlap, the optimized inverse-RoPE and FP8 <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> path, PDL, and GPU-side scale-buffer and block-table cleanup</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>The first measured curve establishes the validated functional baseline.</strong> It represents the complete execution path after functional bring-up: hybrid SWA/CSA/HCA attention, persistent Compressor state, MTP, KV Cache Manager V2, and disaggregated cache transfer. We treat all work required to reach this point as part of the baseline rather than assigning it a performance gain. Every subsequent curve uses the same model, precision recipe, and fixed-shape workload definition. The reported evolution therefore measures optimization of a working system rather than the addition of missing model features.</p>
+<p><strong>Exact Indexer Top-K and Compressor improvements move the May 8 frontier.</strong> The small-batch multi-CTA path increased GPU utilization for exact Top-K, while BF16 Compressor input and additional Compressor fusion removed conversion, launch, and intermediate-buffer overhead. Runtime fixes were equally important: correcting sliding-window over-allocation improved usable generation-side KV capacity, while the launcher fix ensured that the configured NUMA policy was applied to multi-process disaggregated runs. Together, the full re-tuned sweep raised the peak by 18.6%, from 984 to 1,167 tokens/s/GPU.</p>
+<p><strong>MegaMoE and EPLB drive the mid-May step.</strong> The largest movement in the system curve came between May 8 and May 18. MegaMoE fused expert dispatch, the two expert GEMMs, activation, and combine into a communication-aware path using symmetric memory and in-kernel synchronization. At the throughput-oriented end of the curve, the May 18 sweep also moved to EPLB-enabled DEP placements to improve expert balance across ranks. In parallel, mHC absorbed the adjacent RMSNorm, and the Indexer and attention paths gained expanded dependency-aware overlap. Together, these changes produced a 29.0% stage-over-stage increase and a 53.0% increase over the initial baseline. Because the maximizing configuration changed across the complete sweeps, this movement is not a single-configuration decomposition of the individual optimizations.</p>
+<p><strong>Attention overlap and runtime cleanup extend the late-May frontier.</strong> By May 28, deeper Indexer, Compressor, and Q-path overlap reduced exposed attention work. PDL, producer-side FP8 scale-buffer initialization, the optimized inverse-RoPE and FP8 <code class="docutils literal notranslate"><span class="pre">o_a_proj</span></code> input path, and cheaper GPU-side block-table preparation removed additional synchronization, launch, and data-movement overhead. The May 28 curve is roughly 7–8% above May 18 across most throughput-oriented DEP points, lifting the observed peak to 1,618 tokens/s/GPU. This broad movement is more informative than any single microbenchmark: it shows that the optimizations survived full-model scheduling, cache management, and context/generation rate matching.</p>
+<p>May 28 is the latest measured curve, not the current performance ceiling. The newer DeepSeek-V4 stack subsequently integrated sparse-MLA softmax and V-load improvements, fused MegaMoE input preparation, the optimized 128× Compressor prefill reduction, and later attention-epilogue fusion. These changes target attention, MoE preparation, and Compressor overhead, but the complete GB300 8K/1K Pareto sweep has not been rerun with the newer stack. None of their gains is included in the reported 64.5% improvement, and we do not extrapolate a new end-to-end number. We expect a refreshed curve to move further once it is measured under the same methodology.</p>
+<p>The latest measured fixed-shape InferenceX curve establishes the clean model/runtime baseline for <a class="reference internal" href="#part-ii-agentic-workload-optimizations"><span class="xref myst">Part II</span></a>. Agentic workloads change the optimization boundary: dynamic multi-turn prompts, very high KV reuse, conversation locality, routing, and serialization become part of the critical path. The next section, <a class="reference internal" href="#agentperf-workflow"><span class="xref myst"><strong>AgentPerf Workflow</strong></span></a>, introduces that wider optimization boundary without re-counting the model-specific gains above.</p>
+</section>
+</section>
+</section>
+<section id="part-ii-agentic-workload-optimizations">
+<h2>Part II. Agentic-Workload Optimizations<a class="headerlink" href="#part-ii-agentic-workload-optimizations" title="Link to this heading">#</a></h2>
+<section id="agentperf-workflow">
+<h3>AgentPerf Workflow<a class="headerlink" href="#agentperf-workflow" title="Link to this heading">#</a></h3>
+<p><a class="reference external" href="https://artificialanalysis.ai/methodology/agentperf">AA-AgentPerf</a> measures how many active coding agents an inference deployment can support while meeting a model-specific service level objective (SLO). This <a class="reference external" href="https://developer.nvidia.com/blog/nvidia-achieves-leading-agentic-coding-performance-on-first-agentic-ai-benchmark/">NVIDIA Developer Blog</a> introduces the benchmark and explains why prerecorded trajectories are needed to represent agentic inference. Unlike the fixed-shape InferenceX workload used in Part I, AA-AgentPerf replays multi-turn coding sessions with interleaved reasoning and tool calls. Each simulated agent advances sequentially and waits for the current response and any client-simulated tool time before sending its next request.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Property</p></th>
+<th class="head text-left"><p>Fixed-shape InferenceX</p></th>
+<th class="head text-left"><p>AA-AgentPerf</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Unit of load</p></td>
+<td class="text-left"><p>Independent request</p></td>
+<td class="text-left"><p>Active agent following a trajectory</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Request shape</p></td>
+<td class="text-left"><p>Fixed input and output lengths</p></td>
+<td class="text-left"><p>Growing input context and variable output lengths</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Inter-request dependency</p></td>
+<td class="text-left"><p>Requests are independent</p></td>
+<td class="text-left"><p>Each turn waits for the response and any client-simulated tool time</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Prefix reuse</p></td>
+<td class="text-left"><p>No accumulated cross-turn history</p></td>
+<td class="text-left"><p>Accumulated history enables reuse across turns</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Objective</p></td>
+<td class="text-left"><p>Throughput and latency at a fixed shape</p></td>
+<td class="text-left"><p>Highest concurrency satisfying model-specific SLO thresholds</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The following figure summarizes the closed-loop request path for aggregated and disaggregated serving.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog26_agentperf_closed_loop_workflow.svg" width="100%" alt="AA-AgentPerf closed-loop workflow. A simulated agent sends the next recorded turn with its accumulated conversation. The inference deployment routes the request, reuses matching KV blocks, prefills the uncached suffix, and streams the generated response. In disaggregated serving, the generation side retrieves the KV cache using context metadata. The client drains the complete response, simulates tool time when needed, advances the trajectory, and sends the next turn only after the current cycle completes.">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5. AA-AgentPerf closed-loop request workflow. Repeated conversation prefixes can be reused through the KV cache. Aggregated serving performs prefill and generation on the same worker. In disaggregated serving, context metadata allows the generation worker to retrieve the KV cache and continue decoding. Tool time is simulated by the client and consumes no LLM compute.</em></sub></p>
+<p>This closed loop makes the complete request cycle part of every agent’s progress. Repeated prefixes make KV-cache reuse important because later turns can avoid recomputing accumulated history. Growing contexts and variable output lengths also exercise cache capacity and scheduling differently from fixed-shape requests. Simulated tool delays introduce idle periods between turns, while concurrent agents maintain sustained load on the deployment.</p>
+<p>AA-AgentPerf reports the highest concurrency that satisfies both the P25 of per-request output speed and the P95 of per-request time to first token (TTFT). Because the benchmark is continuously updated, this blog uses the <a class="reference external" href="https://artificialanalysis.ai/methodology/agentperf">AA methodology</a> current at publication for the exact thresholds. We refer to the current DeepSeek-V4 Pro SLO #1 and SLO #2 tiers as <strong>SLO20</strong> and <strong>SLO60</strong>. SLO20 requires at least 20 tokens/s and P95 TTFT at most 10 seconds. SLO60 requires at least 60 tokens/s and P95 TTFT at most 5 seconds. SLO20 emphasizes serving capacity, while SLO60 preserves a faster interactive experience.</p>
+<p>For engineering comparisons, we use concurrency per GPU (CPG). It is the supported concurrency divided by the total number of GPUs in the deployment, including both context and generation GPUs.</p>
+</section>
+<section id="lessons-from-deepseek-v3-2-agentic-workload-optimization">
+<h3>Lessons from DeepSeek-V3.2 Agentic Workload Optimization<a class="headerlink" href="#lessons-from-deepseek-v3-2-agentic-workload-optimization" title="Link to this heading">#</a></h3>
+<p>Before DeepSeek-V4, we optimized DeepSeek-V3.2 for long, multi-turn agentic workloads in both aggregated and disaggregated serving. The durable value of that work was not a particular benchmark result or deployment configuration. It was a set of system-level rules that guided the DeepSeek-V4 effort:</p>
+<ol class="arabic simple">
+<li><p><strong>High reuse creates a different bottleneck from raw GPU throughput.</strong> High prefix reuse can leave only a small uncached suffix to compute while the accumulated conversation still occupies substantial KV-cache capacity. Scheduling and capacity planning should therefore consider the remaining compute tokens and resident KV footprint rather than raw prompt length alone.</p></li>
+<li><p><strong>Amortize host overhead without pausing generation.</strong> Two complementary approaches addressed this overhead. First, CUDA Graph capture and kernel fusion reduced recurring host and launch work. <strong>Piecewise CUDA Graph capture</strong> covered graphable regions in prefill and mixed prefill-decode iterations when the full iteration could not be captured as one graph. Generation-only iterations continued to use the regular monolithic CUDA Graph path. Second, context-only <strong>Delay batching</strong> briefly held small context requests so newly arriving context requests could join a larger batch. Generation requests continued to run during this wait.</p></li>
+<li><p><strong>Treat routing as a trajectory-level balance between locality and load.</strong> Later turns benefit from returning to the workers and ranks that hold their conversation prefix. That affinity must be balanced against load so that preserving reuse does not create persistent rank imbalance.</p></li>
+<li><p><strong>Measure disaggregated serving end to end.</strong> Front-end preprocessing and KV-cache movement can limit throughput even when context and generation GPUs appear underutilized. Asynchronous preprocessing, parallel data movement, and per-stage observability are therefore part of serving performance.</p></li>
+</ol>
+<p>DeepSeek-V4 changed the model path, cache layout, and serving control plane, so the earlier configuration could not simply be reused. We carried forward these rules rather than the exact parallel strategy, cache settings, batching parameters, or transfer settings. The following section applies them to DeepSeek-V4 routing, KV lifecycle, host overhead, and scheduling.</p>
+</section>
+<section id="end-to-end-optimizations-for-agentic-serving">
+<h3>End-to-End Optimizations for Agentic Serving<a class="headerlink" href="#end-to-end-optimizations-for-agentic-serving" title="Link to this heading">#</a></h3>
+<p>Starting from the final model/runtime stack in <a class="reference internal" href="#part-i-deepseek-v4-model-support-and-optimizations"><span class="xref myst">Part I</span></a>, this section applies the measurement methodology and system-level principles learned from <a class="reference internal" href="#lessons-from-deepseek-v32-agentic-workload-optimization"><span class="xref myst">DeepSeek-V3.2</span></a> to DeepSeek-V4’s AgentPerf-specific request path, without counting the model-specific gains again. In this workload, a routing miss can force a long conversation prefix to be recomputed, erasing gains from faster kernels. Hashing that same prefix token by token in Python can also serialize the orchestrator’s request path. These bottlenecks expand the optimization boundary beyond GPU kernels. The remaining work spans three coupled areas: preserving locality through routing, keeping reusable KV blocks resident through lifecycle and capacity management, and removing overhead across the worker host paths, scheduler, orchestrator, and CTX-to-GEN protocol once reuse reduces the GPU work per turn.</p>
+<section id="preserve-locality-with-two-level-routing">
+<h4>Preserve locality with two-level routing<a class="headerlink" href="#preserve-locality-with-two-level-routing" title="Link to this heading">#</a></h4>
+<p>The DeepSeek-V3.2 study showed the central routing tradeoff: affinity without load control creates imbalance, while load balancing that overrides affinity destroys reuse. DeepSeek-V4 applies that lesson through two consecutive placement decisions. The front-end orchestrator first selects a context (CTX) server instance. The attention data-parallel (ADP) router then selects a rank within that instance. At either level, the router can use an explicit conversation identifier or infer locality from KV-cache contents. Reuse is preserved only when both decisions return a later turn to the server and rank that own its KV blocks. Instance-level affinity cannot compensate for a rank-level miss, and the correct rank is unreachable after the wrong server has been selected.</p>
+<div align="center">
+<figure>
+  <img src="../media/tech_blog26_two_level_routing.svg" width="100%" alt="Two-level routing for context locality in disaggregated serving. The front-end orchestrator first selects a context server, then the selected server's attention data-parallel router selects a rank. At each level, the router can use either conversation-aware affinity or KV-cache-aware scoring. Full conversation-prefix reuse requires both decisions to return to the context server and rank that own the corresponding KV blocks. The selected context rank transfers the KV cache to a generation server for decoding.">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6. Two-level routing for context locality in disaggregated serving. The front-end orchestrator first selects a CTX server, and that server's ADP router then selects a rank. Conversation-aware routing uses explicit conversation affinity, while KV-cache-aware routing infers placement from reusable prefix blocks and load. Full conversation-prefix reuse requires both decisions to return the request to the CTX server and ADP rank that hold the corresponding KV blocks.</em></sub></p>
+<section id="instance-level-routing-across-context-servers">
+<h5>Instance-level routing across context servers<a class="headerlink" href="#instance-level-routing-across-context-servers" title="Link to this heading">#</a></h5>
+<p>The first routing level distributes conversations across CTX server instances. It must preserve locality for later turns while balancing new conversations across servers.</p>
+<p><strong>Conversation-aware routing.</strong> When the client provides a stable conversation identifier, the orchestrator assigns the first turn to the least-loaded CTX server, using round-robin among equally loaded candidates, and records the binding. For each later turn, the orchestrator uses that binding to send the request back to the same server, preserving reuse of the conversation prefix cached there as long as the server remains available. The affinity decision then becomes a session-table lookup, avoiding full-prompt tokenization and block-hash computation on the front-end event loop.</p>
+<p><strong>KV-cache-aware routing.</strong> When a reliable conversation identifier is unavailable, the orchestrator infers locality by tokenizing the prompt, deriving its block keys, estimating the reusable prefix on each CTX server, and balancing reuse against current load. We made three improvements to keep this path efficient and stable. First, incremental tokenization reuses the token IDs for the stable prompt prefix and encodes only the appended suffix. The orchestrator passes those token IDs to the worker and applies the same tool definitions and chat-template arguments, avoiding repeated tokenization while ensuring that both sides derive the same block keys. Second, we refined candidate scoring, which selects a CTX server by weighing its reusable prefix against its current load. Instead of normalizing the cache match by the full prompt length, the new score uses the absolute number of matched blocks and a separate active-request penalty. This prevents the long system and tool prefix shared across requests from diluting the score advantage contributed by conversation-specific blocks. Third, we strengthened affinity when temporary cache eviction weakens the cache-match signal. A bounded mapping derived from stable early conversation content remembers the selected CTX server and continues to direct later turns to it even if eviction temporarily lowers the server’s cache-match score.</p>
+<p>Cache-aware routing also requires the orchestrator to maintain a compatible and sufficiently current view of each worker’s cache. Three design choices make that view both reliable and inexpensive to maintain. First, the orchestrator and workers use the same hash algorithm and cache namespace. An optional cache salt acts as a namespace identifier, allowing KV reuse only between requests that carry the same value. Second, the orchestrator adopts the worker’s block size by default. When it tracks cache at a finer supported granularity, completed-request backfill adds the routed block keys to the selected server’s cache view after successful execution, which lets the orchestrator track newly cached prefixes at its own granularity without translating between incompatible event boundaries. Third, cache metadata updates are batched, and worker events are refreshed in the background to keep this maintenance off the routing critical path. Together, these changes keep cache tracking useful without turning it into a new routing bottleneck.</p>
+</section>
+<section id="rank-level-routing-within-a-context-server">
+<h5>Rank-level routing within a context server<a class="headerlink" href="#rank-level-routing-within-a-context-server" title="Link to this heading">#</a></h5>
+<p>After a CTX server has been selected, the second routing level places the request on one of its ADP ranks. It must preserve the exact rank that owns the reusable prefix while keeping new conversations distributed across the instance.</p>
+<p><strong>Conversation-aware routing.</strong> The ADP router records a bounded <code class="docutils literal notranslate"><span class="pre">conversation</span> <span class="pre">ID</span> <span class="pre">→</span> <span class="pre">rank</span></code> mapping. It assigns the first turn of each new conversation by round-robin among ranks below a loose fair-share target, then pins later turns to the recorded rank. A returning conversation may exceed that soft target because moving it would discard rank-local reuse. Affinity is relaxed only when the assigned rank reaches the hard active-request limit. An overflow request does not overwrite the original binding, which allows a later turn to return when the rank has capacity again.</p>
+<p><strong>KV-cache-aware routing.</strong> Without a reliable conversation ID, the ADP router must infer rank locality from the KV blocks that are actually present. For each new request, every rank probes its local radix tree to measure the reusable prefix without reserving any cache blocks. The probe uses the request’s cache salt so that it searches the same cache namespace as the KV cache manager. The ranks then exchange their prefix-match lengths and current loads. For each candidate rank, the router estimates the remaining prefill work as the input length minus the matched prefix, then adds a normalized load penalty. A meaningful prefix match therefore favors the rank that can reuse it, while a weak match caused only by the shared system and tool scaffold is ignored in favor of load balancing. A loose fair-share cap provides a second guard against concentrating too many requests on a few warm ranks. When several related requests arrive in the same scheduling batch, the router groups them by their early prefix and places longer requests first. After each assignment, it updates the selected rank’s load using only the tokens that still require computation. The next request is therefore routed against the work already placed in that batch rather than a stale load snapshot.</p>
+<p><strong>Protect rank balance.</strong> A new conversation contains the shared system and tool scaffold but little conversation-specific history. Without explicit cold-start handling, the first few ranks that cache this common prefix can attract more new conversations, while the remaining ranks stay cold. Conversation-aware routing prevents this feedback loop by distributing first turns with round-robin before pinning later turns. KV-cache-aware routing can instead use an optional warmup phase that sends initial requests to ranks not yet selected, allowing every rank to cache the shared prefix before normal scoring begins.</p>
+</section>
+<section id="routing-policy-selection">
+<h5>Routing policy selection<a class="headerlink" href="#routing-policy-selection" title="Link to this heading">#</a></h5>
+<p>Our evaluation results show that, with completed-request backfill, the cache-aware path achieved a cache hit rate comparable to conversation-aware routing, but required additional preprocessing and cache tracking. The two approaches therefore offer different ways to preserve locality: one uses explicit conversation metadata, while the other infers locality from cache contents.</p>
+</section>
+</section>
+<section id="kv-cache-reuse-optimizations">
+<h4>KV cache reuse optimizations<a class="headerlink" href="#kv-cache-reuse-optimizations" title="Link to this heading">#</a></h4>
+<p>Two-level routing keeps successive turns of the same conversation on the CTX server and ADP rank that hold the reusable prefix. Placement alone is not enough. The prefix must also remain resident until the next turn arrives. Analysis of early DeepSeek-V4 AgentPerf runs showed substantial optimization headroom in cache memory management. DeepSeek-V4 divides cache memory among the sliding-window cache and several persistent compressed caches with different storage costs and demand profiles, so reuse depends on both the cache lifecycle and how memory is budgeted across pools. We first added per-pool cache metrics to locate pressure, then used those signals to optimize the sliding-window cache lifecycle and tune cache pool ratios.</p>
+<p><strong>Add per-pool cache metrics.</strong> An overall cache hit rate shows how much reuse was achieved, but it does not reveal which pool was constrained or whether the cause was sustained pressure or a short-lived capacity spike. We added per-pool telemetry for occupancy, allocation and commit volume, cached KV length, and data movement between HBM and host memory. Reuse counters distinguish fully reused, partially reused, and missed blocks. Peak watermarks and complete iteration histories capture transient pressure that periodic summaries can miss, while memory probes expose the HBM headroom before and after model loading. Host-tier gauges further distinguish evictable blocks from blocks dropped before reuse. Together, these signals identify the constrained pool, distinguish incorrect lifecycle retention from insufficient pool capacity, and provide the evidence for the next two optimizations.</p>
+<p><strong>Optimize the sliding-window cache lifecycle.</strong> As described in <a class="reference internal" href="#cache-management-and-runtime-features"><span class="xref myst"><strong>Cache management and runtime features</strong></span></a>, DeepSeek-V4’s sliding-window cache includes SWA KV and short-lived Compressor KV/score state. These buffers should remain bounded by their active windows rather than grow with the full prompt. The previous reuse policy retained SWA KV across the full prompt, even though a later agent turn needs only the blocks within the active window. We introduced the <code class="docutils literal notranslate"><span class="pre">per_request</span></code> policy to select the sliding-window state needed by the next turn when the current prefill request completes, allowing older pages to be recycled. The same retention issue appeared at the CTX-to-GEN handoff in disaggregated serving. Before this optimization, GEN allocated sliding-window cache for the full transferred prompt, including blocks outside the active window. We changed GEN initialization to allocate cache only for blocks within the active window. Together, these changes keep the sliding-window cache bounded during prefill and disaggregated handoff. Persistent compressed caches still retain the long-term prefix and continue to grow with sequence length.</p>
+<p><strong>Tune cache pool ratios.</strong> Correcting the cache lifecycle removes stale allocations, but reusable prefixes can still be evicted when the available HBM is divided poorly across pools. The two cache categories respond differently to workload shape. Sliding-window cache pressure is driven by the active-request count, while persistent compressed caches grow with retained sequence length and the number of concurrent conversations. Each allocation must be satisfied by its own pool group, so free pages in one group cannot cover a shortage in another. A split tuned for a different request-length distribution or serving role can therefore exhaust one pool and evict reusable blocks even while another pool has unused capacity. To address this imbalance, we introduced configurable pool-ratio controls for DeepSeek-V4. On CTX servers, prefix reuse makes pool demand highly dependent on the workload’s prefix-reuse pattern, which the runtime cannot infer reliably. Users should therefore tune <code class="docutils literal notranslate"><span class="pre">pool_ratio</span></code> manually using the per-pool metrics described above. On GEN servers, users can set <code class="docutils literal notranslate"><span class="pre">avg_seq_len</span></code> to the workload’s average total sequence length, allowing KV Cache Manager V2 to derive the initial pool ratio automatically. These controls direct capacity to the pools that need it and avoid evicting reusable history while memory remains unused elsewhere. An opt-in beta rebalancer can also adjust the split from runtime statistics. It is disabled by default and currently supports a narrower set of aggregated-serving configurations. Extending this mechanism to broader deployments remains ongoing work.</p>
+<p><strong>Host offloading and incremental transfer.</strong> We also evaluated host KV offloading and incremental CTX-to-GEN transfer. Compared with models that retain full K/V history for every token, DeepSeek-V4 stores long-term history in compressed attention and Indexer caches while keeping raw-token KV and Compressor state within bounded sliding windows. Its KV-cache footprint per input token is therefore relatively small. This compact representation keeps more reusable KV blocks resident, leaving less additional reuse for host offloading to recover. It also reduces the CTX-to-GEN payload, limiting the data movement that incremental transfer can overlap. Neither mechanism therefore produced a meaningful end-to-end improvement for this AgentPerf configuration. The evaluation is still useful for workloads with larger KV-cache footprints or higher transfer volumes.</p>
+</section>
+<section id="optimize-scheduling-and-remove-end-to-end-overhead">
+<h4>Optimize scheduling and remove end-to-end overhead<a class="headerlink" href="#optimize-scheduling-and-remove-end-to-end-overhead" title="Link to this heading">#</a></h4>
+<p>Routing and cache management make later turns with reusable prefixes much cheaper on the GPU. That saving reaches the user only if the rest of the serving path also avoids processing the full long prompt again. Profiling showed substantial host work during CTX prefill and a persistent gap between GEN inter-token latency and the speed-of-light (SOL) estimate. Long token arrays were still being hashed, copied, tokenized, serialized, and broadcast at several boundaries. We addressed this gap inside both the workers and the serving control plane. First, we removed host work from the CTX and GEN critical paths. We then optimized scheduling, orchestration, and protocol handling.</p>
+<section id="optimize-host-overhead-for-ctx-and-gen">
+<h5>Optimize host overhead for CTX and GEN<a class="headerlink" href="#optimize-host-overhead-for-ctx-and-gen" title="Link to this heading">#</a></h5>
+<p>Effective prefix reuse reduces the GPU work to the uncached suffix, but the surrounding host path can still scale with the full prompt. This is especially costly when the work runs in Python or is repeated on every distributed rank. We therefore moved per-token loops out of Python where possible and skipped host operations that could not produce useful GPU work.</p>
+<p><strong>CTX host path.</strong> Profiling showed that CTX was paying host work at the wrong granularity. Block-key construction paid a conversion and SHA-256 update for every token, turning a long prompt into many small operations before prefill could begin. Distributed coordination was paid once per iteration, even when no new request was available. Those empty iterations could still enter prefix-gather and request-broadcast collectives. The first cost grew with the full prompt, while the second could create host bubbles without producing any GPU work. We changed each operation to follow the unit of useful work. Block-key construction now packs one block of tokens into a contiguous byte buffer and updates the hash once per block. All ranks perform a lightweight request-count probe before entering the larger collectives. If no new request exists, they take the same fast path and skip both prefix gathering and request broadcast.</p>
+<p><strong>GEN host path.</strong> On GEN, profiling did not point to one dominant function. Instead, host time accumulated through three prompt-proportional costs as each long-prompt request crossed the CTX-to-GEN handoff, entered GEN, and was distributed across the ranks. First, GEN could repeat tokenization already completed by CTX. Second, request admission and routing repeatedly copied or materialized the full token list. Third, interprocess request transfer serialized token IDs as individual Python objects before rebuilding the full list on the receiving side. The latter two costs occurred on request-ingress or executor-loop paths while holding the Python GIL, so they could delay the next generation iteration. To reduce this accumulated host time, we introduced a set of targeted optimizations, each addressing one of these costs directly. (a) CTX now returns the prompt token IDs that it already computed, allowing GEN to bypass tokenization. (b) During admission, enqueue no longer deep-copies the token list, while routing obtains the token count without materializing the full list. (c) Serialization and C++ request construction use a compact token representation, avoiding per-token Python objects and full-list reconstruction.</p>
+</section>
+<section id="optimize-scheduling-orchestration-and-protocol-handling">
+<h5>Optimize scheduling, orchestration, and protocol handling<a class="headerlink" href="#optimize-scheduling-orchestration-and-protocol-handling" title="Link to this heading">#</a></h5>
+<p>After reducing host work inside CTX and GEN, latency could still accumulate before a request entered a worker and while data moved between workers. We treated this serving control plane as three related problems. Scheduling determines which ready request runs next. The orchestrator performs routing and relays data between CTX and GEN. The protocol must minimize redundant payload while preserving request identity when retries occur.</p>
+<p><strong>Scheduling.</strong> Under high concurrency, a GEN worker may have to choose between newly admitted requests waiting for their first token and requests that have already begun decoding. When the batch or token budget is tight, placing both groups in the same queue can leave a new request behind many ongoing conversations for several scheduling iterations. We added an opt-in policy for disaggregated GEN that gives first-token requests priority while preserving FIFO order within both groups. This can move a newly admitted request into an earlier feasible batch and reduce the queueing delay before its first decode step without adding GPU work. The policy is designed to improve first-token responsiveness and tail-latency SLO compliance rather than raw throughput.</p>
+<p><strong>Orchestrator.</strong> Profiling exposed two sources of per-request overhead. First, <strong>native block-key hashing</strong> removed the routing hot spot. The instance-level KV router originally hashed every token ID in a Python loop on its single asyncio thread. This held the Global Interpreter Lock (GIL) and serialized concurrent requests before they could reach CTX. Replacing the loop with a native C++ block-key hasher preserved the cache-key format while moving prompt-length hashing out of the Python event loop. Second, <strong>efficient relay serialization</strong> reduced request-body processing when a request crossed the HTTP boundaries to CTX and GEN. The default path previously materialized a JSON-compatible Python object containing the full prompt-token list, after which the HTTP client traversed that object again to encode the request body. We changed this path to use <code class="docutils literal notranslate"><span class="pre">pydantic-core</span></code> to emit the JSON body directly. For deployments where request-body processing remains a bottleneck, an opt-in <code class="docutils literal notranslate"><span class="pre">msgspec</span></code> MessagePack transport provides an alternative internal orchestrator-to-worker path that removes JSON encoding and parsing from this hop. The external OpenAI API and the default direct-JSON path remain unchanged.</p>
+<p><strong>CTX-to-GEN protocol.</strong> The CTX-to-GEN protocol had two issues: it could carry more request state than GEN needed, and a retried request could leave CTX and GEN with inconsistent identifiers. In supported text-only, non-Harmony deployments, an opt-in path removes earlier chat history from the GEN request while preserving the prompt token IDs, final message, tool definitions, and generation settings that GEN still needs. This reduces copying, serialization, and transfer without changing the request semantics supported by that path. We also hardened the retry path so that known transient connection failures do not leave CTX and GEN with inconsistent request identifiers. Together, these changes reduce protocol overhead while preserving consistency across the disaggregated handoff.</p>
+<p>Across the host and serving-control-plane paths, these changes reduce prompt-proportional processing, redundant serialization, and avoidable synchronization between GPU iterations. Together with routing and cache management, they allow prefix reuse to translate into end-to-end performance. The next section, <a class="reference internal" href="#agentperf-results-and-external-validation"><span class="xref myst"><strong>AgentPerf Results and External Validation</strong></span></a>, presents the combined end-to-end results under frozen configurations and evaluates them against the SLO20 and SLO60 objectives.</p>
+</section>
+</section>
+</section>
+<section id="agentperf-results-and-external-validation">
+<h3>AgentPerf Results and External Validation<a class="headerlink" href="#agentperf-results-and-external-validation" title="Link to this heading">#</a></h3>
+<p>The previous section described how routing, KV-cache policy, host-path cleanup, scheduling, and orchestration removed distinct end-to-end bottlenecks. This section presents the DeepSeek-V4 Pro AgentPerf evaluation setup and the results reported by Artificial Analysis. We keep these agent-workload results separate from the model-specific results in <a class="reference internal" href="#part-i-deepseek-v4-model-support-and-optimizations"><span class="xref myst">Part I</span></a> and report the best-performing configurations we developed for those AA-AgentPerf measurements.</p>
+<p>The GB300 NVL72 configurations served DeepSeek-V4 Pro at maximum thinking effort using TensorRT LLM with disaggregated serving. Several context (CTX) workers fed one generation (GEN) worker through NIXL KV-cache transfer. Each CTX worker used four GPUs with attention data parallelism and MoE expert parallelism.</p>
+<p>To select the end-to-end topology, we followed the speed-of-light (SOL) rate-matching workflow introduced in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.md#measurement-methodology">TensorRT LLM disaggregated serving tech blog</a>. We first measured CTX request throughput across candidate parallel mappings and batch settings that could satisfy the TTFT target, and independently measured GEN output throughput and per-agent output speed across mappings, batch sizes, and concurrency levels. We then matched the aggregate service rates of the two tiers to construct an idealized SOL Pareto curve. The final SLO20 configuration used DEP8 with a larger GEN batch to maximize capacity. The final SLO60 configuration used DEP16 with a smaller GEN batch to preserve higher per-agent decode speed. SOL assumes perfect rate matching and excludes practical end-to-end costs such as KV-cache transfer, routing, host work, and workload burstiness, so it served as a configuration-selection reference rather than a reported AgentPerf result.</p>
+<p>The same rate-matching calculation provided the starting <code class="docutils literal notranslate"><span class="pre">xPyD</span></code> ratio, where <code class="docutils literal notranslate"><span class="pre">xPyD</span></code> denotes <code class="docutils literal notranslate"><span class="pre">x</span></code> CTX/prefill instances feeding <code class="docutils literal notranslate"><span class="pre">y</span></code> GEN/decode instances. For each selected GEN operating point, we converted its output-token throughput into a request-equivalent service rate using the workload’s output-length distribution, then compared it with the measured per-instance CTX request rate to estimate the ideal number of CTX instances. Because this ratio can be fractional while a deployment requires whole workers, we evaluated the neighboring integer <code class="docutils literal notranslate"><span class="pre">xPyD</span></code> topologies that fit the GPU budget. We selected the topology that provided the best end-to-end balance while satisfying both the output-speed and TTFT requirements, then swept concurrency to find its maximum passing load.</p>
+<p>The configurations used DEP4 CTX workers with <code class="docutils literal notranslate"><span class="pre">max_batch_size:</span> <span class="pre">128</span></code> and the TensorRT LLM MoE backend. The capacity-oriented SLO20 configuration used a DEP8 GEN worker with <code class="docutils literal notranslate"><span class="pre">max_batch_size:</span> <span class="pre">192</span></code>. The higher-speed SLO60 configuration used a DEP16 GEN worker with <code class="docutils literal notranslate"><span class="pre">max_batch_size:</span> <span class="pre">32</span></code> and an offline EPLB map. Both GEN workers used the DeepGEMM MegaMoE backend. Both deployments used the MXFP4 recipe, MTP-3, FP8 KV cache, conversation-affinity routing at the orchestrator and ADP-rank levels, and heuristic GVR Top-K.</p>
+<p>As defined in <a class="reference internal" href="#agentperf-workflow"><span class="xref myst"><strong>AgentPerf Workflow</strong></span></a>, we use concurrency per GPU (CPG) to compare deployment configurations. The GPU count here includes both the CTX and GEN tiers, and only points that pass the target SLO are reported. The Artificial Analysis article, <a class="reference external" href="https://artificialanalysis.ai/articles/aa-agentperf/">First results from AA-AgentPerf: the hardware benchmark for the agent era</a>, reports the GB300 configurations provided by NVIDIA and run and verified by Artificial Analysis. These results validate the complete workload path rather than an isolated TensorRT LLM microbenchmark. Artificial Analysis replayed the agent trajectories and applied its SLO search and steady-state methodology. The associated <a class="reference external" href="https://artificialanalysis.ai/benchmarks/hardware/configs">serving-configuration browser</a> discloses the precision, topology, worker YAML, routing mode, MTP setup, cache policy, transfer backend, and launch commands.</p>
+<p>The GB300 results reached 57.5 CPG at SLO20 and 19.2 CPG at SLO60:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Target</p></th>
+<th class="head text-left"><p>CTX/GEN topology</p></th>
+<th class="head text-right"><p>Passing concurrency</p></th>
+<th class="head text-right"><p>GPUs used</p></th>
+<th class="head text-right"><p>CPG</p></th>
+<th class="head text-left"><p>Provenance</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>SLO20</p></td>
+<td class="text-left"><p>6 × CTX DEP4 + 1 × GEN DEP8</p></td>
+<td class="text-right"><p>1,840</p></td>
+<td class="text-right"><p>32</p></td>
+<td class="text-right"><p>57.5</p></td>
+<td class="text-left"><p>NVIDIA configuration, run and verified by AA</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>SLO60</p></td>
+<td class="text-left"><p>6 × CTX DEP4 + 1 × GEN DEP16</p></td>
+<td class="text-right"><p>768</p></td>
+<td class="text-right"><p>40</p></td>
+<td class="text-right"><p>19.2</p></td>
+<td class="text-left"><p>NVIDIA configuration, run and verified by AA</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<section id="reproduction-and-future-work">
+<h2>Reproduction and Future Work<a class="headerlink" href="#reproduction-and-future-work" title="Link to this heading">#</a></h2>
+<section id="how-to-reproduce">
+<h3>How to reproduce<a class="headerlink" href="#how-to-reproduce" title="Link to this heading">#</a></h3>
+<p>TensorRT LLM already provides the common operational steps for launching disaggregated serving. Follow the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM.md">disaggregated serving tech blog</a> and the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/features/disagg-serving.html">disaggregated serving guide</a> for environment setup, CTX and GEN worker startup, NIXL KV-cache transfer, and orchestrator launch. Both result sets below build on this foundation but use different workload-specific references. The InferenceX path uses the linked GB300 recipes to reproduce the fixed-shape 8K/1K Pareto sweeps. The AA-AgentPerf path starts from the current TensorRT LLM <code class="docutils literal notranslate"><span class="pre">main</span></code> branch to evaluate the latest optimized stack and uses the linked AA configuration entries and methodology for the submitted topology, settings, and SLO evaluation.</p>
+<p><strong>InferenceX 8K/1K.</strong> Reproduce the fixed-shape results from <a class="reference internal" href="#deepseek-v4-performance-evolution"><span class="xref myst"><strong>DeepSeek-V4 Performance Evolution</strong></span></a> with the <a class="reference external" href="https://github.com/NVIDIA/srt-slurm/tree/sa-submission-q2-2026/recipes/DeepSeek-V4-Pro/disagg/trtllm_dynamo/gb300_mxfp4/ISL8K_OSL1K/MTP">GB300 MXFP4 ISL8K/OSL1K MTP recipes</a>. The directory contains the CTX/GEN topology sweep, MTP settings, benchmark concurrencies, and worker configurations used for the 8K/1K measurements.</p>
+<p><strong>AA-AgentPerf.</strong> For the results reported above, use the corresponding entries in the <a class="reference external" href="https://artificialanalysis.ai/benchmarks/hardware/configs">Artificial Analysis configuration browser</a>. The 57.5-CPG SLO20 result uses the <a class="reference external" href="https://artificialanalysis.ai/benchmarks/hardware/configs#config-60987f21-a7db-4a8e-8d3a-810a7527de2f">GB300 DEP8 configuration</a>, while the 19.2-CPG SLO60 result uses the <a class="reference external" href="https://artificialanalysis.ai/benchmarks/hardware/configs#config-8e07c398-605a-457f-96c4-bb002691de79">GB300 DEP16 configuration</a>. Each entry provides the CTX and GEN worker YAML, disaggregated server configuration, topology, routing settings, and launch commands needed to reproduce the deployment setup. Use the <a class="reference external" href="https://artificialanalysis.ai/methodology/agentperf">AA-AgentPerf methodology</a> for the benchmark procedure and SLO evaluation.</p>
+</section>
+<section id="future-work">
+<h3>Future Work<a class="headerlink" href="#future-work" title="Link to this heading">#</a></h3>
+<p>Our next phase continues to optimize DeepSeek-V4 as a complete serving system: improve the low-precision GPU execution path, reduce host and control-plane overhead, broaden hardware coverage, and expand speculative decoding support. These directions need to advance together, because faster model execution raises end-to-end capacity only when cache management, routing, and orchestration can keep the GPUs supplied efficiently. The following work is already underway.</p>
+<p><strong>Advance the NVFP4 execution path.</strong> We are moving the performance path to the NVFP4 DeepSeek-V4 checkpoint, continuing to tune the NVFP4 MegaMoE backend, and evaluating a more aggressive quantization recipe that applies NVFP4 to additional linear layers. This work treats the checkpoint, kernel coverage, and quantization recipe as one end-to-end path.</p>
+<p><strong>Fuse more small kernels.</strong> We will continue combining adjacent small operations to reduce intermediate memory traffic and the number of kernel launches. These fusions target both GPU execution time and the host launch overhead that remains visible in small effective batches.</p>
+<p><strong>Move the KV Cache Manager V2 hot path to C++.</strong> KV Cache Manager V2 provides the flexible multi-pool model required by DeepSeek-V4, but its performance-critical control path is still primarily implemented in Python. Migrating this path to C++ will reduce GIL contention and recurring host overhead, which become especially visible when high cache reuse leaves only a small amount of GPU work per turn.</p>
+<p><strong>Optimize and scale the serving control plane.</strong> Conversation-aware and KV-aware routing still have room to reduce TTFT and CPU overhead while preserving cache locality and balanced placement. At larger deployment scales, a multiprocess orchestrator with a coordinator-and-worker architecture is being developed to address the point at which a single orchestrator becomes the bottleneck. We will optimize these paths as one control plane, resolve the current multiprocess TTFT issues, and validate the complete design under high-concurrency, multi-turn workloads.</p>
+<p><strong>Add DeepSeek-V4 DSpark support.</strong> We are integrating the DSpark speculative-decoding path for DeepSeek-V4 and validating it against the MTP baseline. The remaining work includes measuring acceptance behavior, tuning the runtime configuration, and quantifying the resulting end-to-end gain.</p>
+<p><strong>Extend DeepSeek-V4 support to Hopper.</strong> The current performance work is centered on Blackwell. We are extending the model and runtime paths required for complete DeepSeek-V4 execution on Hopper, with platform-appropriate kernels and precision support.</p>
+</section>
+</section>
+<section id="conclusion-and-acknowledgments">
+<h2>Conclusion and Acknowledgments<a class="headerlink" href="#conclusion-and-acknowledgments" title="Link to this heading">#</a></h2>
+<p>DeepSeek-V4 optimization in TensorRT LLM is an end-to-end systems effort. Building a production-ready model stack required correctness across hybrid attention, mHC, MTP, MoE, quantization, cache management, and disaggregated execution. Moving the performance frontier then required coordinated work from GPU kernels and execution overlap through KV reuse, host efficiency, routing, orchestration, configuration tuning, and benchmark methodology. The result is a stack that improves both fixed-shape inference and long-running agentic serving, demonstrating that delivered performance comes from optimizing the model and the serving system together.</p>
+<p>This work is the result of close collaboration across many teams and every layer of the inference stack. We sincerely thank everyone who contributed to model bring-up, accuracy validation, benchmark optimization, and infrastructure support. The results shared here came from repeated cycles of analysis, implementation, profiling, debugging, validation, and configuration tuning. We are grateful for the expertise, persistence, and teamwork that turned DeepSeek-V4 into a production-ready, high-performance TensorRT LLM stack.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../../developer-guide/sparse-attention-development-guide.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Sparse Attention Development Guide</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#part-i-deepseek-v4-model-support-and-optimizations">Part I. DeepSeek-V4 Model Support and Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#building-a-production-ready-deepseek-v4-stack">Building a Production-Ready DeepSeek-V4 Stack</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#model-support-and-parallelism">Model support and parallelism</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#hybrid-attention-swa-csa-and-hca">Hybrid attention: SWA, CSA, and HCA</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#compressor-implementation">Compressor implementation</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#beyond-attention-mhc-moe-and-speculative-decoding">Beyond attention: mHC, MoE, and speculative decoding</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#parallelism-and-deployment-notation">Parallelism and deployment notation</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-management-and-runtime-features">Cache management and runtime features</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#precision-strategy-and-accuracy">Precision strategy and accuracy</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-v4-performance-optimizations">DeepSeek-V4 Performance Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#optimize-the-csa-hca-hot-path">Optimize the CSA/HCA hot path</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#compressor-and-mhc">Compressor and mHC</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#compressor-optimizations">Compressor optimizations</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#mhc-optimizations">mHC optimizations</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-optimizations">MoE optimizations</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#runtime-optimization">Runtime optimization</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deepseek-v4-performance-evolution">DeepSeek-V4 Performance Evolution</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#experimental-setup">Experimental setup</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#from-baseline-to-the-latest-measured-curve">From Baseline to the Latest Measured Curve</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#part-ii-agentic-workload-optimizations">Part II. Agentic-Workload Optimizations</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#agentperf-workflow">AgentPerf Workflow</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#lessons-from-deepseek-v3-2-agentic-workload-optimization">Lessons from DeepSeek-V3.2 Agentic Workload Optimization</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-optimizations-for-agentic-serving">End-to-End Optimizations for Agentic Serving</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#preserve-locality-with-two-level-routing">Preserve locality with two-level routing</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#instance-level-routing-across-context-servers">Instance-level routing across context servers</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#rank-level-routing-within-a-context-server">Rank-level routing within a context server</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#routing-policy-selection">Routing policy selection</a></li>
+</ul>
+</li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-reuse-optimizations">KV cache reuse optimizations</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#optimize-scheduling-and-remove-end-to-end-overhead">Optimize scheduling and remove end-to-end overhead</a><ul class="nav section-nav flex-column">
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#optimize-host-overhead-for-ctx-and-gen">Optimize host overhead for CTX and GEN</a></li>
+<li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#optimize-scheduling-orchestration-and-protocol-handling">Optimize scheduling, orchestration, and protocol handling</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#agentperf-results-and-external-validation">AgentPerf Results and External Validation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reproduction-and-future-work">Reproduction and Future Work</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-reproduce">How to reproduce</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#future-work">Future Work</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion-and-acknowledgments">Conclusion and Acknowledgments</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on July 20, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

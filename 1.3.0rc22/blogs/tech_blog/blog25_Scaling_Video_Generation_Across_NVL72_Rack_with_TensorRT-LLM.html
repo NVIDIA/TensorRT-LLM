@@ -1,0 +1,1520 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Scaling Video Generation Across NVL72 rack with TensorRT-LLM &#8212; TensorRT LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=83e831d6" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script src="../../_static/config_selector.js?v=52eb2d38"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=b8b12719"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc22';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+
+    <link rel="icon" href="../../_static/favicon.png"/>
+
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="next" title="MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell" href="blog24_MoE_as_Dense_GEMM.html" />
+    <link rel="prev" title="DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.3.0rc22" />
+  
+    
+    <script src="../../_static/searchtools.js"></script>
+    <script src="../../_static/language_data.js"></script>
+    <script src="../../searchindex.js"></script>
+  
+
+
+  </head>
+
+  <body data-default-mode="">
+
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../installation/containers.html">Container Images</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../supported-hardware.html">Supported Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sparse_attention.html">Sparse Attention</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_connector.html">KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_kv_cache_offloading.html">KV Cache Offloading</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_lmcache_connector.html">LMCache KV Cache Connector</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/visual_gen_examples.html">VisualGen Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/api_walkthrough.html">API walkthrough</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client.html">Aiperf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/aiperf_client_for_multimodal.html">Aiperf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_responses_client.html">Curl Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_responses_client.html">OpenAI Responses Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/prometheus_metrics.html">Prometheus Metrics</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/dynamo_k8s_example.html">Dynamo K8s Example</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../deployment-guide/index.html">Model Recipes</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-nemotron-3-on-trtllm.html">Deployment Guide for Nemotron v3 (Ultra &amp; Super) on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.html">Deployment Guide for DeepSeek R1 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama3.3-70b-on-trtllm.html">Deployment Guide for Llama3.3 70B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.html">Deployment Guide for Llama4 Scout 17B on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.html">Deployment Guide for GPT-OSS on TensorRT-LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3-on-trtllm.html">Deployment Guide for Qwen3 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-qwen3.5-on-trtllm.html">Deployment Guide for Qwen3.5 on TensorRT LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-glm-5-on-trtllm.html">Deployment Guide for GLM-5 on TensorRT LLM - Blackwell Hardware</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.html">Deployment Guide for MiniMax-M3 on TensorRT LLM</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Beta)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-eval.html">trtllm-eval</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">API Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Features</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/model-express.html">ModelExpress (MX) Checkpoint Loading</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/auto_deploy/auto-deploy.html">AutoDeploy (Beta)</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../features/auto_deploy/transforms.html">AutoDeploy Transforms</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/core.html">Core Transform APIs</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/factory.html">Factory Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/export.html">Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_export.html">Post-Export Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/pattern_matcher.html">Pattern Matching Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/sharding.html">Sharding Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/weight_load.html">Weight Loading Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/post_load_fusion.html">Post-Load Fusion Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/cache_init.html">Cache Initialization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/visualize.html">Visualization Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/compile.html">Compilation Stage</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../features/auto_deploy/transforms/additional.html">Additional Registered Transforms</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/ray-orchestrator.html">Ray Orchestrator (Prototype)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/torch_compile_and_piecewise_cuda_graph.html">Torch Compile &amp; Piecewise CUDA Graph</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/helix.html">Helix Parallelism</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/kv-cache-connector.html">KV Cache Connector</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/sparse-attention.html">Sparse Attention</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/overview.html">Architecture Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-analysis.html">Performance Analysis</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/perf-benchmarking.html">TensorRT LLM Benchmarking</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/dev-containers.html">Using Dev Containers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/api-change.html">LLM API Change Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/kv-transfer.html">Introduction to KV Cache Transmission</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/telemetry.html">Telemetry</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../developer-guide/sparse-attention-development-guide.html">Sparse Attention Development Guide</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html">Inference Time Compute Implementation in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog12_Combining_Guided_Decoding_and_Speculative_Decoding.html">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog11_GPT_OSS_Eagle3.html">Running GPT-OSS-120B with Eagle3 Speculative Decoding on GB200/B200 (TensorRT LLM)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog10_ADP_Balance_Strategy.html">ADP Balance Strategy</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog09_Deploying_GPT_OSS_on_TRTLLM.html">Running a High Performance GPT-OSS-120B Inference Server with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.html">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog07_NGram_performance_Analysis_And_Auto_Enablement.html">N-Gram Speculative Decoding in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog06_Llama4_maverick_eagle_guide.html">How to launch Llama4 Maverick + Eagle3 TensorRT LLM server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog05_Disaggregated_Serving_in_TensorRT-LLM.html">Disaggregated Serving in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.html">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog03_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog02_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html">How to get best performance on DeepSeek-R1 in TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Quick Links</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">Releases</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
+<li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="scaling-video-generation-across-nvl72-rack-with-tensorrt-llm">
+<h1>Scaling Video Generation Across NVL72 rack with TensorRT-LLM<a class="headerlink" href="#scaling-video-generation-across-nvl72-rack-with-tensorrt-llm" title="Link to this heading">#</a></h1>
+<p>By NVIDIA TensorRT LLM Team</p>
+<section id="abstract">
+<h2>Abstract<a class="headerlink" href="#abstract" title="Link to this heading">#</a></h2>
+<p>Modern Diffusion Transformer (DiT) video generation models such as <a class="reference external" href="https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers">Wan 2.2 T2V-A14B</a> and <a class="reference external" href="https://huggingface.co/nvidia/Cosmos3-Super">Cosmos3-Super</a> model are computationally expensive: generating a single 5-second 720p clip takes over five minutes. Almost all of that time is the DiT denoising loop, which runs tens of full forward passes, each over a 70-150k-token sequence. Unlike LLM decode, every denoising step in DiT is a “prefill” - classifier-free guidance (CFG) evaluates the transformer twice, and the VAE decoder has its own peak both in compute and in activation memory. At these sequence lengths, the dense bidirectional attention — quadratic in the sequence — dominates the per-step compute cost. Pipeline parallelism cannot amortize a single-step single-request workload. Tensor parallelism reduces per-layer compute effectively within a node but adds communication in every layer including the FFN. Sequence-parallel methods restrict communication to inside the attention operation and directly attack the dominant cost, which is why the sequence is the natural multi-node scaling axis.</p>
+<p>This post describes how the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/visual_gen/visual_gen.py#L176"><code class="docutils literal notranslate"><span class="pre">VisualGen</span></code></a> runtime in TensorRT-LLM scales the DiT denoising loop and the VAE decoder from a single NVIDIA B200 to a full GB200 NVL72 rack using techniques like - <strong>CFG</strong>, <strong>Ulysses parallelism</strong>, <strong>Ring Attention</strong>, <strong>Attention2D context parallelism</strong>, and <strong>parallel VAE</strong> - unified under a single PyTorch <code class="docutils literal notranslate"><span class="pre">DeviceMesh</span></code>. The first four shard the DiT’s CFG streams and token sequence, while parallel VAE scales the decoder independently. All axes are declarative knobs on <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/visual_gen/args.py#L165"><code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code></a>; no model code changes are required to go from 1 GPU to 72.</p>
+<p>On Wan 2.2 T2V-A14B (a 5-second 1280×720 video, 40 steps), the <code class="docutils literal notranslate"><span class="pre">CFG=2</span> <span class="pre">×</span> <span class="pre">Ulysses=4</span> <span class="pre">×</span> <span class="pre">Attention2D</span> <span class="pre">3×3</span></code> recipe shrinks the DiT denoising loop by <strong>~53×</strong> going from a single NVIDIA B200 to a full GB200 NVL72 rack - which in turn drives a <strong>~41× end-to-end</strong> speedup. End-to-end trails the denoise speedup because of a fixed tail that stays constant as the DiT is sharded wider, setting the floor by Amdahl’s law.</p>
+<p>The same runtime carries over unchanged to Cosmos3-Super (a 64B Mixture-of-Transformers generating a 189-frame 1280×720 clip), where the identical <code class="docutils literal notranslate"><span class="pre">CFG=2</span> <span class="pre">×</span> <span class="pre">Ulysses=4</span> <span class="pre">×</span> <span class="pre">Attention2D</span> <span class="pre">3×3</span></code> recipe delivers <strong>~55× on the denoise loop (~33× end-to-end)</strong> on the full GB200 NVL72 rack.</p>
+<p align="center">
+  <img src="../media/tech_blog25_nvl72_scaling.png" alt="Wan 2.2 T2V-A14B scaling from one B200 GPU to the 72-GPU GB200 NVL72 recipe: ~53x denoise, ~41x end-to-end" width="49%">
+  <img src="../media/tech_blog25_cosmos3_highlight.png" alt="Cosmos3-Super scaling from one B200 GPU to the full 72-GPU GB200 NVL72 recipe: ~55x denoise, ~33x end-to-end" width="49%">
+</p>
+<p align="center"><sub><em>Figure 1. The same VisualGen recipe scaling two models from a single GPU to a full GB200 NVL72 rack. Left: Wan 2.2 T2V-A14B (5-second 1280×720, 40 steps). Right: Cosmos3-Super (189-frame 1280×720, 35 steps) under the identical `CFG=2 × Ulysses=4 × Attention2D 3×3` recipe.</em></sub></p>
+</section>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#the-scaling-challenge-in-video-generation"><span class="xref myst">The Scaling Challenge in Video Generation</span></a></p></li>
+<li><p><a class="reference internal" href="#cfg-parallelism"><span class="xref myst">CFG Parallelism</span></a></p></li>
+<li><p><a class="reference internal" href="#ulysses-parallelism"><span class="xref myst">Ulysses Parallelism</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#toward-async-ulysses-overlapping-communication-and-computation"><span class="xref myst">Toward Async Ulysses: Overlapping Communication and Computation</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#context-parallelism"><span class="xref myst">Context Parallelism</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#1-ring-attention"><span class="xref myst">Ring Attention</span></a></p></li>
+<li><p><a class="reference internal" href="#2-attention2d-parallelism"><span class="xref myst">Attention2D Context Parallelism</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#scaling-the-vae-decoder"><span class="xref myst">Scaling the VAE Decoder</span></a></p></li>
+<li><p><a class="reference internal" href="#the-parallelism-mesh"><span class="xref myst">The Parallelism Mesh</span></a></p></li>
+<li><p><a class="reference internal" href="#nvl72-scaling-results"><span class="xref myst">NVL72 Scaling Results</span></a></p>
+<ul>
+<li><p><a class="reference internal" href="#cosmos3-super"><span class="std std-ref">Cosmos3-Super</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#serving-with-trtllm-serve"><span class="xref myst">Serving with trtllm-serve</span></a></p></li>
+<li><p><a class="reference internal" href="#quality-evaluation"><span class="xref myst">Quality Evaluation</span></a></p></li>
+<li><p><a class="reference internal" href="../../legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html#conclusion"><span class="std std-ref">Conclusion</span></a></p></li>
+<li><p><a class="reference internal" href="#picking-the-right-configuration"><span class="xref myst">Picking the Right Configuration</span></a></p></li>
+<li><p><a class="reference internal" href="#limitations-and-future-work"><span class="xref myst">Limitations and Future Work</span></a></p></li>
+<li><p><a class="reference internal" href="../../torch/features/overlap_scheduler.html#references"><span class="std std-ref">References</span></a></p></li>
+<li><p><a class="reference internal" href="#acknowledgement"><span class="std std-ref">Acknowledgement</span></a></p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="the-scaling-challenge-in-video-generation">
+<h2>The Scaling Challenge in Video Generation<a class="headerlink" href="#the-scaling-challenge-in-video-generation" title="Link to this heading">#</a></h2>
+<p>Video generation with a multi-step diffusion transformer has a distinctive compute profile. A single request runs the full transformer forward 30–50 times — once per denoising step — and each step attends over the entire spatiotemporal sequence from scratch: there is no KV cache and no amortization across steps. For <a class="reference external" href="https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers">Wan-AI/Wan 2.2 T2V-A14B</a> generating a 5-second 1280×720 video, that is roughly <strong>72k DiT tokens</strong> per step of dense, bidirectional self-attention, repeated across 40 steps*. Even on a single NVIDIA B200 GPU, this could take several minutes generating a 5s clip.</p>
+<p>At 72k tokens per step, dense bidirectional self-attention — quadratic in sequence length, with no causal mask — dominates the per-step compute cost whereas the FFN, norms, and modulation scale linearly with sequence length; attention does not. By contrast, LLM inference can keep per-step attention cost bounded: at decode, given sequence length $N$, the KV cache reduces each step to $O(N)$ against a fixed cached context; even at prefill, the full $O(N^2)$ is paid once over sequences that are typically far shorter than 72k tokens. In DiT inference, $O(N^2)$ is paid on every denoising step at full length, with no caching. The <strong>sequence</strong> is therefore the natural axis to shard — the attention matrix is a full, unmasked $N \times N$ block — so the sequence and workload can divide cleanly across GPUs in ways that causal, triangularly-masked attention cannot. A second natural axis is CFG: classifier-free guidance evaluates the transformer twice per step — conditional and unconditional — sharing no state between the two passes, so the two evaluations can run on disjoint GPU groups in parallel.</p>
+<p>Tensor parallelism is a natural fit for reducing per-layer memory and compute: it partitions weight matrices across GPUs and runs efficiently over fast intra-node interconnects. TRT-LLM VisualGen supports TP and it becomes more important as models grow (head counts climb to 40 in Wan 2.2 A14B model to 64 in <a class="reference external" href="https://huggingface.co/nvidia/Cosmos3-Super">nvidia/Cosmos3-Super</a> model). Its tradeoff is communication cost across the full model: TP adds a collective in every layer, including the FFN. When attention dominates the per-step cost — as it does at 72k tokens — sequence-parallel methods are a better fit, because they restrict communication to inside the attention operation and let FFN, norms, and modulation run on the local sequence shard with no collective overhead.</p>
+<p>Pipeline parallelism, on the other hand, is a poor fit for a different reason. PP hides its inter-stage communication by microbatch pipelining, but that only pays off with many requests in flight. Video generation here is latency-bound on a single request at a time, so at any moment all but one pipeline stage would sit idle. Hence, PP buys no speedup on the metric that matters for these workloads.</p>
+<p>This post focuses on the sequence and CFG axes as the primary multi-node scaling story; TP composes with all of them and is out of scope here due to its relatively poor efficiency across multiple nodes.</p>
+<p>Finally, the VAE decoder at the end of the loop has its own activation-memory peak that is <em>larger</em> than any single DiT step’s activation footprint, and lives outside the transformer entirely. Parallel VAE attacks this by spatially sharding the decoder along an image’s spatial axis, so each rank decodes a $1/P$ slice locally before a final all-gather reconstructs the full video.</p>
+<p>To summarize, this post adopts the parallelism strategy below to scale video generation:</p>
+<ul class="simple">
+<li><p><strong>CFG parallelism</strong> splits the conditional and unconditional prompts onto disjoint GPU groups - two perfectly parallel prefills with one small all-gather at the combine step.</p></li>
+<li><p><strong>Sequence parallelism</strong> (Ulysses, Ring, Attention2D) shards the spatiotemporal sequence across GPUs and pays for it with collectives only inside the attention layer; the FFN, norms, and modulation run sequence-sharded for free.</p></li>
+<li><p><strong>Parallel VAE</strong> spatially shards the decoder so the post-DiT decode peak does not become the new bottleneck after the DiT itself has been scaled out.</p></li>
+</ul>
+<p>The rest of this post walks through each of these axes first, then shows how they compose into a single PyTorch <code class="docutils literal notranslate"><span class="pre">DeviceMesh</span></code> built from declarative knobs on <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code> - and how the same configuration scales from a single NVIDIA B200 to a full GB200 NVL72 rack.</p>
+<p><sub>* This post targets multi-step diffusion transformers; step-distilled diffusion models and autoregressive video models are out of scope. See - <a class="reference internal" href="#limitations-and-future-work"><span class="xref myst">Limitations and Future Work</span></a></sub></p>
+</section>
+<section id="cfg-parallelism">
+<h2>CFG Parallelism<a class="headerlink" href="#cfg-parallelism" title="Link to this heading">#</a></h2>
+<p>Classifier-Free Guidance evaluates the diffusion transformer twice per denoising step - once with the positive prompt embedding to produce $<code class="docutils literal notranslate"><span class="pre">\text{noise}_\text{cond}</span></code>$, once with the negative prompt embedding to produce $<code class="docutils literal notranslate"><span class="pre">\text{noise}_\text{uncond}</span></code>$ - and combines the two predictions as</p>
+<div class="highlight-math notranslate"><div class="highlight"><pre><span></span>\text{noise} = \text{noise}_\text{uncond} + \text{guidance\_scale} \cdot (\text{noise}_\text{cond} - \text{noise}_\text{uncond})
+</pre></div>
+</div>
+<p>The two evaluations share weights, timestep, and shape, so they are perfectly parallelisable across two disjoint GPU groups. CFG parallelism exploits this by setting <code class="docutils literal notranslate"><span class="pre">cfg_size</span> <span class="pre">=</span> <span class="pre">2</span></code>: the conditional stream runs on one half of the mesh and the unconditional stream on the other half. Each half runs its full DiT forward end to end with no cross-stream communication; only the two scalar noise tensors meet at the combine step.</p>
+<p><code class="docutils literal notranslate"><span class="pre">cfg</span></code> is the outermost mesh dimension, so each half of the GPUs runs one stream end to end and loads only its own (conditional or unconditional) prompt embedding. The two halves meet just once per step: a single all-gather over the CFG group exchanges the local <code class="docutils literal notranslate"><span class="pre">noise_pred</span></code>, after which every rank holds both predictions and applies the combine locally. Extra guidance streams (e.g. STG, modality conditioning) reuse the same all-gather - one collective per stream.</p>
+<p><strong>The net effect is a near-2x per-step latency reduction</strong> for the cost of 2x weight replication and a single per-step all-gather over a 2-rank group - small enough that the collective is bandwidth-bound, not latency-bound, and overlaps essentially perfectly with the post-combine scheduler step on each rank. Turning on <code class="docutils literal notranslate"><span class="pre">cfg_size=2</span></code> alone, with no other parallelism, nearly halves latency:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Config</p></th>
+<th class="head text-right"><p>GPUs</p></th>
+<th class="head text-right"><p>Denoise</p></th>
+<th class="head text-right"><p>End-to-end</p></th>
+<th class="head text-right"><p>Speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">cfg1</span></code> (single stream)</p></td>
+<td class="text-right"><p>1</p></td>
+<td class="text-right"><p>342.04s</p></td>
+<td class="text-right"><p>346.16s</p></td>
+<td class="text-right"><p>1.0×</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">cfg2</span></code> (CFG parallel)</p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>179.96s</p></td>
+<td class="text-right"><p>183.01s</p></td>
+<td class="text-right"><p><strong>1.90× / 1.89×</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>That near-linear scaling makes CFG the cheapest scaling axis available, and the one worth spending GPUs on <em>before</em> widening a sequence-parallel axis. On a 72-GPU rack, moving a 2x factor onto CFG (<code class="docutils literal notranslate"><span class="pre">cfg2·ulysses4·cp9</span></code>) rather than Ulysses (<code class="docutils literal notranslate"><span class="pre">cfg1·ulysses8·cp9</span></code>) cuts the denoise loop from 7.57s to 7.04s - <strong>~7.5% faster on the denoise loop (~6% end-to-end)</strong> - and CFG composes with every other axis (Ulysses, Attention2D, Ring, parallel VAE) unchanged.</p>
+</section>
+<section id="ulysses-parallelism">
+<h2>Ulysses Parallelism<a class="headerlink" href="#ulysses-parallelism" title="Link to this heading">#</a></h2>
+<p>The key insight behind Ulysses (<a class="reference external" href="https://arxiv.org/abs/2309.14509">arXiv:2309.14509</a>) is that outside the attention operation, activations are already sharded across GPUs along the sequence axis — each rank holds $[B, S/P, H, D]$ (<code class="docutils literal notranslate"><span class="pre">P</span></code> is the sequence-parallel degree), and FFN, norms, and modulation all run locally on that shard with no communication. The problem is that standard attention is inherently global: a query at position $i$ needs to see all keys and values across the full sequence length. Ulysses solves this by swapping the sharding axis just for the attention operation. A pair of all-to-alls converts $[B, S/P, H, D] \rightarrow [B, S, H/P, D]$ before attention and back again after, so each rank sees the full sequence but only a $1/P$ slice of heads. The FFN and everything else never touch a collective (unless composed with an FFN-sharding scheme like TP, which adds its own).</p>
+<p align="center">
+  <img src="../media/tech_blog25_ulysses_dataflow.png" alt="Ulysses sequence parallelism data layout: a pair of all-to-alls transposes a frame-sharded layout into a head-sharded layout for attention, then back" width="1080">
+</p>
+<p align="center"><sub><em>Figure 2. Ulysses keeps every stage except attention sequence-sharded - each rank owns a slice of the video frames (all heads), so QKV projection, norms, and the MLP run locally with no collective. A pair of all-to-alls transposes the layout to head-sharded (each rank owns all frames but a 1/P slice of heads) just for the full-sequence attention, then transposes back for the MLP.</em></sub></p>
+<p><strong>Fused vs. unfused QKV all-to-all.</strong> Before the input all-to-all, Q, K, and V have been computed by the QKV projection and sit in memory as three separate $[B, S/P, H, D]$ tensors. They need the same collective pattern over the same process group, so there are two ways to send them:</p>
+<ul class="simple">
+<li><p><strong>Unfused (3 collectives):</strong> issue a separate <code class="docutils literal notranslate"><span class="pre">all_to_all_4d</span></code> for Q, then K, then V. Simple, and works with any inner backend since the result lands as three independent tensors the backend can read directly.</p></li>
+<li><p><strong>Fused (1 collective):</strong> pack Q, K, V into a single $[B, S/P, 3, H, D]$ buffer and exchange it in one <code class="docutils literal notranslate"><span class="pre">all_to_all_5d</span></code>. Requires the inner backend to accept a stacked QKV input.</p></li>
+</ul>
+<p>The two paths transfer exactly the same bytes over the wire — the bandwidth cost is identical. The difference is in <strong>launch overhead</strong>: each NCCL collective is its own kernel launch with its own staging and stream synchronization, so cutting from three collectives to one removes two of those serialization points on the critical path. At the small per-rank tensor sizes and batch sizes of DiT inference this is a measurable win, particularly when Ulysses is running across many layers per denoising step.</p>
+<p>The stacked QKV buffer produced by the all-to-all is a single contiguous allocation; the inner backend can apply a single pass FP8 cast before the attention kernel rather than launching three separate casts on three separate tensors. For a workflow that runs QKV in BF16 but wants to feed the attention kernel in FP8, the fused path cuts the quantization overhead by roughly 3×. The resulting FP8 QKV also lands in a layout that can be passed directly into the attention kernel without an intermediate copy, keeping the memory footprint tight.</p>
+<p><strong>Communication cost.</strong> Ulysses parallelism involves <strong>only two all-to-all communications per layer, regardless of sequence length</strong>. For a sequence length $N$ and $P$ GPUs, each GPU sends a data chunk of size $O(N/P^2)$ to each of the other $P-1$ GPUs. This leads to a communication cost of $O(N/P)$.</p>
+<p><strong>Limitation.</strong> Ulysses sequence parallelism is constrained by the model’s attention head count: the Ulysses degree $P$ must not exceed the head count <code class="docutils literal notranslate"><span class="pre">num_heads</span></code> and must evenly divide <code class="docutils literal notranslate"><span class="pre">num_heads</span></code>; to use all GPUs in an NVL72 system uniformly, $P$ must also divide 72. For Wan2.2‑T2V‑A14B with $<code class="docutils literal notranslate"><span class="pre">\text{num\_heads}</span> <span class="pre">=</span> <span class="pre">40</span></code>$, this constraint makes $P = 8$ the largest feasible Ulysses degree on NVL72.</p>
+<section id="toward-async-ulysses-overlapping-communication-and-computation">
+<h3>Toward Async Ulysses: Overlapping Communication and Computation<a class="headerlink" href="#toward-async-ulysses-overlapping-communication-and-computation" title="Link to this heading">#</a></h3>
+<p align="center">
+  <img src="../media/tech_blog25_async_ulysses.png" alt="Async Ulysses V-to-Q-to-K pipeline: each tensor's all-to-all runs on the Copy Engines and overlaps the next tensor's projection compute" width="1080">
+</p>
+<p align="center"><sub><em>Figure 3. Async Ulysses moves the Q/K/V all-to-all onto the GPU's Copy Engines on a separate stream and pipelines it V→Q→K, so each tensor's cross-rank transfer overlaps the next tensor's projection compute (V's transfer hides under Q's compute, Q's under K's), hiding the collective latency behind useful work.</em></sub></p>
+<p>The current Ulysses implementation issues the input all-to-all synchronously — the compute stream idles for the full duration of the collective before the attention kernel starts. At WAN-scale sequence lengths with <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">=</span> <span class="pre">4</span></code> on NVIDIA B200, each all-to-all runs roughly 1-2ms. Across 40 attention layers and 40 denoising steps, that idle time adds up. Async Ulysses saves the idle time by running the V/Q/K cross-rank exchange on a dedicated side stream concurrently with the next V/Q/K’s compute on the default stream. It is opt-in via <code class="docutils literal notranslate"><span class="pre">async_ulysses:</span> <span class="pre">true</span></code> in <code class="docutils literal notranslate"><span class="pre">parallel_config</span></code>, and applies to peers that are reachable over NVLink via CUDA IPC.</p>
+<p><strong>Design</strong></p>
+<ul class="simple">
+<li><p><strong>Use Copy Engine for peer-to-peer communication.</strong> The P2P data movement runs on the GPU’s Copy Engines (CE) instead of SM-resident NCCL kernels. NCCL collectives occupy SMs and would compete with the next Q/K/V projection, normalization, and RoPE for compute resources; CEs and SMs are physically disjoint hardware, so comm and compute can truly run in parallel.</p></li>
+<li><p><strong>Write the local chunk directly, skip the CE.</strong> A fused pre-exchange kernel handles the permute and writes the local rank’s own chunk directly via HBM, avoiding a local D2D copy through the CE’s local channel whose limited bandwidth would otherwise become the critical path.</p></li>
+<li><p><strong>Communication and computation on separate streams.</strong> The two lanes run on independent CUDA streams, synchronized by lightweight events at each Q/K/V issue point, so they execute in parallel rather than blocking each other on the same stream.</p></li>
+<li><p><strong>V → Q → K rolling pipeline.</strong> V is issued first because it has the lightest pre-exchange compute (no normalization, no RoPE) — its compute finishes earliest, which lets the first CE push kick off as early as possible and starts the comm/compute overlap right away. From there each transfer hides under the next slot’s compute: V’s push overlaps Q’s compute, and Q’s push overlaps K’s compute. K, issued last, has no follow-up compute to hide behind, so the default stream waits for the K transfer (and final barrier) before attention starts.</p></li>
+<li><p><strong>Symmetric-memory buffers and barriers for cross-rank exchange.</strong> A small ring of CUDA-IPC-backed symmetric-memory buffers holds the per-V/Q/K receive slots, with peer-writable pointers exchanged once at startup. Barriers are deferred to the end of all three V/Q/K pushes — the transfers stream through the CE back-to-back without intervening fence kernels, and the default stream sees a fully-synced receive buffer before attention starts.</p></li>
+</ul>
+<p><strong>Speedup:</strong></p>
+<p><em>B200 Isolated all-to-all.</em> Single-tensor all-to-all latency, <code class="docutils literal notranslate"><span class="pre">B=2,</span> <span class="pre">S_total=6144,</span> <span class="pre">H=32,</span> <span class="pre">D=128</span></code>, warmup=30, bench=100.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Ulysses Size</p></th>
+<th class="head text-left"><p>Fused QKV 5D all-to-all</p></th>
+<th class="head text-left"><p>Split QKV 3x 4D all-to-all</p></th>
+<th class="head text-left"><p>Async Ulysses Pipeline</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>4</p></td>
+<td class="text-left"><p>419 µs (1.00×)</p></td>
+<td class="text-left"><p>483 µs (0.87×)</p></td>
+<td class="text-left"><p><strong>339 µs (1.24×)</strong></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>8</p></td>
+<td class="text-left"><p>251 µs (1.00×)</p></td>
+<td class="text-left"><p>294 µs (0.85×)</p></td>
+<td class="text-left"><p><strong>194 µs (1.29×)</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>B200 End-to-end.</em> OFF vs ON = async Ulysses disabled vs enabled.</p>
+<p>WAN 2.2 T2V-A14B, 720×1280, 80 frames, 40 steps, NVFP4:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-right"><p>World size</p></th>
+<th class="head text-right"><p>Ulysses</p></th>
+<th class="head text-right"><p>CFG</p></th>
+<th class="head text-right"><p>Async off e2e (s)</p></th>
+<th class="head text-right"><p>Async off denoise (s)</p></th>
+<th class="head text-right"><p>Async on e2e (s)</p></th>
+<th class="head text-right"><p>Async on denoise (s)</p></th>
+<th class="head text-right"><p>E2E Δlatency</p></th>
+<th class="head text-right"><p>Denoise Δlatency</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-right"><p>2</p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>1</p></td>
+<td class="text-right"><p>206.731</p></td>
+<td class="text-right"><p>203.31</p></td>
+<td class="text-right"><p>198.311</p></td>
+<td class="text-right"><p>194.89</p></td>
+<td class="text-right"><p><strong>−4.07%</strong></p></td>
+<td class="text-right"><p><strong>−4.14%</strong></p></td>
+</tr>
+<tr class="row-odd"><td class="text-right"><p>4</p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>103.031</p></td>
+<td class="text-right"><p>100.46</p></td>
+<td class="text-right"><p>100.504</p></td>
+<td class="text-right"><p>97.93</p></td>
+<td class="text-right"><p><strong>−2.45%</strong></p></td>
+<td class="text-right"><p><strong>−2.55%</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-right"><p>8</p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>55.444</p></td>
+<td class="text-right"><p>53.28</p></td>
+<td class="text-right"><p>54.114</p></td>
+<td class="text-right"><p>51.95</p></td>
+<td class="text-right"><p><strong>−2.40%</strong></p></td>
+<td class="text-right"><p><strong>−2.48%</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+</section>
+<section id="context-parallelism">
+<h2>Context Parallelism<a class="headerlink" href="#context-parallelism" title="Link to this heading">#</a></h2>
+<section id="ring-attention">
+<h3>1. Ring Attention<a class="headerlink" href="#ring-attention" title="Link to this heading">#</a></h3>
+<p>Like Ulysses, Ring attention (<a class="reference external" href="https://arxiv.org/abs/2310.01889">arXiv:2310.01889</a>) shards the spatiotemporal sequence so each rank holds $[B, S/P, H, D]$ and FFN, norms, and modulation run on that shard with no communication. The difference is how attention itself is made global: Ulysses swaps to head sharding inside the attention layer, which caps the parallel degree at the number of attention heads. <strong>Ring has no head-count ceiling</strong> - the ring degree $P$ can exceed <code class="docutils literal notranslate"><span class="pre">num_heads</span></code>, which makes it the lever required for pushing sequence parallelism past the Ulysses limit on a given GPU count.</p>
+<p><strong>K/V blocks rotate; Q stays put.</strong> Each rank keeps its local query shard resident and passes key/value blocks around a ring of $P$ GPUs. Over $P$ steps, the rank computes partial attention of its local Q against whichever K/V block it currently holds, then merges the result into a running output. After $P$ steps, every query position has attended over every key/value in the full sequence:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">Rank</span> <span class="n">r</span> <span class="n">holds</span> <span class="n">Q_r</span> <span class="p">(</span><span class="n">fixed</span><span class="p">)</span> <span class="ow">and</span> <span class="n">K</span><span class="o">/</span><span class="n">V</span> <span class="n">block</span> <span class="k">for</span> <span class="n">step</span> <span class="n">i</span>
+
+  <span class="n">step</span> <span class="mi">0</span><span class="p">:</span>  <span class="n">attn</span><span class="p">(</span><span class="n">Q_r</span><span class="p">,</span> <span class="n">K_r</span><span class="p">,</span> <span class="n">V_r</span><span class="p">)</span>  <span class="o">--</span><span class="n">isend</span><span class="o">/</span><span class="n">irecv</span><span class="o">--&gt;</span>  <span class="n">K</span><span class="o">/</span><span class="n">V</span> <span class="kn">from</span><span class="w"> </span><span class="nn">rank</span> <span class="n">r</span><span class="o">+</span><span class="mi">1</span>
+  <span class="n">step</span> <span class="mi">1</span><span class="p">:</span>  <span class="n">attn</span><span class="p">(</span><span class="n">Q_r</span><span class="p">,</span> <span class="n">K_</span><span class="p">{</span><span class="n">r</span><span class="o">+</span><span class="mi">1</span><span class="p">},</span> <span class="n">V_</span><span class="p">{</span><span class="n">r</span><span class="o">+</span><span class="mi">1</span><span class="p">})</span>  <span class="o">--</span><span class="n">isend</span><span class="o">/</span><span class="n">irecv</span><span class="o">--&gt;</span>  <span class="o">...</span>
+     <span class="o">...</span>
+  <span class="n">step</span> <span class="n">P</span><span class="o">-</span><span class="mi">1</span><span class="p">:</span> <span class="n">attn</span><span class="p">(</span><span class="n">Q_r</span><span class="p">,</span> <span class="n">K_</span><span class="p">{</span><span class="n">r</span><span class="o">-</span><span class="mi">1</span><span class="p">},</span> <span class="n">V_</span><span class="p">{</span><span class="n">r</span><span class="o">-</span><span class="mi">1</span><span class="p">})</span>   <span class="p">(</span><span class="n">no</span> <span class="n">exchange</span> <span class="n">on</span> <span class="n">final</span> <span class="n">step</span><span class="p">)</span>
+
+  <span class="n">running</span> <span class="n">output</span> <span class="n">merged</span> <span class="n">after</span> <span class="n">each</span> <span class="n">step</span>  <span class="o">--&gt;</span>  <span class="n">final</span> <span class="n">O_r</span>
+</pre></div>
+</div>
+<p><strong>Online-softmax merge.</strong> Each step yields a partial output and a log-sum-exp (LSE) statistic; <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py"><code class="docutils literal notranslate"><span class="pre">RingAttention</span></code></a> merges them with a streaming softmax recurrence in <strong>fp32</strong>, block by block, until the result matches one global attention pass.</p>
+<p><strong>Overlapping communication and compute.</strong> The K/V exchange for the next block is posted with non-blocking point-to-point (<code class="docutils literal notranslate"><span class="pre">batch_isend_irecv</span></code>) <em>before</em> the current block’s FA4 kernel runs, so the neighbor transfer overlaps with attention compute. Even ranks send-then-recv and odd ranks recv-then-send to avoid deadlock; the final ring step skips the exchange entirely.</p>
+<p><strong>Communication cost.</strong> Ring pays $P-1$ neighbor exchanges per attention layer, and communication volume scales as $O(N)$ in sequence length $N$ — more sequential steps than Ulysses. Each ring step also runs a partial FA4 pass plus an online-softmax merge, so attention work grows with ring degree $P$, not just communication. The upside is flexibility: <strong>no head-count ceiling</strong>, a simple 1D topology, and straightforward composition with Ulysses on the same mesh ($<code class="docutils literal notranslate"><span class="pre">\text{cp\_size}</span> <span class="pre">\times</span> <span class="pre">\text{ulysses\_size}</span></code>$). P2P can overlap with compute, which keeps Ring competitive at small $P$ and short sequences. For production video lengths, though, we <strong>generally prefer Attention2D</strong> (detailed in the next section) for the context-parallel axis, owing to its lower communication cost – $O(N/\sqrt{P})$ versus $O(N)$ for Ring attention.</p>
+</section>
+<section id="attention2d-parallelism">
+<h3>2. Attention2D Parallelism<a class="headerlink" href="#attention2d-parallelism" title="Link to this heading">#</a></h3>
+<p>Attention2D parallelism (<a class="reference external" href="https://arxiv.org/abs/2503.15758">arXiv:2503.15758</a>) treats the $P$ context-parallel GPUs as a logical 2D grid of $<code class="docutils literal notranslate"><span class="pre">\text{row\_size}</span> <span class="pre">\times</span> <span class="pre">\text{col\_size}</span></code>$ workers. It is our preferred <strong>context-parallel strategy</strong> once Ulysses has consumed the head-divisible fraction of the mesh and more GPUs remain. Like Ring, it shards the spatiotemporal sequence with <strong>no head-count ceiling</strong> — any $<code class="docutils literal notranslate"><span class="pre">\text{row\_size}</span> <span class="pre">\times</span> <span class="pre">\text{col\_size}</span></code>$ grid is valid regardless of how many attention heads the DiT has. It also <strong>generalizes 1D context parallelism</strong> - setting $<code class="docutils literal notranslate"><span class="pre">\text{col\_size}=1</span></code>$ reduces to the no-merge scheme (all-gather K/V), while setting $<code class="docutils literal notranslate"><span class="pre">\text{row\_size}=1</span></code>$ reduces to the merge scheme (all-gather Q). - and <strong>scales the CP degree better</strong>, gathering only $S/\sqrt{P}$ per axis ($O(N/\sqrt{P})$ communication) on a symmetric grid, which suits long-sequence DiT inference. The runtime adapts the original Attention2D design from causal LLM training to <strong>full bidirectional</strong> DiT inference.</p>
+<p><strong>Gather phase: Q along rows and K/V along columns.</strong> Ranks form a $<code class="docutils literal notranslate"><span class="pre">\text{row\_size}</span> <span class="pre">\times</span> <span class="pre">\text{col\_size}</span></code>$ grid ($<code class="docutils literal notranslate"><span class="pre">P</span> <span class="pre">=</span> <span class="pre">\text{row\_size}</span> <span class="pre">\times</span> <span class="pre">\text{col\_size}</span></code>$). Each rank starts with a $1/P$ shard of all three tensors — $Q_i, K_i, V_i$, each $[B, S/P, H, D]$. Attention2D then runs two all-gathers on the two independent grid axes:</p>
+<ul class="simple">
+<li><p><strong>Q gather</strong> over the <strong>row group</strong> (<code class="docutils literal notranslate"><span class="pre">row_process_group</span></code>): the <code class="docutils literal notranslate"><span class="pre">col_size</span></code> ranks that share a row. Concatenates their $Q_i$ → every member holds $<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">S/\text{row\_size},</span> <span class="pre">H,</span> <span class="pre">D]</span></code>$. K/V are untouched.</p></li>
+<li><p><strong>K/V gather</strong> over the <strong>column group</strong> (<code class="docutils literal notranslate"><span class="pre">col_process_group</span></code>): the <code class="docutils literal notranslate"><span class="pre">row_size</span></code> ranks that share a column, fused into a single collective. Concatenates their $<code class="docutils literal notranslate"><span class="pre">K_i</span> <span class="pre">/</span> <span class="pre">V_i</span></code>$ → every member holds $<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">S/\text{col\_size},</span> <span class="pre">H,</span> <span class="pre">D]</span></code>$. Q is untouched.</p></li>
+</ul>
+<p>So <strong>Q expands by <code class="docutils literal notranslate"><span class="pre">col_size</span></code></strong> (a row holds <code class="docutils literal notranslate"><span class="pre">col_size</span></code> ranks → $<code class="docutils literal notranslate"><span class="pre">S/\text{row\_size}</span></code>$) and <strong>K/V expand by <code class="docutils literal notranslate"><span class="pre">row_size</span></code></strong> (a column holds <code class="docutils literal notranslate"><span class="pre">row_size</span></code> ranks → $<code class="docutils literal notranslate"><span class="pre">S/\text{col\_size}</span></code>$); on a symmetric $\sqrt{P} \times \sqrt{P}$ mesh both land at $S/\sqrt{P}$. The picture below uses a $2 \times 3$ grid (<code class="docutils literal notranslate"><span class="pre">row_size=2,</span> <span class="pre">col_size=3</span></code>, $P=6$), with $S$ split into shards $0..5$:</p>
+<p align="center">
+  <img src="../media/tech_blog25_attention2d.png" alt="Attention2D per-rank data flow on a 2x3 grid: gather Q over the row group, K/V over the column group, one attention pass per rank produces a partial output, then an all-to-all over the row group exchanges partials and a local flash_attn_combine reduction merges them" width="1080">
+</p>
+<p align="center"><sub><em>Figure 4. Attention2D data flow traced for rank0 on a 2x3 grid (`row_size=2, col_size=3`, P=6). Each rank starts with a 1/P shard; ① an all-gather over the `row_process_group` collects Q, ② an all-gather over the `col_process_group` collects K/V, giving each rank the [B, S/row, H, D] queries x [B, S/col, H, D] keys it attends in one pass to produce a single partial output (with its LSE). The row group's ranks share the same Q but attend over disjoint K/V slices, so ③ an `all_to_all` over the `row_process_group` exchanges those partials, then a local `flash_attn_combine` reduction merges them into the final [B, S/P, H, D] shard.</em></sub></p>
+<p>Members of a <strong>row (Q) group</strong> end up with identical Q but <strong>disjoint</strong> K/V slices; members of a <strong>column (K/V) group</strong> share identical K/V but hold different Q.</p>
+<p><strong>Local Attention.</strong> The inner backend (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py"><code class="docutils literal notranslate"><span class="pre">Attention2DAttention</span></code></a>) runs attention with LSE returning a partial output $<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">S/\text{row\_size},</span> <span class="pre">H,</span> <span class="pre">D]</span></code>$ and a log-sum-exp (LSE) statistic $<code class="docutils literal notranslate"><span class="pre">[B,</span> <span class="pre">H,</span> <span class="pre">S/\text{row\_size}]</span></code>$. The LSE records the softmax normalizer for that partial pass.</p>
+<p><strong>Merge phase.</strong> The <code class="docutils literal notranslate"><span class="pre">col_size</span></code> ranks that share the same Q each attended over a <strong>disjoint slice of K/V</strong> (above: ranks <code class="docutils literal notranslate"><span class="pre">0</span></code>, <code class="docutils literal notranslate"><span class="pre">1</span></code>, <code class="docutils literal notranslate"><span class="pre">2</span></code> all hold queries <code class="docutils literal notranslate"><span class="pre">{0,1,2}</span></code> but keys <code class="docutils literal notranslate"><span class="pre">{0,3}</span></code>, <code class="docutils literal notranslate"><span class="pre">{1,4}</span></code>, <code class="docutils literal notranslate"><span class="pre">{2,5}</span></code> respectively). Their FA4 outputs are partial results for the <strong>same query positions</strong> over <strong>complementary key spans</strong>, so they must be combined <strong>within that row group</strong> to recover the full softmax. For <code class="docutils literal notranslate"><span class="pre">col_size</span> <span class="pre">=</span> <span class="pre">3</span></code>, the partial results are spread across 3 GPUs. These are combined into the final output as follows:</p>
+<ol class="arabic simple">
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">all_to_all_single</span></code></strong> over the <code class="docutils literal notranslate"><span class="pre">row_process_group</span></code> exchanges output and LSE chunks among the <code class="docutils literal notranslate"><span class="pre">3</span></code> ranks.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">flash_attn_combine</span></code></strong> merges the <code class="docutils literal notranslate"><span class="pre">3</span></code> received <code class="docutils literal notranslate"><span class="pre">(output,</span> <span class="pre">LSE)</span></code> pairs in one batched kernel, producing the fully reduced $[B, S/P, H, D]$ shard that matches the input layout.</p></li>
+</ol>
+<p><strong>Difference from Ring:</strong></p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p></p></th>
+<th class="head text-left"><p>Ring</p></th>
+<th class="head text-left"><p>Attention2D</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><strong>Q communication</strong></p></td>
+<td class="text-left"><p>None. All required Q tokens  available locally.</p></td>
+<td class="text-left"><p>$O(N / \sqrt{P})$ data all-gathered among <code class="docutils literal notranslate"><span class="pre">col_size</span></code> ranks within a row group</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><strong>K/V communication</strong></p></td>
+<td class="text-left"><p>$O(N)$ data exchanged among all $P$ ranks in a P2P fashion</p></td>
+<td class="text-left"><p>$O(N / \sqrt{P})$ data all-gathered among <code class="docutils literal notranslate"><span class="pre">row_size</span></code> ranks within a column group</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><strong>Partials</strong></p></td>
+<td class="text-left"><p>$P$ blocks, one per ring step, each against a rotating K/V shard</p></td>
+<td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">col_size</span></code> partials from the row (Q) group, each over a disjoint slice of K/V</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><strong>Merge schedule</strong></p></td>
+<td class="text-left"><p><strong>Streaming</strong> — merge after every FA4 step, in-place on the local rank (<code class="docutils literal notranslate"><span class="pre">sigmoid</span></code> / <code class="docutils literal notranslate"><span class="pre">logsigmoid</span></code> recurrence)</p></td>
+<td class="text-left"><p><strong>Batch</strong> — one FA4 pass, then a single <code class="docutils literal notranslate"><span class="pre">flash_attn_combine</span></code> after the row <code class="docutils literal notranslate"><span class="pre">all_to_all</span></code></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><strong>Merge communication</strong></p></td>
+<td class="text-left"><p>None (all local)</p></td>
+<td class="text-left"><p>One <strong><code class="docutils literal notranslate"><span class="pre">all_to_all</span></code></strong> of size $O(N / \sqrt{P})$ on output+LSE within the row group (fixed collectives, no per-hop wait tail)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><strong>Attention passes</strong></p></td>
+<td class="text-left"><p>$P$ partial FA4 kernels</p></td>
+<td class="text-left"><p><strong>1</strong> FA4 kernel per rank</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><strong>Compute–communication overlap</strong></p></td>
+<td class="text-left"><p>Computation and communication overlap</p></td>
+<td class="text-left"><p>Computation and communication currently run in separate phases (no overlap)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><strong>Communication cost</strong></p></td>
+<td class="text-left"><p>$O(N)$</p></td>
+<td class="text-left"><p>$O(N / \sqrt{P})$</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><strong>Scaling</strong></p></td>
+<td class="text-left"><p>No scaling: communication cost remains constant as $P$ increases</p></td>
+<td class="text-left"><p>Efficient scaling: communication cost decreases as $O(1 / \sqrt{P})$ as $P$ increases</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><strong>Communication cost.</strong> Across the full layer, Attention2D runs three collective phases: Q all-gather (row), K/V all-gather (column), and output+LSE all-to-all (row). On a symmetric mesh ($<code class="docutils literal notranslate"><span class="pre">\text{row\_size}</span> <span class="pre">\approx</span> <span class="pre">\text{col\_size}</span> <span class="pre">\approx</span> <span class="pre">\sqrt{P}</span></code>$), moved volume scales as $O(N / \sqrt{P})$ in sequence length $N$, compared to $O(N)$ for Ring — the same head-count freedom, but better communication scaling and one attention pass instead of $P$.</p>
+<p align="center">
+  <img src="../media/tech_blog25_a2d_vs_ring.png" alt="Bar chart of denoise-loop latency for Attention2D vs Ring at 32 GPU (UL=8, CP=2), 64 GPU (UL=8, CP=4), and 72 GPU (UL=4, CP=9); Ring is +3%, +13%, and +83% slower respectively" width="820">
+</p>
+<p align="center"><sub><em>Figure 5. Denoise-loop latency for Attention2D vs Ring on GB200 NVL72 (Wan 2.2 T2V-A14B, 5-second 1280×720 video, 40 steps). `cfg=2` is fixed. Attention2D scales favorably with increasing context-parallel degree — its communication cost reduces as O(1 / sqrt{P}) while Ring Attention's remains flat at O(1), for a fixed sequence length N  — yielding progressively larger latency gaps of +3% at CP=2, +13% at CP=4, and +83% at CP=9. Ring Attention suffers a sharp latency regression at 72 GPUs: to evenly divide the 36 available GPUs per cfg replica, the Ulysses parallelism degree (UL) must be reduced from 8 to 4, which increases communication volume along the CP axis. This amplifies Ring Attention's latency, as its communication volume scales as O(N). Attention2D is far less sensitive to the increased communication volume because it scales as O(N / sqrt{P}), allowing the higher parallelism degree to offset the additional volume.</em></sub></p>
+</section>
+</section>
+<section id="scaling-the-vae-decoder">
+<h2>Scaling the VAE Decoder<a class="headerlink" href="#scaling-the-vae-decoder" title="Link to this heading">#</a></h2>
+<p>After the DiT denoising loop finishes, a single latent tensor still has to be turned into pixels by the VAE decoder. When the DiT is scaled out to 72 GPUs as on a GB200 NVL72 rack, the denoising loop runs in a fraction of its single-GPU time, but an unsharded VAE decode still runs on a single rank - so VAE decoding becomes a non-trivial performance bottleneck in the whole pipeline. Parallel VAE removes that serial tail.</p>
+<p><strong>Spatial sharding.</strong> Unlike the DiT - which shards the <em>token sequence</em> - the VAE is a convolutional UNet-style stack that operates on a <code class="docutils literal notranslate"><span class="pre">(B,</span> <span class="pre">C,</span> <span class="pre">T,</span> <span class="pre">H,</span> <span class="pre">W)</span></code> video tensor, so the natural axis to split is <strong>image space</strong>. <code class="docutils literal notranslate"><span class="pre">parallel_vae_split_dim</span></code> selects height or width, and the latent (decode) or video (encode) tensor is chunked along that dimension across the <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span></code> ranks. Each rank owns a $1/P$ spatial slice and decodes it locally; a single all-gather at the end reconstructs the full frame:</p>
+<p align="center">
+  <img src="../media/tech_blog25_parallel_vae.png" alt="Parallel VAE: route the final latent to the parallel_vae_size VAE-group ranks while the rest idle, split image space along W into 1/P slices, decode each slice locally, all-gather into the full video, and use halo exchange so boundary convolutions stay correct" width="1080">
+</p>
+<p align="center"><sub><em>Figure 6. Parallel VAE decode. The full latent is split along an image-space axis (`W` here) into 1/P slices across the `parallel_vae_size` VAE-group ranks (the rest idle); each rank decodes its slice locally — boundary convolutions exchange only a thin k-1 "halo" with their neighbors (edge ranks zero-pad), and attention blocks gather the full split dimension — then a final all-gather reconstructs the full video.</em></sub></p>
+<p><strong>Convolutions need their neighbors: Halo Exchange.</strong> A spatial split breaks every convolution at the chunk boundary - a $k \times k$ conv needs $k-1$ rows/columns that now live on the adjacent rank. Instead of gathering the whole activation, each conv exchanges only the thin boundary “halo” with its neighbors, runs, then strips the extra output; boundary ranks zero-pad. The halo is tiny and kernel-sized, so per-conv communication stays small regardless of activation size. VAE attention blocks, being global, instead gather along the split dimension before attention and re-shard afterward.</p>
+<p><strong>The VAE’s parallel degree is chosen independently of how the DiT is sharded.</strong> <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span></code> sets the VAE’s width without matching the CFG, Ulysses, or context-parallel degrees - independence of degree, not hardware, since the VAE decodes on a subset of the same GPUs. A separate knob is needed because the VAE saturates far earlier than the DiT, and because the split dimension must divide the few latent rows/columns evenly, which a large <code class="docutils literal notranslate"><span class="pre">world_size</span></code> rarely does.</p>
+<p>This yields two regimes:</p>
+<ul class="simple">
+<li><p><strong>Single node (<code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&lt;=</span> <span class="pre">8</span></code>)</strong> - <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span> <span class="pre">==</span> <span class="pre">world_size</span></code>; every rank decodes (e.g. the 8-GPU Wan 2.2 example pairs <code class="docutils literal notranslate"><span class="pre">cfg_size=2,</span> <span class="pre">ulysses_size=4</span></code> with <code class="docutils literal notranslate"><span class="pre">parallel_vae_size=8</span></code>).</p></li>
+<li><p><strong>Multi-node (<code class="docutils literal notranslate"><span class="pre">world_size</span> <span class="pre">&gt;</span> <span class="pre">8</span></code>, e.g. NVL72)</strong> - the DiT scales to all 72 ranks but <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span></code> stays at its ceiling (~8); the VAE decodes on that subset while the rest idle.</p></li>
+</ul>
+<p><strong>Measured impact.</strong> On the full 72-GPU recipe the denoising loop is only <strong>7.04s</strong>, but a rank-0-only decode adds <strong>~2.7s</strong> - after the DiT has already been scaled out ~53x, <strong>~25% of the 11.1s end-to-end request</strong> is now spent in a single-rank VAE. Sweeping <code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span></code> shows why a separate VAE knob matters: the first few doublings nearly halve decode latency, then returns flatten as the VAE runs out of spatial work to split and per-rank halo/all-gather overhead starts to dominate. Setting <code class="docutils literal notranslate"><span class="pre">parallel_vae_size=8</span></code> cuts decode to <strong>~0.8s</strong> (<strong>3.3x faster, a 69% reduction</strong>), shrinking end-to-end to <strong>9.2s</strong> (<strong>1.2x, -17%</strong>) and dropping the VAE’s share to <strong>~9%</strong>. The VAE saturates at this width - <code class="docutils literal notranslate"><span class="pre">parallel_vae_size=16</span></code> measures no faster - which is why the multi-node recipe caps the VAE at ~8 ranks.</p>
+<p><em>Decode scaling</em> - the full sweep, decode-only:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p><code class="docutils literal notranslate"><span class="pre">parallel_vae_size</span></code></p></th>
+<th class="head text-right"><p>VAE decode</p></th>
+<th class="head text-right"><p>Decode speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>1 (unsharded)</p></td>
+<td class="text-right"><p>2.72s</p></td>
+<td class="text-right"><p>1.00×</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>2</p></td>
+<td class="text-right"><p>1.72s</p></td>
+<td class="text-right"><p>1.58×</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>4</p></td>
+<td class="text-right"><p>1.04s</p></td>
+<td class="text-right"><p>2.62×</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>8</p></td>
+<td class="text-right"><p>0.83s</p></td>
+<td class="text-right"><p><strong>3.28×</strong></p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>16</p></td>
+<td class="text-right"><p>0.85s</p></td>
+<td class="text-right"><p>3.20×</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>End-to-end impact</em> - on the full 72-GPU NVL72 recipe:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>NVL72 recipe</p></th>
+<th class="head text-right"><p>VAE decode</p></th>
+<th class="head text-right"><p>VAE share of E2E</p></th>
+<th class="head text-right"><p>End-to-end</p></th>
+<th class="head text-right"><p>E2E speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">parallel_vae_size=1</span></code> (unsharded)</p></td>
+<td class="text-right"><p>2.72s</p></td>
+<td class="text-right"><p>24.5%</p></td>
+<td class="text-right"><p>11.08s</p></td>
+<td class="text-right"><p>1.00×</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">parallel_vae_size=8</span></code></p></td>
+<td class="text-right"><p>0.83s</p></td>
+<td class="text-right"><p>9.0%</p></td>
+<td class="text-right"><p>9.20s</p></td>
+<td class="text-right"><p><strong>1.20×</strong></p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="the-parallelism-mesh">
+<h2>The Parallelism Mesh<a class="headerlink" href="#the-parallelism-mesh" title="Link to this heading">#</a></h2>
+<p>All five parallelism axes - CFG, TP, Ulysses, context parallelism, and the parallel-VAE slice - live on a single PyTorch <code class="docutils literal notranslate"><span class="pre">DeviceMesh</span></code> built once at startup by <code class="docutils literal notranslate"><span class="pre">VisualGenMapping</span></code> (in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/mapping.py"><code class="docutils literal notranslate"><span class="pre">mapping.py</span></code></a>). The user only sets the per-axis sizes on <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/visual_gen/args.py#L165"><code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code></a>; every per-axis process group (<code class="docutils literal notranslate"><span class="pre">cfg_group</span></code>, <code class="docutils literal notranslate"><span class="pre">ulysses_group</span></code>, <code class="docutils literal notranslate"><span class="pre">cp_group</span></code>, <code class="docutils literal notranslate"><span class="pre">attn2d_row_group</span></code>, <code class="docutils literal notranslate"><span class="pre">attn2d_col_group</span></code>, <code class="docutils literal notranslate"><span class="pre">vae_group</span></code>, …) is derived from that one mesh and cached, so different layers - Linear, attention, VAE - all see consistent NCCL communicators.</p>
+<p>The total world size is just the product of the axes:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">world_size</span> <span class="o">=</span> <span class="n">cfg_size</span>  <span class="n">x</span>  <span class="n">tp_size</span>  <span class="n">x</span>  <span class="n">cp_size</span>  <span class="n">x</span>  <span class="n">ulysses_size</span>
+
+<span class="n">cp_size</span> <span class="o">=</span> <span class="n">ring_size</span>                                 <span class="p">(</span><span class="n">Ring</span> <span class="n">attention</span><span class="p">)</span>
+          <span class="n">OR</span> <span class="n">attn2d_row_size</span> <span class="n">x</span> <span class="n">attn2d_col_size</span>      <span class="p">(</span><span class="n">Attention2D</span><span class="p">,</span> <span class="mi">2</span><span class="n">D</span> <span class="n">tile</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The mesh axis order is fixed as <strong><code class="docutils literal notranslate"><span class="pre">cfg</span> <span class="pre">-</span> <span class="pre">tp</span> <span class="pre">-</span> <span class="pre">cp</span> <span class="pre">-</span> <span class="pre">ulysses</span></code></strong> regardless of CP mode. For Attention2D, <code class="docutils literal notranslate"><span class="pre">cp_size</span> <span class="pre">=</span> <span class="pre">attn2d_row_size</span> <span class="pre">×</span> <span class="pre">attn2d_col_size</span></code>, and dedicated <strong>row</strong> and <strong>column</strong> process groups are derived from the rank layout for Q vs K/V gathers:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span>Ring:          cp = ring_size
+Attention2D:   cp = attn2d_row × attn2d_col   (+ row_group, col_group subgroups)
+</pre></div>
+</div>
+<p>The ordering is deliberate: <strong>Ulysses is innermost, CFG is outermost</strong>, decided by how <em>sensitive</em> each axis’s communication pattern is to the uniformity of the interconnect (TP not shown here as it is out-of-scope for this post):</p>
+<ul class="simple">
+<li><p><strong>Ulysses (innermost)</strong> wraps CP, so its <strong>all-to-all</strong> fires first and moves only $\approx A/(UL \cdot CP)$ per rank ($A = S \cdot H$) — the <em>least</em> traffic of the three — yet it is the most bisection-bandwidth-hungry, topology-fragile collective there is: every rank exchanges with every other rank in the group, so the transfer is gated by the <em>slowest</em> pairwise link, and it is a single blocking step on the attention critical path. So even though it is the lightest axis, the entire Ulysses group has to live on a single fast, fully-connected fabric, because one slow hop drags down the whole exchange. This only matters on <strong>heterogeneous</strong> topologies that mix NVLink with a slower fabric — e.g. an 8-GPU/node cluster consisting of intra-node NVLink but inter-node InfiniBand with <code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">&gt;</span> <span class="pre">8</span></code> would push the all-to-all onto the slow links. On a uniform NVLink domain like GB200 NVL72 every pair is NVLink-connected, so a Ulysses group can span all 72 GPUs at full bandwidth.</p></li>
+<li><p><strong>Context parallelism (middle)</strong> moves more per rank than Ulysses, but how much depends on the backend. <strong>Ring</strong> moves $\approx A/UL$ — because each rank relays the full K/V around the ring over its $CP-1$ point-to-point steps, exchanging only with its two neighbors (never a full-group all-to-all). <strong>Attention2D</strong> moves just $\approx A/(UL \cdot \sqrt{CP})$ — since its K/V all-gather is confined to a $\sqrt{CP}$-rank row/column subgroup, a factor $\sqrt{CP}$ lighter than a full-group all-to-all. Both patterns are <strong>boundary-tolerant</strong>: heavier in bytes than Ulysses, but far less fragile than its all-to-all. And on a uniform fabric like GB200 NVL72, Ulysses’ fit-within-NVLink constraint goes away entirely, so making CP the innermost axis (to favor its larger volume) becomes a reasonable alternative — one we leave to future work.</p></li>
+<li><p><strong>CFG (outermost)</strong> only recombines the conditional/unconditional branches once per denoising step - a tiny reduction a few dozen times for the entire generation, so it can afford the slowest inter-node / inter-rack fabric.</p></li>
+</ul>
+<p>This maps onto hardware through the rank layout. PyTorch lays out global ranks row-major over <code class="docutils literal notranslate"><span class="pre">mesh_shape</span></code> (leftmost dim varies slowest, rightmost varies fastest), so making Ulysses the <strong>fastest-varying</strong> axis means ranks that share <code class="docutils literal notranslate"><span class="pre">(cfg,</span> <span class="pre">tp,</span> <span class="pre">cp)</span></code> get <em>consecutive</em> IDs. A launcher that binds ranks contiguously per node then realizes the placement above for free — each axis lands on the fabric it needs without any manual rank-to-GPU mapping.</p>
+<p>The VAE is handled separately from the denoiser axes. Instead of being carved from the denoiser mesh, its group is built by <strong>overlaying a fresh device group on top of the existing world</strong> (the <code class="docutils literal notranslate"><span class="pre">cfg</span> <span class="pre">×</span> <span class="pre">tp</span> <span class="pre">×</span> <span class="pre">cp</span> <span class="pre">×</span> <span class="pre">ulysses</span></code> mesh), which lets VAE parallelism scale independently of the DiT (see <a class="reference internal" href="#scaling-the-vae-decoder"><span class="xref myst">Scaling the VAE Decoder</span></a> above). Its one constraint is that the VAE ranks fit within a single CFG group, or span the whole world: after the guidance combine the latent handed to the decoder lives on a single CFG branch, so a VAE group straddling both branches would mix the conditional and unconditional copies and its gather/halo collectives would be incoherent.</p>
+<p>For the full property catalog (every <code class="docutils literal notranslate"><span class="pre">*_group</span></code>, <code class="docutils literal notranslate"><span class="pre">*_rank</span></code>, the flattened <code class="docutils literal notranslate"><span class="pre">seq_mesh</span></code>, and the <code class="docutils literal notranslate"><span class="pre">to_llm_mapping()</span></code> bridge that lets Linear layers reuse the LLM TP path), see <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/mapping.py"><code class="docutils literal notranslate"><span class="pre">mapping.py</span></code></a>.</p>
+</section>
+<section id="nvl72-scaling-results">
+<h2>NVL72 Scaling Results<a class="headerlink" href="#nvl72-scaling-results" title="Link to this heading">#</a></h2>
+<p>All performance numbers in this section use the same measured workload and publish one distributed recipe: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml</span></code></a>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Item</p></th>
+<th class="head text-left"><p>Value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Model</p></td>
+<td class="text-left"><p><a class="reference external" href="https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers"><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-T2V-A14B-Diffusers</span></code></a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Hardware</p></td>
+<td class="text-left"><p>GB200 NVL72</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Request shape</p></td>
+<td class="text-left"><p>5-second 1280×720 video (<code class="docutils literal notranslate"><span class="pre">num_frames=80</span></code>* at 16 fps)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Denoising steps</p></td>
+<td class="text-left"><p>40</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Precision</p></td>
+<td class="text-left"><p>BF16</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Attention backend</p></td>
+<td class="text-left"><p>FA4</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Guidance scale</p></td>
+<td class="text-left"><p>5.0</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Benchmark load</p></td>
+<td class="text-left"><p>3 prompts, single-stream</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><sub>* We request 80 frames rather than Wan’s native 81 because of the sequence-parallel divisibility constraint: Wan’s temporal VAE maps 81 frames to 21 latent frames which does not divide evenly across the context-parallel degrees in the sweep, while 80 frames gives 20 latent frames which gives a sequence length cleanly divisible by different CP. This is a benchmarking convenience, not a hard limit — 81 frames can be easily supported by padding a few tokens at the framework level (see <a class="reference internal" href="#limitations-and-future-work"><span class="xref myst">Limitations and Future Work</span></a>).</sub></p>
+<p>Throughout this section we report two metrics. <strong>Denoise loop</strong> is the DiT denoising time — the work that the parallelism axes actually shard. <strong>End-to-end request</strong> is the full per-request latency measured at the serving endpoint, which adds the fixed tail that does not shrink as the DiT is sharded wider: text encoding and VAE decode plus mp4 encode and request/transport overhead.</p>
+<p>The headline result is summarized in <a class="reference internal" href="#scaling-video-generation-across-nvl72-rack-with-tensorrt-llm"><span class="xref myst">Figure 1</span></a> at the top of the post; the underlying numbers are:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Metric</p></th>
+<th class="head text-right"><p>1× B200 baseline</p></th>
+<th class="head text-right"><p>72-GPU GB200 NVL72</p></th>
+<th class="head text-right"><p>Speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Denoise loop</p></td>
+<td class="text-right"><p>370.8s</p></td>
+<td class="text-right"><p>7.04s</p></td>
+<td class="text-right"><p>52.7× (~53×)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>End-to-end request</p></td>
+<td class="text-right"><p>373.35s</p></td>
+<td class="text-right"><p>9.20s</p></td>
+<td class="text-right"><p>40.6× (~41×)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Sweeping the best recipe at every width on GB200 NVL72 shows the DiT denoise loop scaling almost linearly across the full rack:</p>
+<p align="center">
+  <img src="../media/tech_blog25_scaling_lines.png" alt="WAN 2.2 T2V-A14B DiT denoise-loop latency vs ideal linear scaling on GB200 NVL72, from 1 to 72 GPUs, with per-point parallel efficiency" width="1080">
+</p>
+<p align="center"><sub><em>Figure 7. DiT denoise-loop scaling on GB200 NVL72 (best config at each width, GB200 1-GPU baseline). The loop tracks ideal linear scaling closely - ~49× at 72 GPUs - because CFG and sequence parallelism shard the transformer almost perfectly.</em></sub></p>
+<p>Crucially, that ~67% efficiency at full-rack scale is only reachable with <strong>Attention2D</strong>. Once Ulysses hits WAN’s head-divisibility wall (<code class="docutils literal notranslate"><span class="pre">ulysses_size</span> <span class="pre">≤</span> <span class="pre">8</span></code> for 40 heads), the residual GPUs have to go into a context-parallel axis - and Attention2D is the only one that holds up at NVL72 scale. At 72 GPUs, <code class="docutils literal notranslate"><span class="pre">cfg2·ul4·attn2d</span> <span class="pre">3×3</span></code> lands at <strong>~67% efficiency</strong>, while the equivalent <code class="docutils literal notranslate"><span class="pre">cfg2·ul4·ring9</span></code> collapses to <strong>~37% efficiency</strong> - <strong>83% slower at the same GPU count</strong>. Attention2D’s fixed $O(N/\sqrt{P})$ row/column collectives keep scaling all the way across the rack (see <a class="reference internal" href="#2-attention2d-parallelism"><span class="xref myst">Figure 5</span></a>).</p>
+<p>The full recipe behind these numbers is shown below:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">FA4</span>
+<span class="nt">parallel_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">cfg_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">            </span><span class="c1"># CFG: conditional / unconditional streams on disjoint halves</span>
+<span class="w">  </span><span class="nt">ulysses_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">        </span><span class="c1"># Ulysses sharding</span>
+<span class="w">  </span><span class="nt">attn2d_size</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">3</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">3</span><span class="p p-Indicator">]</span><span class="w">    </span><span class="c1"># Attention2D context parallelism (row × col)</span>
+<span class="w">  </span><span class="nt">parallel_vae_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span><span class="w">   </span><span class="c1"># spatial VAE sharding (saturates at ~8)</span>
+<span class="nt">compilation_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">resolutions</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">720</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1280</span><span class="p p-Indicator">]</span><span class="w">        </span><span class="c1"># warmup at the benchmarked shape (request size 1280x720)</span>
+<span class="w">  </span><span class="nt">num_frames</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">80</span><span class="w">                 </span><span class="c1"># 5-second clip at 16 fps</span>
+</pre></div>
+</div>
+<section id="cosmos3-super">
+<h3>Cosmos3-Super<a class="headerlink" href="#cosmos3-super" title="Link to this heading">#</a></h3>
+<p>The same runtime scales a very different model unchanged. Cosmos3-Super is a 64B Mixture-of-Transformers with 64 attention heads, generating a longer 189-frame clip — so each denoising step is an even larger dense prefill than Wan. Only the workload and the per-width recipe change; the CFG, Ulysses, Attention2D, and parallel-VAE knobs are identical (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/cosmos3_t2v_bf16_gb200_nvl72.yml</span></code></a>)</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Item</p></th>
+<th class="head text-left"><p>Value</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Model</p></td>
+<td class="text-left"><p><a class="reference external" href="https://huggingface.co/nvidia/Cosmos3-Super"><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super</span></code></a></p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Hardware</p></td>
+<td class="text-left"><p>GB200 NVL72</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Request shape</p></td>
+<td class="text-left"><p>189-frame 1280×720 video at 24 fps</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Denoising steps</p></td>
+<td class="text-left"><p>35</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Precision</p></td>
+<td class="text-left"><p>BF16</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Attention backend</p></td>
+<td class="text-left"><p>FA4</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>Guidance scale</p></td>
+<td class="text-left"><p>6.0</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>Benchmark load</p></td>
+<td class="text-left"><p>3 prompts, single-stream</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The headline result is summarized on the right of <a class="reference internal" href="#scaling-video-generation-across-nvl72-rack-with-tensorrt-llm"><span class="xref myst">Figure 1</span></a> at the top of the post; the underlying numbers are:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Metric</p></th>
+<th class="head text-right"><p>1× B200 baseline</p></th>
+<th class="head text-right"><p>72-GPU GB200 NVL72</p></th>
+<th class="head text-right"><p>Speedup</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>Denoise loop</p></td>
+<td class="text-right"><p>373.1s</p></td>
+<td class="text-right"><p>6.79s</p></td>
+<td class="text-right"><p>54.9× (~55×)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>End-to-end request</p></td>
+<td class="text-right"><p>383.1s</p></td>
+<td class="text-right"><p>11.78s</p></td>
+<td class="text-right"><p>32.5× (~33×)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Sweeping the best recipe at every width gives the same near-linear denoise-loop scaling as Wan:</p>
+<p align="center">
+  <img src="../media/tech_blog25_cosmos3_scaling_lines.png" alt="Cosmos3-Super DiT denoise-loop latency vs ideal linear scaling on GB200 NVL72, with per-point parallel efficiency" width="1080">
+</p>
+<p align="center"><sub><em>Figure 8. Cosmos3-Super DiT denoise-loop scaling on GB200 NVL72 (best config at each width, GB200 1-GPU baseline). The loop tracks ideal linear scaling closely - ~49× at 72 GPUs - because CFG and sequence parallelism shard the transformer almost perfectly.</em></sub></p>
+<p>As with Wan, the denoise loop scales almost linearly under the <em>same</em> recipe, which proves that the sequence-length sharding pattern for the DiT generalizes across models — even at a very different model size and sequence length. End-to-end efficiency falls off faster because it folds in everything outside the DiT, including the longer clip’s larger mp4 encode and transport/persist; those fixed per-request costs become the dominant share once the denoise loop collapses to ~7s (Amdahl’s law).</p>
+</section>
+</section>
+<section id="serving-with-trtllm-serve">
+<h2>Serving with trtllm-serve<a class="headerlink" href="#serving-with-trtllm-serve" title="Link to this heading">#</a></h2>
+<p>The same <code class="docutils literal notranslate"><span class="pre">--visual_gen_args</span></code> YAML drives <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> for online serving. Distributed multi-node serving is handled by the <code class="docutils literal notranslate"><span class="pre">benchmark_visual_gen_mgmn_distributed.sh</span></code> script under <code class="docutils literal notranslate"><span class="pre">examples/visual_gen/serve/</span></code>:</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">CONTAINER_IMAGE</span><span class="o">=</span>/path/to/tensorrt-llm.sqsh
+<span class="nb">export</span><span class="w"> </span><span class="nv">PROJECT_ROOT</span><span class="o">=</span>/path/to/TensorRT-LLM
+<span class="nb">export</span><span class="w"> </span><span class="nv">MODEL</span><span class="o">=</span>Wan-AI/Wan2.2-T2V-A14B-Diffusers
+<span class="nb">export</span><span class="w"> </span><span class="nv">SERVER_CONFIG</span><span class="o">=</span>examples/visual_gen/configs/wan22_t2v_bf16_gb200_nvl72.yml
+
+<span class="c1"># Fill in &lt;ACCOUNT_NAME&gt; and &lt;PARTITION&gt; with your SLURM account and partition</span>
+sbatch<span class="w"> </span>-A<span class="w"> </span>&lt;ACCOUNT_NAME&gt;<span class="w"> </span>-p<span class="w"> </span>&lt;PARTITION&gt;<span class="w"> </span>-N<span class="w"> </span><span class="m">18</span><span class="w"> </span>--ntasks-per-node<span class="o">=</span><span class="m">4</span><span class="w"> </span>--ntasks<span class="o">=</span><span class="m">72</span><span class="w"> </span>examples/visual_gen/serve/benchmark_visual_gen_mgmn_distributed.sh
+</pre></div>
+</div>
+<p>The script spawns <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> across all allocated ranks in the background, polls <code class="docutils literal notranslate"><span class="pre">http://${MASTER_ADDR}:8000/health</span></code> until 200, and then runs <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.serve.scripts.benchmark_visual_gen</span></code> from rank-0 only.</p>
+</section>
+<section id="quality-evaluation">
+<h2>Quality Evaluation<a class="headerlink" href="#quality-evaluation" title="Link to this heading">#</a></h2>
+<p>We validate the implementation in two ways - <strong>correctness</strong> checks that every parallel configuration reproduces a single-GPU reference forward of the transformer, and <strong>quality</strong> compares full decoded video against a single-GPU reference across many prompts.</p>
+<section id="distributed-correctness">
+<h3>Distributed correctness<a class="headerlink" href="#distributed-correctness" title="Link to this heading">#</a></h3>
+<p>A single-node (4- and 8-GPU) parity harness (<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/visual_gen/multi_gpu/test_wan_transformer_parallel.py"><code class="docutils literal notranslate"><span class="pre">test_wan_transformer_parallel.py</span></code></a>) runs a BF16 <code class="docutils literal notranslate"><span class="pre">WanTransformer3DModel</span></code> forward (reduced layers, FA4) under each parallel configuration and compares it against an unsharded single-GPU reference on identical weights and seeded inputs.</p>
+<p>Every configuration — Ulysses, CFG+Ulysses, Ring×Ulysses, and Attention2D <code class="docutils literal notranslate"><span class="pre">row×col</span></code>×Ulysses — matches the single-GPU reference within <code class="docutils literal notranslate"><span class="pre">atol</span> <span class="pre">=</span> <span class="pre">1e-2,</span> <span class="pre">rtol</span> <span class="pre">=</span> <span class="pre">1e-3</span></code>. Because the harness uses randomly-initialized (stabilized) weights and a single forward on a reduced model, it isolates the <strong>parallelism itself</strong>: it proves the all-gather / all-to-all / online-softmax-merge collectives are numerically correct, independent of any specific checkpoint.</p>
+</section>
+<section id="end-to-end-video-quality">
+<h3>End-to-end video quality<a class="headerlink" href="#end-to-end-video-quality" title="Link to this heading">#</a></h3>
+<p>We generate small videos using 6 prompts with Wan 2.2 T2V-A14B at 832x480, 9 frames, 8 steps, fixed seed 42 (BF16, FA4), and score each parallel configuration’s decoded video against a single-GPU reference, averaging LPIPS / PSNR / SSIM / cosine over all frames.</p>
+<p>Comparing decoded videos needs a reference point as the FA4 attention kernel and compiled layer (<code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>) use nondeterministic reductions (see below), so two single-GPU runs with the same prompt and seed differ slightly, and the iterative denoiser compounds those differences over its steps. We therefore establish a floor — a second single-GPU run scored against the first — and report each parallel configuration relative to it. All four metrics are computed per frame on the decoded MP4 and averaged, so they also include H.264 quantization.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Configuration</p></th>
+<th class="head text-right"><p>GPUs</p></th>
+<th class="head text-right"><p>LPIPS↓</p></th>
+<th class="head text-right"><p>ΔLPIPS vs floor</p></th>
+<th class="head text-right"><p>PSNR↑</p></th>
+<th class="head text-right"><p>SSIM↑</p></th>
+<th class="head text-right"><p>Cosine↑</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p><em>floor</em> (2nd single-GPU run)</p></td>
+<td class="text-right"><p>1</p></td>
+<td class="text-right"><p>0.121</p></td>
+<td class="text-right"><p>—</p></td>
+<td class="text-right"><p>25.18</p></td>
+<td class="text-right"><p>0.878</p></td>
+<td class="text-right"><p>0.981</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">ulysses2</span></code></p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>0.187</p></td>
+<td class="text-right"><p>+0.066</p></td>
+<td class="text-right"><p>24.34</p></td>
+<td class="text-right"><p>0.796</p></td>
+<td class="text-right"><p>0.974</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">cfg2</span></code></p></td>
+<td class="text-right"><p>2</p></td>
+<td class="text-right"><p>0.200</p></td>
+<td class="text-right"><p>+0.079</p></td>
+<td class="text-right"><p>23.83</p></td>
+<td class="text-right"><p>0.777</p></td>
+<td class="text-right"><p>0.970</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">cfg2·ulysses2</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>0.196</p></td>
+<td class="text-right"><p>+0.075</p></td>
+<td class="text-right"><p>23.72</p></td>
+<td class="text-right"><p>0.783</p></td>
+<td class="text-right"><p>0.970</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">ulysses4</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>0.198</p></td>
+<td class="text-right"><p>+0.077</p></td>
+<td class="text-right"><p>23.87</p></td>
+<td class="text-right"><p>0.777</p></td>
+<td class="text-right"><p>0.969</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">attn2d</span> <span class="pre">2×1·ulysses2</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>0.198</p></td>
+<td class="text-right"><p>+0.077</p></td>
+<td class="text-right"><p>24.00</p></td>
+<td class="text-right"><p>0.777</p></td>
+<td class="text-right"><p>0.970</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">attn2d</span> <span class="pre">1×2·ulysses2</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>0.209</p></td>
+<td class="text-right"><p>+0.088</p></td>
+<td class="text-right"><p>23.45</p></td>
+<td class="text-right"><p>0.768</p></td>
+<td class="text-right"><p>0.968</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p><code class="docutils literal notranslate"><span class="pre">attn2d</span> <span class="pre">2×2</span></code></p></td>
+<td class="text-right"><p>4</p></td>
+<td class="text-right"><p>0.220</p></td>
+<td class="text-right"><p>+0.099</p></td>
+<td class="text-right"><p>23.36</p></td>
+<td class="text-right"><p>0.759</p></td>
+<td class="text-right"><p>0.967</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>To drill into that nondeterminism — and to confirm each parallel configuration is measured against the right baseline — we first isolate it on a single GPU. Wan runs in BF16 with two performance knobs, FA4 attention and <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>, both of which use nondeterministic reductions, so the same prompt and seed need not produce identical pixels and the iterative denoiser compounds those tiny differences across its steps. To size that effect, we hold the model and seed fixed and change one implementation detail at a time:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head text-left"><p>Single-GPU perturbation, same seed</p></th>
+<th class="head text-right"><p>LPIPS↓</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td class="text-left"><p>PyTorch SDPA, <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> off — rerun</p></td>
+<td class="text-right"><p>0.00 (bit-exact)</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>FA4 vs PyTorch SDPA attention backend</p></td>
+<td class="text-right"><p>0.21</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>PyTorch SDPA, <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> on vs off</p></td>
+<td class="text-right"><p>0.24</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A deterministic backend (PyTorch SDPA attention, <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> off) reproduces byte-for-byte, confirming the harness is exact. Turning on the fast kernels breaks that: an FA4 rerun alone already moves the output 0.121 LPIPS — the <em>floor</em> row in the results table above — and swapping the attention backend (0.21) or toggling <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code> (0.24) moves it further. Routine single-GPU choices alone therefore span 0–0.24 LPIPS, all from pixel-level kernel ordering rather than any algorithmic change (LPIPS is a learned perceptual distance where 0 is bit-wise identical). Setting <code class="docutils literal notranslate"><span class="pre">torch.use_deterministic_algorithms(True)</span></code> forces deterministic kernel implementations and collapses this noise floor back to 0 LPIPS (bit-exact reruns), but impacts performance. We leave it off for the performance numbers above and instead measure parallel configurations against the realistic faster kernel floor.</p>
+<p>Against that band, parallelism is essentially free. Every parallel configuration lands at 0.187–0.220 LPIPS (cosine ≥ 0.967, PSNR ≥ 23 dB) — only 0.07–0.10 above the floor, well inside the spread that single-GPU kernel choices already produce. The offset is independent of parallel degree: 2-GPU Ulysses (0.187) is as close to the reference as the 4-GPU recipes (~0.196–0.198). Attention2D paths run marginally higher (up to 0.220) because their cross-rank online-softmax merge and gather collectives reorder non-associative BF16 additions — the same effect the correctness test isolates, bounded across steps rather than compounding. A parallel run is thus about as far from the single-GPU reference as two single-GPU runs are from each other.</p>
+</section>
+</section>
+<section id="conclusion">
+<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
+<p>Serving Diffusion Transformers for video generation is a different scaling problem from LLM serving: a single latency-bound request, no KV cache, and full bi-directional attention over a 70–150k-token sequence that dominates all of the tens of denoising steps. The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/visual_gen/visual_gen.py#L176"><code class="docutils literal notranslate"><span class="pre">VisualGen</span></code></a> runtime in TensorRT-LLM attacks that cost by unifying four parallelism axes — CFG, Ulysses, Attention2D context parallelism, and parallel VAE — under a single PyTorch <code class="docutils literal notranslate"><span class="pre">DeviceMesh</span></code>, exposed as declarative knobs on <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>. All four axes work together to compress the latency: CFG splits the two guidance streams, halving per-rank compute across the CFG group (2 GPUs, ~2×). Ulysses then shards the sequence until it hits each model’s head-count wall (<code class="docutils literal notranslate"><span class="pre">ulysses</span> <span class="pre">≤</span> <span class="pre">8</span></code> for Wan and Cosmos3), taking the first 16 GPUs to ~14×. Context parallelism carries the DiT the rest of the way to the full rack: we use Attention2D rather than Ring Attention because its 2D row/column groups and $O(N/\sqrt{P})$ collectives hold near-linear scaling at 72 GPUs — where Ring Attention’s $O(N)$ cost caps out around 64 — reaching ~49× on the denoise loop. Finally, parallel VAE scales out the decode, which becomes the bottleneck at NVL72 scale once the DiT is this small.</p>
+<p>The result is near-ideal scaling of the DiT denoising steps. On Wan 2.2 T2V-A14B, the <code class="docutils literal notranslate"><span class="pre">CFG=2</span> <span class="pre">×</span> <span class="pre">Ulysses=4</span> <span class="pre">×</span> <span class="pre">Attention2D</span> <span class="pre">3×3</span></code> recipe shrinks the DiT denoise loop ~53× from a single B200 to a full GB200 NVL72 rack (~41× end-to-end), and the <em>same</em> recipe applies unchanged to the 64B Cosmos3-Super (~55× denoise, ~33× end-to-end), confirming that the sequence-length sharding pattern generalizes across very different model sizes and sequence lengths. Concretely, a video clip that once took over five minutes to generate now finishes in ~9 seconds on the full GB200 NVL72 rack — and we expect the same approach to carry over to the next generation of longer, higher-resolution video models.</p>
+</section>
+<section id="picking-the-performant-configuration">
+<h2>Picking the Performant Configuration<a class="headerlink" href="#picking-the-performant-configuration" title="Link to this heading">#</a></h2>
+<p>We allocate GPUs in order of how cleanly each axis scales. <strong>CFG</strong> comes first: it splits the two guidance streams, halving per-rank compute for a roughly 2× gain. <strong>Ulysses</strong> follows, sharding the sequence until it saturates the model’s head count. The remaining GPUs go to <strong>Attention2D</strong>, kept as a symmetric grid so neither axis becomes the bottleneck. Finding the right balance between Ulysses and Attention2D is a matter of tuning: going from 64 to 72 GPUs, for instance, Ulysses drops from 8 to 4 and Attention2D widens to keep the grid square. Finally, VAE decode is tuned separately and scaled out only once it surfaces as the end-to-end bottleneck — a degree of 4 or 8 usually gives the best scaling.</p>
+</section>
+<section id="limitations-and-future-work">
+<h2>Limitations and Future Work<a class="headerlink" href="#limitations-and-future-work" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>In the current implementation, the sequence length must be divisible by the sequence-parallel size. This will be extended in the future to support arbitrary input dimensions, e.g. via padding or another scheme.</p></li>
+</ul>
+<p>Future directions:</p>
+<ol class="arabic simple">
+<li><p><strong>Fuse the Attention2D dispatch/combine into FA4.</strong> Today the row/column gathers and the <code class="docutils literal notranslate"><span class="pre">flash_attn_combine</span></code> reduction run as separate steps around the attention kernel, costing an extra all-gather plus a memory copy on the critical path of every attention block. Folding the dispatch and combine directly into the FA4 kernel would remove that round-trip and shrink the per-layer context-parallel overhead.</p></li>
+<li><p><strong>Overlap Attention2D communication with compute.</strong> The Attention2D row/column gathers and the <code class="docutils literal notranslate"><span class="pre">flash_attn_combine</span></code> reduction currently run as exposed, blocking collectives around the attention kernel. Overlap is possible by pipelining them against compute and is left for future work.</p></li>
+<li><p><strong>Fold the Attention2D combine into a reduce-scatter.</strong> To merge the partial attention outputs across a subgroup, Attention2D today does an <code class="docutils literal notranslate"><span class="pre">all-to-all</span></code> followed by a local LSE merge. It could instead be expressed as a single <code class="docutils literal notranslate"><span class="pre">reduce-scatter</span></code> with the LSE merge as a custom reduce op.</p></li>
+<li><p><strong>Disaggregate the VAE from the DiT.</strong> The VAE decode is currently overlaid on the denoiser ranks, locking both stages to one resource pool. Splitting them into independently scaled pools — the denoiser streaming latents to a dedicated VAE service frame-by-frame — would let each be provisioned for its own throughput target, a key enabler for low-latency interactive models.</p></li>
+<li><p><strong>Tune for heterogeneous NVLink + InfiniBand clusters.</strong> Every recipe and scaling number here was measured on a single GB200 NVL72 NVLink domain. On an NVL8 + cross-node IB topology the trade-offs shift: async Ulysses only accelerates the NVLink peers reachable over CUDA IPC, and the best mesh ordering and config — the Ulysses/CP split for a given GPUs-per-node and which CP backend wins across IB — is an open question. A dedicated tuning study on that topology is left for future work.</p></li>
+<li><p><strong>Extend to autoregressive video models.</strong> The recipes here target multi-step diffusion. Autoregressive video models instead use causal, KV-cache-bearing attention with a fundamentally different cost profile, so adapting the parallelism strategy to that regime is left for future work.</p></li>
+<li><p><strong>Explore step-distilled models.</strong> The methods in this post apply directly to step-distilled models: each step is the same dense prefill, so the per-step DiT sharding and its optimal mesh are unchanged. The end-to-end balance shifts, however, due to a handful of DiT steps, the fixed tail (VAE decode, text encoding) starts to dominate the request, so parallel VAE and VAE disaggregation matter much more. Re-tuning the DiT-vs-VAE GPU split for that regime is left for future work.</p></li>
+<li><p><strong>Compose TP with Attention2D.</strong> Tensor parallelism composes with the sequence and CFG axes today, but combining it with Attention2D is not yet implemented. Supporting it would let large-head-count models split weights and sequence simultaneously on the same mesh.</p></li>
+</ol>
+</section>
+<section id="references">
+<h2>References<a class="headerlink" href="#references" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p>VisualGen runtime: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/_torch/visual_gen"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm/_torch/visual_gen/</span></code></a></p>
+<ul>
+<li><p>Mesh: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/mapping.py"><code class="docutils literal notranslate"><span class="pre">mapping.py</span></code></a></p></li>
+<li><p>Parallelism wrappers: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py"><code class="docutils literal notranslate"><span class="pre">attention_backend/parallel.py</span></code></a></p></li>
+<li><p>Pipeline base: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/pipeline.py"><code class="docutils literal notranslate"><span class="pre">pipeline.py</span></code></a></p></li>
+<li><p>Config models: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/config.py"><code class="docutils literal notranslate"><span class="pre">config.py</span></code></a></p></li>
+<li><p>Parallel VAE: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/modules/vae/parallel_vae_interface.py"><code class="docutils literal notranslate"><span class="pre">modules/vae/parallel_vae_interface.py</span></code></a></p></li>
+</ul>
+</li>
+<li><p>Examples:</p>
+<ul>
+<li><p>Offline scripts: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/</span></code></a></p></li>
+<li><p>Shared YAML configs: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/configs"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/configs/</span></code></a></p></li>
+<li><p>Serving + benchmark: <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/serve/</span></code></a></p></li>
+</ul>
+</li>
+<li><p>Papers:</p>
+<ul>
+<li><p>DeepSpeed Ulysses: <a class="reference external" href="https://arxiv.org/abs/2309.14509">arXiv:2309.14509</a></p></li>
+<li><p>Attention2D: <a class="reference external" href="https://arxiv.org/abs/2503.15758">arXiv:2503.15758</a></p></li>
+<li><p>Ring Attention: <a class="reference external" href="https://arxiv.org/abs/2310.01889">arXiv:2310.01889</a></p></li>
+</ul>
+</li>
+</ul>
+</section>
+<section id="acknowledgement">
+<h2>Acknowledgement<a class="headerlink" href="#acknowledgement" title="Link to this heading">#</a></h2>
+<p>Scaling video generation across the GB200 NVL72 rack in TensorRT-LLM is the result of close collaboration spanning multiple people and teams. We are grateful to the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in terms of video generation performance in TensorRT LLM. We hope that the techniques and the experience shared in this blog will help the developer community better leverage NVIDIA GPU capabilities in their critical video generation applications.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="blog24_MoE_as_Dense_GEMM.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#abstract">Abstract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-scaling-challenge-in-video-generation">The Scaling Challenge in Video Generation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cfg-parallelism">CFG Parallelism</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ulysses-parallelism">Ulysses Parallelism</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#toward-async-ulysses-overlapping-communication-and-computation">Toward Async Ulysses: Overlapping Communication and Computation</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#context-parallelism">Context Parallelism</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ring-attention">1. Ring Attention</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention2d-parallelism">2. Attention2D Parallelism</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scaling-the-vae-decoder">Scaling the VAE Decoder</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-parallelism-mesh">The Parallelism Mesh</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#nvl72-scaling-results">NVL72 Scaling Results</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-super">Cosmos3-Super</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-with-trtllm-serve">Serving with trtllm-serve</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quality-evaluation">Quality Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#distributed-correctness">Distributed correctness</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#end-to-end-video-quality">End-to-end video quality</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#conclusion">Conclusion</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#picking-the-performant-configuration">Picking the Performant Configuration</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#limitations-and-future-work">Limitations and Future Work</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#references">References</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgement">Acknowledgement</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on July 20, 2026.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/8ba9340">8ba9340</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
