@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaMemPool.h"
 
@@ -121,7 +122,7 @@ TEST_F(BufferManagerTest, Pointers)
     static_assert(std::is_same_v<decltype(trtPointerType), BufferDataType const>);
     static_assert(trtPointerType.isPointer());
     static_assert(trtPointerType.getDataType() == TRTDataType<cppBaseType>::value);
-    static_assert(static_cast<nvinfer1::DataType>(trtPointerType) == BufferDataType::kTrtPointerType);
+    static_assert(static_cast<tensorrt_llm::DataType>(trtPointerType) == BufferDataType::kTrtPointerType);
     static_assert(trtPointerType == BufferDataType::kTrtPointerType); // uses implicit type conversion
     // The C++ type corresponding to the TensorRT type for storing pointers (int64_t)
     using cppStorageType = DataTypeTraits<trtPointerType>::type;

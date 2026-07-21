@@ -24,6 +24,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
@@ -491,7 +492,7 @@ void initBindings(nb::module_& m)
             nb::arg("max_num_sequences"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"),
             nb::call_guard<nb::gil_scoped_release>())
         .def(nb::init<tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32, tr::SizeType32,
-                 tr::WorldConfig const&, int64_t, nvinfer1::DataType, nvinfer1::DataType,
+                 tr::WorldConfig const&, int64_t, tensorrt_llm::DataType, tensorrt_llm::DataType,
                  std::vector<tr::SizeType32> const&, tr::SizeType32>(),
             nb::arg("d_state"), nb::arg("d_conv"), nb::arg("num_heads"), nb::arg("n_groups"), nb::arg("head_dim"),
             nb::arg("max_batch_size"), nb::arg("world_config"), nb::arg("stream"), nb::arg("dtype"),

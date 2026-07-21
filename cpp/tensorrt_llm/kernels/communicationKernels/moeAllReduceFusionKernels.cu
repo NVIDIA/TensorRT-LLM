@@ -16,6 +16,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
@@ -442,11 +443,11 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 #define MOE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                \
     return moereduction_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                                       \
-    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF)                                          \
+    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kHALF)                                      \
     {                                                                                                                  \
         MOE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                                \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16)                                     \
+    else if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16)                                 \
     {                                                                                                                  \
         MOE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }
@@ -727,13 +728,13 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
 #define MOE_FINALIZE_DISPATCH1(DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                       \
     return moefinalize_allreduce_fusion_kernel_launcher<DTYPE, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT>(params);
 #define MOE_FINALIZE_DISPATCH0(NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT)                                              \
-    if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kHALF                                           \
-        && params.scale_dtype == nvinfer1::DataType::kHALF)                                                            \
+    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kHALF                                       \
+        && params.scale_dtype == tensorrt_llm::DataType::kHALF)                                                        \
     {                                                                                                                  \
         MOE_FINALIZE_DISPATCH1(half, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                                       \
     }                                                                                                                  \
-    else if (params.nranks == NRANKS && params.dtype == nvinfer1::DataType::kBF16                                      \
-        && params.scale_dtype == nvinfer1::DataType::kBF16)                                                            \
+    else if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16                                  \
+        && params.scale_dtype == tensorrt_llm::DataType::kBF16)                                                        \
     {                                                                                                                  \
         MOE_FINALIZE_DISPATCH1(__nv_bfloat16, NRANKS, RESIDUAL_OUT, NORM_OUT, QUANT_OUT);                              \
     }

@@ -23,6 +23,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/device/splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
 
@@ -117,16 +118,16 @@ void cudaGraphGroupedGemmTemplate(cutlass::gemm::GemmCoord* problemSizesPtr, int
 template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
 void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
-    nvinfer1::DataType dataType, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream)
 {
-    if (dataType == nvinfer1::DataType::kHALF)
+    if (dataType == tensorrt_llm::DataType::kHALF)
     {
         cudaGraphGroupedGemmTemplate<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu,
             hostMaxProblemSizesPtr, stream);
     }
 #ifdef ENABLE_BF16
-    else if (dataType == nvinfer1::DataType::kBF16)
+    else if (dataType == tensorrt_llm::DataType::kBF16)
     {
         cudaGraphGroupedGemmTemplate<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC, kStages>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu,
@@ -141,7 +142,7 @@ void cudaGraphGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int pro
 
 void cudaGraphGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu, void** ptrBGpu,
     void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu, bool isLoraIn,
-    nvinfer1::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, int minKN, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, cudaStream_t stream)
 {
     if (isLoraIn)
     {
@@ -283,17 +284,17 @@ void cudaGraphSplitKGroupedGemmTemplate(cutlass::gemm::GemmCoord* problemSizesPt
 template <int M1, int N1, int K1, int M2, int N2, int K2, int kAlignmentAB, int kAlignmentC, int kStages>
 void cudaGraphSplitKGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
-    nvinfer1::DataType dataType, int splitKSlices, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr,
+    tensorrt_llm::DataType dataType, int splitKSlices, cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr,
     int64_t* splitKOffsetsGpu, cudaStream_t stream)
 {
-    if (dataType == nvinfer1::DataType::kHALF)
+    if (dataType == tensorrt_llm::DataType::kHALF)
     {
         cudaGraphSplitKGroupedGemmTemplate<M1, N1, K1, M2, N2, K2, cutlass::half_t, kAlignmentAB, kAlignmentC, kStages>(
             problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu,
             splitKSlices, hostMaxProblemSizesPtr, splitKOffsetsGpu, stream);
     }
 #ifdef ENABLE_BF16
-    else if (dataType == nvinfer1::DataType::kBF16)
+    else if (dataType == tensorrt_llm::DataType::kBF16)
     {
         cudaGraphSplitKGroupedGemmTemplate<M1, N1, K1, M2, N2, K2, cutlass::bfloat16_t, kAlignmentAB, kAlignmentC,
             kStages>(problemSizesPtr, problemCount, ptrAGpu, ptrBGpu, ptrCGpu, ptrDGpu, ldaGpu, ldbGpu, ldcGpu, lddGpu,
@@ -308,7 +309,7 @@ void cudaGraphSplitKGroupedGemmType(cutlass::gemm::GemmCoord* problemSizesPtr, i
 
 void cudaGraphSplitKGroupedGemm(cutlass::gemm::GemmCoord* problemSizesPtr, int problemCount, void** ptrAGpu,
     void** ptrBGpu, void** ptrCGpu, void** ptrDGpu, int64_t* ldaGpu, int64_t* ldbGpu, int64_t* ldcGpu, int64_t* lddGpu,
-    bool isLoraIn, nvinfer1::DataType dataType, int splitKSlices, int minKN,
+    bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN,
     cutlass::gemm::GemmCoord* hostMaxProblemSizesPtr, int64_t* splitKOffsetsGpu, cudaStream_t stream)
 {
     if (isLoraIn)
