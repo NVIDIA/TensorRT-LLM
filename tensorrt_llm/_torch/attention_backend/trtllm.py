@@ -641,6 +641,48 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:self.num_seqs],
         )
 
+    def prepare_encoder_decoder(self, prompt_lens: torch.Tensor,
+                                kv_lens: torch.Tensor, context_kv_tokens: int,
+                                generation_kv_tokens: int,
+                                max_kv_len: int) -> None:
+        """Prepare simple encoder-decoder attention from native host buffers."""
+        super().prepare()
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        assert self.kv_cache_manager is not None
+        assert self.draft_kv_cache_manager is None
+        assert not self.is_spec_decoding_enabled
+        assert self.kv_cache_params.num_extra_kv_tokens == 0
+        assert not self.enable_flash_mla
+        assert not self.enable_helix
+        assert not self.enable_context_mla_with_cached_kv
+        assert self.request_ids is not None
+        assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+            f"The max KV cache length of input sequences ({max_kv_len}) "
+            "exceeds the KV cache manager's maximum supported length "
+            f"({self.kv_cache_manager.max_seq_len}).")
+
+        num_seqs = self.num_seqs
+        self.prompt_lens_cuda[:num_seqs].copy_(prompt_lens, non_blocking=True)
+        self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
+        self.host_total_kv_lens[0] = context_kv_tokens
+        self.host_total_kv_lens[1] = generation_kv_tokens
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:num_seqs].fill_(1)
+
+        self.kv_cache_manager.copy_batch_block_offsets(
+            self.kv_cache_block_offsets, self.request_ids, self.beam_width,
+            self.num_contexts, num_seqs)
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
+            kv_lens=kv_lens,
+            prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
+            prompt_lens_cpu=prompt_lens,
+            host_request_types=self.host_request_types[:num_seqs],
+        )
+
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
         extra_attrs = get_model_extra_attrs()
