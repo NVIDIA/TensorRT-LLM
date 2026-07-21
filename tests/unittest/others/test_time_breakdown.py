@@ -256,6 +256,45 @@ class TestRequestDataParser(unittest.TestCase):
         self.assertEqual(parsed['disagg_server_arrival_time'], 0.5)
         self.assertEqual(parsed['disagg_server_first_token_time'], 3.0)
 
+    def test_parse_phased_disaggregated_format(self):
+        parser = RequestDataParser()
+        request_data = {
+            'request_id': 'req789',
+            'phases': {
+                'disagg': {
+                    'timing_metrics': {
+                        'server_arrival_time': 0.5,
+                        'server_first_token_time': 3.0,
+                    }
+                },
+                'ctx': {
+                    'timing_metrics': {
+                        'server_arrival_time': 1.0,
+                        'arrival_time': 1.1,
+                    }
+                },
+                'gen': {
+                    'timing_metrics': {
+                        'server_arrival_time': 2.0,
+                        'arrival_time': 2.1,
+                    },
+                    'time_breakdown_metrics': {
+                        'step_metrics': [{
+                            'iter': 1
+                        }]
+                    },
+                },
+            },
+        }
+
+        parsed = parser.parse_request(request_data, 0)
+
+        self.assertEqual(parsed['request_index'], 'req789')
+        self.assertEqual(parsed['ctx_arrival_time'], 1.1)
+        self.assertEqual(parsed['gen_arrival_time'], 2.1)
+        self.assertEqual(parsed['disagg_server_arrival_time'], 0.5)
+        self.assertEqual(parsed['step_metrics'], [{'iter': 1}])
+
     def test_parse_missing_fields(self):
         """Test parsing with missing fields (should default to 0)."""
         parser = RequestDataParser()
@@ -390,6 +429,23 @@ class TestRequestTimeBreakdown(unittest.TestCase):
             self.assertAlmostEqual(timing_data[0]['ctx_preprocessing_time'],
                                    expected_preprocessing,
                                    places=5)
+        finally:
+            os.unlink(temp_file)
+
+    def test_parse_jsonl_file(self):
+        """Test parsing server-produced JSONL records."""
+        with tempfile.NamedTemporaryFile(mode='w',
+                                         suffix='.jsonl',
+                                         delete=False) as f:
+            for record in self.test_data:
+                f.write(json.dumps(record) + '\n')
+            temp_file = f.name
+
+        try:
+            timing_data = self.analyzer.parse_json_file(temp_file)
+            self.assertEqual(len(timing_data), 2)
+            self.assertEqual(timing_data[0]['ctx_server_arrival_time'], 1.0)
+            self.assertEqual(timing_data[1]['ctx_server_arrival_time'], 2.0)
         finally:
             os.unlink(temp_file)
 
