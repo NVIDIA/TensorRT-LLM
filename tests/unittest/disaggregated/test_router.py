@@ -1766,7 +1766,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
     DeepSeek-V3 Metaspace, ``_fallback_to_fast_tokenizer`` for DeepSeek-V3.2
     on transformers >= 5.x). Without this routing, ``trtllm-serve`` would
     tokenize prompts differently from the rest of TRT-LLM when computing
-    block hashes for cache hits.
+    block hashes for cache hits. The request's model is client-controlled, so
+    it must not enable remote tokenizer code unless an operator configured a
+    fixed tokenizer directory.
     """
 
     class _Probe(BlockHashMixin):
@@ -1782,11 +1784,25 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=wrapper) as routed:
         out = probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("dummy/model", trust_remote_code=True)
+    routed.assert_called_once_with("dummy/model", trust_remote_code=False)
     # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
     # not the TransformersTokenizer wrapper.
     assert out is inner
     assert probe._tokenizers["dummy/model"] is inner
+
+    fixed_probe = _Probe()
+    fixed_probe._init_block_hashing(tokenizer_dir="/trusted/tokenizer")
+
+    fixed_inner = mock.MagicMock()
+    fixed_wrapper = mock.MagicMock(tokenizer=fixed_inner)
+    with mock.patch(
+            "tensorrt_llm.tokenizer.TransformersTokenizer.from_pretrained",
+            return_value=fixed_wrapper) as routed:
+        fixed_out = fixed_probe._get_tokenizer("dummy/model")
+
+    routed.assert_called_once_with("/trusted/tokenizer", trust_remote_code=True)
+    assert fixed_out is fixed_inner
+    assert fixed_probe._tokenizers["dummy/model"] is fixed_inner
 
 
 @pytest.mark.asyncio
