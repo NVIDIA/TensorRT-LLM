@@ -266,6 +266,14 @@ class OpenAIDisaggregatedService(OpenAIService):
         if ctx_server_info and "server_info" in ctx_server_info:
             disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
             if disaggregated_params:
+                # Used only by the coordinator to reject stale endpoint
+                # lifetimes; never forward this internal ownership token in an
+                # inference request.
+                disaggregated_params = {
+                    key: value
+                    for key, value in disaggregated_params.items()
+                    if key != "ctx_endpoint_generation"
+                }
                 # ctx_info_endpoint from get_disaggregated_params() is a list;
                 # the Pydantic model expects a single str.
                 ep = disaggregated_params.get("ctx_info_endpoint")
@@ -399,6 +407,51 @@ class OpenAIDisaggregatedService(OpenAIService):
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
                 request, req_id=disagg_request_id
             )
+            cached_disaggregated_params = ctx_server_info.get("server_info", {}).get(
+                "disaggregated_params", {}
+            )
+            cached_endpoint = cached_disaggregated_params.get("ctx_info_endpoint")
+            cached_generation = cached_disaggregated_params.get("ctx_endpoint_generation")
+            if not cached_endpoint or cached_generation:
+                try:
+                    runtime_server_info = await self._ctx_router.get_runtime_server_info(
+                        ctx_server,
+                        require_generation=bool(cached_generation),
+                    )
+                except BaseException:
+                    # Selection has already reserved router/coordinator load,
+                    # but no OpenAIClient owns it yet.  Release it here and
+                    # shield cleanup from request cancellation.
+                    cleanup_task = asyncio.create_task(
+                        self._ctx_router.finish_request(
+                            request,
+                            success=False,
+                            req_id=disagg_request_id,
+                        )
+                    )
+
+                    def report_cleanup_error(completed_task: asyncio.Task) -> None:
+                        if completed_task.cancelled():
+                            return
+                        cleanup_error = completed_task.exception()
+                        if cleanup_error is not None:
+                            logger.error(
+                                "Failed to release context routing "
+                                "reservation after server-info refresh "
+                                f"failure: {cleanup_error}"
+                            )
+
+                    cleanup_task.add_done_callback(report_cleanup_error)
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        # The callback above records cleanup failure without
+                        # replacing the original refresh exception.
+                        pass
+                    raise
+                ctx_server_info = {"server_info": runtime_server_info}
             ctx_req = self._get_ctx_request(request, disagg_request_id)
         gen_req = self._get_gen_request(
             request,
