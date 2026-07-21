@@ -17,8 +17,7 @@ except ImportError:
 
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        merge_attention_forward_args)
+                        PredefinedAttentionMask, merge_attention_forward_args)
 from .sparse.kernel import triton_index_gather
 from .sparse.params import SparseParams
 
@@ -96,7 +95,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         q_scaling: Optional[float] = None,
-        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
         sparse_params: Optional[SparseParams] = None,
         **kwargs,
     ):
