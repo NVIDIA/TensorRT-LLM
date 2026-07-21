@@ -102,7 +102,9 @@ if TYPE_CHECKING:
 
 
 class BasePipeline(nn.Module):
-    """Base class for diffusion pipelines."""
+    """
+    Base class for diffusion pipelines.
+    """
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
