@@ -122,7 +122,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
-| `kv_cache_config.mamba_state_cache_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_attention_window` | `Optional[List[int]]` | `value` |  |  |
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |
@@ -431,7 +431,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
-| `kv_cache_config.mamba_state_cache_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.mamba_state_config.periodic_snapshot_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_attention_window` | `Optional[List[int]]` | `value` |  |  |
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |

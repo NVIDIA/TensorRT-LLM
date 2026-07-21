@@ -59,6 +59,7 @@ from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
+                                  V2MambaHybridCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -94,14 +95,14 @@ def get_kv_cache_manager_cls(
         cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
-    For hybrid mamba models the choice between ``Mixed`` (TRTLLM_USE_PY_MAMBA)
-    and ``Cpp`` (unified pool with block reuse) is made here. Callers that
-    don't care about disagg can omit ``is_disagg`` and get the unified-pool
-    default.
+    For hybrid mamba models the choice between
+    ``V2MambaHybridCacheManager`` and compatibility managers is made here.
+    Callers that don't care about disagg can omit ``is_disagg`` and get the
+    unified-pool default.
 
-    Env-var overrides (agg mode only — disagg picks its inner impl via
-    ``cache_transceiver_config.transceiver_runtime``):
-      * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
+    V1 is the default for hybrid Mamba models. V2 is selected only by an
+    explicit ``kv_cache_config.use_kv_cache_manager_v2=True`` and is rejected
+    for disaggregated serving until its transceiver/page-table adapter exists.
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -122,44 +123,102 @@ def get_kv_cache_manager_cls(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
 
+        state_config = kv_cache_config.mamba_state_config
+        interval = state_config.periodic_snapshot_interval
+        has_periodic_snapshots = interval is not None and interval > 0
+        has_additional_snapshots = bool(
+            state_config.additional_snapshot_offsets_from_start
+            or state_config.additional_snapshot_offsets_from_end)
+        use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
+
+        if is_disagg and use_v2:
+            raise ValueError(
+                "KV cache manager V2 for hybrid Mamba models is not "
+                "supported with disaggregated serving. Set "
+                "use_kv_cache_manager_v2=False or 'auto' to use a V1 "
+                "Mamba cache manager.")
+        if has_additional_snapshots and not use_v2:
+            raise ValueError("Mamba additional snapshot offsets require "
+                             "use_kv_cache_manager_v2=True; V1 supports only "
+                             "periodic_snapshot_interval.")
+        if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
+                and not has_additional_snapshots):
+            raise ValueError(
+                "Hybrid Mamba block reuse requires at least one snapshot "
+                "policy: set "
+                "mamba_state_config.periodic_snapshot_interval > 0 or "
+                "provide additional snapshot offsets.")
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
+        if is_disagg:
+            if kv_cache_config.enable_block_reuse:
+                return CppMambaHybridCacheManager
+            if (cache_transceiver_config is not None and
+                    cache_transceiver_config.transceiver_runtime == "PYTHON"):
+                logger.info("Python transceiver detected; using "
+                            "MixedMambaHybridCacheManager for hybrid model")
+                return MixedMambaHybridCacheManager
+            return CppMambaHybridCacheManager
+
         if use_py_mamba_cache_manager():
+            if use_v2:
+                raise ValueError(
+                    "TRTLLM_USE_PY_MAMBA=1 conflicts with explicit "
+                    "use_kv_cache_manager_v2=True.")
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
                     "TRTLLM_USE_PY_MAMBA=1 forces "
                     "MixedMambaHybridCacheManager, which does not support "
                     "block reuse. Disable block reuse or unset "
-                    "TRTLLM_USE_PY_MAMBA to use CppMambaHybridCacheManager.")
+                    "TRTLLM_USE_PY_MAMBA to use the configured cache manager.")
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
-        if kv_cache_config.enable_block_reuse:
-            return CppMambaHybridCacheManager
-        if (cache_transceiver_config is not None
-                and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-            logger.info("Python transceiver detected; using "
-                        "MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
-        default_cls = CppMambaHybridCacheManager
         env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
         if env_override is not None:
-            if env_override.upper() == 'MIXED':
+            env_override = env_override.upper()
+            if env_override == 'MIXED':
+                if use_v2:
+                    raise ValueError(
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=MIXED conflicts with "
+                        "explicit use_kv_cache_manager_v2=True.")
+                if kv_cache_config.enable_block_reuse:
+                    raise ValueError(
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=MIXED forces "
+                        "MixedMambaHybridCacheManager, which does not support "
+                        "block reuse. Disable block reuse, use the CPP "
+                        "preference, or explicitly enable KV cache manager "
+                        "V2.")
                 logger.warning(
-                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED overrides the default Mamba cache manager to MixedMambaHybridCacheManager. This may lead to increased memory usage due to lack of block reuse, but can be necessary for disaggregated setups or to avoid potential issues with the C++ manager. Set TLLM_MAMBA_MANAGER_PREFERENCE=CPP to use the CppMambaHybridCacheManager instead, which is the default for non-disaggregated setups without block reuse explicitly disabled."
-                )
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED "
+                    "overrides the default Mamba cache manager to "
+                    "MixedMambaHybridCacheManager.")
                 return MixedMambaHybridCacheManager
-            elif env_override.upper() == 'CPP':
+            if env_override == 'CPP':
+                if use_v2:
+                    raise ValueError(
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=CPP conflicts with "
+                        "explicit use_kv_cache_manager_v2=True.")
                 logger.warning(
-                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP overrides the default Mamba cache manager to CppMambaHybridCacheManager. This enables block reuse and can reduce memory usage, but may not be compatible with disaggregated setups. Set TLLM_MAMBA_MANAGER_PREFERENCE=MIXED to use the MixedMambaHybridCacheManager instead if you encounter issues with the C++ manager or are running in a disaggregated environment."
-                )
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP "
+                    "overrides the default Mamba cache manager to "
+                    "CppMambaHybridCacheManager.")
                 return CppMambaHybridCacheManager
-            else:
-                logger.warning(
-                    f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
-                    f"Expected 'CPP' or 'MIXED'. Using default {default_cls.__name__}."
-                )
-        return default_cls
+            logger.warning(
+                f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
+                "Expected 'CPP' or 'MIXED'. Using the configured "
+                "KV cache manager default.")
+
+        if not use_v2:
+            return CppMambaHybridCacheManager
+
+        if (kv_cache_config.enable_block_reuse
+                and kv_cache_config.enable_kv_pool_rebalance):
+            raise ValueError(
+                "V2 Mamba block reuse is not compatible with "
+                "enable_kv_pool_rebalance because the rebalancer does not "
+                "yet model retained recurrent-state snapshots.")
+        return V2MambaHybridCacheManager
     elif sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     else:
@@ -358,22 +417,16 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
-        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
-        # state in a separate cache that doesn't honor block reuse. Warn at
-        # the routing site so users see the warning where the decision is
-        # actually made.
+        # Compatibility managers do not support MTP block reuse. Warn at the
+        # routing site so users see the concrete manager selected for the
+        # incompatible combination.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
-                and kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
-                or self._speculative_config is not None
-            if uses_v1_mamba_route:
+                and kv_cache_config.enable_block_reuse \
+                and self._speculative_config is not None:
+            if not issubclass(cls, V2MambaHybridCacheManager):
                 logger.warning(
                     "Block reuse does not work with MTP for hybrid linear models "
-                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
-                )
+                    f"when using non-V2 Mamba cache manager {cls.__name__}")
         return cls
 
     def _fallback_if_unsupported_kv_cache_manager_v2(
@@ -390,7 +443,7 @@ class KvCacheCreator:
             if self._kv_connector_manager is not None:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
-                incompat.append("beam_width > 1")
+                incompat.append("max_beam_width > 1")
             if incompat:
                 incompat_str = ", ".join(incompat)
                 # Some models are structurally bound to V2 and cannot fall
@@ -415,6 +468,12 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                if is_hybrid_linear(config):
+                    raise NotImplementedError(
+                        "Hybrid Mamba cache managers do not support "
+                        f"{incompat_str}; CppMambaHybridCacheManager does not "
+                        "provide a compatible fallback. Use max_beam_width=1 "
+                        "and disable the KV connector.")
                 # Plain V2 (explicitly enabled or selected by a model default):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
@@ -446,6 +505,23 @@ class KvCacheCreator:
                 spec_config=self._speculative_config,
                 **extra_kwargs))
 
+    def _get_separate_target_layer_mask(self) -> Optional[List[bool]]:
+        """Return the target-only mask used by a separate draft cache."""
+        if not self._should_create_separate_draft_kv_cache():
+            return None
+        num_target_layers = (self._model_engine.model.model_config.
+                             pretrained_config.num_hidden_layers)
+        return [True] * num_target_layers
+
+    def _get_one_model_draft_layer_mask(self) -> List[bool]:
+        """Return the same draft-only mask used by runtime construction."""
+        num_draft_layers = self._get_num_draft_layers()
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
+            return [True] * num_draft_layers
+        target_num_layers = (self._model_engine.model.model_config.
+                             pretrained_config.num_hidden_layers)
+        return [False] * target_num_layers + [True] * num_draft_layers
+
     def _get_kv_size_per_token(self,
                                kv_cache_config: Optional[KvCacheConfig] = None
                                ) -> CacheCost:
@@ -457,8 +533,13 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
         model_config = self._model_engine.model.model_config
+        target_layer_mask = self._get_separate_target_layer_mask()
+        target_kwargs = ({
+            "layer_mask": target_layer_mask
+        } if target_layer_mask is not None else {})
         total = self._per_manager_cache_cost(self._kv_cache_manager_cls,
-                                             model_config, kv_cache_config)
+                                             model_config, kv_cache_config,
+                                             **target_kwargs)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
         if self._draft_model_engine is not None:
@@ -493,7 +574,8 @@ class KvCacheCreator:
                     self._kv_cache_manager_cls,
                     effective_draft_config,
                     kv_cache_config,
-                    num_layers=self._get_num_draft_layers())
+                    num_layers=self._get_num_draft_layers(),
+                    layer_mask=self._get_one_model_draft_layer_mask())
         return total
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -1091,20 +1173,8 @@ class KvCacheCreator:
         Create a KV cache manager for draft model layers in one-model mode
         when target and draft have different KV cache layouts.
         """
-        # Get target model's num_hidden_layers to compute correct layer indices.
-        # Draft model layers in one-model mode start at target_num_layers.
-        target_pretrained_config = self._model_engine.model.model_config.pretrained_config
-        target_num_layers = target_pretrained_config.num_hidden_layers
-
-        # PARD, External Drafter: draft is a separate model, layers start from 0.
-        # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
         num_draft_layers = self._get_num_draft_layers()
-        if self._speculative_config.spec_dec_mode.is_external_drafter():
-            spec_dec_layer_mask = [True] * num_draft_layers
-        else:
-            spec_dec_layer_mask = [False] * target_num_layers + [
-                True
-            ] * num_draft_layers
+        spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
 
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP).
@@ -1191,9 +1261,13 @@ class KvCacheCreator:
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
         total_kv = self._get_kv_size_per_token(target_kv_cache_config)
+        target_layer_mask = self._get_separate_target_layer_mask()
+        target_kwargs = ({
+            "layer_mask": target_layer_mask
+        } if target_layer_mask is not None else {})
         target_kv = self._per_manager_cache_cost(
             self._kv_cache_manager_cls, self._model_engine.model.model_config,
-            target_kv_cache_config)
+            target_kv_cache_config, **target_kwargs)
         # The draft contribution is whatever the aggregate has on top of the
         # target. Both pieces are CacheCost; subtraction is component-wise.
         draft_kv = CacheCost(slope=total_kv.slope - target_kv.slope,
@@ -1941,6 +2015,9 @@ def _create_kv_cache_manager(
         mamba_ssm_stochastic_rounding = (stochastic_rounding
                                          and mamba_params.mamba_ssm_cache_dtype
                                          == torch.float16)
+        mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
+        if not issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+            mamba_manager_extra_kwargs["model_type"] = "nemotron_hybrid"
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1968,10 +2045,9 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_type="nemotron_hybrid",
             use_replay_state_update=use_replay,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
-            **manager_extra_kwargs,
+            **mamba_manager_extra_kwargs,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:
@@ -1988,7 +2064,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             quant_config=quant_config,
         )
-
         # Replay state update for GDN MTP: mirrors the nemotron_hybrid gating
         # above, minus the Mamba2-specific stochastic-rounding/Philox gate.
         # The GDN replay kernel does a plain cast on checkpoint commit, so
@@ -2026,9 +2101,22 @@ def _create_kv_cache_manager(
             logger.info("GDN replay kernel is disabled; set "
                         "TRTLLM_USE_GDN_REPLAY=1 to enable it")
             use_replay = False
+
+        # Upstream GDN replay commits all local layer checkpoints through the
+        # contiguous C++ manager state view. V2 exposes per-layer state views,
+        # so enabling the same path there would fail for partitioned batches.
+        if (use_replay and issubclass(kv_cache_manager_cls,
+                                      V2MambaHybridCacheManager)):
+            logger.info(
+                "GDN replay is not supported by V2MambaHybridCacheManager; "
+                "using the legacy MTP path")
+            use_replay = False
         logger.info("GDN replay state update: " +
                     ("ENABLED" if use_replay else "DISABLED"))
 
+        mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
+        if not issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+            mamba_manager_extra_kwargs["model_type"] = "qwen3_next"
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -2056,9 +2144,8 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            model_type="qwen3_next",
             use_replay_state_update=use_replay,
-            **manager_extra_kwargs,
+            **mamba_manager_extra_kwargs,
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager

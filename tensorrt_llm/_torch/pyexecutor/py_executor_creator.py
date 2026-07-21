@@ -770,8 +770,9 @@ def create_py_executor(
         ctx_chunk_config = None
 
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK,
-                            kv_cache_config.mamba_state_cache_interval)
+        # Snapshot boundaries come from expect_snapshot_points.  The unit is
+        # only used to align chunks shortened by the scheduling budget.
+        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if guided_decoding_config is not None:

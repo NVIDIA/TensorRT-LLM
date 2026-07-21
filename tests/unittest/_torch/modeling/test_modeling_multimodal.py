@@ -640,7 +640,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             head_dim = text_config.hidden_size // text_config.num_attention_heads
 
         # CppMambaHybridCacheManager reads Pydantic-only fields
-        # (mamba_state_cache_interval, enable_block_reuse) so we have to
+        # (mamba_state_config, enable_block_reuse) so we have to
         # construct the llmapi.llm_args.KvCacheConfig here, not the C++
         # bindings KvCacheConfig that the standard KVCacheManager path uses.
         kv_cache_config = PyKvCacheConfig(max_tokens=num_blocks * tokens_per_block)

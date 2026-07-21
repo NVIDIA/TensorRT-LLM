@@ -408,3 +408,21 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_old_prompt)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+def test_iteration_stats_reports_physical_pool_groups_without_window_metadata() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_stats = True
+    manager.impl = SimpleNamespace(
+        cache_tier_list=[object()],
+        get_and_reset_iteration_stats=lambda: {},
+    )
+    manager._stats_life_cycle_metadata = lambda: {}
+    manager._storage_pool_groups_by_window = lambda: {}
+    manager._get_and_reset_iteration_peak_block_stats = lambda _level: [None, None]
+    manager._get_storage_statistics = lambda _level: [object(), object()]
+    manager._build_pool_group_iteration_stats = lambda pool_group_id, *_args: pool_group_id
+
+    stats = manager.get_iteration_stats()
+
+    assert stats.by_pool_group == {0: 0, 1: 1}

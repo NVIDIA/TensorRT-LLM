@@ -74,6 +74,40 @@ scheduler_config:
   enable_prefix_aware_scheduling: false
 ```
 
+### Mamba Snapshot Boundaries
+
+Hybrid Mamba models must retain the recurrent Mamba state together with the
+attention KV prefix. Snapshot policy is grouped under
+`kv_cache_config.mamba_state_config`. `periodic_snapshot_interval` controls
+periodic boundaries; set it to `0` to disable them. The interval is accepted
+through this nested configuration in the Python API. YAML/JSON configuration
+files also accept the deprecated `kv_cache_config.mamba_state_cache_interval`
+key and migrate it to the nested field while loading. The prototype
+`additional_snapshot_offsets_from_start` and
+`additional_snapshot_offsets_from_end` options add fixed boundaries. Start
+offsets count tokens from the beginning of the prompt. End offsets count
+backward from the prompt end, and an end offset of `0` selects the final
+prompt boundary. For example:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  mamba_state_config:
+    periodic_snapshot_interval: 0
+    additional_snapshot_offsets_from_start: [128]
+    additional_snapshot_offsets_from_end: [0, 32]
+```
+
+This retains snapshots after the first 128 tokens, at the end of the prompt,
+and before the final 32 prompt tokens. Positions outside a particular prompt
+are ignored. Exact explicit boundaries currently require aggregated serving
+with `V2MambaHybridCacheManager`, `max_beam_width=1`, and no KV connector.
+Hybrid Mamba models use the V1 C++ compatibility manager by default; select V2
+explicitly with `use_kv_cache_manager_v2: true`. V1 and the current
+disaggregated-serving route support periodic snapshots only, while V2 does not
+yet support disaggregated serving.
+
 ### KV Cache Salting for Secure Reuse
 
 KV cache salting provides a security mechanism to control which requests can reuse cached KV states. When a `cache_salt` parameter is provided with a request, the KV cache system will only allow reuse of cached blocks given the same cache salt value. This prevents potential security issues such as prompt theft attacks, where malicious users might try to infer information from cached states of other users' requests.

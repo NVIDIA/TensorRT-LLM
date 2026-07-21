@@ -34,7 +34,7 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, field_validator, model_validator)
+                      PrivateAttr, StrictInt, field_validator, model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -58,9 +58,7 @@ from ..bindings.executor import (BatchingType as _BatchingType,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
-                                 DecodingMode,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 EagleConfig as _EagleConfig,
                                  ExecutorConfig as _ExecutorConfig,
                                  ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
@@ -3460,6 +3458,85 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
         description="The arguments of the request reordering policy.")
 
 
+_StrictPositiveInt = Annotated[StrictInt, PydanticField(gt=0)]
+_StrictNonNegativeInt = Annotated[StrictInt, PydanticField(ge=0)]
+
+
+class MambaStateConfig(StrictBaseModel):
+    """Configuration for reusable Mamba recurrent-state snapshots."""
+
+    periodic_snapshot_interval: NonNegativeInt = Field(
+        default=256,
+        description=
+        "The number of tokens between periodic snapshots in the Mamba "
+        "prefix cache. Set to 0 to disable periodic snapshots.")
+
+    additional_snapshot_offsets_from_start: List[_StrictPositiveInt] = Field(
+        default_factory=list,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Additional Mamba state snapshot offsets measured from the start "
+        "of each prompt. Offsets beyond the prompt length are ignored. "
+        "These snapshots require KV cache manager V2.")
+
+    additional_snapshot_offsets_from_end: List[_StrictNonNegativeInt] = Field(
+        default_factory=list,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Additional Mamba state snapshot offsets measured backward from "
+        "the end of each prompt. An offset of 0 selects the prompt end. "
+        "Offsets that do not resolve inside the prompt are ignored. These "
+        "snapshots require KV cache manager V2.")
+
+
+def _migrate_legacy_mamba_interval_from_config_file(
+        config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate the legacy Mamba interval in a YAML/JSON config mapping.
+
+    This intentionally runs only at config-file ingestion boundaries. The
+    Pydantic models remain strict so direct Python construction accepts only
+    ``mamba_state_config.periodic_snapshot_interval``.
+    """
+    kv_cache_config = config_dict.get("kv_cache_config")
+    legacy_field = "mamba_state_cache_interval"
+    if not isinstance(kv_cache_config,
+                      dict) or legacy_field not in kv_cache_config:
+        return config_dict
+
+    migrated_config = dict(config_dict)
+    migrated_kv_cache_config = dict(kv_cache_config)
+    migrated_config["kv_cache_config"] = migrated_kv_cache_config
+
+    state_config_field = "mamba_state_config"
+    interval_field = "periodic_snapshot_interval"
+    if state_config_field in migrated_kv_cache_config:
+        state_config = migrated_kv_cache_config[state_config_field]
+        if not isinstance(state_config, dict):
+            raise ValueError(
+                "Config file field 'kv_cache_config.mamba_state_config' must "
+                "be a mapping when using the legacy "
+                "'kv_cache_config.mamba_state_cache_interval' option.")
+        if interval_field in state_config:
+            raise ValueError("Config file cannot set both "
+                             "'kv_cache_config.mamba_state_cache_interval' and "
+                             "'kv_cache_config.mamba_state_config."
+                             "periodic_snapshot_interval'.")
+        migrated_state_config = dict(state_config)
+    else:
+        migrated_state_config = {}
+
+    migrated_state_config[interval_field] = migrated_kv_cache_config.pop(
+        legacy_field)
+    migrated_kv_cache_config[state_config_field] = migrated_state_config
+    logger.warning(
+        "Config-file option 'kv_cache_config.mamba_state_cache_interval' is "
+        "deprecated; use 'kv_cache_config.mamba_state_config."
+        "periodic_snapshot_interval' instead.")
+    return migrated_config
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -3593,10 +3670,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                                   description="The number of tokens per block.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    mamba_state_cache_interval: PositiveInt = Field(
-        default=256,
-        description=
-        "The number of tokens between cache steps in the Mamba prefix cache.")
+    mamba_state_config: MambaStateConfig = Field(
+        default_factory=MambaStateConfig,
+        description="Configuration for reusable Mamba state snapshots.")
 
     use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
         default="auto",
@@ -4326,6 +4402,8 @@ class BaseLlmArgs(StrictBaseModel):
     def from_yaml(cls, yaml_path: Union[str, Path]):
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
+        config_dict = _migrate_legacy_mamba_interval_from_config_file(
+            config_dict)
         return cls(**config_dict)
 
     @field_validator("dtype")
@@ -5753,6 +5831,9 @@ def update_llm_args_with_extra_dict(
 
     If `explicit_cli_keys` is None, YAML wins on conflicts.
     """
+    llm_args_dict = _migrate_legacy_mamba_interval_from_config_file(
+        llm_args_dict)
+
     # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
     # name to `explicit_cli_keys` to make it win over YAML's same-named
     # field inside `kv_cache_config:`.

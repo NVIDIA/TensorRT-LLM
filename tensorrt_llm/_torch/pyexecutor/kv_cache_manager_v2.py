@@ -721,6 +721,7 @@ class KVCacheManagerV2(BaseResourceManager):
         execution_stream: Optional[torch.cuda.Stream] = None,
         is_disagg: bool = False,
         enable_stats: bool = False,
+        num_reserved_index_slots: int = 1,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -1087,7 +1088,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
-        # Plus 1 for cuda graph dummy request.
+        # Reserve stable slots for persistent request IDs such as CUDA-graph
+        # padding requests. The default preserves the main-branch allocation.
         # In disaggregated mode, use a coefficient of 2: at any moment up to
         # `max_num_sequences` requests can be actively generating while another
         # up to `max_num_sequences` requests are still in KV transfer
@@ -1095,10 +1097,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
-        index_mapper_capacity = max_num_sequences * (2 if is_disagg else 1) + 1
+        if num_reserved_index_slots < 0:
+            raise ValueError("num_reserved_index_slots must be non-negative")
+        index_mapper_capacity = (
+            max_num_sequences * (2 if is_disagg else 1) + num_reserved_index_slots
+        )
         logger.info(
             f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
-            f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, max_beam_width={max_beam_width})"
+            f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, "
+            f"num_reserved_index_slots={num_reserved_index_slots}, "
+            f"max_beam_width={max_beam_width})"
         )
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
@@ -2698,7 +2706,10 @@ class KVCacheManagerV2(BaseResourceManager):
             for window_size in sorted(windows)
         }
 
-        pool_group_ids = sorted(set(windows_by_pool_group) | set(pool_group_deltas))
+        all_pool_group_ids = set(range(len(primary_stats)))
+        pool_group_ids = sorted(
+            all_pool_group_ids | set(windows_by_pool_group) | set(pool_group_deltas)
+        )
         stats_by_pool_group = {
             pool_group_id: self._build_pool_group_iteration_stats(
                 pool_group_id,
