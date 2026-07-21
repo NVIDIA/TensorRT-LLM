@@ -56,6 +56,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
+from ..speculative.interface import SpecMetadata
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -1378,6 +1379,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         local_attention_mask_data = None
@@ -1403,6 +1405,11 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
             ple_input_ids=kwargs.pop("ple_input_ids", None),
             **kwargs,
         )
+
+        if spec_metadata is not None and spec_metadata.is_layer_capture(self.layer_idx):
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx, output)
+        if attn_metadata.padded_num_tokens is not None:
+            output = output[: attn_metadata.num_tokens]
 
         logits = self.logits_processor.forward(
             output,

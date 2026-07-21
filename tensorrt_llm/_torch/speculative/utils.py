@@ -146,6 +146,7 @@ def get_spec_metadata(spec_config,
             eagle3_resource_manager=spec_resource_manager,
             layers_to_capture=None,
             is_mtp_eagle=True,
+            is_gemma4_assistant=model_config.model_type == "gemma4_assistant",
         )
     if spec_config.spec_dec_mode.is_eagle3():
         effective_dynamic_tree = _is_effective_dynamic_tree(spec_config)

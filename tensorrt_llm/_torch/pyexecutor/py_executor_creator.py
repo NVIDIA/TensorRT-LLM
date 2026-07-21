@@ -578,21 +578,33 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
             draft_spec_config = copy.copy(spec_config)
 
-            use_chain_drafter = (
+            capturable_drafter_eligible = (
                 guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
                 and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
                 and draft_spec_config.draft_len_schedule is None)
+            use_chain_drafter = (capturable_drafter_eligible
+                                 and draft_spec_config._allow_chain_drafter
+                                 and llm_args.attn_backend == "TRTLLM")
 
             logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
+            if (capturable_drafter_eligible
+                    and (use_chain_drafter
+                         or draft_spec_config.spec_dec_mode.is_mtp_eagle())):
 
                 def drafting_loop_wrapper(model):
                     from tensorrt_llm._torch.speculative.drafting_loops import (
+                        Gemma4AssistantDraftingLoopWrapper,
                         LinearDraftingLoopWrapper,
                         StaticTreeDraftingLoopWrapper)
                     from tensorrt_llm.llmapi import EagleDecodingConfig
+
+                    if model.config.model_type == "gemma4_assistant":
+                        return Gemma4AssistantDraftingLoopWrapper(
+                            spec_config.max_draft_len,
+                            spec_config.tokens_per_gen_step - 1, model)
+
+                    if not use_chain_drafter:
+                        return None
 
                     static_tree_drafter = isinstance(
                         draft_spec_config, EagleDecodingConfig

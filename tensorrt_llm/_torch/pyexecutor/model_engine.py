@@ -281,8 +281,8 @@ class PyTorchModelEngine(ModelEngine):
         dist: Optional[Distributed] = None,
         spec_config: Optional[DecodingBaseConfig] = None,
         is_draft_model: bool = False,
-        drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
-                                                 torch.nn.Module]] = None,
+        drafting_loop_wrapper: Optional[Callable[
+            [torch.nn.Module], Optional[torch.nn.Module]]] = None,
         model: Optional[torch.nn.Module] = None,
         checkpoint_loader: Optional[BaseCheckpointLoader] = None,
         model_weights_memory_tag: Optional[str] = None,
@@ -431,8 +431,12 @@ class PyTorchModelEngine(ModelEngine):
             enable_overlap_headroom=self._enable_dsv4_overlap_headroom,
         )
         if drafting_loop_wrapper is not None:
-            self.model = drafting_loop_wrapper(self.model)
-            self.model_is_wrapped = True
+            wrapped_model = drafting_loop_wrapper(self.model)
+            if wrapped_model is not None:
+                self.model = wrapped_model
+                self.model_is_wrapped = True
+            else:
+                self.model_is_wrapped = False
         else:
             self.model_is_wrapped = False
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
@@ -1469,8 +1473,12 @@ class PyTorchModelEngine(ModelEngine):
         logger.info("Running autotuner warmup...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        token_num_upper_bound = min(self.max_num_tokens,
-                                    self.batch_size * (self.max_seq_len - 1))
+        if (self.is_draft_model and self.model_is_wrapped
+                and self.model.config.model_type == "gemma4_assistant"):
+            token_num_upper_bound = 1
+        else:
+            token_num_upper_bound = min(
+                self.max_num_tokens, self.batch_size * (self.max_seq_len - 1))
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
@@ -2405,10 +2413,14 @@ class PyTorchModelEngine(ModelEngine):
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if self.is_draft_model and isinstance(spec_resource_manager,
                                               Eagle3ResourceManager):
-            spec_resource_manager.is_first_draft = is_first_draft
+            is_gemma4_assistant = (self.model_is_wrapped
+                                   and self.model.config.model_type
+                                   == "gemma4_assistant")
+            spec_resource_manager.is_first_draft = (is_first_draft
+                                                    and not is_gemma4_assistant)
             if is_first_draft:
                 for req in batch.generation_requests:
-                    req.py_is_first_draft = True
+                    req.py_is_first_draft = not is_gemma4_assistant
                     req.py_draft_tokens = []
 
     def _set_up_attn_metadata(

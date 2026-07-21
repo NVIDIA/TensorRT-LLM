@@ -2808,6 +2808,145 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     @unittest.mock.patch(
         "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
     )
+    def test_cuda_graph_speculative_verification_hybrid_headdim(self):
+        """Speculative graph refreshes paged-prefill state after request turnover."""
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        kv_cache_manager = self._get_kv_cache_manager(
+            config, num_blocks=32, tokens_per_block=32, batch_size=2
+        )
+        self.addCleanup(kv_cache_manager.shutdown)
+
+        capture_request_ids = [0]
+        replay_request_ids = [1]
+        capture_cached_tokens = [96]
+        replay_cached_tokens = [48]
+        verification_tokens = 6
+        capture_requests = kv_cache_manager.add_dummy_requests(
+            capture_request_ids,
+            [capture_cached_tokens[0] + verification_tokens],
+        )
+        replay_requests = kv_cache_manager.add_dummy_requests(
+            replay_request_ids,
+            [replay_cached_tokens[0] + verification_tokens],
+        )
+        self.assertIsNotNone(capture_requests)
+        self.assertIsNotNone(replay_requests)
+
+        layer_indices = [
+            config.layer_types.index("sliding_attention"),
+            config.layer_types.index("full_attention"),
+        ]
+        layers = []
+        queries = []
+        keys = []
+        values = []
+        for layer_idx in layer_indices:
+            is_sliding = config.layer_types[layer_idx] == "sliding_attention"
+            head_dim = config.head_dim if is_sliding else config.global_head_dim
+            layers.append(
+                FlashInferAttention(
+                    layer_idx=layer_idx,
+                    num_heads=config.num_attention_heads,
+                    head_dim=head_dim,
+                    num_kv_heads=config.num_key_value_heads,
+                    flashinfer_backend="trtllm-gen",
+                )
+            )
+            queries.append(
+                torch.randn(
+                    verification_tokens,
+                    config.num_attention_heads * head_dim,
+                    dtype=config.torch_dtype,
+                    device="cuda",
+                )
+            )
+            keys.append(
+                torch.randn(
+                    verification_tokens,
+                    config.num_key_value_heads * head_dim,
+                    dtype=config.torch_dtype,
+                    device="cuda",
+                )
+            )
+            values.append(torch.randn_like(keys[-1]))
+            torch.nn.init.normal_(kv_cache_manager.get_buffers(layer_idx))
+
+        def make_metadata(
+            *,
+            is_cuda_graph: bool,
+            request_ids: list[int],
+            cached_tokens: list[int],
+        ):
+            return FlashInferAttentionMetadata(
+                seq_lens=torch.tensor([verification_tokens], dtype=torch.int),
+                num_contexts=1,
+                is_cuda_graph=is_cuda_graph,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=cached_tokens
+                ),
+                workspace_buffer=(
+                    torch.empty(_FLASHINFER_WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
+                    if is_cuda_graph
+                    else None
+                ),
+                max_num_requests=1,
+                max_num_tokens=verification_tokens,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+
+        graph_metadata = make_metadata(
+            is_cuda_graph=True,
+            request_ids=capture_request_ids,
+            cached_tokens=capture_cached_tokens,
+        )
+        graph_metadata.prepare()
+        for _ in range(2):
+            for layer, query, key, value in zip(layers, queries, keys, values, strict=True):
+                layer.forward(query, key, value, graph_metadata)
+
+        graph_outputs = []
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for layer, query, key, value in zip(layers, queries, keys, values, strict=True):
+                graph_outputs.append(layer.forward(query, key, value, graph_metadata))
+
+        graph_metadata.request_ids = replay_request_ids
+        graph_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=replay_cached_tokens,
+        )
+        graph_metadata.prepare()
+
+        reference_metadata = make_metadata(
+            is_cuda_graph=False,
+            request_ids=replay_request_ids,
+            cached_tokens=replay_cached_tokens,
+        )
+        reference_metadata.prepare()
+        reference_outputs = [
+            layer.forward(query, key, value, reference_metadata)
+            for layer, query, key, value in zip(layers, queries, keys, values, strict=True)
+        ]
+
+        graph.replay()
+        torch.cuda.synchronize()
+
+        for layer, graph_output, reference_output in zip(
+            layers, graph_outputs, reference_outputs, strict=True
+        ):
+            torch.testing.assert_close(
+                graph_output,
+                reference_output,
+                atol=1e-2,
+                rtol=0,
+                msg=f"Layer {layer.layer_idx}: verification graph output diverges from eager",
+            )
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
     def test_cuda_graph_multi_step_decode(self):
         """CUDA graph multi-step decode with hybrid head_dim.
 

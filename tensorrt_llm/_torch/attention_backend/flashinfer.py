@@ -225,6 +225,8 @@ class FlashInferWrappers:
     # and columns before narrowing future updates.
     decode_block_table_active_rows: int = field(default=0, repr=False)
     decode_block_table_active_width: int = field(default=0, repr=False)
+    host_prefill_block_tables: Optional[torch.Tensor] = field(default=None,
+                                                              repr=False)
 
 
 @dataclass(kw_only=True)
@@ -1324,6 +1326,51 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_active_pool_id = primary_pool_id
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
+
+        # Gemma4's trtllm-gen paged-prefill graphs capture one stable block
+        # table per head dimension. Refresh those tables and KV lengths after
+        # request turnover instead of replaying with graph-warmup page IDs.
+        if (self.is_cuda_graph and self.num_contexts > 0
+                and self._vswa_layer_to_pool is not None):
+            head_dim_to_pool = getattr(self, "_vswa_head_dim_to_pool", None)
+            for plan_params, wrappers in self._plan_params_to_wrappers.items():
+                if plan_params.attention_mask_data is not None:
+                    continue
+                prefill_wrapper = wrappers.prefill_wrapper
+                if (prefill_wrapper is None
+                        or prefill_wrapper._backend != "trtllm-gen"):
+                    continue
+                block_tables = prefill_wrapper._block_tables
+                pool_id = (head_dim_to_pool.get(plan_params.head_dim)
+                           if head_dim_to_pool else None)
+                if block_tables is None or pool_id is None:
+                    continue
+                host_pool_indices = self._host_pool_indices[pool_id]
+                host_block_tables = wrappers.host_prefill_block_tables
+                if (host_block_tables is None
+                        or host_block_tables.shape != block_tables.shape):
+                    host_block_tables = torch.zeros(
+                        block_tables.shape,
+                        dtype=torch.int32,
+                        pin_memory=prefer_pinned(),
+                    )
+                    wrappers.host_prefill_block_tables = host_block_tables
+                else:
+                    host_block_tables.zero_()
+                source_offset = 0
+                for row, num_blocks_for_row in enumerate(
+                        num_blocks[:self.num_contexts]):
+                    copy_width = min(int(num_blocks_for_row),
+                                     block_tables.size(1))
+                    host_block_tables[row, :copy_width].copy_(
+                        host_pool_indices[source_offset:source_offset +
+                                          copy_width])
+                    source_offset += int(num_blocks_for_row)
+                block_tables.copy_(host_block_tables, non_blocking=True)
+                prefill_wrapper._kv_lens_buffer[:self.num_contexts].copy_(
+                    _to_int32_tensor(kv_lens_host[:self.num_contexts]),
+                    non_blocking=True,
+                )
 
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
