@@ -142,7 +142,6 @@ def _rank_info(
         cp_rank=0,
         device_id=0,
         layer_num_per_pp=layer_num_per_pp,
-        server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(
