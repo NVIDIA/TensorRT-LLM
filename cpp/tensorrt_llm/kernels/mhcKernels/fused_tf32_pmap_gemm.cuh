@@ -52,40 +52,27 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-attributes"
 
-#include <cuda/std/utility>
 #include <cuda_bf16.h>
 #include <cutlass/arch/barrier.h>
 
-namespace deep_gemm::sm90
-{
-using cuda::std::swap;
-}
-
-namespace deep_gemm::sm100
-{
-using cuda::std::swap;
-}
-
-#include <deep_gemm/common/reduction.cuh>
-#include <deep_gemm/common/sm100_utils.cuh>
-#include <deep_gemm/common/sm90_utils.cuh>
-#include <deep_gemm/common/tma_utils.cuh>
+#include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
 namespace fused_mhc
 {
 
 // Reuse DeepGEMM's swizzle helper
-using deep_gemm::sm100::make_umma_desc;
-using deep_gemm::sm100::get_num_aligned_tmem_cols;
-using deep_gemm::sm100::tcgen05_before_thread_sync;
-using deep_gemm::sm100::tcgen05_after_thread_sync;
-using deep_gemm::sm100::advance_umma_desc_lo;
-using deep_gemm::tma_copy;
-using deep_gemm::utils::PatternVisitor;
+using deep_gemm::mma::sm100::advance_umma_desc_lo;
+using deep_gemm::mma::sm100::make_umma_desc;
 using deep_gemm::ptx::get_lane_idx;
+using deep_gemm::ptx::tcgen05_after_thread_sync;
+using deep_gemm::ptx::tcgen05_before_thread_sync;
+using deep_gemm::utils::get_num_aligned_tmem_cols;
+using deep_gemm::utils::PatternVisitor;
 
 template <uint32_t kSwizzleMode, uint32_t kSwizzleBase = 16>
 __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& offset, uint32_t const& lane_idx)
@@ -287,10 +274,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
 #pragma unroll
                 for (uint32_t j = 0; j < HC_MULT; ++j)
                 {
-                    tma_copy<BLOCK_K, BLOCK_M, kSwizzleResMode>(&tensor_map_residual, full_input[i_stage],
+                    deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleResMode>(&tensor_map_residual, full_input[i_stage],
                         smem_res[i_stage] + j * BLOCK_M * BLOCK_K, j * HIDDEN + h_idx, m_idx);
                 }
-                tma_copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
+                deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
                     &tensor_map_x, full_input[i_stage], smem_x_stg[i_stage], h_idx, m_idx);
                 constexpr uint32_t kInputBytes = SMEM_RES_PER_ISTG + SMEM_X_PER_ISTG;
                 full_input[i_stage]->arrive_and_expect_tx(kInputBytes);
@@ -300,7 +287,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 {
                     empty_B[b_stage]->wait(((s / N_B_STAGES) & 1) ^ 1);
                     uint32_t k_idx = hc * HIDDEN + h_idx;
-                    tma_copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(
+                    deep_gemm::tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(
                         &tensor_map_b, full_B[b_stage], smem_b[b_stage], k_idx, 0);
                     full_B[b_stage]->arrive_and_expect_tx(SMEM_B_PER_STAGE);
                     b_stage = (b_stage + 1) % N_B_STAGES;
@@ -456,7 +443,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 for (uint32_t i = 0; i < kNumLoads; i += 2)
                 {
                     auto smem_ptr = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::sm90::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
+                    deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
                         x_vals[1][i + 1], const_cast<uint8_t*>(smem_ptr));
                 }
             }
@@ -472,7 +459,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 {
                     auto smem_ptr
                         = r_base + get_swizzled_smem_offset<kSwizzleResMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::sm90::SM90_U32x4_LDSM_N::copy(r_vals[j][0][i + 0], r_vals[j][1][i + 0],
+                    deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(r_vals[j][0][i + 0], r_vals[j][1][i + 0],
                         r_vals[j][0][i + 1], r_vals[j][1][i + 1], const_cast<uint8_t*>(smem_ptr));
                 }
             }
@@ -839,10 +826,10 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
 #pragma unroll
                 for (uint32_t j = 0; j < HC_MULT; ++j)
                 {
-                    tma_copy<BLOCK_K, BLOCK_M, kSwizzleResMode>(&tensor_map_residual, full_input[i_stage],
+                    deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleResMode>(&tensor_map_residual, full_input[i_stage],
                         smem_res[i_stage] + j * BLOCK_M * BLOCK_K, j * HIDDEN + h_idx, m_idx);
                 }
-                tma_copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
+                deep_gemm::tma::copy<BLOCK_K, BLOCK_M, kSwizzleXMode>(
                     &tensor_map_x, full_input[i_stage], smem_x_stg[i_stage], h_idx, m_idx);
                 constexpr uint32_t kInputBytes = SMEM_RES_PER_ISTG + SMEM_X_PER_ISTG;
                 full_input[i_stage]->arrive_and_expect_tx(kInputBytes);
@@ -852,7 +839,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 {
                     empty_B[b_stage]->wait(((s / N_B_STAGES) & 1) ^ 1);
                     uint32_t k_idx = hc * HIDDEN + h_idx;
-                    tma_copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(
+                    deep_gemm::tma::copy<BLOCK_K, BLOCK_N, kSwizzleBMode>(
                         &tensor_map_b, full_B[b_stage], smem_b[b_stage], k_idx, 0);
                     full_B[b_stage]->arrive_and_expect_tx(SMEM_B_PER_STAGE);
                     b_stage = (b_stage + 1) % N_B_STAGES;
@@ -1008,7 +995,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 for (uint32_t i = 0; i < kNumLoads; i += 2)
                 {
                     auto smem_ptr = x_base + get_swizzled_smem_offset<kSwizzleXMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::sm90::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
+                    deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(x_vals[0][i + 0], x_vals[1][i + 0], x_vals[0][i + 1],
                         x_vals[1][i + 1], const_cast<uint8_t*>(smem_ptr));
                 }
             }
@@ -1024,7 +1011,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 {
                     auto smem_ptr
                         = r_base + get_swizzled_smem_offset<kSwizzleResMode>(i + lane_idx / 16, lane_idx % 16);
-                    deep_gemm::sm90::SM90_U32x4_LDSM_N::copy(r_vals[j][0][i + 0], r_vals[j][1][i + 0],
+                    deep_gemm::ptx::SM90_U32x4_LDSM_N::copy(r_vals[j][0][i + 0], r_vals[j][1][i + 0],
                         r_vals[j][0][i + 1], r_vals[j][1][i + 1], const_cast<uint8_t*>(smem_ptr));
                 }
             }
