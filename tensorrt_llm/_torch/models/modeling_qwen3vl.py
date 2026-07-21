@@ -840,6 +840,11 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+        # Pin the no-cache ``max_seq_len`` to the startup token budget once:
+        # it participates in the C++ attention-op cache key, so a stable
+        # value means one warmup-created op serves every runtime batch
+        # instead of a new cudaMalloc'd op per distinct segment length.
+        self.attn_metadata.max_seq_len = max_num_tokens
         # Pre-allocate the vision-block ``rope_position_ids`` as an ``arange``
         # sized to the encoder's ``max_num_tokens`` (engine-driven) so per-call
         # code just slices ``[:seq_len]`` instead of allocating a fresh

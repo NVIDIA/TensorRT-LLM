@@ -114,7 +114,22 @@ def _prepare_qwen_vl_vision_attn_metadata(
                                non_blocking=True)
     attn_metadata.cu_q_seqlens = cu_seqlens
     attn_metadata.cu_kv_seqlens = cu_seqlens
-    attn_metadata.max_seq_len = max(seq_lens)
+    # Deliberately do NOT update `max_seq_len` to this batch's maximum:
+    # it feeds the C++ attention-op cache key (mMaxSeqLen /
+    # mMaxContextLength), so a per-batch value creates and permanently
+    # caches a new AttentionOp — each with its own cudaMalloc'd workspace
+    # and semaphores — for every distinct segment length the serving
+    # traffic produces, growing GPU usage without bound. `max_seq_len` is
+    # pinned once in `setup_attn_metadata` to the encoder token budget, so
+    # every batch reuses the single op that warmup already created and
+    # profiled. Kernels read the real lengths from `seq_lens`.
+    batch_max_seq_len = max(seq_lens)
+    if batch_max_seq_len > attn_metadata.max_seq_len:
+        raise ValueError(
+            f"Encoder attention segment of {batch_max_seq_len} tokens "
+            f"exceeds the startup maximum {attn_metadata.max_seq_len}; "
+            "increase encoder_max_num_tokens or reduce the input "
+            "max_pixels")
     # The vision tower runs no-cache, context-only attention and supplies its
     # own `cu_seqlens` above, so the heavy KV-oriented `prepare()` (kv_lens /
     # prompt_lens / host_request_types setup) is unnecessary host work.
@@ -1691,6 +1706,15 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
             max_num_requests=capacities["full_attention"], **kwargs)
         self.window_attn_metadata = self.metadata_cls(
             max_num_requests=capacities["window_attention"], **kwargs)
+        # Pin the no-cache `max_seq_len` to the startup token budget once.
+        # It participates in the C++ attention-op cache key, so keeping it
+        # constant means one op (created during warmup, its workspace part
+        # of the profiled peak) serves every runtime batch instead of a new
+        # cudaMalloc'd op per distinct segment length; no encoder segment
+        # can exceed the budget (an atomic item must fit it, enforced at
+        # admission).
+        self.full_attn_metadata.max_seq_len = max_num_tokens
+        self.window_attn_metadata.max_seq_len = max_num_tokens
         # Size the vision-block ``rope_position_ids`` scratch to the encoder
         # token budget; ``forward`` grows it on the rare miss above the budget.
         self._rope_position_ids_buffer = torch.arange(max_num_tokens,

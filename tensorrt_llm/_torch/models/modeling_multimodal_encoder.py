@@ -77,6 +77,9 @@ class MultimodalEncoderMixin:
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+        # Pin the no-cache ``max_seq_len`` to the startup token budget once
+        # (stable C++ attention-op cache key; see the Qwen setup overrides).
+        self.attn_metadata.max_seq_len = max_num_tokens
 
 
 class VisionTower(nn.Module):
