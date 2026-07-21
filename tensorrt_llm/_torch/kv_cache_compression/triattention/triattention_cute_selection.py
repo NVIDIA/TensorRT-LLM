@@ -37,6 +37,9 @@ _SMALL_TILE_RESIDENT_CTAS_PER_SM = 6
 _STATS_FIELDS = 3
 _STD_EPSILON = 1.0e-6
 _SUPPORTED_PAGE_SHARDS = (2, 3)
+# The fused score kernel pads each KV head's group of score planes up to the
+# minimum tcgen05 MMA tile (GQA groups below 8 ride zero-padded columns).
+_PADDED_HEAD_COLUMNS = 8
 
 
 def _select_normalize_union_config(
@@ -120,6 +123,7 @@ class _TriAttentionNormalizeUnionKernel:
         seq_len: int,
         score_start: int,
         num_q_heads: int,
+        num_kv_heads: int | None = None,
         page_shards: int,
         tokens_per_lane: int,
         token_subtiles: int,
@@ -131,6 +135,24 @@ class _TriAttentionNormalizeUnionKernel:
             raise ValueError("TriAttention stats/union score_start is out of range")
         if page_shards not in _SUPPORTED_PAGE_SHARDS:
             raise ValueError("TriAttention stats/union has unsupported page shards")
+        # ``num_kv_heads`` declares that the score scratch pads each KV
+        # head's group of head planes up to the MMA tile: real head row
+        # ``q_head`` then lives in scratch plane ``kv * 8 + qg``. Omitting
+        # it keeps the compact plane-per-head layout (GQA group 8 is
+        # identical either way). The partial-stats rows are always compact.
+        if num_kv_heads is None:
+            self.score_group_size = num_q_heads
+            self.score_head_pad = 0
+        else:
+            if num_kv_heads <= 0 or num_q_heads % num_kv_heads:
+                raise ValueError("TriAttention stats/union requires uniform GQA groups")
+            self.score_group_size = num_q_heads // num_kv_heads
+            if self.score_group_size > _PADDED_HEAD_COLUMNS:
+                raise ValueError(
+                    "TriAttention stats/union supports GQA groups up to the "
+                    f"padded head tile ({_PADDED_HEAD_COLUMNS})"
+                )
+            self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
         if tokens_per_lane not in (_SMALL_TOKENS_PER_LANE, _LARGE_TOKENS_PER_LANE):
             raise ValueError("TriAttention stats/union has unsupported load width")
         if token_subtiles not in (_SMALL_TOKEN_SUBTILES, _LARGE_TOKEN_SUBTILES):
@@ -295,6 +317,11 @@ class _TriAttentionNormalizeUnionKernel:
             q_head = logical_row - layer_slot * self.num_q_heads
             segment = first_segment + layer_slot
             stats_row = segment * self.num_q_heads + q_head
+            # Map the real head row onto its (possibly padded) score plane;
+            # the padded planes carry zero scores and are never visited.
+            score_plane = q_head
+            if cutlass.const_expr(self.score_head_pad > 0):
+                score_plane = q_head + (q_head // self.score_group_size) * self.score_head_pad
 
             count = cutlass.Float32(0.0)
             mean = cutlass.Float32(0.0)
@@ -330,7 +357,7 @@ class _TriAttentionNormalizeUnionKernel:
             for token_subtile in cutlass.range_constexpr(self.token_subtiles):
                 subtile_first_token = first_token + token_subtile * self.subtile_token_tile
                 score_index = (
-                    cutlass.Int64(q_head) * request_count * self.num_layers * self.seq_len
+                    cutlass.Int64(score_plane) * request_count * self.num_layers * self.seq_len
                     + seg_out_offset[segment]
                     + self.score_start
                     + subtile_first_token
