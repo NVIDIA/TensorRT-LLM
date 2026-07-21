@@ -873,21 +873,18 @@ def sampling_batch_spec_dec_one_model(
 ) -> torch.Tensor:
     """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
     top_k = sanitize_top_k(top_k, logits.shape[-1])
-    # Greedy rows (temperature <= threshold) must return the argmax token, not a
-    # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; safely_apply_temperature_inplace then guards the division
-    # against the greedy sentinel, and torch.where restores the greedy rows below.
-    # All ops are branch-free (no data-dependent control flow), so this stays
-    # CUDA-graph safe.
+    # Greedy rows (temperature <= threshold) reduce to top_k=1 sampling: with the
+    # divisor clamped to 1.0 by safely_apply_temperature_inplace (order-preserving
+    # for those rows), flashinfer deterministically returns the max-probability
+    # token, i.e. the argmax of the original logits. All ops remain branch-free
+    # (no data-dependent control flow), so this stays CUDA-graph safe.
     is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
-    greedy_tokens = logits.argmax(dim=-1)
+    top_k = torch.where(is_greedy, torch.ones_like(top_k), top_k)
+    top_p = torch.where(is_greedy, torch.ones_like(top_p), top_p)
     logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
-    sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
+    return flashinfer.top_k_top_p_sampling_from_logits_op(
         logits, top_k, top_p, seed=seed, offset=offset
     )
-    # argmax yields int64; cast so torch.where preserves the sampler's dtype
-    # (flashinfer returns int32) instead of promoting the result to int64.
-    return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
 
 
 @torch.compile(options={"max-autotune": True})
