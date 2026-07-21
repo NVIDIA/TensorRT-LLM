@@ -296,6 +296,38 @@ def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
     return bool(getattr(config, "enable_fused_hc", True))
 
 
+def _normalize_deepseek_v4_mixed_precision_config(
+    model_config: ModelConfig[PretrainedConfig],
+) -> ModelConfig[PretrainedConfig]:
+    """Resolve DeepSeek-V4 NVFP4 checkpoints' FP8 base-layer config."""
+    quant_config = model_config.quant_config
+    hf_quant_config = getattr(model_config.pretrained_config, "quantization_config", None)
+    if (
+        quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
+        or not isinstance(hf_quant_config, dict)
+        or hf_quant_config.get("quant_method") != "fp8"
+        or tuple(hf_quant_config.get("weight_block_size", ())) != (128, 128)
+    ):
+        return model_config
+
+    fp8_quant_config = quant_config.model_copy(
+        deep=True,
+        update={
+            "quant_algo": QuantAlgo.FP8_BLOCK_SCALES,
+            "group_size": 128,
+            "exclude_modules": ["*kv_b_proj*", "*k_b_proj*", "*eh_proj*"],
+        },
+    )
+    fp8_quant_config.__dict__.pop("quant_mode", None)
+    fp8_quant_config.__dict__.pop("layer_quant_mode", None)
+
+    normalized_config = copy.deepcopy(model_config)
+    normalized_config._frozen = False
+    normalized_config.quant_config = fp8_quant_config
+    normalized_config._frozen = True
+    return normalized_config
+
+
 def _copy_deepseek_v4_fused_a_weight_scale(
     module: Linear, fused_a: torch.Tensor, fused_a_scale: torch.Tensor
 ) -> None:
@@ -2484,6 +2516,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         }
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        model_config = _normalize_deepseek_v4_mixed_precision_config(model_config)
         self.mapping_with_cp = None
         # Note: Currently the usage of mapping is all over the place making its usage brittle
         # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
