@@ -71,6 +71,36 @@ def _normalize_condition_video_keep(keep: str | None) -> str:
     return normalized
 
 
+def _crop_video_frames(video, extra_params) -> torch.Tensor:
+    """Crop the V2V reference to the conditioning window before transport.
+
+    Runs once in the coordinator (spec ``reducer``) before the request is
+    deep-copied, pickled over ZMQ, and broadcast per rank: a full 189-frame
+    720p reference is ~520 MiB while the default conditioning window is 5
+    frames (~14 MiB). Semantics-preserving — the worker's own first/last crop
+    is idempotent, so reduced and unreduced tensors generate identically.
+    Anything invalid is returned unchanged for the validators to reject.
+    """
+    if not isinstance(video, torch.Tensor) or video.ndim != 4:
+        return video
+    try:
+        indexes = _normalize_condition_video_latent_indexes(
+            extra_params.get("condition_video_latent_indexes")
+        )
+        keep = _normalize_condition_video_keep(extra_params.get("condition_video_keep"))
+    except (TypeError, ValueError):
+        return video
+    # 4 = Cosmos3 VAE temporal compression; if a future VAE changes it, the
+    # worker pads/crops the window itself, so a mismatch degrades gracefully.
+    window = max(indexes) * 4 + 1
+    if video.shape[0] <= window:
+        return video
+    sliced = video[-window:] if keep == "last" else video[:window]
+    # A slice is a view over the full storage and would pickle all of it;
+    # clone so the transport payload owns only the window.
+    return sliced.clone()
+
+
 def _validate_video_reference_tensor(video: torch.Tensor) -> None:
     if video.ndim != 4 or video.shape[-1] != 3:
         raise ValueError(
@@ -79,6 +109,11 @@ def _validate_video_reference_tensor(video: torch.Tensor) -> None:
         )
     if video.dtype != torch.uint8:
         raise ValueError(f"Cosmos3 video reference must have dtype uint8, got {video.dtype}.")
+    if video.device.type != "cpu":
+        raise ValueError(
+            f"Cosmos3 video reference must be a CPU tensor, got device '{video.device}' "
+            "(it is pickled to the workers; keep decoded references on the host)."
+        )
 
 
 # Fields merged by the executor for every request. Modality-specific values
@@ -166,11 +201,13 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description=(
             "V2V reference: decoded video frames as a uint8 [T, H, W, C] RGB "
             "torch.Tensor (build one from a file with "
-            "tensorrt_llm.inputs.media_io.load_video_frames_tensor). The worker "
-            "keeps the first/last conditioning window per "
-            "condition_video_latent_indexes / condition_video_keep and "
-            "VAE-encodes it; media is always decoded by the producer."
+            "tensorrt_llm.inputs.media_io.load_video_frames_tensor). The "
+            "coordinator crops it to the conditioning window per "
+            "condition_video_latent_indexes / condition_video_keep before "
+            "dispatch; the worker VAE-encodes it. Media is always decoded "
+            "by the producer."
         ),
         validator=_validate_video_reference_tensor,
+        reducer=_crop_video_frames,
     ),
 }

@@ -32,7 +32,11 @@ from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 from tensorrt_llm.visual_gen.output import VisualGenOutput
-from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+from tensorrt_llm.visual_gen.params import (
+    VisualGenParams,
+    reduce_visual_gen_params,
+    validate_visual_gen_params,
+)
 
 __all__ = [
     "VisualGen",
@@ -387,6 +391,10 @@ class VisualGen:
         # from the READY signal) and skip validation — there's nothing
         # user-supplied to validate against.
         if params is not None:
+            # Shrink oversized transport payloads (spec-declared reducers)
+            # before the deep copy, so the copy/pickle/broadcast chain only
+            # ever carries the reduced values. Non-mutating for the caller.
+            params = reduce_visual_gen_params(params, self.executor.extra_param_specs)
             resolved_params = params.model_copy(deep=True)
             # Raising in the caller's process means ``ValueError`` reaches
             # the user as a natural Python exception; the worker only has

@@ -39,7 +39,6 @@ from .defaults import (
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
     COSMOS3_T2I_PARAMS,
-    _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
@@ -937,26 +936,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             condition_video_latent_indexes = _normalize_condition_video_latent_indexes(
                 condition_video_latent_indexes
             )
-            condition_video_keep = _normalize_condition_video_keep(condition_video_keep)
-            condition_pixel_frames = min(
-                _condition_pixel_frame_count(
-                    condition_video_latent_indexes, self.vae_scale_factor_temporal
-                ),
-                num_frames,
-            )
             if not isinstance(video, torch.Tensor) or video.ndim != 4:
                 raise ValueError(
                     "Cosmos3 V2V reference must be a uint8 [T, H, W, C] tensor "
                     f"(the 'video' extra-param contract), got {type(video).__name__}"
                     f"{' of shape ' + str(tuple(video.shape)) if isinstance(video, torch.Tensor) else ''}."
                 )
-            # Crop the first/last conditioning window uniformly
-            window = (
-                video[-condition_pixel_frames:]
-                if condition_video_keep == "last"
-                else video[:condition_pixel_frames]
-            )
-            frames = [PIL.Image.fromarray(frame.cpu().numpy()) for frame in window]
+            # video is already the conditioning window: the coordinator crops it
+            frames = [PIL.Image.fromarray(frame.cpu().numpy()) for frame in video]
             video = self._preprocess_condition_video(frames, height, width)
 
             if self.rank == 0:

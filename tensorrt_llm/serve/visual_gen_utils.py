@@ -4,13 +4,14 @@ import os
 from typing import Any, Dict, List, Optional
 
 from tensorrt_llm.inputs.media_io import (
-    decode_video_frames_from_bytes,
-    frames_to_tensor,
+    DecodedVideoTooLargeError,
+    decode_video_tensor_from_bytes,
     is_decodable_image_bytes,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+from tensorrt_llm.visual_gen.params import reduce_visual_gen_params
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message
@@ -180,7 +181,10 @@ def parse_visual_gen_params(
             else:
                 # V2V: decode in memory into a uint8 [T, H, W, C] tensor
                 try:
-                    frames = decode_video_frames_from_bytes(payload)
+                    video = decode_video_tensor_from_bytes(payload)
+                except DecodedVideoTooLargeError:
+                    # Still a 400, but with the actionable size message intact.
+                    raise
                 except ValueError as exc:
                     raise ValueError(
                         "input_reference content is neither a decodable image "
@@ -188,12 +192,16 @@ def parse_visual_gen_params(
                     ) from exc
                 if params.extra_params is None:
                     params.extra_params = {}
-                params.extra_params["video"] = frames_to_tensor(frames)
+                params.extra_params["video"] = video
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
 
-    return params
+    # Apply spec-declared transport reducers here as well (generate_async
+    # reduces non-mutatively, so without this the serve-owned params — held by
+    # the sync/async routes for the job's whole lifetime — would retain the
+    # full decoded reference, e.g. ~500 MiB per queued V2V request).
+    return reduce_visual_gen_params(params, generator.extra_param_specs)
 
 
 class AsyncDictStore:
