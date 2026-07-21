@@ -168,6 +168,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Nano` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 
 ### Feature Matrix
 
