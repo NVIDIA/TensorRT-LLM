@@ -89,6 +89,140 @@ def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
         )
 
 
+def make_ramp_pools(
+    count,
+    *,
+    num_kv_heads=2,
+    pages=6,
+    tokens_per_block=32,
+    head_dim=64,
+    layer_stride=37,
+    base=0,
+    device=None,
+):
+    """bf16 pools carrying a shifted ``arange % 251`` ramp payload.
+
+    Every value is exact in bf16 and any wrong page/plane/head/token move
+    lands on a different byte pattern, so pool-equality checks in the
+    compaction tests stay conclusive. Geometry defaults to the compact op's
+    supported production shape (32-token pages, head_dim 64).
+    """
+    return [
+        (
+            (
+                torch.arange(
+                    pages * 2 * num_kv_heads * tokens_per_block * head_dim,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                + base
+                + layer * layer_stride
+            )
+            % 251
+        )
+        .view(pages, 2, num_kv_heads, tokens_per_block, head_dim)
+        .to(torch.bfloat16)
+        for layer in range(count)
+    ]
+
+
+def build_compaction(**overrides):
+    """``BatchedKVCacheCompaction`` with the suite's default 2-layer geometry."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
+        BatchedKVCacheCompaction,
+    )
+
+    args = dict(
+        eviction_mode="union",
+        dense_layers=[0, 1],
+        swa_layers=[],
+        layer_group_representative={0: 0, 1: 1},
+        layer_pool_keys=[("dense", 0), ("dense", 0)],
+        page_table_slots={0: 0, 1: 0},
+        request_count=2,
+        decode_keep_count=4,
+        swa_window=None,
+    )
+    args.update(overrides)
+    return BatchedKVCacheCompaction(**args)
+
+
+def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None):
+    """A ``__new__``-built staging shell for the bulk page-table copy tests."""
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        _FixedScoreStagingBuffers,
+    )
+
+    staging = _FixedScoreStagingBuffers.__new__(_FixedScoreStagingBuffers)
+    staging.device = device
+    staging.max_requests = max_requests
+    staging.copy_block_count = copy_block_count
+    if page_count is not None:
+        staging.page_count = page_count
+    staging.bulk_copy_done = torch.cuda.Event()
+    staging.bulk_consume_done = torch.cuda.Event()
+    staging.page_tables_active = False
+    staging.copy_done = torch.cuda.Event()
+    staging.copy_pending = False
+    staging._bulk_offsets_src = torch.empty(
+        1, max_requests, 2, copy_block_count, dtype=torch.int32, device="cpu", pin_memory=True
+    )
+    staging._bulk_copy_idx_src = torch.arange(
+        max_requests, dtype=torch.int32, device="cpu", pin_memory=True
+    )
+    staging.block_offsets_device = torch.empty(
+        1, max_requests, 2, copy_block_count, dtype=torch.int32, device=device
+    )
+    return staging
+
+
+def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
+    """The manager surface ``_stage_page_tables_bulk``/``stage`` consume."""
+    return SimpleNamespace(
+        host_kv_cache_block_offsets=host_table,
+        kv_factor=2,
+        index_mapper=SimpleNamespace(gather_k_block_offsets=gather),
+        index_scales=torch.full((num_slots,), 2, dtype=torch.int32, pin_memory=True),
+        kv_offset=torch.ones(num_slots, dtype=torch.int32, pin_memory=True),
+        _stream=manager_stream,
+    )
+
+
+def make_fixed_resources_stubs(manager, *, decode_width=260):
+    """Stub the calibration/staging surfaces around ``_fixed_resources_for``."""
+    manager._H = 2
+    manager._F = 2
+    manager._freq_scale_sq = torch.ones(2)
+    manager._offsets = torch.ones(2)
+    manager.calibration = {"omega": torch.ones(2)}
+    manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
+    manager._page_table_pool_keys = mock.Mock(return_value=[("pool", 0)])
+    pool = torch.empty(8, 2, 1, 4, 4)
+    layout = SimpleNamespace(
+        manager=SimpleNamespace(num_pools=1),
+        num_layers=2,
+        global_layers=[0, 1],
+        layer_pools=[pool, pool],
+        dense_layers=[0, 1],
+        swa_layers=[],
+        storage_groups={0: [0, 1]},
+        pool_view_fingerprint=(("fixed",),),
+    )
+    score_staging = SimpleNamespace(
+        fused_group=SimpleNamespace(output=torch.empty(8, 4, decode_width)),
+        bind_score_launcher=mock.Mock(),
+        token_starts_device=torch.zeros(8, dtype=torch.int32),
+        decode_width=decode_width,
+        page_table_token_capacity=65537,
+        max_requests=8,
+    )
+    keep_set_selector = SimpleNamespace(
+        valid_widths=torch.empty(8, dtype=torch.int32),
+        top_indices_i32=torch.zeros(8, 4, dtype=torch.int32),
+    )
+    return layout, score_staging, keep_set_selector
+
+
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     """Build an unallocated V2 double with TriAttention's production contract."""
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2

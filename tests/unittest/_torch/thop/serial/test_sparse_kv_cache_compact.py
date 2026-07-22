@@ -13,8 +13,6 @@ import tensorrt_llm  # noqa: F401  # Register torch.ops.trtllm operators.
 _TOKENS_PER_BLOCK = 32
 _NUM_KV_HEADS = 2
 _BATCH_SIZE = 2
-_MAX_PAGES_PER_SEQUENCE = 3
-_NUM_PAGES = _BATCH_SIZE * _MAX_PAGES_PER_SEQUENCE
 _PAGE_INDEX_DIVISOR = 2
 
 # Kernel-name substrings for the profiler probes below. The pipelined bf16
@@ -52,8 +50,10 @@ def _make_pools(
     dtype: torch.dtype,
     head_dim: int,
     page_index_scale: int = _PAGE_INDEX_DIVISOR,
+    pages_per_seq: int = 3,
+    sequential_pages: bool = False,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    num_pages = _NUM_PAGES * page_index_scale // _PAGE_INDEX_DIVISOR
+    num_pages = _BATCH_SIZE * pages_per_seq * page_index_scale // _PAGE_INDEX_DIVISOR
     shape = (
         num_pages,
         2,
@@ -67,9 +67,15 @@ def _make_pools(
         for layer in range(num_layers)
     ]
     pools = [pool.cuda() for pool in pools_cpu]
-    raw_pages = [[4, 1, 5], [2, 0, 3]]
-    assert set(raw_pages[0]).isdisjoint(raw_pages[1])
-    raw_page_table = torch.tensor(raw_pages, dtype=torch.int32, device="cuda")
+    if sequential_pages:
+        raw_page_table = torch.arange(
+            _BATCH_SIZE * pages_per_seq, dtype=torch.int32, device="cuda"
+        ).reshape(_BATCH_SIZE, pages_per_seq)
+    else:
+        assert pages_per_seq == 3
+        raw_pages = [[4, 1, 5], [2, 0, 3]]
+        assert set(raw_pages[0]).isdisjoint(raw_pages[1])
+        raw_page_table = torch.tensor(raw_pages, dtype=torch.int32, device="cuda")
     page_table = _encode_k_block_offsets(raw_page_table, page_index_scale)
     page_tables = [page_table] * num_layers
     assert page_tables[0].stride(0) == 2 * page_tables[0].shape[1]
@@ -177,78 +183,72 @@ def _compact(
     )
 
 
-@pytest.mark.parametrize(
-    "dtype,head_dim",
-    [
-        (torch.bfloat16, 64),
-        (torch.bfloat16, 128),
-    ],
-)
-@pytest.mark.parametrize(
-    "destination_base,page_index_scale",
-    [(0, 2), (2, 2), (2, 4)],
-)
-def test_sparse_kv_cache_compact_layers(dtype, head_dim, destination_base, page_index_scale):
-    pools_cpu, pools, page_tables = _make_pools(3, dtype, head_dim, page_index_scale)
-    page_tables_cpu = [page_table.cpu() for page_table in page_tables]
-    source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
-    source_row = torch.tensor([2, 5, 8, 3, 7, 10], dtype=torch.int32)
-    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
-    expected = _reference_compact(
-        pools_cpu,
-        page_tables_cpu,
-        source_indices,
-        source_offsets,
-        destination_base,
+_SMALL_ROW = [2, 5, 8, 3, 7, 10]
+# One byte-equality case per launch shape the op serves: dtype/head_dim and
+# destination/page-scale sweeps, per-request destination bases (one launch
+# mixing pinned-prompt lengths), a 3-D per-layer source with layer routing,
+# and a multi-tile launch (40/35 moves across 24-page sequences).
+_LAYER_CASES = [
+    pytest.param(
+        dict(head_dim=head_dim, dest=dest, scale=scale),
+        id=f"bf16_h{head_dim}_dest{dest}_scale{scale}",
     )
-    arguments = _device_arguments(pools, source_indices, source_offsets)
+    for head_dim in (64, 128)
+    for dest, scale in ((0, 2), (2, 2), (2, 4))
+] + [
+    pytest.param(
+        dict(head_dim=64, num_layers=2, row=[3, 5, 8, 6, 7, 10], dest=[2, 5]),
+        id="per_request_destination_bases",
+    ),
+    pytest.param(
+        dict(
+            head_dim=64,
+            num_layers=2,
+            dest=2,
+            indices3d=[
+                [[2, 5, 8, 3, 7, 10], [3, 6, 9, 2, 5, 8]],
+                [[3, 7, 10, 2, 6, 9], [2, 5, 9, 3, 6, 10]],
+                [[4, 7, 9, 3, 6, 8], [3, 5, 8, 4, 7, 10]],
+            ],
+            layer_indices=[2, 0],
+        ),
+        id="per_layer_source",
+    ),
+    pytest.param(
+        dict(
+            head_dim=64,
+            num_layers=2,
+            dest=2,
+            pages_per_seq=24,
+            sequential_pages=True,
+            offsets=(0, 40, 75),
+            row=list(range(40, 80)) + list(range(36, 71)),
+        ),
+        id="multiple_tiles",
+    ),
+]
 
-    _compact(pools, page_tables, arguments, destination_base)
-    torch.cuda.synchronize()
 
-    for actual, reference in zip(pools, expected):
-        assert torch.equal(actual.cpu(), reference)
-
-
-def test_sparse_kv_cache_compact_layers_per_request_destination_bases():
-    # One launch may mix pinned-prompt lengths: each request lands at its own
-    # destination base.
-    pools_cpu, pools, page_tables = _make_pools(2, torch.bfloat16, 64)
-    page_tables_cpu = [page_table.cpu() for page_table in page_tables]
-    source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
-    source_row = torch.tensor([3, 5, 8, 6, 7, 10], dtype=torch.int32)
-    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
-    destination_bases = [2, 5]
-    expected = _reference_compact(
-        pools_cpu,
-        page_tables_cpu,
-        source_indices,
-        source_offsets,
-        destination_bases,
+@pytest.mark.parametrize("case", _LAYER_CASES)
+def test_sparse_kv_cache_compact_layers(case):
+    pools_cpu, pools, page_tables = _make_pools(
+        case.get("num_layers", 3),
+        torch.bfloat16,
+        case["head_dim"],
+        case.get("scale", _PAGE_INDEX_DIVISOR),
+        pages_per_seq=case.get("pages_per_seq", 3),
+        sequential_pages=case.get("sequential_pages", False),
     )
-    arguments = _device_arguments(pools, source_indices, source_offsets)
-
-    _compact(pools, page_tables, arguments, destination_bases)
-    torch.cuda.synchronize()
-
-    for actual, reference in zip(pools, expected):
-        assert torch.equal(actual.cpu(), reference)
-
-
-def test_sparse_kv_cache_compact_layers_per_layer_source():
-    pools_cpu, pools, page_tables = _make_pools(2, torch.bfloat16, 64)
     page_tables_cpu = [page_table.cpu() for page_table in page_tables]
-    source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
-    source_indices = torch.tensor(
-        [
-            [[2, 5, 8, 3, 7, 10], [3, 6, 9, 2, 5, 8]],
-            [[3, 7, 10, 2, 6, 9], [2, 5, 9, 3, 6, 10]],
-            [[4, 7, 9, 3, 6, 8], [3, 5, 8, 4, 7, 10]],
-        ],
-        dtype=torch.int32,
-    )
-    source_layer_indices = torch.tensor([2, 0], dtype=torch.int32)
-    destination_base = 2
+    source_offsets = torch.tensor(case.get("offsets", (0, 3, 6)), dtype=torch.int32)
+    if "indices3d" in case:
+        source_indices = torch.tensor(case["indices3d"], dtype=torch.int32)
+        source_layer_indices = torch.tensor(case["layer_indices"], dtype=torch.int32)
+    else:
+        source_row = torch.tensor(case.get("row", _SMALL_ROW), dtype=torch.int32)
+        source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
+        source_layer_indices = None
+    destination_base = case.get("dest", 0)
     expected = _reference_compact(
         pools_cpu,
         page_tables_cpu,
@@ -257,66 +257,7 @@ def test_sparse_kv_cache_compact_layers_per_layer_source():
         destination_base,
         source_layer_indices,
     )
-    arguments = _device_arguments(
-        pools,
-        source_indices,
-        source_offsets,
-        source_layer_indices,
-    )
-
-    _compact(pools, page_tables, arguments, destination_base)
-    torch.cuda.synchronize()
-
-    for actual, reference in zip(pools, expected):
-        assert torch.equal(actual.cpu(), reference)
-
-
-def test_sparse_kv_cache_compact_layers_rejects_flat_source_with_layer_indices():
-    # A flat [kv_heads, total] source with per-layer indices would silently
-    # read layer 0 for every launch; the op rejects the combination instead.
-    _, pools, page_tables = _make_pools(2, torch.bfloat16, 64)
-    source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
-    source_row = torch.tensor([2, 5, 8, 3, 7, 10], dtype=torch.int32)
-    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
-    source_layer_indices = torch.tensor([0, 0], dtype=torch.int32)
     arguments = _device_arguments(pools, source_indices, source_offsets, source_layer_indices)
-
-    with pytest.raises(RuntimeError, match="require 3-D per-layer source_indices"):
-        _compact(pools, page_tables, arguments, 0)
-
-
-def test_sparse_kv_cache_compact_layers_multiple_tiles():
-    num_layers = 2
-    max_pages_per_sequence = 24
-    num_pages = _BATCH_SIZE * max_pages_per_sequence
-    shape = (num_pages, 2, _NUM_KV_HEADS, _TOKENS_PER_BLOCK, 64)
-    numel = torch.Size(shape).numel()
-    pools_cpu = [
-        ((torch.arange(numel, dtype=torch.int32) + layer * 37) % 251)
-        .reshape(shape)
-        .to(torch.bfloat16)
-        for layer in range(num_layers)
-    ]
-    pools = [pool.cuda() for pool in pools_cpu]
-    raw_page_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").reshape(
-        _BATCH_SIZE, max_pages_per_sequence
-    )
-    page_table = _encode_k_block_offsets(raw_page_table)
-    page_tables = [page_table] * num_layers
-    assert page_tables[0].stride(0) == 2 * max_pages_per_sequence
-    page_tables_cpu = [table.cpu() for table in page_tables]
-    source_offsets = torch.tensor([0, 40, 75], dtype=torch.int32)
-    source_row = torch.cat((torch.arange(40, 80), torch.arange(36, 71))).to(torch.int32)
-    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
-    destination_base = 2
-    expected = _reference_compact(
-        pools_cpu,
-        page_tables_cpu,
-        source_indices,
-        source_offsets,
-        destination_base,
-    )
-    arguments = _device_arguments(pools, source_indices, source_offsets)
 
     _compact(pools, page_tables, arguments, destination_base)
     torch.cuda.synchronize()
@@ -330,7 +271,7 @@ def test_sparse_kv_cache_compact_layers_cuda_graph_replay():
     pools_cpu, pools, page_tables = _make_pools(3, torch.bfloat16, 64)
     page_tables_cpu = [page_table.cpu() for page_table in page_tables]
     source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
-    source_row = torch.tensor([2, 5, 8, 3, 7, 10], dtype=torch.int32)
+    source_row = torch.tensor(_SMALL_ROW, dtype=torch.int32)
     source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
     replay_row = torch.tensor([3, 6, 9, 2, 5, 8], dtype=torch.int32)
     replay_indices = replay_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
@@ -362,7 +303,7 @@ def test_sparse_kv_cache_compact_layers_cuda_graph_replay():
 #
 # The fast path only dispatches for bf16 pools with head_dim 64/128 and
 # 32/128-token pages, so the cases below use their own builder instead of the
-# 4-token-page fixtures above.
+# 3-page fixtures above.
 
 _FAST_BATCH_SIZE = 3
 # Per-request move counts: two ragged tiles plus a full one (pipeline steady
@@ -504,45 +445,56 @@ def _run_fast_geometry_case(case: _FastGeometryCase) -> list[torch.Tensor]:
 
 # The full fast-path gate matrix. 128-token pages are the geometry the ported
 # kernel was written for; 32-token pages and head_dim 128 are this tree's
-# production configuration.
+# production configuration. The per-layer-source row keeps the 3-D routing
+# path runnable through the fast kernel.
 _FAST_GEOMETRY_MATRIX = [(64, 32), (128, 32), (64, 128), (128, 128)]
 
 
-@pytest.mark.parametrize("head_dim,tokens_per_block", _FAST_GEOMETRY_MATRIX)
-def test_sparse_kv_cache_compact_layers_fast_geometry(head_dim, tokens_per_block):
+@pytest.mark.parametrize(
+    "head_dim,tokens_per_block,per_layer",
+    [(h, t, False) for h, t in _FAST_GEOMETRY_MATRIX] + [(64, 32, True)],
+)
+def test_sparse_kv_cache_compact_layers_fast_geometry(head_dim, tokens_per_block, per_layer):
     # Eligible geometry always dispatches the pipelined kernel; the
     # byte-compare against the CPU reference is the correctness net.
-    case = _make_fast_geometry_case(head_dim, tokens_per_block)
+    case = _make_fast_geometry_case(head_dim, tokens_per_block, per_layer_sources=per_layer)
     expected = _run_fast_geometry_case(case)
     for actual, reference in zip(case.pools, expected):
         assert torch.equal(actual.cpu(), reference)
 
 
-def test_sparse_kv_cache_compact_layers_fast_geometry_per_layer_source():
-    case = _make_fast_geometry_case(64, 32, per_layer_sources=True)
-    expected = _run_fast_geometry_case(case)
-    for actual, reference in zip(case.pools, expected):
-        assert torch.equal(actual.cpu(), reference)
-
-
+# One representative per reject family: dtype outside the bf16-only gate,
+# head_dim outside the gate, page size outside the gate, and a flat 2-D
+# source combined with per-layer indices (which would silently read layer 0
+# for every launch). There is no fallback kernel: every reject must fail
+# loudly and leave the pools untouched.
 @pytest.mark.parametrize(
-    "dtype,head_dim,tokens_per_block",
+    "dtype,head_dim,tokens_per_block,flat_with_layer_indices,match",
     [
-        (torch.float16, 64, 32),  # dtype outside the bf16-only gate
-        (torch.bfloat16, 256, 32),  # head_dim outside the gate
-        (torch.bfloat16, 64, 16),  # page size outside the gate
+        pytest.param(torch.float16, 64, 32, False, "bf16|BF16", id="dtype_outside_gate"),
+        pytest.param(torch.bfloat16, 256, 32, False, "bf16|BF16", id="head_dim_outside_gate"),
+        pytest.param(torch.bfloat16, 64, 16, False, "bf16|BF16", id="page_size_outside_gate"),
+        pytest.param(
+            torch.bfloat16,
+            64,
+            32,
+            True,
+            "require 3-D per-layer source_indices",
+            id="flat_source_with_layer_indices",
+        ),
     ],
 )
-def test_sparse_kv_cache_compact_layers_rejects_unsupported_geometry(
-    dtype, head_dim, tokens_per_block
+def test_sparse_kv_cache_compact_layers_rejects_invalid_launch(
+    dtype, head_dim, tokens_per_block, flat_with_layer_indices, match
 ):
-    # There is no fallback kernel: near-miss geometries must fail loudly
-    # instead of silently degrading, and the pools must stay untouched.
     case = _make_fast_geometry_case(head_dim, tokens_per_block, dtype=dtype)
+    source_layer_indices = case.source_layer_indices
+    if flat_with_layer_indices:
+        source_layer_indices = torch.tensor([0, 0], dtype=torch.int32)
     arguments = _device_arguments(
-        case.pools, case.source_indices, case.source_offsets, case.source_layer_indices
+        case.pools, case.source_indices, case.source_offsets, source_layer_indices
     )
-    with pytest.raises((RuntimeError, ValueError), match="bf16|BF16"):
+    with pytest.raises((RuntimeError, ValueError), match=match):
         _compact(
             case.pools,
             case.page_tables,

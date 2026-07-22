@@ -9,8 +9,9 @@ broadcast over the draft's own KV heads, the draft's own protected tail is
 appended as ordinals ``valid_seq_len + 0..tail-1``, and both caches land at
 ``destination_base = prompt_len``. These tests cover the physical draft moves,
 the packed move indices, stream ordering across both cache managers, the
-speculative admission gates, the published compressed-token invariant, and
-prepared-compaction cache invalidation.
+speculative admission gates (one representative per guard family), the
+published compressed-token invariant, and prepared-compaction cache
+invalidation.
 """
 
 from types import SimpleNamespace
@@ -18,16 +19,16 @@ from unittest import mock
 
 import pytest
 import torch
+from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_fake_v2 as _make_fake_v2
+from conftest import make_fixed_resources_stubs as _make_fixed_resources_stubs
+from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_request as _make_request
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-    BatchedKVCacheCompaction,
-)
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     TriAttention,
     _FixedScoreStagingBuffers,
@@ -47,55 +48,19 @@ def _launched_draft_compaction(draft_protected_tails):
     """Build target and draft pools with distinct head counts, then compact.
 
     The compact op ships only the pipelined bf16 kernels, so the pools use
-    the supported production geometry (bf16, 32-token pages, head_dim 64).
-    Pool payloads are a shifted ``arange % 251`` ramp: every value is exact
-    in bf16 and any wrong page/plane/head/token move lands on a different
-    byte pattern, so the equality checks below stay conclusive.
+    the supported production geometry (bf16, 32-token pages, head_dim 64) and
+    the conclusive shifted ``arange % 251`` ramp payload.
     """
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
-    target_kv_heads = 2
-    draft_kv_heads = 4
     prompt_len = 2
-    decode_keep_count = 4
-    tokens_per_block = 32
-    head_dim = 64
     target_protected_tails = [2, 1]
     valid_seq_lens = [10, 9]
 
     target_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
     draft_tables = torch.tensor([[1, 0, 2], [5, 4, 3]], dtype=torch.int32, device=device)
-    target_pools = [
-        (
-            (
-                torch.arange(
-                    6 * 2 * target_kv_heads * tokens_per_block * head_dim,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                + layer * 37
-            )
-            % 251
-        )
-        .view(6, 2, target_kv_heads, tokens_per_block, head_dim)
-        .to(torch.bfloat16)
-        for layer in range(2)
-    ]
-    draft_pool = (
-        (
-            (
-                torch.arange(
-                    6 * 2 * draft_kv_heads * tokens_per_block * head_dim,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                + 149
-            )
-            % 251
-        )
-        .view(6, 2, draft_kv_heads, tokens_per_block, head_dim)
-        .to(torch.bfloat16)
-    )
+    target_pools = _make_ramp_pools(2, num_kv_heads=2, device=device)
+    draft_pool = _make_ramp_pools(1, num_kv_heads=4, base=149, device=device)[0]
     assert target_pools[0].shape[2] != draft_pool.shape[2]
     initial_target = [pool.clone() for pool in target_pools]
     initial_draft = draft_pool.clone()
@@ -104,21 +69,13 @@ def _launched_draft_compaction(draft_protected_tails):
     # never appear in the selection rectangle.
     keep = torch.tensor([[2, 4, 7, 9], [3, 5, 6, 8]], dtype=torch.int64, device=device)
 
-    compaction = BatchedKVCacheCompaction(
-        eviction_mode="union",
+    compaction = _build_compaction(
         layer_pools=target_pools,
-        dense_layers=[0, 1],
-        swa_layers=[],
-        layer_group_representative={0: 0, 1: 1},
         layer_pool_keys=[("pool", 0), ("pool", 0)],
         kept_token_ordinals=keep.to(torch.int32),
         valid_sequence_lengths=torch.tensor(valid_seq_lens, dtype=torch.int32, device=device),
         kv_block_offsets=_encode_block_offsets(target_tables),
-        page_table_slots={0: 0, 1: 0},
-        request_count=request_count,
         prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
-        decode_keep_count=decode_keep_count,
-        swa_window=None,
         protected_tail_capacity=max(target_protected_tails),
         draft_layer_pools=[draft_pool],
         draft_layers=[0],
@@ -150,11 +107,14 @@ def _launched_draft_compaction(draft_protected_tails):
     )
 
 
-def test_draft_pools_receive_target_union_keep_set_and_own_tail():
-    built = _launched_draft_compaction(draft_protected_tails=[1, 2])
+@pytest.mark.parametrize("draft_protected_tails", [[1, 1], [1, 2]])
+def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protected_tails):
+    built = _launched_draft_compaction(draft_protected_tails=draft_protected_tails)
     device = built.device
     prompt_len = built.prompt_len
 
+    expected_offsets = [0]
+    expected_moves = []
     for request in range(built.request_count):
         valid = built.valid_seq_lens[request]
         # Target dense layers compact the union keep set plus the target tail.
@@ -207,27 +167,13 @@ def test_draft_pools_receive_target_union_keep_set_and_own_tail():
                 before[:, head].index_select(1, draft_source),
             )
 
+        expected_moves.append(draft_source.to(torch.int32))
+        expected_offsets.append(expected_offsets[-1] + int(draft_source.numel()))
 
-@pytest.mark.parametrize("draft_protected_tails", [[1, 1], [1, 2]])
-def test_draft_pack_matches_keep_broadcast_and_tail_ordinal_oracle(draft_protected_tails):
-    built = _launched_draft_compaction(draft_protected_tails=draft_protected_tails)
+    # The packed draft move indices must match the same broadcast-plus-tail
+    # oracle the physical moves followed.
     draft_compaction = built.compaction.draft_compaction
-
-    expected_offsets = [0]
-    expected_moves = []
-    for request in range(built.request_count):
-        decode = built.keep[request].to(torch.int32)
-        tail = torch.arange(
-            built.valid_seq_lens[request],
-            built.valid_seq_lens[request] + draft_protected_tails[request],
-            dtype=torch.int32,
-            device=built.device,
-        )
-        moves = torch.cat((decode, tail))
-        expected_moves.append(moves)
-        expected_offsets.append(expected_offsets[-1] + int(moves.numel()))
     expected_row = torch.cat(expected_moves)
-
     assert draft_compaction.move_source_offsets.cpu().tolist() == expected_offsets
     draft_indices = draft_compaction.move_source_indices
     # The index buffer is sized for the widest tail (the capacity); this
@@ -268,32 +214,47 @@ def test_mark_page_tables_consumed_orders_both_manager_streams():
 @pytest.mark.parametrize(
     "gate,match",
     [
-        ("union_only", "union"),
+        # One representative per guard family (the per-mode/per-config
+        # variants raise through the same checks).
+        ("union_only_per_head", "union"),
+        ("union_only_per_layer", "union"),
         ("draft_kv_factor", "standard key/value cache"),
         ("full_attention_draft", "full-attention draft"),
-        ("dflash", "standard paged cache compacted together"),
+        ("callsite_dflash", "standard paged cache compacted together"),
+        ("callsite_draft_target", "standard paged cache compacted together"),
+        ("callsite_pard", "standard paged cache compacted together"),
     ],
 )
 def test_draft_admission_gates_raise(gate, match):
     draft_manager = _make_fake_v2(is_draft=True)
     if gate == "full_attention_draft":
         draft_manager.max_attention_window_vec = [128]
-    if gate == "dflash":
-        # DFlash reads cross-attention context buffers, not a paged KV cache;
-        # the call-site speculative gate rejects before any manager is
-        # created.
+    if gate.startswith("callsite_"):
+        # These draft contracts read cross-attention buffers or unvalidated
+        # paged tails; the call-site speculative gate rejects every one of
+        # them before any manager is created.
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import (
             DFlashDecodingConfig,
+            DraftTargetDecodingConfig,
+            PARDDecodingConfig,
             TriAttentionKvCacheCompressionConfig,
         )
 
+        spec_config = {
+            "callsite_dflash": lambda: DFlashDecodingConfig(max_draft_len=3),
+            "callsite_draft_target": lambda: DraftTargetDecodingConfig(
+                max_draft_len=3,
+                speculative_model="/tmp/draft-target-model",
+            ),
+            "callsite_pard": lambda: PARDDecodingConfig(max_draft_len=3),
+        }[gate]()
         with pytest.raises(ValueError, match=match):
             validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(
                     model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
                 ),
-                DFlashDecodingConfig(max_draft_len=3),
+                spec_config,
                 draft_manager,
             )
         return
@@ -301,7 +262,10 @@ def test_draft_admission_gates_raise(gate, match):
         _make_fake_v2(),
         top_B=8,
         model_path="/models/test",
-        eviction_mode="per_head" if gate == "union_only" else "union",
+        eviction_mode={
+            "union_only_per_head": "per_head",
+            "union_only_per_layer": "per_layer_perhead",
+        }.get(gate, "union"),
         draft_kv_cache_manager=draft_manager,
     )
     if gate == "draft_kv_factor":
@@ -359,6 +323,10 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
                 confirmed = state.confirmed_kv_length
                 cache.capacity = confirmed
                 assert confirmed == 2 + 4
+                # The staged logical position restores the uncompressed
+                # length: physical confirmed plus everything evicted so far.
+                prepared = internals.attach.call_args.args[0]
+                assert prepared[0].round_start == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
             assert request.py_num_compressed_tokens == uncompressed - confirmed
@@ -379,13 +347,7 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
     manager = _make_triattention(top_B=4)
-    manager._H = 2
-    manager._F = 2
-    manager._freq_scale_sq = torch.ones(2)
-    manager._offsets = torch.ones(2)
-    manager.calibration = {"omega": torch.ones(2)}
-    manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
-    manager._page_table_pool_keys = mock.Mock(return_value=[("pool", 0)])
+    layout, score_staging, keep_set_selector = _make_fixed_resources_stubs(manager)
     draft_manager = _make_fake_v2(is_draft=True)
     draft_manager.num_pools = 1
     manager.draft_kv_cache_manager = draft_manager
@@ -397,30 +359,6 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
             pool_page_counts=(4,),
             pool_view_fingerprint=(),
         )
-    )
-    pool = torch.empty(8, 2, 1, 4, 4)
-    layout = SimpleNamespace(
-        manager=SimpleNamespace(num_pools=1),
-        num_layers=2,
-        global_layers=[0, 1],
-        layer_pools=[pool, pool],
-        dense_layers=[0, 1],
-        swa_layers=[],
-        storage_groups={0: [0, 1]},
-        pool_view_fingerprint=(("fixed",),),
-    )
-
-    score_staging = SimpleNamespace(
-        fused_group=SimpleNamespace(output=torch.empty(8, 4, 260)),
-        bind_score_launcher=mock.Mock(),
-        token_starts_device=torch.zeros(8, dtype=torch.int32),
-        decode_width=260,
-        page_table_token_capacity=65537,
-        max_requests=8,
-    )
-    keep_set_selector = SimpleNamespace(
-        valid_widths=torch.empty(8, dtype=torch.int32),
-        top_indices_i32=torch.zeros(8, 4, dtype=torch.int32),
     )
     prepared = [
         _PreparedEviction(

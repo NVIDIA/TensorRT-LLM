@@ -4,12 +4,11 @@
 
 import pytest
 import torch
+from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-    BatchedKVCacheCompaction,
-)
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _BatchedPerHeadKeepSetSelector,
     _BatchedUnionKeepSetSelector,
@@ -71,36 +70,6 @@ def _per_head_keep_oracle(
     return torch.stack(rows)
 
 
-def _legacy_union(scores: torch.Tensor, keep_count: int) -> torch.Tensor:
-    row_top = {
-        int(index)
-        for row in scores
-        for index in _stable_topk(row, row.numel(), keep_count).tolist()
-    }
-    combined = scores.max(dim=0).values
-    ordered = sorted(
-        row_top,
-        key=lambda index: (-float(combined[index]), index),
-    )
-    return torch.tensor(ordered[:keep_count], dtype=torch.long)
-
-
-@pytest.mark.parametrize("rows,width,keep_count", [(2, 8, 4), (5, 17, 7)])
-def test_direct_union_topk_matches_legacy_union_with_heavy_ties(rows, width, keep_count):
-    for seed in range(25):
-        generator = torch.Generator().manual_seed(seed)
-        scores = torch.randint(
-            -2,
-            3,
-            (rows, width),
-            generator=generator,
-            dtype=torch.int32,
-        ).to(torch.float32)
-        combined = scores.max(dim=0).values
-        direct = _stable_topk(combined, width, keep_count).to(torch.long)
-        assert torch.equal(direct, _legacy_union(scores, keep_count))
-
-
 @pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
 @pytest.mark.parametrize("normalize_scores", [False, True])
 def test_per_head_selection_matches_torch_oracle_on_selector_stream(
@@ -149,64 +118,11 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     assert torch.equal(second, expected)
 
 
-def test_union_eager_runs_the_registered_cute_op():
-    _require_cute_topk_op()
-    device = torch.device("cuda", torch.cuda.current_device())
-    # The fused CuTe pipeline is the production union-row producer; these
-    # selector tests stage prepared union rows into ``combined`` directly.
-    scores = torch.randn(2, 4, 96, dtype=torch.float32, device=device)
-    selector = _BatchedUnionKeepSetSelector(
-        rows=4,
-        width=96,
-        keep_count=64,
-        dtype=torch.float32,
-        device=device,
-        max_requests=2,
-    )
-    selector.combined.copy_(scores.amax(dim=1))
-    selector.select_prepared_union_scores()
-    torch.cuda.synchronize(device)
-    assert torch.all(selector.keep[:, 1:] >= selector.keep[:, :-1])
-
-
-def test_prepared_union_rows_select_exact_indices():
-    _require_cute_topk_op()
-    device = torch.device("cuda", torch.cuda.current_device())
-    request_count, width, keep_count = 2, 97, 64
-    generator = torch.Generator(device=device).manual_seed(53)
-    combined_rows = torch.randn(
-        request_count,
-        width,
-        generator=generator,
-        dtype=torch.float32,
-        device=device,
-    )
-    valid_widths = torch.tensor([83, 91], dtype=torch.int32, device=device)
-
-    selector = _BatchedUnionKeepSetSelector(
-        rows=7,
-        width=width,
-        keep_count=keep_count,
-        dtype=torch.float32,
-        device=device,
-        max_requests=request_count,
-    )
-    selector.valid_widths.copy_(valid_widths)
-    selector.combined.copy_(combined_rows)
-    selector.select_prepared_union_scores()
-    actual_keep = selector.keep.cpu()
-    expected_combined = combined_rows.cpu()
-    torch.cuda.synchronize(device)
-
-    for request, valid_width in enumerate(valid_widths.cpu().tolist()):
-        expected_keep = torch.sort(
-            _stable_topk(expected_combined[request], valid_width, keep_count)
-        ).values
-        assert torch.equal(actual_keep[request], expected_keep)
-
-
 @pytest.mark.parametrize("keep_count,width", [(4, 64), (4096, 4224), (8192, 9216)])
 def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, width):
+    # Heavily tied integer scores with ragged valid widths and per-request
+    # prompt rebase: the strongest oracle over the direct union top-k path
+    # (it subsumes the sorted-output and exact-indices smoke variants).
     _require_cute_topk_op()
     device = torch.device("cuda", torch.cuda.current_device())
     prompt_len = 17
@@ -246,12 +162,6 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
             _stable_topk(combined[request], valid_width, keep_count).to(torch.int32) + prompt_len
         ).values
         assert torch.equal(actual[request], expected_decode)
-
-
-# The retired split-union preparation (``prepare_union_scores``) is covered
-# by its standalone reference copy in test_triattention_cute_union_fusion.py,
-# which validates it against a pure-torch oracle and uses it as the
-# fused-pipeline equivalence reference.
 
 
 @pytest.mark.parametrize("per_layer", [False, True])
@@ -329,8 +239,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
     # The compact op ships only the pipelined bf16 kernels: pools use the
     # supported geometry (bf16, 32-token pages, head_dim 64), and the kept
     # ordinals are spread across all three pages per request so the moves
-    # still cross page boundaries. The bf16-exact ``arange % 251`` payload
-    # keeps every wrong-move byte pattern distinguishable.
+    # still cross page boundaries.
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     num_layers = 2
@@ -343,22 +252,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
     head_dim = 64
     protected_tails = [2, 1]
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
-    initial_pools = [
-        (
-            (
-                torch.arange(
-                    6 * 2 * num_kv_heads * tokens_per_block * head_dim,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                + layer * 37
-            )
-            % 251
-        )
-        .view(6, 2, num_kv_heads, tokens_per_block, head_dim)
-        .to(torch.bfloat16)
-        for layer in range(num_layers)
-    ]
+    initial_pools = _make_ramp_pools(num_layers, device=device)
     pools = [pool.clone() for pool in initial_pools]
 
     # Kept ordinals are decode-only but hold absolute positions; the pinned
@@ -391,21 +285,13 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
                     device=device,
                 )
 
-    compaction = BatchedKVCacheCompaction(
+    compaction = _build_compaction(
         eviction_mode=eviction_mode,
         layer_pools=pools,
-        dense_layers=[0, 1],
-        swa_layers=[],
-        layer_group_representative={0: 0, 1: 1},
-        layer_pool_keys=[("dense", 0), ("dense", 0)],
         kept_token_ordinals=keep.to(torch.int32),
         valid_sequence_lengths=torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device),
         kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
-        page_table_slots={0: 0, 1: 0},
-        request_count=request_count,
         prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
-        decode_keep_count=decode_keep_count,
-        swa_window=None,
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(compaction, protected_tails)
@@ -454,15 +340,12 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     num_layers = 2
-    num_kv_heads = 2
     # bf16 pools in the compact op's supported geometry; three 32-token pages
     # per request with a 80-token sequence keep the moves page-crossing.
     seq_len = 80
     decode_keep_count = 3
     prompt_lens = [2, 5]
     protected_tails = [2, 1]
-    tokens_per_block = 32
-    head_dim = 64
     decode_widths = [seq_len - prompt_len for prompt_len in prompt_lens]
     width = max(decode_widths)
 
@@ -486,40 +369,17 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
     )
 
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
-    initial_pools = [
-        (
-            (
-                torch.arange(
-                    6 * 2 * num_kv_heads * tokens_per_block * head_dim,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                + layer * 37
-            )
-            % 251
-        )
-        .view(6, 2, num_kv_heads, tokens_per_block, head_dim)
-        .to(torch.bfloat16)
-        for layer in range(num_layers)
-    ]
+    initial_pools = _make_ramp_pools(num_layers, device=device)
     cohort_pools = [pool.clone() for pool in initial_pools]
     keep_cuda = keep.to(device)
     valid_seq_lens = torch.tensor([seq_len, seq_len], dtype=torch.int32, device=device)
-    cohort_compaction = BatchedKVCacheCompaction(
-        eviction_mode="union",
+    cohort_compaction = _build_compaction(
         layer_pools=cohort_pools,
-        dense_layers=[0, 1],
-        swa_layers=[],
-        layer_group_representative={0: 0, 1: 1},
-        layer_pool_keys=[("dense", 0), ("dense", 0)],
         kept_token_ordinals=keep_cuda,
         valid_sequence_lengths=valid_seq_lens,
         kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
-        page_table_slots={0: 0, 1: 0},
-        request_count=request_count,
         prompt_offsets=torch.tensor(prompt_lens, dtype=torch.int32, device=device),
         decode_keep_count=decode_keep_count,
-        swa_window=None,
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(cohort_compaction, protected_tails)
@@ -527,21 +387,14 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
 
     expected_pools = [pool.clone() for pool in initial_pools]
     for request in range(request_count):
-        single_compaction = BatchedKVCacheCompaction(
-            eviction_mode="union",
+        single_compaction = _build_compaction(
             layer_pools=expected_pools,
-            dense_layers=[0, 1],
-            swa_layers=[],
-            layer_group_representative={0: 0, 1: 1},
-            layer_pool_keys=[("dense", 0), ("dense", 0)],
             kept_token_ordinals=keep_cuda[request : request + 1],
             valid_sequence_lengths=valid_seq_lens[request : request + 1],
             kv_block_offsets=_encode_block_offsets(page_tables[request : request + 1].unsqueeze(0)),
-            page_table_slots={0: 0, 1: 0},
             request_count=1,
             prompt_offsets=torch.tensor([prompt_lens[request]], dtype=torch.int32, device=device),
             decode_keep_count=decode_keep_count,
-            swa_window=None,
             protected_tail_capacity=protected_tails[request],
         )
         _set_protected_tails(single_compaction, [protected_tails[request]])
@@ -595,29 +448,13 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     )
     expected_keep = torch.tensor([[[1, 6], [2, 5], [3, 7]]], dtype=torch.int32, device=device)
 
-    pools = []
-    for layer, (table, values) in enumerate(zip(layer_tables, score_values)):
-        pool = (
-            (
-                (
-                    torch.arange(
-                        2 * 2 * tokens_per_block * head_dim,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    + layer * 37
-                )
-                % 251
-            )
-            .view(2, 2, 1, tokens_per_block, head_dim)
-            .to(torch.bfloat16)
-        )
+    pools = _make_ramp_pools(num_layers, num_kv_heads=1, pages=2, device=device)
+    for pool, (table, values) in zip(pools, zip(layer_tables, score_values)):
         for token, value in enumerate(values):
             page = int(table[0, token // tokens_per_block])
             slot = token % tokens_per_block
             pool[page, 0, 0, slot, 0] = value
             pool[page, 0, 0, slot, num_freqs] = 0
-        pools.append(pool)
     initial_pools = [pool.clone() for pool in pools]
 
     q_real = torch.zeros(num_layers, num_q_heads, num_freqs, dtype=torch.float32, device=device)
@@ -668,11 +505,10 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     keep_set_selector.select_requests(scores, normalize_scores=False)
     assert torch.equal(keep_set_selector.keep, expected_keep)
 
-    batched_compaction = BatchedKVCacheCompaction(
+    batched_compaction = _build_compaction(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
         dense_layers=dense_layers,
-        swa_layers=[],
         layer_group_representative=layer_group_representative,
         layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
         kept_token_ordinals=keep_set_selector.keep[:1],
@@ -682,15 +518,14 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         request_count=1,
         prompt_offsets=torch.zeros(1, dtype=torch.int32, device=device),
         decode_keep_count=keep_count,
-        swa_window=None,
         protected_tail_capacity=0,
     )
     _set_protected_tails(batched_compaction, [0])
     batched_compaction.compact()
     torch.cuda.synchronize(device)
 
-    for layer, (before_pool, after_pool, table) in enumerate(
-        zip(initial_pools, pools, layer_tables)
+    for before_pool, after_pool, table, layer in zip(
+        initial_pools, pools, layer_tables, range(num_layers)
     ):
         pages = table[0].to(torch.long)
         # The logical view spans both pages (2 * tokens_per_block slots); the
@@ -709,8 +544,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     32-token pages, head_dim 64): the request spans three pages so that
     compacting to two pages still releases one physical page for reuse.
     Token scores are tracked in a host-side mirror and the expected keep
-    sets are derived from it, replacing the hand-written score tables of the
-    old 4-token-page fixture.
+    sets are derived from it.
     """
     pytest.importorskip("cutlass")
     import tensorrt_llm
@@ -860,11 +694,9 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             prompt_offsets_buffer=score_staging.token_starts_device,
         )
         score_staging.bind_score_launcher(keep_set_selector.valid_widths, "mean")
-        batched_compaction = BatchedKVCacheCompaction(
-            eviction_mode="union",
+        batched_compaction = _build_compaction(
             layer_pools=[pool],
             dense_layers=[0],
-            swa_layers=[],
             layer_group_representative={0: 0},
             layer_pool_keys=[("pool", 0)],
             kept_token_ordinals=keep_set_selector.keep[:1],
@@ -874,7 +706,6 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             request_count=1,
             prompt_offsets=score_staging.token_starts_device[:1],
             decode_keep_count=keep_count,
-            swa_window=None,
             protected_tail_capacity=protected_tail,
         )
         _set_protected_tails(batched_compaction, [protected_tail])
@@ -974,12 +805,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
     device = torch.device("cuda", torch.cuda.current_device())
     dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
     swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
-    initial_pools = [
-        ((torch.arange(6 * 2 * 1 * 32 * 64, dtype=torch.int32, device=device) + layer * 37) % 251)
-        .view(6, 2, 1, 32, 64)
-        .to(torch.bfloat16)
-        for layer in range(2)
-    ]
+    initial_pools = _make_ramp_pools(2, num_kv_heads=1, device=device)
     pools = [pool.clone() for pool in initial_pools]
     # Decode-only kept ordinals holding absolute positions past the prompt.
     keep = torch.tensor(
@@ -989,8 +815,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
     )
     valid_seq_lens = torch.tensor([64, 56], dtype=torch.int32, device=device)
     protected_tails = [2, 1]
-    compaction = BatchedKVCacheCompaction(
-        eviction_mode="union",
+    compaction = _build_compaction(
         layer_pools=pools,
         dense_layers=[0],
         swa_layers=[1],
@@ -1000,9 +825,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         valid_sequence_lengths=valid_seq_lens,
         kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
         page_table_slots={0: 0, 1: 1},
-        request_count=2,
         prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
-        decode_keep_count=4,
         swa_window=2,
         protected_tail_capacity=max(protected_tails),
     )
@@ -1070,8 +893,7 @@ def test_cache_families_read_the_staged_move_offsets_rows():
     staged_rows = torch.zeros(2, 3, dtype=torch.int32, device=device)
     dense_offsets_row = staged_rows[0]
     swa_offsets_row = staged_rows[1]
-    compaction = BatchedKVCacheCompaction(
-        eviction_mode="union",
+    compaction = _build_compaction(
         layer_pools=pools,
         dense_layers=[0],
         swa_layers=[1],
@@ -1081,9 +903,7 @@ def test_cache_families_read_the_staged_move_offsets_rows():
         valid_sequence_lengths=torch.tensor([8, 7], dtype=torch.int32, device=device),
         kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
         page_table_slots={0: 0, 1: 1},
-        request_count=2,
         prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
-        decode_keep_count=4,
         swa_window=2,
         protected_tail_capacity=2,
         dense_move_offsets=dense_offsets_row,
