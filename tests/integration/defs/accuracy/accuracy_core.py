@@ -105,7 +105,19 @@ class HypothesisTestingParams:
 
     def report(self, accuracy: Optional[float] = None) -> str:
         metric_name = self.metric_name.upper()
-        report = f"""===========================================================
+        if self.threshold_override is not None:
+            # The hypothesis-test statistics do not apply to an explicit
+            # floor; printing them would suggest a different threshold.
+            report = f"""===========================================================
+= {metric_name} CHECK
+===========================================================
+#Samples: {self.num_samples}
+Higher is better: {self.higher_is_better}
+Reference {self.metric_name}: {self.ref_accuracy:.3f}
+Threshold (explicit floor): {self.threshold:.3f}
+==========================================================="""
+        else:
+            report = f"""===========================================================
 = {metric_name} HYPOTHESIS TESTING
 ===========================================================
 Alpha (Type I:  False Positive): {self.alpha:.3f}
