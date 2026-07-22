@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/scheduledBlocksManager.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 
@@ -36,6 +37,14 @@ using kv_cache_manager::BlockKeyHasher;
 
 namespace
 {
+
+constexpr char kExcludeDisaggGenerationTransferFromCapacityEnv[]
+    = "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY";
+
+bool excludeDisaggGenerationTransferFromCapacity()
+{
+    return common::getBoolEnv(kExcludeDisaggGenerationTransferFromCapacityEnv);
+}
 
 std::tuple<std::unordered_set<BlockKey, BlockKeyHasher>, std::unordered_set<BlockKey, BlockKeyHasher>>
 prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
@@ -254,6 +263,8 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     SizeType32 claimedPeftPages{0};
     std::unordered_set<uint64_t> uniqTaskIds{};
     std::size_t numAdmittedRequests{0};
+    bool const excludeDisaggGenerationTransfer
+        = !StaticBatchScheduling && excludeDisaggGenerationTransferFromCapacity();
     RequestVector pendingRequests;
     RequestVector pendingDisGenInitRequests;
     pendingRequests.reserve(activeRequests.size());
@@ -269,14 +280,25 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
             continue;
         }
 
-        if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests))
+        bool const isDisaggGenerationTransfer = req->isDisaggGenerationTransmissionInProgress();
+        if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests)
+            && !(excludeDisaggGenerationTransfer && isDisaggGenerationTransfer))
         {
+            // Under the diagnostic, keep scanning so later transfer-only requests still reserve their physical
+            // resources even after the logical compute-request capacity is full.
+            if (excludeDisaggGenerationTransfer)
+            {
+                continue;
+            }
             break;
         }
 
-        if (req->isDisaggGenerationTransmissionInProgress() || req->isGenerationInProgressState())
+        if (isDisaggGenerationTransfer || req->isGenerationInProgressState())
         {
-            ++numAdmittedRequests;
+            if (!isDisaggGenerationTransfer || !excludeDisaggGenerationTransfer)
+            {
+                ++numAdmittedRequests;
+            }
             if (req->isGenerationInProgressState())
             {
                 scheduledRequests.emplace_back(req);
@@ -493,6 +515,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
     RequestVector scheduledRequests;
     RequestVector pausedRequests;
     std::size_t numAdmittedRequests{0};
+    bool const excludeDisaggGenerationTransfer = excludeDisaggGenerationTransferFromCapacity();
     auto reqItEnd = std::end(activeRequests);
     for (auto reqIt = std::begin(activeRequests); reqIt != reqItEnd;)
     {
@@ -512,12 +535,15 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
 
         if (req->isDisaggGenerationTransmissionInProgress())
         {
-            if (numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests))
+            if (!excludeDisaggGenerationTransfer && numAdmittedRequests >= static_cast<std::size_t>(mMaxNumRequests))
             {
                 break;
             }
             claimPeftPagesForRequest(req, peftCacheManager, numScheduledPeftPages, seenTaskIds);
-            ++numAdmittedRequests;
+            if (!excludeDisaggGenerationTransfer)
+            {
+                ++numAdmittedRequests;
+            }
             reqIt++;
             continue;
         }
@@ -669,6 +695,17 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     executor::CapacitySchedulerPolicy capacitySchedulerPolicy, bool hasKvCacheManager, bool twoStepsLookAhead,
     LlmRequestState noScheduleUntilState, LlmRequestState noScheduleAfterState, bool enablePrefixAwareScheduling)
 {
+    bool const diagnosticIsEffective = hasKvCacheManager && excludeDisaggGenerationTransferFromCapacity()
+        && (capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kMAX_UTILIZATION
+            || capacitySchedulerPolicy == executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT);
+    if (diagnosticIsEffective)
+    {
+        TLLM_LOG_INFO(
+            "NVBUG6448152_SCHED event=effective_config exclude_disagg_gen_transfer_from_capacity=1 policy=%d "
+            "max_num_requests=%d",
+            static_cast<int>(capacitySchedulerPolicy), static_cast<int>(maxNumRequests));
+    }
+
     if (!hasKvCacheManager)
     {
         mScheduler = MaxRequestsScheduler{maxNumRequests, noScheduleUntilState, noScheduleAfterState};

@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
@@ -45,6 +46,56 @@ namespace tc = tensorrt_llm::common;
 
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using VecTokens = std::vector<TokenIdType>;
+
+namespace
+{
+
+constexpr char kExcludeDisaggGenerationTransferFromCapacityEnv[]
+    = "TRTLLM_NVBUG_6448152_EXCLUDE_DISAGG_GEN_TRANSFER_FROM_CAPACITY";
+
+struct ScopedEnv
+{
+    explicit ScopedEnv(char const* key, char const* value)
+        : mKey(key)
+    {
+        char const* previousValue = std::getenv(key);
+        mHadPreviousValue = previousValue != nullptr;
+        if (mHadPreviousValue)
+        {
+            mPreviousValue = previousValue;
+        }
+        if (value != nullptr)
+        {
+            setenv(key, value, 1);
+        }
+        else
+        {
+            unsetenv(key);
+        }
+    }
+
+    ~ScopedEnv()
+    {
+        if (mHadPreviousValue)
+        {
+            setenv(mKey.c_str(), mPreviousValue.c_str(), 1);
+        }
+        else
+        {
+            unsetenv(mKey.c_str());
+        }
+    }
+
+    ScopedEnv(ScopedEnv const&) = delete;
+    ScopedEnv& operator=(ScopedEnv const&) = delete;
+
+private:
+    std::string mKey;
+    bool mHadPreviousValue;
+    std::string mPreviousValue;
+};
+
+} // namespace
 
 struct RequestState
 {
@@ -808,6 +859,8 @@ TEST_F(CapacitySchedulerTest, DisaggGenInitMaxUtilization)
 
 TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
 {
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, nullptr);
+
     SizeType32 kvCacheMaxNumTokens = 200;
     SizeType32 kvCacheTokensPerBlock = 10;
     SizeType32 kvCacheMaxNumTokensPerSeq = 90;
@@ -846,6 +899,80 @@ TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCountsAgainstAdmission)
         ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1u) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
         EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId)
             << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+    }
+}
+
+TEST_F(CapacitySchedulerTest, DisaggGenTransferInProgressCanBeExcludedFromAdmissionCapacity)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 90;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager
+            = getKvCacheManager(2, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq);
+        auto peftCacheManager = getPeftCacheManager();
+
+        int32_t maxNewTokens = 40;
+        int32_t promptLen = 10;
+        auto transferReq = createRequest(promptLen, maxNewTokens, 0, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+        auto pendingReq = createRequest(promptLen, maxNewTokens, 1, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+        kvCacheManager->addSequenceBatch(
+            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+            {std::ref(*transferReq)});
+
+        RequestList activeRequests{transferReq, pendingReq};
+        auto capacityScheduler = CapacityScheduler(1, capacitySchedulerPolicy, kvCacheManager != nullptr);
+        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager);
+        EXPECT_TRUE(fittingRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        ASSERT_EQ(fittingDisaggGenInitRequests.size(), 1u) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_EQ(fittingDisaggGenInitRequests.front()->mRequestId, pendingReq->mRequestId)
+            << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+    }
+}
+
+TEST_F(CapacitySchedulerTest, ExcludedDisaggGenTransferStillClaimsPeftCapacity)
+{
+    ScopedEnv scopedEnv(kExcludeDisaggGenerationTransferFromCapacityEnv, "1");
+
+    SizeType32 kvCacheMaxNumTokens = 200;
+    SizeType32 kvCacheTokensPerBlock = 10;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 90;
+
+    auto capacitySchedulerPolicies = std::vector<CapacitySchedulerPolicy>{
+        CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT, CapacitySchedulerPolicy::kMAX_UTILIZATION};
+    for (auto capacitySchedulerPolicy : capacitySchedulerPolicies)
+    {
+        auto kvCacheManager
+            = getKvCacheManager(2, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq);
+        auto peftCacheManager = std::make_shared<MockPeftCacheManager>(15, 15, 15);
+
+        int32_t maxNewTokens = 40;
+        int32_t promptLen = 10;
+        auto transferReq = createRequest(promptLen, maxNewTokens, 0, 100,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+        auto pendingReq = createRequest(promptLen, maxNewTokens, 1, 200,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kDISAGG_GENERATION_INIT);
+        kvCacheManager->addSequenceBatch(
+            {{{transferReq->mRequestId, transferReq->mPromptLen, transferReq->mSamplingConfig.beamWidth}}},
+            {std::ref(*transferReq)});
+
+        RequestList activeRequests{transferReq, pendingReq};
+        auto capacityScheduler = CapacityScheduler(1, capacitySchedulerPolicy, kvCacheManager != nullptr);
+        auto [fittingRequests, fittingDisaggGenInitRequests, pausedRequests]
+            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager);
+        EXPECT_TRUE(fittingRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
+        EXPECT_TRUE(fittingDisaggGenInitRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
         EXPECT_TRUE(pausedRequests.empty()) << "policy=" << static_cast<int>(capacitySchedulerPolicy);
     }
 }
