@@ -636,7 +636,7 @@ class MTPEagleDynamicTreeWorker(MTPEagleWorker):
     # Top-level forward                                                   #
     # ------------------------------------------------------------------ #
     @nvtx_range("mtp_dyn.forward")
-    def forward(
+    def _forward_impl(
         self,
         input_ids,
         position_ids,

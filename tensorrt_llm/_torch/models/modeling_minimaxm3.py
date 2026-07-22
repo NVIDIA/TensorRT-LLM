@@ -62,6 +62,8 @@ from ..utils import (
     get_model_extra_attrs,
     is_torch_compiling,
 )
+from .checkpoints.base_weight_mapper import BaseWeightMapper
+from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
@@ -1471,20 +1473,6 @@ class MiniMaxM3Model(DecoderModel):
         return hidden_states
 
 
-# HF MiniMax-M3 stores the routed score-correction bias one level above
-# the router weight (``block_sparse_moe.e_score_correction_bias``,
-# sibling of ``block_sparse_moe.gate.weight``). The TRT-LLM module tree
-# binds it to :class:`MiniMaxM3Gate`, so the generic loader expects to
-# see it at ``block_sparse_moe.gate.e_score_correction_bias``. The
-# regex below moves the key into the gate's prefix before the loader
-# dispatches; this lets ``mark_consumed("...gate")`` cleanly remove
-# both the weight and the bias together without disturbing the sibling
-# ``block_sparse_moe.experts.*`` backend subtree.
-_M3_GATE_BIAS_RENAME_MAP = {
-    r"^(.*\.block_sparse_moe)\.e_score_correction_bias$": (r"\1.gate.e_score_correction_bias"),
-}
-
-
 @register_auto_model("MiniMaxM3SparseForCausalLM")
 class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
@@ -1500,13 +1488,23 @@ class MiniMaxM3ForCausalLM(DecoderModelForCausalLM[MiniMaxM3Model, PretrainedCon
             vocab_size=model_config.pretrained_config.vocab_size,
         )
 
-    def load_weights(self, weights, *args, **kwargs):
-        # Merge the M3-specific gate-bias rename into any caller-
-        # supplied ``params_map`` so the VL wrapper and any downstream
-        # tooling that already passes one keep working.
-        params_map = kwargs.pop("params_map", None) or {}
-        merged = {**_M3_GATE_BIAS_RENAME_MAP, **params_map}
-        return super().load_weights(weights, *args, params_map=merged, **kwargs)
+    def load_weights(
+        self,
+        weights: Dict,
+        weight_mapper: Optional[BaseWeightMapper] = None,
+        params_map: Optional[Dict[str, str]] = None,
+        allow_partial_loading: bool = False,
+    ) -> None:
+        if weight_mapper is None:
+            weight_mapper = MiniMaxM3HfWeightMapper()
+        weight_mapper.init_model_and_config(self, self.model_config)
+        merged_params_map = {**MINIMAX_M3_PARAMS_MAP, **(params_map or {})}
+        super().load_weights(
+            weights=weights,
+            weight_mapper=weight_mapper,
+            params_map=merged_params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
 
 
 def _strip_language_model_prefix(
@@ -1642,7 +1640,13 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
         self.last_loaded_vision_keys = []
         self.last_missing_vision_keys = []
 
-    def load_weights(self, weights, *args, **kwargs):
+    def load_weights(
+        self,
+        weights: Dict,
+        weight_mapper: Optional[BaseWeightMapper] = None,
+        params_map: Optional[Dict[str, str]] = None,
+        allow_partial_loading: bool = False,
+    ) -> None:
         text_cfg = self.config
         if is_minimax_m3_vl_config(text_cfg):
             text_cfg = get_text_config(text_cfg)
@@ -1665,7 +1669,12 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             self.last_loaded_vision_keys = loaded
             self.last_missing_vision_keys = missing
 
-        return super().load_weights(text_weights, *args, **kwargs)
+        super().load_weights(
+            weights=text_weights,
+            weight_mapper=weight_mapper,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
 
     def forward(
         self,
