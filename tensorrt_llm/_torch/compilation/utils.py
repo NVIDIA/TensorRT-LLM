@@ -65,6 +65,10 @@ def capture_piecewise_cuda_graph(enable: bool):
 
 def inplace_info():
     inplace_map = {
+        torch.ops.trtllm.flashinfer_fused_add_add_rmsnorm.default: {
+            1: "input",
+            2: "residual"
+        },
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default: {
             1: "input",
             2: "residual"

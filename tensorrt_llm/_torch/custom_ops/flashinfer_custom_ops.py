@@ -63,6 +63,30 @@ if IS_FLASHINFER_AVAILABLE:
                           eps,
                           enable_pdl=get_env_enable_pdl())
 
+    @torch.library.custom_op("trtllm::flashinfer_fused_add_add_rmsnorm",
+                             mutates_args=("input", "residual"))
+    def flashinfer_fused_add_add_rmsnorm(input: torch.Tensor,
+                                         additional: torch.Tensor,
+                                         residual: torch.Tensor,
+                                         weight: torch.Tensor,
+                                         eps: float) -> None:
+        # Keep this import lazy so installations that use FlashInfer's CUDA
+        # norm fallback do not need CUTLASS DSL unless the default-off WideEP
+        # path is explicitly selected.
+        from ..cute_dsl_kernels.flashinfer_fused_add_add_rmsnorm import \
+            fused_add_add_rmsnorm_cute
+        fused_add_add_rmsnorm_cute(input,
+                                   additional,
+                                   residual,
+                                   weight,
+                                   eps,
+                                   enable_pdl=get_env_enable_pdl())
+
+    @flashinfer_fused_add_add_rmsnorm.register_fake
+    def _(input: torch.Tensor, additional: torch.Tensor, residual: torch.Tensor,
+          weight: torch.Tensor, eps: float) -> None:
+        pass
+
     @torch.library.custom_op("trtllm::flashinfer_fused_add_rmsnorm_quant",
                              mutates_args=("out", "residual"))
     def flashinfer_fused_add_rmsnorm_quant(out: torch.Tensor,
