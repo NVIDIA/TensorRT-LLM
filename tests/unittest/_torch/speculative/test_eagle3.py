@@ -32,6 +32,32 @@ from tensorrt_llm.lora_helper import LoraConfig
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
+def test_dynamic_tree_metadata_forces_target_mask_prepare_each_step() -> None:
+    metadata = TrtllmAttentionMetadata(
+        seq_lens=None,
+        seq_lens_kv=None,
+        num_contexts=0,
+        max_num_requests=1,
+        max_num_tokens=1,
+        max_seq_len=1,
+    )
+    common_kwargs = dict(
+        batch_size=0,
+        is_spec_decoding_enabled=False,
+        is_spec_dec_tree=True,
+        max_draft_len=1,
+        max_total_draft_tokens=1,
+    )
+
+    metadata.update_spec_dec_param(is_spec_dec_dynamic_tree=True,
+                                   **common_kwargs)
+    assert metadata.force_prepare_spec_dec_tree_mask
+
+    metadata.update_spec_dec_param(is_spec_dec_dynamic_tree=False,
+                                   **common_kwargs)
+    assert not metadata.force_prepare_spec_dec_tree_mask
+
+
 def test_mtp_dynamic_tree_relocation_uses_full_attention_window(
         monkeypatch: pytest.MonkeyPatch) -> None:
     worker = object.__new__(MTPEagleDynamicTreeWorker)
