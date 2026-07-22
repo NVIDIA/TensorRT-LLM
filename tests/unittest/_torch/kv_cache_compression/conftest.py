@@ -41,12 +41,20 @@ def encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
     return encoded
 
 
+def compaction_family(compaction, name):
+    """Return one cache family dict ("dense", "swa", or "draft") or None."""
+    for family in compaction["families"]:
+        if family["name"] == name:
+            return family
+    return None
+
+
 def _write_move_offsets(compaction, offsets, moves_per_request):
     cumulative = [0]
     for count in moves_per_request:
         cumulative.append(cumulative[-1] + count)
     # Rows past the cohort are padding and contribute no moves.
-    cumulative.extend(cumulative[-1:] * (compaction.request_count - len(moves_per_request)))
+    cumulative.extend(cumulative[-1:] * (compaction["request_count"] - len(moves_per_request)))
     offsets.copy_(torch.tensor(cumulative, dtype=torch.int32), non_blocking=True)
 
 
@@ -54,38 +62,39 @@ def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
     """Load a cohort's per-request protected tails into the move offsets.
 
     Production stages these rows through the single round-metadata upload;
-    tests drive the fixed buffers directly through this helper (moved out of
-    BatchedKVCacheCompaction, whose production surface has no caller for it).
+    tests drive the fixed buffers directly through this helper.
     """
-    if len(tail_lengths) > compaction.request_count:
+    if len(tail_lengths) > compaction["request_count"]:
         raise ValueError("the cohort exceeds the compaction request capacity")
-    if any(tail < 0 or tail > compaction.protected_tail_capacity for tail in tail_lengths):
+    if any(tail < 0 or tail > compaction["protected_tail_capacity"] for tail in tail_lengths):
         raise ValueError("a protected tail exceeds the configured capacity")
     _write_move_offsets(
         compaction,
-        compaction.target_dense_compaction.move_source_offsets,
-        [compaction.decode_keep_count + int(tail) for tail in tail_lengths],
+        compaction_family(compaction, "dense")["offsets"],
+        [compaction["decode_keep_count"] + int(tail) for tail in tail_lengths],
     )
-    if compaction.target_swa_compaction is not None:
+    swa_family = compaction_family(compaction, "swa")
+    if swa_family is not None:
         _write_move_offsets(
             compaction,
-            compaction.target_swa_compaction.move_source_offsets,
-            [compaction.swa_window + int(tail) for tail in tail_lengths],
+            swa_family["offsets"],
+            [compaction["swa_window"] + int(tail) for tail in tail_lengths],
         )
-    if compaction.draft_compaction is not None:
+    draft_family = compaction_family(compaction, "draft")
+    if draft_family is not None:
         if draft_tail_lengths is None:
             draft_tail_lengths = [0] * len(tail_lengths)
         if len(draft_tail_lengths) != len(tail_lengths):
             raise ValueError("draft protected tails must match the cohort")
         if any(
-            tail < 0 or tail > compaction.draft_protected_tail_capacity
+            tail < 0 or tail > compaction["draft_protected_tail_capacity"]
             for tail in draft_tail_lengths
         ):
             raise ValueError("a draft protected tail exceeds the configured capacity")
         _write_move_offsets(
             compaction,
-            compaction.draft_compaction.move_source_offsets,
-            [compaction.decode_keep_count + int(tail) for tail in draft_tail_lengths],
+            draft_family["offsets"],
+            [compaction["decode_keep_count"] + int(tail) for tail in draft_tail_lengths],
         )
 
 
@@ -127,9 +136,9 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``BatchedKVCacheCompaction`` with the suite's default 2-layer geometry."""
+    """``build_cache_compactions`` with the suite's default 2-layer geometry."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-        BatchedKVCacheCompaction,
+        build_cache_compactions,
     )
 
     args = dict(
@@ -144,21 +153,18 @@ def build_compaction(**overrides):
         swa_window=None,
     )
     args.update(overrides)
-    return BatchedKVCacheCompaction(**args)
+    return build_cache_compactions(**args)
 
 
 def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None):
-    """A ``__new__``-built staging shell for the bulk page-table copy tests."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        _FixedScoreStagingBuffers,
-    )
-
-    staging = _FixedScoreStagingBuffers.__new__(_FixedScoreStagingBuffers)
+    """A bare workspace namespace for the bulk page-table copy tests."""
+    staging = SimpleNamespace()
     staging.device = device
     staging.max_requests = max_requests
     staging.copy_block_count = copy_block_count
     if page_count is not None:
         staging.page_count = page_count
+    staging.stream = None
     staging.bulk_copy_done = torch.cuda.Event()
     staging.bulk_consume_done = torch.cuda.Event()
     staging.page_tables_active = False
@@ -188,41 +194,38 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
     )
 
 
-def make_fixed_resources_stubs(manager, *, decode_width=260):
-    """Stub the calibration/staging surfaces around ``_fixed_resources_for``."""
+def make_workspace_stubs(manager, *, decode_width=260):
+    """Stub the calibration/layout surfaces around ``_workspace_for``."""
     manager._H = 2
     manager._F = 2
     manager._freq_scale_sq = torch.ones(2)
     manager._offsets = torch.ones(2)
+    manager._phase = {"rows": 8}
     manager.calibration = {"omega": torch.ones(2)}
     manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
     manager._page_table_pool_keys = mock.Mock(return_value=[("pool", 0)])
     pool = torch.empty(8, 2, 1, 4, 4)
-    layout = SimpleNamespace(
+    layout = dict(
         manager=SimpleNamespace(num_pools=1),
         num_layers=2,
         global_layers=[0, 1],
         layer_pools=[pool, pool],
         dense_layers=[0, 1],
         swa_layers=[],
+        swa_window=None,
         storage_groups={0: [0, 1]},
+        layer_group_representative={0: 0, 1: 0},
+        layer_pool_keys=(("pool", 0), ("pool", 0)),
         pool_view_fingerprint=(("fixed",),),
     )
-    score_staging = SimpleNamespace(
-        fused_group=SimpleNamespace(output=torch.empty(8, 4, decode_width)),
-        bind_score_launcher=mock.Mock(),
-        token_starts_device=torch.zeros(8, dtype=torch.int32),
+    workspace = SimpleNamespace(
         decode_width=decode_width,
         page_table_token_capacity=65537,
         max_requests=8,
-    )
-    keep_set_selector = SimpleNamespace(
+        token_starts_device=torch.zeros(8, dtype=torch.int32),
         valid_widths=torch.empty(8, dtype=torch.int32),
-        # The builder zero-fills the mode's provisional top-k buffer.
-        top_indices_i32=torch.zeros(8, 4, dtype=torch.int32),
-        final_indices=torch.zeros(8, 4, dtype=torch.int32),
     )
-    return layout, score_staging, keep_set_selector
+    return layout, workspace
 
 
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
@@ -231,6 +234,7 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
 
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse
+    fake_v2.enable_swa_scratch_reuse = False
     fake_v2.is_draft = is_draft
     fake_v2.kv_compression_manages_history = False
     fake_v2.kv_factor = 2
@@ -250,7 +254,7 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.kv_cache_manager_py_config = SimpleNamespace(layers=[])
     fake_v2.impl = object()
     fake_v2.kv_cache_map = {}
-    fake_v2.host_kv_cache_block_offsets = torch.empty(1, dtype=torch.int64)
+    fake_v2.host_kv_cache_block_offsets = torch.zeros(1, 8, 2, 8, dtype=torch.int32)
     fake_v2.pp_layers = []
     fake_v2.layer_offsets = {}
     fake_v2.layer_to_pool_mapping_dict = {}
@@ -287,40 +291,22 @@ def make_request(request_id, **overrides):
 @contextmanager
 def mocked_eviction_internals(manager):
     """Run the real ``_evict_requests`` body around mocked GPU launches."""
-    score_staging = SimpleNamespace(
-        launch_prepared_score=mock.Mock(return_value=torch.zeros(1)),
-        launch_prepared_union_fusion=mock.Mock(),
-        mark_page_tables_consumed=mock.Mock(),
-    )
-    # The dispatch reads the selector's own eviction mode, so the stub
-    # mirrors the manager's and carries both mode paths' launch surfaces.
-    keep_set_selector = SimpleNamespace(
-        eviction_mode=manager.eviction_mode,
-        combined=torch.zeros(1),
-        select_requests=mock.Mock(),
-        select_prepared_union_scores=mock.Mock(),
-        refresh_row_prompt_offsets=mock.Mock(),
-    )
-    resources = SimpleNamespace(
-        score_staging=score_staging,
-        keep_set_selector=keep_set_selector,
-    )
-    batched_compaction = SimpleNamespace(compact=mock.Mock())
+    from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
+
+    workspace = SimpleNamespace(max_requests=8)
+    layout = dict(swa_layers=[], swa_window=None)
     with (
-        mock.patch.object(manager, "_runtime_kv_layout", return_value=SimpleNamespace()),
-        mock.patch.object(manager, "_fixed_resources_for", return_value=resources),
-        mock.patch.object(
-            manager,
-            "_batched_compaction_for",
-            return_value=batched_compaction,
-        ),
-        mock.patch.object(manager, "_attach_page_ids") as attach,
+        mock.patch.object(manager, "_runtime_kv_layout", return_value=layout),
+        mock.patch.object(manager, "_workspace_for", return_value=workspace),
+        mock.patch.object(module, "stage_eviction_cohort") as stage,
+        mock.patch.object(module, "run_eviction_round") as run_round,
+        mock.patch.object(module, "mark_page_tables_consumed") as consumed,
     ):
         yield SimpleNamespace(
-            score_staging=score_staging,
-            keep_set_selector=keep_set_selector,
-            batched_compaction=batched_compaction,
-            attach=attach,
+            workspace=workspace,
+            stage=stage,
+            run_round=run_round,
+            consumed=consumed,
         )
 
 

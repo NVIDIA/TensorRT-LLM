@@ -10,8 +10,7 @@ appended as ordinals ``valid_seq_len + 0..tail-1``, and both caches land at
 ``destination_base = prompt_len``. These tests cover the physical draft moves,
 the packed move indices, stream ordering across both cache managers, the
 speculative admission gates (one representative per guard family), the
-published compressed-token invariant, and prepared-compaction cache
-invalidation.
+published compressed-token invariant, and workspace rebuild/invalidation.
 """
 
 from types import SimpleNamespace
@@ -20,21 +19,26 @@ from unittest import mock
 import pytest
 import torch
 from conftest import build_compaction as _build_compaction
+from conftest import compaction_family as _compaction_family
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_fake_v2 as _make_fake_v2
-from conftest import make_fixed_resources_stubs as _make_fixed_resources_stubs
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_request as _make_request
 from conftest import make_triattention as _make_triattention
+from conftest import make_workspace_stubs as _make_workspace_stubs
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import set_protected_tails as _set_protected_tails
 
+from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import run_cache_compactions
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     TriAttention,
-    _FixedScoreStagingBuffers,
-    _PreparedEviction,
-    _RequestCompressionState,
+    mark_page_tables_consumed,
 )
+
+
+def _fresh_request_state():
+    """One request's compression ledger, as the manager initializes it."""
+    return {"generation_steps": 0, "evicted_tokens": 0, "confirmed_kv_length": None}
 
 
 def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
@@ -86,7 +90,7 @@ def _launched_draft_compaction(draft_protected_tails):
         draft_page_table_slots={0: 0},
     )
     _set_protected_tails(compaction, target_protected_tails, draft_protected_tails)
-    compaction.compact()
+    run_cache_compactions(compaction)
     torch.cuda.synchronize(device)
 
     return SimpleNamespace(
@@ -172,10 +176,10 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
 
     # The packed draft move indices must match the same broadcast-plus-tail
     # oracle the physical moves followed.
-    draft_compaction = built.compaction.draft_compaction
+    draft_family = _compaction_family(built.compaction, "draft")
     expected_row = torch.cat(expected_moves)
-    assert draft_compaction.move_source_offsets.cpu().tolist() == expected_offsets
-    draft_indices = draft_compaction.move_source_indices
+    assert draft_family["offsets"].cpu().tolist() == expected_offsets
+    draft_indices = draft_family["source"]
     # The index buffer is sized for the widest tail (the capacity); this
     # round's moves are packed at the front, where the offsets point.
     capacity_total = built.request_count * (
@@ -188,27 +192,28 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
 
 
 def test_mark_page_tables_consumed_orders_both_manager_streams():
-    staging = _FixedScoreStagingBuffers.__new__(_FixedScoreStagingBuffers)
-    staging.device = torch.device("cuda", torch.cuda.current_device())
-    staging.page_tables_active = True
     event = mock.Mock()
-    staging.bulk_consume_done = event
+    workspace = SimpleNamespace(
+        device=torch.device("cuda", torch.cuda.current_device()),
+        page_tables_active=True,
+        bulk_consume_done=event,
+    )
     target_stream = mock.Mock()
     draft_stream = mock.Mock()
     compute_stream = SimpleNamespace()
 
     with mock.patch.object(torch.cuda, "current_stream", return_value=compute_stream):
-        staging.mark_page_tables_consumed(target_stream, draft_stream)
+        mark_page_tables_consumed(workspace, target_stream, draft_stream)
 
     # One event records the compact launches; BOTH cache managers wait on it,
     # so neither can free or reallocate pages this cohort is still reading.
     event.record.assert_called_once_with(compute_stream)
     target_stream.wait_event.assert_called_once_with(event)
     draft_stream.wait_event.assert_called_once_with(event)
-    assert staging.page_tables_active is False
+    assert workspace.page_tables_active is False
 
     with pytest.raises(RuntimeError, match="not staged"):
-        staging.mark_page_tables_consumed(target_stream, draft_stream)
+        mark_page_tables_consumed(workspace, target_stream, draft_stream)
 
 
 @pytest.mark.parametrize(
@@ -298,7 +303,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager.draft_kv_cache_manager = draft_manager
 
     request = _make_request(7, py_prompt_len=2, py_num_accepted_draft_tokens=1)
-    manager._request_states[7] = _RequestCompressionState()
+    manager._request_states[7] = _fresh_request_state()
     batch = SimpleNamespace(generation_requests=[request])
 
     # Every step confirms one sampled token plus one accepted draft token.
@@ -308,7 +313,6 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     previous_published = 0
     eviction_rounds = 0
     with _mocked_eviction_internals(manager) as internals:
-        score_staging = internals.score_staging
         for _ in range(6):
             uncompressed += 2
             confirmed += 2
@@ -317,16 +321,18 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
             manager._periodic_evict(batch)
 
             state = manager._request_states[7]
-            if state.confirmed_kv_length < confirmed:
+            if state["confirmed_kv_length"] < confirmed:
                 # An eviction round compacted the cache to prompt + budget.
                 eviction_rounds += 1
-                confirmed = state.confirmed_kv_length
+                confirmed = state["confirmed_kv_length"]
                 cache.capacity = confirmed
                 assert confirmed == 2 + 4
                 # The staged logical position restores the uncompressed
-                # length: physical confirmed plus everything evicted so far.
-                prepared = internals.attach.call_args.args[0]
-                assert prepared[0].round_start == uncompressed
+                # length: physical confirmed plus everything evicted so far
+                # (stage_eviction_cohort args: ws, manager, ids, round_starts,
+                # prompt lengths, seq lens, page-table lens).
+                round_starts = internals.stage.call_args.args[3]
+                assert round_starts[0] == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
             assert request.py_num_compressed_tokens == uncompressed - confirmed
@@ -338,8 +344,8 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     # Each round the draft cache shrinks with the target and both manager
     # streams are ordered after the compact launches.
     assert draft_cache.resize.call_args_list == [mock.call(7, None)] * eviction_rounds
-    assert score_staging.mark_page_tables_consumed.call_args_list == (
-        [mock.call(target._stream, draft_manager._stream)] * eviction_rounds
+    assert internals.consumed.call_args_list == (
+        [mock.call(internals.workspace, target._stream, draft_manager._stream)] * eviction_rounds
     )
 
 
@@ -347,13 +353,21 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
     manager = _make_triattention(top_B=4)
-    layout, score_staging, keep_set_selector = _make_fixed_resources_stubs(manager)
+    layout, workspace = _make_workspace_stubs(manager)
+    # The one-time host block-offset table shape gate reads the real manager
+    # tables (int32 [pools, slots, K/V, blocks]).
+    manager.kv_cache_manager.host_kv_cache_block_offsets = torch.zeros(
+        1, 8, 2, 4, dtype=torch.int32
+    )
     draft_manager = _make_fake_v2(is_draft=True)
     draft_manager.num_pools = 1
+    draft_manager.host_kv_cache_block_offsets = torch.zeros(1, 8, 2, 4, dtype=torch.int32)
     manager.draft_kv_cache_manager = draft_manager
     manager._draft_runtime_kv_layout = mock.Mock(
-        return_value=SimpleNamespace(
+        return_value=dict(
             layer_pools=[],
+            dense_layers=[],
+            layer_group_representative={},
             pool_representatives=(),
             layer_pool_keys=(),
             pool_page_counts=(4,),
@@ -361,53 +375,50 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
         )
     )
     prepared = [
-        _PreparedEviction(
-            request=_make_request(7),
-            request_id=7,
-            seq_len=8,
-            round_start=8,
-            prompt_len=0,
-            expected_keep_count=4,
-            protected_tail=0,
-        )
+        {
+            "request": _make_request(7),
+            "request_id": 7,
+            "seq_len": 8,
+            "round_start": 8,
+            "prompt_len": 0,
+            "expected_keep_count": 4,
+            "protected_tail": 0,
+        }
     ]
 
-    with (
-        mock.patch.object(
-            module,
-            "_FixedScoreStagingBuffers",
-            return_value=score_staging,
-        ) as score_cls,
-        mock.patch.object(
-            module,
-            "_BatchedKeepSetSelector",
-            return_value=keep_set_selector,
-        ),
-    ):
-        resources = manager._fixed_resources_for(layout, prepared)
+    with mock.patch.object(
+        module,
+        "prepare_eviction_workspace",
+        return_value=workspace,
+    ) as prepare:
+        resources = manager._workspace_for(layout, prepared)
 
         # Request capacity follows the executor limits, while the score
         # bucket follows what the cohort actually presents (power-of-two,
         # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
-        assert resources.score_staging is score_staging
-        assert score_cls.call_args.kwargs["max_requests"] == 8
-        assert score_cls.call_args.kwargs["decode_width"] == 4 + 2 * 128
-        assert score_cls.call_args.kwargs["seq_len"] == 1024
-        assert score_cls.call_args.kwargs["page_table_token_capacity"] == 1024 + 1
-        assert score_cls.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
+        assert resources is workspace
+        assert prepare.call_args.kwargs["eviction_mode"] == "union"
+        assert prepare.call_args.kwargs["max_requests"] == 8
+        assert prepare.call_args.kwargs["decode_width"] == 4 + 2 * 128
+        assert prepare.call_args.kwargs["seq_len"] == 1024
+        assert prepare.call_args.kwargs["page_table_token_capacity"] == 1024 + 1
+        assert prepare.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
 
-        # A second round with unchanged pools reuses the resident buffers and
-        # keeps the cached compaction launches.
-        cached_compaction = object()
-        manager._batched_compaction = cached_compaction
-        assert manager._fixed_resources_for(layout, prepared) is resources
-        assert score_cls.call_count == 1
-        assert manager._batched_compaction is cached_compaction
+        # A second round with unchanged pools reuses the resident workspace
+        # (and with it the compaction launch data it carries).
+        assert manager._workspace_for(layout, prepared) is resources
+        assert prepare.call_count == 1
 
-        # A pool change invalidates both the buffers and the compaction
-        # launches that alias them.
-        layout.pool_view_fingerprint = (("moved",),)
-        rebuilt = manager._fixed_resources_for(layout, prepared)
+        # A pool change invalidates the whole workspace, compaction included.
+        layout["pool_view_fingerprint"] = (("moved",),)
+        rebuilt_workspace = SimpleNamespace(
+            decode_width=workspace.decode_width,
+            page_table_token_capacity=workspace.page_table_token_capacity,
+            max_requests=workspace.max_requests,
+        )
+        prepare.return_value = rebuilt_workspace
+        rebuilt = manager._workspace_for(layout, prepared)
         assert rebuilt is not resources
-        assert score_cls.call_count == 2
-        assert manager._batched_compaction is None
+        assert rebuilt is rebuilt_workspace
+        assert prepare.call_count == 2
+        assert manager._workspace is rebuilt_workspace

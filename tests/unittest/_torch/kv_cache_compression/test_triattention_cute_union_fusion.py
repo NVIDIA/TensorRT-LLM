@@ -3,10 +3,11 @@
 """Equivalence coverage for the fused score+stats+union pipeline (two CuTe kernels).
 
 The reference side gathers the SAME production score rows (the fused pack's
-score-only entry) and normalizes + union-reduces them with a pure-torch
-float32 oracle. The fused-vs-reference comparison was always tolerance-based
-(the fused pipeline's reduction order differs from any reference); the
-tolerances are unchanged from the retired Triton reference copies.
+score-only entry, which every workspace runner compiles) and normalizes +
+union-reduces them with a pure-torch float32 oracle. The fused-vs-reference
+comparison was always tolerance-based (the fused pipeline's reduction order
+differs from any reference); the tolerances are unchanged from the retired
+Triton reference copies.
 """
 
 import pytest
@@ -16,6 +17,114 @@ _SM100_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
     reason="TriAttention CuTe kernels require SM100",
 )
+
+
+def _make_union_workspace(
+    *,
+    layer_pools,
+    max_requests,
+    seq_len,
+    num_q_heads,
+    q_real,
+    q_imag,
+    mlr_coef,
+    freq_scale_sq,
+    omega,
+    offsets,
+    decode_width=None,
+):
+    """A union-mode workspace over one shared page-table slot (no compaction).
+
+    The union runner also compiles the score-only entries, so one workspace
+    serves both the fused pipeline and the split reference leg.
+    """
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        prepare_eviction_workspace,
+    )
+
+    num_layers = len(layer_pools)
+    return prepare_eviction_workspace(
+        eviction_mode="union",
+        layer_pools=layer_pools,
+        dense_groups=[list(range(num_layers))],
+        dense_layers=list(range(num_layers)),
+        page_representatives=[0],
+        max_requests=max_requests,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        num_freqs=int(q_real.shape[-1]),
+        keep_count=1,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        offsets=offsets,
+        omega=omega,
+        decode_width=decode_width,
+        build_compaction=False,
+    )
+
+
+def _write_block_offsets(ws, encoded):
+    """Load a test page table into the workspace's staged block-offset plane."""
+    ws.block_offsets_device.zero_()
+    ws.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
+
+
+def _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts):
+    """Stage the per-round score metadata exactly like ``run_eviction_round``."""
+    num_segments = request_count * ws.num_layers
+    torch.sub(
+        valid_seq_lens[:request_count],
+        token_starts[:request_count],
+        out=valid_widths[:request_count],
+    )
+    torch.index_select(
+        valid_seq_lens, 0, ws.seg_req[:num_segments], out=ws.seg_seq_len[:num_segments]
+    )
+    ws.cute_token_starts[:request_count].copy_(token_starts[:request_count])
+
+
+def _launch_split_scores(
+    ws, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
+):
+    """The production score-only leg plus the decode-window gather."""
+    _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts)
+    assert ws.runner.supports(request_count)
+    ws.runner.launch(request_count, mean_cos, mean_sin)
+    num_segments = request_count * ws.num_layers
+    group_size = ws.num_q_heads // ws.num_kv_heads
+    source = (
+        ws.cute_scratch[: ws.num_kv_heads * 8 * num_segments * ws.bucket_seq_len]
+        .view(ws.num_kv_heads, 8, request_count, ws.num_layers, ws.bucket_seq_len)[:, :group_size]
+        .permute(2, 3, 0, 1, 4)
+    )
+    columns = token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + ws.gather_columns
+    columns = columns.clamp_(max=ws.bucket_seq_len - 1).expand(
+        request_count, ws.num_layers, ws.num_kv_heads, group_size, ws.decode_width
+    )
+    output = torch.full(
+        (request_count, ws.num_layers, ws.num_q_heads, ws.decode_width),
+        float("nan"),
+        dtype=torch.float32,
+        device=ws.device,
+    )
+    torch.gather(
+        source,
+        4,
+        columns,
+        out=output.view(request_count, ws.num_layers, ws.num_kv_heads, group_size, ws.decode_width),
+    )
+    return output
+
+
+def _launch_union_fusion(
+    ws, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
+):
+    """The fused score+stats+normalized-union pipeline (THE union path)."""
+    _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts)
+    assert ws.runner.supports_union_fusion(request_count)
+    ws.runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_out[:request_count])
 
 
 def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:
@@ -56,10 +165,6 @@ def _check_union_fusion_matches_split_pipeline(
     """
     pytest.importorskip("cutlass")
 
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        _FixedScoreGroup,
-    )
-
     torch.manual_seed(20260721)
     device = torch.device("cuda")
     seq_len = 256
@@ -84,27 +189,23 @@ def _check_union_fusion_matches_split_pipeline(
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
+    ws = _make_union_workspace(
+        layer_pools=[pool],
+        max_requests=2,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        omega=omega,
+        offsets=offsets,
+    )
     k_plane = [2 * page for page in page_permutation]
     v_plane = [2 * page + 1 for page in page_permutation]
-    block_offsets = torch.tensor(
-        [[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device
-    )
-    group = _FixedScoreGroup(
-        [pool],
-        [0],
-        2,
-        num_pages,
-        seq_len,
-        num_q_heads,
-        block_offsets,
-        [0],
-        q_real,
-        q_imag,
-        mlr_coef,
-        freq_scale_sq,
-        omega,
-        offsets,
-        output_width=seq_len,
+    _write_block_offsets(
+        ws,
+        torch.tensor([[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device),
     )
     if valid_lens is None:
         valid_lens = [seq_len, seq_len]
@@ -118,7 +219,8 @@ def _check_union_fusion_matches_split_pipeline(
     # then the pure-torch union oracle.
     split_widths = torch.empty(request_count, dtype=torch.int32, device=device)
     token_starts = torch.tensor(score_starts, dtype=torch.int32, device=device)
-    per_head = group.launch(
+    per_head = _launch_split_scores(
+        ws,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -134,7 +236,8 @@ def _check_union_fusion_matches_split_pipeline(
     fused_out = torch.full(
         (request_count, seq_len), float("nan"), dtype=torch.float32, device=device
     )
-    group.launch_cute_union_fusion(
+    _launch_union_fusion(
+        ws,
         request_count,
         valid_seq_lens,
         fused_widths,
@@ -204,11 +307,11 @@ def test_union_fusion_matches_split_pipeline(
 def test_union_fusion_guards_raise(guard: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """One representative per fused-pipeline guard family raises loudly.
 
-    ``runner_construction_failure``: a fused-runner construction failure
-    surfaces as the no-fallback RuntimeError at score setup
-    (``prepare_cute_score`` runs before the union runner is built).
-    ``frequency_count``: 16 frequencies (head size 32) sit outside the fused
-    kernel contract and are rejected at kernel construction.
+    ``runner_construction_failure``: a runner construction failure surfaces
+    as the no-fallback RuntimeError at workspace construction (the only
+    place the CuTe entries compile). ``frequency_count``: 16 frequencies
+    (head size 32) sit outside the fused kernel contract and are rejected at
+    kernel construction.
     """
     cutlass = pytest.importorskip("cutlass")
 
@@ -233,9 +336,6 @@ def test_union_fusion_guards_raise(guard: str, monkeypatch: pytest.MonkeyPatch) 
         return
 
     import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused as fused_module  # noqa: E501
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        _FixedScoreGroup,
-    )
 
     torch.manual_seed(20260721)
     device = torch.device("cuda")
@@ -246,44 +346,23 @@ def test_union_fusion_guards_raise(guard: str, monkeypatch: pytest.MonkeyPatch) 
     ).to(torch.bfloat16)
     q_real = 0.125 * torch.randn(1, num_q_heads, num_freqs, device=device)
     omega = torch.linspace(0.01, 0.03, num_freqs, device=device)
-    k_plane = [2 * page for page in range(num_pages)]
-    v_plane = [2 * page + 1 for page in range(num_pages)]
-    block_offsets = torch.tensor(
-        [[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device
-    )
-    group = _FixedScoreGroup(
-        [pool],
-        [0],
-        2,
-        num_pages,
-        seq_len,
-        num_q_heads,
-        block_offsets,
-        [0],
-        q_real,
-        torch.randn_like(q_real) * 0.125,
-        torch.randn_like(q_real) * 0.125,
-        torch.linspace(0.5, 1.5, num_freqs, device=device),
-        omega,
-        torch.tensor([1.0, 2.0, 4.0], device=device),
-        output_width=seq_len,
-    )
 
     def _refuse_construction(**_kwargs):
         raise ValueError("synthetic fused-runner construction failure")
 
     monkeypatch.setattr(fused_module, "TriAttentionCuteScoreRunner", _refuse_construction)
-    mean_cos = torch.cos(torch.outer(torch.tensor([256.0, 257.0], device=device), omega))
-    mean_sin = torch.sin(torch.outer(torch.tensor([256.0, 257.0], device=device), omega))
     with pytest.raises(RuntimeError, match="no other score path exists"):
-        group.launch_cute_union_fusion(
-            2,
-            torch.full((2,), seq_len, dtype=torch.int32, device=device),
-            torch.empty(2, dtype=torch.int32, device=device),
-            torch.zeros(2, dtype=torch.int32, device=device),
-            mean_cos.contiguous(),
-            mean_sin.contiguous(),
-            torch.empty((2, seq_len), dtype=torch.float32, device=device),
+        _make_union_workspace(
+            layer_pools=[pool],
+            max_requests=2,
+            seq_len=seq_len,
+            num_q_heads=num_q_heads,
+            q_real=q_real,
+            q_imag=torch.randn_like(q_real) * 0.125,
+            mlr_coef=torch.randn_like(q_real) * 0.125,
+            freq_scale_sq=torch.linspace(0.5, 1.5, num_freqs, device=device),
+            omega=omega,
+            offsets=torch.tensor([1.0, 2.0, 4.0], device=device),
         )
 
 
@@ -321,10 +400,6 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     """
     pytest.importorskip("cutlass")
 
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        _FixedScoreGroup,
-    )
-
     torch.manual_seed(20260722)
     device = torch.device("cuda")
     num_layers = 36
@@ -360,28 +435,24 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
-    page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
-    block_offsets = torch.zeros(1, max_requests, 2, num_pages, dtype=torch.int32, device=device)
-    block_offsets[0, :request_count, 0] = 2 * page_ids
-    block_offsets[0, :request_count, 1] = 2 * page_ids + 1
-    group = _FixedScoreGroup(
-        layer_pools,
-        list(range(num_layers)),
-        max_requests,
-        num_pages,
-        seq_len,
-        num_q_heads,
-        block_offsets,
-        [0] * num_layers,
-        q_real,
-        q_imag,
-        mlr_coef,
-        freq_scale_sq,
-        omega,
-        offsets,
-        output_width=decode_window,
+    ws = _make_union_workspace(
+        layer_pools=layer_pools,
+        max_requests=max_requests,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        omega=omega,
+        offsets=offsets,
+        decode_width=decode_window,
     )
-    assert (num_kv_heads * 8 * max_requests * num_layers * seq_len > 2**31) == (max_requests == 64)
+    assert (ws.cute_scratch.numel() > 2**31) == (max_requests == 64)
+    page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
+    ws.block_offsets_device.zero_()
+    ws.block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
+    ws.block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
 
     valid_seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
     token_starts = torch.zeros(max_requests, dtype=torch.int32, device=device)
@@ -391,7 +462,8 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     # Reference: the split score gather over the same decode windows, then
     # the pure-torch union oracle.
     split_widths = torch.zeros(max_requests, dtype=torch.int32, device=device)
-    per_head = group.launch(
+    per_head = _launch_split_scores(
+        ws,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -408,7 +480,8 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     fused_out = torch.full(
         (max_requests, seq_len), float("nan"), dtype=torch.float32, device=device
     )
-    group.launch_cute_union_fusion(
+    _launch_union_fusion(
+        ws,
         max_requests,
         valid_seq_lens,
         fused_widths,

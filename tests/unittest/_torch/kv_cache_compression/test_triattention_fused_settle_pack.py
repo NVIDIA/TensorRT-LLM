@@ -16,14 +16,10 @@ paths).
 
 import pytest
 import torch
+from conftest import compaction_family as _compaction_family
 from conftest import encode_block_offsets as _encode_block_offsets
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-    BatchedKVCacheCompaction,
-)
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    _BatchedKeepSetSelector,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import build_cache_compactions
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _settle_ties_and_pack_compaction_sources_kernel,
 )
@@ -393,13 +389,14 @@ def test_settle_handles_topk_sentinel_padding():
         assert (output[row, emitted:] == stale).all(), f"row {row} tail"
 
 
-def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buffers():
-    """The handoff exports the live move buffers, drops the compaction-time
-    dense pack launch, and the selector only accepts a packing that reads its
-    own keep buffer."""
+def test_pack_fusion_drops_the_compaction_dense_pack_and_exports_live_buffers():
+    """Fused packing must remove the compaction-side dense pack launch (each
+    round packs exactly once, in the selection settle), and the exported pack
+    description must point at the very move buffers and keep ordinals the C++
+    compacts consume."""
     device = torch.device("cuda", torch.cuda.current_device())
-    request_count, num_kv_heads, keep_count, width = 2, 2, 4, 16
-    # BatchedKVCacheCompaction admits only bf16 pools in the compact op's
+    request_count, num_kv_heads, keep_count = 2, 2, 4
+    # The compaction builder admits only bf16 pools in the compact op's
     # supported geometry (32/128-token pages, head_dim 64/128).
     tokens_per_block, head_dim = 32, 64
     pools = [
@@ -409,26 +406,17 @@ def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buff
         for _ in range(2)
     ]
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
+    keep = torch.zeros(request_count, keep_count, dtype=torch.int32, device=device)
 
-    selector = _BatchedKeepSetSelector(
-        eviction_mode="union",
-        rows=3,
-        width=width,
-        keep_count=keep_count,
-        dtype=torch.float32,
-        device=device,
-        max_requests=request_count,
-    )
-
-    def build_compaction(kept_token_ordinals):
-        return BatchedKVCacheCompaction(
+    def build(fuse_dense_pack_into_selection):
+        return build_cache_compactions(
             eviction_mode="union",
             layer_pools=pools,
             dense_layers=[0, 1],
             swa_layers=[],
             layer_group_representative={0: 0, 1: 1},
             layer_pool_keys=[("dense", 0), ("dense", 0)],
-            kept_token_ordinals=kept_token_ordinals,
+            kept_token_ordinals=keep,
             valid_sequence_lengths=torch.full(
                 (request_count,), 10, dtype=torch.int32, device=device
             ),
@@ -439,23 +427,20 @@ def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buff
             decode_keep_count=keep_count,
             swa_window=None,
             protected_tail_capacity=1,
+            fuse_dense_pack_into_selection=fuse_dense_pack_into_selection,
         )
 
-    compaction = build_compaction(selector.keep)
-    assert compaction.target_dense_compaction.move_index_pack is not None
+    standalone = build(fuse_dense_pack_into_selection=False)
+    standalone_dense = _compaction_family(standalone, "dense")
+    assert standalone_dense["pack"] is standalone["dense_pack"]
 
-    pack_arguments = compaction.hand_move_source_pack_to_selection()
-    assert compaction.target_dense_compaction.move_index_pack is None
-    assert len(compaction.cache_compactions) == 1
-    assert compaction.cache_compactions[0] is compaction.target_dense_compaction
-    assert pack_arguments.dense_indices is compaction.target_dense_compaction.move_source_indices
-    assert pack_arguments.dense_offsets is compaction.target_dense_compaction.move_source_offsets
-
-    selector.fuse_move_source_pack(pack_arguments)
-    assert selector._move_source_pack is pack_arguments
-
-    # A packing built over any other keep buffer must be rejected: the fused
-    # kernel reads back the ordinals it just wrote.
-    foreign = build_compaction(torch.zeros_like(selector.keep))
-    with pytest.raises(ValueError, match="keep buffer"):
-        selector.fuse_move_source_pack(foreign.hand_move_source_pack_to_selection())
+    fused = build(fuse_dense_pack_into_selection=True)
+    dense = _compaction_family(fused, "dense")
+    assert dense["pack"] is None
+    assert len(fused["families"]) == 1
+    pack = fused["dense_pack"]
+    assert pack["dense_indices"] is dense["source"]
+    assert pack["dense_offsets"] is dense["offsets"]
+    # The fused settle kernel reads back the ordinals it just wrote, so the
+    # packing must describe the caller's own keep buffer.
+    assert pack["kept_token_ordinals"] is keep

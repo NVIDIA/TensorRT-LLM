@@ -7,7 +7,7 @@ entry and union eviction launches its fused score+stats+union pipeline. It
 uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ,
 and producer-only page-ID lookahead. Geometries outside the exact contract
 validated here raise loudly at setup
-(``_FixedScoreGroup.prepare_cute_score``); there is no fallback path.
+(``triattention.prepare_eviction_workspace``); there is no fallback path.
 """
 
 from __future__ import annotations

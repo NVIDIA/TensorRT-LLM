@@ -34,23 +34,17 @@ import torch
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_bare_staging as _make_bare_staging
 from conftest import make_fake_v2 as _make_fake_v2
-from conftest import make_fixed_resources_stubs as _make_fixed_resources_stubs
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import make_triattention as _make_triattention
+from conftest import make_workspace_stubs as _make_workspace_stubs
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
 from pydantic import ValidationError
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
 # compression manager -- no attention classes or KV-cache-manager subclass.
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    TriAttention,
-    _PreparedEviction,
-    _PreparedGenerationBatch,
-    _RequestCompressionState,
-    _RuntimeKVLayout,
-)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
 # Framework base class lives in pyexecutor.resource_manager; the factory lives
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
@@ -75,11 +69,11 @@ def _set_request_state(
     evicted_tokens=0,
     confirmed_kv_length=None,
 ):
-    state = _RequestCompressionState(
-        generation_steps=generation_steps,
-        evicted_tokens=evicted_tokens,
-        confirmed_kv_length=confirmed_kv_length,
-    )
+    state = {
+        "generation_steps": generation_steps,
+        "evicted_tokens": evicted_tokens,
+        "confirmed_kv_length": confirmed_kv_length,
+    }
     manager._request_states[request_id] = state
     return state
 
@@ -94,15 +88,15 @@ def _prepared_eviction(
     round_start=None,
     prompt_len=0,
 ):
-    return _PreparedEviction(
-        request=request,
-        request_id=request_id,
-        seq_len=seq_len,
-        round_start=int(seq_len if round_start is None else round_start),
-        prompt_len=prompt_len,
-        expected_keep_count=expected_keep_count,
-        protected_tail=protected_tail,
-    )
+    return {
+        "request": request,
+        "request_id": request_id,
+        "seq_len": seq_len,
+        "round_start": int(seq_len if round_start is None else round_start),
+        "prompt_len": prompt_len,
+        "expected_keep_count": expected_keep_count,
+        "protected_tail": protected_tail,
+    }
 
 
 @pytest.fixture
@@ -185,7 +179,7 @@ class TestTriAttentionClass:
         )
         triattention = _make_triattention()
         triattention.kv_cache_manager = manager
-        cached = _RuntimeKVLayout(
+        cached = dict(
             manager=manager,
             num_layers=3,
             global_layers=[10, 11, 12],
@@ -351,22 +345,22 @@ class TestEvictionLifecycle:
         with pytest.raises(RuntimeError, match="request 8 must be resumed"):
             manager._periodic_evict(batch)
 
-        assert first_state.generation_steps == 127
-        assert first_state.confirmed_kv_length is None
-        assert second_state.generation_steps == 127
-        assert second_state.confirmed_kv_length is None
+        assert first_state["generation_steps"] == 127
+        assert first_state["confirmed_kv_length"] is None
+        assert second_state["generation_steps"] == 127
+        assert second_state["confirmed_kv_length"] is None
 
     def test_non_boundary_step_skips_eviction_geometry(self):
         manager, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         state = manager._request_states[7]
-        state.generation_steps = 126
+        state["generation_steps"] = 126
 
         with mock.patch.object(manager, "_minimum_evictable_length") as keep_count:
             manager._periodic_evict(batch)
 
         keep_count.assert_not_called()
-        assert state.generation_steps == 127
-        assert state.confirmed_kv_length == 1024 + 4096 + 1
+        assert state["generation_steps"] == 127
+        assert state["confirmed_kv_length"] == 1024 + 4096 + 1
 
     def test_eager_eviction_runs_large_due_cohort_in_one_round(self):
         manager, _, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
@@ -402,23 +396,17 @@ class TestEvictionLifecycle:
             evicted_tokens=127,
             confirmed_kv_length=128,
         )
-        buffers = object()
-        compaction = object()
-        manager._eviction_resources = buffers
-        manager._batched_compaction = compaction
-        manager._prepared_generation_batch = _PreparedGenerationBatch(
-            batch=SimpleNamespace(),
-            growth_by_request={7: 1},
-        )
+        workspace = object()
+        manager._workspace = workspace
+        manager._prepared_generation_batch = (SimpleNamespace(), {7: 1})
 
         manager.on_request_finish(_make_request(7))
 
         assert manager._request_states == {}
-        assert manager._prepared_generation_batch.growth_by_request == {}
-        # The buffers are sized for the executor limits, not one cohort, so
-        # they stay resident for the next generation batch.
-        assert manager._eviction_resources is buffers
-        assert manager._batched_compaction is compaction
+        assert manager._prepared_generation_batch[1] == {}
+        # The workspace is sized for the executor limits, not one cohort, so
+        # it stays resident for the next generation batch.
+        assert manager._workspace is workspace
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
@@ -432,9 +420,9 @@ class TestEvictionLifecycle:
         cache = mgr.kv_cache_manager.kv_cache_map[7]
         cache.capacity = confirmed + tail
         mgr.kv_cache_manager.num_extra_kv_tokens = reserve
-        mgr._prepared_generation_batch = _PreparedGenerationBatch(
-            batch=SimpleNamespace(generation_requests=[request]),
-            growth_by_request={7: current_growth},
+        mgr._prepared_generation_batch = (
+            SimpleNamespace(generation_requests=[request]),
+            {7: current_growth},
         )
         draft_manager = _make_fake_v2(is_draft=True)
         draft_cache = SimpleNamespace(is_active=True, resize=mock.Mock(return_value=True))
@@ -443,7 +431,7 @@ class TestEvictionLifecycle:
         mgr.draft_kv_cache_manager = draft_manager
 
         def compact(*_args, **_kwargs):
-            mgr._request_states[7].confirmed_kv_length = retained
+            mgr._request_states[7]["confirmed_kv_length"] = retained
             return [(7, retained)]
 
         with mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict:
@@ -454,7 +442,7 @@ class TestEvictionLifecycle:
             2,
             protected_tail_lengths={7: tail},
         )
-        assert mgr._request_states[7].confirmed_kv_length == retained
+        assert mgr._request_states[7]["confirmed_kv_length"] == retained
         cache.resize.assert_called_once_with(retained + tail, None)
         # The draft cache shrinks in the same round, to the same retained
         # length plus the draft's own protected tail.
@@ -492,7 +480,7 @@ class TestEvictionLifecycle:
 
         manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert manager._request_states[7].confirmed_kv_length == physical_confirmed
+        assert manager._request_states[7]["confirmed_kv_length"] == physical_confirmed
         cache.resize.assert_not_called()
 
     def test_mla_selfkonly_cache_is_rejected(self):
@@ -598,14 +586,16 @@ class TestEvictionLifecycle:
 
         triattention.prepare_resources(batch)
 
-        assert triattention._prepared_generation_batch.batch is batch
-        assert triattention._prepared_generation_batch.growth_by_request == {7: expected_growth}
+        assert triattention._prepared_generation_batch[0] is batch
+        assert triattention._prepared_generation_batch[1] == {7: expected_growth}
 
 
 class TestFixedScoreMetadata:
     @pytest.mark.parametrize("normalize_scores", [False, True])
     @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-    def test_fixed_buffers_bind_score_after_selection(self, eviction_mode, normalize_scores):
+    def test_workspace_build_receives_mode_and_capacity_kwargs(
+        self, eviction_mode, normalize_scores
+    ):
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
         if eviction_mode == "union" and not normalize_scores:
@@ -623,9 +613,9 @@ class TestFixedScoreMetadata:
             eviction_mode=eviction_mode,
             normalize_scores=normalize_scores,
         )
-        # The buffers follow the executor limits: eight requests (max batch
+        # The workspace follows the executor limits: eight requests (max batch
         # size) by 260 decode tokens (top_B plus two eviction periods).
-        layout, score_staging, keep_set_selector = _make_fixed_resources_stubs(manager)
+        layout, workspace = _make_workspace_stubs(manager)
         prepared = [
             _prepared_eviction(
                 _make_request(7),
@@ -635,27 +625,28 @@ class TestFixedScoreMetadata:
             )
         ]
 
-        with (
-            mock.patch.object(
-                module,
-                "_FixedScoreStagingBuffers",
-                return_value=score_staging,
-            ),
-            mock.patch.object(
-                module,
-                "_BatchedKeepSetSelector",
-                return_value=keep_set_selector,
-            ) as build_selection,
-        ):
-            resources = manager._fixed_resources_for(layout, prepared)
+        with mock.patch.object(
+            module,
+            "prepare_eviction_workspace",
+            return_value=workspace,
+        ) as build_workspace:
+            resources = manager._workspace_for(layout, prepared)
 
-        score_staging.bind_score_launcher.assert_called_once_with(
-            keep_set_selector.valid_widths,
-            "mean",
-        )
-        assert build_selection.call_args.kwargs["eviction_mode"] == eviction_mode
-        assert resources.score_staging is score_staging
-        assert resources.keep_set_selector is keep_set_selector
+        assert resources is workspace
+        kwargs = build_workspace.call_args.kwargs
+        assert kwargs["eviction_mode"] == eviction_mode
+        assert kwargs["keep_count"] == 4
+        assert kwargs["max_requests"] == 8
+        assert kwargs["decode_width"] == 260
+        assert kwargs["phase"] is manager._phase
+        assert kwargs["layer_pool_keys"] == list(layout["layer_pool_keys"])
+        # The cached workspace serves later rounds without rebuilding.
+        with mock.patch.object(
+            module,
+            "prepare_eviction_workspace",
+            side_effect=AssertionError("workspace was rebuilt"),
+        ):
+            assert manager._workspace_for(layout, prepared) is workspace
 
     def test_bulk_page_table_copy_snapshots_and_orders_consumers(self):
         """The bulk copy stages immutable host snapshots, and the next copy
@@ -667,6 +658,11 @@ class TestFixedScoreMetadata:
         subsequent bulk copy must also wait until the previous round's
         consumers (recorded by ``mark_page_tables_consumed``) are done.
         """
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            _stage_block_offsets,
+            mark_page_tables_consumed,
+        )
+
         device = torch.device("cuda", torch.cuda.current_device())
         current_stream = torch.cuda.current_stream(device)
         manager_stream = torch.cuda.Stream(device=device)
@@ -695,7 +691,9 @@ class TestFixedScoreMetadata:
         manager = _make_staging_manager(host_table, gather, manager_stream)
 
         def stage_once():
-            assert staging._stage_page_tables_bulk(
+            # Raises on any staging failure; success returns None.
+            _stage_block_offsets(
+                staging,
                 manager,
                 [7],
                 current_stream,
@@ -745,7 +743,7 @@ class TestFixedScoreMetadata:
         torch.cuda._sleep(20_000_000)
         snapshot.copy_(staging.block_offsets_device)
         staging.page_tables_active = True
-        staging.mark_page_tables_consumed(manager_stream)
+        mark_page_tables_consumed(staging, manager_stream)
 
         stage_once()
         current_stream.synchronize()
@@ -754,60 +752,48 @@ class TestFixedScoreMetadata:
         assert staging.block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
 
     def test_staged_page_tables_bypass_per_request_cuda_materialization(self):
-        manager = _make_triattention()
-        get_batch = mock.Mock()
-        manager.kv_cache_manager = SimpleNamespace(get_batch_cache_indices=get_batch)
-        staging = SimpleNamespace(
-            stage=mock.Mock(return_value=True),
-            max_requests=8,
+        manager = _make_triattention(top_B=4)
+        manager.kv_cache_manager.num_extra_kv_tokens = 3
+        manager.kv_cache_manager._stream = mock.Mock()
+        manager.kv_cache_manager.get_batch_cache_indices = mock.Mock(
+            side_effect=AssertionError("eviction staged page tables per request")
         )
-        prepared = [
-            _prepared_eviction(
-                SimpleNamespace(),
-                request_id=7,
-                round_start=8,
-                seq_len=8,
-                prompt_len=3,
-                expected_keep_count=6,
-                protected_tail=2,
-            ),
-            _prepared_eviction(
-                SimpleNamespace(),
-                request_id=8,
-                round_start=9,
-                seq_len=9,
-                prompt_len=5,
-                expected_keep_count=6,
-                protected_tail=3,
-            ),
-        ]
+        first = _make_request(7, py_prompt_len=3)
+        second = _make_request(8, py_prompt_len=5)
+        _set_request_state(manager, 7, confirmed_kv_length=8)
+        _set_request_state(manager, 8, confirmed_kv_length=10)
 
-        layout = SimpleNamespace(swa_layers=[], swa_window=None)
-        manager._attach_page_ids(prepared, staging, layout)
+        with _mocked_eviction_internals(manager) as internals:
+            manager._evict_requests(
+                [(first, 7), (second, 8)],
+                2,
+                protected_tail_lengths={7: 2, 8: 3},
+            )
 
-        # top_B=8: per-request moves are keep + tail = [10, 11]; padded rows
-        # repeat the final offset out to the request capacity.
-        staging.stage.assert_called_once_with(
-            manager.kv_cache_manager,
-            [7, 8],
-            [8, 9],
-            [3, 5],
-            [8, 9],
-            [10, 12],
-            draft_manager=None,
-            dense_move_offsets=[0, 10, 21, 21, 21, 21, 21, 21, 21],
-            swa_move_offsets=None,
-            draft_move_offsets=None,
+        # One batched staging call carries the whole cohort: request ids,
+        # round starts, pinned prompt lengths, valid lengths, and page-table
+        # lengths (valid + protected tail). top_B=4: per-request moves are
+        # keep + tail = [6, 7]; padded rows repeat the final offset out to
+        # the request capacity.
+        args = internals.stage.call_args
+        assert args.args[0] is internals.workspace
+        assert args.args[1] is manager.kv_cache_manager
+        assert args.args[2:7] == ([7, 8], [8, 10], [3, 5], [8, 10], [10, 13])
+        assert args.kwargs["draft_manager"] is None
+        assert args.kwargs["dense_move_offsets"] == [0, 6, 13, 13, 13, 13, 13, 13, 13]
+        assert args.kwargs["swa_move_offsets"] is None
+        assert args.kwargs["draft_move_offsets"] is None
+        internals.consumed.assert_called_once_with(
+            internals.workspace, manager.kv_cache_manager._stream
         )
-        assert all(not hasattr(item, "page_ids") for item in prepared)
 
     @requires_sm100
     @pytest.mark.parametrize("request_count", [1, 7, 8])
     def test_staging_stages_dense_and_swa_tables_and_rejects_stream_changes(self, request_count):
         pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-            _FixedScoreStagingBuffers,
-            _FixedScoreStreamMismatch,
+            prepare_eviction_workspace,
+            stage_eviction_cohort,
         )
 
         device = torch.device("cuda", torch.cuda.current_device())
@@ -848,34 +834,37 @@ class TestFixedScoreMetadata:
         assert not freq.is_contiguous()
         assert not omega.is_contiguous()
         assert not offsets.is_contiguous()
-        staging = _FixedScoreStagingBuffers(
-            pools,
-            dense_groups,
-            [0, 1, 2],
-            representatives,
-            max_requests,
-            seq_len,
-            num_q_heads,
-            num_freqs,
-            q_real,
-            q_imag,
-            mlr,
-            freq,
-            offsets,
-            omega,
+        # The workspace constructor converts every non-contiguous fp64
+        # calibration input to contiguous fp32 (the runner's flat views would
+        # otherwise fail) and compiles the score kernel here.
+        staging = prepare_eviction_workspace(
+            eviction_mode="per_head",
+            layer_pools=pools,
+            dense_groups=dense_groups,
+            dense_layers=[0, 1, 2],
+            page_representatives=representatives,
+            max_requests=max_requests,
+            seq_len=seq_len,
+            num_q_heads=num_q_heads,
+            num_freqs=num_freqs,
+            keep_count=4,
+            q_real=q_real,
+            q_imag=q_imag,
+            mlr_coef=mlr,
+            freq_scale_sq=freq,
+            offsets=offsets,
+            omega=omega,
             page_table_token_capacity=page_table_token_capacity,
+            build_compaction=False,
         )
         assert staging.bucket_seq_len == seq_len
         assert staging.page_table_token_capacity == page_table_token_capacity
-        assert staging.page_count == page_count
-        assert staging.mean_phase_table.offsets.dtype == torch.float32
-        assert staging.mean_phase_table.offsets.is_contiguous()
-        assert staging.mean_phase_table.omega.dtype == torch.float32
-        assert staging.mean_phase_table.omega.is_contiguous()
-        fused = staging.fused_group
-        for calibration in (*fused.pointer_middle[2:], *fused.pointer_tail):
-            assert calibration.dtype == torch.float32
-            assert calibration.is_contiguous()
+        # page_count 3 rounds up to the 4-block copy granule.
+        assert staging.copy_block_count == (page_count + 3) // 4 * 4
+        assert staging.phase["offsets"].dtype == torch.float32
+        assert staging.phase["offsets"].is_contiguous()
+        assert staging.phase["omega"].dtype == torch.float32
+        assert staging.phase["omega"].is_contiguous()
         tables = {
             10: [
                 [3 * request, 3 * request + 1, 3 * request + 2] for request in range(request_count)
@@ -917,23 +906,27 @@ class TestFixedScoreMetadata:
         manager = _make_staging_manager(
             host_table, gather, torch.cuda.Stream(device=device), num_slots=3
         )
-        manager.enable_swa_scratch_reuse = False
 
-        assert not staging.stage(
-            manager,
-            request_ids,
-            [2**31] * request_count,
-            token_starts,
-            [seq_len] * request_count,
-            [10] * request_count,
-        )
+        # Round starts past the int32 metadata range fail loudly before any
+        # GPU work is enqueued.
+        with pytest.raises((RuntimeError, OverflowError, ValueError)):
+            stage_eviction_cohort(
+                staging,
+                manager,
+                request_ids,
+                [2**31] * request_count,
+                token_starts,
+                [seq_len] * request_count,
+                [10] * request_count,
+            )
         assert gather.call_count == 0
         with mock.patch.object(
             torch,
             "index_select",
             side_effect=AssertionError("page-table staging used torch.index_select"),
         ):
-            assert staging.stage(
+            stage_eviction_cohort(
+                staging,
                 manager,
                 request_ids,
                 round_starts,
@@ -966,8 +959,8 @@ class TestFixedScoreMetadata:
         calls = gather.call_count
         other_stream = torch.cuda.Stream(device=device)
         with torch.cuda.stream(other_stream):
-            with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
-                staging.stage(manager, request_ids, round_starts, token_starts)
+            with pytest.raises(RuntimeError, match="staging CUDA stream"):
+                stage_eviction_cohort(staging, manager, request_ids, round_starts, token_starts)
         assert gather.call_count == calls
 
     @requires_sm100
@@ -983,10 +976,7 @@ class TestFixedScoreMetadata:
         table rebind.
         """
         pytest.importorskip("cutlass")
-        from tensorrt_llm._torch.kv_cache_compression.triattention import triattention_kernels
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-            _FixedScoreGroup,
-        )
+        from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
         device = torch.device("cuda", torch.cuda.current_device())
         torch.manual_seed(20260707 + request_count)
@@ -1030,47 +1020,46 @@ class TestFixedScoreMetadata:
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
         round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
         round_starts = round_device[:request_count].tolist()
-        token_starts = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
-        block_offsets = _encode_block_offsets(page_ids_3d)
-        group = _FixedScoreGroup(
-            pools,
-            layer_order,
-            max_requests,
-            page_count,
-            seq_len,
-            num_q_heads,
-            block_offsets,
-            layer_order,  # slot i holds layer i's tables
-            q_real,
-            q_imag,
-            mlr,
-            freq,
-            omega,
-            offsets,
-            output_width=seq_len - prompt_len,
+        # One group per layer: slot i holds layer i's own block table.
+        ws = module.prepare_eviction_workspace(
+            eviction_mode="per_head",
+            layer_pools=pools,
+            dense_groups=[[layer] for layer in layer_order],
+            dense_layers=layer_order,
+            page_representatives=layer_order,
+            max_requests=max_requests,
+            seq_len=seq_len,
+            num_q_heads=num_q_heads,
+            num_freqs=num_freqs,
+            keep_count=4,
+            q_real=q_real,
+            q_imag=q_imag,
+            mlr_coef=mlr,
+            freq_scale_sq=freq,
+            offsets=offsets,
+            omega=omega,
+            decode_width=seq_len - prompt_len,
+            build_compaction=False,
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
-        mean_cos = torch.empty(request_count, num_freqs, dtype=torch.float32, device=device)
-        mean_sin = torch.empty_like(mean_cos)
-        # Rows cover this launch and the +17 round-start advance below.
-        mean_phase_table = triattention_kernels.MeanPhaseTable(
-            offsets, omega, initial_rows=int(round_device.max()) + 18
-        )
-        mean_phase_table.gather(round_device, mean_cos, mean_sin, request_count)
+
+        def stage_round():
+            # Stage the round metadata straight into the fixed device rows
+            # (the cohort staging path is covered by the staging test above).
+            ws.round_starts_device.copy_(round_device)
+            ws.valid_seq_lens_device[:request_count].copy_(valid_seq_lens)
+            ws.token_starts_device.fill_(prompt_len)
+            ws.block_offsets_device[:, :, :, :page_count].copy_(_encode_block_offsets(page_ids_3d))
+
         score_sentinel = -12345.0
-        group.output.fill_(score_sentinel)
-        fixed = group.launch(
-            request_count,
-            valid_seq_lens,
-            valid_widths,
-            token_starts,
-            mean_cos,
-            mean_sin,
-        ).clone()
-        assert valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
+        stage_round()
+        ws.score_output.fill_(score_sentinel)
+        with mock.patch.object(module, "run_cache_compactions"):
+            module.run_eviction_round(ws, normalize_scores=False)
+        fixed = ws.score_output.clone()
+        assert ws.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
         # The deployed fused score must agree with the independent Torch oracle
         # when every layer owns a distinct V2 block table.
@@ -1097,7 +1086,7 @@ class TestFixedScoreMetadata:
                 torch.testing.assert_close(segment, expected, rtol=5e-3, atol=5e-3)
 
         round_device.add_(17)
-        block_offsets.copy_(_encode_block_offsets(page_ids_3d.roll(1, dims=2)))
+        page_ids_3d = page_ids_3d.roll(1, dims=2)
         valid_seq_lens.copy_(
             torch.tensor(
                 [seq_len - (request + 1) % 2 for request in range(request_count)],
@@ -1105,19 +1094,14 @@ class TestFixedScoreMetadata:
                 device=device,
             )
         )
-        mean_phase_table.gather(round_device, mean_cos, mean_sin, request_count)
         expected_second_widths = valid_seq_lens - prompt_len
-        group.output.fill_(score_sentinel)
-        valid_widths.fill_(-1)
-        second_launch = group.launch(
-            request_count,
-            valid_seq_lens,
-            valid_widths,
-            token_starts,
-            mean_cos,
-            mean_sin,
-        ).clone()
-        assert torch.equal(valid_widths, expected_second_widths)
+        stage_round()
+        ws.score_output.fill_(score_sentinel)
+        ws.valid_widths.fill_(-1)
+        with mock.patch.object(module, "run_cache_compactions"):
+            module.run_eviction_round(ws, normalize_scores=False)
+        second_launch = ws.score_output.clone()
+        assert torch.equal(ws.valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
 
 
