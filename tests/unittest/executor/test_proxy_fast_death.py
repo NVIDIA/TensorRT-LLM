@@ -53,6 +53,9 @@ def _bare_proxy():
     proxy._results = {}
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
+    # Seed attrs normally set in __init__ but bypassed by __new__ here (the
+    # workers_started=False shutdown path still cleans up the IPC dir).
+    proxy._multi_frontend_ipc_dir = None
     return proxy
 
 
