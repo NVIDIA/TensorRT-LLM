@@ -22,7 +22,7 @@ os.environ.pop("UCX_NET_DEVICES", None)
 # the 120s per-test timeout intermittently (https://nvbugs/6426834). One
 # progress thread is enough here: these tests verify transfer logic, not
 # transfer-engine threading.
-os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "1")
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 from dataclasses import dataclass
 from typing import List, Optional
 
