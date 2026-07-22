@@ -1,0 +1,54 @@
+# GSM8K under the InferenceMAX protocol. Mirrors
+# https://github.com/SemiAnalysisAI/InferenceX utils/evals/gsm8k.yaml (itself
+# derived from upstream lm-evaluation-harness gsm8k.yaml with doc_to_text
+# changed so chat models answer in an extractable format; see
+# lm-evaluation-harness#3411). Differences from that file: the task is renamed
+# to avoid clashing with the upstream registry, and max_gen_toks pins the
+# InferenceMAX generation budget (16384 context minus 4096 prompt) so
+# thinking-model CoT is not truncated at lm-eval's 256-token default.
+tag:
+  - math_word_problems
+task: gsm8k_inferencemax
+dataset_path: openai/gsm8k
+dataset_name: main
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: test
+doc_to_text: "Question: {{question}}\nEnd your response with the answer on the last line, formatted as: #### [number]\nAnswer:"
+doc_to_target: "{{answer}}"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+generation_kwargs:
+  until:
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+  max_gen_toks: 12288
+repeats: 1
+num_fewshot: 5
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        group_select: -1
+        regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "regex"
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: "take_first"
+metadata:
+  version: 3.0
