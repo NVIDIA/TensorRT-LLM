@@ -2287,7 +2287,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
            cleared then re-set for the newly-admitted slots -- both the host-side
            ``TorchSampler._top_p_decay_slots`` set (an O(1) hot-path early-out)
            and its device mirror ``is_top_p_decay_slot_cuda`` (the gate the
-           fused kernels use, so the hot path needs no host-side filtering) --
+           fused ops use, so the hot path needs no host-side filtering) --
            and the per-slot buffers are initialized. This clear-then-set also
            covers slot reuse: stale entries from a prior occupant are never
            consumed.
@@ -3092,6 +3092,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots: list[int] = []
         # Used for beam search updates
         max_prompt_len: int = 0
+
         # Prepare finish reasons handler
         self._finish_reasons_handler.setup_new_request_handling()
         for request in new_requests:
