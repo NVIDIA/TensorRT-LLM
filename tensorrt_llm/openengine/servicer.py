@@ -1292,29 +1292,3 @@ class OpenEngineServicer(
             data_parallel_rank=rank,
             events=[kv_pb2.KvEvent(all_blocks_cleared=kv_pb2.AllBlocksCleared())],
         )
-
-    async def Embed(self, request: object, context: grpc.aio.ServicerContext) -> None:
-        del request
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "Embedding is not implemented by this server"
-        )
-
-    async def Classify(self, request: object, context: grpc.aio.ServicerContext) -> None:
-        del request
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "Classification is not implemented by this server"
-        )
-
-    async def Score(self, request: object, context: grpc.aio.ServicerContext) -> None:
-        del request
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "Scoring is not implemented by this server"
-        )
-
-    async def SubscribeRuntimeEvents(
-        self, request: object, context: grpc.aio.ServicerContext
-    ) -> None:
-        del request
-        await context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "Runtime event streaming is not implemented"
-        )
