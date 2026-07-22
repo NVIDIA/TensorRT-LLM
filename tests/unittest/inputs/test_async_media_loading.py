@@ -49,6 +49,16 @@ def _make_audio_file(tmp_path: str) -> str:
     return tmp_path
 
 
+def _make_audio_data_url() -> str:
+    sample_rate = 16000
+    time_axis = np.linspace(0, 0.05, int(sample_rate * 0.05), endpoint=False)
+    audio_samples = (np.sin(2 * np.pi * 440 * time_axis) * 0.5).astype(np.float32)
+    audio_buf = BytesIO()
+    soundfile.write(audio_buf, audio_samples, sample_rate, format="WAV")
+    b64_str = base64.b64encode(audio_buf.getvalue()).decode()
+    return f"data:audio/wav;base64,{b64_str}"
+
+
 # ──────────────────────────────────────────────────────────────
 # async_load_image
 # ──────────────────────────────────────────────────────────────
@@ -112,6 +122,13 @@ class TestAsyncLoadAudio:
         audio_array, sample_rate = await async_load_audio(wav_path)
         assert isinstance(audio_array, np.ndarray)
         assert sample_rate == 16000  # matches the sr=16000 used in _make_audio_file
+
+    @pytest.mark.asyncio
+    async def test_load_audio_from_data_url(self):
+        url = _make_audio_data_url()
+        audio_array, sample_rate = await async_load_audio(url)
+        assert isinstance(audio_array, np.ndarray)
+        assert sample_rate == 16000
 
     @pytest.mark.asyncio
     async def test_cpu_work_runs_in_executor(self):
