@@ -41,6 +41,7 @@ from pydantic import Field, model_validator
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import named_graphmodules
 from ...utils.logger import ad_logger
 from ..interface import (
     BaseTransform,
@@ -83,6 +84,21 @@ def _validate_no_forward_hooks(model: nn.Module) -> None:
             "pipeline_cache does not support caching modules with forward hooks; "
             f"modules with forward hooks: {modules_with_hooks}"
         )
+
+
+def _restore_managed_graph_inputs(model: nn.Module, cm: CachedSequenceInterface) -> None:
+    """Activate interface-managed inputs required by a restored graph."""
+    active_args = set(cm.info.named_args)
+    available_args = cm.info.available_args
+
+    for _, graph_module in named_graphmodules(model):
+        for node in graph_module.graph.nodes:
+            if node.op != "placeholder":
+                continue
+            name = str(node.target)
+            if name in available_args and name not in active_args:
+                cm.info.activate_arg(name)
+                active_args.add(name)
 
 
 def _default_pipeline_cache_root() -> str:
@@ -186,7 +202,7 @@ class PipelineCache(BaseTransform):
 
     def maybe_restore(
         self,
-        _cm: CachedSequenceInterface,
+        cm: CachedSequenceInterface,
         factory: ModelFactory,
         shared_config: SharedConfig,
         transform_index: int,
@@ -203,6 +219,7 @@ class PipelineCache(BaseTransform):
         module: nn.Module | None = None
         try:
             module = self._load_module(context)
+            _restore_managed_graph_inputs(module, cm)
             local_success = True
         except Exception as exc:
             ad_logger.warning(f"Failed to restore AutoDeploy pipeline cache: {exc}")
