@@ -274,6 +274,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
+        self._ctx_output_sizes: Optional[Dict[int, int]] = None
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
             raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
@@ -736,12 +737,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         kv_lens_slice = kv_lens[:num_requests]
         cached_slice = cached_token_lens[:num_requests]
 
+        # Host-side per-ratio ctx compressed-token counts (Python ints), so
+        # _compute_ctx_compressed_position_ids never reads a device scalar
+        # (implicit D2H + stream sync) for its arange size / slice bound.
+        ctx_output_sizes: Optional[Dict[int, int]] = None
         if num_contexts > 0:
             # Prefill path: need per-request tensor ops for ctx scalar metadata.
+            ctx_output_sizes = {}
             for compress_ratio in self.compress_ratio_set:
                 new_comp_kv_lens = kv_lens_slice // compress_ratio - cached_slice // compress_ratio
                 cu_new = new_comp_kv_lens.cumsum(0)
                 num_ctx_compressed_tokens = cu_new[num_contexts - 1].item()
+                ctx_output_sizes[compress_ratio] = num_ctx_compressed_tokens
                 num_gen_compressed_tokens = num_generations * (
                     (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
                 )
@@ -760,12 +767,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 )
                 self.max_ctx_compressed_tokens[compress_ratio] = 0
 
+        # Cached for on_update_kv_lens(); see the reuse gate there.
+        self._ctx_output_sizes = ctx_output_sizes
+
         # 2) CUDA-side: fill *_cuda buffers on device.
         kv_lens_cuda = (
             self.cached_token_lens_cuda[:num_requests] + self._seq_lens_cuda[:num_requests]
         )
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
-        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda)
+        self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -780,6 +790,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         self,
         kv_lens: torch.Tensor,
         cached_tokens: torch.Tensor,
+        ctx_output_sizes: Optional[Dict[int, int]] = None,
     ):
         """Compute per-ratio compressed KV lens and position IDs on device.
 
@@ -788,6 +799,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         Args:
             kv_lens: Total KV lengths per request (device tensor, [batch_size]).
             cached_tokens: Cached token counts per request (device tensor, [batch_size]).
+            ctx_output_sizes: Optional per-ratio host-computed ctx
+                compressed-token counts (Python ints); avoids implicit
+                device-scalar reads (D2H + stream sync) in the ctx position-id
+                computation. prepare() always passes it; on_update_kv_lens()
+                reuses the cached copy unless the extend_ctx path may have
+                mutated ctx-row kv_lens on device.
         """
         batch_size = kv_lens.shape[0]
         num_contexts = self.num_contexts
@@ -811,6 +828,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 self.compressed_position_ids_cuda,
                 num_contexts,
                 self._compress_ratios_sorted,
+                ctx_output_sizes,
             )
 
         if self.num_gen_tokens_per_seq > 0 and num_generations > 0:
@@ -847,7 +865,13 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             num_gen_tokens // self.num_generations if self.num_generations > 0 else 0
         )
 
-        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
+        # Reuse prepare()'s host-computed ctx sizes unless the extend_ctx path
+        # (num_chunked_ctx_requests > 0) may have mutated ctx-row kv_lens on
+        # device; every other path only changes gen rows.
+        ctx_output_sizes = (
+            self._ctx_output_sizes if getattr(self, "num_chunked_ctx_requests", 0) == 0 else None
+        )
+        self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
 
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
@@ -1003,14 +1027,24 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
         num_contexts: int,
         compress_ratios: list,
+        ctx_output_sizes: Optional[Dict[int, int]] = None,
     ):
-        """Context-only compressed position IDs (eager, data-dependent shapes)."""
+        """Context-only compressed position IDs (eager, data-dependent shapes).
+
+        ctx_output_sizes (host ints) keeps the arange size and slice bound off
+        the device; the 0-dim-CUDA fallback costs two implicit D2H syncs per
+        ratio.
+        """
         device = past_kv_lens_bufs[compress_ratios[0]].device
         for compress_ratio in compress_ratios:
             past_kv = past_kv_lens_bufs[compress_ratio]
             cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
 
-            total_ctx_comp = cu_new_comp[num_contexts]
+            total_ctx_comp = (
+                ctx_output_sizes[compress_ratio]
+                if ctx_output_sizes is not None
+                else cu_new_comp[num_contexts]
+            )
             ctx_idx = torch.arange(total_ctx_comp, dtype=torch.int32, device=device)
             ctx_cu = cu_new_comp[: num_contexts + 1].to(torch.int32)
             ctx_req = torch.searchsorted(ctx_cu[1:], ctx_idx, right=True)
