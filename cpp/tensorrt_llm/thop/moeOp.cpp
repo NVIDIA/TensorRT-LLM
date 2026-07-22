@@ -553,7 +553,17 @@ public:
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
-        setRunnerProfiles(profile_ids);
+        // ===== Routed-expert LoRA activation flags =====
+        // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
+        // (fc1_slot_lora_ranks) schema. Computed before tactic selection so a
+        // GEMM2 fused-finalize tactic can be excluded when LoRA is active (the
+        // routed-expert LoRA delta occupies the GEMM2 epilogue that the FINALIZE
+        // fusion would use).
+        bool const lora_per_request = fc1_lora_ranks.has_value();
+        bool const lora_slot_indexed = fc1_slot_lora_ranks.has_value();
+        bool const lora_active = lora_per_request || lora_slot_indexed;
+
+        setRunnerProfiles(profile_ids, lora_active);
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -573,10 +583,8 @@ public:
         }
 
         // ===== Routed-expert LoRA setup =====
-        // LoRA is activated by the per-request schema (fc1_lora_ranks).
-        bool const lora_per_request = fc1_lora_ranks.has_value();
-        bool const lora_slot_indexed = fc1_slot_lora_ranks.has_value();
-        bool const lora_active = lora_per_request || lora_slot_indexed;
+        // Activation flags (lora_per_request / lora_slot_indexed / lora_active)
+        // were computed above, before tactic selection.
         bool const is_gated_act = isGatedActivation(base_activation_type);
         if (lora_active)
         {
@@ -1140,7 +1148,7 @@ private:
         }
     }
 
-    void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids)
+    void setRunnerProfiles(torch::optional<c10::ArrayRef<int64_t>> profile_ids, bool lora_active = false)
     {
         if (mUseDeepSeekFP8BlockScaling)
         {
@@ -1163,6 +1171,26 @@ private:
             best_gemm2_profile
                 = profile_ids.value()[1] == -1 ? best_gemm2_profile : mGemm2Profiles.at(profile_ids.value()[1]);
         }
+
+        // Routed-expert MoE LoRA is incompatible with the GEMM2 fused-finalize
+        // epilogue: the LoRA delta is applied in the GEMM2 epilogue that the
+        // FINALIZE fusion would otherwise occupy (see setupTmaWarpSpecializedInputs
+        // in moe_kernels.cu). The GEMM2 tactic autotuner profiles with LoRA off
+        // (runGemmProfile forces USE_LORA=false) and can therefore select a
+        // FINALIZE tactic, and a cached runner may still expose FINALIZE tactics
+        // if it was first constructed with fused finalize enabled. Downgrade the
+        // selected tactic to the equivalent non-fused (NONE) epilogue when LoRA
+        // is active. Every FINALIZE config is a copy of a valid non-FINALIZE
+        // config with the fusion flag flipped (see MoeGemmRunner::getConfigs), so
+        // clearing the flag yields a supported tactic with the same tile shape.
+        if (lora_active
+            && best_gemm2_profile.epilogue_fusion_type
+                == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE)
+        {
+            best_gemm2_profile.epilogue_fusion_type
+                = tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+        }
+
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
 
