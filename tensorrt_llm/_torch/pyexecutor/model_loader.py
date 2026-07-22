@@ -636,6 +636,7 @@ class ModelLoader:
                             value, self._metrics):
                         self._call_load_weights(model.load_weights, weights,
                                                 self.weight_mapper)
+                        torch.cuda.synchronize()
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -660,6 +661,7 @@ class ModelLoader:
                             self._metrics):
                         self._call_load_weights(model.load_draft_weights,
                                                 weights, draft_weight_mapper)
+                        torch.cuda.synchronize()
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
@@ -784,6 +786,7 @@ class ModelLoader:
                                     self._call_load_weights(
                                         model.load_weights, weights,
                                         self.weight_mapper)
+                                    torch.cuda.synchronize()
                             elif not weights_preloaded:
                                 raise RuntimeError(
                                     f"GMS RW: checkpoint loader "
@@ -818,6 +821,7 @@ class ModelLoader:
                                     self._call_load_weights(
                                         model.load_draft_weights, draft_weights,
                                         draft_weight_mapper)
+                                    torch.cuda.synchronize()
 
                             # Run post_load hooks INSIDE the pool so any
                             # tensors they create or rebind (fused QKV,
@@ -989,7 +993,7 @@ class ModelLoader:
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
 
-                torch.cuda.current_stream().synchronize()
+                torch.cuda.synchronize()
                 # Reclaim segments freed during per-module post_load_weights (e.g.
                 # MegaMoE _transform_main_weights releases ~5-6 GiB of redundant
                 # weight Parameters via `.data = empty(0)` that PyTorch's caching
