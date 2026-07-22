@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,6 +142,30 @@ TEST_F(PeftCacheManagerTest, addRequestPeftMissingTask)
 
     mPeftManager->addRequestPeft(llmRequest);
 }
+
+#if defined(ENABLE_FP8)
+TEST_F(PeftCacheManagerTest, adapterSelectsHomogeneousCacheDataType)
+{
+    SamplingConfig samplingConfig;
+    auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
+    TensorPtr fp8Weights = mManager->cpu(loraWeightsTp2->getShape(), tensorrt_llm::DataType::kFP8);
+    auto fp8Request = std::make_shared<LlmRequest>(0, 4, tokens, samplingConfig, false);
+    fp8Request->setLoraTaskId(1234);
+    fp8Request->setLoraWeights(fp8Weights);
+    fp8Request->setLoraConfig(loraConfigTp2);
+
+    mPeftManager->addRequestPeft(fp8Request);
+    EXPECT_EQ(mPeftManager->getDataType(), tensorrt_llm::DataType::kFP8);
+
+    auto floatRequest = std::make_shared<LlmRequest>(1, 4, tokens, samplingConfig, false);
+    floatRequest->setLoraTaskId(5678);
+    floatRequest->setLoraWeights(loraWeightsTp2);
+    floatRequest->setLoraConfig(loraConfigTp2);
+    EXPECT_THAT([&]() { mPeftManager->addRequestPeft(floatRequest); },
+        testing::Throws<std::runtime_error>(testing::Property(
+            &std::runtime_error::what, testing::HasSubstr("PEFT cache supports one homogeneous LoRA dtype"))));
+}
+#endif
 
 TEST_F(PeftCacheManagerTest, putGet)
 {

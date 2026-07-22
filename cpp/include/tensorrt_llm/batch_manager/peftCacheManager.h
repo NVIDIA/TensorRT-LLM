@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@
 
 #include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -125,6 +127,8 @@ public:
 
     [[nodiscard]] bool isTaskCachedDevice(uint64_t const taskId) const;
 
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const;
+
     void resetDeviceCache() override;
 
     void markRequestDone(LlmRequest const& llmReq, bool pause = false) override;
@@ -157,6 +161,8 @@ public:
     void prefetchLoraWeights(std::string const& modelDir, runtime::BufferManager const& bufferManager);
 
 private:
+    void configureDataType(tensorrt_llm::DataType dataType);
+
     std::unique_ptr<runtime::LoraCache> mHostLoraCache;
     std::unique_ptr<runtime::LoraCache> mDeviceLoraCache;
 
@@ -174,6 +180,9 @@ private:
 
     runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
+
+    mutable std::mutex mDataTypeMutex;
+    std::optional<tensorrt_llm::DataType> mDataType;
 
     int mDevice{-1};
 };

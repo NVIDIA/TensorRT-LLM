@@ -1060,14 +1060,19 @@ class LoraManager(object):
                     else:
                         scale = float(hf_config["lora_alpha"]) / effective_rank
 
-                    # Cast to model dtype before scaling
-                    # fp8 tensors don't support scalar multiply in PyTorch
-                    model_dtype = str_dtype_to_torch(model_config.dtype)
-                    t_in = t_in.to(model_dtype)
-                    t_out = t_out.to(model_dtype)
-                    t_out = t_out * scale
-                    if is_dora and t_mag is not None:
-                        t_mag = t_mag.to(model_dtype)
+                    is_fp8 = t_out.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    if is_fp8 and torch.cuda.get_device_capability()[0] >= 9:
+                        # Keep weights in FP8 for the native Hopper kernel.
+                        # FP8 has no scalar multiply, so scale through BF16.
+                        t_out = (t_out.to(torch.bfloat16) * scale).to(t_out.dtype)
+                    else:
+                        # Pre-Hopper kernels require the model compute dtype.
+                        model_dtype = str_dtype_to_torch(model_config.dtype)
+                        t_in = t_in.to(model_dtype)
+                        t_out = t_out.to(model_dtype)
+                        t_out = t_out * scale
+                        if is_dora and t_mag is not None:
+                            t_mag = t_mag.to(model_dtype)
 
                     self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = effective_rank
                     if self._retain_device_tensors:

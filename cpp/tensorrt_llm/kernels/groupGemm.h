@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,12 @@ namespace kernels
 {
 
 int64_t getGroupedGemmParamsWorkSpaceSize(int64_t problem_count);
+
+//! @brief Returns the parameter workspace size for the FP8 grouped GEMM path.
+//!
+//! The FP8 path (CUTLASS 3.x) stores problem shapes, pointer arrays, and
+//! cute stride arrays on the device. This function returns the required bytes.
+int64_t getFp8GroupedGemmParamsWorkSpaceSize(int64_t problemCount);
 
 void groupedGemm(std::vector<cutlass::gemm::GemmCoord> problem_sizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
