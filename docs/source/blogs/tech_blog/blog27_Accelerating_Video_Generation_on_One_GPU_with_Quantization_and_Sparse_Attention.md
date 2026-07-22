@@ -12,7 +12,7 @@ A representative profile of the compiled dense BF16 path shows why attention is 
 optimization target: it accounts for 71.7% of end-to-end latency, with GEMMs adding another 20.8%.
 
 <p align="center">
-  <img src="../media/tech_blog27_bf16_time_breakdown.png" alt="Pie chart showing that a representative compiled dense BF16 path spends 71.7% of end-to-end latency in attention, 20.8% in GEMMs, and 7.5% in other pipeline work" width="1080">
+  <img src="../media/tech_blog27_bf16_time_breakdown.png" alt="Pie chart showing that a representative compiled dense BF16 path spends 71.7% of end-to-end latency in attention, 20.8% in GEMMs, and 7.5% in other work" width="1080">
 </p>
 
 <p align="center"><sub><em>Figure 1. Representative end-to-end latency breakdown for the compiled
