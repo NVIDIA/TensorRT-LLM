@@ -59,6 +59,10 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
+        # Keep AttentionInfo on attention-free PP stages so it can still carry
+        # the attention-DP topology used by Mamba transfers.  A zero head count
+        # means that this rank has no local attention cache; AttentionPolicy
+        # must not perform head-ratio arithmetic for such ranks.
         kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
         return cls(
             instance_name=instance_name,
