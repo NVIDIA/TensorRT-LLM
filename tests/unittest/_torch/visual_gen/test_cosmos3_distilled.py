@@ -18,6 +18,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_T2I_PARAMS,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     DISTILLED_GUIDANCE_SCALE,
     Cosmos3SamplingPolicy,
@@ -84,8 +85,13 @@ def _bare_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
         action_gen=False,
         sampling=Cosmos3SamplingPolicy(),
         default_use_system_prompt=False,
+        family=QWEN3_RECIPE.name,
+        use_native_flow_schedule=False,
     )
     defaults.update(attrs)
+    if "mode_schedulers" not in defaults:
+        scheduler = defaults.get("scheduler")
+        defaults["mode_schedulers"] = {"video": scheduler, "image": scheduler}
     for key, value in defaults.items():
         setattr(pipeline, key, value)
     return pipeline
@@ -257,7 +263,7 @@ class TestFlowShift:
         policy = _base_policy()
         scheduler = _base_scheduler()
 
-        rebuilt = policy.set_flow_shift(scheduler, 3.0)
+        rebuilt = policy.with_flow_shift(scheduler, 3.0)
         assert rebuilt is not scheduler
         assert isinstance(rebuilt, UniPCMultistepScheduler)
         assert float(rebuilt.config.flow_shift) == 3.0
@@ -266,17 +272,17 @@ class TestFlowShift:
         """No separate shift-tracking state: a second call with the same target
         on the rebuilt instance is a no-op; restoring rebuilds again."""
         policy = _base_policy()
-        rebuilt = policy.set_flow_shift(_base_scheduler(), 3.0)
-        assert policy.set_flow_shift(rebuilt, 3.0) is rebuilt
+        rebuilt = policy.with_flow_shift(_base_scheduler(), 3.0)
+        assert policy.with_flow_shift(rebuilt, 3.0) is rebuilt
 
-        restored = policy.set_flow_shift(rebuilt, 1.0)
+        restored = policy.with_flow_shift(rebuilt, 1.0)
         assert restored is not rebuilt
         assert float(restored.config.flow_shift) == 1.0
 
     def test_distilled_is_structural_noop(self):
         policy = _distilled_policy()
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(DISTILLED_SCHEDULER_CONFIG)
-        assert policy.set_flow_shift(scheduler, 3.0) is scheduler
+        assert policy.with_flow_shift(scheduler, 3.0) is scheduler
 
 
 class TestSetTimesteps:

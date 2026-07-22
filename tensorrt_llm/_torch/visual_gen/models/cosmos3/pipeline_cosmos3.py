@@ -24,7 +24,7 @@ import torch
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
-from transformers import Qwen2Tokenizer
+from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -35,15 +35,14 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
 from .defaults import (
-    COSMOS3_720P_PARAMS,
+    COSMOS3_ENVELOPES,
     COSMOS3_EXTRA_SPECS,
-    COSMOS3_PIPELINE_DEFAULTS,
-    COSMOS3_T2I_PARAMS,
+    COSMOS3_GENERATION_DEFAULTS,
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sampling import Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
-from .transformer_cosmos3 import Cosmos3VFMTransformer
+from .transformer_cosmos3 import Cosmos3VFMTransformer, resolve_arch_recipe
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
@@ -68,6 +67,7 @@ TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARD
         "nvidia/Cosmos3-Super-Image2Video-4Step",
         "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Text2Image-4Step",
+        "nvidia/Cosmos3-Edge",
     ],
     doc="Cosmos3 Omnimodal world models.",
 )
@@ -77,7 +77,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self.audio_gen = False
         self.action_gen = False
         self.sampling = Cosmos3SamplingPolicy()
+        self.use_native_flow_schedule = False
         self.default_use_system_prompt = COSMOS3_EXTRA_SPECS["use_system_prompt"].default
+        self.family = resolve_arch_recipe(primary_pretrained_config).name
         if getattr(
             primary_pretrained_config,
             "audio_gen",
@@ -87,10 +89,58 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.audio_gen = True
 
         if getattr(primary_pretrained_config, "action_gen", False):
-            logger.info("Initializing Cosmos3OmniMoTPipeline with action generation.")
+            logger.info(
+                "Checkpoint declares action weights; action generation is not supported "
+                "by this pipeline (weights are skipped)."
+            )
             self.action_gen = True
 
         super().__init__(pipeline_config)
+
+    def _mode_params(self, mode: str) -> dict:
+        """Generation default table for this checkpoint family and request mode."""
+        return COSMOS3_GENERATION_DEFAULTS[(self.family, mode)]
+
+    def _log_envelope_advisory(
+        self,
+        *,
+        is_t2i: bool,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        max_sequence_length: int,
+    ) -> None:
+        """One advisory line for requests outside the model-card envelope.
+
+        The envelope is documented support, not enforced validation: the
+        reference runtime accepts a wider range, so out-of-envelope requests
+        run — they just carry no quality claim. Families without a declared
+        envelope get no advisory.
+        """
+        env = COSMOS3_ENVELOPES.get(self.family)
+        if env is None:
+            return
+        outside = []
+        if (height, width) not in env["resolutions"]:
+            outside.append(f"{width}x{height} resolution")
+        if not is_t2i:
+            lo, hi = env["num_frames"]
+            if not lo <= num_frames <= hi:
+                outside.append(f"num_frames={num_frames} (validated: {lo}-{hi})")
+            lo, hi = env["frame_rate"]
+            if not lo <= frame_rate <= hi:
+                outside.append(f"frame_rate={frame_rate} (validated: {lo}-{hi})")
+        if max_sequence_length > env["max_sequence_length"]:
+            outside.append(
+                f"max_sequence_length={max_sequence_length} (validated: "
+                f"<= {env['max_sequence_length']})"
+            )
+        if outside:
+            logger.warning(
+                "Request is outside the model-card validated envelope "
+                f"({'; '.join(outside)}); generation proceeds but quality may degrade."
+            )
 
     def _init_transformer(self) -> None:
         logger.info("Initializing Cosmos3VFMTransformer")
@@ -119,6 +169,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.default_use_system_prompt = bool(
                 model_index.get("default_use_system_prompt", self.default_use_system_prompt)
             )
+            self.use_native_flow_schedule = bool(
+                model_index.get("use_native_flow_schedule", self.use_native_flow_schedule)
+            )
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")
@@ -134,7 +187,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
-            self.tokenizer = Qwen2Tokenizer.from_pretrained(
+            self.tokenizer = AutoTokenizer.from_pretrained(
                 checkpoint_dir,
                 subfolder="text_tokenizer",
             )
@@ -157,6 +210,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.vae_scale_factor_spatial = getattr(
                 self.vae.config, "scale_factor_spatial", self.vae_scale_factor_spatial
             )
+            if (
+                getattr(self.transformer, "temporal_compression_factor_declared", False)
+                and self.transformer.temporal_compression_factor != self.vae_scale_factor_temporal
+            ):
+                raise ValueError(
+                    f"Transformer config declares temporal_compression_factor="
+                    f"{self.transformer.temporal_compression_factor}, but the VAE reports "
+                    f"scale_factor_temporal={self.vae_scale_factor_temporal}."
+                )
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -165,7 +227,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # checkpoints, FlowMatchEuler (fixed stochastic schedule) for
             # distilled ones. The policy holds the derived immutable facts.
             self.scheduler = load_scheduler(checkpoint_dir)
-            self.sampling = Cosmos3SamplingPolicy.from_scheduler(self.scheduler)
+            self.sampling = Cosmos3SamplingPolicy.from_scheduler(
+                self.scheduler, native_flow_schedule=self.use_native_flow_schedule
+            )
+            # flow_shift is a per-mode table fact, not a request field, so the
+            # mode schedulers are prebuilt once; forward() only picks one.
+            base_scheduler = self.scheduler
+            self.mode_schedulers = {}
+            for mode in ("video", "image"):
+                shift = self._mode_params(mode).get("flow_shift")
+                if shift is None:
+                    shift = self.sampling.checkpoint_flow_shift
+                self.mode_schedulers[mode] = self.sampling.with_flow_shift(base_scheduler, shift)
+            self.scheduler = self.mode_schedulers["video"]
             if self.audio_gen:
                 # Separate instance so video and audio scheduler states don't
                 # collide (schedulers mutate internal state on every .step()).
@@ -202,11 +276,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_warmup_resolutions(self):
-        return [(720, 1280)]
+        video = self._mode_params("video")
+        return [(video["height"], video["width"])]
 
     @property
     def default_warmup_num_frames(self):
-        return [189]
+        return [self._mode_params("video")["num_frames"]]
 
     @property
     def default_warmup_steps(self):
@@ -215,7 +290,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_generation_params(self):
-        return {**COSMOS3_PIPELINE_DEFAULTS, **self.sampling.generation_default_overrides()}
+        """Fields merged by the executor into every request.
+
+        Mode-dependent values remain None until infer() selects the request
+        mode; key membership also declares these fields supported during
+        request validation. ``flow_shift`` is pipeline-internal, not a
+        request field.
+        """
+        defaults = {k: v for k, v in self._mode_params("video").items() if k != "flow_shift"}
+        defaults.update(
+            {
+                "height": None,
+                "width": None,
+                "num_inference_steps": None,
+                "guidance_scale": None,
+            }
+        )
+        return {**defaults, **self.sampling.generation_default_overrides()}
 
     @property
     def extra_param_specs(self):
@@ -231,7 +322,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         defaults = self.default_generation_params
         guidance_scale = defaults["guidance_scale"]
         if guidance_scale is None:
-            guidance_scale = COSMOS3_720P_PARAMS["guidance_scale"]
+            guidance_scale = self._mode_params("video")["guidance_scale"]
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
@@ -254,7 +345,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_t2i = str(output_type).lower() == "image"
 
         # None = unset; resolve by mode exactly once. Non-None values pass through.
-        mode_params = COSMOS3_T2I_PARAMS if is_t2i else COSMOS3_720P_PARAMS
+        mode_params = self._mode_params("image" if is_t2i else "video")
 
         def resolved(value, field_name):
             return value if value is not None else mode_params[field_name]
@@ -635,13 +726,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         seed: int,
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
-        height: int = COSMOS3_720P_PARAMS["height"],
-        width: int = COSMOS3_720P_PARAMS["width"],
-        num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
-        num_inference_steps: int = COSMOS3_720P_PARAMS["num_inference_steps"],
-        guidance_scale: float = COSMOS3_720P_PARAMS["guidance_scale"],
-        max_sequence_length: int = COSMOS3_720P_PARAMS["max_sequence_length"],
-        frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_frames: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        max_sequence_length: Optional[int] = None,
+        frame_rate: Optional[float] = None,
         use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
         use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
         use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
@@ -652,11 +743,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         """Run one generation. ``infer()`` is the resolved entry point.
 
         Production requests arrive through ``infer()`` with fully resolved
-        values; the signature defaults are the base-checkpoint *video* table
-        values for direct internal callers. ``forward()`` cannot tell a
-        signature default from an explicit argument, so on distilled
-        checkpoints (which fix steps/guidance and reject anything else) direct
-        callers must pass checkpoint-valid sampling values.
+        values; unset (None) numeric parameters resolve here from the same
+        per-variant mode tables, so direct internal callers get
+        checkpoint-appropriate values (including the fixed distilled
+        steps/guidance).
         """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -672,7 +762,35 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             raise ValueError(f"output_type must be 'video' or 'image', got {output_type!r}.")
         is_t2i = output_type == "image"
 
+        mode_params = self._mode_params(output_type)
+        video_params = self._mode_params("video")
+        sampling_overrides = self.sampling.generation_default_overrides()
+
+        def _resolved(value, key):
+            if value is not None:
+                return value
+            if key in sampling_overrides:
+                return sampling_overrides[key]
+            return mode_params.get(key, video_params.get(key))
+
+        height = _resolved(height, "height")
+        width = _resolved(width, "width")
+        num_frames = _resolved(num_frames, "num_frames")
+        num_inference_steps = _resolved(num_inference_steps, "num_inference_steps")
+        guidance_scale = _resolved(guidance_scale, "guidance_scale")
+        max_sequence_length = _resolved(max_sequence_length, "max_sequence_length")
+        frame_rate = _resolved(frame_rate, "frame_rate")
+
         self.sampling.validate_request(num_inference_steps, guidance_scale)
+
+        self._log_envelope_advisory(
+            is_t2i=is_t2i,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            max_sequence_length=max_sequence_length,
+        )
 
         guidance_interval = None
         if is_t2i:
@@ -682,16 +800,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 )
             num_frames = 1
             enable_audio = False
-            guidance_interval = COSMOS3_T2I_PARAMS["guidance_interval"]
-            self.scheduler = self.sampling.set_flow_shift(
-                self.scheduler, COSMOS3_T2I_PARAMS["flow_shift"]
-            )
-        else:
-            # Restore the checkpoint flow_shift in case a prior T2I request
-            # rebuilt the scheduler with shift=3.0.
-            self.scheduler = self.sampling.set_flow_shift(
-                self.scheduler, self.sampling.checkpoint_flow_shift
-            )
+            guidance_interval = mode_params["guidance_interval"]
+
+        self.scheduler = self.mode_schedulers[output_type]
 
         # Weight-presence guard, not workflow policy: the request explicitly
         # asks for audio, but the checkpoint ships no audio tower. Silently

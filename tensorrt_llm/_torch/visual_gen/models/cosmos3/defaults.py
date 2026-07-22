@@ -45,16 +45,60 @@ COSMOS3_T2I_PARAMS = {
     "guidance_interval": (400.0, 1000.0),
 }
 
-# Fields merged by the executor into every request. Mode-dependent values
-# remain None until infer() selects the request mode; key membership also
-# declares these fields supported during request validation.
-COSMOS3_PIPELINE_DEFAULTS = {
-    **COSMOS3_720P_PARAMS,
-    "height": None,
-    "width": None,
-    "num_inference_steps": None,
-    "guidance_scale": None,
+# Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
+# model-card I2V command (T2V mirrors it — the model card documents I2V only);
+# ``flow_shift`` rides the checkpoint-declared native flow schedule. T2I values
+# are the cosmos-framework t2i mode defaults at Edge's native resolution
+# (480p at 1:1 aspect), with full-range CFG.
+COSMOS3_EDGE_VIDEO_PARAMS = {
+    "height": 480,
+    "width": 832,
+    "num_inference_steps": 50,
+    "guidance_scale": 5.0,
+    "max_sequence_length": 4096,
+    "num_frames": 121,
+    "frame_rate": 24.0,
+    "flow_shift": 3.0,
 }
+
+COSMOS3_EDGE_T2I_PARAMS = {
+    "height": 640,
+    "width": 640,
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "guidance_interval": None,
+}
+
+# Model-card validated envelope for Edge; advisory only (the reference
+# runtime accepts a wider range), surfaced as a log line per request.
+COSMOS3_EDGE_ENVELOPE = {
+    "num_frames": (50, 150),
+    "frame_rate": (12.0, 30.0),
+    "max_sequence_length": 4096,
+    "resolutions": frozenset(
+        {(640, 640), (544, 736), (736, 544), (480, 832), (832, 480), (256, 256), (256, 320),
+         (320, 256), (192, 320), (320, 192)}
+    ),
+}
+
+# (family, mode) → generation defaults. Family is the architecture recipe
+# name resolved from the transformer config; mode is the request's output
+# type — never inferred from the checkpoint name (a task-specialized
+# checkpoint can still be asked to run any mode).
+COSMOS3_GENERATION_DEFAULTS: Dict = {
+    ("qwen3", "video"): COSMOS3_720P_PARAMS,
+    ("qwen3", "image"): COSMOS3_T2I_PARAMS,
+    ("nemotron_dense", "video"): COSMOS3_EDGE_VIDEO_PARAMS,
+    ("nemotron_dense", "image"): COSMOS3_EDGE_T2I_PARAMS,
+}
+
+# Families without an entry get no envelope advisory.
+COSMOS3_ENVELOPES: Dict = {
+    "nemotron_dense": COSMOS3_EDGE_ENVELOPE,
+}
+
+
 
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
