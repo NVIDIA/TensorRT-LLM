@@ -10,6 +10,7 @@ process groups.
 
 from __future__ import annotations
 
+import itertools
 import os
 from typing import Optional
 
@@ -407,19 +408,18 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         for d in reversed(self._dim_names):
             strides[d] = acc
             acc *= self._dim_sizes[d]
-        bases = [0]
-        for d in self._dim_names:
-            if d in ("cfg", "ulysses"):
-                continue
-            bases = [b + strides[d] * v for b in bases for v in range(self._dim_sizes[d])]
-        return [
-            [
-                b + strides["cfg"] * c + strides["ulysses"] * u
-                for c in range(self._dim_sizes["cfg"])
-                for u in range(self._dim_sizes["ulysses"])
-            ]
-            for b in bases
-        ]
+        other_dims = [d for d in self._dim_names if d not in ("cfg", "ulysses")]
+        groups = []
+        for coords in itertools.product(*(range(self._dim_sizes[d]) for d in other_dims)):
+            base = sum(strides[d] * v for d, v in zip(other_dims, coords))
+            groups.append(
+                [
+                    base + strides["cfg"] * c + strides["ulysses"] * u
+                    for c in range(self._dim_sizes["cfg"])
+                    for u in range(self._dim_sizes["ulysses"])
+                ]
+            )
+        return groups
 
     # ------------------------------------------------------------------
     # Rank decomposition
