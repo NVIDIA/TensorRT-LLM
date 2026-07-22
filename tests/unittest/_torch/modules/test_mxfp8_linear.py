@@ -13,10 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.linear import Linear, MXFP8LinearMethod, get_quant_method
+import tensorrt_llm._torch.modules.linear as linear_module
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    MXFP8LinearMethod,
+    flashinfer_mxfp8_decode_graph_capture,
+    get_quant_method,
+)
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -42,14 +52,99 @@ def test_quant_dequant_roundtrip_is_close():
     assert rel < 0.1, f"relative error too high: {rel}"
 
 
-def test_mxfp8_dispatch_returns_mxfp8_method():
+def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     """get_quant_method must dispatch QuantAlgo.MXFP8 to MXFP8LinearMethod.
 
     This is a pure dispatch check; no CUDA required.
     """
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     method = get_quant_method(qc)
     assert isinstance(method, MXFP8LinearMethod)
+    assert method.backend == "trtllm"
+
+
+def _mock_mxfp8_ops(monkeypatch):
+    quantized = torch.empty((2, 4), dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty(512, dtype=torch.uint8)
+    quantize = Mock(return_value=(quantized, activation_scale))
+    native_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    native_gemm = Mock(return_value=native_output)
+    fake_trtllm_ops = SimpleNamespace(mxfp8_quantize=quantize, mxfp8_mxfp8_gemm=native_gemm)
+    monkeypatch.setattr(linear_module.torch, "ops", SimpleNamespace(trtllm=fake_trtllm_ops))
+    return quantized, activation_scale, quantize, native_gemm, native_output
+
+
+def test_mxfp8_flashinfer_call_contract(monkeypatch):
+    """The forced backend reuses TRT tensors and a zero-copy weight transpose."""
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "flashinfer")
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+
+    expected = torch.empty((2, 3), dtype=torch.bfloat16)
+    mm_mxfp8 = Mock(return_value=expected)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    quantized, activation_scale, quantize, _, _ = _mock_mxfp8_ops(monkeypatch)
+
+    weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty(512, dtype=torch.uint8)
+    module = SimpleNamespace(weight=weight, weight_scale=weight_scale, dtype=torch.bfloat16)
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+
+    method = MXFP8LinearMethod()
+    output = method.apply(module, activation, bias=None)
+
+    assert output is expected
+    quantize.assert_called_once_with(activation, True)
+    args = mm_mxfp8.call_args.args
+    kwargs = mm_mxfp8.call_args.kwargs
+    assert args[0] is quantized
+    assert args[1].shape == (4, 3)
+    assert args[1].data_ptr() == weight.data_ptr()
+    assert args[2] is activation_scale
+    assert args[3] is weight_scale
+    assert kwargs == {
+        "out_dtype": torch.bfloat16,
+        "use_8x4_sf_layout": False,
+        "backend": "cutlass",
+    }
+
+
+def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+
+    flashinfer_output = torch.empty((2, 3), dtype=torch.bfloat16)
+    mm_mxfp8 = Mock(return_value=flashinfer_output)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(mm_mxfp8=mm_mxfp8))
+    _, _, _, native_gemm, native_output = _mock_mxfp8_ops(monkeypatch)
+
+    module = SimpleNamespace(
+        weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 4), dtype=torch.bfloat16)
+    method = MXFP8LinearMethod()
+    assert method.enable_flashinfer_auto()
+
+    assert method.apply(module, activation, bias=None) is native_output
+    native_gemm.assert_called_once()
+    mm_mxfp8.assert_not_called()
+
+    method.mark_flashinfer_autotuned()
+    with flashinfer_mxfp8_decode_graph_capture():
+        assert method.apply(module, activation, bias=None) is flashinfer_output
+    mm_mxfp8.assert_called_once()
+
+    # Leaving the decode-capture scope restores the eager/native path.
+    assert method.apply(module, activation, bias=None) is native_output
+    assert native_gemm.call_count == 2
+
+
+def test_mxfp8_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "unknown")
+    with pytest.raises(ValueError, match="TRTLLM_MXFP8_GEMM_BACKEND"):
+        MXFP8LinearMethod()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 Linear load path requires CUDA")
