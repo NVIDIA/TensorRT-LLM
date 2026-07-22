@@ -453,15 +453,26 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     ]
 
     def release_action = params.action
+    def stageNames = [
+        internalReleaseX86:  "Build Internal release (x86_64 trtllm)",
+        internalReleaseSBSA: "Build Internal release (SBSA trtllm)",
+        ciImageX86:          "Build CI Image (x86_64 tritondevel)",
+        ciImageSBSA:         "Build CI Image (SBSA tritondevel)",
+        ciImageRockyPy310:   "Build CI Image (RockyLinux8 Python310)",
+        ciImageRockyPy312:   "Build CI Image (RockyLinux8 Python312)",
+        ciImageSBSAUbuntu:   "Build CI Image (SBSA Ubuntu24.04 Python312)",
+        ngcReleaseX86:       "Build NGC devel And release (x86_64)",
+        ngcReleaseSBSA:      "Build NGC devel And release (SBSA)",
+    ]
     def buildConfigs = [
-        "Build Internal release (x86_64 trtllm)": [
+        (stageNames.internalReleaseX86): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
             dockerfileStage: "release",
         ],
-        "Build Internal release (SBSA trtllm)": [
+        (stageNames.internalReleaseSBSA): [
             target: "trtllm",
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-sbsa",
@@ -469,27 +480,27 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             arch: "arm64",
             dockerfileStage: "release",
         ],
-        "Build CI Image (x86_64 tritondevel)": [:],
-        "Build CI Image (SBSA tritondevel)": [
+        (stageNames.ciImageX86): [:],
+        (stageNames.ciImageSBSA): [
             arch: "arm64",
         ],
-        "Build CI Image (RockyLinux8 Python310)": [
+        (stageNames.ciImageRockyPy310): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.10.12",
             postTag: "-py310",
         ],
-        "Build CI Image (RockyLinux8 Python312)": [
+        (stageNames.ciImageRockyPy312): [
             target: "rockylinux8",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build CI Image (SBSA Ubuntu24.04 Python312)": [
+        (stageNames.ciImageSBSAUbuntu): [
             arch: "arm64",
             target: "ubuntu24",
             args: "PYTHON_VERSION=3.12.3",
             postTag: "-py312",
         ],
-        "Build NGC devel And release (x86_64)": [
+        (stageNames.ngcReleaseX86): [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/amd64'",
@@ -500,7 +511,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             ],
             dockerfileStage: "release",
         ],
-        "Build NGC devel And release (SBSA)": [
+        (stageNames.ngcReleaseSBSA): [
             target: "ngc-release",
             action: release_action,
             args: "DOCKER_BUILD_OPTS='--load --platform linux/arm64'",
@@ -513,6 +524,19 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             dockerfileStage: "release",
         ],
     ]
+    def enabledStages = []
+    if (params.buildInternalRelease) {
+        enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
+    }
+    if (params.buildCiImage) {
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+    }
+    if (params.buildNgcRelease) {
+        enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
+    }
+    buildConfigs = buildConfigs.findAll { key, config -> key in enabledStages }
+    echo "Running stages: ${buildConfigs.keySet()}"
+
     // Override all fields in build config with default values
     buildConfigs.each { key, config ->
         defaultBuildConfig.each { defaultKey, defaultValue ->
@@ -580,6 +604,21 @@ pipeline {
             name: "action",
             choices: ["build", "push"],
             description: "Docker image generation action. build: only perform image build step; push: build docker image and push it to artifacts"
+        )
+        booleanParam(
+            name: "buildInternalRelease",
+            defaultValue: true,
+            description: "Build internal release images (x86_64 and SBSA trtllm)"
+        )
+        booleanParam(
+            name: "buildCiImage",
+            defaultValue: true,
+            description: "Build CI images (tritondevel and OS variant images)"
+        )
+        booleanParam(
+            name: "buildNgcRelease",
+            defaultValue: true,
+            description: "Build NGC devel and release images (x86_64 and SBSA)"
         )
     }
     options {

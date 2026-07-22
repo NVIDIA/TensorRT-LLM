@@ -58,6 +58,17 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
 
+        # top_k sizes the shared-memory index staging (s_indices), so bound it
+        # here. Direct callers and the run_topk_decode CLI bypass the decode
+        # wrappers, and an oversized top_k would otherwise surface as an opaque
+        # smem launch failure. 16384 matches the wrapper guards in
+        # cute_dsl_custom_ops.py.
+        if top_k <= 0 or top_k > 16384:
+            raise ValueError(
+                f"top_k must be in range [1, 16384], got {top_k}. "
+                "Maximum supported top_k is 16384 for Blackwell architecture."
+            )
+
         # 8 bits for radix-based filter.
         self.radix = 256
 

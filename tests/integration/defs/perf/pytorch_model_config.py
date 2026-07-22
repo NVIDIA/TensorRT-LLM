@@ -90,6 +90,61 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # DeepSeek V4 Flash uses TRTLLM for MXFP4 routed experts.
+        {
+            'patterns': ['deepseek_v4_flash-bench'],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+                'max_seq_len': 10240,
+                'max_num_tokens': 4096,
+                'enable_chunked_prefill': True,
+                'kv_cache_config': {
+                    'free_gpu_memory_fraction': 0.5,
+                },
+            }
+        },
+        # DeepSeek V4 Flash-Base uses WIDEEP for FP8 block-scale on Blackwell.
+        {
+            'patterns': ['deepseek_v4_flash_base'],
+            'config': {
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'WIDEEP',
+                },
+                'max_seq_len': 10240,
+            }
+        },
+        # DeepSeek V4 Pro DSpark mirrors the upstream 8-GPU accuracy configuration.
+        {
+            'patterns': ['deepseek_v4_pro_dspark'],
+            'config': {
+                'attn_backend': 'TRTLLM',
+                'enable_attention_dp': True,
+                'moe_config': {
+                    'backend': 'MEGAMOE_DEEPGEMM',
+                },
+                'max_seq_len': 10240,
+                'max_num_tokens': 9216,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'enable_chunked_prefill': False,
+                'disable_overlap_scheduler': True,
+                'custom_tokenizer': 'deepseek_v4',
+                'speculative_config': {
+                    'decoding_type':
+                    'DSpark',
+                    'max_draft_len':
+                    5,
+                    'speculative_model':
+                    f'{llm_models_root()}/DeepSeek-V4-Pro-DSpark',
+                },
+            }
+        },
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [

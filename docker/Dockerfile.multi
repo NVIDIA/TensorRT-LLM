@@ -31,7 +31,6 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
@@ -45,11 +44,11 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     echo "Using Python version: ${PYTHON_VERSION}" && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
-    TRT_VER=${TRT_VER} CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
+    CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
-         --tensorrt --polygraphy --mpi4py --pytorch
+         --cuda_libs --polygraphy --mpi4py --pytorch
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt

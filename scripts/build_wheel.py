@@ -489,7 +489,6 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
-         trt_root: str = None,
          nccl_root: str = None,
          nixl_root: str = None,
          mooncake_root: str = None,
@@ -595,9 +594,6 @@ def main(*,
         extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
         # Don't include duplicate conditions
         cmake_def_args.extend(set(extra_cmake_vars))
-
-    if trt_root is not None:
-        cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
@@ -1002,11 +998,6 @@ def main(*,
     scripts_dir = pkg_dir / "scripts"
     if scripts_dir.exists():
         clear_folder(scripts_dir)
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-
-    if not on_windows:
-        install_file(project_dir / "docker/common/install_tensorrt.sh",
-                     scripts_dir / "install_tensorrt.sh")
 
     if not cpp_only:
 
@@ -1235,12 +1226,6 @@ def add_arguments(parser: ArgumentParser):
         help="Additional make targets to build. Example: \"target_1 target_2\"",
         nargs="+",
         default=[])
-    parser.add_argument(
-        "--trt_root",
-        default="/usr/local/tensorrt",
-        help="[DEPRECATED] No effect: TensorRT is no longer required to build. "
-        "Accepted for backward compatibility and will be removed in a future release."
-    )
     parser.add_argument("--nccl_root",
                         help="Directory containing NCCL headers and libraries")
     parser.add_argument("--nixl_root",

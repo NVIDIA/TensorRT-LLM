@@ -97,6 +97,17 @@ def test_s3_stdout_echo_requires_explicit_opt_in():
         context = lines[max(0, idx - 3):idx]
         assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
 
+    progress_lines = [
+        idx for idx, line in enumerate(lines)
+        if 'console_output_style=progress-even-when-capture-no' in line
+    ]
+    assert progress_lines, 'Expected upload-only pytest progress configuration'
+
+    for idx in progress_lines:
+        context = lines[max(0, idx - 3):idx]
+        assert any('if (ENABLE_UPLOAD_TEST_RESULTS)' in line
+                   for line in context)
+
 
 @pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",

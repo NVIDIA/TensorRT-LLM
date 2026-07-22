@@ -45,7 +45,7 @@ git checkout main && git pull
 Run the build command (**incremental by default** — omit `-c`/`--clean` unless explicitly requested or the incremental build fails):
 
 ```bash
-./scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache -a "<arch>" -f --nvtx
+./scripts/build_wheel.py --use_ccache -a "<arch>" -f --nvtx
 ```
 
 Replace `<arch>` with the target GPU architecture (see Architecture Reference below). If not specified by the user, auto-detect from `nvidia-smi`.
@@ -66,7 +66,6 @@ python3 -c "import tensorrt_llm; print(tensorrt_llm.__version__)"
 
 | Flag | Description |
 |------|-------------|
-| `--trt_root /usr/local/tensorrt` | TensorRT installation path (standard in NVIDIA containers) |
 | `-a "<arch>"` | Target GPU architecture(s) |
 | `--nvtx` | Enable NVTX markers for profiling |
 | `--use_ccache` | Use ccache for faster recompilation |

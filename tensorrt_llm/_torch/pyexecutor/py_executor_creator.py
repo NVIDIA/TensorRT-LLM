@@ -677,10 +677,6 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
-    # Set default value for cache_transceiver_config.max_tokens_in_buffer
-    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
-        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
-
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
@@ -742,6 +738,17 @@ def create_py_executor(
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer.
+    # Placed after the FlashMLA tokens_per_block override and rounded up to a
+    # tokens_per_block multiple: CacheTransBufferManager requires
+    # max_tokens_in_buffer % tokens_per_block == 0 (cacheTransBuffer.cpp),
+    # and net_max_seq_len is in general not aligned (e.g. max_seq_len plus a
+    # non-power-of-two seq_len offset).
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = (
+            (net_max_seq_len + tokens_per_block - 1) // tokens_per_block *
+            tokens_per_block)
 
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block

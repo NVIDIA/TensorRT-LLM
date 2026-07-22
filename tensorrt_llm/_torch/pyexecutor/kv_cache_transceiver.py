@@ -15,7 +15,8 @@ from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager)
+                                  CppMambaHybridCacheManager,
+                                  MixedMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -128,6 +129,12 @@ def create_kv_cache_transceiver(
     # unsupported).
     if cache_transceiver_config.transceiver_runtime == "auto":
         cache_transceiver_config.transceiver_runtime = None
+
+    if (cache_transceiver_config.transceiver_runtime != "PYTHON"
+            and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
+        raise ValueError(
+            "MixedMambaHybridCacheManager requires the Python transceiver "
+            "runtime in disaggregated serving.")
 
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 

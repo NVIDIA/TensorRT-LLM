@@ -59,6 +59,7 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
+        kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -77,7 +78,7 @@ class RankInfo:
             self_endpoint="",
             transfer_engine_info=bytes(),
             attention=AttentionInfo(
-                kv_heads_per_rank=kvm.num_kv_heads_per_layer[0],
+                kv_heads_per_rank=kv_heads_per_rank,
                 tokens_per_block=kvm.tokens_per_block,
                 dims_per_head=kvm.head_dim,
                 element_bytes=get_size_in_bytes(1, kvm.dtype),

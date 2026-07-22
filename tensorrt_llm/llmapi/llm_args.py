@@ -3719,7 +3719,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     max_util_for_resume: float = Field(
         default=0.95,
-        ge=0,
+        gt=0,
         le=1,
         status="prototype",
         description=
@@ -3768,12 +3768,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    block_reuse_policy: Literal["all_reusable", "per_request"] = Field(
-        default="all_reusable",
-        status="prototype",
-        description="KV cache manager v2 block reuse policy. "
-        "With SWA scratch reuse and 'all_reusable', only non-scratch "
-        "blocks are saved for reuse.")
+    block_reuse_policy: Literal[
+        "all_reusable", "per_request", "per_conversation"] = Field(
+            default="all_reusable",
+            status="prototype",
+            description="KV cache manager v2 block reuse policy. "
+            "'all_reusable' commits reusable blocks after every context chunk; "
+            "'per_request' commits them only after the final context chunk; "
+            "'per_conversation' uses 'per_request' commits and drops the previous "
+            "turn's committed SWA-window blocks after the current turn's final context "
+            "chunk. All reusable blocks remain subject to normal cache eviction. "
+            "Requests without conversation params use 'per_request' behavior. When "
+            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+            "blocks are committed for reuse.")
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3866,14 +3873,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
-        return v
-
-    @field_validator('max_util_for_resume')
-    @classmethod
-    def validate_max_util_for_resume(cls, v: float):
-        if not 0 <= v <= 1:
-            raise ValueError(
-                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
     @field_validator('pool_ratio')
@@ -4307,6 +4306,19 @@ class BaseLlmArgs(StrictBaseModel):
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
         description="The path to the tokenizer directory for postprocessing.",
+        status="prototype")
+
+    num_serve_frontends: int = Field(
+        default=1,
+        ge=1,
+        # = executor.utils.MAX_NUM_FRONTENDS (cannot be imported here);
+        # test_multi_frontend_routing pins the two together.
+        le=64,
+        description=
+        "The number of HTTP frontend processes serving one executor. Used by "
+        "trtllm-serve: values > 1 run additional attached frontend processes "
+        "that share the serving port via SO_REUSEPORT (classic IPC executor "
+        "path only).",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
@@ -5310,9 +5322,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 # Plain tensor parallelism is supported (the draft path
                 # all-gathers vocab-sharded draft logits before rejection, see
                 # SpecWorkerBase.maybe_gather_sharded_draft_logits).
-                # attention-DP and context parallelism remain gated.
-                rs_parallel_active = (self.context_parallel_size > 1
-                                      or self.enable_attention_dp)
+                # Attention DP is supported: each rank holds full-vocab draft
+                # logits for its own requests (the LM-head-TP fast path is
+                # bypassed for advanced sampling, and is_all_greedy_sample is
+                # group-synchronized so the LM-head-TP group's collectives stay
+                # uniform -- see SpecMetadata.group_all_greedy_sample). Only
+                # context parallelism remains gated.
+                rs_parallel_active = self.context_parallel_size > 1
                 rs_guided_active = self.guided_decoding_backend is not None
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None
@@ -5364,10 +5380,9 @@ class TorchLlmArgs(BaseLlmArgs):
                                     "relaxed-thinking acceptance is enabled")
                             if rs_parallel_active:
                                 reasons.append(
-                                    "tensor/context parallelism or attention-DP "
-                                    "is active (the draft path resolves only "
-                                    "the global argmax, not full distributions)"
-                                )
+                                    "context parallelism is active (the draft "
+                                    "path resolves only the global argmax, "
+                                    "not full distributions)")
                             if rs_guided_active:
                                 reasons.append("guided decoding is enabled")
                         raise ValueError(

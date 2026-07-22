@@ -616,9 +616,10 @@
     {
       "allowed_values": [
         "all_reusable",
-        "per_request"
+        "per_request",
+        "per_conversation"
       ],
-      "annotation": "Literal['all_reusable', 'per_request']",
+      "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_policy"
@@ -1070,6 +1071,13 @@
       "converter": "",
       "kind": "value",
       "path": "num_postprocess_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_serve_frontends"
     },
     {
       "allowed_values": [

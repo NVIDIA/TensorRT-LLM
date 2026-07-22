@@ -1,5 +1,7 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/qwen3_next.py
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
@@ -489,6 +491,7 @@ class Qwen3NextAttention(Qwen3Attention):
                          fuse_qk_norm_rope=fuse_qk_norm_rope,
                          attn_output_gate=True,
                          use_gemma_rms_norm=True)
+        self._fuse_qk_norm_rope_gate = True
 
 
 class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
