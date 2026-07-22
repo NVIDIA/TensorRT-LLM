@@ -1611,6 +1611,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
+                // [M3 bringup] Skip all SBSA tests on this feat branch.
+                echo "Skipping SBSA tests (M3 bringup feat branch: no SBSA test coverage)"
+                return
+
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
                 stage(testStageName) {
