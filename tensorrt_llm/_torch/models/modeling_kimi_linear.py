@@ -528,6 +528,7 @@ class KimiKDARuntime(nn.Module):
                     conv_pool,
                     ssm_pool,
                     state_indices[:num_prefills],
+                    layer_cache,
                 ))
         if num_decodes > 0:
             decode_rows = hidden_states.shape[0] - num_ctx_tokens
@@ -538,6 +539,7 @@ class KimiKDARuntime(nn.Module):
                         conv_pool,
                         ssm_pool,
                         state_indices[num_prefills:],
+                        layer_cache,
                     ))
             else:
                 # Speculative verification: each generation request carries
@@ -562,8 +564,33 @@ class KimiKDARuntime(nn.Module):
             return outputs[0]
         return torch.cat(outputs, dim=0)
 
+    def _has_kda_replay_caches(self, layer_cache) -> bool:
+        """True when the manager allocated the fused-verify replay caches."""
+        return getattr(layer_cache, "kda_qkg_cache", None) is not None
+
+    def _sync_kda_replay_conv_window(self, layer_cache, slot_indices,
+                                     conv_q, conv_k, conv_v) -> None:
+        """Seed the replay conv caches' committed window from FLA windows.
+
+        The fused verify kernel keeps its own extended fp32 dim-contiguous
+        conv caches; their committed window (columns ``[0, W-1)``) must hold
+        the last ``W-1`` raw conv inputs whenever another path (prefill,
+        plain decode) advances the base conv pool. The FLA window's oldest
+        column drops out of every future convolution, so columns ``[1, W)``
+        of the FLA cache map 1:1 onto the committed window.
+        """
+        if not self._has_kda_replay_caches(layer_cache):
+            return
+        w = self.mixer.conv_size
+        for cache, window in ((layer_cache.kda_conv_q, conv_q),
+                              (layer_cache.kda_conv_k, conv_k),
+                              (layer_cache.kda_conv_v, conv_v)):
+            cache[:, :, :w - 1].index_copy_(
+                0, slot_indices, window[:, :, 1:].to(cache.dtype))
+
     def _forward_prefill(self, x2d, cu_seqlens, mamba_metadata, num_prefills,
-                         conv_pool, ssm_pool, slot_indices) -> torch.Tensor:
+                         conv_pool, ssm_pool, slot_indices,
+                         layer_cache=None) -> torch.Tensor:
         from einops import rearrange
 
         mixer = self.mixer
@@ -632,11 +659,16 @@ class KimiKDARuntime(nn.Module):
             0, slot_indices,
             torch.cat([conv_q, conv_k, conv_v], dim=1).to(conv_pool.dtype))
         ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
+        # Fused-verify replay caches: seed the committed conv window so the
+        # first verify round convolves the correct history (pending drafts
+        # are zero for a fresh request, so the tail columns are unused).
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_q,
+                                          conv_k, conv_v)
 
         return self._output_gate_and_proj(x, o)
 
-    def _forward_decode(self, x2d, conv_pool, ssm_pool,
-                        slot_indices) -> torch.Tensor:
+    def _forward_decode(self, x2d, conv_pool, ssm_pool, slot_indices,
+                        layer_cache=None) -> torch.Tensor:
         from ..modules.kimi_kda.kimi_kda_mixer import KimiKDACachedState
 
         mixer = self.mixer
@@ -667,18 +699,139 @@ class KimiKDARuntime(nn.Module):
         )
         ssm_pool.index_copy_(
             0, slot_indices, new_cache.recurrent_state.to(ssm_pool.dtype))
+        # Fused-verify replay caches: keep the committed conv window in
+        # sync with the plain-decode advance. NOTE: this path is only
+        # correct for requests with no pending accepted drafts
+        # (prev_num_accepted_tokens == 0); with drafts pending, the live
+        # pools lag by the pending prefix and only the fused verify kernel
+        # can advance them. The spec workers pad drafts to the static max,
+        # so drafted batches always take the verify path.
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices,
+                                          new_cache.conv_state_q,
+                                          new_cache.conv_state_k,
+                                          new_cache.conv_state_v)
 
         return out.squeeze(1)
 
     def _forward_verify(self, x2d, num_steps, layer_cache, conv_pool,
                         ssm_pool, slot_indices) -> torch.Tensor:
         """Speculative verification: advance each request ``num_steps``
-        tokens, writing the state after every step into the manager's
-        SpeculativeState scratch buffers (``intermediate_conv_window`` /
-        ``intermediate_ssm``, batch-row indexed). Live pools are read-only
-        here; ``update_mamba_states()`` commits the accepted step's state
-        after sampling. Sequential per-step FLA calls — correctness first;
-        the fused multi-token kernel is a later optimization.
+        tokens (1 golden + ``num_steps - 1`` padded drafts).
+
+        Two paths:
+
+        * Fused (``trtllm::kda_mtp_decode``, when the manager allocated the
+          KDA replay caches): one kernel launch replays the previous
+          round's accepted drafts from the per-slot replay caches, then
+          processes the new tokens, committing the recurrent state and conv
+          windows **in place** after the golden token and caching the new
+          drafts. ``update_mamba_states()`` afterwards only records the
+          accepted count for the next round's replay.
+        * Legacy (sequential per-step FLA): per-step states go to the
+          manager's batch-row-indexed intermediate scratch buffers and
+          ``update_mamba_states()`` promotes the accepted step's state
+          after sampling.
+        """
+        if self._has_kda_replay_caches(layer_cache):
+            assert self.mixer.verify_kernel_path == "optimized", (
+                "KDA replay caches are allocated but the fused verify "
+                "kernel is unavailable; the legacy intermediate buffers "
+                "were not allocated so there is no fallback")
+            return self._forward_verify_fused(x2d, num_steps, layer_cache,
+                                              ssm_pool, slot_indices)
+        return self._forward_verify_sequential(x2d, num_steps, layer_cache,
+                                               conv_pool, ssm_pool,
+                                               slot_indices)
+
+    def _forward_verify_fused(self, x2d, num_steps, layer_cache, ssm_pool,
+                              slot_indices) -> torch.Tensor:
+        """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
+
+        Token layout: the kernel indexes each request's new tokens at
+        ``cu_seqlens[n] + num_accepted[n] + i``. The runtime packs the
+        ``num_steps`` new tokens per request contiguously, so we pass
+        ``cu_seqlens[n] = n * num_steps - num_accepted[n]`` — the shift
+        lands the kernel's reads/writes exactly on the packed rows. A
+        negative entry for request 0 is fine: ``bos`` is only ever used
+        additively with a token offset ``>= num_accepted``.
+        """
+        mixer = self.mixer
+        num_decodes = x2d.shape[0] // num_steps
+        num_spec = num_steps - 1
+        H = mixer.num_heads
+        K = mixer.head_k_dim
+        x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
+        T_total = num_decodes * num_steps
+
+        x_q = mixer.q_proj(x).view(1, T_total, H, K)
+        x_k = mixer.k_proj(x).view(1, T_total, H, K)
+        x_v = mixer.v_proj(x).view(1, T_total, H, mixer.head_dim)
+        # Raw gate / beta: the kernel applies dt_bias, A_log, the
+        # lower-bound sigmoid gate, and the beta sigmoid itself.
+        g = mixer.f_b_proj(mixer.f_a_proj(x)).view(1, T_total, H, K)
+        beta = mixer.b_proj(x).view(1, T_total, H)
+
+        w_q, w_k, w_v = self._get_mtp_conv_weights()
+        lower_bound = (mixer.gate_lower_bound_override
+                       if mixer.gate_lower_bound_override is not None else
+                       mixer.gate_lower_bound)
+
+        pending = layer_cache.prev_num_accepted_tokens[slot_indices].to(
+            torch.int32)  # accepted drafts of the previous round, per req
+        cu_seqlens = torch.arange(0, (num_decodes + 1) * num_steps,
+                                  num_steps,
+                                  dtype=torch.int32,
+                                  device=x2d.device)
+        cu_seqlens[:num_decodes].sub_(pending)
+
+        out = mixer._dispatch.mtp_verify(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=layer_cache.kda_conv_q,
+            cs_k=layer_cache.kda_conv_k,
+            cs_v=layer_cache.kda_conv_v,
+            g=g,
+            beta=beta,
+            # .detach(): the CuTe DSL DLPack bridge rejects grad-tracking
+            # tensors.
+            A_log=mixer.A_log.detach(),
+            dt_bias=mixer.dt_bias.detach(),
+            recurrent_state=ssm_pool,
+            qkg_cache=layer_cache.kda_qkg_cache,
+            v_cache=layer_cache.kda_v_cache,
+            beta_cache=layer_cache.kda_beta_cache,
+            ssm_state_indices=slot_indices.to(torch.int32),
+            cu_seqlens=cu_seqlens,
+            num_spec=num_spec,
+            num_accepted_tokens=pending,
+            lower_bound=lower_bound,
+            scale=mixer.head_k_dim**-0.5,
+        )
+        o = out.view(num_decodes, num_steps, H, mixer.head_dim)
+        return self._output_gate_and_proj(x, o)
+
+    def _get_mtp_conv_weights(self):
+        """fp32 ``[dim, W]`` conv weights for the fused verify kernel,
+        computed once per runtime instance."""
+        cached = getattr(self, "_mtp_conv_weights", None)
+        if cached is None:
+            mixer = self.mixer
+            cached = tuple(
+                conv.weight.detach().squeeze(1).float().contiguous()
+                for conv in (mixer.q_conv1d, mixer.k_conv1d, mixer.v_conv1d))
+            self._mtp_conv_weights = cached
+        return cached
+
+    def _forward_verify_sequential(self, x2d, num_steps, layer_cache,
+                                   conv_pool, ssm_pool,
+                                   slot_indices) -> torch.Tensor:
+        """Sequential per-step FLA verification (legacy intermediate-buffer
+        path). Live pools are read-only here; ``update_mamba_states()``
+        commits the accepted step's state after sampling.
         """
         from einops import rearrange
         from fla.ops.kda import fused_recurrent_kda

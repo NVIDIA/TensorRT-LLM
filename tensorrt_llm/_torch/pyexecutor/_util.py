@@ -1886,6 +1886,20 @@ def _create_kv_cache_manager(
         if kimi_state_tp > 1:
             mamba_params.num_heads *= kimi_state_tp
             mamba_params.n_groups *= kimi_state_tp
+        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
+        # kernel can run here, allocate the per-slot replay caches instead
+        # of the legacy per-step intermediate verification buffers. The
+        # kernel replays accepted drafts from these caches and commits
+        # states in place, replacing the intermediate-buffer + promotion
+        # flow for KDA layers.
+        kimi_extra_kwargs = {}
+        if spec_config is not None and issubclass(
+                kv_cache_manager_cls, MixedMambaHybridCacheManager):
+            from ..modules.kimi_kda._kda_kernels import \
+                is_kda_mtp_verify_available
+            if is_kda_mtp_verify_available():
+                kimi_extra_kwargs["kda_replay_num_spec"] = (
+                    spec_config.tokens_per_gen_step - 1)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -1916,6 +1930,7 @@ def _create_kv_cache_manager(
             # Reuse the qwen3_next [Q | K | V] conv-state section layout;
             # all three KDA sections have identical width.
             model_type="qwen3_next",
+            **kimi_extra_kwargs,
             **manager_extra_kwargs,
         )
     elif is_mla(config):

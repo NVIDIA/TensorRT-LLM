@@ -256,9 +256,14 @@ class KimiKDALinearAttention(nn.Module):
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
 
+        # The optimized decode/verify kernels are specialized for the Kimi
+        # K3 shape (K == V == 128). Reduced-dim test configurations must
+        # fall back to FLA instead of hard-failing inside the kernels.
+        kernel_shape_ok = self.head_k_dim == 128 and self.head_dim == 128
         self._dispatch = KDAKernelDispatch(
             use_optimized_prefill=use_optimized_prefill,
-            use_optimized_decode=use_optimized_decode,
+            use_optimized_decode=use_optimized_decode and kernel_shape_ok,
+            use_optimized_verify=kernel_shape_ok,
         )
 
     # ------------------------------------------------------------------
@@ -272,6 +277,10 @@ class KimiKDALinearAttention(nn.Module):
     @property
     def decode_kernel_path(self) -> str:
         return self._dispatch.decode_kernel_path
+
+    @property
+    def verify_kernel_path(self) -> str:
+        return self._dispatch.verify_kernel_path
 
     @property
     def sm_100_optimized_supported(self) -> bool:

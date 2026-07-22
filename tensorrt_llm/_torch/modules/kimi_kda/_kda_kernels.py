@@ -104,6 +104,51 @@ def _load_fla_chunk_kda() -> ModuleType:
 
 
 # ---------------------------------------------------------------------------
+# In-tree KDA multi-token verify op (CuTe DSL, trtllm::kda_mtp_decode).
+# ---------------------------------------------------------------------------
+
+_MTP_MODULE: Optional[ModuleType] = None
+_MTP_IMPORT_ERROR: Optional[BaseException] = None
+
+
+def _load_mtp_module() -> ModuleType:
+    """Import the in-tree MTP verify custom-op module (registers the op)."""
+    global _MTP_MODULE, _MTP_IMPORT_ERROR
+    if _MTP_MODULE is not None:
+        return _MTP_MODULE
+    if _MTP_IMPORT_ERROR is not None:
+        raise _MTP_IMPORT_ERROR
+    try:
+        module = importlib.import_module(
+            "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops"
+        )
+    except BaseException as exc:  # ImportError when CuTe DSL is unavailable
+        _MTP_IMPORT_ERROR = exc
+        raise
+    _MTP_MODULE = module
+    return module
+
+
+def is_intree_mtp_available() -> bool:
+    """True when the in-tree CuTe DSL MTP verify op can be imported."""
+    try:
+        _load_mtp_module()
+        return True
+    except Exception:
+        return False
+
+
+def is_kda_mtp_verify_available() -> bool:
+    """True when the fused multi-token verify kernel can run here.
+
+    Used by the executor (cache-manager sizing) to decide whether to
+    allocate the KDA replay caches instead of the legacy intermediate
+    verification buffers.
+    """
+    return is_kda_optimized_supported() and is_intree_mtp_available()
+
+
+# ---------------------------------------------------------------------------
 # Dispatch API used by the KimiKDALinearAttention module.
 # ---------------------------------------------------------------------------
 
@@ -117,11 +162,16 @@ class KDAKernelDispatch:
         Selected prefill path: ``"optimized"`` or ``"fla"``.
     decode_kernel_path : str
         Selected decode path: ``"optimized"`` or ``"fla"``.
+    verify_kernel_path : str
+        Selected multi-token verify path: ``"optimized"`` (fused
+        ``trtllm::kda_mtp_decode`` replay kernel) or ``"fla"`` (sequential
+        per-step ``fused_recurrent_kda`` with intermediate-buffer state
+        promotion).
     Notes
     -----
-    Prefill and decode dispatch are decided independently. Both require a
-    supported GPU; optimized prefill additionally requires the in-tree CuTe
-    DSL op to be importable.
+    Prefill, decode, and verify dispatch are decided independently. All
+    require a supported GPU; the in-tree CuTe DSL ops additionally require
+    their modules to be importable.
     """
 
     _selection_logged = False
@@ -130,6 +180,7 @@ class KDAKernelDispatch:
         self,
         use_optimized_prefill: bool = True,
         use_optimized_decode: bool = True,
+        use_optimized_verify: bool = True,
     ) -> None:
         optimized_supported = is_kda_optimized_supported()
         self.prefill_kernel_path = "fla"
@@ -138,6 +189,9 @@ class KDAKernelDispatch:
         self.decode_kernel_path = (
             "optimized" if use_optimized_decode and optimized_supported else "fla"
         )
+        self.verify_kernel_path = "fla"
+        if use_optimized_verify and optimized_supported and is_intree_mtp_available():
+            self.verify_kernel_path = "optimized"
         # One line per process so runs record which paths actually executed
         # (the fallback is otherwise silent).
         if not KDAKernelDispatch._selection_logged:
@@ -147,7 +201,8 @@ class KDAKernelDispatch:
 
                 logger.info(
                     f"KDA kernel dispatch: prefill={self.prefill_kernel_path} "
-                    f"decode={self.decode_kernel_path}"
+                    f"decode={self.decode_kernel_path} "
+                    f"verify={self.verify_kernel_path}"
                 )
             except Exception:  # pragma: no cover — source-loader stub path
                 pass
@@ -161,6 +216,23 @@ class KDAKernelDispatch:
         if self.decode_kernel_path == "optimized":
             return _kda_decode.__file__ or "<kimi_kda._kda_decode>"
         return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
+
+    def mtp_verify(self, **kwargs) -> torch.Tensor:
+        """Run the fused KDA multi-token verify kernel.
+
+        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
+        ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
+        argument and state-management contract). Only defined on the
+        optimized path; the FLA fallback is the module's sequential
+        per-step loop with intermediate-buffer promotion.
+        """
+        if self.verify_kernel_path != "optimized":
+            raise RuntimeError(
+                "mtp_verify called on non-optimized path; use the module's "
+                "sequential FLA verify fallback instead."
+            )
+        _load_mtp_module()  # registers trtllm::kda_mtp_decode
+        return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
     def prefill_chunk_kda(
         self,
