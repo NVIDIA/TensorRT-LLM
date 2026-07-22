@@ -74,3 +74,27 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     # Oversized requests are rejected rather than silently corrupting memory.
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
+
+
+def test_per_token_valid_blocks_multi_token_decode():
+    """Spec-verify decode rows expose one entry per query TOKEN, walking the
+    causal ladder within the verify window."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        per_token_valid_blocks,
+    )
+
+    # One request verifying 4 tokens against kv_len 10 (offset 6): token t
+    # attends 7 + t positions; with 2-token blocks that is ceil((7+t)/2).
+    qo = torch.tensor([4], dtype=torch.int32)
+    kv = torch.tensor([10], dtype=torch.int32)
+    off = torch.tensor([6], dtype=torch.int32)
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=2)
+    assert n_valid.tolist() == [4, 4, 5, 5]
+
+    # Mixed batch: an ordinary decode row (qo=1) alongside a verify row.
+    qo = torch.tensor([1, 3], dtype=torch.int32)
+    kv = torch.tensor([9, 6], dtype=torch.int32)
+    off = kv - qo
+    n_valid = per_token_valid_blocks(qo, kv, off, causal=True, block_size=4)
+    # Row 0: 9 positions -> 3 blocks. Row 1 tokens attend 4, 5, 6 -> 1, 2, 2.
+    assert n_valid.tolist() == [3, 1, 2, 2]
