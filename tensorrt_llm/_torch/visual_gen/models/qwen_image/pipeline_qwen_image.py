@@ -62,7 +62,12 @@ _DEFAULT_GENERATION_PARAMS = {
 }
 
 
-@register_pipeline("QwenImagePipeline")
+@register_pipeline(
+    "QwenImagePipeline",
+    hf_ids=[
+        "Qwen/Qwen-Image",
+    ],
+)
 class QwenImagePipeline(BasePipeline):
     """Qwen-Image text-to-image pipeline.
 

@@ -42,9 +42,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--visual_gen_args",
-        "--extra_visual_gen_options",
         dest="visual_gen_args",
-        help="Optional VisualGenArgs YAML file.",
+        type=str,
+        default=None,
+        help="Path to YAML config (same as trtllm-serve --visual_gen_args)",
     )
     parser.add_argument(
         "--prompt",
