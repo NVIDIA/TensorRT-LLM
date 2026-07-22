@@ -102,3 +102,99 @@ def test_optimized_prefill_matches_fla_reference() -> None:
     expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
     _assert_close(actual, expected)
     assert optimized.prefill_kernel_source()
+
+
+@torch.no_grad()
+def test_kda_prefill_op_empty_token_batch():
+    """T=0 call: no output rows, recurrent state passes through unchanged.
+
+    The runtime can emit a context batch with an empty token payload
+    (observed under the overlap scheduler + logprobs flows). The op used
+    to raise ``RuntimeError: step must be nonzero`` from its
+    ``arange(step=T)`` buffer setup; the FLA fallback tolerates the call.
+    """
+    num_heads, head_k, head_v = 4, 128, 128
+    q = torch.empty(1, 0, num_heads, head_k, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty_like(q)
+    g = torch.empty(1, 0, num_heads, head_k, dtype=torch.float32, device="cuda")
+    v = torch.empty(1, 0, num_heads, head_v, dtype=torch.bfloat16, device="cuda")
+    beta = torch.empty(1, 0, num_heads, dtype=torch.float32, device="cuda")
+    initial_state = torch.randn(
+        1, num_heads, head_k, head_v, dtype=torch.float32, device="cuda")
+
+    output, final_state = torch.ops.trtllm.kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=head_k**-0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+    assert output.shape == (1, 0, num_heads, head_v)
+    torch.testing.assert_close(final_state, initial_state)
+    # State must not alias the input (the caller copies it back into the
+    # pool the initial state may be a view of).
+    assert final_state.data_ptr() != initial_state.data_ptr()
+
+    _, final_state_zero = torch.ops.trtllm.kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=head_k**-0.5,
+        initial_state=None,
+        output_final_state=True,
+    )
+    torch.testing.assert_close(final_state_zero, torch.zeros_like(initial_state))
+
+
+@torch.no_grad()
+def test_kda_prefill_op_empty_token_batch_variants():
+    """Regression coverage for the T=0 guard's other entry shapes.
+
+    - varlen (cu_seqlens present): n_seqs derives from cu_seqlens, not B
+    - output_final_state=False: the op's empty-tensor final-state fallback
+    - use_fused_k1234=True: the guard must precede the fused-path branch
+    """
+    num_heads, head_k, head_v = 4, 128, 128
+    q = torch.empty(1, 0, num_heads, head_k, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty_like(q)
+    g = torch.empty(1, 0, num_heads, head_k, dtype=torch.float32, device="cuda")
+    v = torch.empty(1, 0, num_heads, head_v, dtype=torch.bfloat16, device="cuda")
+    beta = torch.empty(1, 0, num_heads, dtype=torch.float32, device="cuda")
+    common = dict(q=q, k=k, v=v, g=g, beta=beta, scale=head_k**-0.5)
+
+    # Varlen: two zero-length sequences -> final_state per sequence.
+    cu_seqlens = torch.tensor([0, 0, 0], dtype=torch.long, device="cuda")
+    _, final_state = torch.ops.trtllm.kda_prefill(
+        **common, initial_state=None, output_final_state=True,
+        cu_seqlens=cu_seqlens)
+    assert final_state.shape == (2, num_heads, head_k, head_v)
+    assert (final_state == 0).all()
+
+    # output_final_state=False: op returns the empty placeholder tensor.
+    output, final_state = torch.ops.trtllm.kda_prefill(
+        **common, initial_state=None, output_final_state=False)
+    assert output.shape == (1, 0, num_heads, head_v)
+    assert final_state.numel() == 0
+
+    # Fused path: the guard must fire before _launch_fused_k1234.
+    output, final_state = torch.ops.trtllm.kda_prefill(
+        **common, initial_state=None, output_final_state=True,
+        use_fused_k1234=True)
+    assert output.shape == (1, 0, num_heads, head_v)
+    assert final_state.shape == (1, num_heads, head_k, head_v)
+
+
+@torch.no_grad()
+def test_kda_mixer_empty_prefill():
+    """Runtime-shaped regression: the mixer dispatch with an empty token
+    payload (the crashing call shape from jobs 2654867/2655260) must run
+    end-to-end on the optimized path."""
+    optimized, _ = _make_attention_pair()
+    hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    out = optimized.forward_prefill(hidden_states)
+    assert out.shape == (1, 0, HIDDEN_SIZE)
