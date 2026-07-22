@@ -1,11 +1,13 @@
-# Extra LLM-API options for Kimi K3 (golden prairie) runs, used by
-# trtllm-eval via --config. CUDA graphs and the overlap scheduler are
-# enabled: the generation-phase MLA latent-cache append derives its write
-# positions from device tensors (attention_backend/utils.py), so it is
-# CUDA-graph-safe — verified at GSM8K parity with the eager path (96.82 on
-# the full test set). Remaining Kimi K3 runtime constraints: no chunked
-# prefill, no KV block reuse, tokens_per_block=64 (MLA (576,512) trtllm-gen
-# generation kernel).
+# Extra LLM-API options for Kimi K3, used by trtllm-eval via --config.
+# DEP16 deployment: attention runs data-parallel and the experts shard
+# across the expert-parallel group (assumes tp_size=16). CUDA graphs and
+# the overlap scheduler are enabled: the generation-phase MLA latent-cache
+# append derives its write positions from device tensors
+# (attention_backend/utils.py), so it is CUDA-graph-safe. Remaining Kimi K3
+# runtime constraints: no chunked prefill, no KV block reuse,
+# tokens_per_block=64 (MLA (576,512) trtllm-gen generation kernel).
+enable_attention_dp: true
+moe_expert_parallel_size: 16
 disable_overlap_scheduler: false
 cuda_graph_config:
   enable_padding: true

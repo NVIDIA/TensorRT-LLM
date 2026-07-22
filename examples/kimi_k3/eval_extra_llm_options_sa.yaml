@@ -1,6 +1,11 @@
 # Extra LLM-API options for Kimi K3 GSM8K/eval runs WITH suffix-automaton
-# speculative decoding. Same runtime constraints as
-# eval_extra_llm_options.yaml plus the SA config (longest-match).
+# speculative decoding (longest-match). SA runs stay eager (no CUDA graphs /
+# overlap scheduler) and need max_batch_size <= 8 (SpeculativeState
+# buffers). Unlike eval_extra_llm_options.yaml, this config deliberately
+# does NOT enable the DEP16 knobs: SA with attention DP is not yet
+# certified, so SA runs use the plain expert-parallel deployment
+# (replicated attention). MoE backend selection is automatic (fused
+# TRTLLM-Gen SiTU op on SM100/SM103), same as the non-SA config.
 disable_overlap_scheduler: true
 cuda_graph_config: null
 enable_chunked_prefill: false

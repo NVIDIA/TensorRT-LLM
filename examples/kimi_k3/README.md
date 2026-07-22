@@ -1,113 +1,138 @@
-# Kimi K3 ("golden prairie") in TensorRT-LLM — setup & reproduction
+# Kimi K3
 
-Runs the Kimi K3 model (93-layer hybrid KDA/MLA text core, 896 MXFP4 routed
-experts with SiTU activation, ~1.5 TB HF checkpoint) end-to-end through the
-TRT-LLM PyTorch backend, including a GSM8K eval.
+This example runs Kimi K3 with TensorRT-LLM. It includes an LLM API quick
+start and configuration for GSM8K evaluation.
 
-## The two external inputs
+## Hardware support
 
-Everything is parameterized by one path (host path; the sbatch scripts
-mount it into the container at an identical path):
+Only NVIDIA Blackwell GPUs are currently supported and tested. Support for
+other GPU architectures may be added in a future release.
 
-| Env var | Contents |
-|---|---|
-| `KIMI_K3_MODEL_DIR` | the complete HF checkpoint (`goldenprairie-final-weights_vv1`): config + tokenizer + 96 safetensors shards |
-
-Each sbatch script sets up the runtime env inline on every rank (before any
-python import): persistent JIT caches and a node-local per-rank
-`TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks). The
-fused MoE path (`KIMI_K3_FUSED_MOE=native`) uses the in-tree TRTLLM-Gen
-SiTU cubins — the model runs from this repo alone, with no external kernel
-collection. The private-snapshot `KIMI_K3_FUSED_MOE=1` path (see the
-commented-out lines in the sbatch scripts) is still required for SA
-speculative decoding: the in-tree cubins do not yet cover the bs<=8 and
-EP=4 shapes those runs need.
+The full-model example uses 16 GPUs in the DEP16 deployment: attention runs
+data-parallel and the 896 experts shard across the expert-parallel group
+(`enable_attention_dp=true`, `moe_expert_parallel_size=16`).
 
 ## Prerequisites
 
-1. Build this repo for aarch64 (GB200/GB300) into `.venv-3.12` — standard
-   editable build inside the 26.05 sbsa PyTorch container.
-2. `pip install fla-core einops` into the venv (KDA prefill/decode kernels
-   use FLA's Triton implementation).
-3. (Private-snapshot path only) When running `KIMI_K3_FUSED_MOE=1`, set up the
-   flashinfer snapshot 3rdparty deps per
-   `$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE/SNAPSHOT_SETUP.md` (clone the pinned
-   `3rdparty/{cutlass,spdlog,cccl}` and create the `flashinfer/data/*`
-   symlinks). Not needed for the default `native` path.
+- TensorRT-LLM built from this repository and installed in place. Inside
+  the TensorRT-LLM container, from the repository root:
 
-## Deployment shape
+  ```bash
+  python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
+  .venv-3.12/bin/python -m pip install --no-deps -e .
+  ```
 
-* **16 GPUs (4× GB300 trays), DEP16 by default**: attention runs
-  data-parallel and the 896 experts shard across the EP group
-  (`enable_attention_dp=true`, `moe_expert_parallel_size=16`); tokens are
-  exchanged with AllGather/ReduceScatter around the local-expert kernels.
-  Each rank holds the full ~70 GB bf16 non-expert model plus 896/16 = 56
-  experts per MoE layer (~90 GB MXFP4). Set `KIMI_K3_ADP=0` (sanity) or
-  `KIMI_K3_EVAL_CONFIG=.../eval_extra_llm_options.yaml` (gsm8k) for the
-  plain-EP mode (replicated attention + latent allreduce). The DEP16 eval
-  config assumes TP=16; other TP widths need a custom config.
-* Fused MoE (`KIMI_K3_FUSED_MOE=native`, default): in-tree TRTLLM-Gen SiTU
-  op (`mxe4m3_mxe2m1_block_scale_moe_runner`, W4A8 MXFP4 weights × MXFP8
-  activations) consuming the checkpoint's MXFP4 weights via a one-time
-  load-time shuffle. `KIMI_K3_FUSED_MOE=1` selects the private-snapshot
-  flashinfer `trtllm_fp4_block_scale_routed_moe` path (W4A16, requires the
-  snapshot env; still required for SA spec-dec runs — in-tree cubins lack
-  the bs≤8 shapes). Both are ~0.5–0.8 ms/layer vs ~60–140 ms for the
-  reference dequant loop.
-* Required LLM args (see `eval_extra_llm_options.yaml`): chunked prefill
-  off, KV block reuse off, `tokens_per_block=64`. CUDA graphs and the
-  overlap scheduler are ON by default — the generation-phase MLA
-  latent-cache append derives its write positions from device tensors
-  (`attention_backend/utils.py`), making it CUDA-graph-safe; verified at
-  GSM8K parity with the eager path (96.82 on the full test set). Spec-dec
-  (SA) runs keep both OFF for now: the verify/promote path is certified
-  eager without overlap; enabling them is a measured follow-up. Keep
-  `max_batch_size` ≤ ~32 (each KDA state slot costs ~455 MB across the 69
-  KDA layers; ≤8 with SA — SpeculativeState buffers).
-* Unsupported: pipeline parallel, speculative decoding, disagg.
+  `build_wheel.py` creates the `.venv-3.12` virtual environment at the
+  repository root (named after the container's Python version). Adjust
+  `--cuda_architectures` to the target GPUs (`100-real` for GB200,
+  `103-real` for GB300). The Slurm scripts below run TensorRT-LLM from this
+  in-place environment, so build and install with the repository at the
+  same path the jobs use.
+- A complete Hugging Face-format Kimi K3 checkpoint and tokenizer.
+- A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
+  image.
+- The `fla-core` and `einops` packages, installed into the same in-place
+  environment. Note: these dependencies might be removed in a future
+  release, replaced by other kernels.
 
-## Run
+  ```bash
+  .venv-3.12/bin/python -m pip install fla-core einops
+  ```
 
-Preferred entry point: `examples/kimi_k3/run_kimi.py`, which resolves the
-two paths + `IMAGE` from `~/.config/kimi-bringup.ini`. One-time setup:
+## Run the model
+
+Kimi K3 requires a multi-node launch. From the repository root, submit the
+quick-start Slurm job with the checkpoint and container paths:
 
 ```bash
-cp examples/kimi_k3/kimi-bringup.ini.example ~/.config/kimi-bringup.ini
-$EDITOR ~/.config/kimi-bringup.ini   # point `workspace` at your directory
+sbatch examples/kimi_k3/quick_start_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh
 ```
 
-Then:
+Slurm prints the submitted job ID immediately. After the job starts, its output
+is written to `kimi-k3-quick-start-<job-id>.log` in the submission directory.
+The model is loaded once, then the log shows four prompts, their generated
+text, and whether each response contains the expected text. A successful run
+should report `True` for all four checks.
+
+For a full GSM8K evaluation, submit:
 
 ```bash
-examples/kimi_k3/run_kimi.py sanity        # 4-GPU / 4-layer pipeline check (~10 min)
-examples/kimi_k3/run_kimi.py sanity-full   # 16-GPU full sanity (~40 min, mostly weight loading)
-examples/kimi_k3/run_kimi.py gsm8k         # 16-GPU GSM8K, full 1319-problem test set (~3 hr)
+sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh
 ```
 
-Extra args are forwarded to sbatch; `--dry-run` prints the resolved inputs
-and command without submitting. See `run_kimi.py --help` for the env-var /
-config-key / workspace resolution rules.
+This job writes progress and results to
+`kimi-k3-gsm8k-<job-id>.log`. If no local dataset path is configured,
+`trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log
+contains a results table with the normalized GSM8K exact-match scores. With
+the tested checkpoint and the settings in this example, users should expect
+approximately:
 
-The sbatch scripts can also be submitted directly, exporting
-`KIMI_K3_MODEL_DIR` and `IMAGE` yourself (they
-have no defaults and fail fast if unset) — see each script's header. Both
-default `REPO` to the submit directory — submit from the repo root, or set
-`REPO` explicitly. Partition/account in the `#SBATCH` headers are cluster
-defaults; override on the command line as needed.
+| Filter | Exact match |
+| :-- | --: |
+| Flexible extract | 96.51 |
+| Strict match | 96.44 |
 
-## Debug knobs
+The expected average accuracy is approximately 96.47. Small differences are
+possible with different checkpoint or dependency revisions.
 
-* `KIMI_K3_ADP=0` — disable the default DEP deployment in the sanity
-  (plain EP: replicated attention + latent allreduce).
-* `KIMI_K3_NUM_LAYERS_OVERRIDE=<N>` — truncate to the first N decoder layers
-  (loads only those shards; output is gibberish by construction, pipeline
-  checks only).
-* `KIMI_K3_FUSED_MOE=0` — fall back to the in-tree MXFP4 dequant reference
-  MoE (bit-parity oracle for the fused paths, ~100× slower).
-* `KIMI_K3_FUSED_MOE=1` — private-snapshot flashinfer SiTU path (W4A16;
-  the only path with cubins for the truncated 4-GPU/EP=4 shapes and the
-  bs<=8 shapes SA spec-dec runs use); requires the snapshot env and
-  `FLASHINFER_PRIVATE_CUBIN_DIR`.
-* `KIMI_K3_MLA_MAX_POSITIONS` (default 65536) — identity-RoPE table bound
-  (K3 MLA is NoPE); raise for longer sequences.
-* `TLLM_LOG_LEVEL_BY_MODULE="debug:_torch"` — verbose model-side logging.
+To evaluate with suffix-automaton (SA) speculative decoding, add `--sa`:
+
+```bash
+sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh \
+    --sa
+```
+
+This selects `eval_extra_llm_options_sa.yaml` and the SA-required
+`max_batch_size` of 8 (see Current limitations below for what SA runs
+change). Scores should match the non-SA run within noise — SA speculative
+decoding is lossless.
+
+Scheduler options must precede the script path; model and image arguments
+follow it. The scripts default to the `batch` partition and the
+`coreai_comparch_trtllm` account. Change the corresponding `#SBATCH` settings
+to match your cluster, or override them when submitting the job. For example:
+
+```bash
+sbatch --partition=PARTITION --account=ACCOUNT --time=04:00:00 \
+    SCRIPT --model MODEL --image IMAGE
+```
+
+## Troubleshooting
+
+### The job reaches its time limit
+
+The default time limits are intentionally aggressive to make the jobs easier
+to schedule: 40 minutes for the quick start and two hours for GSM8K.
+Depending on how fast your cluster's filesystem loads the weights, a job may
+be terminated before producing its final results, particularly with cold
+runtime caches or a busy filesystem.
+
+Request a longer allocation if the time is not sufficient for your environment:
+
+```bash
+sbatch --time=02:00:00 examples/kimi_k3/quick_start_kimi_k3.sbatch \
+    --model MODEL --image IMAGE
+
+sbatch --time=04:00:00 examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+    --model MODEL --image IMAGE
+```
+
+## Current limitations
+
+Pipeline parallelism, disaggregated serving, chunked prefill, and KV-cache
+block reuse are not supported. CUDA graphs and the overlap scheduler are
+supported and enabled by default: the generation-phase MLA latent-cache
+append derives its write positions from device tensors, making it
+CUDA-graph-safe, verified at GSM8K parity with the eager path.
+
+Suffix-automaton (SA) speculative decoding is supported as an opt-in for
+evaluation (see `eval_extra_llm_options_sa.yaml`). SA runs keep CUDA graphs
+and the overlap scheduler off, need `max_batch_size` ≤ 8, and use the plain
+expert-parallel deployment rather than DEP16 (SA with attention DP is not
+yet certified).

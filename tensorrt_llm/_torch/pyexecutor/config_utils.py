@@ -540,31 +540,10 @@ def load_pretrained_config(model_name_or_path: str,
         # (model_type "kimi_k3" with text/vision sub-configs). TRT-LLM runs
         # the text model only, so flatten to the in-tree KimiLinearConfig
         # (this also avoids trust_remote_code for the config).
-        import os as _os
-
         from tensorrt_llm._torch.configs import KimiLinearConfig
         text_dict = dict(config_dict.get("text_config") or config_dict)
         model_config = KimiLinearConfig.from_dict(text_dict)
         model_config.architectures = ["KimiLinearForCausalLM"]
-        # Debug knob: truncate the model to the first N layers (the layer
-        # schedule lists are filtered consistently). Used for reduced-GPU
-        # bring-up; extra checkpoint layers are ignored at load time.
-        layers_override = _os.environ.get("KIMI_K3_NUM_LAYERS_OVERRIDE")
-        if layers_override:
-            n = int(layers_override)
-            assert 0 < n <= model_config.num_hidden_layers
-            model_config.num_hidden_layers = n
-            lin = dict(model_config.linear_attn_config)
-            lin["kda_layers"] = [l for l in lin["kda_layers"] if l <= n]
-            lin["full_attn_layers"] = [
-                l for l in lin["full_attn_layers"] if l <= n
-            ]
-            model_config.linear_attn_config = lin
-            logger.warning(
-                f"KIMI_K3_NUM_LAYERS_OVERRIDE={n}: truncating Kimi K3 to the "
-                f"first {n} decoder layers "
-                f"({len(lin['kda_layers'])} KDA / "
-                f"{len(lin['full_attn_layers'])} MLA)")
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
