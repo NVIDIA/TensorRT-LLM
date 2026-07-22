@@ -7,7 +7,7 @@ from typing import Callable, List, Optional, Tuple
 import pytest
 import torch
 from torch.multiprocessing.reductions import reduce_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.llm_data import llm_models_root
 from utils.torch_ref import RefHFModel
 from utils.util import getSMVersion, skip_pre_hopper
@@ -41,13 +41,21 @@ def release_shared_cuda_memory():
 
 
 class RefHFModelWithIPCHandles(RefHFModel):
-    def __init__(self, model_dir: str, device_id: int = 0, num_hidden_layers: int = 4):
+    def __init__(self, model_dir: str, device_id: int = 0, **model_kwargs):
         self.device_id = device_id
-        config = AutoConfig.from_pretrained(model_dir)
-        config.num_hidden_layers = num_hidden_layers
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_dir, config=config, torch_dtype=torch.bfloat16, attn_implementation="eager"
+            model_dir,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="eager",
+            **model_kwargs,
         ).to(f"cuda:{device_id}")
+        # Hybrid configs (e.g. NemotronH) derive num_hidden_layers from
+        # ``layers_block_type`` and silently ignore the num_hidden_layers
+        # override; callers must pass a truncated ``layers_block_type`` for
+        # such models. Catch a silently ignored override loudly here.
+        num_hidden_layers = model_kwargs.get("num_hidden_layers")
+        if num_hidden_layers is not None:
+            assert self.model.config.num_hidden_layers == num_hidden_layers
         self.all_weights = {}
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._replicate_weights()
