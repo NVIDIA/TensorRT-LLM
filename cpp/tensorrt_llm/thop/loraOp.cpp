@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -157,7 +157,10 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
     {
     case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
     case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
-    default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16");
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
+#endif
+    default: throw std::invalid_argument("Invalid dtype, only supports float16, bfloat16, float8_e4m3fn");
     }
 
     auto mLoraImpl = std::make_shared<tensorrt_llm::kernels::LoraImpl>(
@@ -227,7 +230,12 @@ void lora_grouped_gemm_cuda_graph(th::Tensor const& lora_in_sizes, // [layer_mod
     {
     case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
     case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
-    default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
+#endif
+    default:
+        TORCH_CHECK(
+            false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got %s", c10::toString(dtype));
     }
 
     int const minKnInt = std::max(1, static_cast<int>(minKN));
@@ -307,7 +315,12 @@ void lora_group_gemm_param_fill_row_reorder_fusion(th::Tensor const& in_sizes, /
     {
     case torch::kFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kHALF; break;
     case torch::kBFloat16: loraRuntimeDataType = tensorrt_llm::DataType::kBF16; break;
-    default: TORCH_CHECK(false, "Invalid dtype, only supports float16, bfloat16, got %s", c10::toString(dtype));
+#ifdef ENABLE_FP8
+    case torch::kFloat8_e4m3fn: loraRuntimeDataType = tensorrt_llm::DataType::kFP8; break;
+#endif
+    default:
+        TORCH_CHECK(
+            false, "Invalid dtype, only supports float16, bfloat16, float8_e4m3fn, got %s", c10::toString(dtype));
     }
 
     int64_t const dtype_element_size = input.element_size();

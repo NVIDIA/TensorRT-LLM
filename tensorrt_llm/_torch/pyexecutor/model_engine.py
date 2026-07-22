@@ -5408,8 +5408,11 @@ class PyTorchModelEngine(ModelEngine):
                     peft_cache_manager)
             peft_table = peft_cache_manager.get_and_reset_batch_peft_table(
             ) if peft_cache_manager is not None else None
-            return peft_table and self._get_eager_lora_params_from_requests(
+            lora_params = peft_table and self._get_eager_lora_params_from_requests(
                 scheduled_requests, attn_metadata, peft_table)
+            if lora_params:
+                lora_params["data_type"] = peft_cache_manager.data_type
+            return lora_params
 
     def _get_eager_lora_params_from_requests(
             self, scheduled_requests: ScheduledRequests,

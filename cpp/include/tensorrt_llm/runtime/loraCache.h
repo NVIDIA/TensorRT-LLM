@@ -1,5 +1,5 @@
-/*loraCac
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+/*
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -185,6 +185,16 @@ public:
      */
     LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelConfig const& modelConfig,
         WorldConfig const& worldConfig, BufferManager const& bufferManager);
+
+    /**
+     * \brief Reinitialize an empty cache to store the given data type.
+     *
+     * The page geometry remains unchanged. This is intended for selecting a
+     * homogeneous LoRA cache dtype before the first task is inserted.
+     */
+    void setDataType(tensorrt_llm::DataType dataType);
+
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const;
 
     /**
      * \brief put a task in the cache, and claim pages for it, and optionally load task weights.

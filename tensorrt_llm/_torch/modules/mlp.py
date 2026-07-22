@@ -8,7 +8,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 
@@ -269,8 +269,7 @@ class MLP(nn.Module):
 
         assert self.layer_idx is not None, "layer_idx is required for lora"
         x_up_lora = self.up_lora(x, lora_params, self.layer_idx)
-        if x_up_lora is not None:
-            x_up = x_up + x_up_lora
+        x_up = add_lora_result(x_up, x_up_lora)
 
         x_act = self.activation(x_up)
         x_down = self.down_proj(x_act,

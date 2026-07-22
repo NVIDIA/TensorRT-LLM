@@ -14,7 +14,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, add_lora_result
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
@@ -3600,8 +3600,7 @@ class Linear(nn.Module):
         output = self.quant_method.apply(self, input, bias)
         if self.lora is not None and bool(lora_params):
             lora_result = self.lora(input, lora_params, layer_idx)
-            if lora_result is not None:
-                output = output + lora_result
+            output = add_lora_result(output, lora_result)
         return output
 
     def apply_linear_allreduce(self,

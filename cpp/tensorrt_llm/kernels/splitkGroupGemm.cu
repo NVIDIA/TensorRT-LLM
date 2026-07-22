@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,10 +31,44 @@
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/default_splitk_gemm_grouped.h"
 #include "tensorrt_llm/cutlass_extensions/include/cutlass_extensions/gemm/kernel/splitk_gemm_grouped.h"
 
+#ifdef ENABLE_FP8
+#include "cute/tensor.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/group_array_problem_shape.hpp"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/util/packed_stride.hpp"
+#endif // ENABLE_FP8
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+namespace
+{
+
+constexpr int kFp8TmaAlignment = 16;
+
+void checkFp8GroupedGemmAlignment(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, char const* kernelName)
+{
+    for (size_t problemIdx = 0; problemIdx < problemSizes.size(); ++problemIdx)
+    {
+        auto const& problem = problemSizes[problemIdx];
+        if (problem.m() == 0 || problem.n() == 0 || problem.k() == 0)
+        {
+            continue;
+        }
+
+        TLLM_CHECK_WITH_INFO(problem.n() % kFp8TmaAlignment == 0 && problem.k() % kFp8TmaAlignment == 0,
+            "%s requires GEMM N and K dimensions to be multiples of %d elements for 128-bit TMA alignment. "
+            "Problem %zu has M=%d, N=%d, K=%d.",
+            kernelName, kFp8TmaAlignment, problemIdx, problem.m(), problem.n(), problem.k());
+    }
+}
+
+} // namespace
 
 int64_t inline getGemmCoordSize(int64_t problemCount)
 {
@@ -226,12 +260,228 @@ void splitkGroupedGemmType_(std::vector<cutlass::gemm::GemmCoord> const& problem
 #endif
 }
 
+#ifdef ENABLE_FP8
+
+// ====================================================================
+// FP8 split-K grouped GEMM using CUTLASS 3.x collective API (Hopper).
+//
+// CUTLASS 3.x grouped GEMM does not have a split-K variant. We use the
+// regular cooperative fp8 grouped GEMM instead: the Hopper cooperative
+// schedule distributes work across warps efficiently even for large-K
+// small-N problems. The output is fp8, matching the non-split-K path's
+// final output type convention used by LoRA.
+// ====================================================================
+
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+
+void fp8SplitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
+    std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
+    void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
+    cudaStream_t stream)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    using namespace cute;
+
+    using ElementA = cutlass::float_e4m3_t;
+    using ElementB = cutlass::float_e4m3_t;
+    using ElementC = cutlass::float_e4m3_t;
+    using ElementD = cutlass::float_e4m3_t;
+    using ElementAccumulator = float;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = cutlass::layout::RowMajor;
+
+    static constexpr int kAlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int kAlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int kAlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    static constexpr int kAlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+
+    using ArchTag = cutlass::arch::Sm90;
+    using OperatorClass = cutlass::arch::OpClassTensorOp;
+
+    using TileShape = Shape<_128, _128, _128>;
+    using ClusterShape = Shape<_1, _2, _1>;
+
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8FastAccum;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+
+    using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
+
+    using CollectiveEpilogue =
+        typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass, TileShape, ClusterShape,
+            cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator, ElementC, LayoutC*,
+            kAlignmentC, ElementD, LayoutD*, kAlignmentD, EpilogueSchedule>::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
+        LayoutA*, kAlignmentA, ElementB, LayoutB*, kAlignmentB, ElementAccumulator, TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        KernelSchedule>::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using StrideA = typename GemmKernel::InternalStrideA;
+    using StrideB = typename GemmKernel::InternalStrideB;
+    using StrideC = typename GemmKernel::InternalStrideC;
+    using StrideD = typename GemmKernel::InternalStrideD;
+
+    int const problemCount = static_cast<int>(problemSizes.size());
+
+    std::vector<typename ProblemShape::UnderlyingProblemShape> problemShapesHost(problemCount);
+    std::vector<ElementA const*> ptrAHost(problemCount);
+    std::vector<ElementB const*> ptrBHost(problemCount);
+    std::vector<ElementC const*> ptrCHost(problemCount);
+    std::vector<ElementD*> ptrDHost(problemCount);
+    std::vector<StrideA> strideAHost(problemCount);
+    std::vector<StrideB> strideBHost(problemCount);
+    std::vector<StrideC> strideCHost(problemCount);
+    std::vector<StrideD> strideDHost(problemCount);
+
+    for (int i = 0; i < problemCount; ++i)
+    {
+        auto const& coord = problemSizes[i];
+        int const m = coord.m();
+        int const n = coord.n();
+        int const k = coord.k();
+
+        problemShapesHost[i] = cute::make_shape(m, n, k);
+        ptrAHost[i] = static_cast<ElementA const*>(ptrA[i]);
+        ptrBHost[i] = static_cast<ElementB const*>(ptrB[i]);
+        ptrCHost[i] = static_cast<ElementC const*>(ptrC[i]);
+        ptrDHost[i] = static_cast<ElementD*>(ptrD[i]);
+
+        strideAHost[i] = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+        strideBHost[i] = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+        strideCHost[i] = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
+        strideDHost[i] = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(m, n, 1));
+    }
+
+    auto const align16 = [](int64_t bytes) -> int64_t { return (bytes + 15) / 16 * 16; };
+
+    int64_t const szProblemShapes = align16(problemCount * sizeof(typename ProblemShape::UnderlyingProblemShape));
+    int64_t const szPtrA = align16(problemCount * sizeof(ElementA const*));
+    int64_t const szPtrB = align16(problemCount * sizeof(ElementB const*));
+    int64_t const szPtrC = align16(problemCount * sizeof(ElementC const*));
+    int64_t const szPtrD = align16(problemCount * sizeof(ElementD*));
+    int64_t const szStrideA = align16(problemCount * sizeof(StrideA));
+    int64_t const szStrideB = align16(problemCount * sizeof(StrideB));
+    int64_t const szStrideC = align16(problemCount * sizeof(StrideC));
+    int64_t const szStrideD = align16(problemCount * sizeof(StrideD));
+
+    int64_t const totalParamsBytes
+        = szProblemShapes + szPtrA + szPtrB + szPtrC + szPtrD + szStrideA + szStrideB + szStrideC + szStrideD;
+    TLLM_CHECK_WITH_INFO(totalParamsBytes <= gemmParamsWorkSpaceSize,
+        "FP8 split-K grouped GEMM params workspace too small: need %ld, have %ld", totalParamsBytes,
+        gemmParamsWorkSpaceSize);
+
+    std::vector<char> hostBuf(totalParamsBytes);
+    char* cursor = hostBuf.data();
+
+    auto copyToHostBuf = [&cursor](void const* src, int64_t bytes)
+    {
+        std::memcpy(cursor, src, bytes);
+        cursor += (bytes + 15) / 16 * 16;
+    };
+
+    copyToHostBuf(problemShapesHost.data(), problemCount * sizeof(typename ProblemShape::UnderlyingProblemShape));
+    copyToHostBuf(ptrAHost.data(), problemCount * sizeof(ElementA const*));
+    copyToHostBuf(ptrBHost.data(), problemCount * sizeof(ElementB const*));
+    copyToHostBuf(ptrCHost.data(), problemCount * sizeof(ElementC const*));
+    copyToHostBuf(ptrDHost.data(), problemCount * sizeof(ElementD*));
+    copyToHostBuf(strideAHost.data(), problemCount * sizeof(StrideA));
+    copyToHostBuf(strideBHost.data(), problemCount * sizeof(StrideB));
+    copyToHostBuf(strideCHost.data(), problemCount * sizeof(StrideC));
+    copyToHostBuf(strideDHost.data(), problemCount * sizeof(StrideD));
+
+    tensorrt_llm::common::cudaAutoCpy(reinterpret_cast<int8_t*>(gemmParamsWorkSpace),
+        reinterpret_cast<int8_t const*>(hostBuf.data()), totalParamsBytes, stream);
+
+    char* devBase = static_cast<char*>(gemmParamsWorkSpace);
+    int64_t devOff = 0;
+
+    auto devPtr = [&devBase, &devOff](int64_t sz) -> void*
+    {
+        void* p = devBase + devOff;
+        devOff += (sz + 15) / 16 * 16;
+        return p;
+    };
+
+    auto* devProblemShapes = static_cast<typename ProblemShape::UnderlyingProblemShape*>(devPtr(szProblemShapes));
+    auto* devPtrA = static_cast<ElementA const**>(devPtr(szPtrA));
+    auto* devPtrB = static_cast<ElementB const**>(devPtr(szPtrB));
+    auto* devPtrC = static_cast<ElementC const**>(devPtr(szPtrC));
+    auto* devPtrD = static_cast<ElementD**>(devPtr(szPtrD));
+    auto* devStrideA = static_cast<StrideA*>(devPtr(szStrideA));
+    auto* devStrideB = static_cast<StrideB*>(devPtr(szStrideB));
+    auto* devStrideC = static_cast<StrideC*>(devPtr(szStrideC));
+    auto* devStrideD = static_cast<StrideD*>(devPtr(szStrideD));
+
+    cutlass::KernelHardwareInfo hwInfo;
+    hwInfo.device_id = 0;
+    cudaGetDevice(&hwInfo.device_id);
+    hwInfo.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hwInfo.device_id);
+
+    typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
+        {problemCount, devProblemShapes, nullptr}, {devPtrA, devStrideA, devPtrB, devStrideB},
+        {{1.0f, 0.0f}, devPtrC, devStrideC, devPtrD, devStrideD}, hwInfo};
+
+    Gemm gemm;
+
+    size_t const workspaceSize = Gemm::get_workspace_size(arguments);
+    TLLM_CHECK_WITH_INFO(static_cast<int64_t>(workspaceSize) <= gemmWorkSpaceSize,
+        "FP8 split-K grouped GEMM workspace too small: need %lu, have %ld", workspaceSize, gemmWorkSpaceSize);
+
+    cutlass::Status status = gemm.can_implement(arguments);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 split-K grouped GEMM can_implement failed: %s",
+        cutlass::cutlassGetStatusString(status));
+
+    status = gemm.initialize(arguments, gemmWorkSpace, stream);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 split-K grouped GEMM initialize failed: %s",
+        cutlass::cutlassGetStatusString(status));
+
+    status = gemm.run(stream);
+    TLLM_CHECK_WITH_INFO(status == cutlass::Status::kSuccess, "FP8 split-K grouped GEMM run failed: %s",
+        cutlass::cutlassGetStatusString(status));
+
+    sync_check_cuda_error(stream);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+
+#endif // ENABLE_FP8
+
 void splitkGroupedGemm(std::vector<cutlass::gemm::GemmCoord> const& problemSizes, std::vector<void*> const& ptrA,
     std::vector<void*> const& ptrB, std::vector<void*> const& ptrC, std::vector<void*> const& ptrD,
     void* gemmParamsWorkSpace, int64_t gemmParamsWorkSpaceSize, void* gemmWorkSpace, int64_t gemmWorkSpaceSize,
     bool isLoraIn, tensorrt_llm::DataType dataType, int splitKSlices, int minKN, cudaStream_t stream)
 {
     TLLM_LOG_TRACE("%s start, isLoraIn: %d, minKN = %d", __PRETTY_FUNCTION__, static_cast<int>(isLoraIn), minKN);
+
+#ifdef ENABLE_FP8
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+    if (dataType == tensorrt_llm::DataType::kFP8)
+    {
+        checkFp8GroupedGemmAlignment(problemSizes, "FP8 split-K grouped GEMM");
+
+        fp8SplitkGroupedGemm(problemSizes, ptrA, ptrB, ptrC, ptrD, gemmParamsWorkSpace, gemmParamsWorkSpaceSize,
+            gemmWorkSpace, gemmWorkSpaceSize, stream);
+        return;
+    }
+#else
+    if (dataType == tensorrt_llm::DataType::kFP8)
+    {
+        TLLM_CHECK_WITH_INFO(false,
+            "FP8 split-K grouped GEMM requires CUTLASS modifiable TMA support (CUDA 12.3+ and Hopper sm90+ kernels).");
+    }
+#endif // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED
+#endif // ENABLE_FP8
+
     if (isLoraIn)
     {
         // K >> N, like K = 1024, N = 8
