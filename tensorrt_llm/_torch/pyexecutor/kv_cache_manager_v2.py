@@ -230,6 +230,46 @@ def _estimate_full_attn_size_per_token(
     )
 
 
+def _compute_auto_host_tier_quota(
+    quota: int,
+    local_ranks: int,
+    mem_available: float,
+    memlock_limit: float,
+) -> int:
+    """Compute the auto-provisioned host cache tier quota for a single rank.
+
+    The host tier backs the MAX_UTILIZATION scheduler's suspend/resume path,
+    so it must be positive. It defaults to the device quota, capped by the
+    per-node available-memory budget shared with co-located ranks and by the
+    pinnable-memory (RLIMIT_MEMLOCK) limit.
+
+    Args:
+        quota: Device (GPU) KV cache quota in bytes; must be positive.
+        local_ranks: Number of ranks co-located on this physical node.
+        mem_available: Available host memory in bytes, or ``float("inf")``
+            if unknown.
+        memlock_limit: RLIMIT_MEMLOCK soft limit in bytes, or
+            ``float("inf")`` if unlimited or unknown.
+
+    Returns:
+        Host cache tier quota in bytes (always positive).
+    """
+    candidates = [quota]
+    if mem_available != float("inf"):
+        candidates.append(int(mem_available / local_ranks * 0.5))
+    if memlock_limit != float("inf"):
+        candidates.append(int(memlock_limit * 0.8))
+    host_quota = min(candidates)
+    if host_quota <= 0:
+        logger.warning(
+            f"KV cache manager v2 auto host tier sizing computed a "
+            f"non-positive quota ({host_quota}); falling back to the "
+            f"device quota {quota / (1 << 30):.2f}GiB"
+        )
+        host_quota = quota
+    return host_quota
+
+
 def _estimate_swa_cache_size(
     layer_sizes: Sequence[int],
     attention_windows: Sequence[Optional[int]],
@@ -950,6 +990,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # memory and pinnable memory limit to avoid allocation failures.
             import resource
 
+            # Rank-aware host tier sizing: divide the per-node memory budget
+            # by the number of ranks sharing this physical node.  Each rank
+            # independently provisions a host tier; without this, N
+            # co-located ranks each reserving a device-quota-sized block can
+            # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
+            # ~170GiB device quota each on a 975GiB node).
+            local_ranks = max(1, Distributed.get(mapping).local_world_size)
+
             try:
                 mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
             except (ValueError, OSError):
@@ -959,14 +1007,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float("inf")
             except (ValueError, OSError):
                 memlock_limit = float("inf")
-            candidates = [quota]
-            if mem_available != float("inf"):
-                candidates.append(int(mem_available * 0.5))
-            if memlock_limit != float("inf"):
-                candidates.append(int(memlock_limit * 0.8))
-            host_quota = min(candidates)
-            if host_quota <= 0:
-                host_quota = quota
+            host_quota = _compute_auto_host_tier_quota(
+                quota, local_ranks, mem_available, memlock_limit
+            )
+            logger.info(
+                f"KV cache manager v2 auto host tier sizing: "
+                f"{local_ranks} co-located rank(s) on this node, "
+                f"available host memory {mem_available / (1 << 30):.2f}GiB"
+            )
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
