@@ -801,6 +801,8 @@ def setup_disagg_cluster(
             config.get("conditional_disagg_config", None),
             "perf_metrics_max_requests":
             config.get("perf_metrics_max_requests", 0),
+            "perf_metrics_output_dir":
+            config.get("perf_metrics_output_dir", None),
             "return_perf_metrics":
             config.get("return_perf_metrics", False),
         }

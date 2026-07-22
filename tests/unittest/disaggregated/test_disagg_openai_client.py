@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     UsageInfo,
 )
+from tensorrt_llm.serve.perf_metrics import SSE_METRICS_EVENT
+from tensorrt_llm.serve.responses_utils import ResponseHooks
 from tensorrt_llm.serve.router import Router
 
 
@@ -185,6 +187,43 @@ class TestOpenAIHttpClient:
         for i, chunk in enumerate(chunks):
             assert chunk == dummy_data[i]
         mock_session.post.assert_called_once()
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session, success=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_streaming_metrics_do_not_fail_request(
+        self, openai_client, streaming_completion_request, mock_session, mock_router
+    ):
+        openai_client._request_perf_metrics = True
+        mock_http_response = AsyncMock()
+        mock_http_response.status = 200
+        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+
+        response_data = b'data: "Hello"\n\ndata: [DONE]\n\n'
+        metrics_data = f"event: {SSE_METRICS_EVENT}\ndata: not-json\n\n".encode()
+
+        async def mock_iter_any():
+            yield response_data
+            yield metrics_data
+
+        mock_http_response.content = AsyncMock()
+        mock_http_response.content.iter_any = mock_iter_any
+        mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
+        mock_http_response.__aexit__ = AsyncMock()
+        mock_session.post.return_value = mock_http_response
+        hooks = MagicMock(spec=ResponseHooks)
+
+        response_generator = await openai_client.send_request(
+            streaming_completion_request, hooks=hooks
+        )
+        chunks = [chunk async for chunk in response_generator]
+
+        assert b"".join(chunks) == response_data
+        hooks.on_perf_metrics.assert_not_called()
+        hooks.on_resp_done.assert_called_once_with(
+            "localhost:8000", streaming_completion_request, None
+        )
         mock_router.finish_request.assert_called_once_with(
             streaming_completion_request, mock_session, success=True
         )

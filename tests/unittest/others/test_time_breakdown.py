@@ -19,7 +19,8 @@ from unittest.mock import patch
 from tensorrt_llm.serve.scripts.time_breakdown import (RequestDataParser,
                                                        RequestTimeBreakdown,
                                                        TimingMetric,
-                                                       TimingMetricsConfig)
+                                                       TimingMetricsConfig,
+                                                       main)
 
 
 class TestTimingMetric(unittest.TestCase):
@@ -451,7 +452,7 @@ class TestRequestTimeBreakdown(unittest.TestCase):
 
     def test_parse_json_file_not_found(self):
         """Test parsing a non-existent file."""
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(FileNotFoundError):
             self.analyzer.parse_json_file('non_existent_file.json')
 
     def test_parse_json_file_invalid_json(self):
@@ -462,10 +463,15 @@ class TestRequestTimeBreakdown(unittest.TestCase):
             temp_file = f.name
 
         try:
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(ValueError):
                 self.analyzer.parse_json_file(temp_file)
         finally:
             os.unlink(temp_file)
+
+    def test_main_handles_missing_file(self):
+        """Test that the CLI converts library exceptions to a failure status."""
+        with patch('sys.argv', ['time_breakdown.py', 'non_existent_file.json']):
+            self.assertEqual(main(), 1)
 
     def test_create_timing_diagram(self):
         """Test creating a timing diagram."""
