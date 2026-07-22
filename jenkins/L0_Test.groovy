@@ -236,6 +236,53 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
     }
 }
 
+// Scrape the SLURM job output log for a device / driver / interconnect fault
+// signature and return the matched signature itself, or "" for no match.
+//
+// Device faults (CUDA/NVLink/ECC/driver) print into job-output.log but never
+// reach the stage exception chain -- the tracker squashes a failed job to
+// `exit 1` -- so classify() otherwise sees only a generic failure and cannot
+// steer the retry off the bad node. This is a GATE only: the returned signature
+// is folded into a fresh exception so FailureClassifier.PATTERN_CATALOG (the
+// authoritative list) makes the real retry/severity decision. A signature the
+// catalog does not recognize simply falls through to a normal rethrow.
+// App-induced CUDA errors (illegal memory access, unspecified launch failure,
+// OOM) are deliberately excluded -- the OpenSearch stage data shows those are
+// overwhelmingly code regressions, not node faults, and must not trigger a
+// node-avoiding retry.
+//
+// grep -o returns only the matched signature (not the whole line), so a long
+// log line cannot truncate the signature out of the result before it reaches
+// classify(). Each alternative must therefore be catalog-exact: it must match
+// (via `.` wildcards for shell-hostile chars) the full catalog substring, so
+// grep -o emits text that still contains the catalog pattern.
+def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath) {
+    def deviceFaultRegex = "cudaErrorMapBufferObjectFailed|mapping of buffer object failed|" +
+        "uncorrectable NVLink error|cudaErrorNvlinkUncorrectable|CUDA_ERROR_SYSTEM_NOT_READY|" +
+        "uncorrectable ECC error|CUDA_ERROR_ECC_UNCORRECTABLE|has fallen off the bus|GPU is lost|" +
+        "Unable to determine the device handle for GPU|RmInitAdapter failed|Failed to initialize NVML|" +
+        "could... communicate with the NVIDIA driver|CUDA_ERROR_DEVICE_UNAVAILABLE|" +
+        "no CUDA-capable device is detected|CUDA_ERROR_UNKNOWN: 999|CUDA unknown error|" +
+        "CUDA-capable device.s. is/are busy or unavailable"
+    try {
+        // Wrap the body in `bash -c` so it is shell-agnostic: cluster login shells
+        // are often csh/tcsh, which can't parse this bash test/pipe/redirection
+        // syntax. The login shell only has to run `bash -c '<single-quoted body>'`.
+        return Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(remote,
+                "\"bash -c 'if [ -f \\\"${remoteLogPath}\\\" ]; then grep -aioE \\\"${deviceFaultRegex}\\\" \\\"${remoteLogPath}\\\" 2>/dev/null | tail -n 1 | cut -c1-500; fi'\""),
+            returnStdout: true,
+            numRetries: 1,
+        )?.trim()
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception scrapeEx) {
+        pipeline.echo("Ignorable warning: could not scrape ${remoteLogPath} for device faults on ${remote.host}: ${scrapeEx.message}")
+        return ""
+    }
+}
+
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
@@ -1888,6 +1935,23 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "(hit partition walltime ${partition?.time}min); treating as a test timeout, not retrying. " +
                             "Original failure: ${e.message}",
                             e)
+                    }
+                    // A terminal FAILED state may be a node/device fault whose
+                    // signature (CUDA/NVLink/ECC/driver) printed only into the SLURM
+                    // job output log, never into this exception chain. Scrape the log
+                    // and, on a hit, surface the matched line into a fresh exception
+                    // so the authoritative catalog (FailureClassifier.classify at the
+                    // runLLMTestlistWithSbatch caller) can match it and steer the retry
+                    // off the bad node. A miss falls through to the plain rethrow.
+                    if (slurmState == "FAILED") {
+                        def deviceHit = scrapeSlurmLogForDeviceFault(pipeline, remote, slurmJobLogPath)
+                        if (deviceHit) {
+                            echo "[INFRA-RETRY] ${stageName}: device-fault signature in SLURM job ${slurmJobId} log; " +
+                                 "surfacing to classifier: ${deviceHit}"
+                            throw new Exception(
+                                "Device/interconnect fault on SLURM node during job ${slurmJobId} for ${stageName}: " +
+                                "${deviceHit} | original: ${e.message}")
+                        }
                     }
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} terminal state=${slurmState ?: 'unknown'}; " +
                          "deferring to failure classifier."
