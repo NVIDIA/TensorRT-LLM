@@ -714,6 +714,17 @@ class MiniMaxM3Attention(Attention):
         # quantization changes cache storage only, so this stays the compute dtype.
         self.attn_activation_dtype = config.torch_dtype
 
+        # Whether the main K/V cache is stored as FP8 E4M3. When true and the MSA
+        # backend is active, the fused QK-norm+RoPE kernel emits FP8 q/k/v
+        # directly, so the separate q-cast and cache-write casts collapse into one
+        # kernel. This only moves where the E4M3 conversion happens, not its value.
+        quant_config = getattr(model_config, "quant_config", None)
+        self.main_kv_is_fp8 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp8_kv_cache()
+        )
+
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
             hidden_size=self.head_dim_value,
@@ -864,6 +875,7 @@ class MiniMaxM3Attention(Attention):
         head_dim: int,
         q_norm: RMSNorm,
         k_norm: RMSNorm,
+        out_fp8: bool = False,
     ) -> Optional[torch.Tensor]:
         """Fuse per-head Gemma RMSNorm and partial RoPE into one kernel.
 
@@ -874,9 +886,15 @@ class MiniMaxM3Attention(Attention):
         channels, matching M3's whole-head norm with front partial RoPE, and
         leaves the V heads untouched.
 
-        Returns None with qkv unmodified when the kernel does not apply, so the
-        caller runs norm and RoPE separately: non-bf16 activations (the kernel
-        is bf16-only), missing position_ids, or no rotary embedding.
+        When out_fp8 is True, an out-of-place FP8 variant runs instead: it reads
+        the bf16 fused qkv and returns a fresh FP8 E4M3 tensor with Q/K normed
+        and roped and V copy-cast, folding the FP8 activation quant into the
+        norm+RoPE epilogue. The input qkv is left untouched.
+
+        Returns None, leaving qkv untouched, when the fused path does not apply
+        so callers fall back to separate norm and RoPE. This happens when
+        activations are not bf16 (the kernel is bf16-only), when RoPE has no
+        position_ids, or when no partial-RoPE rotary_emb exists.
         """
         if position_ids is None or qkv.dtype != torch.bfloat16:
             return None
@@ -891,6 +909,32 @@ class MiniMaxM3Attention(Attention):
         rotary_dim = int(self.pos_embd_params.rope.dim)
         # The kernel assumes a contiguous [num_tokens, total_heads * head_dim].
         qkv = qkv.contiguous()
+        position_ids_i32 = position_ids.reshape(-1).contiguous().to(torch.int32)
+        if out_fp8:
+            # Out-of-place FP8 variant: returns a fresh E4M3 [q|k|v] tensor.
+            return torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+                qkv,
+                num_heads_q,
+                num_heads_k,
+                num_heads_v,
+                head_dim,
+                rotary_dim,
+                q_norm.variance_epsilon,
+                q_norm.weight,
+                k_norm.weight,
+                self.pos_embd_params.rope.theta,
+                self.pos_embd_params.is_neox,
+                position_ids_i32,
+                1.0,  # factor: no YARN (M3 has no rope_scaling)
+                0.0,  # low
+                0.0,  # high
+                1.0,  # attention_factor
+                True,  # is_qk_norm
+                self.use_gemma_norm,  # use_gemma
+                False,  # use_mrope
+                0,  # mrope_section1
+                0,  # mrope_section2
+            )
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv,
             num_heads_q,
@@ -903,7 +947,7 @@ class MiniMaxM3Attention(Attention):
             k_norm.weight,
             self.pos_embd_params.rope.theta,
             self.pos_embd_params.is_neox,
-            position_ids.reshape(-1).contiguous().to(torch.int32),
+            position_ids_i32,
             1.0,  # factor: no YARN (M3 has no rope_scaling)
             0.0,  # low
             0.0,  # high
@@ -924,6 +968,59 @@ class MiniMaxM3Attention(Attention):
         The forward paths assert on this.
         """
         return self.attn_activation_dtype == torch.bfloat16 and position_ids is not None
+
+    def _msa_backend_active(self) -> bool:
+        """Whether the MSA fmha_sm100 backend handles this layer's attention.
+
+        Used to gate MSA-only main-branch optimizations (FP8 q/k/v emission and
+        skipping the split q/k contiguous copies). The Triton/SDPA reference
+        backends are left on the conservative contiguous/bf16 path.
+        """
+        return isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+
+    def _emit_fp8_main_qkv(self) -> bool:
+        """Whether the main-branch fused QK-norm+RoPE should emit FP8 q/k/v.
+
+        Only the MSA backend consumes an FP8 paged K/V cache directly (the
+        kernel variant shares one dtype across q/k/v). The Triton/SDPA reference
+        paths keep bf16, so gate on the MSA backend being active in addition to
+        the cache being FP8. The index branch always stays bf16.
+        """
+        return self.main_kv_is_fp8 and self._msa_backend_active()
+
+    def _split_main_qkv(
+        self, fused_qkv: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the fused [q|k|v] buffer into per-tensor q/k/v.
+
+        The MSA fmha_sm100 kernel reads q with its real strides through the TMA
+        descriptor (both the dense and the packed-decode Q load paths address
+        global memory with q.stride()), and k/v are scattered into the paged
+        cache by an indexed copy that tolerates a strided source. So on the MSA
+        backend the split column-views can be handed over directly with no
+        contiguous copy. Other backends keep the previous contiguity (q/k made
+        contiguous, v a column-slice view).
+        """
+        q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self._msa_backend_active():
+            return q, k, v
+        return q.contiguous(), k.contiguous(), v
+
+    def _split_index_qk(self, fused_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Split the fused [idx_q|idx_k] buffer into per-tensor idx_q/idx_k.
+
+        The index analogue of _split_main_qkv. The index cache is bf16, so there
+        is no FP8 output variant here. On the MSA backend the split is stride
+        safe: idx_q feeds the fmha_sm100 proxy, which loads Q via TMA using its
+        real strides, and idx_k is scattered into the paged index-K cache by an
+        indexed copy that tolerates a strided source. The split column-views are
+        handed over directly with no contiguous copy. Other backends fall back to
+        contiguous idx_q and idx_k.
+        """
+        idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
+        if self._msa_backend_active():
+            return idx_q, idx_k
+        return idx_q.contiguous(), idx_k.contiguous()
 
     def forward(
         self,
@@ -1025,11 +1122,10 @@ class MiniMaxM3Attention(Attention):
             head_dim=self.head_dim,
             q_norm=self.q_norm,
             k_norm=self.k_norm,
+            out_fp8=self._emit_fp8_main_qkv(),
         )
         if fused_qkv is not None:
-            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # Match the contiguity of the separate path; V stays a column-slice view.
-            q, k = q.contiguous(), k.contiguous()
+            q, k, v = self._split_main_qkv(fused_qkv)
         else:
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
@@ -1237,7 +1333,12 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
+        # Attention output is always the compute dtype (bf16); q may be FP8 when
+        # the MSA FP8-KV path emits FP8 q/k/v, so pin the dtype rather than
+        # inheriting it from q.
+        output = q.new_empty(
+            (q.shape[0], self.num_heads * self.head_dim), dtype=self.attn_activation_dtype
+        )
         if self.register_to_config and is_torch_compiling():
             minimax_m3_attn_custom_op_inplace(
                 q,
@@ -1370,10 +1471,10 @@ class MiniMaxM3Attention(Attention):
                 head_dim=self.head_dim,
                 q_norm=self.q_norm,
                 k_norm=self.k_norm,
+                out_fp8=self._emit_fp8_main_qkv(),
             )
             if fused_qkv is not None:
-                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-                return q.contiguous(), k.contiguous(), v
+                return self._split_main_qkv(fused_qkv)
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
                 f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
@@ -1399,8 +1500,7 @@ class MiniMaxM3Attention(Attention):
                 k_norm=self.index_k_norm,
             )
             if fused_idx is not None:
-                idx_q, idx_k = fused_idx.split([self.index_q_size, self.index_k_size], dim=-1)
-                return idx_q.contiguous(), idx_k.contiguous()
+                return self._split_index_qk(fused_idx)
             assert not self._expect_fused_qk_norm_rope(position_ids), (
                 f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
                 f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
