@@ -120,8 +120,7 @@ def _signal_handler_cleanup_child(signum, frame):
 
 
 def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
-    """
-    Check if a parameter should be explicitly included in llm_args.
+    """Check if a parameter should be explicitly included in llm_args.
 
     Returns True if parameter is either:
     1. Always required (core params that must be present), OR
@@ -374,7 +373,9 @@ def launch_server(
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
-        num_media_load_workers: int = 8):
+        num_media_load_workers: int = 8,
+        openengine_host: str = "127.0.0.1",
+        openengine_port: Optional[int] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -411,6 +412,51 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
+        request_tracker = None
+        kv_event_fanout = None
+        stats_fanout = None
+        openengine_server_cls = None
+        resolved_openengine_role = None
+        if openengine_port is not None:
+            from fastapi.responses import JSONResponse
+
+            try:
+                from tensorrt_llm.openengine.server import (OpenEngineServer,
+                                                            openengine_role)
+            except ModuleNotFoundError as error:
+                if error.name and error.name.startswith("openengine"):
+                    llm.shutdown()
+                    raise click.ClickException(
+                        "OpenEngine support requires openengine-proto 0.2.0. "
+                        "Run scripts/install_openengine.py against the pinned "
+                        "local OpenEngine sibling checkout.") from error
+                raise
+            from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
+            from tensorrt_llm.serve.request_tracker import (RequestTracker,
+                                                            track_http_response)
+            from tensorrt_llm.serve.stats_fanout import StatsFanout
+
+            request_tracker = RequestTracker(llm)
+            kv_cache_config = getattr(llm.args, "kv_cache_config", None)
+            event_buffer_size = getattr(kv_cache_config,
+                                        "event_buffer_max_size", 0)
+            if event_buffer_size > 0:
+                kv_event_fanout = KvEventFanout(llm,
+                                                buffer_size=event_buffer_size)
+            stats_buffer_size = getattr(llm.args, "iter_stats_max_iterations",
+                                        1000)
+            if stats_buffer_size is None or stats_buffer_size == 0:
+                stats_buffer_size = 1000
+            elif stats_buffer_size < 0:
+                stats_buffer_size = None
+            stats_fanout = StatsFanout(llm, buffer_size=stats_buffer_size)
+            openengine_server_cls = OpenEngineServer
+            try:
+                resolved_openengine_role = openengine_role(server_role)
+            except ValueError:
+                llm.shutdown()
+                raise
+
         server = OpenAIServer(
             generator=llm,
             model=model,
@@ -422,22 +468,76 @@ def launch_server(
             chat_template=chat_template,
             allow_request_chat_template=allow_request_chat_template,
             input_processor_workers=num_input_processor_workers,
-            media_load_workers=num_media_load_workers)
+            media_load_workers=num_media_load_workers,
+            kv_event_fanout=kv_event_fanout,
+            stats_fanout=stats_fanout,
+            shutdown_generator=openengine_server_cls is None)
         _apply_fastapi_middlewares(server.app, middleware)
+
+        if request_tracker is not None:
+
+            @server.app.middleware("http")
+            async def openengine_process_admission(request, call_next):
+                if request.method != "POST":
+                    return await call_next(request)
+                try:
+                    request_tracker.begin_external()
+                    if stats_fanout is not None:
+                        stats_fanout.wake()
+                except RuntimeError:
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": "TensorRT-LLM is draining"})
+                response = None
+                try:
+                    response = await call_next(request)
+                finally:
+                    if response is None:
+                        await request_tracker.finish_external()
+                return await track_http_response(response, request_tracker)
 
         # Optionally disable GC (default: not disabled)
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
             gc.disable()
 
-        uvloop.run(server(host, port, sockets=[s]))
+        if openengine_server_cls is None:
+            uvloop.run(server(host, port, sockets=[s]))
+        else:
+
+            async def serve_http_and_openengine():
+                openengine_server = None
+                try:
+                    openengine_server = openengine_server_cls(
+                        llm=llm,
+                        model=model,
+                        role=resolved_openengine_role,
+                        host=openengine_host,
+                        port=openengine_port,
+                        tracker=request_tracker,
+                        media_config=multimodal_server_config,
+                        reasoning_parser=getattr(llm.args, "reasoning_parser",
+                                                 None),
+                        tool_parser=tool_parser,
+                        kv_event_fanout=kv_event_fanout,
+                        stats_fanout=stats_fanout,
+                    )
+                    await openengine_server.start()
+                    await server(host, port, sockets=[s])
+                finally:
+                    try:
+                        if openengine_server is not None:
+                            await openengine_server.stop()
+                    finally:
+                        llm.shutdown()
+
+            uvloop.run(serve_http_and_openengine())
 
 
 def launch_grpc_server(host: str,
                        port: int,
                        llm_args: dict,
                        served_model_name: Optional[str] = None):
-    """
-    Launch a gRPC server for TensorRT-LLM.
+    """Launch a gRPC server for TensorRT-LLM.
 
     This provides a high-performance gRPC interface designed for external routers
     (e.g., sgl-router) using pre-tokenized input and raw token ID output.
@@ -1034,6 +1134,18 @@ def launch_visual_gen_server(
     help="Run gRPC server instead of OpenAI HTTP server. "
     "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
     status="prototype")
+@stability_option("--openengine-host",
+                  type=str,
+                  default="127.0.0.1",
+                  help="Host for the optional OpenEngine sibling gRPC server.",
+                  status="prototype")
+@stability_option(
+    "--openengine-port",
+    type=int,
+    default=None,
+    help=
+    "Port for the optional OpenEngine sibling gRPC server. Disabled when absent.",
+    status="prototype")
 @stability_option(
     "--served_model_name",
     type=str,
@@ -1091,12 +1203,17 @@ def serve(
         telemetry: bool, custom_module_dirs: list[Path],
         chat_template: Optional[str], allow_request_chat_template: bool,
         middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-        served_model_name: Optional[str], visual_gen_args: Optional[str]):
+        served_model_name: Optional[str], visual_gen_args: Optional[str],
+        openengine_host: str, openengine_port: Optional[int]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if grpc and openengine_port is not None:
+        raise click.UsageError(
+            "--openengine-port cannot be combined with dedicated --grpc mode")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1236,6 +1353,12 @@ def serve(
         multimodal_server_config = MultimodalServerConfig(
             media_io_kwargs=parsed_media_io_kwargs)
 
+        if openengine_port is not None and server_role is not None:
+            role_name = getattr(server_role, "name", str(server_role)).upper()
+            if role_name in ("MM_ENCODER", "VISUAL_GEN"):
+                raise click.UsageError(
+                    f"OpenEngine does not support server role {role_name!r}")
+
         if grpc:
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
@@ -1282,7 +1405,9 @@ def serve(
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
-                num_media_load_workers=num_media_load_workers)
+                num_media_load_workers=num_media_load_workers,
+                openengine_host=openengine_host,
+                openengine_port=openengine_port)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1297,6 +1422,9 @@ def serve(
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
     if is_visual_gen:
+        if openengine_port is not None:
+            raise click.UsageError(
+                "--openengine-port is not supported by the VisualGen server")
         _serve_visual_gen()
     else:
         _serve_llm()
@@ -1624,7 +1752,6 @@ def disaggregated(
     schedule_style: str,
 ):
     """Running server in disaggregated mode"""
-
     logger.set_level(log_level)
 
     if metrics_log_interval != 0:
@@ -2037,7 +2164,6 @@ def set_cuda_device():
                   status="beta")
 def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
-
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2248,7 +2374,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
                             f"Child process {_child_p_global.pid} failed to be killed even after 30s."
                         )
             assert _child_p_global.poll(
-            ) is not None, f"the subprocess should be terminated"
+            ) is not None, "the subprocess should be terminated"
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,

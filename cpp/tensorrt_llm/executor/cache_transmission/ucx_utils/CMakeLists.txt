@@ -31,7 +31,9 @@ if(ENABLE_UCX)
 
   target_link_libraries(${UCX_WRAPPER_TARGET}
                         PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,ucxx::ucxx>)
-  target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ucxx::ucxx ucx::ucs)
+  # ucxx is already linked with WHOLE_ARCHIVE above. Repeating the same target
+  # without a feature is rejected by newer CMake versions.
+  target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ucx::ucs)
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${CUDA_RT_LIB})
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${TORCH_LIBRARIES})
   target_link_libraries(${UCX_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES})

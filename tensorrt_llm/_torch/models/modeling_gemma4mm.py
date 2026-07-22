@@ -209,6 +209,12 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     # image, when present) can be split across chunks safely.
     mm_bidirectional_blocks = False
 
+    def get_openengine_modalities(self) -> tuple[str, ...]:
+        return ("image", "audio")
+
+    def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
+        return ()
+
     def __init__(
         self,
         model_path: str,

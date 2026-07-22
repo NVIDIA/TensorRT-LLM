@@ -30,6 +30,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # ---------------------------------------------------------------------------
@@ -654,6 +655,32 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex._prepare_and_schedule_batch()
 
         mock_fetch.assert_called_once()
+
+
+class TestPrepareDisaggGenInitResources:
+    def test_prepares_peft_cache_for_lazy_lora(self):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        ex = object.__new__(PyExecutor)
+        managers = {
+            kind: Mock()
+            for kind in (
+                ResourceManagerType.KV_CACHE_MANAGER,
+                ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
+                ResourceManagerType.PEFT_CACHE_MANAGER,
+            )
+        }
+        ex.resource_manager = Mock(resource_managers=managers)
+        ex._recv_disagg_gen_cache = Mock()
+        request = Mock()
+
+        ex._prepare_disagg_gen_init([request])
+
+        for manager in managers.values():
+            prepared = manager.prepare_resources.call_args.args[0]
+            assert prepared.context_requests == [request]
+        ex._recv_disagg_gen_cache.assert_called_once_with([request])
 
 
 # ---------------------------------------------------------------------------
