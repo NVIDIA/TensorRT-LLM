@@ -78,6 +78,13 @@ class HypothesisTestingParams:
     beta: float = 0.2
     sigma: float = 50.0
     higher_is_better: bool = True
+    # Free-text provenance for the reference row (e.g. an externally
+    # published score to compare against); printed in the report only.
+    reference_note: Optional[str] = None
+    # Explicit pass/fail cutoff. When set, it replaces the hypothesis-test
+    # threshold computed from sigma/alpha — use for benchmark-style floors
+    # where a fixed, human-readable gate is preferred.
+    threshold_override: Optional[float] = None
     theta: float = field(init=False)
     threshold: float = field(init=False)
 
@@ -86,16 +93,34 @@ class HypothesisTestingParams:
                                    sigma=self.sigma,
                                    alpha=self.alpha,
                                    beta=self.beta)
-        self.threshold = compute_threshold(
-            self.num_samples,
-            self.ref_accuracy,
-            sigma=self.sigma,
-            alpha=self.alpha,
-            higher_is_better=self.higher_is_better)
+        if self.threshold_override is not None:
+            self.threshold = self.threshold_override
+        else:
+            self.threshold = compute_threshold(
+                self.num_samples,
+                self.ref_accuracy,
+                sigma=self.sigma,
+                alpha=self.alpha,
+                higher_is_better=self.higher_is_better)
 
     def report(self, accuracy: Optional[float] = None) -> str:
         metric_name = self.metric_name.upper()
-        report = f"""===========================================================
+        reference_line = f"Reference {self.metric_name}: {self.ref_accuracy:.3f}"
+        if self.reference_note is not None:
+            reference_line += f" ({self.reference_note})"
+        if self.threshold_override is not None:
+            # The hypothesis-test statistics do not apply to an explicit
+            # floor; printing them would suggest a different threshold.
+            report = f"""===========================================================
+= {metric_name} CHECK
+===========================================================
+#Samples: {self.num_samples}
+Higher is better: {self.higher_is_better}
+{reference_line}
+Threshold (explicit floor): {self.threshold:.3f}
+==========================================================="""
+        else:
+            report = f"""===========================================================
 = {metric_name} HYPOTHESIS TESTING
 ===========================================================
 Alpha (Type I:  False Positive): {self.alpha:.3f}
@@ -104,7 +129,7 @@ Sigma (Standard deviation): {self.sigma:.3f}
 #Samples: {self.num_samples}
 Higher is better: {self.higher_is_better}
 Theta (Minimum detectable effect): {self.theta:.3f}
-Reference {self.metric_name}: {self.ref_accuracy:.3f}
+{reference_line}
 Threshold: {self.threshold:.3f}
 ==========================================================="""
         if accuracy is not None:
@@ -190,7 +215,9 @@ class AccuracyTask:
             sigma=entry.get("sigma", self.SIGMA),
             num_samples=entry.get("num_samples", self.NUM_SAMPLES),
             higher_is_better=entry.get("higher_is_better",
-                                       self.HIGHER_IS_BETTER))
+                                       self.HIGHER_IS_BETTER),
+            reference_note=entry.get("reference_note"),
+            threshold_override=entry.get("threshold"))
 
     def evaluate(self,
                  llm: Union[PyTorchLLM, AutoDeployLLM],
@@ -412,6 +439,36 @@ class GSM8K(AccuracyTask):
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
     EVALUATE_KWARGS = dict(scores_filter=None)
+
+
+class GSM8KInferenceMax(AccuracyTask):
+    # GSM8K under the InferenceMAX (SemiAnalysisAI/InferenceX) protocol: chat
+    # template + 5-shot multiturn + "#### [number]" format instruction + a
+    # 12288-token generation budget for thinking models, gated on strict
+    # "#### N" extraction. Scores are directly comparable to
+    # inferencex.semianalysis.com/evaluation; the completion-format GSM8K
+    # above measures the same model several points lower on chat/thinking
+    # models. Substantially slower than GSM8K: thinking output dominates
+    # (minutes with spec decoding + CUDA graphs, tens of minutes eager).
+    DATASET = "gsm8k_inferencemax"
+    DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 1319  # Full sample
+
+    MAX_INPUT_LEN = 4096
+    MAX_OUTPUT_LEN = 12288
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8KInferenceMax
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=True,
+                            fewshot_as_multiturn=True)
+
+    # InferenceMAX publishes em_strict as the primary score.
+    EVALUATE_KWARGS = dict(scores_filter="exact_match,strict-match")
 
 
 class GPQADiamond(AccuracyTask):
