@@ -173,11 +173,6 @@ def tensorrt_llm_gptj_example_root(llm_backend_root):
 
 
 @pytest.fixture(scope="session")
-def tensorrt_llm_multimodal_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/models/core/multimodal")
-
-
-@pytest.fixture(scope="session")
 def tensorrt_llm_opt_example_root(llm_backend_root):
     return os.path.join(llm_backend_root, "../examples/models/contrib/opt")
 
@@ -208,18 +203,8 @@ def tensorrt_llm_llama_example_root(llm_backend_root):
 
 
 @pytest.fixture(scope="session")
-def tensorrt_llm_qwen_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/models/core/qwen")
-
-
-@pytest.fixture(scope="session")
 def tensorrt_llm_mllama_example_root(llm_backend_root):
     return os.path.join(llm_backend_root, "../examples/models/core/mllama")
-
-
-@pytest.fixture(scope="session")
-def tensorrt_llm_mixtral_example_root(llm_backend_root):
-    return os.path.join(llm_backend_root, "../examples/models/core/mixtral")
 
 
 @pytest.fixture(scope="session")

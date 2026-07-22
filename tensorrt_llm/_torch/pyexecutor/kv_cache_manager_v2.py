@@ -1176,7 +1176,12 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         return Role.KEY_BLOCK_SCALE
 
-    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+    def _build_pool_mapping_tensors(self):
+        """Build the (kv_cache_pool_pointers, kv_cache_pool_mapping) tensors.
+
+        An overridable hook for subclasses whose pools coalesce extra
+        per-layer buffers alongside K/V.
+        """
         kv_cache_pool_pointers_list = []
         kv_cache_pool_mapping_list = []
         block_scale_pool_pointers_list = []
@@ -1275,18 +1280,22 @@ class KVCacheManagerV2(BaseResourceManager):
                     [pool_pointers[1], block_scale_pool_pointers[1]],
                 ]
 
-        self.kv_cache_pool_pointers = torch.tensor(
+        kv_cache_pool_pointers = torch.tensor(
             kv_cache_pool_pointers_list,
             dtype=torch.int64,
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        self.kv_cache_pool_mapping = torch.tensor(
+        kv_cache_pool_mapping = torch.tensor(
             kv_cache_pool_mapping_list,
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
         )
+        return kv_cache_pool_pointers, kv_cache_pool_mapping
+
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
+        self.kv_cache_pool_pointers, self.kv_cache_pool_mapping = self._build_pool_mapping_tensors()
         self.index_scales = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
