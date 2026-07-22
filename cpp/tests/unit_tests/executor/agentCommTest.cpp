@@ -264,8 +264,8 @@ TEST_P(AgentCommTest, CacheSenderRejectsStandaloneFinalizedReplay)
 
     tbm::LlmRequest::RequestIdType constexpr requestId{29};
     tr::SamplingConfig const samplingConfig{1};
-    auto request = std::make_shared<tbm::LlmRequest>(
-        requestId, 1, tbm::LlmRequest::VecTokens{1}, samplingConfig, /*isStreaming=*/false);
+    auto const inputTokens = std::make_shared<tbm::LlmRequest::VecTokens>(tbm::LlmRequest::VecTokens{1});
+    auto request = std::make_shared<tbm::LlmRequest>(requestId, 1, inputTokens, samplingConfig, /*isStreaming=*/false);
     auto responseFuture = sender.sendAsync(request);
     ASSERT_TRUE(sender.cancelRequest(*request));
     ASSERT_EQ(responseFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
