@@ -4222,6 +4222,19 @@ class BaseLlmArgs(StrictBaseModel):
         description="The path to the tokenizer directory for postprocessing.",
         status="prototype")
 
+    num_serve_frontends: int = Field(
+        default=1,
+        ge=1,
+        # = executor.utils.MAX_NUM_FRONTENDS (cannot be imported here);
+        # test_multi_frontend_routing pins the two together.
+        le=64,
+        description=
+        "The number of HTTP frontend processes serving one executor. Used by "
+        "trtllm-serve: values > 1 run additional attached frontend processes "
+        "that share the serving port via SO_REUSEPORT (classic IPC executor "
+        "path only).",
+        status="prototype")
+
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.",
@@ -5223,9 +5236,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 # Plain tensor parallelism is supported (the draft path
                 # all-gathers vocab-sharded draft logits before rejection, see
                 # SpecWorkerBase.maybe_gather_sharded_draft_logits).
-                # attention-DP and context parallelism remain gated.
-                rs_parallel_active = (self.context_parallel_size > 1
-                                      or self.enable_attention_dp)
+                # Attention DP is supported: each rank holds full-vocab draft
+                # logits for its own requests (the LM-head-TP fast path is
+                # bypassed for advanced sampling, and is_all_greedy_sample is
+                # group-synchronized so the LM-head-TP group's collectives stay
+                # uniform -- see SpecMetadata.group_all_greedy_sample). Only
+                # context parallelism remains gated.
+                rs_parallel_active = self.context_parallel_size > 1
                 rs_guided_active = self.guided_decoding_backend is not None
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None
@@ -5277,10 +5294,9 @@ class TorchLlmArgs(BaseLlmArgs):
                                     "relaxed-thinking acceptance is enabled")
                             if rs_parallel_active:
                                 reasons.append(
-                                    "tensor/context parallelism or attention-DP "
-                                    "is active (the draft path resolves only "
-                                    "the global argmax, not full distributions)"
-                                )
+                                    "context parallelism is active (the draft "
+                                    "path resolves only the global argmax, "
+                                    "not full distributions)")
                             if rs_guided_active:
                                 reasons.append("guided decoding is enabled")
                         raise ValueError(
