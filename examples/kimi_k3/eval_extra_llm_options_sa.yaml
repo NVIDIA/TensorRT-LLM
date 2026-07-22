@@ -1,0 +1,14 @@
+# Extra LLM-API options for Kimi K3 GSM8K/eval runs WITH suffix-automaton
+# speculative decoding. Same runtime constraints as
+# eval_extra_llm_options.yaml plus the SA config (longest-match).
+disable_overlap_scheduler: true
+cuda_graph_config: null
+enable_chunked_prefill: false
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64
+speculative_config:
+  decoding_type: SA
+  max_draft_len: 2
+  max_matching_ngram_size: -1
