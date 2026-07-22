@@ -74,7 +74,7 @@ class _RunningScoreTracker:
     the run and never fails the eval itself.
     """
 
-    def __init__(self, task_dict: dict, interval: int):
+    def __init__(self, task_dict: dict, interval: int) -> None:
         self.interval = interval
         self.tasks = {}
         self._collect_tasks(task_dict)
@@ -89,14 +89,13 @@ class _RunningScoreTracker:
             else:
                 self.tasks[name] = obj
 
-    def update(self, instance, text: str) -> None:
+    def update(self, instance: Any, text: str) -> None:
         if self.disabled:
             return
         try:
             task = self.tasks.get(instance.task_name)
             if task is None or not getattr(task, "_filters", None):
-                raise ValueError(
-                    f"no scorable task for {instance.task_name!r}")
+                raise ValueError(f"no scorable task for {instance.task_name!r}")
             # Score a shallow copy: the harness appends resps / applies
             # filters to the real instance later, and must see it untouched.
             probe = copy.copy(instance)
@@ -112,7 +111,7 @@ class _RunningScoreTracker:
                     probe.doc, [probe.filtered_resps[ensemble.name]])
                 for metric, value in metrics.items():
                     if isinstance(value, (int, float)):
-                        key = f"{metric},{ensemble.name}"
+                        key = f"{instance.task_name},{metric},{ensemble.name}"
                         self.metric_sums[key] += value
                         self.metric_counts[key] += 1
         except Exception as e:
@@ -126,11 +125,23 @@ class _RunningScoreTracker:
             return
         if done % self.interval != 0 and done != total:
             return
-        stats = " | ".join(
-            f"{key} ~ {100 * self.metric_sums[key] / count:.2f}"
-            for key, count in self.metric_counts.items())
+        stats = " | ".join(f"{key} ~ {100 * self.metric_sums[key] / count:.2f}"
+                           for key, count in self.metric_counts.items())
         logger.info(f"Partial scores after {done}/{total} responses "
                     f"(estimate, 0~100): {stats}")
+
+
+def _parse_partial_scores_env() -> Optional[int]:
+    """Parse TLLM_EVAL_PARTIAL_SCORES_EVERY and return the logging interval or None."""
+    env_interval = os.environ.get(PARTIAL_SCORES_ENV_VAR)
+    if not env_interval:
+        return None
+    try:
+        value = int(env_interval)
+    except ValueError:
+        raise ValueError(f"{PARTIAL_SCORES_ENV_VAR} must be an integer, got "
+                         f"{env_interval!r}") from None
+    return value if value > 0 else None
 
 
 class LmEvalWrapper(TemplateLM):
@@ -267,8 +278,8 @@ class LmEvalWrapper(TemplateLM):
 
         outputs = []
         for output, request in zip(
-                tqdm(results, desc="Fetching responses",
-                     disable=disable_tqdm), requests):
+                tqdm(results, desc="Fetching responses", disable=disable_tqdm),
+                requests):
             outputs.append(output.result())
             if scorer is not None:
                 scorer.update(request, outputs[-1].outputs[0].text)
@@ -720,17 +731,7 @@ class LmEvalEvaluator(Evaluator):
         # score every N completed responses (see _RunningScoreTracker).
         # Env-var driven so it uniformly covers every lm-eval-backed task
         # without per-task CLI plumbing.
-        partial_scores_every = None
-        env_interval = os.environ.get(PARTIAL_SCORES_ENV_VAR)
-        if env_interval:
-            try:
-                partial_scores_every = int(env_interval)
-            except ValueError:
-                raise ValueError(
-                    f"{PARTIAL_SCORES_ENV_VAR} must be an integer, got "
-                    f"{env_interval!r}") from None
-            if partial_scores_every <= 0:
-                partial_scores_every = None
+        partial_scores_every = _parse_partial_scores_env()
 
         lm_kwargs: Dict[str, Any] = dict(
             sampling_params=sampling_params,
