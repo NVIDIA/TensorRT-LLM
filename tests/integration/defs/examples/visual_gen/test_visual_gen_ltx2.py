@@ -148,8 +148,8 @@ LTX2_TWO_STAGE_NUM_FRAMES = 121
 LTX2_TWO_STAGE_STEPS = 40
 LTX2_TWO_STAGE_GUIDANCE_SCALE = 4.0
 
-# Golden VBench scores for two-stage pipeline variants.
-# Initially None — first CI run is a baseline that prints scores for capture.
+# Golden VBench scores for two-stage pipeline variants, captured from the
+# initial baseline runs.
 VBENCH_LTX2_TWO_STAGE_BF16_GOLDEN_SCORES = {
     "subject_consistency": 0.9877,
     "background_consistency": 0.9601,
@@ -480,7 +480,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
 
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
-    text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
+    text_encoder_path = _ltx2_lpips_text_encoder_path()
     upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
     lora_path = os.path.join(scratch_space, LTX2_DISTILLED_LORA_SUBPATH)
 

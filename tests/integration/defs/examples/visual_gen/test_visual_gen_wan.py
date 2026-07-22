@@ -69,6 +69,7 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
 )
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
+WAN22_T2V_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers"
 WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
@@ -168,7 +169,7 @@ class WanAccuracyCase:
 WAN_MODEL_SPECS = (
     WanModelSpec(
         id="wan21",
-        checkpoint_subdir="Wan2.1-T2V-1.3B-Diffusers",
+        checkpoint_subdir=WAN_T2V_MODEL_SUBPATH,
         golden_file="wan21_t2v_lpips_golden_video.mp4",
         cache_golden_file=WAN21_CACHE_GOLDEN_FILE,
         prompt=WAN21_LPIPS_PROMPT,
@@ -181,7 +182,7 @@ WAN_MODEL_SPECS = (
     ),
     WanModelSpec(
         id="wan22",
-        checkpoint_subdir="Wan2.2-T2V-A14B-Diffusers",
+        checkpoint_subdir=WAN22_T2V_MODEL_SUBPATH,
         golden_file="wan22_t2v_lpips_golden_video.mp4",
         cache_golden_file=WAN22_CACHE_GOLDEN_FILE,
         prompt=WAN22_LPIPS_PROMPT,
@@ -253,6 +254,8 @@ def _build_wan_accuracy_cases():
     _validate_single_feature_config(vsa_features, {"vsa"}, "Wan 2.1 VSA")
     cases.append(
         pytest.param(
+            # Keep the prompt pair aligned with the fixed dense golden, which
+            # was calibrated with the WAN 2.2 LPIPS prompt.
             WanAccuracyCase(
                 id="wan21-vsa",
                 model_id="wan21-vsa",
@@ -264,7 +267,7 @@ def _build_wan_accuracy_cases():
                 width=WAN21_VSA_WIDTH,
                 num_frames=WAN21_VSA_NUM_FRAMES,
                 num_inference_steps=WAN21_VSA_NUM_INFERENCE_STEPS,
-                guidance_scale=5.0,
+                guidance_scale=WAN21_LPIPS_GUIDANCE_SCALE,
                 features=vsa_features,
                 lpips_threshold=WAN_FEATURE_THRESHOLDS[("wan21-vsa", "vsa")],
             ),
@@ -329,7 +332,7 @@ def wan21_bf16_video_path(_visual_gen_deps, llm_venv):
     # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
     with torch.compiler.set_stance("force_eager"):
         _generate_wan_lpips_video(
-            _lpips_model_path("Wan2.1-T2V-1.3B-Diffusers"),
+            _lpips_model_path(WAN_T2V_MODEL_SUBPATH),
             output_path,
             WAN21_LPIPS_PROMPT,
             WAN21_LPIPS_NEGATIVE_PROMPT,
@@ -352,7 +355,7 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     # TorchCompileConfig(enable=False) does not suppress nested @torch.compile decorators.
     with torch.compiler.set_stance("force_eager"):
         _generate_wan_lpips_video(
-            _lpips_model_path("Wan2.2-T2V-A14B-Diffusers"),
+            _lpips_model_path(WAN22_T2V_MODEL_SUBPATH),
             output_path,
             WAN22_LPIPS_PROMPT,
             WAN22_LPIPS_NEGATIVE_PROMPT,
