@@ -3976,10 +3976,101 @@ if IS_CUTLASS_DSL_AVAILABLE:
         a, sfa, b, sfb, output = inputs
         m, packed_k = sfa.shape
         aligned_m = pad_up(m, 4)
-        packed_sfa = torch.empty_strided((m, packed_k), (1, aligned_m),
-                                         dtype=sfa.dtype,
-                                         device=sfa.device)
-        return [a, packed_sfa, b, sfb, output]
+        packed_sfa_storage = torch.empty_strided((aligned_m, packed_k),
+                                                 (1, aligned_m),
+                                                 dtype=sfa.dtype,
+                                                 device=sfa.device)
+        return [a, packed_sfa_storage[:m], b, sfb, output]
+
+    class Dsv4DeepGemmObWarmupRunner(TunableRunner):
+        """Precompile fused DSV4 O_b DeepGEMM layouts during engine startup."""
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, deep_gemm_gen_tuning_buckets), ),
+            constraint_specs=(
+                ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
+            ),
+            inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+            exclude_from_cache=True,
+        )
+
+        def __init__(self, output_dtype: torch.dtype):
+            self.output_dtype = output_dtype
+
+        def unique_id(self):
+            return (self.output_dtype, )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            del inputs, profile
+            return [0]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+        ) -> torch.Tensor:
+            del tactic
+            from tensorrt_llm import deep_gemm
+
+            a, sfa, b, sfb, output = inputs
+            deep_gemm.fp8_gemm_nt(
+                (a, sfa),
+                (b, sfb),
+                output,
+                c=None,
+                disable_ue8m0_cast=False,
+            )
+            return output
+
+    def warmup_dsv4_deep_gemm_ob(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        max_num_tokens: int,
+    ) -> None:
+        """JIT all fused DSV4 O_b DeepGEMM M buckets before inference."""
+        if max_num_tokens <= 0:
+            return
+
+        n, k = weight.shape
+        packed_scale_k = 128 * 4
+        if k % packed_scale_k != 0:
+            raise ValueError(
+                f"DSV4 O_b K={k} must be divisible by {packed_scale_k}")
+
+        packed_k = k // packed_scale_k
+        aligned_m = pad_up(max_num_tokens, 4)
+        a = torch.empty((max_num_tokens, k),
+                        device=weight.device,
+                        dtype=torch.float8_e4m3fn)
+        sfa_storage = torch.empty_strided(
+            (aligned_m, packed_k),
+            (1, aligned_m),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        sfa = sfa_storage[:max_num_tokens]
+        output = torch.empty((max_num_tokens, n),
+                             device=weight.device,
+                             dtype=output_dtype)
+
+        tuner = AutoTuner.get()
+        if not tuner.is_tuning_mode:
+            raise RuntimeError(
+                "DSV4 DeepGEMM O_b warmup must run inside autotune()")
+        runner = Dsv4DeepGemmObWarmupRunner(output_dtype)
+        tuner.choose_one(
+            "trtllm::dsv4_deep_gemm_ob::startup_warmup",
+            [runner],
+            runner.tuning_config,
+            [a, sfa, weight, weight_scale, output],
+        )
 
     def _make_dsv4_ob_tuning_config(num_splits: int) -> TuningConfig:
         buckets = _DSV4_OB_TUNING_BUCKETS[num_splits]

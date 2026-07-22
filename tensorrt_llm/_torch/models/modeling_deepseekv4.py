@@ -2565,6 +2565,39 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             **kwargs,
         )
 
+    def warmup_dsv4_fused_ob(self, max_num_tokens: int) -> None:
+        """Precompile each fused DeepGEMM O_b signature during startup."""
+        from ..custom_ops import cute_dsl_custom_ops
+
+        warmed_signatures = set()
+        for layer in self.model.layers:
+            attention = getattr(layer, "self_attn", None)
+            should_warmup = getattr(attention, "_should_warmup_dsv4_deep_gemm_ob", None)
+            if should_warmup is None or not should_warmup():
+                continue
+
+            weight = attention.o_b_proj.weight
+            weight_scale = attention.o_b_proj.weight_scale
+            signature = (
+                tuple(weight.shape),
+                tuple(weight.stride()),
+                weight.dtype,
+                tuple(weight_scale.shape),
+                tuple(weight_scale.stride()),
+                weight_scale.dtype,
+                attention.dtype,
+                weight.device,
+            )
+            if signature in warmed_signatures:
+                continue
+            warmed_signatures.add(signature)
+            cute_dsl_custom_ops.warmup_dsv4_deep_gemm_ob(
+                weight,
+                weight_scale,
+                attention.dtype,
+                max_num_tokens,
+            )
+
     def load_weights(self, weights: Dict):
         weight_loader = DeepseekV4WeightLoader(self)
         weight_loader.load_weights(weights)

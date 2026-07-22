@@ -1252,6 +1252,11 @@ class MLA(nn.Module):
             and not getattr(self.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
         )
 
+    def _should_warmup_dsv4_deep_gemm_ob(self) -> bool:
+        return self._should_use_fused_oproj() and not _is_env_truthy(
+            "TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ"
+        )
+
     def _fused_oa_ob_proj(
         self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
