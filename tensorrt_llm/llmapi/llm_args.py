@@ -5701,12 +5701,33 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
-        if (not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
-                and self.pipeline_parallel_size > 1 and is_sm_100f()):
+        disable_pp_auto = os.getenv(
+            "TRTLLM_NVBUG_6448152_DISABLE_PP_CUTE_BF16_AUTO") == "1"
+        is_sm100_pp = self.pipeline_parallel_size > 1 and is_sm_100f()
+        should_auto_enable = (
+            not (self.use_cute_dsl_bf16_bmm and self.use_cute_dsl_bf16_gemm)
+            and is_sm100_pp)
+        if should_auto_enable and not disable_pp_auto:
             logger.info("Automatically enabling CuTe DSL BF16 BMM and GEMM for "
                         "SM100/SM103 PP.")
             self.use_cute_dsl_bf16_bmm = True
             self.use_cute_dsl_bf16_gemm = True
+
+        if disable_pp_auto:
+            marker_key = ("nvbug6448152_cute_effective_"
+                          f"{self.pipeline_parallel_size}_{int(is_sm100_pp)}_"
+                          f"{int(should_auto_enable)}_"
+                          f"{int(self.use_cute_dsl_bf16_bmm)}_"
+                          f"{int(self.use_cute_dsl_bf16_gemm)}")
+            logger.info_once(
+                "NVBUG6448152_CUTE event=effective_config "
+                f"pp_size={self.pipeline_parallel_size} "
+                f"sm100_pp={int(is_sm100_pp)} "
+                f"auto_suppressed={int(should_auto_enable)} "
+                f"bmm={int(self.use_cute_dsl_bf16_bmm)} "
+                f"gemm={int(self.use_cute_dsl_bf16_gemm)}",
+                key=marker_key,
+            )
 
         if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
             major, minor = torch.cuda.get_device_capability()

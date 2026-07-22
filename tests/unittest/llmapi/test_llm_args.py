@@ -65,6 +65,51 @@ from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 from .test_llm import llama_model_path
 
 
+@pytest.mark.parametrize(
+    "disable_pp_auto,pp_size,explicit_bmm,explicit_gemm,expected_bmm,expected_gemm",
+    [
+        (False, 4, None, None, True, True),
+        (True, 4, None, None, False, False),
+        (True, 4, True, True, True, True),
+        (True, 4, True, False, True, False),
+        (True, 1, None, None, False, False),
+    ],
+)
+def test_cute_dsl_bf16_pp_auto_enable_diagnostic(
+    monkeypatch,
+    disable_pp_auto,
+    pp_size,
+    explicit_bmm,
+    explicit_gemm,
+    expected_bmm,
+    expected_gemm,
+):
+    monkeypatch.setattr(llm_args_mod, "is_sm_100f", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    if disable_pp_auto:
+        monkeypatch.setenv("TRTLLM_NVBUG_6448152_DISABLE_PP_CUTE_BF16_AUTO",
+                           "1")
+    else:
+        monkeypatch.delenv("TRTLLM_NVBUG_6448152_DISABLE_PP_CUTE_BF16_AUTO",
+                           raising=False)
+
+    overrides = {}
+    if explicit_bmm is not None:
+        overrides["use_cute_dsl_bf16_bmm"] = explicit_bmm
+    if explicit_gemm is not None:
+        overrides["use_cute_dsl_bf16_gemm"] = explicit_gemm
+
+    args = TorchLlmArgs(
+        model="/tmp/test",
+        pipeline_parallel_size=pp_size,
+        skip_tokenizer_init=True,
+        **overrides,
+    )
+
+    assert args.use_cute_dsl_bf16_bmm is expected_bmm
+    assert args.use_cute_dsl_bf16_gemm is expected_gemm
+
+
 def test_LookaheadDecodingConfig():
     # from constructor
     config = LookaheadDecodingConfig(max_window_size=4,
