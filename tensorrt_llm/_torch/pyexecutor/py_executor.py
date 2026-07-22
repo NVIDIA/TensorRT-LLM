@@ -67,7 +67,7 @@ from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import (HangDetector, hard_kill_on_rank_crash,
-                            propagate_hard_kill)
+                            propagate_hard_kill, start_rank_crash_kill_watchdog)
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
@@ -1203,15 +1203,25 @@ class PyExecutor:
             self._event_loop_error = e
             raise e
         finally:
-            self._executor_loop_cleanup()
             if crashed:
-                # Peers cannot make progress without this rank's loop: they
-                # would block in their next collective until their own
-                # HangDetectors fire 300s later. Kill the world now instead;
-                # the grace inside lets the stashed error reach rank-local
-                # waiters and the ready handshake first, so the client sees
-                # the original exception rather than a bare worker death.
-                hard_kill_on_rank_crash(self.dist.world_size)
+                # Armed BEFORE cleanup: cleanup can block without bound on a
+                # send handle wedged by the crash, and a kill placed only
+                # after it would never fire.
+                start_rank_crash_kill_watchdog(self.dist.world_size)
+            try:
+                self._executor_loop_cleanup()
+            finally:
+                if crashed:
+                    # Peers cannot make progress without this rank's loop:
+                    # they would block in their next collective until their
+                    # own HangDetectors fire 300s later. Kill the world now
+                    # instead; the grace inside lets the stashed error reach
+                    # rank-local waiters and the ready handshake first, so
+                    # the client sees the original exception rather than a
+                    # bare worker death. Nested finally: the kill must fire
+                    # even when cleanup itself raises; the watchdog above
+                    # covers cleanup blocking.
+                    hard_kill_on_rank_crash(self.dist.world_size)
 
     @property
     def is_warmup(self) -> bool:

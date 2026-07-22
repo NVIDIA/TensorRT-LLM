@@ -147,6 +147,39 @@ def hard_kill_on_rank_crash(world_size: int) -> bool:
         return False
 
 
+def start_rank_crash_kill_watchdog(world_size: int) -> Optional[threading.Thread]:
+    """Arm a daemon thread that hard-kills the world once the grace elapses.
+
+    Must be armed BEFORE executor-loop cleanup: cleanup can block without
+    bound (e.g. ``wait()`` on a pending PP send handle wedged by the crash),
+    and a kill placed after it would never be reached — leaving peers to
+    burn in their own 300 s HangDetectors, the exact failure this kill
+    exists to avoid. The thread reuses ``hard_kill_on_rank_crash``, so the
+    kill fires at crash + grace whether cleanup finishes, blocks, or raises.
+
+    Never raises. Returns the armed thread, or ``None`` when the kill is
+    not applicable (single rank, disabled by env) or the thread could not
+    be started — in that case the caller's post-cleanup kill remains the
+    only mechanism.
+    """
+    try:
+        if world_size <= 1:
+            return None
+        if _rank_crash_kill_grace() is None:
+            return None
+        watchdog = threading.Thread(
+            target=hard_kill_on_rank_crash,
+            args=(world_size,),
+            name="rank_crash_kill_watchdog",
+            daemon=True,
+        )
+        watchdog.start()
+        return watchdog
+    except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
+        _best_effort_log_error(f"failed to arm rank-crash kill watchdog (ignored): {e!r}")
+        return None
+
+
 class HangDetector:
     """Watchdog that fires when the executor loop stops checkpointing.
 
