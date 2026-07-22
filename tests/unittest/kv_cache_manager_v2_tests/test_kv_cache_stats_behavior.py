@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DEFAULT_BEAM_INDEX
 from tensorrt_llm.sampling_params import SamplingParams
@@ -126,7 +126,7 @@ def _create_manager(
             max_gpu_total_bytes=gpu_bytes,
             max_util_for_resume=1.0,
             max_attention_window=max_attention_window,
-            block_reuse_policy=block_reuse_policy,
+            block_reuse_config=BlockReuseConfig(block_reuse_policy=block_reuse_policy),
         ),
         CacheType.SELF,
         num_layers=num_layers,

@@ -2629,12 +2629,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
+            block_reuse_config = kv_cache_config.block_reuse_config
             block_reuse_policy = BlockReusePolicy(
-                kv_cache_config.block_reuse_policy)
+                block_reuse_config.block_reuse_policy)
             if block_reuse_policy == BlockReusePolicy.ALL_REUSABLE:
                 # SSM reuse is valid only at explicit snapshot boundaries.
-                kv_cache_config.block_reuse_policy = (
-                    BlockReusePolicy.PER_REQUEST.value)
+                kv_cache_config.block_reuse_config = block_reuse_config.model_copy(
+                    update={
+                        "block_reuse_policy": BlockReusePolicy.PER_REQUEST.value
+                    })
         self.kv_cache_config = kv_cache_config
 
         super().__init__(

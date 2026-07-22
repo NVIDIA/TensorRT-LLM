@@ -577,7 +577,14 @@
       "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
-      "path": "kv_cache_config.block_reuse_policy"
+      "path": "kv_cache_config.block_reuse_config.block_reuse_policy"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.max_num_turns"
     },
     {
       "allowed_values": [],

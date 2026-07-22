@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.conversation_params import ConversationParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_BEAM_INDEX,
@@ -71,7 +71,9 @@ def _make_cache_config_for_test(
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = num_extra_kv_tokens
     cache_manager.enable_stats = False
-    cache_manager.block_reuse_policy = BlockReusePolicy(kv_cache_config.block_reuse_policy)
+    cache_manager.block_reuse_policy = BlockReusePolicy(
+        kv_cache_config.block_reuse_config.block_reuse_policy
+    )
     cache_manager.is_draft = is_draft
     cache_manager.num_local_layers = 1
     cache_manager.pp_layers = [0]
@@ -107,7 +109,7 @@ def test_commit_min_snapshot_follows_block_reuse_policy(
     config = _make_cache_config_for_test(
         KvCacheConfig(
             enable_block_reuse=enable_block_reuse,
-            block_reuse_policy=block_reuse_policy,
+            block_reuse_config=BlockReuseConfig(block_reuse_policy=block_reuse_policy),
             enable_partial_reuse=True,
         ),
         is_draft=is_draft,
@@ -285,7 +287,12 @@ class _ContextRequest:
 
 
 @pytest.fixture
-def manager() -> KVCacheManagerV2:
+def max_num_turns() -> int:
+    return 1
+
+
+@pytest.fixture
+def manager(max_num_turns: int) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     init_cuda_once()
@@ -296,7 +303,10 @@ def manager() -> KVCacheManagerV2:
             max_gpu_total_bytes=16 << 20,
             max_attention_window=[MAX_SEQ_LEN, TOKENS_PER_BLOCK],
             max_util_for_resume=1.0,
-            block_reuse_policy="per_conversation",
+            block_reuse_config=BlockReuseConfig(
+                block_reuse_policy="per_conversation",
+                max_num_turns=max_num_turns,
+            ),
         ),
         CacheType.SELF,
         num_layers=2,
@@ -470,6 +480,39 @@ def test_per_conversation_policy_drops_previous_divergent_blocks(
         assert request_old_prompt.prepopulated_prompt_len == 0
     finally:
         _free_if_active(manager, request_old_prompt)
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+
+
+@pytest.mark.parametrize("max_num_turns", [2])
+def test_per_conversation_policy_retains_configured_number_of_turns(
+    manager: KVCacheManagerV2,
+) -> None:
+    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request_b = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
+    request_a_probe = _ContextRequest(3, list(range(8)), 8, "conv-2")
+    request_c = _ContextRequest(4, list(range(200, 208)), 8, "conv-1")
+    request_a_after_eviction = _ContextRequest(5, list(range(8)), 8, "conv-3")
+
+    try:
+        _run_context(manager, request_a)
+        _free_if_active(manager, request_a)
+        _run_context(manager, request_b)
+        _free_if_active(manager, request_b)
+
+        assert manager.prepare_context(request_a_probe)
+        assert request_a_probe.prepopulated_prompt_len == request_a_probe.prompt_len - 1
+        _free_if_active(manager, request_a_probe)
+
+        _run_context(manager, request_c)
+        _free_if_active(manager, request_c)
+
+        assert manager.prepare_context(request_a_after_eviction)
+        assert request_a_after_eviction.prepopulated_prompt_len == 0
+    finally:
+        _free_if_active(manager, request_a_after_eviction)
+        _free_if_active(manager, request_c)
+        _free_if_active(manager, request_a_probe)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
 

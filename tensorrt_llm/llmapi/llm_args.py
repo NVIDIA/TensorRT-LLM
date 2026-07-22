@@ -3618,6 +3618,35 @@ class MambaStateConfig(StrictBaseModel):
         "snapshots require KV cache manager V2.")
 
 
+class BlockReuseConfig(StrictBaseModel):
+    """Configuration for KV cache block reuse policies."""
+
+    block_reuse_policy: Literal[
+        "all_reusable", "per_request", "per_conversation"] = Field(
+            default="all_reusable",
+            status="prototype",
+            description="KV cache manager v2 block reuse policy. "
+            "'all_reusable' commits reusable blocks after every context chunk; "
+            "'per_request' commits them only after the final context chunk; "
+            "'per_conversation' uses 'per_request' commits and retains committed "
+            "SWA-window blocks and Mamba stable-boundary state for up to "
+            "`max_num_turns` completed turns. Periodic Mamba state snapshots "
+            "are disabled with 'per_conversation'. All reusable blocks remain "
+            "subject to normal cache eviction. "
+            "Requests without conversation params use 'per_request' behavior. When "
+            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+            "blocks are committed for reuse.")
+
+    max_num_turns: PositiveInt = Field(
+        default=1,
+        status="prototype",
+        description=
+        "Maximum number of completed conversation turns whose committed SWA-window "
+        "blocks and Mamba stable-boundary state are retained by KV cache manager v2. "
+        "Only used when "
+        "`block_reuse_policy` is 'per_conversation'.")
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -3840,21 +3869,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "unset. This does not take effect when pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    block_reuse_policy: Literal[
-        "all_reusable", "per_request", "per_conversation"] = Field(
-            default="all_reusable",
-            status="prototype",
-            description="KV cache manager v2 block reuse policy. "
-            "'all_reusable' commits reusable blocks after every context chunk; "
-            "'per_request' commits them only after the final context chunk; "
-            "'per_conversation' uses 'per_request' commits and drops the previous "
-            "turn's committed SWA-window blocks and Mamba stable-boundary state "
-            "after the current turn's final context chunk. Periodic Mamba state "
-            "snapshots are disabled with 'per_conversation'. All reusable blocks "
-            "remain subject to normal cache eviction. "
-            "Requests without conversation params use 'per_request' behavior. When "
-            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
-            "blocks are committed for reuse.")
+    block_reuse_config: BlockReuseConfig = Field(
+        default_factory=BlockReuseConfig,
+        status="prototype",
+        description="KV cache manager v2 configuration for block reuse policies."
+    )
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3940,13 +3959,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     def disable_periodic_mamba_snapshots_for_conversations(
             self) -> 'KvCacheConfig':
         """Use only explicit stable boundaries for conversation reuse."""
-        if (self.block_reuse_policy == "per_conversation"
+        if (self.block_reuse_config.block_reuse_policy == "per_conversation"
                 and self.mamba_state_config.periodic_snapshot_interval != 0):
             interval = self.mamba_state_config.periodic_snapshot_interval
             logger.warning(
                 f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
                 "is ignored because "
-                "'kv_cache_config.block_reuse_policy=per_conversation' disables "
+                "'kv_cache_config.block_reuse_config."
+                "block_reuse_policy=per_conversation' disables "
                 "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})

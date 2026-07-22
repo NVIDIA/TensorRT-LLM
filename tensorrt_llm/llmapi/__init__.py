@@ -7,7 +7,7 @@ from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
-                       CacheTransceiverConfig, CalibConfig,
+                       BlockReuseConfig, CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DecodeCudaGraphConfig,
                        DeepSeekSparseAttentionConfig,
@@ -42,6 +42,7 @@ __all__ = [
     'DisaggregatedParams',
     'ConversationParams',
     'DisaggScheduleStyle',
+    'BlockReuseConfig',
     'KvCacheConfig',
     'MambaStateConfig',
     'KvCacheRetentionConfig',
