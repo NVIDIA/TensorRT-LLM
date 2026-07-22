@@ -1565,7 +1565,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # so we skip only the RoPE and do the append + scheduler init here: the
         # generation FMHA only reads the cache, and the fallback path needs the
         # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
+        # Packed-cache FMHAs own their append and must not use this native-cache helper.
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
+                and getattr(self, "kv_layout", "native") == "native"
                 and forward_args.attention_input_type
                 == AttentionInputType.generation_only):
             num_ctx = metadata.num_contexts

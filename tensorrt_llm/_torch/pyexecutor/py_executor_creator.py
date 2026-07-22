@@ -690,6 +690,7 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)
+
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64

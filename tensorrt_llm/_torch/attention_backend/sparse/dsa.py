@@ -783,6 +783,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
+            self.token_positions_cuda[:self.num_tokens] = global_positions.to(
+                torch.int32)
             # Honor MXFP4 indexer K cache layout (½ byte per value vs FP8's
             # 1 byte) when the cache manager exposes a use_fp4 flag.
             index_head_dim = self.kv_cache_manager.index_head_dim
@@ -999,6 +1001,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.slot_mapping_scale,
             device='cpu',
             pin_memory=prefer_pinned(),
+        )
+        # token_positions_cuda: absolute position (cached + offset) per token,
+        # refreshed in on_update_kv_lens() alongside the indexer slot mappings
+        # (same source values, runtime-corrected under overlap scheduling).
+        # The FlashInfer sparse-MLA FMHA consumes it for latent-pool append slots.
+        self.token_positions_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens, ),
+            cache_name="token_positions_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
         )
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
         # These buffers will be allocated dynamically in Indexer.prepare() based on actual total_kv_len to save memory.
@@ -2956,6 +2969,17 @@ class Indexer(nn.Module):
                                         q_scale=q_scale)
 
 
+def _resolve_dsa_kv_layout(attn_backend: str | None) -> str:
+    """Resolve the DSA layout owned by TRTLLM's selected sparse-MLA FMHA."""
+    if attn_backend == "TRTLLM":
+        from ..fmha.flashinfer_sparse_mla import \
+            is_flashinfer_sparse_mla_enabled
+
+        if is_flashinfer_sparse_mla_enabled("dsa"):
+            return "inline_scale"
+    return "native"
+
+
 class DSATrtllmAttention(TrtllmAttention):
     """TRT-LLM attention layer with DSA sparse indexer for MLA models."""
 
@@ -3002,6 +3026,8 @@ class DSATrtllmAttention(TrtllmAttention):
             attention_chunk_size=attention_chunk_size,
             **kwargs)
 
+        self.kv_layout = _resolve_dsa_kv_layout("TRTLLM")
+
         # Cross-layer indexer sharing: only "full" layers own an indexer;
         # "shared" layers reuse the previous full layer's top-k (see
         # MLA.forward_dsa_*). Resolved per-layer in to_sparse_params; defaults to
@@ -3021,6 +3047,12 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
+    @classmethod
+    def support_fused_rope(cls) -> bool:
+        # FlashInfer writes inline-scale pages after Python-side RoPE. This
+        # also disables the short-sequence dense-MHA bypass for that FMHA.
+        return _resolve_dsa_kv_layout("TRTLLM") == "native"
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -3029,6 +3061,8 @@ class DSATrtllmAttention(TrtllmAttention):
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Transform local TopK indices to global paged KV cache indices."""
+        if forward_args.topk_indices is None:
+            raise RuntimeError("DSA sparse attention requires top-k indices.")
         # Transform the local topk indices to global topk indices in paged kv cache
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
@@ -3146,6 +3180,28 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
+        # TRTLLM's FlashInfer sparse-MLA FMHA reads the latent pool as packed
+        # inline-scale pages. Cache allocation and FMHA dispatch use the same
+        # registry/environment helper so fallback never sees this layout.
+        attn_backend = kwargs.pop("attn_backend", None)
+        self._kv_layout = _resolve_dsa_kv_layout(attn_backend)
+        if self._kv_layout == "inline_scale":
+            from .inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
+            assert tokens_per_block == PAGE_SIZE, (
+                f"The FlashInfer DSA FMHA requires tokens_per_block="
+                f"{PAGE_SIZE}: its SM120 kernels are instantiated for "
+                f"{PAGE_SIZE}-token inline-scale pages. Set "
+                f"kv_cache_config.tokens_per_block accordingly.")
+            assert head_dim == 576, (
+                f"inline-scale KV layout requires kv_lora_rank + "
+                f"qk_rope_head_dim == 576, got {head_dim}")
+            elem_bytes = {DataType.BF16: 2, DataType.FP8: 1}.get(dtype)
+            assert elem_bytes is not None, (
+                f"inline-scale KV layout supports BF16- or FP8-declared "
+                f"latent pools, got {dtype}")
+            assert TOKEN_BYTES % elem_bytes == 0
+            head_dim = TOKEN_BYTES // elem_bytes
+
         super().__init__(
             kv_cache_config,
             kv_cache_type,
@@ -3238,8 +3294,16 @@ class DSACacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
-        mem_per_token *= num_attention_layers * head_dim
+        if _resolve_dsa_kv_layout(getattr(model_config, "attn_backend",
+                                          None)) == "inline_scale":
+            # FlashInfer serves the latent pool as inline-scale pages
+            # (inline_scale_kv.py): a fixed 656 bytes per token regardless of
+            # the KV cache dtype.
+            from .inline_scale_kv import TOKEN_BYTES
+            mem_per_token = num_attention_layers * TOKEN_BYTES
+        else:
+            # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
+            mem_per_token *= num_attention_layers * head_dim
 
         # Indexer K cache: physically allocated as raw UINT8 in
         # WindowBlockManager::allocatePools (poolDtype = kUINT8), so we assume
