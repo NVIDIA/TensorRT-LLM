@@ -40,6 +40,13 @@ def parse_arguments() -> argparse.Namespace:
         default=16,
         help="Number of GPUs used for expert parallelism (default: 16).",
     )
+    parser.add_argument(
+        "--enable-block-reuse",
+        action="store_true",
+        help="Enable KV-cache block reuse (unified-pool hybrid cache "
+        "manager with KDA recurrent-state snapshots; prefix-cache hits "
+        "skip recomputing shared prompt prefixes).",
+    )
     return parser.parse_args()
 
 
@@ -56,7 +63,7 @@ def main() -> None:
         max_batch_size=8,
         max_seq_len=4096,
         max_num_tokens=4096,
-        enable_chunked_prefill=False,
+        enable_chunked_prefill=True,
         disable_overlap_scheduler=False,
         # CUDA graphs require the graph-safe MLA latent-cache append (write
         # positions derived from device tensors, attention_backend/utils.py);
@@ -64,7 +71,7 @@ def main() -> None:
         cuda_graph_config=CudaGraphConfig(enable_padding=True,
                                           max_batch_size=8),
         kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
+            enable_block_reuse=args.enable_block_reuse,
             free_gpu_memory_fraction=0.25,
             tokens_per_block=64,
         ),

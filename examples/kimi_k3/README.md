@@ -123,13 +123,35 @@ sbatch --time=04:00:00 examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 ```
 
+## Chunked prefill and KV-cache block reuse
+
+Chunked prefill is supported and enabled by default in this example
+(`enable_chunked_prefill: true` in the quick start and in
+`eval_extra_llm_options.yaml`).
+
+KV-cache block reuse is supported as an opt-in: set
+`kv_cache_config.enable_block_reuse: true`, or use the example flags —
+`--enable-block-reuse` for the quick start and `--reuse` for the GSM8K
+job (which selects `eval_extra_llm_options_reuse.yaml`):
+
+```bash
+sbatch examples/kimi_k3/quick_start_kimi_k3.sbatch \
+    --model MODEL --image IMAGE --enable-block-reuse
+
+sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+    --model MODEL --image IMAGE --reuse
+```
+
+Block reuse stays off by default because suffix-automaton speculative
+decoding requires the default cache manager, which cannot reuse blocks.
+
 ## Current limitations
 
-Pipeline parallelism, disaggregated serving, chunked prefill, and KV-cache
-block reuse are not supported. CUDA graphs and the overlap scheduler are
-supported and enabled by default: the generation-phase MLA latent-cache
-append derives its write positions from device tensors, making it
-CUDA-graph-safe, verified at GSM8K parity with the eager path.
+Pipeline parallelism and disaggregated serving are not supported. CUDA
+graphs and the overlap scheduler are supported and enabled by default: the
+generation-phase MLA latent-cache append derives its write positions from
+device tensors, making it CUDA-graph-safe, verified at GSM8K parity with
+the eager path.
 
 Suffix-automaton (SA) speculative decoding is supported as an opt-in for
 evaluation (see `eval_extra_llm_options_sa.yaml`). SA runs keep CUDA graphs

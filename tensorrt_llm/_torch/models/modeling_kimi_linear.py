@@ -53,9 +53,18 @@ Speculative decoding: SA (suffix automaton, one-engine, draft-weight-free);
 the KDA/MLA runtimes implement multi-token verification with deferred
 state promotion.
 
-Not supported: pipeline parallelism, CUDA graphs, chunked prefill,
-KV block reuse, draft-head spec-dec modes (MTP/Eagle — no draft-head
-checkpoint exists).
+Chunked prefill is supported: continuation chunks feed the previous KDA
+conv/recurrent state back into the FLA kernels (``use_initial_states``)
+and the MLA prefill path natively attends over the cached latent prefix
+(``kv_len = cached + q_len``). KV-cache block reuse is supported as an
+opt-in via ``kv_cache_config.enable_block_reuse=true``, which routes to
+the unified-pool ``CppMambaHybridCacheManager`` (per-block KDA state
+snapshots every ``mamba_state_cache_interval`` tokens, FORCE_CHUNK
+context chunking).
+
+Not supported: pipeline parallelism, draft-head spec-dec modes
+(MTP/Eagle — no draft-head checkpoint exists). SA speculative decoding
+is validated only without block reuse (Mixed cache manager).
 """
 
 from __future__ import annotations
@@ -564,8 +573,9 @@ class KimiKDARuntime(nn.Module):
         k_proj_states = mixer.k_proj(x)
         v_proj_states = mixer.v_proj(x)
 
-        # Initial states: only present under chunked prefill / block reuse
-        # (both unsupported/disabled); handled generically for robustness.
+        # Initial states: present for continuation chunks (chunked prefill)
+        # and for prefix-cache hits (block reuse), where the previous
+        # conv/recurrent state was onboarded into this request's slot.
         conv_q_in = conv_k_in = conv_v_in = None
         recurrent_in = None
         if mamba_metadata.use_initial_states:
@@ -1112,7 +1122,10 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args) -> dict:
-        # - KDA recurrent state is incompatible with KV block reuse.
+        # - enable_block_reuse defaults off: reuse is supported as an
+        #   explicit opt-in (routes to CppMambaHybridCacheManager with
+        #   per-block KDA state snapshots); the default stays on the
+        #   Mixed manager, which SA speculative decoding requires.
         # - tokens_per_block=64: with 32, the flashinfer trtllm-gen FMHA lib
         #   rejects the MLA (576, 512) generation kernel (marked slower) and
         #   the fallback C++ path requires num_heads % 64 == 0, which K3's

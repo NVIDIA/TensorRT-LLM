@@ -14,6 +14,10 @@
 # (selects eval_extra_llm_options_sa.yaml and the SA-required
 # max_batch_size of 8).
 #
+# Pass --reuse to additionally enable KV-cache block reuse
+# (eval_extra_llm_options_reuse.yaml); chunked prefill is enabled by
+# default. --sa and --reuse are mutually exclusive.
+#
 # REPO defaults to the submit directory (override by exporting REPO), and
 # must contain the built TensorRT-LLM checkout. Provide scheduler-specific
 # options on the sbatch command line as needed.
@@ -30,16 +34,17 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH [--sa]"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--sa | --reuse]"
 }
 
 MODEL=""
 CONTAINER_IMAGE=""
-SA=0
+MODE=default
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --sa)
-            SA=1
+        --sa|--reuse)
+            [[ "$MODE" == default ]] || { echo "error: --sa and --reuse are mutually exclusive" >&2; usage >&2; exit 2; }
+            MODE=${1#--}
             shift
             ;;
         --model)
@@ -79,15 +84,26 @@ done
 
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
-# SA speculative decoding needs its own LLM options (eager, plain-EP; see
-# the yaml) and max_batch_size <= 8 (SpeculativeState buffers).
-if [[ "$SA" == "1" ]]; then
-    EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_sa.yaml
-    MAX_BATCH_SIZE=8
-else
-    EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
-    MAX_BATCH_SIZE=32
-fi
+# Per-mode LLM options.
+# - sa: SA speculative decoding needs its own LLM options (eager, plain-EP;
+#   see the yaml) and max_batch_size <= 8 (SpeculativeState buffers).
+# - reuse: KV-cache block reuse; drops --disable_kv_cache_reuse so the
+#   yaml's enable_block_reuse takes effect.
+MAX_BATCH_SIZE=32
+KV_REUSE_ARG="--disable_kv_cache_reuse"
+case "$MODE" in
+    sa)
+        EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_sa.yaml
+        MAX_BATCH_SIZE=8
+        ;;
+    reuse)
+        EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options_reuse.yaml
+        KV_REUSE_ARG=""
+        ;;
+    *)
+        EVAL_CONFIG=$REPO/examples/kimi_k3/eval_extra_llm_options.yaml
+        ;;
+esac
 
 # Mount every input at its host path so the paths are valid inside too.
 MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro"
@@ -129,7 +145,7 @@ srun --mpi=pmix \
             --max_seq_len 8192 \
             --max_num_tokens 8192 \
             --kv_cache_free_gpu_memory_fraction 0.25 \
-            --disable_kv_cache_reuse \
+            $KV_REUSE_ARG \
             --trust_remote_code \
             --config '$EVAL_CONFIG' \
             gsm8k
