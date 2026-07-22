@@ -198,20 +198,34 @@ class KDAKernelDispatch:
         boundaries (K == V == 128 for Kimi K3, so shapes alone cannot catch
         a mix-up — the transpose is semantic).
         """
-        if self.prefill_kernel_path == "optimized":
+        use_optimized = self.prefill_kernel_path == "optimized"
+        chunk_indices = None
+        if use_optimized and cu_seqlens is not None:
+            from fla.ops.utils.index import prepare_chunk_indices
+            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+            # The persistent K123 scheduler needs at least 4 total chunks
+            # (cgs_per_head = NT // 4 cooperative groups per head). The
+            # eqlen path guarantees this by padding to a 256-token multiple
+            # inside the op; varlen has no such pad, so small varlen
+            # batches (short-prompt contexts, NT < 4) launch with a
+            # zero-size grid -> DSLCudaRuntimeError. Route them to the FLA
+            # reference path (negligible perf impact at these sizes). The
+            # check must happen HERE, before the l2norm/beta-sigmoid
+            # pre-transforms below: the FLA path applies both in-kernel.
+            if chunk_indices.shape[0] < 4:
+                use_optimized = False
+
+        if use_optimized:
             import torch.nn.functional as F
             from fla.modules.l2norm import l2norm_fwd
             from fla.ops.common.gate import fused_beta_sigmoid
-            from fla.ops.utils.index import prepare_chunk_indices
 
             q, _ = l2norm_fwd(q)
             k, _ = l2norm_fwd(k)
             beta = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
 
-            chunk_indices = None
             real_T = q.shape[1]
             if cu_seqlens is not None:
-                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
                 # The op's varlen single-seq path (Phase 2.1) expects the
                 # caller to zero-pad the packed tensors to a chunk multiple
                 # (FLA convention) while cu_seqlens keeps the real length;

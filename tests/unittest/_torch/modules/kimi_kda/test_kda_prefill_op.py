@@ -198,3 +198,36 @@ def test_kda_mixer_empty_prefill():
     hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     out = optimized.forward_prefill(hidden_states)
     assert out.shape == (1, 0, HIDDEN_SIZE)
+
+
+@torch.no_grad()
+def test_kda_prefill_op_small_varlen_batch():
+    """Small varlen batches (short-prompt contexts) through the dispatch.
+
+    The persistent K123 scheduler needs >= 4 total chunks, so the dispatch
+    routes NT < 4 batches to the FLA path ([6,12], [1,2,3], [30] here);
+    the [6,12,20,25] case carries exactly NT=4 with total T < 64, running
+    the optimized masked path where building the eqlen chunk-offset
+    scratch used to raise ``step must be nonzero`` (arange step
+    ``T // 64 == 0``) — its output is parity-checked against FLA.
+    """
+    optimized, reference = _make_attention_pair()
+    for sequence_lengths in ([6, 12], [1, 2, 3], [30], [6, 12, 20, 25]):
+        cumulative_lengths = torch.tensor(
+            [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
+            dtype=torch.long,
+            device="cuda",
+        )
+        hidden_states = (
+            torch.randn(
+                1,
+                sum(sequence_lengths),
+                HIDDEN_SIZE,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * 0.05
+        )
+        actual = optimized.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
+        expected = reference.forward_prefill(hidden_states, cu_seqlens=cumulative_lengths)
+        _assert_close(actual, expected)

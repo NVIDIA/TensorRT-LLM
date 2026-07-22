@@ -333,7 +333,14 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
         # caller's [N_seqs, H, K, V] contig fp32 convention.
         S_out = torch.empty(N_seqs, H, K_dim, V_dim, device=dev, dtype=torch.float32)
         cu_eqlen = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=dev)
-        co_eqlen = torch.arange(0, (B + 1) * (T // BT), T // BT, dtype=torch.int32, device=dev)
+        # co_eqlen is consumed only on the eqlen path (varlen K4 derives its
+        # chunk offsets from cu_seqlens). Eqlen inputs are pre-padded to a
+        # 256-multiple upstream, so T // BT >= 4 there; varlen calls can
+        # carry T < BT (short-prompt batches), where arange(step=T // BT)
+        # would raise "step must be nonzero" building this dead buffer.
+        # Clamp the step so the buffer stays constructible.
+        nt_eq = max(T // BT, 1)
+        co_eqlen = torch.arange(0, (B + 1) * nt_eq, nt_eq, dtype=torch.int32, device=dev)
 
         T_total = B * T
         A_kk_flat = A_kk.reshape(T_total, H, BT)
@@ -906,6 +913,15 @@ def _chunk_kda_fwd(
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
         NT = len(chunk_indices)
+        if NT < 4:
+            # The persistent K123 scheduler launches NT // 4 cooperative
+            # groups per head; fewer than 4 total chunks produces a
+            # zero-size grid (DSLCudaRuntimeError at launch). Callers must
+            # route such batches to the FLA path — see
+            # KDAKernelDispatch.prefill_chunk_kda.
+            raise ValueError(
+                f"kda_prefill requires >= 4 total varlen chunks (got {NT}); "
+                "route small varlen batches to the FLA fallback")
         N_seqs = len(cu_seqlens) - 1
     else:
         NT = T // BT
