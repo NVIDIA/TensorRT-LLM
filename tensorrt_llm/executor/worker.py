@@ -326,11 +326,16 @@ def worker_main(
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
         logger_debug(f"error: {traceback.format_exc()}", "red")
-        if is_leader:
-            # Send error message with confirmation
-            error_msg = (e, traceback.format_exc())
-            if not worker_init_status_queue.notify_with_retry(error_msg):
-                logger.error("Failed to deliver error message to proxy")
+        if not is_leader:
+            # Rank 0 may be blocked in a collective that the failed rank can
+            # no longer enter. Abort the MPI job so the proxy exits promptly.
+            mpi_comm().Abort(1)
+            raise
+
+        # Send error message with confirmation
+        error_msg = (e, traceback.format_exc())
+        if not worker_init_status_queue.notify_with_retry(error_msg):
+            logger.error("Failed to deliver error message to proxy")
         return
 
     # Optionally disable GC (default: not disabled)
