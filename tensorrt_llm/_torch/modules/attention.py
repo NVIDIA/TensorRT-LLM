@@ -17,6 +17,7 @@ from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
+from ..attention_backend.sparse.hooks import get_sparse_attn_hooks
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
@@ -602,6 +603,8 @@ class Attention(nn.Module):
         sparse_params = (sparse_attn_cfg.to_sparse_params(
             pretrained_config=config.pretrained_config,
             layer_idx=self.layer_idx) if sparse_attn_cfg is not None else None)
+        self.sparse_params = sparse_params
+        self.sparse_attn_hooks = get_sparse_attn_hooks(self)
 
         attn_cls = get_attention_backend(self.attn_backend,
                                          sparse_params=sparse_params)
@@ -631,10 +634,21 @@ class Attention(nn.Module):
             logger.info_once(f"Using sparse attention: {algo} {cfg_dump}",
                              key="sparse_attention_config")
 
-            if config.sparse_attention_config.algorithm == "rocket":
-                logger.warning_once("disable rope_fusion for RocketKV.",
-                                    key="disable_rope_fusion_for_rocketkv")
-                self.rope_fusion = False
+        if initialize_sparse_attn := self.sparse_attn_hooks.initialize_sparse_attn:
+            initialize_sparse_attn(
+                self,
+                config=config,
+                mapping=mapping,
+                mapping_o=mapping_o,
+                rms_norm_eps=getattr(config.pretrained_config, "rms_norm_eps",
+                                     1e-6),
+                quant_config=self.quant_config,
+                q_scaling=self.q_scaling,
+                bias=bias,
+                dtype=dtype,
+                reduce_output=reduce_output,
+                aux_stream=None,
+            )
 
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning_once(
@@ -916,6 +930,23 @@ class Attention(nn.Module):
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
     ):
+        if forward_sparse_attn := self.sparse_attn_hooks.forward_sparse_attn:
+            return forward_sparse_attn(
+                self,
+                q,
+                k,
+                v,
+                attn_metadata,
+                attention_mask,
+                attention_window_size,
+                attention_mask_data,
+                mrope_config,
+                attention_sinks,
+                relative_attention_bias,
+                relative_attention_max_distance,
+                has_lora,
+            )
+
         mrope_rotary_cos_sin = None
         mrope_position_deltas = None
         if mrope_config is not None:
@@ -1062,6 +1093,15 @@ class Attention(nn.Module):
 
         if self.attn_output_gate:
             attn_output = self.apply_output_gate(attn_output, gate)
+
+        if project_sparse_attn_output := self.sparse_attn_hooks.project_sparse_attn_output:
+            return project_sparse_attn_output(
+                self,
+                attn_output,
+                attn_metadata,
+                all_reduce_params,
+                lora_params,
+            )
 
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,

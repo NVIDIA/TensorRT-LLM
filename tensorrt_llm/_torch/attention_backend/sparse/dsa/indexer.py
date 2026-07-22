@@ -1807,7 +1807,7 @@ class Indexer(nn.Module):
         Returns (q_fp_bytes, k_fp_bytes, k_scale, weights, q_scale). The last
         tensor is only consumed by the FP4 kernel dispatch; the FP8 path
         ignores it. It is returned unconditionally so the two-op CUDA graph
-        split in dsa.mla_module.forward_dsa_proj sees a stable signature.
+        split in dsa.module.forward_dsa_proj sees a stable signature.
         """
         assert self._fused_wk_wp_weight is not None, \
             "cache_derived_state() must be called before forward()"

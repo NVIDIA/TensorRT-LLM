@@ -21,13 +21,13 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 if TYPE_CHECKING:
     pass
 
-from ..kernels.common import (triton_bmm, triton_flatten_to_batch,
-                              triton_index_gather, triton_softmax, triton_topk)
-from .kernels import (triton_rocket_batch_to_flatten,
+from .kernels import (triton_bmm, triton_flatten_to_batch, triton_index_gather,
+                      triton_rocket_batch_to_flatten,
                       triton_rocket_paged_kt_cache_bmm, triton_rocket_qk_split,
                       triton_rocket_reduce_scores,
                       triton_rocket_update_kt_cache_ctx,
-                      triton_rocket_update_kt_cache_gen)
+                      triton_rocket_update_kt_cache_gen, triton_softmax,
+                      triton_topk)
 from .metadata import (RocketTrtllmAttentionMetadata,
                        RocketVanillaAttentionMetadata)
 from .params import RocketKVParams

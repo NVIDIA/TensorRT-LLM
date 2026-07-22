@@ -36,8 +36,10 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
-from tensorrt_llm._torch.attention_backend.sparse.dsa.mla_module import should_use_short_mha
-from tensorrt_llm._torch.attention_backend.sparse.module import forward_context_sparse_mla
+from tensorrt_llm._torch.attention_backend.sparse.dsa.module import (
+    forward_context_sparse_attn,
+    should_use_short_mha,
+)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -388,9 +390,9 @@ def _make_metadata(
 def _run_forward(
     mla, q, compressed_kv, k_pe, latent_cache, position_ids, metadata, topk_indices=None
 ):
-    """Run forward_context_sparse_mla on cloned inputs and return the output tensor."""
+    """Run forward_context_sparse_attn on cloned inputs and return the output tensor."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
-    forward_context_sparse_mla(
+    forward_context_sparse_attn(
         mla,
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),

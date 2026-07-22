@@ -1463,6 +1463,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         assert sparse_params is not None, (
             "sparse_params is required for DeepseekV4TrtllmAttention and cannot be None"
         )
+        assert mla_params is not None, "DeepSeek-V4 attention requires MLA parameters"
+        mla_params = replace(
+            mla_params,
+            v_head_dim=head_dim,
+            rope_append=False,
+        )
         TrtllmAttention.__init__(
             self,
             layer_idx,

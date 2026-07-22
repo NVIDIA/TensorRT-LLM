@@ -1355,9 +1355,6 @@ class DeepseekV4Attention(MLA):
             reduce_output=reduce_output,
         )
 
-        self.indexer = getattr(self.mqa, "indexer", None)
-        self.compressor = getattr(self.mqa, "compressor", None)
-
 
 class DeepseekV4Gate(nn.Module):
     def __init__(

@@ -15,7 +15,6 @@
 
 import functools
 import math
-import os
 import weakref
 from typing import Optional, cast
 
@@ -41,6 +40,7 @@ from ..attention_backend.interface import (
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
 )
+from ..attention_backend.sparse.hooks import get_sparse_attn_hooks
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -61,16 +61,6 @@ from .linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
-
-# Import FlashMLA sparse attention kernel
-try:
-    from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
-except ImportError:
-    flash_mla_sparse_fwd = None
-
-
-def _is_env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "on")
 
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
@@ -120,37 +110,9 @@ def _extract_mla_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
-def _should_use_sparse_mla_epilogue_fusion(*args, **kwargs):
-    from ..attention_backend.sparse.module import should_use_sparse_mla_epilogue_fusion
-
-    return should_use_sparse_mla_epilogue_fusion(*args, **kwargs)
-
-
-def _create_sparse_mla_epilogue_buffers(*args, **kwargs):
-    from ..attention_backend.sparse.module import create_sparse_mla_epilogue_buffers
-
-    return create_sparse_mla_epilogue_buffers(*args, **kwargs)
-
-
-def _validate_sparse_mla_epilogue_buffers(*args, **kwargs):
-    from ..attention_backend.sparse.module import validate_sparse_mla_epilogue_buffers
-
-    return validate_sparse_mla_epilogue_buffers(*args, **kwargs)
-
-
 def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    enable_dsv4_epilogue_fusion = _should_use_sparse_mla_epilogue_fusion(
-        mla_layer, metadata.num_contexts, metadata.num_generations
-    )
-    output_input = hidden_states[:0] if enable_dsv4_epilogue_fusion else hidden_states
-    attn_output = mla_layer.create_output(output_input, metadata.num_contexts)
-    outputs = [attn_output]
-    if enable_dsv4_epilogue_fusion:
-        outputs.extend(
-            _create_sparse_mla_epilogue_buffers(mla_layer, hidden_states, metadata.num_tokens)
-        )
-    return outputs
+    return mla_layer._create_outputs(hidden_states, metadata)
 
 
 @torch.library.custom_op("trtllm::create_mla_outputs", mutates_args=())
@@ -165,17 +127,14 @@ def _create_mla_outputs_fake(hidden_states, layer_idx):
 
 @torch.library.custom_op(
     "trtllm::mla_custom_op_inplace",
-    mutates_args=("output", "dsv4_output", "dsv4_output_sf"),
+    mutates_args=("attn_output",),
 )
 def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
     position_ids: Optional[torch.Tensor],
     layer_idx: str,
-    output: torch.Tensor,
+    attn_output: list[torch.Tensor],
     latent_cache_gen: Optional[torch.Tensor],
-    dsv4_output: Optional[torch.Tensor],
-    dsv4_output_sf: Optional[torch.Tensor],
-    enable_dsv4_epilogue_fusion: bool,
     hidden_states_fp4: Optional[torch.Tensor] = None,
     hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> None:
@@ -189,21 +148,12 @@ def mla_custom_op_inplace(
             scaling_factor=hidden_states_sf,
             unquantized_hidden_states=hidden_states,
         )
-    if enable_dsv4_epilogue_fusion:
-        if dsv4_output is None or dsv4_output_sf is None:
-            raise RuntimeError("Sparse MLA fused epilogue requires caller-provided output buffers.")
-        dsv4_epilogue_output = (dsv4_output, dsv4_output_sf)
-    else:
-        if dsv4_output is not None or dsv4_output_sf is not None:
-            raise RuntimeError("Sparse MLA epilogue buffers require epilogue fusion to be enabled.")
-        dsv4_epilogue_output = None
     mla_layer.forward_impl(
         position_ids,
         hidden_states,
         metadata,
-        output=output,
+        attn_output=attn_output,
         latent_cache_gen=latent_cache_gen,
-        dsv4_epilogue_output=dsv4_epilogue_output,
     )
 
 
@@ -355,13 +305,7 @@ class MLA(nn.Module):
             else None
         )
         self.sparse_params = sparse_params
-
-        sparse_algorithm = getattr(sparse_params, "algorithm", None)
-        self.is_dsa = sparse_algorithm == "dsa"
-        self.is_deepseek_v4 = sparse_algorithm == "deepseek_v4"
-        self._disable_dsv4_epilogue_fusion = self.is_deepseek_v4 and _is_env_truthy(
-            "TRTLLM_DSV4_DISABLE_FMHA_EPILOGUE_FUSION"
-        )
+        self.sparse_attn_hooks = get_sparse_attn_hooks(self)
 
         # Fold the residual-less q_a_layernorm -> q_b_proj NVFP4 input
         # quantization into one fused RMSNorm + FP4-quantize kernel. Resolve
@@ -406,16 +350,6 @@ class MLA(nn.Module):
         self.num_heads_tp = self.num_heads // tp_size
         self.num_heads_tp_cp = self.num_heads_tp // cp_size
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size - 1) // tp_size
-        if self.is_deepseek_v4:
-            if self.num_groups % tp_size != 0:
-                raise ValueError(
-                    f"DeepSeek-V4 num_groups ({self.num_groups}) must be divisible by tp_size ({tp_size})."
-                )
-            if self.num_heads % self.num_groups != 0:
-                raise ValueError(
-                    f"DeepSeek-V4 num_heads ({self.num_heads}) must be divisible by num_groups ({self.num_groups})."
-                )
-        self.n_local_groups = self.num_groups // tp_size
 
         rms_norm_eps = getattr(config.pretrained_config, "rms_norm_eps", 1e-6)
         quant_config = config.get_quant_config()
@@ -458,11 +392,6 @@ class MLA(nn.Module):
                 use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
                 use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
             )
-            if self.is_deepseek_v4:
-                # V4 unweighted per-head RMS on Q post-wq_b; q.view(-1, head_dim) at call site.
-                self.q_b_layernorm = RMSNorm(
-                    hidden_size=self.qk_head_dim, eps=rms_norm_eps, dtype=dtype, has_weights=False
-                )
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -493,39 +422,6 @@ class MLA(nn.Module):
             )
             self.q_b_proj = self.q_proj
 
-        kv_a_layernorm_hidden_size = (
-            self.kv_lora_rank + self.qk_rope_head_dim if self.is_deepseek_v4 else kv_lora_rank
-        )
-        self.kv_a_layernorm = RMSNorm(
-            hidden_size=kv_a_layernorm_hidden_size, dtype=dtype, eps=rms_norm_eps
-        )
-
-        if not self.is_deepseek_v4:
-            self.kv_b_proj = Linear(
-                self.kv_lora_rank,
-                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-                bias=bias,
-                dtype=dtype,
-                mapping=mapping,
-                tensor_parallel_mode=TensorParallelMode.COLUMN,
-                quant_config=quant_config,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                allreduce_strategy=config.allreduce_strategy,
-                force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
-            )
-            # This parameter will view into self.kv_b_proj.weight after loading weights.
-            # For dummy weight initialization, this parameter is initialized with empty tensor.
-            # Used in forward_absorption only
-            self.v_b_proj = nn.Parameter(
-                torch.empty(
-                    (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-
         mapping_o = Mapping(
             world_size=pp_size * dp_size * tp_size * cp_size,
             tp_size=tp_size * cp_size,
@@ -536,49 +432,6 @@ class MLA(nn.Module):
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
         self.mapping_o = mapping_o
-        if self.is_deepseek_v4:
-            self.o_a_proj = nn.Parameter(
-                torch.empty(
-                    (
-                        self.n_local_groups,
-                        self.o_lora_rank,
-                        self.num_heads * self.qk_head_dim // self.num_groups,
-                    ),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.o_b_proj = Linear(
-                self.num_groups * self.o_lora_rank,
-                self.hidden_size,
-                bias=False,
-                dtype=dtype,
-                mapping=mapping_o,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                quant_config=quant_config,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                reduce_output=reduce_output,
-                allreduce_strategy=config.allreduce_strategy,
-                force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
-            )
-        else:
-            self.o_proj = Linear(
-                self.num_key_value_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=self.dense_bias,
-                dtype=dtype,
-                mapping=mapping_o,
-                tensor_parallel_mode=TensorParallelMode.ROW,
-                quant_config=quant_config,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                reduce_output=reduce_output,
-                allreduce_strategy=config.allreduce_strategy,
-                force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
-                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
-            )
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
@@ -590,22 +443,46 @@ class MLA(nn.Module):
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
 
-        self.has_dsv4_indexer = (
-            self.is_deepseek_v4
-            and layer_idx is not None
-            and sparse_params is not None
-            and sparse_params.compress_ratios[layer_idx] == 4
+        self.aux_stream = aux_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.kv_a_layernorm = RMSNorm(hidden_size=self.kv_lora_rank, dtype=dtype, eps=rms_norm_eps)
+        self.kv_b_proj = Linear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=bias,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            quant_config=quant_config,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
         )
-        self.indexer_stream = None
-        self.indexer_aux_stream = None
-        self.compressor_stream = None
-        if self.has_dsv4_indexer and aux_stream is not None:
-            self.indexer_stream = torch.cuda.Stream(device=aux_stream.device)
-            self.indexer_aux_stream = torch.cuda.Stream(device=aux_stream.device)
-            self.compressor_stream = torch.cuda.Stream(device=aux_stream.device)
-        mqa_aux_stream = (
-            self.indexer_aux_stream if self.indexer_aux_stream is not None else aux_stream
+        self.v_b_proj = nn.Parameter(
+            torch.empty(
+                (self.num_heads_tp_cp, self.v_head_dim, self.kv_lora_rank),
+                dtype=dtype,
+            ),
+            requires_grad=False,
         )
+        self.o_proj = Linear(
+            self.num_key_value_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=self.dense_bias,
+            dtype=dtype,
+            mapping=mapping_o,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            quant_config=quant_config,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            reduce_output=reduce_output,
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+        )
+        self.attention_output_hidden_size = self.o_proj.in_features
 
         self.mqa = create_attention(
             config.attn_backend,
@@ -613,7 +490,7 @@ class MLA(nn.Module):
             self.num_heads_tp,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
             num_kv_heads=1,
-            pos_embd_params=pos_embd_params,
+            pos_embd_params=self.pos_embd_params,
             quant_config=quant_config,
             q_scaling=q_scaling,
             is_mla_enable=True,
@@ -621,26 +498,57 @@ class MLA(nn.Module):
             kv_lora_rank=self.kv_lora_rank,
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim if self.is_deepseek_v4 else self.kv_lora_rank,
             hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-            sparse_params=sparse_params,
+            v_head_dim=self.kv_lora_rank,
+            sparse_params=self.sparse_params,
             dtype=dtype,
-            aux_stream=mqa_aux_stream,
-            rope_append=not self.is_deepseek_v4,
+            aux_stream=aux_stream,
+            rope_append=True,
         )
-        self.compressor = getattr(self.mqa, "compressor", None)
-        self.indexer = getattr(self.mqa, "indexer", None)
+
+        # MHA is the dense expanded-KV path. Algorithms that do not use it
+        # remove it in their initialization hook.
+        self.mha = create_attention(
+            config.attn_backend,
+            self.layer_idx,
+            self.num_heads_tp,
+            head_dim=self.qk_head_dim,
+            num_kv_heads=self.num_key_value_heads_tp,
+            pos_embd_params=self.pos_embd_params,
+            quant_config=quant_config,
+            q_scaling=q_scaling,
+            is_mla_enable=True,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            predicted_tokens_per_seq=self.predicted_tokens_per_seq,
+            skip_create_weights_in_init=config.skip_create_weights_in_init,
+            sparse_params=None,
+        )
+
+        if initialize_sparse_attn := self.sparse_attn_hooks.initialize_sparse_attn:
+            initialize_sparse_attn(
+                self,
+                config=config,
+                mapping=mapping,
+                mapping_o=mapping_o,
+                rms_norm_eps=rms_norm_eps,
+                quant_config=quant_config,
+                q_scaling=q_scaling,
+                bias=bias,
+                dtype=dtype,
+                reduce_output=reduce_output,
+                aux_stream=aux_stream,
+            )
+
+        if self.mqa is None:
+            raise RuntimeError("MLA requires a non-null MQA attention backend")
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
-
-        self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
-        self.dsv4_overlap_start_event = torch.cuda.Event()
-        self.dsv4_compressor_start_event = torch.cuda.Event()
-        self.dsv4_compressor_event = torch.cuda.Event()
-        self.dsv4_indexer_event = torch.cuda.Event()
 
         self.rope_fusion = self.mqa.support_fused_rope()
         self.rotary_emb = None
@@ -652,61 +560,13 @@ class MLA(nn.Module):
                 is_neox=pos_embd_params.is_neox,
             )
 
-        if self.is_deepseek_v4:
-            self.inverse_rotary_emb = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.qk_rope_head_dim,
-                is_neox=pos_embd_params.is_neox,
-                inverse=True,
-            )
-
-        # Short-sequence MHA optimization for DSA models:
-        # For short prefill sequences, use MHA (kv_b_proj expansion + standard
-        # attention) instead of the absorption path, which has overhead from
-        # extra BMMs and larger head_dim (kv_lora_rank + qk_rope_head_dim).
-        # Only active when rope_fusion is True (DSA with TrtllmAttention).
-        _threshold_str = os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")
-        try:
-            self.short_seq_mha_threshold = int(_threshold_str)
-        except ValueError as err:
-            raise ValueError(
-                f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, got '{_threshold_str}'"
-            ) from err
-
-        # MHA attention backend: used by non-DSA (standard MLA) and optionally
-        # by DSA for the short-seq path (dense attention, no sparse config).
-        _short_seq_mha = (
-            self.is_dsa and self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
-        )
-        if (not self.is_dsa or _short_seq_mha) and not self.is_deepseek_v4:
-            mha_sparse_params = None if _short_seq_mha else sparse_params
-            self.mha = create_attention(
-                config.attn_backend,
-                self.layer_idx,
-                self.num_heads_tp,
-                head_dim=self.qk_head_dim,
-                num_kv_heads=self.num_key_value_heads_tp,
-                pos_embd_params=pos_embd_params,
-                quant_config=quant_config,
-                q_scaling=q_scaling,
-                is_mla_enable=True,
-                q_lora_rank=self.q_lora_rank,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                v_head_dim=self.v_head_dim,
-                predicted_tokens_per_seq=self.predicted_tokens_per_seq,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                sparse_params=mha_sparse_params,
-            )
-        else:
-            self.mha = None
-
         self.llama_4_scaling = False
         if hasattr(config.pretrained_config, "llama_4_scaling"):
             self.llama_4_scaling = True
             self.floor_scale = getattr(
-                config.pretrained_config.llama_4_scaling, "original_max_position_embeddings", 8192
+                config.pretrained_config.llama_4_scaling,
+                "original_max_position_embeddings",
+                8192,
             )
             self.attn_scale = getattr(config.pretrained_config.llama_4_scaling, "beta", 0.1)
 
@@ -716,41 +576,35 @@ class MLA(nn.Module):
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to
         # quant_config, which could be modified after __init__.
-        # self.mha is non-None for non-DSA models (standard MHA) and for DSA
-        # models when the short-seq MHA optimization is active.
         if self.mha is not None:
             self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
+        if create_sparse_attn_weights := self.sparse_attn_hooks.create_sparse_attn_weights:
+            create_sparse_attn_weights(self)
+            self._weights_transformed = False
+            return
 
         # k_b_proj_trans's dtype must be consistent with self.kv_b_proj,
         # which can be modified after __init__
-        if self.is_deepseek_v4:
-            has_fp8_block_scales = (
-                self.o_b_proj.quant_config
-                and self.o_b_proj.quant_config.quant_mode.has_fp8_block_scales()
-            )
-        else:
-            has_fp8_block_scales = (
-                self.kv_b_proj.quant_config
-                and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
-            )
-
-            mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
-            self.k_b_proj_trans = nn.Parameter(
-                torch.empty(
-                    (self.num_heads_tp, self.kv_lora_rank, self.qk_nope_head_dim),
-                    dtype=mla_weight_dtype,
-                ),
-                requires_grad=False,
-            )
+        has_fp8_block_scales = bool(
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
+        )
+        mla_weight_dtype = torch.float8_e4m3fn if has_fp8_block_scales else self.dtype
+        self.k_b_proj_trans = nn.Parameter(
+            torch.empty(
+                (self.num_heads_tp, self.kv_lora_rank, self.qk_nope_head_dim),
+                dtype=mla_weight_dtype,
+            ),
+            requires_grad=False,
+        )
 
         self.k_b_proj_trans_dequant = None
         self.v_b_proj_dequant = None
-        self.o_a_proj_dequant = None
-        if has_fp8_block_scales and not self.is_deepseek_v4:
+        if has_fp8_block_scales:
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
                     (
@@ -791,55 +645,9 @@ class MLA(nn.Module):
                     ),
                     requires_grad=False,
                 )
-        elif has_fp8_block_scales:
-            self.o_a_proj_scale = nn.Parameter(
-                torch.empty(
-                    (
-                        self.n_local_groups,
-                        self.o_lora_rank // 128,
-                        self.num_heads * self.qk_head_dim // self.num_groups // 128,
-                    ),
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            if is_sm_100f():
-                # DSv4 always keeps o_a_proj in its native FP8 e4m3 form so
-                # cute_dsl_fp8_bmm_blackwell + fused_inv_rope_fp8_quant can
-                # consume it directly. Decoupled from
-                # use_cute_dsl_blockscaling_bmm: only DSv4 has o_a_proj, and
-                # the fused inv-RoPE -> FP8 quant -> cute-dsl BMM chain is the
-                # only viable path for it on SM100; gating on the global
-                # bmm-config flag was conflating two independent kernel
-                # choices (K/V absorption BMM vs. DSv4 o_a_proj BMM).
-                if self.is_deepseek_v4:
-                    self.o_a_proj = nn.Parameter(
-                        torch.empty(
-                            (
-                                self.n_local_groups,
-                                self.o_lora_rank,
-                                self.num_heads * self.qk_head_dim // self.num_groups,
-                            ),
-                            dtype=torch.float8_e4m3fn,
-                        ),
-                        requires_grad=False,
-                    )
-                else:
-                    self.o_a_proj_dequant = nn.Parameter(
-                        torch.empty(
-                            (
-                                self.n_local_groups,
-                                self.o_lora_rank,
-                                self.num_heads * self.qk_head_dim // self.num_groups,
-                            ),
-                            dtype=self.dtype,
-                        ),
-                        requires_grad=False,
-                    )
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
-            self.o_a_proj_scale = None
         self._weights_transformed = False
 
     def apply_rope(
@@ -920,11 +728,17 @@ class MLA(nn.Module):
             )
             hidden_states = hidden_states.unquantized_hidden_states
         num_tokens = hidden_states.shape[0]
-        if self.is_deepseek_v4:
-            hidden_size = self.num_heads_tp_cp * self.v_head_dim
-        else:
-            hidden_size = self.o_proj.in_features
-        return hidden_states.new_empty([num_tokens, hidden_size], dtype=hidden_states.dtype)
+        return hidden_states.new_empty(
+            [num_tokens, self.attention_output_hidden_size], dtype=hidden_states.dtype
+        )
+
+    def _create_outputs(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> list[torch.Tensor]:
+        """Create the standard output and any algorithm-specific output buffers."""
+        if prepare_outputs := self.sparse_attn_hooks.prepare_sparse_attn_outputs:
+            return prepare_outputs(self, hidden_states, attn_metadata)
+        return [self.create_output(hidden_states, attn_metadata.num_contexts)]
 
     def _attention_scaling(self, q, position_ids):
         def _get_attn_scale(position_ids: torch.Tensor) -> torch.Tensor:
@@ -970,32 +784,25 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
+        attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor] = None,
-        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """Run the dense or sparse implementation of the shared MLA module."""
-        if self.sparse_params is not None:
-            from ..attention_backend.sparse.module import forward_sparse_mla
-
-            forward_sparse_mla(
+        if self.sparse_attn_hooks:
+            self.sparse_attn_hooks.require("forward_sparse_attn")(
                 self,
                 position_ids,
                 hidden_states,
                 attn_metadata,
-                output,
-                dsv4_epilogue_output=dsv4_epilogue_output,
+                attn_output,
             )
             return
-
-        if dsv4_epilogue_output is not None:
-            raise RuntimeError("Dense MLA does not support sparse MLA epilogue buffers")
 
         self._forward_impl(
             position_ids,
             hidden_states,
             attn_metadata,
-            output,
+            attn_output[0],
             latent_cache_gen=latent_cache_gen,
         )
 
@@ -1118,13 +925,13 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Dense MHA context path: expand KV via kv_b_proj and run attention.
-
-        Used by non-DSA models and as the short-seq MHA fallback for DSA models.
-        """
+        """Dense MHA context path: expand KV via kv_b_proj and run attention."""
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
-            [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
+            [
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim,
+            ],
             -1,
         )
 
@@ -1187,7 +994,10 @@ class MLA(nn.Module):
         # compute full_k_nope and full_v from full_compressed_kv
         full_kv = self.kv_b_proj(full_compressed_kv)
         full_k_nope, full_v = full_kv.split(
-            [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
+            [
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim,
+            ],
             -1,
         )
 
@@ -1281,7 +1091,10 @@ class MLA(nn.Module):
             # [tokens, 2, h, kv_dim], without rope_dim
             chunked_kv = self.kv_b_proj(chunked_compressed_kv)
             chunked_k_nope, chunked_v = chunked_kv.split(
-                [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
+                [
+                    self.num_heads_tp * self.qk_nope_head_dim,
+                    self.num_heads_tp * self.v_head_dim,
+                ],
                 -1,
             )
 
@@ -1340,7 +1153,10 @@ class MLA(nn.Module):
         # final round of attention
 
         k_nope, v = kv.split(
-            [self.num_heads_tp * self.qk_nope_head_dim, self.num_heads_tp * self.v_head_dim],
+            [
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim,
+            ],
             -1,
         )
 
@@ -1391,7 +1207,13 @@ class MLA(nn.Module):
     @staticmethod
     @functools.cache
     def cached_warmup_forward_context_with_cached_kv(
-        num_heads_tp, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank, v_head_dim, dtype, device
+        num_heads_tp,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
     ):
         """Warmup torch.compile for cat operations with different tensor layouts.
 
@@ -1415,7 +1237,11 @@ class MLA(nn.Module):
                 num_tokens, 1, qk_rope_head_dim, dtype=dtype, device=device
             ).expand(-1, num_heads_tp, -1)
             k_pe = torch.empty(
-                num_tokens, 1, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+                num_tokens,
+                1,
+                kv_lora_rank + qk_rope_head_dim,
+                dtype=dtype,
+                device=device,
             )[:, :, -qk_rope_head_dim:].expand(-1, num_heads_tp, -1)
             torch._dynamo.maybe_mark_dynamic(chunked_k_nope, 0)
             torch._dynamo.maybe_mark_dynamic(chunked_k_pe, 0)
@@ -1503,10 +1329,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-        enable_dsv4_epilogue_fusion: bool = False,
-        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1537,23 +1360,13 @@ class MLA(nn.Module):
                 device=q.device,
             )
 
-        if self.is_deepseek_v4:
-            fused_q = q
-            self.mqa.mla_rope_generation(
-                fused_q,
-                q_pe,
-                latent_cache,
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-            )
-        else:
+        if hasattr(self, "k_b_proj_trans"):
             fused_q = torch.empty(
-                [num_tokens, self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim)],
+                [
+                    num_tokens,
+                    self.num_heads_tp,
+                    (self.kv_lora_rank + self.qk_rope_head_dim),
+                ],
                 dtype=q.dtype,
                 device=q.device,
             )
@@ -1633,21 +1446,13 @@ class MLA(nn.Module):
                 )
 
             fused_q = fused_q.view(
-                [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
+                [
+                    num_tokens,
+                    self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
+                ]
             )
-
-        # Use generation_only for generation phase and context_only for context phase in DSA attention
-        attention_input_type = AttentionInputType.generation_only
-        dsv4_output = output if self.is_deepseek_v4 else None
-        dsv4_output_sf = None
-        dsv4_cos_sin_cache = None
-        if enable_dsv4_epilogue_fusion:
-            assert self.is_deepseek_v4
-            assert dsv4_epilogue_output is not None
-            dsv4_output, dsv4_output_sf = _validate_sparse_mla_epilogue_buffers(
-                self, num_tokens, dsv4_epilogue_output
-            )
-            dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
+        else:
+            raise RuntimeError("MLA absorption requires k_b_proj_trans")
 
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -1656,38 +1461,18 @@ class MLA(nn.Module):
             None,
             position_ids,
             attn_metadata,
-            attention_input_type=attention_input_type,
+            attention_input_type=AttentionInputType.generation_only,
             out_scale=self.out_scale,
-            output=dsv4_output,
-            output_sf=dsv4_output_sf,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by `invokeMLARopeGeneration`
-            topk_indices=topk_indices,  # used by DSA attention
             cu_q_seqlens=cu_q_seqlens,  # used by `mlaGeneration`
             cu_kv_seqlens=cu_kv_seqlens,  # used by `mlaGeneration`
             fmha_scheduler_counter=fmha_scheduler_counter,  # used by `mlaGeneration`
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-            dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
-            enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
         )
         fused_q = None
-
-        if enable_dsv4_epilogue_fusion:
-            return attn_out_latent
-
-        if self.is_deepseek_v4:
-            if self.mapping.has_cp_helix():
-                raise RuntimeError(
-                    "DeepSeek-V4 + CP Helix is not supported: "
-                    "_helix_post_process returns a different tensor, "
-                    "bypassing the pre-allocated output buffer."
-                )
-            assert attn_out_latent.data_ptr() == output.data_ptr(), (
-                "Attention backend did not write into the provided output buffer."
-            )
-            return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (
@@ -1732,23 +1517,22 @@ class MLA(nn.Module):
         output: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         latent_cache: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
-        enable_dsv4_epilogue_fusion: bool = False,
-        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         num_tokens = q.shape[0]
 
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
-        if self.is_deepseek_v4:
-            fused_q = q
-        else:
+        if hasattr(self, "k_b_proj_trans"):
             # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
             # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
             fused_q = torch.empty(
-                [num_tokens, self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim)],
+                [
+                    num_tokens,
+                    self.num_heads_tp,
+                    (self.kv_lora_rank + self.qk_rope_head_dim),
+                ],
                 dtype=q.dtype,
                 device=q.device,
             )
@@ -1763,7 +1547,10 @@ class MLA(nn.Module):
                 # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
                 # The output of bmm is written directly into fused_q
                 self._bmm_bf16_out(
-                    q_nope_t, self.k_b_proj_trans, self.k_b_proj_trans.transpose(1, 2), q_nope_out
+                    q_nope_t,
+                    self.k_b_proj_trans,
+                    self.k_b_proj_trans.transpose(1, 2),
+                    q_nope_out,
                 )
             elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
                 # [num_heads, num_tokens, self.kv_lora_rank]
@@ -1785,46 +1572,13 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
-                [num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)]
-            )
-
-        # Use generation_only for generation phase and context_only for context phase in DSA attention
-        attention_input_type = AttentionInputType.context_only
-
-        # Fused FP8-Q path: forward the pre-quantized buffers stashed in
-        # `_q_branch`; the C++ op enables fusion when both are non-None.
-        quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
-        fused_q_pe = getattr(self, "_fused_q_pe", None)
-        quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
-        use_fused_q_fp8 = (
-            self.is_deepseek_v4
-            and quant_q_buffer is not None
-            and fused_q_pe is not None
-            and quant_scale_qkv is not None
-        )
-
-        if use_fused_q_fp8:
-            # Defensive prefix slicing: context-only batches today, mixed-batch later.
-            q_pe = fused_q_pe[:num_tokens]
-            quant_q_buffer = quant_q_buffer[:num_tokens].view(
-                num_tokens,
-                self.num_heads_tp,
-                self.kv_lora_rank + self.qk_rope_head_dim,
+                [
+                    num_tokens,
+                    self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim),
+                ]
             )
         else:
-            quant_q_buffer = None
-            quant_scale_qkv = None
-
-        dsv4_output = output if self.is_deepseek_v4 else None
-        dsv4_output_sf = None
-        dsv4_cos_sin_cache = None
-        if enable_dsv4_epilogue_fusion:
-            assert self.is_deepseek_v4
-            assert dsv4_epilogue_output is not None
-            dsv4_output, dsv4_output_sf = _validate_sparse_mla_epilogue_buffers(
-                self, num_tokens, dsv4_epilogue_output
-            )
-            dsv4_cos_sin_cache = self.inverse_rotary_emb.rotary_cos_sin
+            raise RuntimeError("MLA absorption requires k_b_proj_trans")
 
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -1833,36 +1587,12 @@ class MLA(nn.Module):
             None,
             position_ids,
             attn_metadata,
-            attention_input_type=attention_input_type,
+            attention_input_type=AttentionInputType.context_only,
             out_scale=self.out_scale,
-            output=dsv4_output,
-            output_sf=dsv4_output_sf,
             latent_cache=latent_cache,  # kvcache and k_pe
             q_pe=q_pe,  # used by applyMLARopeAndAssignQKVKernelOptContext
-            quant_q_buffer=quant_q_buffer,  # fused-FP8 path only
-            quant_scale_qkv=quant_scale_qkv,  # fused-FP8 path only
-            topk_indices=topk_indices,  # used by DSA attention
-            dsv4_inv_rope_cos_sin_cache=dsv4_cos_sin_cache,
-            enable_dsv4_epilogue_fusion=enable_dsv4_epilogue_fusion,
         )
         fused_q = None
-        self._fused_quant_q_buffer = None
-        self._fused_q_pe = None
-
-        if enable_dsv4_epilogue_fusion:
-            return attn_out_latent
-
-        if self.is_deepseek_v4:
-            if self.mapping.has_cp_helix():
-                raise RuntimeError(
-                    "DeepSeek-V4 + CP Helix is not supported: "
-                    "_helix_post_process returns a different tensor, "
-                    "bypassing the pre-allocated output buffer."
-                )
-            assert attn_out_latent.data_ptr() == output.data_ptr(), (
-                "Attention backend did not write into the provided output buffer."
-            )
-            return output
 
         # note: if we do not have CP, then num_heads_tp_cp == num_heads_tp
         assert (
@@ -1902,26 +1632,19 @@ class MLA(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: Optional[torch.Tensor],
-        attn_output: torch.Tensor,
+        attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor],
-        dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """Run the dense or sparse registered custom-op implementation."""
-        if self.sparse_params is not None:
-            from ..attention_backend.sparse.module import forward_sparse_mla_custom_op
-
-            forward_sparse_mla_custom_op(
+        if custom_op := self.sparse_attn_hooks.forward_sparse_attn_custom_op:
+            custom_op(
                 self,
                 hidden_states,
                 position_ids,
                 attn_output,
                 latent_cache_gen,
-                dsv4_epilogue_output=dsv4_epilogue_output,
             )
             return
-
-        if dsv4_epilogue_output is not None:
-            raise RuntimeError("Dense MLA does not support sparse MLA epilogue buffers")
 
         if isinstance(hidden_states, Fp4QuantizedTensor):
             torch.ops.trtllm.mla_custom_op_inplace(
@@ -1930,9 +1653,6 @@ class MLA(nn.Module):
                 self.layer_idx_str,
                 attn_output,
                 latent_cache_gen,
-                None,
-                None,
-                False,
                 hidden_states.fp4_tensor,
                 hidden_states.scaling_factor,
             )
@@ -1943,31 +1663,21 @@ class MLA(nn.Module):
                 self.layer_idx_str,
                 attn_output,
                 latent_cache_gen,
-                None,
-                None,
-                False,
             )
 
     def _project_output(
         self,
-        attn_output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        attn_output: list[torch.Tensor],
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams],
     ) -> torch.Tensor:
         """Apply the MLA output projection."""
-        if self.sparse_params is not None:
-            from ..attention_backend.sparse.module import project_sparse_mla_output
-
-            return project_sparse_mla_output(
-                self, attn_output, position_ids, attn_metadata, all_reduce_params
-            )
-
-        if isinstance(attn_output, tuple):
-            raise RuntimeError("Dense MLA does not support sparse MLA epilogue buffers")
+        if project_output := self.sparse_attn_hooks.project_sparse_attn_output:
+            return project_output(self, attn_output, position_ids, attn_metadata, all_reduce_params)
 
         return self._project_output_impl(
-            attn_output, position_ids, attn_metadata, all_reduce_params
+            attn_output[0], position_ids, attn_metadata, all_reduce_params
         )
 
     def _project_output_impl(
@@ -2000,7 +1710,6 @@ class MLA(nn.Module):
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
-        sparse_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         if self.register_to_config:
             output_hidden_states = hidden_states
             if isinstance(hidden_states, Fp4QuantizedTensor):
@@ -2009,45 +1718,26 @@ class MLA(nn.Module):
                     "unquantized_hidden_states view"
                 )
                 output_hidden_states = hidden_states.unquantized_hidden_states
-            outputs = torch.ops.trtllm.create_mla_outputs(output_hidden_states, self.layer_idx_str)
-            attn_output = outputs[0]
-            if len(outputs) == 3:
-                sparse_epilogue_output = (outputs[1], outputs[2])
-            elif len(outputs) != 1:
-                raise RuntimeError(
-                    "create_mla_outputs must return either the attention output or "
-                    "the attention output plus sparse MLA epilogue buffers."
-                )
+            attn_output = torch.ops.trtllm.create_mla_outputs(
+                output_hidden_states, self.layer_idx_str
+            )
             self._forward_custom_op(
                 hidden_states,
                 position_ids,
                 attn_output,
                 latent_cache_gen,
-                dsv4_epilogue_output=sparse_epilogue_output,
             )
         else:
-            enable_sparse_epilogue_fusion = _should_use_sparse_mla_epilogue_fusion(
-                self, attn_metadata.num_contexts, attn_metadata.num_generations
-            )
-            if enable_sparse_epilogue_fusion:
-                sparse_epilogue_output = _create_sparse_mla_epilogue_buffers(
-                    self, hidden_states, attn_metadata.num_tokens
-                )
-            output_input = hidden_states[:0] if enable_sparse_epilogue_fusion else hidden_states
-            attn_output = self.create_output(output_input, attn_metadata.num_contexts)
+            attn_output = self._create_outputs(hidden_states, attn_metadata)
             self.forward_impl(
                 position_ids,
                 hidden_states,
                 attn_metadata,
-                output=attn_output,
+                attn_output=attn_output,
                 latent_cache_gen=latent_cache_gen,
-                dsv4_epilogue_output=sparse_epilogue_output,
             )
 
-        projection_input = sparse_epilogue_output or attn_output
-        return self._project_output(
-            projection_input, position_ids, attn_metadata, all_reduce_params
-        )
+        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def resmooth_parameters(self, module_weight, module_weight_scale, recipe=(1, 128, 128)):
         weight, weight_scale = fp8_utils.resmooth_to_fp8_e8m0(module_weight, module_weight_scale)
@@ -2069,16 +1759,16 @@ class MLA(nn.Module):
     def transform_weights(self) -> None:
         if self._weights_transformed:
             return
-        # In DeepSeek-V4 mode, kv_b_proj doesn't exist
-        if getattr(self, "is_deepseek_v4", False):
-            has_fp8_block_scales = False
-        else:
-            has_fp8_block_scales = (
-                self.kv_b_proj.quant_config
-                and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
-            )
-        is_sm120 = get_sm_version() == 120
-        if is_sm120 and has_fp8_block_scales:
+        if transform_sparse_attn_weights := self.sparse_attn_hooks.transform_sparse_attn_weights:
+            transform_sparse_attn_weights(self)
+            self._weights_transformed = True
+            return
+
+        has_fp8_block_scales = bool(
+            self.kv_b_proj.quant_config
+            and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
+        )
+        if get_sm_version() == 120 and has_fp8_block_scales:
             self.k_b_proj_trans, self.k_b_proj_trans_scale = self.resmooth_parameters(
                 self.k_b_proj_trans, self.k_b_proj_trans_scale, recipe=(1, 128, 128)
             )

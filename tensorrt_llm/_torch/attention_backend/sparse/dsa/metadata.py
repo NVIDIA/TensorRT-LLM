@@ -58,6 +58,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Cross-layer indexer sharing: previous full layer's top-k, reused by
     # "shared" layers (None for a dense per-layer indexer).
     shared_topk_indices: Optional[torch.Tensor] = None
+    # Top-k selected for the current attention call. The DSA module sets it
+    # immediately before entering the shared MLA absorption implementation;
+    # the DSA backend consumes it without exposing top-k through MLA APIs.
+    runtime_topk_indices: Optional[torch.Tensor] = None
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -164,6 +168,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Cross-layer indexer sharing is per-step state; clear it so a "shared"
         # layer can never reuse a previous step's top-k before a full layer runs.
         self.shared_topk_indices = None
+        self.runtime_topk_indices = None
 
         # Get kv lengths
         assert self.kv_cache_params.use_cache is True, "DSA requires use_cache to be True"
