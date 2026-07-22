@@ -37,6 +37,7 @@ from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
+from .disagg_server_config import build_disagg_server_config
 from .perf_regression_utils import process_and_upload_test_results
 
 # Sanity-side path differs from test_perf for this key; preserve historical value.
@@ -1037,6 +1038,7 @@ class DisaggConfig:
         hardware: dict,
         server_env_var: str,
         internal_request_auth_key: str | None = None,
+        server_config_extra: Optional[Dict] = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1048,6 +1050,7 @@ class DisaggConfig:
         self.hardware = hardware
         self.server_env_var = server_env_var
         self.internal_request_auth_key = internal_request_auth_key
+        self.server_config_extra = dict(server_config_extra or {})
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1240,20 +1243,19 @@ class DisaggTestCmds(NamedTuple):
         # where another process on the same node grabs the port.
         disagg_server_port = get_free_port()
 
-        server_config = {
-            "hostname": self.hostname,
-            "port": disagg_server_port,
-            "backend": "pytorch",
-            "internal_request_auth_key": self.internal_request_auth_key,
-            "context_servers": {
-                "num_instances": self.num_ctx_servers,
-                "urls": ctx_hostnames,
-            },
-            "generation_servers": {
-                "num_instances": self.num_gen_servers,
-                "urls": gen_hostnames,
-            },
-        }
+        server_config_extra = {}
+        if server_idx < len(self.server_configs):
+            server_config_extra = self.server_configs[server_idx][2].server_config_extra
+        server_config = build_disagg_server_config(
+            hostname=self.hostname,
+            port=disagg_server_port,
+            num_ctx_servers=self.num_ctx_servers,
+            num_gen_servers=self.num_gen_servers,
+            ctx_hostnames=ctx_hostnames,
+            gen_hostnames=gen_hostnames,
+            internal_request_auth_key=self.internal_request_auth_key,
+            server_config_extra=server_config_extra,
+        )
         config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
         with open(config_path, "w") as f:
             yaml.dump(server_config, f)
@@ -1938,6 +1940,7 @@ class PerfSanityTestConfig:
                 hardware=hardware,
                 server_env_var=server_env_var,
                 internal_request_auth_key=internal_request_auth_key,
+                server_config_extra=config.get("server_config_extra", {}),
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
