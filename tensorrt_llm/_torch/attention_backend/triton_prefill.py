@@ -112,8 +112,9 @@ def _fwd_kernel(
     # Sequence boundaries
     qo_indptr,  # [batch+1] cumulative extend token counts
     prefix_indptr,  # [batch+1] cumulative prefix TOKEN counts
-    # Page table for prefix
-    page_table,  # [total_pages] physical page IDs
+    # Page tables for prefix
+    k_page_table,  # [total_pages] physical K page IDs
+    v_page_table,  # [total_pages] physical V page IDs
     page_table_indptr,  # [batch+1] cumulative page counts per seq
     # Mask
     mask_ptr,
@@ -240,8 +241,13 @@ def _fwd_kernel(
             token_positions = start_n + offs_n
             page_local_idx = token_positions // PAGE_SIZE
             token_in_page = token_positions % PAGE_SIZE
-            page_ids = tl.load(
-                page_table + cur_seq_page_start + page_local_idx,
+            k_page_ids = tl.load(
+                k_page_table + cur_seq_page_start + page_local_idx,
+                mask=mask_n,
+                other=-1,
+            )
+            v_page_ids = tl.load(
+                v_page_table + cur_seq_page_start + page_local_idx,
                 mask=mask_n,
                 other=-1,
             )
@@ -250,19 +256,21 @@ def _fwd_kernel(
             # with mask=True still issues the memory access, so a -1 page_id
             # would OOB into K_Buffer/V_Buffer (NaN propagation or illegal
             # address fault). Filter at load and at qk merge.
-            valid_page = page_ids >= 0
-            safe_page_ids = tl.where(valid_page, page_ids, 0)
+            valid_page = (k_page_ids >= 0) & (v_page_ids >= 0)
+            safe_k_page_ids = tl.where(valid_page, k_page_ids, 0)
+            safe_v_page_ids = tl.where(valid_page, v_page_ids, 0)
             # Promote to int64 before multiplying by stride: with KV pools at
             # production scale (e.g. shape [N, 2, 8, 32, 256] => stride 131072
             # elements/page), page_id * stride overflows int32 once page_id
             # exceeds ~16K and silently wraps to a negative offset, IMA-ing
             # K_Buffer/V_Buffer.
-            safe_page_ids = safe_page_ids.to(tl.int64)
+            safe_k_page_ids = safe_k_page_ids.to(tl.int64)
+            safe_v_page_ids = safe_v_page_ids.to(tl.int64)
             final_mask &= valid_page[None, :]
 
             # Load K from paged buffer (transposed for dot product)
             offs_buf_k = (
-                safe_page_ids[None, :] * stride_buf_kpage
+                safe_k_page_ids[None, :] * stride_buf_kpage
                 + cur_kv_head * stride_buf_kh
                 + token_in_page[None, :] * stride_buf_ktoken
                 + offs_d[:, None] * stride_buf_kdim
@@ -291,7 +299,7 @@ def _fwd_kernel(
 
             # Load V from paged buffer
             offs_buf_v = (
-                safe_page_ids[:, None] * stride_buf_vpage
+                safe_v_page_ids[:, None] * stride_buf_vpage
                 + cur_kv_head * stride_buf_vh
                 + token_in_page[:, None] * stride_buf_vtoken
                 + offs_dv[None, :] * stride_buf_vdim
@@ -411,7 +419,8 @@ def _extend_attention_fwd(
     v_buffer: torch.Tensor,
     qo_indptr: torch.Tensor,
     prefix_indptr: torch.Tensor,
-    page_table: torch.Tensor,
+    k_page_table: torch.Tensor,
+    v_page_table: torch.Tensor,
     page_table_indptr: torch.Tensor,
     custom_mask: Optional[torch.Tensor],
     mask_indptr: Optional[torch.Tensor],
@@ -434,7 +443,8 @@ def _extend_attention_fwd(
         v_buffer: V view of paged cache [num_pages, num_kv_heads, page_size, head_dim]
         qo_indptr: [batch+1] extend token boundaries
         prefix_indptr: [batch+1] cumulative prefix token counts
-        page_table: [total_pages] physical page IDs
+        k_page_table: [total_pages] physical K page IDs
+        v_page_table: [total_pages] physical V page IDs
         page_table_indptr: [batch+1] cumulative page counts per seq
         custom_mask: Flattened bool mask or None
         mask_indptr: [batch+1] cumulative mask element counts, or None
@@ -467,7 +477,8 @@ def _extend_attention_fwd(
         v_buffer,
         qo_indptr,
         prefix_indptr,
-        page_table,
+        k_page_table,
+        v_page_table,
         page_table_indptr,
         custom_mask,
         mask_indptr,
@@ -526,6 +537,9 @@ def triton_prefill_with_custom_mask(
     custom_mask: Optional[torch.Tensor],
     sm_scale: float,
     window_left: int = -1,
+    k_cache: Optional[torch.Tensor] = None,
+    v_cache: Optional[torch.Tensor] = None,
+    v_page_table_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """Triton prefill attention with optional custom mask and paged KV cache.
 
@@ -558,32 +572,27 @@ def triton_prefill_with_custom_mask(
             A query at position p attends to keys in [p - window_left, p].
             Use (attention_window_size - 1) since TRTLLM window size is
             exclusive while flashinfer/triton convention is inclusive.
+        k_cache: Optional K-only paged cache
+            [num_pages, num_kv_heads, page_size, head_dim]. Use with
+            ``v_cache`` for backends that store K and V in separate pages.
+        v_cache: Optional V-only paged cache with the same shape as
+            ``k_cache``.
+        v_page_table_indices: Optional physical V page IDs. Defaults to
+            ``page_table_indices`` for caches whose K and V share page IDs.
     """
     device = q.device
     num_contexts = qo_indptr.shape[0] - 1
     extend_lens = qo_indptr[1:] - qo_indptr[:-1]
 
-    # Build causal mask when custom_mask is not provided
     total_kv_lens = prefix_lens + extend_lens
+    is_causal = custom_mask is None
     if custom_mask is None:
-        # Generate causal mask: each query at position i attends to
-        # positions [0..prefix_len+i] (all prefix + causal extend)
-        mask_parts = []
-        for seq_idx in range(num_contexts):
-            ext = int(extend_lens[seq_idx].item())
-            pre = int(prefix_lens[seq_idx].item())
-            total = pre + ext
-            # Row i of extend can see columns [0..pre+i]
-            rows = torch.arange(ext, device=device).unsqueeze(1)
-            cols = torch.arange(total, device=device).unsqueeze(0)
-            seq_mask = cols <= (rows + pre)
-            mask_parts.append(seq_mask.reshape(-1))
-        custom_mask = torch.cat(mask_parts)
-
-    # Compute mask_indptr: each seq's mask is [extend_len, prefix_len + extend_len]
-    mask_sizes = extend_lens * total_kv_lens
-    mask_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
-    mask_indptr[1:] = torch.cumsum(mask_sizes, dim=0)
+        mask_indptr = torch.empty(1, dtype=torch.int32, device=device)
+    else:
+        # Each sequence's custom mask is [extend_len, prefix_len + extend_len].
+        mask_sizes = extend_lens * total_kv_lens
+        mask_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
+        mask_indptr[1:] = torch.cumsum(mask_sizes, dim=0)
 
     # Compute prefix_indptr: cumulative prefix token counts
     prefix_indptr = torch.zeros(num_contexts + 1, dtype=torch.int32, device=device)
@@ -595,8 +604,20 @@ def triton_prefill_with_custom_mask(
     # can run tl.dot in BF16.  Only the accessed pages are copied.
     compute_dtype = q.dtype
     if kv_cache is not None:
+        if k_cache is not None or v_cache is not None:
+            raise ValueError("Specify either kv_cache or k_cache/v_cache, not both.")
         k_buffer = kv_cache.select(1, 0)  # [num_pages, num_kv_heads, page_size, head_dim]
         v_buffer = kv_cache.select(1, 1)
+    elif k_cache is not None and v_cache is not None:
+        k_buffer = k_cache
+        v_buffer = v_cache
+    elif k_cache is not None or v_cache is not None:
+        raise ValueError("k_cache and v_cache must be specified together.")
+    else:
+        k_buffer = None
+        v_buffer = None
+
+    if k_buffer is not None and v_buffer is not None:
         if k_buffer.dtype != compute_dtype:
             num_prefix_pages = int(page_table_indptr[-1].item())
             if num_prefix_pages > 0:
@@ -611,6 +632,8 @@ def triton_prefill_with_custom_mask(
         v_buffer = torch.empty(1, num_kv_heads, 1, head_dim, dtype=v.dtype, device=device)
 
     max_len_extend = int(extend_lens.max().item()) if num_contexts > 0 else 0
+    if v_page_table_indices is None:
+        v_page_table_indices = page_table_indices
 
     _extend_attention_fwd(
         q_extend=q,
@@ -621,14 +644,15 @@ def triton_prefill_with_custom_mask(
         v_buffer=v_buffer,
         qo_indptr=qo_indptr,
         prefix_indptr=prefix_indptr,
-        page_table=page_table_indices,
+        k_page_table=page_table_indices,
+        v_page_table=v_page_table_indices,
         page_table_indptr=page_table_indptr,
         custom_mask=custom_mask,
         mask_indptr=mask_indptr,
         max_len_extend=max_len_extend,
         sm_scale=sm_scale,
         page_size=page_size,
-        is_causal=False,
+        is_causal=is_causal,
         logit_cap=0.0,
         skip_prefix_custom_mask=False,
         window_left=window_left,

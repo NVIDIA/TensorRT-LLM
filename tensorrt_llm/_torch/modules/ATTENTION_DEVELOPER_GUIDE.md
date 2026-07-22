@@ -252,7 +252,7 @@ FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
 `thop.attention` runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
+`triton_custom_mask,flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
 `TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
 library exposes `is_available()` for module/static environment checks and
 `is_supported()` for per-forward request checks.
@@ -261,9 +261,16 @@ The FMHA package is split by role:
 
 - `fmha/interface.py` defines the `Fmha` runtime contract.
 - `fmha/phased.py` defines `PhasedFmha`, which handles mixed context/generation
-  requests and dispatches them to phase-specific hooks.
+  requests and can dispatch each phase to a different ordered FMHA provider.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
+- `fmha/triton_custom_mask.py` implements only the Triton custom-mask context
+  phase. In mixed batches, `PhasedFmha` delegates generation to the next
+  supporting provider, normally `FlashInferTrtllmGenFmha`. The mask data covers
+  context requests only; generation uses causal semantics. H512 context uses
+  the same fused C++ QKV preprocessing and paged-KV append as smaller heads.
+  Q-only KV-shared generation still uses the explicit paged-KV path and launches
+  the trtllm-gen decode kernel directly without a FlashInfer decode wrapper.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
 - `fmha/registry.py` owns `TLLM_FMHA_LIBS` parsing and library ordering.
 

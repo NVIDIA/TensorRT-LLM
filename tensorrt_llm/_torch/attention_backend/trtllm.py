@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend.fmha import (
-    Fmha, get_enabled_fmha_lib_classes)
+    Fmha, PhasedFmha, get_enabled_fmha_lib_classes)
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -302,7 +302,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                         pin_memory=prefer_pinned())
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
-
         if self.workspace is None:
             self.workspace = torch.empty(
                 (0, ),
@@ -1489,6 +1488,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fmha_cls.is_available(self):
                 self.fmha_libs.append(fmha_cls(self))
 
+        phased_fmhas = [
+            fmha for fmha in self.fmha_libs if isinstance(fmha, PhasedFmha)
+        ]
+        for index, fmha in enumerate(phased_fmhas):
+            fmha.set_followup_fmhas(tuple(phased_fmhas[index + 1:]))
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1766,7 +1771,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.create_fmha_libs()
 
         for fmha in self.fmha_libs:
-            if fmha.is_supported(q, k, v, metadata, forward_args):
+            if isinstance(fmha, PhasedFmha):
+                if fmha.try_forward(q, k, v, metadata, forward_args):
+                    break
+            elif fmha.is_supported(q, k, v, metadata, forward_args):
                 fmha.forward(q, k, v, metadata, forward_args)
                 break
         else:

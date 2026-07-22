@@ -768,7 +768,7 @@ class TestGemma4HFComparison(unittest.TestCase):
             f"{failed * 100:.2f}% of elements differ (max {max_failed_frac * 100}%)",
         )
 
-    def _make_hf_and_trt_models(self, config_dict=None):
+    def _make_hf_and_trt_models(self, config_dict=None, attn_backend="FLASHINFER"):
         """Create paired HF and TRT-LLM models with shared weights."""
         from transformers import Gemma4ForCausalLM as HFGemma4
 
@@ -782,7 +782,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         device = torch.device("cuda")
 
         hf_model = HFGemma4(config).to(dtype).to(device).eval()
-        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model_config = ModelConfig(pretrained_config=config, attn_backend=attn_backend)
         trt_model = Gemma4ForCausalLM(model_config).to(dtype).to(device)
 
         wm = Gemma4HfWeightMapper()
@@ -891,6 +891,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         atol=0.5,
         rtol=0.5,
         max_failed_frac=0.01,
+        attn_backend="FLASHINFER",
     ):
         """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
@@ -899,13 +900,15 @@ class TestGemma4HFComparison(unittest.TestCase):
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
-        hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
+        hf, trt, gemma4_config = self._make_hf_and_trt_models(
+            config_dict, attn_backend=attn_backend
+        )
         if gemma4_config.enable_moe_block:
             self._stabilize_moe_routing(hf, trt, gemma4_config)
         hf_cache = DynamicCache()
 
         device = torch.device("cuda")
-        backend = "FLASHINFER"
+        backend = attn_backend
 
         # Set up KV cache
         kv_cache_manager = self._get_kv_cache_manager(gemma4_config)
@@ -1005,6 +1008,14 @@ class TestGemma4HFComparison(unittest.TestCase):
     def test_hybrid_headdim_config(self):
         """Hybrid head_dim: sliding=64, full=128 (per-layer KV cache)."""
         self._run_full_model_comparison(deepcopy(GEMMA4_HYBRID_HEADDIM_CONFIG))
+
+    @torch.no_grad()
+    def test_hybrid_headdim_config_trtllm(self):
+        """TRTLLM backend parity for hybrid sliding/full head dimensions."""
+        self._run_full_model_comparison(
+            deepcopy(GEMMA4_HYBRID_HEADDIM_CONFIG),
+            attn_backend="TRTLLM",
+        )
 
     @torch.no_grad()
     def test_diff_kv_heads_config(self):
@@ -2152,20 +2163,12 @@ class TestGemma4HFComparison(unittest.TestCase):
 class TestGemma4ModelDefaults(unittest.TestCase):
     """Tests for Gemma4 model defaults (get_model_defaults)."""
 
-    def test_causal_lm_requires_flashinfer_backend(self):
-        """Gemma4ForCausalLM must default to FLASHINFER attention backend.
-
-        The TRTLLM backend does not support:
-        - FlashInfer VSWA per-pool page management for hybrid head_dim
-        - trtllm-gen cubin dispatch for head_dim=512 layers
-        - Custom attention masks for bidirectional multimodal tokens
-        Without this default, models crash with:
-            'TrtllmAttentionMetadata' object has no attribute 'kv_layout'
-        """
+    def test_causal_lm_requires_trtllm_backend(self):
+        """Gemma4ForCausalLM must default to the TRTLLM attention backend."""
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         self.assertIn("attn_backend", defaults, "get_model_defaults must set attn_backend")
         self.assertEqual(
-            defaults["attn_backend"], "FLASHINFER", "Gemma4 requires FLASHINFER (exact uppercase)"
+            defaults["attn_backend"], "TRTLLM", "Gemma4 requires TRTLLM (exact uppercase)"
         )
 
     def test_causal_lm_does_not_disable_cuda_graphs(self):
@@ -2173,13 +2176,13 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         self.assertNotIn("cuda_graph_config", defaults)
 
-    def test_conditional_gen_requires_flashinfer_backend(self):
-        """Gemma4ForConditionalGeneration must also default to FLASHINFER."""
+    def test_conditional_gen_requires_trtllm_backend(self):
+        """Gemma4ForConditionalGeneration must also default to TRTLLM."""
         from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
 
         defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
         self.assertIn("attn_backend", defaults)
-        self.assertEqual(defaults["attn_backend"], "FLASHINFER")
+        self.assertEqual(defaults["attn_backend"], "TRTLLM")
 
     def test_conditional_gen_does_not_disable_cuda_graphs(self):
         """Gemma4ForConditionalGeneration must not disable CUDA graphs."""
@@ -2188,34 +2191,21 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         defaults = Gemma4ForConditionalGeneration.get_model_defaults(None)
         self.assertNotIn("cuda_graph_config", defaults)
 
-    def test_attn_backend_dispatches_to_flashinfer(self):
-        """Verify the exact string 'FLASHINFER' dispatches correctly.
-
-        get_attention_backend uses exact case-sensitive match. 'FlashInfer'
-        or 'flashinfer' would silently fall back to TrtllmAttention, which
-        causes 'TrtllmAttentionMetadata has no attribute kv_layout' crashes.
-        """
+    def test_attn_backend_dispatches_to_trtllm(self):
+        """Verify the Gemma4 default dispatches to TrtllmAttention."""
         from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         backend_cls = get_attention_backend(defaults["attn_backend"])
 
-        # Must be FlashInferAttention, not TrtllmAttention
         self.assertEqual(
             backend_cls.__name__,
-            "FlashInferAttention",
-            "FLASHINFER must dispatch to FlashInferAttention",
+            "TrtllmAttention",
+            "TRTLLM must dispatch to TrtllmAttention",
         )
 
-    def test_all_layers_use_trtllm_gen(self):
-        """All Gemma4 layers use trtllm-gen backend uniformly.
-
-        trtllm-gen has pre-compiled cubins for H256+H512, both BF16 and
-        FP8 dtypes.  For FP8 KV cache (NVFP4), the FlashInfer backend
-        casts Q to FP8 to match KV, enabling QkvE4m3OBfloat16 context
-        cubins.  Uniform backend is required for CUDA graph workspace
-        sharing safety.
-        """
+    def test_all_layers_use_trtllm_backend(self):
+        """All Gemma4 layers use the default TRTLLM attention backend."""
         config_dict = deepcopy(GEMMA4_SMALL_CONFIG)
         config = Gemma4TextConfig(**config_dict)
         model_config = ModelConfig(pretrained_config=config)
@@ -2223,9 +2213,9 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         for i in range(config.num_hidden_layers):
             attn = Gemma4Attention(model_config, i)
             self.assertEqual(
-                attn.attn.flashinfer_backend,
-                "trtllm-gen",
-                f"Layer {i} should use trtllm-gen",
+                attn.attn.__class__.__name__,
+                "TrtllmAttention",
+                f"Layer {i} should use the TRTLLM backend",
             )
 
 
