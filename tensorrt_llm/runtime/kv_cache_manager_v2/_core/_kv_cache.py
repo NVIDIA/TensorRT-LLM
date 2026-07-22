@@ -1551,6 +1551,7 @@ class _KVCache:
             event_manager = self.manager.event_manager
             if event_manager is not None:
                 event_manager.add_stored_block_event_from_block(tree_block)
+        tree_block.remove_redundant_covered_siblings()
 
     def _commit_block(
         self,
@@ -1672,6 +1673,8 @@ class _KVCache:
             self._snapshot_ssm_to_tree_block(
                 tree_block, ssm_lc_id, start + num_tokens, move=move_ssm
             )
+        if did_commit:
+            tree_block.remove_redundant_covered_siblings()
 
         if seq_block.is_committed:
             for lc_idx, lc in self.manager._life_cycles.attention_life_cycles():
