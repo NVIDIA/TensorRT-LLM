@@ -30,7 +30,10 @@ from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, Tunabl
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
-from tensorrt_llm._torch.models.modeling_deepseekv4 import _resolve_enable_fused_hc
+from tensorrt_llm._torch.models.modeling_deepseekv4 import (
+    DeepseekV4ForCausalLM,
+    _resolve_enable_fused_hc,
+)
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -82,6 +85,18 @@ def test_dsv4_fused_oproj_requires_split_output_consumer(
     )
 
     assert MLA._should_use_fused_oproj(module) is expected
+
+
+def test_dsv4_deep_gemm_ob_warmup_skips_cute_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = SimpleNamespace(_should_use_fused_oproj=lambda: True)
+
+    monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
+    assert MLA._should_warmup_dsv4_deep_gemm_ob(module)
+
+    monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
+    assert not MLA._should_warmup_dsv4_deep_gemm_ob(module)
 
 
 @pytest.mark.parametrize(
@@ -234,7 +249,7 @@ def test_dsv4_ob_cute_compile_key_excludes_runtime_shapes() -> None:
 
 
 def test_dsv4_ob_tuning_input_hook_restores_packed_scale_layout() -> None:
-    m, n, k, packed_k = 37, 128, 512, 1
+    m, n, k, packed_k = 37, 128, 1024, 2
     inputs = [
         torch.empty((m, k), dtype=torch.float8_e4m3fn),
         torch.empty((m, packed_k), dtype=torch.int32),
@@ -247,7 +262,97 @@ def test_dsv4_ob_tuning_input_hook_restores_packed_scale_layout() -> None:
 
     assert prepared[1].shape == (m, packed_k)
     assert prepared[1].stride() == (1, 40)
+    assert prepared[1].untyped_storage().nbytes() == 40 * packed_k * 4
     assert prepared[4] is inputs[4]
+
+
+def test_dsv4_deep_gemm_ob_warmup_uses_startup_autotuner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm import deep_gemm
+
+    weight = torch.empty((128, 512), device="meta", dtype=torch.float8_e4m3fn)
+    weight_scale = torch.empty((128, 1), device="meta", dtype=torch.int32)
+    tuning_calls = []
+    gemm_calls = []
+
+    def choose_one(custom_op, runners, tuning_config, inputs):
+        tuning_calls.append((custom_op, runners, tuning_config, inputs))
+
+    def deep_gemm_nt(a, b, output, **kwargs):
+        gemm_calls.append((a, b, output, kwargs))
+
+    tuner = SimpleNamespace(is_tuning_mode=True, choose_one=choose_one)
+    monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
+    monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", deep_gemm_nt)
+    cute_dsl_custom_ops.warmup_dsv4_deep_gemm_ob(weight, weight_scale, torch.bfloat16, 37)
+
+    assert len(tuning_calls) == 1
+    custom_op, runners, tuning_config, inputs = tuning_calls[0]
+    assert custom_op == "trtllm::dsv4_deep_gemm_ob::startup_warmup"
+    runner = runners[0]
+    assert isinstance(runner, cute_dsl_custom_ops.Dsv4DeepGemmObWarmupRunner)
+    assert runner.get_valid_tactics([], OptimizationProfile()) == [0]
+    assert tuning_config.exclude_from_cache
+    assert tuning_config.inputs_pre_hook is cute_dsl_custom_ops._prepare_dsv4_ob_tuning_inputs
+    assert tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets(8192) == tuple(
+        range(8, 128, 8)
+    ) + tuple(range(128, 8192, 128))
+    assert inputs[0].shape == (37, 512)
+    assert inputs[1].shape == (37, 1)
+    assert inputs[1].stride() == (1, 40)
+    assert inputs[1].untyped_storage().nbytes() == 40 * 4
+    assert inputs[2] is weight
+    assert inputs[3] is weight_scale
+    assert inputs[4].shape == (37, 128)
+
+    assert runner(inputs, tactic=0) is inputs[4]
+    assert len(gemm_calls) == 1
+    assert gemm_calls[0][0][0] is inputs[0]
+    assert gemm_calls[0][0][1] is inputs[1]
+    assert gemm_calls[0][1][0] is inputs[2]
+    assert gemm_calls[0][1][1] is inputs[3]
+    assert gemm_calls[0][2] is inputs[4]
+    assert gemm_calls[0][3] == {"c": None, "disable_ue8m0_cast": False}
+
+
+def test_dsv4_model_warmup_deduplicates_deep_gemm_signatures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def make_attention(enabled: bool = True):
+        return SimpleNamespace(
+            _should_warmup_dsv4_deep_gemm_ob=lambda: enabled,
+            o_b_proj=SimpleNamespace(
+                weight=torch.empty((128, 512), device="meta", dtype=torch.float8_e4m3fn),
+                weight_scale=torch.empty((1, 4), device="meta"),
+            ),
+            dtype=torch.bfloat16,
+        )
+
+    first = make_attention()
+    duplicate = make_attention()
+    disabled = make_attention(enabled=False)
+    module = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=first),
+                SimpleNamespace(self_attn=duplicate),
+                SimpleNamespace(self_attn=disabled),
+            ]
+        )
+    )
+    calls = []
+
+    def warmup(weight, weight_scale, output_dtype, max_num_tokens):
+        calls.append((weight, weight_scale, output_dtype, max_num_tokens))
+
+    monkeypatch.setattr(cute_dsl_custom_ops, "warmup_dsv4_deep_gemm_ob", warmup)
+    DeepseekV4ForCausalLM.warmup_dsv4_fused_ob(module, 8192)
+
+    assert len(calls) == 1
+    assert calls[0][0] is first.o_b_proj.weight
+    assert calls[0][1] is first.o_b_proj.weight_scale
+    assert calls[0][2:] == (torch.bfloat16, 8192)
 
 
 def _check_dsv4_oa_fp8out_tensor_contract() -> None:
@@ -445,12 +550,16 @@ def test_dsv4_ob_uses_deep_gemm_fallback(
     def fail_transform(*args, **kwargs):
         raise AssertionError("DeepGEMM fallback must not transform the weight scale")
 
+    def fail_autotuner(*args, **kwargs):
+        raise AssertionError("DeepGEMM inference must not consult AutoTuner")
+
     if enable_cute:
         monkeypatch.setenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", "1")
     else:
         monkeypatch.delenv("TRTLLM_DSV4_ENABLE_CUTE_DSL_OB_PROJ", raising=False)
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", deep_gemm_nt)
     monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", fail_transform)
+    monkeypatch.setattr(AutoTuner, "get", fail_autotuner)
     monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", fail_cute)
     output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
 
