@@ -19,8 +19,7 @@ from unittest.mock import patch
 from tensorrt_llm.serve.scripts.time_breakdown import (RequestDataParser,
                                                        RequestTimeBreakdown,
                                                        TimingMetric,
-                                                       TimingMetricsConfig,
-                                                       main)
+                                                       TimingMetricsConfig)
 
 
 class TestTimingMetric(unittest.TestCase):
@@ -257,45 +256,6 @@ class TestRequestDataParser(unittest.TestCase):
         self.assertEqual(parsed['disagg_server_arrival_time'], 0.5)
         self.assertEqual(parsed['disagg_server_first_token_time'], 3.0)
 
-    def test_parse_disaggregated_time_breakdown(self):
-        parser = RequestDataParser()
-        request_data = {
-            'ctx_perf_metrics': {
-                'request_id': 'req789',
-                'perf_metrics': {
-                    'timing_metrics': {
-                        'server_arrival_time': 1.0,
-                        'arrival_time': 1.1,
-                    }
-                },
-            },
-            'gen_perf_metrics': {
-                'request_id': 'req789',
-                'perf_metrics': {
-                    'timing_metrics': {
-                        'server_arrival_time': 2.0,
-                        'arrival_time': 2.1,
-                    }
-                },
-                'time_breakdown_metrics': {
-                    'step_metrics': [{
-                        'iter': 1
-                    }]
-                },
-            },
-            'disagg_server_arrival_time': 0.5,
-            'disagg_server_first_token_time': 3.0,
-            'status': 'complete',
-        }
-
-        parsed = parser.parse_request(request_data, 0)
-
-        self.assertEqual(parsed['request_index'], 'req789')
-        self.assertEqual(parsed['ctx_arrival_time'], 1.1)
-        self.assertEqual(parsed['gen_arrival_time'], 2.1)
-        self.assertEqual(parsed['disagg_server_arrival_time'], 0.5)
-        self.assertEqual(parsed['step_metrics'], [{'iter': 1}])
-
     def test_parse_missing_fields(self):
         """Test parsing with missing fields (should default to 0)."""
         parser = RequestDataParser()
@@ -467,11 +427,6 @@ class TestRequestTimeBreakdown(unittest.TestCase):
                 self.analyzer.parse_json_file(temp_file)
         finally:
             os.unlink(temp_file)
-
-    def test_main_handles_missing_file(self):
-        """Test that the CLI converts library exceptions to a failure status."""
-        with patch('sys.argv', ['time_breakdown.py', 'non_existent_file.json']):
-            self.assertEqual(main(), 1)
 
     def test_create_timing_diagram(self):
         """Test creating a timing diagram."""

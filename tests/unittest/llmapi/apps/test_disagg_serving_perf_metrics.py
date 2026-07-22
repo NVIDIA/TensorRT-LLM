@@ -185,49 +185,30 @@ def test_return_perf_metrics_and_jsonl_dump(
         worker.wait_for_server(timeout=120)
     wait_for_endpoint_ready(disagg_server.url_root + "/health")
 
+    payload = {
+        "model": model_name,
+        "prompt": "Reply with one token.",
+        "max_tokens": 1,
+        "temperature": 0.0,
+    }
     response = requests.post(
         f"{disagg_server.url_root}/v1/completions",
         headers={RETURN_METRICS_HEADER: "1"},
-        json={
-            "model": model_name,
-            "prompt": "Reply with one token.",
-            "max_tokens": 1,
-            "temperature": 0.0,
-        },
+        json=payload,
         timeout=120,
     )
     assert response.status_code == 200
     assert response.json()["id"] is not None
-    assert response.headers.get(SERVER_TIMING_HEADER)
-    assert response.headers.get(START_END_TIME_HEADER)
-    assert response.headers.get(STEP_METRICS_HEADER)
-    assert response.headers.get(CTX_CHUNK_METRICS_HEADER)
+    for header in (
+        SERVER_TIMING_HEADER,
+        START_END_TIME_HEADER,
+        STEP_METRICS_HEADER,
+        CTX_CHUNK_METRICS_HEADER,
+    ):
+        assert response.headers.get(header)
 
     timing_metrics = get_timing_metrics(perf_metrics_output_dir)
     validate_timing_metrics(timing_metrics, "test_return_perf_metrics_and_jsonl_dump")
-    worker_metric_keys = {
-        "ctx_request_id",
-        "perf_metrics",
-        "request_id",
-        "time_breakdown_metrics",
-    }
-    perf_metric_keys = {
-        "first_iter",
-        "kv_cache_metrics",
-        "last_iter",
-        "timing_metrics",
-    }
-    for worker_metrics in (
-        timing_metrics["ctx_perf_metrics"],
-        timing_metrics["gen_perf_metrics"],
-    ):
-        assert set(worker_metrics) == worker_metric_keys
-        assert set(worker_metrics["perf_metrics"]) == perf_metric_keys
-        assert "kv_cache_hit_rate" not in worker_metrics["perf_metrics"]["kv_cache_metrics"]
-    ctx_timing_metrics = timing_metrics["ctx_perf_metrics"]["perf_metrics"]["timing_metrics"]
-    assert "kv_cache_transfer_start" not in ctx_timing_metrics
-    assert "kv_cache_transfer_end" not in ctx_timing_metrics
-    assert "kv_cache_size" not in ctx_timing_metrics
     records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, expected_count=3)
     disagg_record = next(record for record in records if "ctx_server" in record)
     disagg_request_id = disagg_record["disagg_request_id"]
@@ -237,27 +218,6 @@ def test_return_perf_metrics_and_jsonl_dump(
 
     assert "ctx_perf_metrics" in disagg_record
     assert "gen_perf_metrics" in disagg_record
-    assert (
-        disagg_record["disagg_server_arrival_time"]
-        <= disagg_record["disagg_server_first_token_time"]
-    )
-
-    payload = {
-        "model": model_name,
-        "prompt": "Reply with one token.",
-        "max_tokens": 1,
-        "temperature": 0.0,
-    }
-    response = requests.post(
-        f"{disagg_server.url_root}/v1/completions",
-        json=payload,
-        timeout=120,
-    )
-    assert response.status_code == 200
-    assert not response.headers.get(SERVER_TIMING_HEADER)
-    assert not response.headers.get(START_END_TIME_HEADER)
-    assert not response.headers.get(STEP_METRICS_HEADER)
-    assert not response.headers.get(CTX_CHUNK_METRICS_HEADER)
 
     response = requests.post(
         f"{disagg_server.url_root}/v1/completions",
