@@ -5,7 +5,7 @@ Cosmos3 supports four generation modes from a single checkpoint:
 - **T2V** — text-to-video (`prompts/t2v.json`).
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
-- **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
+- **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV). Audio requires an audio-capable checkpoint (Nano / Super); Cosmos3-Edge has no audio tower.
 
 ## Checkpoints
 
@@ -15,6 +15,7 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
+- [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone supporting **T2I / T2V / I2V only**: no audio tower, and the checkpoint's action weights are not supported by this pipeline yet. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 
 ## Guardrails
 
@@ -85,6 +86,12 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step \
 # default come from the checkpoint automatically; defaults are the deployed
 # 720p x 189-frame shape, so no config is required)
 python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step \
+    --prompt "The camera slowly pans right across the scene" \
+    --image_path https://example.com/frame.jpg \
+    --output_path output.mp4
+
+# Cosmos3-Edge image-to-video (480p-native defaults: 832x480 x 121 frames)
+python cosmos3.py --model nvidia/Cosmos3-Edge \
     --prompt "The camera slowly pans right across the scene" \
     --image_path https://example.com/frame.jpg \
     --output_path output.mp4
