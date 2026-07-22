@@ -21,6 +21,7 @@ from tensorrt_llm._torch.modules.linear import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
     FluxJointAttnMLPProj,
@@ -60,17 +61,29 @@ class FluxJointAttention(Attention):
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
+        enable_async_ulysses: bool = True,
     ):
+        config = config or DiffusionModelConfig()
         # Opt in to the fused DiT QK-norm + RoPE kernel (per-head template), but
         # only when TP=1: the fused op asserts tp_size == 1
         # (apply_packed_qk_norm_rope), so under TP>1 we fall back to the unfused
         # F.rms_norm + apply_rotary_emb path. Mirrors WAN's gating.
-        tp_size = config.mapping.tp_size if config and config.mapping else 1
+        tp_size = config.mapping.tp_size if config.mapping else 1
+        vgm = config.visual_gen_mapping
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
+        use_async_ulysses = bool(
+            enable_async_ulysses
+            and added_kv_proj_dim is None
+            and ulysses_size > 1
+            and config.parallel.async_ulysses
+        )
+        qkv_mode = QKVMode.SEPARATE_QKV if use_async_ulysses else QKVMode.FUSE_QKV
+
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=qkv_mode,
             qk_norm=True,
             qk_norm_mode="per_head",
             eps=eps,
@@ -80,8 +93,10 @@ class FluxJointAttention(Attention):
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
+            async_ulysses=use_async_ulysses,
         )
 
+        self._use_async_ulysses = use_async_ulysses
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
 
@@ -256,6 +271,79 @@ class FluxJointAttention(Attention):
             return self._prepare_qkv_fused(hidden_states, encoder_hidden_states, image_rotary_emb)
         return self._prepare_qkv_unfused(hidden_states, encoder_hidden_states, image_rotary_emb)
 
+    def _forward_async_attention(
+        self,
+        hidden_states: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        timestep: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run async Ulysses for single-stream FLUX attention."""
+        if not hasattr(self.attn, "forward_async"):
+            raise ValueError(
+                "FLUX async Ulysses requires UlyssesAttention with async_ulysses=True."
+            )
+
+        batch_size, seq_len = hidden_states.shape[:2]
+        num_heads = self.local_num_attention_heads
+        num_kv_heads = self.local_num_key_value_heads
+        head_dim = self.head_dim
+        # FLUX uses per-head Q/K RMSNorm weights with shape [head_dim]. The
+        # split fused norm+RoPE op only supports full-dim weights
+        # [num_heads * head_dim], so keep the async path on the unfused
+        # per-head norm+RoPE sequence for now.
+
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            qkv_input = hidden_states
+        elif self._maybe_share_qkv_quantize and getattr(self.to_q, "input_scale", None) is not None:
+            x_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+            fp4, sf = torch.ops.trtllm.tunable_fp4_quantize(
+                x_2d, self.to_q.input_scale, self.to_q.scaling_vector_size, False
+            )
+            qkv_input = Fp4QuantizedTensor(fp4, sf, is_sf_swizzled=False)
+        else:
+            qkv_input = hidden_states
+
+        def compute_q():
+            q = self.to_q(qkv_input)
+            if q.dim() == 2:
+                q = q.view(batch_size, seq_len, -1)
+            q = q.view(batch_size, seq_len, num_heads, head_dim)
+            if self.qk_norm:
+                q = F.rms_norm(
+                    q,
+                    (q.shape[-1],),
+                    self.norm_q.weight,
+                    self.norm_q.variance_epsilon,
+                )
+            if image_rotary_emb is not None:
+                q = apply_rotary_emb(q, image_rotary_emb[0], image_rotary_emb[1])
+            return q
+
+        def compute_k():
+            k = self.to_k(qkv_input)
+            if k.dim() == 2:
+                k = k.view(batch_size, seq_len, -1)
+            k = k.view(batch_size, seq_len, num_kv_heads, head_dim)
+            if self.qk_norm:
+                k = F.rms_norm(
+                    k,
+                    (k.shape[-1],),
+                    self.norm_k.weight,
+                    self.norm_k.variance_epsilon,
+                )
+            if image_rotary_emb is not None:
+                k = apply_rotary_emb(k, image_rotary_emb[0], image_rotary_emb[1])
+            return k
+
+        def compute_v():
+            v = self.to_v(qkv_input)
+            if v.dim() == 2:
+                v = v.view(batch_size, seq_len, -1)
+            return v.view(batch_size, seq_len, num_kv_heads, head_dim)
+
+        out = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
+        return out.reshape(out.shape[0], out.shape[1], -1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -279,12 +367,14 @@ class FluxJointAttention(Attention):
         is_dual_stream = encoder_hidden_states is not None and self.added_kv_proj_dim is not None
         txt_seq_len = encoder_hidden_states.shape[1] if is_dual_stream else 0
 
-        query, key, value = self._prepare_qkv(
-            hidden_states, encoder_hidden_states, image_rotary_emb
-        )
-
-        hidden_states = self._attn_impl(query, key, value, timestep=timestep)
-        hidden_states = hidden_states.to(query.dtype)
+        if self._use_async_ulysses and not is_dual_stream:
+            hidden_states = self._forward_async_attention(hidden_states, image_rotary_emb, timestep)
+        else:
+            query, key, value = self._prepare_qkv(
+                hidden_states, encoder_hidden_states, image_rotary_emb
+            )
+            hidden_states = self._attn_impl(query, key, value, timestep=timestep)
+            hidden_states = hidden_states.to(query.dtype)
 
         if is_dual_stream:
             encoder_hidden_states_out, hidden_states = hidden_states.split(
@@ -351,6 +441,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
+            enable_async_ulysses=False,
         )
 
         # Output projection needs FULL dims (ROW parallel divides internally)
