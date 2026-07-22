@@ -34,11 +34,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
-from .defaults import (
-    COSMOS3_ENVELOPES,
-    COSMOS3_EXTRA_SPECS,
-    COSMOS3_GENERATION_DEFAULTS,
-)
+from .defaults import COSMOS3_ENVELOPES, COSMOS3_EXTRA_SPECS, COSMOS3_GENERATION_DEFAULTS
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sampling import Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
@@ -56,6 +52,19 @@ COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolut
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+
+
+def _validate_temporal_compression(transformer, vae_scale_factor_temporal: int) -> None:
+    """A config-declared temporal compression factor must match the VAE."""
+    if (
+        getattr(transformer, "temporal_compression_factor_declared", False)
+        and transformer.temporal_compression_factor != vae_scale_factor_temporal
+    ):
+        raise ValueError(
+            f"Transformer config declares temporal_compression_factor="
+            f"{transformer.temporal_compression_factor}, but the VAE reports "
+            f"scale_factor_temporal={vae_scale_factor_temporal}."
+        )
 
 
 @register_pipeline(
@@ -100,6 +109,22 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def _mode_params(self, mode: str) -> dict:
         """Generation default table for this checkpoint family and request mode."""
         return COSMOS3_GENERATION_DEFAULTS[(self.family, mode)]
+
+    def _resolve_generation_params(self, mode: str, **values) -> dict:
+        """Fill None values: sampling-policy overrides win, then the mode
+        table, then the video table (for fields the image table omits)."""
+        mode_params = self._mode_params(mode)
+        video_params = self._mode_params("video")
+        sampling_overrides = self.sampling.generation_default_overrides()
+        resolved = {}
+        for key, value in values.items():
+            if value is None:
+                if key in sampling_overrides:
+                    value = sampling_overrides[key]
+                else:
+                    value = mode_params.get(key, video_params.get(key))
+            resolved[key] = value
+        return resolved
 
     def _log_envelope_advisory(
         self,
@@ -210,15 +235,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             self.vae_scale_factor_spatial = getattr(
                 self.vae.config, "scale_factor_spatial", self.vae_scale_factor_spatial
             )
-            if (
-                getattr(self.transformer, "temporal_compression_factor_declared", False)
-                and self.transformer.temporal_compression_factor != self.vae_scale_factor_temporal
-            ):
-                raise ValueError(
-                    f"Transformer config declares temporal_compression_factor="
-                    f"{self.transformer.temporal_compression_factor}, but the VAE reports "
-                    f"scale_factor_temporal={self.vae_scale_factor_temporal}."
-                )
+            _validate_temporal_compression(self.transformer, self.vae_scale_factor_temporal)
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -763,23 +780,23 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_t2i = output_type == "image"
 
         mode_params = self._mode_params(output_type)
-        video_params = self._mode_params("video")
-        sampling_overrides = self.sampling.generation_default_overrides()
-
-        def _resolved(value, key):
-            if value is not None:
-                return value
-            if key in sampling_overrides:
-                return sampling_overrides[key]
-            return mode_params.get(key, video_params.get(key))
-
-        height = _resolved(height, "height")
-        width = _resolved(width, "width")
-        num_frames = _resolved(num_frames, "num_frames")
-        num_inference_steps = _resolved(num_inference_steps, "num_inference_steps")
-        guidance_scale = _resolved(guidance_scale, "guidance_scale")
-        max_sequence_length = _resolved(max_sequence_length, "max_sequence_length")
-        frame_rate = _resolved(frame_rate, "frame_rate")
+        resolved = self._resolve_generation_params(
+            output_type,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            max_sequence_length=max_sequence_length,
+            frame_rate=frame_rate,
+        )
+        height = resolved["height"]
+        width = resolved["width"]
+        num_frames = resolved["num_frames"]
+        num_inference_steps = resolved["num_inference_steps"]
+        guidance_scale = resolved["guidance_scale"]
+        max_sequence_length = resolved["max_sequence_length"]
+        frame_rate = resolved["frame_rate"]
 
         self.sampling.validate_request(num_inference_steps, guidance_scale)
 

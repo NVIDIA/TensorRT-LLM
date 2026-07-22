@@ -25,7 +25,7 @@ from diffusers.models.embeddings import TimestepEmbedding
 from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -110,7 +110,9 @@ def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
             "hidden_act": ("relu2",),
             "qk_norm_for_text": (False,),
             "use_und_k_norm_for_gen": (True,),
-            "sound_gen": (None, False),
+            "sound_gen": (False,),
+            "attention_bias": (False,),
+            "rms_norm_eps": (1e-5,),
         }
     else:
         raise ValueError(
@@ -124,6 +126,36 @@ def resolve_arch_recipe(pretrained_config) -> Cosmos3ArchRecipe:
             raise ValueError(
                 f"Cosmos3 config contradicts the {recipe.name!r} recipe: "
                 f"{key}={actual!r}, expected one of {allowed}."
+            )
+
+    # Latent-geometry invariants are validated for the Edge recipe only: every
+    # published Edge checkpoint declares 48/2, so a different value means a
+    # wrong or corrupt config. The qwen3 recipe is left unchecked because
+    # long-standing reduced-dimension test fixtures build it with tiny latent
+    # channels; real qwen3 checkpoints are protected by weight-shape checks.
+    if recipe is NEMOTRON_DENSE_RECIPE:
+        invariants = {"latent_channel": 48, "latent_patch_size": 2}
+        for key, expected in invariants.items():
+            actual = getattr(pretrained_config, key, None)
+            if actual != expected:
+                raise ValueError(
+                    f"Unsupported Cosmos3 Edge transformer config: {key}={actual!r}, "
+                    f"expected {expected}."
+                )
+
+    # A declared patch_latent_dim must agree with the latent geometry it is
+    # derived from (the transformer recomputes it and would silently ignore an
+    # inconsistent declaration).
+    declared_patch_dim = getattr(pretrained_config, "patch_latent_dim", None)
+    latent_channel = getattr(pretrained_config, "latent_channel", None)
+    latent_patch_size = getattr(pretrained_config, "latent_patch_size", None)
+    if None not in (declared_patch_dim, latent_channel, latent_patch_size):
+        expected_patch_dim = (latent_patch_size**2) * latent_channel
+        if declared_patch_dim != expected_patch_dim:
+            raise ValueError(
+                f"Inconsistent Cosmos3 transformer config: patch_latent_dim="
+                f"{declared_patch_dim}, but latent_patch_size**2 * latent_channel = "
+                f"{expected_patch_dim}."
             )
 
     return recipe
@@ -357,10 +389,13 @@ class Cosmos3CausalAttention(Attention):
             module_name=module_name,
             enable_sequence_parallel=False,
         )
+        # Attention Q/K norms run the fp32-weight-multiply flavor in both
+        # recipes (this path has always been F.rms_norm); only the layernorms
+        # differ per recipe.
         eps = model_config.pretrained_config.rms_norm_eps
         if recipe.und_qk_norm:
-            self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
-            self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+            self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+            self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         else:
             self.norm_q = None
             self.norm_k = None
@@ -375,9 +410,7 @@ class Cosmos3CausalAttention(Attention):
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
         if self.norm_q is None:
             return q, k
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
-        return q, k
+        return self.norm_q(q), self.norm_k(k)
 
     def forward_with_kv(
         self,
@@ -442,6 +475,7 @@ class Cosmos3CrossAttention(Attention):
         num_key_value_heads: int,
         head_dim: int,
         model_config: DiffusionModelConfig,
+        recipe: Cosmos3ArchRecipe,
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
@@ -466,15 +500,15 @@ class Cosmos3CrossAttention(Attention):
         )
         model_config.attention.backend = original_backend
 
+        # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
+        # fp32-weight-multiply in both recipes.
         eps = model_config.pretrained_config.rms_norm_eps
-        self.norm_q = Qwen3VLTextRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
-        self.norm_k = Qwen3VLTextRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
-        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
-        return q, k
+        return self.norm_q(q), self.norm_k(k)
 
     def forward(
         self,
@@ -651,6 +685,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             num_key_value_heads=model_config.pretrained_config.num_key_value_heads,
             head_dim=model_config.pretrained_config.head_dim,
             model_config=model_config,
+            recipe=recipe,
             layer_idx=layer_idx,
             module_name=f"layers.{layer_idx}.cross_attention",
         )
@@ -860,8 +895,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
         self.temporal_compression_factor_declared = (
-            getattr(model_config.pretrained_config, "temporal_compression_factor", None)
-            is not None
+            getattr(model_config.pretrained_config, "temporal_compression_factor", None) is not None
         )
         pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
         self.recipe = resolve_arch_recipe(pretrained_config)
@@ -1454,16 +1488,34 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         }
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
-        for param_name, param in self._parameters.items():
-            if param is not None and param_name in remapped:
-                param.data.copy_(remapped[param_name].to(param.dtype))
-
-        # Coverage is default-fail: every parameter of every constructed module
-        # must receive a checkpoint tensor; the remap-stage skip list above is
-        # the only source of intentional omissions.
+        # Coverage is default-fail in both directions: every parameter of every
+        # constructed module must receive a checkpoint tensor, and every mapped
+        # checkpoint tensor must land on a parameter. The remap-stage skip list
+        # above is the only source of intentional omissions.
         missing = []
+        consumed = set()
+
+        for param_name, param in self._parameters.items():
+            if param is None:
+                continue
+            if param_name in remapped:
+                param.data.copy_(remapped[param_name].to(param.dtype))
+                consumed.add(param_name)
+            else:
+                missing.append(param_name)
+
+        def _linear_source_prefixes(module: Linear, name: str) -> list:
+            weights_config = getattr(module, "weights_loading_config", None)
+            weight_mode = getattr(weights_config, "weight_mode", None)
+            if weight_mode in (WeightMode.FUSED_QKV_LINEAR, WeightMode.FUSED_GATE_UP_LINEAR):
+                parent = name.rsplit(".", 1)[0]
+                for suffix, sources in loader.params_map.items():
+                    if name == suffix or name.endswith("." + suffix):
+                        return [f"{parent}.{source}." for source in sources]
+            return [f"{name}."]
+
         for name, module in self.named_modules():
-            if len(module._parameters) == 0:
+            if not name or len(module._parameters) == 0:
                 continue
 
             if isinstance(module, Linear):
@@ -1472,6 +1524,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 # source is absent, so a partially covered fusion also fails.
                 if weight_dicts and all(weight_dicts):
                     loader.load_linear_weights(module, name, weight_dicts)
+                    prefixes = _linear_source_prefixes(module, name)
+                    consumed.update(k for k in remapped if any(k.startswith(p) for p in prefixes))
                 else:
                     missing.append(f"{name}(Linear)")
             else:
@@ -1481,7 +1535,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         continue
                     if param_name in module_weights:
                         param.data.copy_(module_weights[param_name].to(param.dtype))
-                    elif name:
+                        consumed.add(f"{name}.{param_name}")
+                    else:
                         missing.append(f"{name}.{param_name}")
 
         if missing:
@@ -1491,10 +1546,19 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 f"Cosmos3 checkpoint is missing weights for {len(missing)} constructed "
                 f"parameter(s)/module(s): {preview}{suffix}"
             )
+        unconsumed = [k for k in remapped if k not in consumed]
+        if unconsumed:
+            preview = ", ".join(unconsumed[:10])
+            suffix = " ..." if len(unconsumed) > 10 else ""
+            logger.warning(
+                f"{len(unconsumed)} mapped checkpoint tensor(s) matched no constructed "
+                f"parameter: {preview}{suffix}"
+            )
         if skipped_keys:
             logger.info(
                 f"Skipped {len(skipped_keys)} intentionally unused checkpoint tensors "
-                f"(lm_head / und final norm / action heads)."
+                f"(lm_head / und final norm / action heads): "
+                f"{', '.join(sorted(set(k.split('.')[0] for k in skipped_keys)))}"
             )
 
     def post_load_weights(self) -> None:
