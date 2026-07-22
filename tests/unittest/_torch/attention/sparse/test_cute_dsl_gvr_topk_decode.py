@@ -224,6 +224,10 @@ def _tie_aware_check(
         (torch.bfloat16, 1024),
         (torch.float16, 1024),
         (torch.float32, 2048),
+        # fp32 K=512/1024 exercise the P4 pipeline levers (p4_rs_rw_search /
+        # p4_fine_skip / p4_peer_push), which default ON for float32.
+        (torch.float32, 512),
+        (torch.float32, 1024),
     ],
 )
 @pytest.mark.parametrize("N", [4096, 65536])
@@ -433,6 +437,60 @@ def test_cute_dsl_gvr_topk_multi_cta_shortrow_degrade_boundary(dtype, top_k, clu
     )
     torch.cuda.synchronize()
     _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio)
+
+
+# ===========================================================================
+# P4 pipeline levers (fp32 default-ON): tie-cluster fallback coverage.
+#
+# p4_fine_skip replaces the fine recursion with a collect + rank select only
+# when the straddling coarse bin holds <= 128 candidates. A 301-wide tie
+# cluster straddling the K-th rank pushes cnt above 128 and must take the
+# unchanged fallback path (fine recursion + exact tail repair). Kept mild on
+# purpose: massive plateaus (e.g. 60% of the row at one value) sit on the
+# kernel's pre-existing giant-tie undershoot contract boundary and are not a
+# valid exactness fixture for ANY flag configuration.
+# ===========================================================================
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+def test_cute_dsl_gvr_topk_p4_fine_skip_tie_cluster_fallback(top_k, cluster_size):
+    """A 301-value tie straddling the K-th rank forces cnt[b*] > 128 ->
+    the p4_fine_skip fallback (original fine recursion + exact tail) under
+    fp32 defaults; output stays a valid tie-aware top-K."""
+    N = 65536
+    batch_size = 2
+    g = torch.Generator(device="cuda").manual_seed(20260722)
+    logits = torch.randn(batch_size, N, dtype=torch.float32, device="cuda", generator=g)
+    for i in range(batch_size):
+        order = logits[i].argsort(descending=True)
+        kth = logits[i, order[top_k]].item()
+        tie_idx = order[top_k - 150 : top_k + 151]
+        logits[i, tie_idx] = kth  # 301-way tie straddling rank K
+    seq_lens = torch.full((batch_size,), N, dtype=torch.int32, device="cuda")
+    pre_idx = (
+        torch.arange(top_k, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .clone()
+    )
+    for i in range(batch_size):
+        pre_idx[i, 0] = int(logits[i].argmax().item())
+
+    out_indices = torch.empty(batch_size, top_k, dtype=torch.int32, device="cuda")
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=1,
+        compress_ratio=1,
+        cluster_size=cluster_size,
+    )
+    torch.cuda.synchronize()
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
 
 
 # ===========================================================================
