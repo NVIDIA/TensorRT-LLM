@@ -340,3 +340,103 @@ def test_fused_qk_norm_rope_gemma_mrope(
     )
 
     torch.testing.assert_close(output, ref_output, rtol=5e-2, atol=1e-1)
+
+
+# FP8 out-variant coverage. Includes an M3-like GQA shape (8 Q / 1 KV, head_dim
+# 128) so the MiniMax-M3 FP8-KV path geometry is exercised directly.
+fp8_num_heads_groups = [
+    (16, 8, 8),
+    (32, 8, 8),
+    (8, 1, 1),  # MiniMax-M3 sharded GQA (num_heads=8, num_kv_heads=1)
+]
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads_group", fp8_num_heads_groups)
+@pytest.mark.parametrize("num_tokens", [1, 3, 8, 256])
+@pytest.mark.parametrize("is_neox", [False, True])
+@pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
+def test_fused_qk_norm_rope_to_fp8(
+    head_dim, num_heads_group, num_tokens, partial_rotary_factor, is_neox
+):
+    """Test the FP8 out-variant of fused QK RMSNorm + RoPE.
+
+    The op reads a BF16 qkv, applies RMSNorm + RoPE to Q/K and copy-casts V, and
+    returns a new FP8 (E4M3) tensor, folding the FP8 activation-quant into the
+    norm+RoPE epilogue. Verifies:
+      1. The input qkv is left untouched (out-of-place).
+      2. Output dtype is FP8 E4M3 with the same shape.
+      3. The dequantized output matches the BF16 fused reference (Q/K normed+roped,
+         V unchanged) within FP8-appropriate tolerance.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads_q, num_heads_k, num_heads_v = num_heads_group
+    hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+
+    torch.random.manual_seed(0)
+    qkv = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    qkv_ref = qkv.clone()
+
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device) + 100
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+
+    eps = 1e-5
+    base = 10000.0
+    factor, low, high, attention_factor = 1.0, 0, 0, 1.0
+    rotary_dim = int(head_dim * partial_rotary_factor)
+
+    out_fp8 = torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        True,  # is_qk_norm
+        False,  # use_gemma (standard RMSNorm reference below)
+        False,  # use_mrope (plain RoPE)
+        0,  # mrope_section1
+        0,  # mrope_section2
+    )
+
+    assert out_fp8.dtype == torch.float8_e4m3fn
+    assert tuple(out_fp8.shape) == (num_tokens, hidden_size)
+    # Out-of-place: the BF16 input must be left byte-for-byte unchanged.
+    torch.testing.assert_close(qkv, qkv_ref, rtol=0.0, atol=0.0)
+
+    ref_output = torch_ref_rms_norm_rope(
+        qkv_ref,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+    )
+
+    # The op folds the E4M3 cast into the epilogue; compare the dequantized
+    # result against the BF16 reference with FP8-appropriate tolerance (E4M3 has
+    # 3 mantissa bits, so ~1/8 relative resolution).
+    torch.testing.assert_close(
+        out_fp8.float(),
+        ref_output.float(),
+        rtol=0.2,
+        atol=0.1,
+    )
