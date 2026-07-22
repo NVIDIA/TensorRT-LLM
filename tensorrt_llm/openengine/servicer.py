@@ -4,6 +4,7 @@
 """OpenEngine gRPC servicer backed by one TensorRT-LLM LLM instance."""
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -89,6 +90,16 @@ def _signed_i64(value: int) -> int:
     return value
 
 
+def _seconds(value: object) -> float:
+    converter = getattr(value, "total_seconds", None)
+    if callable(converter):
+        return float(converter())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _block_hash(value: object, hash_algo: str | None) -> kv_pb2.KvBlockHash:
     if isinstance(value, bytes):
         return kv_pb2.KvBlockHash(value=value, encoding=hash_algo or "bytes")
@@ -164,6 +175,100 @@ class OpenEngineServicer(
         self.event_host = event_host
         self.event_port = event_port
 
+    def _log_handoff(
+        self,
+        request: generation_pb2.GenerateRequest,
+        phase: str,
+        session: kv_pb2.KvSessionRef | None = None,
+        result: object | None = None,
+    ) -> None:
+        if self.role == server_pb2.ENGINE_ROLE_AGGREGATED:
+            return
+        if session is None:
+            if not request.kv.HasField("session"):
+                return
+            session = request.kv.session
+        if not session.session_id:
+            return
+
+        record: dict[str, Any] = {
+            "phase": phase,
+            "role": server_pb2.EngineRole.Name(self.role),
+            "request_id": request.request_id,
+            "session_id": session.session_id,
+            "handoff_profile": session.handoff_profile,
+            "dp_rank": session.dp_rank,
+        }
+        try:
+            handoff = decode_handoff(session)
+        except (TypeError, ValueError):
+            handoff = None
+        if handoff is not None:
+            record["tensorrt_llm"] = {
+                "ctx_request_id": (
+                    str(handoff.ctx_request_id) if handoff.ctx_request_id is not None else None
+                ),
+                "disagg_request_id": (
+                    str(handoff.disagg_request_id)
+                    if handoff.disagg_request_id is not None
+                    else None
+                ),
+                "ctx_dp_rank": handoff.ctx_dp_rank,
+                "ctx_info_endpoint": handoff.ctx_info_endpoint,
+                "conversation_id": handoff.conversation_id,
+                "schedule_style": (
+                    handoff.schedule_style.name
+                    if isinstance(handoff.schedule_style, DisaggScheduleStyle)
+                    else str(handoff.schedule_style)
+                ),
+            }
+
+        if result is not None:
+            for output in getattr(result, "outputs", ()):
+                metrics = getattr(output, "request_perf_metrics", None)
+                timing = getattr(metrics, "timing_metrics", None)
+                if timing is None:
+                    continue
+                kv_bytes = int(getattr(timing, "kv_cache_size", 0) or 0)
+                start = getattr(timing, "kv_cache_transfer_start", None)
+                end = getattr(timing, "kv_cache_transfer_end", None)
+                start_seconds = _seconds(start)
+                end_seconds = _seconds(end)
+                record["kv_transfer"] = {
+                    "bytes": kv_bytes,
+                    "duration_seconds": max(0.0, end_seconds - start_seconds),
+                }
+                break
+
+        logger.info("OpenEngine handoff %s", json.dumps(record, sort_keys=True))
+
+    def _log_lora_selection(
+        self,
+        request: generation_pb2.GenerateRequest,
+        phase: str,
+        session: kv_pb2.KvSessionRef | None = None,
+    ) -> None:
+        if not request.lora_name:
+            return
+        session_id = ""
+        if session is not None:
+            session_id = session.session_id
+        elif request.kv.HasField("session"):
+            session_id = request.kv.session.session_id
+        logger.info(
+            "OpenEngine LoRA selection %s",
+            json.dumps(
+                {
+                    "phase": phase,
+                    "role": server_pb2.EngineRole.Name(self.role),
+                    "request_id": request.request_id,
+                    "session_id": session_id,
+                    "lora_name": request.lora_name,
+                },
+                sort_keys=True,
+            ),
+        )
+
     @staticmethod
     def _request_metadata(context: grpc.aio.ServicerContext) -> dict[str, str]:
         metadata: dict[str, str] = {}
@@ -208,6 +313,10 @@ class OpenEngineServicer(
     ) -> AsyncGenerator[generation_pb2.GenerateResponse, None]:
         result = None
         consumed_session_id = None
+        produced_session = None
+        admitted = False
+        selected_lora = False
+        selection_logged = False
         try:
             metadata = self._request_metadata(context)
             priority_value = self._metadata_int(
@@ -272,6 +381,10 @@ class OpenEngineServicer(
                 priority=priority,
             )
             self.tracker.admit(request.request_id, result)
+            admitted = True
+            self._log_handoff(request, "admitted")
+            if request.lora_name:
+                selected_lora = True
             if self.stats is not None:
                 self.stats.wake()
             if request.kv.HasField("session") and request.kv.session.session_id:
@@ -311,6 +424,9 @@ class OpenEngineServicer(
                 if context.cancelled():
                     await self.tracker.abort(request.request_id)
                     return
+                if selected_lora and not selection_logged:
+                    self._log_lora_selection(request, "selected")
+                    selection_logged = True
                 if not prompt_sent:
                     prompt = self._prompt_output(current)
                     if prompt is not None:
@@ -335,7 +451,11 @@ class OpenEngineServicer(
                             ),
                         )
                         session = encode_handoff(handoff, requires_decode_media=bool(request.media))
+                        produced_session = session
                         self._track_kv_session(session.session_id, request.request_id)
+                        self._log_handoff(request, "complete", session, current)
+                        if selection_logged:
+                            self._log_lora_selection(request, "complete", session)
                         yield generation_pb2.GenerateResponse(
                             request_id=request.request_id,
                             prefill_ready=generation_pb2.PrefillReady(kv_session=session),
@@ -362,6 +482,9 @@ class OpenEngineServicer(
                     sent_tokens[output.index] = len(token_ids)
                     sent_text[output.index] = len(output.text or "")
                 if current.finished:
+                    self._log_handoff(request, "complete", result=current)
+                    if selection_logged:
+                        self._log_lora_selection(request, "complete")
                     outputs = current.outputs
                     for index, output in enumerate(outputs):
                         response = generation_pb2.GenerateResponse(
@@ -386,6 +509,10 @@ class OpenEngineServicer(
                 ),
             )
         finally:
+            if admitted and not completed:
+                self._log_handoff(request, "aborted", produced_session)
+                if selection_logged:
+                    self._log_lora_selection(request, "aborted", produced_session)
             if consumed_session_id is not None:
                 self._release_kv_session(consumed_session_id)
             if not completed and request.request_id in self.tracker.active_requests:

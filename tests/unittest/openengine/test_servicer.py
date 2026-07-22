@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -284,7 +285,13 @@ async def test_model_info_suppresses_modalities_when_required_lora_is_unavailabl
 
 
 @pytest.mark.asyncio
-async def test_context_then_generation_round_trips_handoff() -> None:
+async def test_context_then_generation_round_trips_handoff(monkeypatch) -> None:
+    log_messages: list[str] = []
+
+    def capture_info(message: str, *args: object) -> None:
+        log_messages.append(message % args)
+
+    monkeypatch.setattr("tensorrt_llm.openengine.servicer.logger.info", capture_info)
     context_handoff = DisaggregatedParams(
         request_type="context_only",
         first_gen_tokens=[7],
@@ -346,6 +353,24 @@ async def test_context_then_generation_round_trips_handoff() -> None:
     assert terminal_usage.cached_prompt_tokens == 1
     assert terminal_usage.completion_tokens == 2
     assert terminal_usage.total_tokens == 4
+
+    handoff_records = [
+        json.loads(message.split("OpenEngine handoff ", 1)[1])
+        for message in log_messages
+        if "OpenEngine handoff " in message
+    ]
+    completed = [record for record in handoff_records if record["phase"] == "complete"]
+    assert {record["role"] for record in completed} == {
+        "ENGINE_ROLE_PREFILL",
+        "ENGINE_ROLE_DECODE",
+    }
+    assert {record["session_id"] for record in completed} == {
+        context_responses[0].prefill_ready.kv_session.session_id
+    }
+    assert {record["handoff_profile"] for record in completed} == {
+        "tensorrt_llm.disaggregated_params.v1"
+    }
+    assert {record["tensorrt_llm"]["disagg_request_id"] for record in completed} == {"101"}
 
     abort_response = await context_service.Abort(
         lifecycle_pb2.AbortRequest(kv_session=context_responses[0].prefill_ready.kv_session),
