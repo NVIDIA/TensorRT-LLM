@@ -135,6 +135,8 @@ srun --mpi=pmix \
         # with an obscure 'bad interpreter' if the repo is mounted anywhere
         # other than its build-time location.
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
+        # Log a running partial score every N completed responses (0 = off).
+        export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
 
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/.venv-3.12/bin/trtllm-eval' \

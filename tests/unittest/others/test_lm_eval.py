@@ -749,8 +749,10 @@ class _FakeTask:
     def __init__(self):
         self._filters = [_FakeEnsemble("strict-match")]
 
-    def process_results(self, doc, filtered_resp):
-        return {"exact_match": float(filtered_resp == doc["answer"])}
+    def process_results(self, doc, results):
+        # Mirror lm-eval's ConfigurableTask.process_results: results is a list
+        # (one entry per repeat/request), and the prediction is results[0].
+        return {"exact_match": float(results[0] == doc["answer"])}
 
 
 class _FakeInstance:
@@ -819,6 +821,29 @@ def test_running_score_tracker_logs_on_interval(caplog):
     assert "exact_match,strict-match" in message
     # 2 of 3 correct -> ~66.67 on the 0~100 scale.
     assert "66.67" in message
+
+
+def test_running_score_tracker_process_results_list_convention():
+    """process_results receives a list, not a bare string (regression for GSM8K bug).
+
+    lm-eval's ConfigurableTask.process_results does ``result = results[0]`` to
+    extract the prediction from the list of per-repeat responses.  If the tracker
+    passes the filtered_resp string directly instead of wrapping it in a list,
+    ``results[0]`` silently returns the *first character* of the string, causing
+    multi-digit answers to score as misses (~26% on GSM8K) while single-digit
+    answers accidentally match.
+    """
+    tracker = _make_tracker()
+    # Use a multi-digit answer so the first-character bug is observable:
+    # "42" would produce results[0]=="4" if the list wrap were missing.
+    doc = {"answer": "42"}
+    tracker.update(_FakeInstance("fake_task", doc), "42")
+    assert not tracker.disabled
+    key = "exact_match,strict-match"
+    assert tracker.metric_sums[key] == 1.0, (
+        "multi-digit answer scored as miss — process_results likely received "
+        "a bare string so results[0] returned only the first character"
+    )
 
 
 def test_running_score_tracker_task_groups_flattened():
