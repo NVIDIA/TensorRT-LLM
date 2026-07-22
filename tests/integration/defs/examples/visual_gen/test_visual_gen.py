@@ -1848,7 +1848,7 @@ def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv:
     """Run examples/visual_gen/models/qwen_image_edit.py end-to-end.
 
     Validates that the Qwen-Image-Edit example script and
-    ``configs/qwen-image-edit-2511-bf16-1gpu.yaml`` work together as documented.
+    ``configs/qwen-image-edit-2511-fp8-1gpu.yaml`` work together as documented.
     """
     model_path = os.environ.get("QWEN_IMAGE_EDIT_MODEL_PATH") or os.path.join(
         _llm_models_root(), QWEN_IMAGE_EDIT_MODEL_SUBPATH
@@ -1869,7 +1869,7 @@ def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv:
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "qwen_image_edit.py")
     config_path = os.path.join(
-        llm_root, "examples", "visual_gen", "configs", "qwen-image-edit-2511-bf16-1gpu.yaml"
+        llm_root, "examples", "visual_gen", "configs", "qwen-image-edit-2511-fp8-1gpu.yaml"
     )
     image_path = os.path.join(llm_root, "examples", "visual_gen", "cat_piano.png")
     assert os.path.isfile(script_path), f"Example script not found: {script_path}"
@@ -1888,10 +1888,6 @@ def test_qwen_image_edit_example(_visual_gen_deps: Any, llm_root: str, llm_venv:
             image_path,
             "--prompt",
             "Add a small red wizard hat to the cat while preserving the source image.",
-            "--num_inference_steps",
-            "4",
-            "--seed",
-            "0",
             "--output_path",
             output_path,
         ],

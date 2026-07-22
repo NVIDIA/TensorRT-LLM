@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# 1-GPU Qwen-Image-Edit-2511 with FP8 blockwise dynamic quantization.
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+quant_config:
+  quant_algo: FP8_BLOCK_SCALES
+  dynamic: true
 attention_config:
   backend: VANILLA
 parallel_config:
