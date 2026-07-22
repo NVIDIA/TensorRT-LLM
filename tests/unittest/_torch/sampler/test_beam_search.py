@@ -1353,9 +1353,10 @@ def test_beam_search_cba_reorders_stop_window():
         m.cache_indirection[0, b, :] = b
     m.cum_log_probs[0] = torch.tensor([-5.0, -1.0])
     # window rows distinguishable per beam
-    m.stop_past_tokens = torch.zeros((3, 1, K), dtype=torch.int32)
-    m.stop_past_tokens[:, 0, 0] = 100
-    m.stop_past_tokens[:, 0, 1] = 200
+    stop_window = torch.zeros((3, 1, K), dtype=torch.int32)
+    stop_window[:, 0, 0] = 100
+    stop_window[:, 0, 1] = 200
+    m.stop_past_tokens = stop_window
 
     # beam1 dominates: both slots descend from beam 1
     logits = torch.full((K, vocab), -50.0)
@@ -1373,8 +1374,63 @@ def test_beam_search_cba_reorders_stop_window():
     )
     assert m.predecessor_beams[0].tolist() == [1, 1]
     # both window rows must now hold beam 1's history
-    assert m.stop_past_tokens[:, 0, 0].tolist() == [200, 200, 200]
-    assert m.stop_past_tokens[:, 0, 1].tolist() == [200, 200, 200]
+    assert stop_window[:, 0, 0].tolist() == [200, 200, 200]
+    assert stop_window[:, 0, 1].tolist() == [200, 200, 200]
+
+
+def test_beam_search_sampling_batch_reorders_stop_window():
+    """The ES=1 path must also reorder the stop-word window on beam swaps."""
+    batch_size = 1
+    beam_width = 2
+    vocab_size = 6
+    max_batch_size = 1
+    seq_len = 6
+
+    seq_slots = torch.arange(batch_size, dtype=torch.int64)
+    stop_window = torch.zeros((3, max_batch_size, beam_width),
+                              dtype=torch.int32)
+    stop_window[:, 0, 0] = 100
+    stop_window[:, 0, 1] = 200
+    metadata = BeamSearchMetadata(
+        cache_indirection=torch.zeros((max_batch_size, beam_width, seq_len + 1),
+                                      dtype=torch.int32),
+        cache_indirection_buffer=torch.full(
+            (max_batch_size, beam_width, seq_len + 1), -1, dtype=torch.int32),
+        cum_log_probs=torch.zeros((max_batch_size, beam_width),
+                                  dtype=torch.float32),
+        seq_slots=seq_slots,
+        seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
+        finished_beams=torch.zeros((max_batch_size, beam_width),
+                                   dtype=torch.int32),
+        new_log_probs=torch.zeros((max_batch_size, beam_width),
+                                  dtype=torch.float32),
+        predecessor_beams=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.int32),
+        seq_offsets=torch.arange(max_batch_size, dtype=torch.int64) *
+        beam_width,
+        beam_idx_arange=torch.arange(beam_width, dtype=torch.int32),
+        beam_gen_lengths=torch.zeros((max_batch_size, beam_width),
+                                     dtype=torch.int32),
+        stop_past_tokens=stop_window,
+    )
+    metadata.cum_log_probs[0] = torch.tensor([-5.0, -1.0])
+
+    # beam 1 dominates: both slots descend from beam 1
+    logits = torch.full((batch_size * beam_width, vocab_size), -50.0)
+    logits[1, 2] = 10.0
+    logits[1, 3] = 9.0
+
+    beam_search_sampling_batch(
+        logits=logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=metadata,
+        temperature=1.0,
+        return_probs=False,
+    )
+    assert metadata.predecessor_beams[0].tolist() == [1, 1]
+    assert stop_window[:, 0, 0].tolist() == [200, 200, 200]
+    assert stop_window[:, 0, 1].tolist() == [200, 200, 200]
 
 
 def test_beam_search_sampling_batch_disagg_handoff():

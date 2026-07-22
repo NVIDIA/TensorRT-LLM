@@ -378,6 +378,19 @@ def beam_search_sampling_batch(
     beam_search_args.predecessor_beams[beam_search_args.seq_slots, :beam_width_out] = (
         predecessor_beam
     )
+    if beam_search_args.stop_past_tokens is not None:
+        # Reorder the finish handler's rolling stop-word window to follow the
+        # beam swap, so multi-token stop-word matching (which appends this
+        # step's tokens to the window after this op) compares against the
+        # correct per-beam history.
+        window = beam_search_args.stop_past_tokens[:, beam_search_args.seq_slots, :beam_width_in]
+        beam_search_args.stop_past_tokens[:, beam_search_args.seq_slots, :beam_width_out] = (
+            torch.gather(
+                window,
+                2,
+                predecessor_beam.long().unsqueeze(0).expand(window.size(0), -1, -1),
+            )
+        )
 
     max_beam_width = beam_search_args.finished_beams.size(1)
     finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
