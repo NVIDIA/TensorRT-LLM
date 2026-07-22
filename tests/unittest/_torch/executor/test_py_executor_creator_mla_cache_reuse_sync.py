@@ -182,6 +182,7 @@ def _make_llm_args():
         trust_remote_code=False,
         mm_encoder_only=False,
         enable_chunked_prefill=False,
+        sparse_attention_config=None,
         attn_backend="TRTLLM",
         speculative_config=None,
         disable_overlap_scheduler=True,
