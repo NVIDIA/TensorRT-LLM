@@ -4312,8 +4312,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # (group_req_indices being sorted ascending) a contiguous group's slots
         # are just a slice of seq_slots_cuda -- no host layout build and no H2D
         # copy.
-        first_req = group_req_indices[0].item()
-        last_req = group_req_indices[-1].item()
+        first_req = int(group_req_indices[0].item())
+        last_req = int(group_req_indices[-1].item())
         group_steps = req_num_steps[group_req_indices]
         if last_req - first_req + 1 == group_req_indices.size(0) and (
             group_steps.max().item() == 1
