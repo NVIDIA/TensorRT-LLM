@@ -959,9 +959,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         else:
             raise RuntimeError(f"Invalid runtime {self._config.runtime}.")
 
-        allowed_configs = import_allowed_perf_config()
-        allowed_models = allowed_configs.get_allowed_models()
-
         if self._config.runtime == "bench":
             build_script = "trtllm-bench"
         elif self._config.runtime == "serve":
@@ -970,12 +967,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             build_script = None
         elif self._config.runtime == "multi_node_disagg_server":
             build_script = None
-        elif self._config.pp_size > 1 or self._config.model_name not in allowed_models:
-            build_script = "trtllm-build"
         else:
-            # build.py is used to build engines for both python and cpp runtime
-            build_script = os.path.join(llm_root,
-                                        "tests/integration/defs/perf/build.py")
+            raise RuntimeError(
+                f"Invalid runtime {self._config.runtime}: engine-build flows "
+                "were removed with the legacy TensorRT backend.")
 
         self._build_script = build_script
         self._benchmark_script = benchmark_script
@@ -984,56 +979,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._perf_cache_fpath = perf_cache_fpath
         self._llm_root = llm_root
         self._gpu_clock_lock = gpu_clock_lock
-
-    def get_trtllm_build_command(self, engine_dir, checkpoint_dir) -> list:
-        build_cmd = [
-            self._build_script, f"--output_dir={engine_dir}",
-            f"--checkpoint_dir={checkpoint_dir}",
-            f"--workers={self._config.tp_size}",
-            f"--use_paged_context_fmha=enable", f"--monitor_memory",
-            f"--max_batch_size={self._config.max_batch_size}"
-        ]
-        # For Multiple Profiles
-        if self._config.multiple_profiles:
-            build_cmd.append(f"--multiple_profiles=enable")
-        else:
-            build_cmd.append(f"--multiple_profiles=disable")
-        num_beams = self._config.num_beams
-        if num_beams > 1:
-            build_cmd.append(f"--max_beam_width={num_beams}")
-        gpu_percent = self._config.gpu_weights_percent
-        if gpu_percent != -1:
-            build_cmd += [f"--weight_streaming"]
-        # For engine inspector
-        build_cmd.append("--profiling_verbosity=layer_names_only")
-        if self._config.num_loras > 0:
-            if "mixtral" in self._config.model_name:
-                build_cmd.append(f"--lora_plugin=auto")
-                build_cmd.append(f"--moe_plugin=auto")
-                build_cmd.append(f"--lora_target_modules")
-                build_cmd.append(f"attn_q")
-                build_cmd.append(f"attn_k")
-                build_cmd.append(f"attn_v")
-                build_cmd.append(f"attn_dense")
-                build_cmd.append(f"moe_h_to_4h")
-                build_cmd.append(f"moe_4h_to_h")
-                build_cmd.append(f"moe_gate")
-                build_cmd.append(f"moe_router")
-            elif "llama" in self._config.model_name:
-                build_cmd.append(f"--lora_plugin=float16")
-                build_cmd.append(f"--lora_target_modules")
-                build_cmd.append(f"attn_q")
-                build_cmd.append(f"attn_k")
-                build_cmd.append(f"attn_v")
-                build_cmd.append(f"attn_dense")
-                build_cmd.append(f"mlp_h_to_4h")
-                build_cmd.append(f"mlp_4h_to_h")
-                build_cmd.append(f"mlp_gate")
-        if TIMING_CACHE_DIR and not self._config.build_only:
-            timing_cache = os.path.join(TIMING_CACHE_DIR, "model.cache")
-            build_cmd.append(f"--input_timing_cache={timing_cache}")
-            build_cmd.append(f"--output_timing_cache={timing_cache}")
-        return build_cmd
 
     def get_trtllm_bench_model(self):
         return get_model_dir(self._config.model_name)
@@ -1071,8 +1016,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def get_prepare_data_command(self, engine_dir, input_len,
                                  output_len) -> list:
         data_cmd = []
-        prepare_data_script = os.path.join(self._llm_root, "benchmarks",
-                                           "prepare_dataset.py")
 
         if self._config.model_name in MODEL_PATH_DICT.keys():
             tokenizer_dir = os.path.join(
@@ -1158,13 +1101,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
                 ]
             else:
-                data_cmd += [
-                    "python3", prepare_data_script, f"--output={dataset_path}",
-                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
-                    f"--num-requests={self._config.num_reqs}",
-                    f"--input-mean={input_len}", f"--output-mean={output_len}",
-                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}"
-                ]
+                raise RuntimeError(
+                    f"Unsupported build script {self._build_script} for "
+                    "dataset preparation.")
 
         return data_cmd
 

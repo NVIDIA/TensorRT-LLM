@@ -4382,6 +4382,19 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @pytest.mark.skip(
+        reason="TP2 hangs in the AUTO custom allreduce on PCIe-only (all-SYS "
+        "topology) nodes; the LMHead AllReduce ignores allreduce_strategy and "
+        "always takes the AUTO path (tunable_allreduce), so the strategy knob "
+        "cannot work around it. Unskip once validated on an NVLink platform "
+        "or the lm_head strategy plumbing is fixed.")
+    @pytest.mark.skip_less_device(2)
+    def test_tp2(self):
+        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
 
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
