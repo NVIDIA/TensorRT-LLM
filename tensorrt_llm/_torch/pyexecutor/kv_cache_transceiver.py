@@ -16,8 +16,8 @@ from tensorrt_llm.mapping import Mapping
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
-                                  MixedMambaHybridCacheManager,
-                                  V2MambaHybridCacheManager)
+                                  MambaHybridCacheManagerV2,
+                                  MixedMambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -162,16 +162,16 @@ def create_kv_cache_transceiver(
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver.
     #
-    # V2MambaHybridCacheManager is backed by the Python KVCacheManagerV2 core,
+    # MambaHybridCacheManagerV2 is backed by the Python KVCacheManagerV2 core,
     # not the C++ BaseKVCacheManager binding required by CacheTransceiverCpp.
     is_v2_mamba_hybrid = isinstance(mamba_cache_manager,
-                                    V2MambaHybridCacheManager)
+                                    MambaHybridCacheManagerV2)
     use_python_transceiver = (
         cache_transceiver_config.transceiver_runtime == "PYTHON")
 
     if is_v2_mamba_hybrid and not use_python_transceiver:
         raise ValueError(
-            "V2MambaHybridCacheManager requires transceiver_runtime='PYTHON' "
+            "MambaHybridCacheManagerV2 requires transceiver_runtime='PYTHON' "
             "with backend='NIXL'; it cannot use the C++ transceiver.")
 
     if use_python_transceiver:

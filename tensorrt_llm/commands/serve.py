@@ -1190,7 +1190,9 @@ def serve(
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f) or {}
+                llm_args_extra_dict = yaml.safe_load(f)
+            if not isinstance(llm_args_extra_dict, dict):
+                raise ValueError("Configuration file root must be a mapping.")
         extra_allow_request_chat_template = _pop_bool_config_option(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
@@ -1425,7 +1427,9 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
-            encoder_args_extra_dict = yaml.safe_load(f) or {}
+            encoder_args_extra_dict = yaml.safe_load(f)
+        if not isinstance(encoder_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
     extra_allow_request_chat_template = _pop_bool_config_option(
         encoder_args_extra_dict, "allow_request_chat_template")
     allow_request_chat_template = (allow_request_chat_template
@@ -1543,6 +1547,8 @@ def serve_embedding(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             extra_dict = yaml.safe_load(f)
+        if not isinstance(extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
 

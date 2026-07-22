@@ -32,7 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiv
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
-    V2MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
@@ -141,7 +141,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
-            self._kv_cache_manager, V2MambaHybridCacheManager
+            self._kv_cache_manager, MambaHybridCacheManagerV2
         ):
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
@@ -235,7 +235,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             groups.append(block_ids)
 
         mamba_state_index = None
-        if isinstance(self._kv_cache_manager, V2MambaHybridCacheManager):
+        if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
                 mamba_state_index = self._kv_cache_manager.get_state_indices([req.py_request_id])[0]
         elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):

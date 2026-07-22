@@ -2691,7 +2691,7 @@ class TestInitRatioConfig(unittest.TestCase):
         slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
 
         self.assertEqual(slots[ssm_pg], 6)
-        # Any non-live SSM capacity enables the conservative upper bound of one
+        # Any extra SSM slot enables the conservative upper bound of one
         # partial attention page for every request lineage.
         self.assertEqual(slots[attn_pg], 12)
         manager.shutdown()

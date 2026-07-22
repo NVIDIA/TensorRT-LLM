@@ -34,8 +34,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestType,
 )
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
-    V2MambaHybridCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
@@ -207,7 +207,7 @@ def _create_managers(
         mapping = Mapping(
             world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_attention_dp
         )
-        manager_cls = V2MambaHybridCacheManager if use_v2 else MixedMambaHybridCacheManager
+        manager_cls = MambaHybridCacheManagerV2 if use_v2 else MixedMambaHybridCacheManager
         manager_kwargs = (
             {
                 "is_disagg": True,
@@ -249,13 +249,13 @@ def _create_managers(
 
 
 def _mamba_layer_ids(manager):
-    if isinstance(manager, V2MambaHybridCacheManager):
+    if isinstance(manager, MambaHybridCacheManagerV2):
         return manager.mamba_layer_offsets
     return manager._impl.mamba_layer_offsets
 
 
 def _mamba_state_slot(manager, request_id):
-    if isinstance(manager, V2MambaHybridCacheManager):
+    if isinstance(manager, MambaHybridCacheManagerV2):
         return manager.get_state_indices([request_id])[0]
     return manager.mamba_cache_index[request_id]
 

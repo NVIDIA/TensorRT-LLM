@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import BindKvCacheTrans
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
-    V2MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -529,7 +529,7 @@ def test_python_nixl_transceiver_accepts_v2_mamba_manager(monkeypatch):
     constructor = Mock(return_value=expected)
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
     monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
-    manager = object.__new__(V2MambaHybridCacheManager)
+    manager = object.__new__(MambaHybridCacheManagerV2)
 
     result = transceiver_module.create_kv_cache_transceiver(
         Mock(), Mock(), manager, Mock(), config, manager
@@ -542,7 +542,7 @@ def test_python_nixl_transceiver_accepts_v2_mamba_manager(monkeypatch):
 @pytest.mark.parametrize("runtime", [None, "CPP", "auto"])
 def test_cpp_runtime_rejects_v2_mamba_manager(runtime):
     config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
-    manager = object.__new__(V2MambaHybridCacheManager)
+    manager = object.__new__(MambaHybridCacheManagerV2)
 
     with pytest.raises(ValueError, match="requires transceiver_runtime='PYTHON'"):
         transceiver_module.create_kv_cache_transceiver(

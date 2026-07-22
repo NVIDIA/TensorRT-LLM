@@ -1097,8 +1097,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # capacity lets the next batch of active requests acquire slots without
         # waiting for the previous batch's transfers to finish.
         max_num_sequences = max_batch_size * mapping.pp_size
-        if num_reserved_index_slots < 0:
-            raise ValueError("num_reserved_index_slots must be non-negative")
+        assert num_reserved_index_slots >= 0, "num_reserved_index_slots must be non-negative"
         index_mapper_capacity = (
             max_num_sequences * (2 if is_disagg else 1) + num_reserved_index_slots
         )

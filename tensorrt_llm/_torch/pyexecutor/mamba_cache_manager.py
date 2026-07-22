@@ -1121,6 +1121,8 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
+        self._dummy_request_mask = None
+        self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
         self.old_dt = None
@@ -1168,6 +1170,20 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             device=device,
         )
         return True
+
+    @torch.inference_mode()
+    def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
+        if self._dummy_request_mask is None:
+            return
+
+        n = len(is_dummy)
+        assert n <= self._dummy_request_mask_host.shape[0]
+        self._dummy_request_mask_host.zero_()
+        if n > 0:
+            self._dummy_request_mask_host[:n].copy_(
+                torch.tensor(is_dummy, dtype=torch.bool))
+        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
+                                       non_blocking=True)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -1582,27 +1598,32 @@ def _get_local_mamba_cache_layout(
     mapping: Mapping,
     *,
     spec_config=None,
-    layer_mask: Optional[List[bool]] = None,
+    is_draft: bool = False,
+    use_separate_draft_kv_cache: bool = False,
 ):
     """Return normalized params and local Mamba/attention layer counts.
 
     Cache construction and affine sizing must follow the model's PP layout:
     partition base layers first, then place appended speculative layers on the
-    last PP rank. An explicit layer mask is authoritative for separate target
-    and draft caches.
+    last PP rank. The normalized params retain target masks and the appended
+    draft-layer count so estimation selects the same combined or per-manager
+    layout as runtime.
     """
     from tensorrt_llm._torch.pyexecutor.config_utils import \
         extract_mamba_kv_cache_params
 
     params = extract_mamba_kv_cache_params(
         model_config.pretrained_config,
-        layer_mask=layer_mask,
         spec_config=spec_config,
         quant_config=model_config.quant_config,
     )
+    mamba_layer_mask, full_attention_layer_mask = params.get_layer_masks(
+        is_draft=is_draft,
+        use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+    )
     combined_layer_mask = [
         is_mamba or is_attention for is_mamba, is_attention in zip(
-            params.mamba_layer_mask, params.full_attention_layer_mask)
+            mamba_layer_mask, full_attention_layer_mask)
     ]
     local_layer_indices, _ = get_pp_layers(
         sum(combined_layer_mask),
@@ -1610,9 +1631,9 @@ def _get_local_mamba_cache_layout(
         spec_config=spec_config,
         layer_mask=combined_layer_mask,
     )
-    local_mamba_layers = sum(params.mamba_layer_mask[layer_idx]
+    local_mamba_layers = sum(mamba_layer_mask[layer_idx]
                              for layer_idx in local_layer_indices)
-    local_attention_layers = sum(params.full_attention_layer_mask[layer_idx]
+    local_attention_layers = sum(full_attention_layer_mask[layer_idx]
                                  for layer_idx in local_layer_indices)
     return params, local_mamba_layers, local_attention_layers
 
@@ -1629,17 +1650,19 @@ def _estimate_mamba_hybrid_cache_cost(
     num_reserved_dummy_slots: int,
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
+    is_draft: bool = False,
+    use_separate_draft_kv_cache: bool = False,
     **kwargs,
 ) -> Tuple[int, int]:
     del num_layers
     spec_config = kwargs.get("spec_config")
-    layer_mask = kwargs.get("layer_mask")
     params, local_mamba_layers, local_attention_layers = (
         _get_local_mamba_cache_layout(
             model_config,
             mapping,
             spec_config=spec_config,
-            layer_mask=layer_mask,
+            is_draft=is_draft,
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
         ))
     attention_slope = (KVCacheManager.get_cache_size_per_token(
         model_config,
@@ -2244,20 +2267,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                     src_state_indices,
                                     num_accepted_draft_tokens, state_indices_d)
 
-    @torch.inference_mode()
-    def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
-        if self._dummy_request_mask is None:
-            return
-
-        n = len(is_dummy)
-        assert n <= self._dummy_request_mask_host.shape[0]
-        self._dummy_request_mask_host.zero_()
-        if n > 0:
-            self._dummy_request_mask_host[:n].copy_(
-                torch.tensor(is_dummy, dtype=torch.bool))
-        self._dummy_request_mask.copy_(self._dummy_request_mask_host,
-                                       non_blocking=True)
-
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
                                  max_num_draft_tokens: int = 0,
@@ -2435,8 +2444,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     def _setup_replay_buffers(self, spec_config) -> None:
         cache_size = self.all_ssm_states.shape[1]
         device = self.all_ssm_states.device
-        self._dummy_request_mask = None
-        self._dummy_request_mask_host = None
         if not self._allocate_pool_replay_buffers(spec_config, cache_size,
                                                   device):
             return
@@ -2451,7 +2458,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         )
 
 
-class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
+class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
     Attention KV pages and Mamba recurrent-state pages are both owned by the
@@ -2647,6 +2654,7 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
             self.layer_offsets[layer_id] for layer_id in self.mamba_pp_layers
         ]
         self._request_id_to_state_index = {}
+        self._request_id_to_is_dummy = {}
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
@@ -2974,7 +2982,19 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
             cache_size = self.all_ssm_states[0].shape[0]
             assert all(t.shape[0] == cache_size for t in self.all_ssm_states)
             device = self.all_ssm_states[0].device
-        self._allocate_pool_replay_buffers(spec_config, cache_size, device)
+        if not self._allocate_pool_replay_buffers(spec_config, cache_size,
+                                                  device):
+            return
+
+        mask_capacity = self._host_state_indices.shape[0]
+        self._dummy_request_mask = torch.zeros(mask_capacity,
+                                               dtype=torch.bool,
+                                               device=device)
+        self._dummy_request_mask_host = torch.zeros(
+            mask_capacity,
+            dtype=torch.bool,
+            pin_memory=prefer_pinned(),
+        )
 
     def _attention_cache_bytes_per_token(self) -> int:
         # Mamba layers have zero KV heads, so the generic calculation naturally
@@ -3083,6 +3103,7 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
         if kv_cache is not None and kv_cache.is_active:
             self.try_commit_blocks(request, kv_cache)
         self._request_id_to_state_index.pop(request.py_request_id, None)
+        self._request_id_to_is_dummy.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -3119,9 +3140,12 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
-        for i, req in enumerate(requests):
-            self._request_id_to_state_index[
-                req.py_request_id] = self._host_state_indices[i].item()
+        is_dummy = [req.is_dummy for req in requests]
+        self._refresh_dummy_request_mask(is_dummy)
+        state_values = self._host_state_indices[:n].tolist()
+        for req, value, dummy in zip(requests, state_values, is_dummy):
+            self._request_id_to_state_index[req.py_request_id] = value
+            self._request_id_to_is_dummy[req.py_request_id] = dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,
@@ -3134,7 +3158,18 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
                 return [0] * len(request_ids)
             return self.cuda_state_indices
         if request_ids is not None:
-            return [self._request_id_to_state_index[rid] for rid in request_ids]
+            indices = [
+                self._request_id_to_state_index[rid] for rid in request_ids
+            ]
+            if is_padding is None:
+                is_padding = [False] * len(request_ids)
+            assert len(request_ids) == len(is_padding)
+            is_dummy = [
+                self._request_id_to_is_dummy.get(rid, False) or padding
+                for rid, padding in zip(request_ids, is_padding)
+            ]
+            self._refresh_dummy_request_mask(is_dummy)
+            return indices
         return self.cuda_state_indices
 
     def get_max_resource_count(self) -> int:
@@ -3159,12 +3194,16 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
         if self._use_replay_state_update:
+            assert self._dummy_request_mask is not None
+            is_dummy_request = self._dummy_request_mask[
+                num_contexts:num_contexts + num_gens]
             replay_metadata = self.get_replay_state_update_metadata()
             assert replay_metadata is not None
             _advance_replay_state(
                 replay_metadata,
                 state_indices_d,
                 num_accepted_tokens[num_contexts:num_contexts + num_gens],
+                is_dummy_request,
             )
         else:
             for layer_offset, dst in enumerate(self.all_ssm_states):
@@ -3268,6 +3307,8 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
         self.prev_num_accepted_tokens = None
         self.cache_buf_idx = None
         self.mamba_ssm_rand_seed = None
+        self._dummy_request_mask = None
+        self._dummy_request_mask_host = None
         self.old_x = None
         self.old_B = None
         self.old_dt = None

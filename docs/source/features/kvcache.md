@@ -80,13 +80,10 @@ Hybrid Mamba models must retain the recurrent Mamba state together with the
 attention KV prefix. Snapshot policy is grouped under
 `kv_cache_config.mamba_state_config`. `periodic_snapshot_interval` controls
 periodic boundaries. They are disabled by default; set the interval to a
-positive value to enable them. The interval is accepted through this nested
-configuration in the Python API. YAML/JSON configuration files also accept the
-deprecated `kv_cache_config.mamba_state_cache_interval` key and migrate it to
-the nested field while loading. Enabling block reuse for a hybrid Mamba model
-requires either a positive periodic interval or an explicit V2 snapshot offset;
-otherwise, configuration validation rejects the unsupported reuse policy. The
-prototype
+positive value to enable them. The deprecated
+`kv_cache_config.mamba_state_cache_interval` alias remains accepted for
+compatibility and is copied to the nested field during validation. New code and
+configuration files should use the nested field. The prototype
 `additional_snapshot_offsets_from_start` and
 `additional_snapshot_offsets_from_end` options add fixed boundaries. Start
 offsets count tokens from the beginning of the prompt. End offsets count
@@ -106,7 +103,7 @@ kv_cache_config:
 This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Exact explicit boundaries currently require aggregated serving
-with `V2MambaHybridCacheManager`, `max_beam_width=1`, and no KV connector.
+with `MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector.
 Hybrid Mamba models use the V1 C++ compatibility manager by default; select V2
 explicitly with `use_kv_cache_manager_v2: true`. V1 and the current
 disaggregated-serving route support periodic snapshots only, while V2 does not

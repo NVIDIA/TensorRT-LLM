@@ -151,6 +151,22 @@ kv_cache_config:
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
 
+    def test_from_yaml_rejects_empty_file(self, tmp_path):
+        yaml_path = tmp_path / "empty.yaml"
+        yaml_path.write_text("", encoding="utf-8")
+
+        with pytest.raises(ValueError,
+                           match="Configuration file root must be a mapping"):
+            TorchLlmArgs.from_yaml(yaml_path)
+
+    def test_from_yaml_rejects_non_mapping_root(self, tmp_path):
+        yaml_path = tmp_path / "list.yaml"
+        yaml_path.write_text("[]", encoding="utf-8")
+
+        with pytest.raises(ValueError,
+                           match="Configuration file root must be a mapping"):
+            TorchLlmArgs.from_yaml(yaml_path)
+
     def test_llm_args_with_pydantic_options(self):
         yaml_content = """
 max_batch_size: 16
@@ -557,6 +573,8 @@ class TestModelDefaults:
 
 
 def test_KvCacheConfig_declaration():
+    assert KvCacheConfig().mamba_state_cache_interval is None
+    assert KvCacheConfig().mamba_state_config.periodic_snapshot_interval == 0
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig().block_reuse_policy == "all_reusable"
     assert KvCacheConfig().enable_swa_scratch_reuse is False
@@ -709,15 +727,24 @@ def test_KvCacheConfig_allows_periodic_snapshots_with_v1():
     assert config.mamba_state_config.periodic_snapshot_interval == 64
 
 
-def test_KvCacheConfig_rejects_removed_mamba_interval_field():
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        KvCacheConfig(mamba_state_cache_interval=64)
+def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
 
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        TorchLlmArgs(
-            model=llama_model_path,
-            kv_cache_config={"mamba_state_cache_interval": 64},
-        )
+    config = KvCacheConfig(mamba_state_cache_interval=64)
+
+    assert config.mamba_state_cache_interval == 64
+    assert config.mamba_state_config.periodic_snapshot_interval == 64
+    assert any("mamba_state_cache_interval' is deprecated" in message
+               for message in warnings_seen)
+    assert "mamba_state_cache_interval" not in config.model_dump()
+
+    llm_args = TorchLlmArgs(
+        model=llama_model_path,
+        kv_cache_config={"mamba_state_cache_interval": 32},
+    )
+    assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 32
 
 
 def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input(
@@ -743,7 +770,7 @@ def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input
 
 
 def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
-    with pytest.raises(ValueError, match="cannot set both"):
+    with pytest.raises(ValueError, match="Cannot set both"):
         update_llm_args_with_extra_dict(
             {"model": "dummy"},
             {

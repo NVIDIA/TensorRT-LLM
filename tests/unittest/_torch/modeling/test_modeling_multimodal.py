@@ -628,6 +628,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         }
 
         mamba_params = extract_mamba_kv_cache_params(text_config)
+        mamba_layer_mask, full_attention_layer_mask = mamba_params.get_layer_masks()
         if mamba_params.dtype not in dtype_map:
             raise ValueError(
                 f"Unsupported dtype for hybrid cache manager: "
@@ -654,15 +655,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             mamba_params.n_groups,
             mamba_params.head_dim,
             mamba_params.num_mamba_layers,
-            mamba_params.mamba_layer_mask,
+            mamba_layer_mask,
             mamba_params.dtype,
             mamba_params.mamba_ssm_cache_dtype,
             # kv cache parameters (positional)
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             # kw-only
-            num_layers=mamba_params.num_full_attention_layers,
-            layer_mask=mamba_params.full_attention_layer_mask,
+            num_layers=sum(full_attention_layer_mask),
+            layer_mask=full_attention_layer_mask,
             num_kv_heads=text_config.num_key_value_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,

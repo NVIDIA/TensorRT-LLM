@@ -38,7 +38,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MambaHybridCacheManager,
-    V2MambaHybridCacheManager,
+    MambaHybridCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
@@ -155,7 +155,7 @@ def _build_layer_group_for_mamba(
     )
 
 
-def _slot_stride_bytes(tensor) -> int:
+def _slot_stride_bytes(tensor: torch.Tensor) -> int:
     return int(tensor.stride(0) * tensor.element_size())
 
 
@@ -200,7 +200,7 @@ def _build_v2_mamba_state_pool(states: Sequence[torch.Tensor]) -> PhysicalPool:
 
 
 def _build_layer_group_for_v2_mamba(
-    manager: V2MambaHybridCacheManager, pool_group_idx: int
+    manager: MambaHybridCacheManagerV2, pool_group_idx: int
 ) -> MambaLayerGroup:
     mamba_layer_offsets = {
         int(global_layer_id): int(local_layer_id)
@@ -447,7 +447,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
             all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
-            if isinstance(manager, V2MambaHybridCacheManager) and any(
+            if isinstance(manager, MambaHybridCacheManagerV2) and any(
                 manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
             ):
                 layer_groups_by_id[layer_group_id] = _build_layer_group_for_v2_mamba(
@@ -509,7 +509,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         layer_groups.append(layer_group)
 
     if isinstance(manager, MambaHybridCacheManager) and not isinstance(
-        manager, V2MambaHybridCacheManager
+        manager, MambaHybridCacheManagerV2
     ):
         mamba_layer_group_idx = len(pool_groups)
         mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)

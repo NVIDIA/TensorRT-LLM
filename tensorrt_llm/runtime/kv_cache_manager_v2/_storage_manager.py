@@ -958,7 +958,7 @@ class StorageManager:
         ssm_lc_idx = self._life_cycles.ssm_life_cycle_id
         total_ssm_slots = sum(kv.num_ssm_slots for kv in batch.kv_caches)
         num_request_lineages = len(batch.kv_caches)
-        # A non-live SSM slot indicates that this batch can retain snapshots.
+        # An extra SSM slot indicates that this batch can retain snapshots.
         # Snapshot alignment is unknown while storage is being sized, so once
         # such capacity exists, reserve one partial attention page per request
         # lineage. V2 replaces covered partial pages within a lineage, making N
@@ -966,7 +966,7 @@ class StorageManager:
         # the bound merely over-reserves attention pages. The guard keeps the
         # default num_ssm_slots=1 descriptors used by non-Mamba managers from
         # paying this Mamba-specific overhead.
-        has_non_live_ssm_capacity = total_ssm_slots > num_request_lineages
+        has_extra_ssm_slot = total_ssm_slots > num_request_lineages
         sys_blocks = batch.system_prompt_length // tokens_per_block
         for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
             pg_idx = self.get_pool_group_index(lc_idx)
@@ -1011,7 +1011,7 @@ class StorageManager:
             # Retained partial-page copies are additional physical blocks, not
             # tokens in KVCacheDesc.capacity, so add their safe upper bound
             # after token staleness and scratch-sharing calculations.
-            if has_non_live_ssm_capacity:
+            if has_extra_ssm_slot:
                 num_slots[pg_idx] += num_request_lineages
         return num_slots
 

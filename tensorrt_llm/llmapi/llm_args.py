@@ -3492,52 +3492,6 @@ class MambaStateConfig(StrictBaseModel):
         "snapshots require KV cache manager V2.")
 
 
-def _migrate_legacy_mamba_interval_from_config_file(
-        config_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Migrate the legacy Mamba interval in a YAML/JSON config mapping.
-
-    This intentionally runs only at config-file ingestion boundaries. The
-    Pydantic models remain strict so direct Python construction accepts only
-    ``mamba_state_config.periodic_snapshot_interval``.
-    """
-    kv_cache_config = config_dict.get("kv_cache_config")
-    legacy_field = "mamba_state_cache_interval"
-    if not isinstance(kv_cache_config,
-                      dict) or legacy_field not in kv_cache_config:
-        return config_dict
-
-    migrated_config = dict(config_dict)
-    migrated_kv_cache_config = dict(kv_cache_config)
-    migrated_config["kv_cache_config"] = migrated_kv_cache_config
-
-    state_config_field = "mamba_state_config"
-    interval_field = "periodic_snapshot_interval"
-    if state_config_field in migrated_kv_cache_config:
-        state_config = migrated_kv_cache_config[state_config_field]
-        if not isinstance(state_config, dict):
-            raise ValueError(
-                "Config file field 'kv_cache_config.mamba_state_config' must "
-                "be a mapping when using the legacy "
-                "'kv_cache_config.mamba_state_cache_interval' option.")
-        if interval_field in state_config:
-            raise ValueError("Config file cannot set both "
-                             "'kv_cache_config.mamba_state_cache_interval' and "
-                             "'kv_cache_config.mamba_state_config."
-                             "periodic_snapshot_interval'.")
-        migrated_state_config = dict(state_config)
-    else:
-        migrated_state_config = {}
-
-    migrated_state_config[interval_field] = migrated_kv_cache_config.pop(
-        legacy_field)
-    migrated_kv_cache_config[state_config_field] = migrated_state_config
-    logger.warning(
-        "Config-file option 'kv_cache_config.mamba_state_cache_interval' is "
-        "deprecated; use 'kv_cache_config.mamba_state_config."
-        "periodic_snapshot_interval' instead.")
-    return migrated_config
-
-
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -3669,6 +3623,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_state_cache_interval: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="deprecated",
+        telemetry=False,
+        exclude=True,
+        description=
+        "Deprecated alias for mamba_state_config.periodic_snapshot_interval.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_state_config: MambaStateConfig = Field(
@@ -3823,6 +3786,27 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_gpu_total_bytes must be non-negative")
         return v
+
+    @model_validator(mode='after')
+    def migrate_legacy_mamba_interval(self) -> 'KvCacheConfig':
+        """Copy the deprecated Mamba interval into its nested replacement."""
+        if self.mamba_state_cache_interval is None:
+            return self
+        if ("periodic_snapshot_interval"
+                in self.mamba_state_config.model_fields_set):
+            raise ValueError("Cannot set both "
+                             "'kv_cache_config.mamba_state_cache_interval' and "
+                             "'kv_cache_config.mamba_state_config."
+                             "periodic_snapshot_interval'.")
+        logger.warning(
+            "'kv_cache_config.mamba_state_cache_interval' is deprecated; use "
+            "'kv_cache_config.mamba_state_config."
+            "periodic_snapshot_interval' instead.")
+        self.mamba_state_config = self.mamba_state_config.model_copy(
+            update={
+                "periodic_snapshot_interval": self.mamba_state_cache_interval
+            })
+        return self
 
     @model_validator(mode='after')
     def validate_disk_cache_config(self):
@@ -4415,8 +4399,8 @@ class BaseLlmArgs(StrictBaseModel):
     def from_yaml(cls, yaml_path: Union[str, Path]):
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
-        config_dict = _migrate_legacy_mamba_interval_from_config_file(
-            config_dict)
+        if not isinstance(config_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
     @field_validator("dtype")
@@ -5844,8 +5828,7 @@ def update_llm_args_with_extra_dict(
 
     If `explicit_cli_keys` is None, YAML wins on conflicts.
     """
-    llm_args_dict = _migrate_legacy_mamba_interval_from_config_file(
-        llm_args_dict)
+    llm_args_dict = dict(llm_args_dict)
 
     # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
     # name to `explicit_cli_keys` to make it win over YAML's same-named
@@ -5958,11 +5941,13 @@ def update_llm_args_with_extra_options(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(
-                llm_args,
-                llm_args_dict,
-                extra_llm_api_options,
-                explicit_cli_keys=explicit_cli_keys)
+        if not isinstance(llm_args_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+        llm_args = update_llm_args_with_extra_dict(
+            llm_args,
+            llm_args_dict,
+            extra_llm_api_options,
+            explicit_cli_keys=explicit_cli_keys)
     return llm_args
 
 
