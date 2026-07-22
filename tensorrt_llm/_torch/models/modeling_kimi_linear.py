@@ -49,8 +49,13 @@ which are nonlinear/linear layers applied to the full sum). ``lm_head`` uses
 the stock ``LMHead`` (vocab-sharded + gather), so logits are identical on all
 ranks.
 
-Not supported: pipeline parallelism, speculative decoding, CUDA graphs,
-chunked prefill, KV block reuse.
+Speculative decoding: SA (suffix automaton, one-engine, draft-weight-free);
+the KDA/MLA runtimes implement multi-token verification with deferred
+state promotion.
+
+Not supported: pipeline parallelism, CUDA graphs, chunked prefill,
+KV block reuse, draft-head spec-dec modes (MTP/Eagle — no draft-head
+checkpoint exists).
 """
 
 from __future__ import annotations
@@ -70,8 +75,8 @@ from ..model_config import ModelConfig
 from ..modules.kimi_k3_moe._mlp import KimiK3RMSNorm, SituAndMul
 from ..modules.kimi_k3_moe.kimi_k3_moe_block import KimiK3RoutedExpertBank
 from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             register_auto_model)
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, register_auto_model
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -512,13 +517,34 @@ class KimiKDARuntime(nn.Module):
                     state_indices[:num_prefills],
                 ))
         if num_decodes > 0:
-            outputs.append(
-                self._forward_decode(
-                    hidden_states[num_ctx_tokens:],
-                    conv_pool,
-                    ssm_pool,
-                    state_indices[num_prefills:],
-                ))
+            decode_rows = hidden_states.shape[0] - num_ctx_tokens
+            if decode_rows == num_decodes:
+                outputs.append(
+                    self._forward_decode(
+                        hidden_states[num_ctx_tokens:],
+                        conv_pool,
+                        ssm_pool,
+                        state_indices[num_prefills:],
+                    ))
+            else:
+                # Speculative verification: each generation request carries
+                # 1 + draft_len tokens (drafts are padded to the static max,
+                # so T is uniform). Per-step states go to the manager's
+                # SpeculativeState scratch buffers — never the live pools —
+                # and kv_cache_manager.update_mamba_states() promotes the
+                # accepted step after sampling.
+                assert decode_rows % num_decodes == 0, (
+                    f"ragged generation batch: {decode_rows} tokens for "
+                    f"{num_decodes} requests")
+                outputs.append(
+                    self._forward_verify(
+                        hidden_states[num_ctx_tokens:],
+                        decode_rows // num_decodes,
+                        layer_cache,
+                        conv_pool,
+                        ssm_pool,
+                        state_indices[num_prefills:],
+                    ))
         if len(outputs) == 1:
             return outputs[0]
         return torch.cat(outputs, dim=0)
@@ -656,6 +682,88 @@ class KimiKDARuntime(nn.Module):
         ssm_pool.index_copy_(0, slot_indices,
                              recurrent_out.to(ssm_pool.dtype))
 
+        return self._output_gate_and_proj(x, o)
+
+    def _forward_verify(self, x2d, num_steps, layer_cache, conv_pool,
+                        ssm_pool, slot_indices) -> torch.Tensor:
+        """Speculative verification: advance each request ``num_steps``
+        tokens, writing the state after every step into the manager's
+        SpeculativeState scratch buffers (``intermediate_conv_window`` /
+        ``intermediate_ssm``, batch-row indexed). Live pools are read-only
+        here; ``update_mamba_states()`` commits the accepted step's state
+        after sampling. Sequential per-step FLA calls — correctness first;
+        the fused multi-token kernel is a later optimization.
+        """
+        from einops import rearrange
+        from fla.ops.kda import fused_recurrent_kda
+
+        intermediate_conv = layer_cache.intermediate_conv_window
+        intermediate_ssm = layer_cache.intermediate_ssm
+        assert intermediate_conv is not None and intermediate_ssm is not None, (
+            "speculative verification requires the cache manager's "
+            "SpeculativeState (legacy intermediate-buffer path)")
+
+        mixer = self.mixer
+        d = self.proj_size
+        num_decodes = x2d.shape[0] // num_steps
+        x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
+
+        q_proj_states = mixer.q_proj(x)
+        k_proj_states = mixer.k_proj(x)
+        v_proj_states = mixer.v_proj(x)
+        g = mixer.f_b_proj(mixer.f_a_proj(x))
+        g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
+        beta = mixer.b_proj(x).float()
+
+        # Gathered copies — mutated across steps, never written back to the
+        # live pools.
+        cs = conv_pool.index_select(0, slot_indices)
+        conv_q, conv_k, conv_v = _kda_split_conv_sections(cs, d)
+        state = ssm_pool.index_select(0, slot_indices)
+
+        step_outputs: List[torch.Tensor] = []
+        for t in range(num_steps):
+            # ShortConvolution.step updates the (gathered) caches in place.
+            q_t, conv_q = mixer.q_conv1d(q_proj_states[:, t:t + 1],
+                                         cache=conv_q,
+                                         output_final_state=True)
+            k_t, conv_k = mixer.k_conv1d(k_proj_states[:, t:t + 1],
+                                         cache=conv_k,
+                                         output_final_state=True)
+            v_t, conv_v = mixer.v_conv1d(v_proj_states[:, t:t + 1],
+                                         cache=conv_v,
+                                         output_final_state=True)
+
+            q_t = rearrange(q_t, "... (h d) -> ... h d", d=mixer.head_k_dim)
+            k_t = rearrange(k_t, "... (h d) -> ... h d", d=mixer.head_k_dim)
+            v_t = rearrange(v_t, "... (h d) -> ... h d", d=mixer.head_dim)
+
+            o_t, state = fused_recurrent_kda(
+                q=q_t,
+                k=k_t,
+                v=v_t,
+                g=g[:, t:t + 1],
+                beta=beta[:, t:t + 1],
+                A_log=mixer.A_log,
+                dt_bias=mixer.dt_bias,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                lower_bound=mixer.gate_lower_bound,
+                state_v_first=True,
+            )
+            step_outputs.append(o_t)
+
+            # Batch-row indexed ([:num_decodes] prefix), matching
+            # update_mamba_states()'s intermediate_state_indices.
+            intermediate_conv[:num_decodes, t] = torch.cat(
+                [conv_q, conv_k, conv_v], dim=1).to(intermediate_conv.dtype)
+            intermediate_ssm[:num_decodes, t] = state.to(
+                intermediate_ssm.dtype)
+
+        o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
         return self._output_gate_and_proj(x, o)
 
     def _output_gate_and_proj(self, x: torch.Tensor,
@@ -1005,17 +1113,24 @@ def _materialize(value) -> torch.Tensor:
 
 @register_auto_model("KimiK3ForConditionalGeneration")
 @register_auto_model("KimiLinearForCausalLM")
-class KimiLinearForCausalLM(DecoderModelForCausalLM[KimiLinearModel, Any]):
+class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel,
+                                                        Any]):
     """Kimi K3 text model (the vision tower is ignored; text-only serving)."""
 
     def __init__(self, model_config: ModelConfig):
         cfg = _get_text_config(model_config.pretrained_config)
         assert model_config.mapping.pp_size == 1, \
             "Kimi K3 does not support pipeline parallelism"
-        assert getattr(model_config, "spec_config", None) is None, \
-            "Kimi K3 does not support speculative decoding"
+        spec_config = getattr(model_config, "spec_config", None)
+        # SA (suffix automaton) is the supported spec-dec mode: one-engine
+        # in-forward drafting, no draft weights; the KDA/MLA verify paths
+        # below implement multi-token verification for it. Modes needing
+        # draft heads (MTP/Eagle) are blocked until a draft-head
+        # checkpoint exists.
+        assert spec_config is None or spec_config.spec_dec_mode.is_sa(), \
+            "Kimi K3 supports speculative decoding only with SA"
         super().__init__(KimiLinearModel(model_config),
-                         config=model_config,
+                         model_config,
                          hidden_size=cfg.hidden_size,
                          vocab_size=cfg.vocab_size)
 
