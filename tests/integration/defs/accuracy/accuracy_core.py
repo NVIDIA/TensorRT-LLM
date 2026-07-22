@@ -105,6 +105,9 @@ class HypothesisTestingParams:
 
     def report(self, accuracy: Optional[float] = None) -> str:
         metric_name = self.metric_name.upper()
+        reference_line = f"Reference {self.metric_name}: {self.ref_accuracy:.3f}"
+        if self.reference_note is not None:
+            reference_line += f" ({self.reference_note})"
         if self.threshold_override is not None:
             # The hypothesis-test statistics do not apply to an explicit
             # floor; printing them would suggest a different threshold.
@@ -113,7 +116,7 @@ class HypothesisTestingParams:
 ===========================================================
 #Samples: {self.num_samples}
 Higher is better: {self.higher_is_better}
-Reference {self.metric_name}: {self.ref_accuracy:.3f}
+{reference_line}
 Threshold (explicit floor): {self.threshold:.3f}
 ==========================================================="""
         else:
@@ -126,12 +129,8 @@ Sigma (Standard deviation): {self.sigma:.3f}
 #Samples: {self.num_samples}
 Higher is better: {self.higher_is_better}
 Theta (Minimum detectable effect): {self.theta:.3f}
-Reference {self.metric_name}: {self.ref_accuracy:.3f}
+{reference_line}
 Threshold: {self.threshold:.3f}
-==========================================================="""
-        if self.reference_note is not None:
-            report = f"""{report}
-External reference: {self.reference_note}
 ==========================================================="""
         if accuracy is not None:
             report = f"""{report}
