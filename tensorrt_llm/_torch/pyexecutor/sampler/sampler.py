@@ -88,7 +88,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.trtllm import top_p_decay_update
+from .ops.top_p_decay import top_p_decay_update
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -2316,7 +2316,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Per-slot reset token id (< 0 never matches a sampled token)."""
         is_top_p_decay_slot_cuda: torch.Tensor
         """Per-slot bool gate (device mirror of ``_top_p_decay_slots``). Lets the
-        fused post-sample update kernel filter decay-active slots on the GPU,
+        fused post-sample update op filter decay-active slots on the GPU,
         avoiding a host-side ``.tolist()`` / set intersection each step."""
 
         @classmethod
@@ -4674,8 +4674,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda for slots that were not scheduled this iteration.
         """
         # Host-side O(1) early-out: skip the kernel launch when no request uses
-        # decay; otherwise a single fused kernel gates on is_decay_slot
-        # on-device and gathers the sampled token in-kernel (decay is
+        # decay; otherwise a single fused (torch.compile) op gates on
+        # is_decay_slot on-device and gathers the sampled token in place (decay is
         # single-token-only, so the token is at local step 0, beam 0).
         if not self._top_p_decay_slots:
             return

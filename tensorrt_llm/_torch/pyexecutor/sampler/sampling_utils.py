@@ -39,7 +39,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_renorm_probs_op,
     top_p_sampling_from_probs_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.ops.trtllm import top_p_decay_gather
+from tensorrt_llm._torch.pyexecutor.sampler.ops.top_p_decay import top_p_decay_gather
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     GREEDY_TEMPERATURE_THRESHOLD,
     BeamSearchMetadata,
@@ -403,7 +403,7 @@ class _StrategyImpls:
             overridden, so a group mixing top-p-decay and plain top-p requests
             keeps each row's correct value. The overridden ``self._top_p`` tensor
             then feeds both sampling and ``top_p_renorm_probs_op`` (so processed
-            logprobs match). Single fused launch (gather + gate + select).
+            logprobs match). Fused via torch.compile (gather + gate + select).
             """
             if not isinstance(group_metadata, TopPDecayMetadata):
                 return
