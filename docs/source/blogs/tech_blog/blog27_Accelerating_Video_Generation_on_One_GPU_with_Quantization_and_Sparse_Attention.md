@@ -8,6 +8,17 @@ Our [earlier post](blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_Tensor
 scaled video generation from one NVIDIA B200 GPU to a GB200 NVL72 rack. This post addresses the
 complementary problem: reducing the work on each GPU before scaling out.
 
+A representative profile of the compiled dense BF16 path shows why attention is the first
+optimization target: it accounts for 71.7% of end-to-end latency, with GEMMs adding another 20.8%.
+
+<p align="center">
+  <img src="../media/tech_blog27_bf16_time_breakdown.png" alt="Pie chart showing that a representative compiled dense BF16 path spends 71.7% of end-to-end latency in attention, 20.8% in GEMMs, and 7.5% in other pipeline work" width="1080">
+</p>
+
+<p align="center"><sub><em>Figure 1. Representative end-to-end latency breakdown for the compiled
+dense BF16 path on one B200. Attention accounts for 71.7% of pipeline time, GEMMs for 20.8%, and
+other work for 7.5%.</em></sub></p>
+
 We combine three composable optimizations in TensorRT-LLM VisualGen:
 
 - **FP8 block-scaled or NVFP4 GEMMs** reduce linear-layer cost.
@@ -27,7 +38,7 @@ conservative Skip Softmax added only a small incremental change.
   <img src="../media/tech_blog27_single_gpu_latency.png" alt="Grouped bar chart showing single-B200 end-to-end latency for BF16, FP8 block-scaled, and NVFP4 GEMMs with dense attention, SAGE attention, and SAGE plus conservative Skip Softmax" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 1. The three optimizations compose. All speedups use the same
+<p align="center"><sub><em>Figure 2. The three optimizations compose. All speedups use the same
 compiled dense BF16 baseline. Skip Softmax uses `target_sparsity=0.65` and
 `disabled_until_timestep=0.86`; lower latency is better.</em></sub></p>
 
@@ -35,7 +46,7 @@ compiled dense BF16 baseline. Skip Softmax uses `target_sparsity=0.65` and
 
 - [Three optimization layers](#three-optimization-layers)
 - [Benchmark design](#benchmark-design)
-- [Where the BF16 baseline time goes](#where-the-bf16-baseline-time-goes)
+- [Where the compiled BF16 path spends time](#where-the-compiled-bf16-path-spends-time)
 - [End-to-end results](#end-to-end-results)
 - [Quality and the dense-family anchor](#quality-and-the-dense-family-anchor)
 - [Choosing an operating point](#choosing-an-operating-point)
@@ -130,18 +141,11 @@ compiled candidates, while eager BF16 supplies the image-space reference. Compil
 mean LPIPS 0.118 against eager BF16, so incremental Skip Softmax effects are best read relative to
 the matching dense precision-family anchor.
 
-## Where the BF16 baseline time goes
+## Where the compiled BF16 path spends time
 
-An Nsight Systems profile of a representative compiled dense BF16 run using the TensorRT-LLM
-release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21` shows where the optimization
-opportunity is concentrated. Attention accounts for nearly three quarters of end-to-end latency,
-while GEMMs account for roughly one fifth.
-
-| Work | Share of pipeline time |
-| :--- | ---: |
-| Attention | 71.7% |
-| GEMM | 20.8% |
-| Other pipeline work | 7.5% |
+Figure 1 summarizes an Nsight Systems profile of a representative compiled dense BF16 run using
+the TensorRT-LLM release image `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21`. Attention accounts
+for nearly three quarters of end-to-end latency, while GEMMs account for roughly one fifth.
 
 Attention includes TensorRT-LLM FMHA and cuDNN SDPA kernels. GEMM includes linear-layer matrix
 multiplications. The remaining category includes normalization, RoPE, activations, scheduler and
@@ -178,7 +182,7 @@ Several effects are visible:
   <img src="../media/tech_blog27_quality_speed_frontier.png" alt="Scatter plot of all 96 configurations showing speedup over compiled dense BF16 against mean LPIPS distance to eager BF16, with dense family anchors marked as stars" width="1080">
 </p>
 
-<p align="center"><sub><em>Figure 2. All 90 Skip Softmax variants and six dense family anchors.
+<p align="center"><sub><em>Figure 3. All 90 Skip Softmax variants and six dense family anchors.
 Farther right is faster; lower is closer to eager BF16. A star is the skip-off anchor for that
 GEMM and attention combination.</em></sub></p>
 
