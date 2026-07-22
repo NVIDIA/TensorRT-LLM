@@ -11,6 +11,19 @@ the HF fields we consume, and build them from ``config.json`` inside
 The inner text config is normalized separately into a ``Qwen3NextConfig`` (the
 runtime model that backs the Qwen3.5 dense text tower) via the shared Qwen3.5
 compatibility shim; it is passed in already constructed.
+
+.. note::
+    This is a transitional import/registration-safety shim, **not** a way to
+    avoid the ``transformers>=5.7.0`` runtime requirement: actually running the
+    model still needs the native ``MiniCPMV4_6Processor`` for image/video
+    preprocessing (see ``_ensure_transformers_supports_minicpmv4_6`` in
+    ``modeling_minicpmv4_6``).  Its only job is to keep ``import tensorrt_llm``,
+    ``AutoConfig``/``AutoTokenizer`` and CI unit-test collection working on the
+    repo's currently-pinned transformers 5.5.4.
+
+    TODO: remove this module once the repo pins ``transformers>=5.7.0`` and
+    switch ``_build_minicpmv4_6_config`` to the native
+    ``transformers.MiniCPMV4_6Config``.
 """
 
 from transformers import PretrainedConfig
