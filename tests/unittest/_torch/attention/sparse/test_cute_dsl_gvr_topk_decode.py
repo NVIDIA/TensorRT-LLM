@@ -756,6 +756,34 @@ def _run_gvr_direct(logits, pre_idx, seq_lens, top_k, enable_r0, cluster_size):
     return out
 
 
+def _assert_index_sets_equal_tie_aware(out_base, out_r0, logits):
+    """Assert two arms' top-K index sets match, modulo boundary value-ties.
+
+    fp32 randn logits DO collide bit-exactly at these sample counts; when the
+    duplicated value sits on the top-K boundary, each arm may legitimately
+    keep a different member of the tie class. Indices in the symmetric
+    difference must all carry the row's boundary (minimum kept) value —
+    anything else is a genuine divergence.
+    """
+    base_sorted, _ = out_base.sort(dim=-1)
+    r0_sorted, _ = out_r0.sort(dim=-1)
+    mismatch = (base_sorted != r0_sorted).any(dim=-1)
+    for bad in mismatch.nonzero().flatten().tolist():
+        base_set = set(out_base[bad].tolist())
+        r0_set = set(out_r0[bad].tolist())
+        diff = sorted(base_set.symmetric_difference(r0_set))
+        row_vals = logits[bad].float()
+        kth = row_vals[out_base[bad].long()].min()
+        diff_vals = row_vals[torch.tensor(diff, device=logits.device, dtype=torch.long)]
+        if not bool((diff_vals == kth).all().item()):
+            raise AssertionError(
+                f"row={bad}: R0 index set != secant-base index set beyond a "
+                f"boundary value-tie (kth={kth.item()}, "
+                f"diff={[(i, row_vals[i].item()) for i in diff]}, "
+                f"base={sorted(base_set)}, r0={sorted(r0_set)})"
+            )
+
+
 def _make_r0_pre_idx(logits, top_k, hint, seed):
     """Build ``pre_idx`` in the kernel's native cr=1 convention: the kernel
     reads ``logits[pre_idx + 1]``, so store ``true_index - 1``.
@@ -822,22 +850,18 @@ def test_cute_dsl_gvr_topk_decode_r0_equivalence(dtype, top_k, N, batch_size, hi
     _tie_aware_check(out_base, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
     _tie_aware_check(out_r0, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
 
-    # 2. Equivalence. fp32 logits are tie-free w.p. 1 → the top-K index set is
-    #    unique, so R0 and base must return the identical set (order-independent,
-    #    compared as sorted indices). For bf16/fp16 boundary value-ties permit
-    #    distinct valid index sets, so equivalence there is the value-set
-    #    equality already established in step 1 (both == torch.topk reference).
+    # 2. Equivalence. fp32 logits are ALMOST tie-free, so R0 and base must
+    #    return the identical index set (order-independent) — but randn
+    #    quantized to fp32 does collide (bs=16, N=8192, seed 0:
+    #    logits[3,2956] == logits[3,4949] bit-exactly, straddling the K=2048
+    #    boundary), and a boundary value-tie makes the arms' distinct index
+    #    picks equally valid. Where the sets differ, require every differing
+    #    index to carry the row's boundary (k-th) value; anything else is a
+    #    real divergence. bf16/fp16 boundary ties are common, so equivalence
+    #    there is the value-set equality already established in step 1
+    #    (both == torch.topk reference).
     if dtype == torch.float32:
-        base_sorted, _ = out_base.sort(dim=-1)
-        r0_sorted, _ = out_r0.sort(dim=-1)
-        mismatch = (base_sorted != r0_sorted).any(dim=-1)
-        if bool(mismatch.any().item()):
-            bad = int(mismatch.int().argmax().item())
-            raise AssertionError(
-                f"row={bad}: R0 index set != secant-base index set "
-                f"(base={sorted(out_base[bad].tolist())}, "
-                f"r0={sorted(out_r0[bad].tolist())})"
-            )
+        _assert_index_sets_equal_tie_aware(out_base, out_r0, logits)
 
 
 @skip_not_sm100
@@ -878,7 +902,7 @@ def test_cute_dsl_gvr_topk_decode_r0_equivalence_bigbs(
     _tie_aware_check(out_base, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
     _tie_aware_check(out_r0, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
     if dtype == torch.float32:
-        assert torch.equal(out_base.sort(dim=-1).values, out_r0.sort(dim=-1).values)
+        _assert_index_sets_equal_tie_aware(out_base, out_r0, logits)
 
 
 @skip_not_sm100
