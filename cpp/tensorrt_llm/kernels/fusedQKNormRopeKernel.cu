@@ -24,6 +24,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -56,15 +57,52 @@ __device__ __forceinline__ float selectMRopePosId(int const* position_ids, int t
     return static_cast<float>(position_ids[sec * num_tokens + tokenIdx]);
 }
 
-// Perform per-head QK Norm and RoPE in a single kernel.
+// Store a per-thread run of `numElemsPerThread` float elements to the output
+// head, converting to the output dtype. BF16 uses the packed uint vector store;
+// FP8 E4M3 packs pairs via __nv_fp8x2_e4m3 (saturating round-to-nearest, matching
+// torch's .to(torch.float8_e4m3fn)).
+template <typename OutT, int numElemsPerThread, int vecSize>
+__device__ __forceinline__ void storeHeadElements(
+    OutT* out, int offsetThread, float const (&elements)[numElemsPerThread])
+{
+    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+    if constexpr (std::is_same_v<OutT, __nv_bfloat16>)
+    {
+        vec_T vec;
+        for (int i = 0; i < vecSize; i++)
+        {
+            __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
+            reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
+        }
+        *reinterpret_cast<vec_T*>(&out[offsetThread]) = vec;
+    }
+    else // __nv_fp8_e4m3
+    {
+        static_assert(numElemsPerThread % 2 == 0, "FP8 store expects an even element count per thread");
+#pragma unroll
+        for (int i = 0; i < numElemsPerThread; i += 2)
+        {
+            __nv_fp8x2_e4m3 packed(make_float2(elements[i], elements[i + 1]));
+            reinterpret_cast<__nv_fp8x2_storage_t*>(&out[offsetThread])[i / 2] = packed.__x;
+        }
+    }
+}
+
+// Perform per-head QK Norm and RoPE in a single kernel, reading a BF16 input and
+// writing the result to a (possibly different-dtype) output buffer.
 // head_dim: the dimension of each head
 // interleave: interleave=!is_neox.
-template <int head_dim, bool interleave>
+// OutT: output element type (__nv_bfloat16 for in-place/BF16, __nv_fp8_e4m3 for FP8).
+// When process_v is true, V heads are copy-cast into the output (no norm/RoPE);
+// otherwise only Q/K heads are processed and V output slots are left untouched.
+template <int head_dim, bool interleave, typename OutT>
 __global__ void fusedQKNormRopeKernel(
-    __nv_bfloat16* qkv,            // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    __nv_bfloat16 const* qkv_in,   // Combined QKV input [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    OutT* qkv_out,                 // Output buffer, same layout as qkv_in
     int const num_heads_q,         // Number of query heads
     int const num_heads_k,         // Number of key heads
     int const num_heads_v,         // Number of value heads
+    bool const process_v,          // Whether to copy-cast V heads into qkv_out
     int const rotary_dim,          // Dimension for RoPE
     float const eps,               // Epsilon for RMS normalization
     __nv_bfloat16 const* q_weight, // RMSNorm weights for query
@@ -95,17 +133,37 @@ __global__ void fusedQKNormRopeKernel(
 
     // Total number of attention heads (Q and K)
     int const total_qk_heads = num_heads_q + num_heads_k;
+    // Heads actually processed by this launch: Q + K, plus V when copy-casting.
+    int const total_proc_heads = total_qk_heads + (process_v ? num_heads_v : 0);
 
-    // Determine which token and head type (Q or K) this warp processes
-    int const tokenIdx = globalWarpIdx / total_qk_heads;
-    int const localHeadIdx = globalWarpIdx % total_qk_heads;
+    // Determine which token and head this warp processes
+    int const tokenIdx = globalWarpIdx / total_proc_heads;
+    int const localHeadIdx = globalWarpIdx % total_proc_heads;
 
     // Skip if this warp is assigned beyond the number of tokens
     if (tokenIdx >= num_tokens)
         return;
 
     bool const isQ = localHeadIdx < num_heads_q;
-    int const headIdx = isQ ? localHeadIdx : localHeadIdx - num_heads_q;
+    bool const isV = localHeadIdx >= total_qk_heads;
+    // headIdx is the head's index within its own (Q/K/V) segment.
+    int headIdx;
+    int segStart; // element offset of the segment start within a token row
+    if (isQ)
+    {
+        headIdx = localHeadIdx;
+        segStart = 0;
+    }
+    else if (!isV)
+    {
+        headIdx = localHeadIdx - num_heads_q;
+        segStart = num_heads_q * head_dim;
+    }
+    else
+    {
+        headIdx = localHeadIdx - total_qk_heads;
+        segStart = total_qk_heads * head_dim;
+    }
 
     int const num_heads = num_heads_q + num_heads_k + num_heads_v;
 
@@ -119,25 +177,15 @@ __global__ void fusedQKNormRopeKernel(
     constexpr int vecSize = elemSizeBytes / 4; // Use packed_as<uint, vecSize> to perform loading/saving.
     using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
 
-    int offsetWarp; // Offset for the warp
-    if (isQ)
-    {
-        // Q segment: token offset + head offset within Q segment
-        offsetWarp = tokenIdx * num_heads * head_dim + headIdx * head_dim;
-    }
-    else
-    {
-        // K segment: token offset + entire Q segment + head offset within K segment
-        offsetWarp = tokenIdx * num_heads * head_dim + num_heads_q * head_dim + headIdx * head_dim;
-    }
+    int const offsetWarp = tokenIdx * num_heads * head_dim + segStart + headIdx * head_dim;
     int offsetThread = offsetWarp + laneId * numElemsPerThread;
 
     // Sum of squares for RMSNorm
     float sumOfSquares = 0.0f;
 
-    // Load.
+    // Load from the BF16 input.
     {
-        vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[offsetThread]);
+        vec_T vec = *reinterpret_cast<vec_T const*>(&qkv_in[offsetThread]);
         for (int i = 0; i < vecSize; i++)
         {
             float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
@@ -147,6 +195,13 @@ __global__ void fusedQKNormRopeKernel(
             elements[2 * i] = vals.x;
             elements[2 * i + 1] = vals.y;
         }
+    }
+
+    // V heads are copy-cast only: skip norm and RoPE and store the raw values.
+    if (isV)
+    {
+        storeHeadElements<OutT, numElemsPerThread, vecSize>(qkv_out, offsetThread, elements);
+        return;
     }
 
     if (is_qk_norm)
@@ -284,17 +339,8 @@ __global__ void fusedQKNormRopeKernel(
         }
     }
 
-    // Store.
-    {
-        vec_T vec;
-        for (int i = 0; i < vecSize; i++)
-        {
-            __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-            reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
-        }
-        vec_T* outputPtr = reinterpret_cast<vec_T*>(&qkv[offsetThread]);
-        *outputPtr = vec;
-    }
+    // Store to the (templated) output.
+    storeHeadElements<OutT, numElemsPerThread, vecSize>(qkv_out, offsetThread, elements);
 }
 
 // Borrowed from
@@ -311,11 +357,13 @@ __global__ void fusedQKNormRopeKernel(
         __VA_ARGS__                                                                                                    \
     }
 
-void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
-    int const num_heads_v, int const head_dim, int const rotary_dim, float const eps, void const* q_weight,
-    void const* k_weight, float const base, bool const interleave, int const* position_ids, float factor, float low,
-    float high, float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope,
-    int mrope_section1, int mrope_section2)
+template <typename OutT>
+static void launchFusedQKNormRopeImpl(__nv_bfloat16 const* qkv_in, OutT* qkv_out, bool const process_v,
+    int const num_tokens, int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim,
+    int const rotary_dim, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
+    float const base, bool const interleave, int const* position_ids, float factor, float low, float high,
+    float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope, int mrope_section1,
+    int mrope_section2)
 {
     if (factor == 1.0f)
     {
@@ -333,8 +381,9 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     constexpr int blockSize = 256;
 
     int const warpsPerBlock = blockSize / 32;
-    int const totalQKHeads = num_heads_q + num_heads_k;
-    int const totalWarps = num_tokens * totalQKHeads;
+    // Q + K heads, plus V heads when copy-casting them into the output.
+    int const totalProcHeads = num_heads_q + num_heads_k + (process_v ? num_heads_v : 0);
+    int const totalWarps = num_tokens * totalProcHeads;
 
     int const gridSize = common::divUp(totalWarps, warpsPerBlock);
     dim3 gridDim(gridSize);
@@ -346,32 +395,68 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     {
     case 64:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<64, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
-                    num_heads_v, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high,
-                    attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
+            fusedQKNormRopeKernel<64, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
+                num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
+                num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
+                mrope_section2);
         });
         break;
     case 128:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<128, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
-                    num_heads_v, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high,
-                    attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
+            fusedQKNormRopeKernel<128, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
+                num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
+                num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
+                mrope_section2);
         });
         break;
     case 256:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<256, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
-                    num_heads_v, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high,
-                    attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
+            fusedQKNormRopeKernel<256, INTERLEAVE, OutT><<<gridDim, blockDim, 0, stream>>>(qkv_in, qkv_out, num_heads_q,
+                num_heads_k, num_heads_v, process_v, rotary_dim, eps, q_weight, k_weight, base, position_ids,
+                num_tokens, factor, low, high, attention_factor, is_qk_norm, use_gemma, use_mrope, mrope_section1,
+                mrope_section2);
         });
         break;
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);
+    }
+}
+
+void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
+    int const num_heads_v, int const head_dim, int const rotary_dim, float const eps, void const* q_weight,
+    void const* k_weight, float const base, bool const interleave, int const* position_ids, float factor, float low,
+    float high, float attention_factor, cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope,
+    int mrope_section1, int mrope_section2)
+{
+    // In-place BF16: input and output alias the same buffer; V is left untouched.
+    launchFusedQKNormRopeImpl<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(qkv),
+        reinterpret_cast<__nv_bfloat16*>(qkv), /*process_v=*/false, num_tokens, num_heads_q, num_heads_k, num_heads_v,
+        head_dim, rotary_dim, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
+        reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, interleave, position_ids, factor, low, high,
+        attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1, mrope_section2);
+}
+
+void launchFusedQKNormRopeOut(void const* qkv_in, void* qkv_out, bool out_fp8, bool process_v, int const num_tokens,
+    int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim, int const rotary_dim,
+    float const eps, void const* q_weight, void const* k_weight, float const base, bool const interleave,
+    int const* position_ids, float factor, float low, float high, float attention_factor, cudaStream_t stream,
+    bool is_qk_norm, bool use_gemma, bool use_mrope, int mrope_section1, int mrope_section2)
+{
+    auto const* in = reinterpret_cast<__nv_bfloat16 const*>(qkv_in);
+    auto const* qw = reinterpret_cast<__nv_bfloat16 const*>(q_weight);
+    auto const* kw = reinterpret_cast<__nv_bfloat16 const*>(k_weight);
+    if (out_fp8)
+    {
+        launchFusedQKNormRopeImpl<__nv_fp8_e4m3>(in, reinterpret_cast<__nv_fp8_e4m3*>(qkv_out), process_v, num_tokens,
+            num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim, eps, qw, kw, base, interleave, position_ids,
+            factor, low, high, attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1,
+            mrope_section2);
+    }
+    else
+    {
+        launchFusedQKNormRopeImpl<__nv_bfloat16>(in, reinterpret_cast<__nv_bfloat16*>(qkv_out), process_v, num_tokens,
+            num_heads_q, num_heads_k, num_heads_v, head_dim, rotary_dim, eps, qw, kw, base, interleave, position_ids,
+            factor, low, high, attention_factor, stream, is_qk_norm, use_gemma, use_mrope, mrope_section1,
+            mrope_section2);
     }
 }
 } // namespace kernels
