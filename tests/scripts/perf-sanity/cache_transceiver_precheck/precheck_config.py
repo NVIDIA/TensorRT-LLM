@@ -113,15 +113,18 @@ def wireup_timeout_s(max_world):
 
 
 def default_step_timeout_s(max_world):
-    """External (srun-level) timeout covering one precheck instance,
-    including the first-rep wire-up. Imported by the launch tooling
+    """External (srun-level) timeout covering one precheck instance.
+
+    Includes the first-rep wire-up. Imported by the launch tooling
     (jenkins/scripts/perf/{,local/}submit.py) so the outer timeout can
-    never drift below the driver's internal budget."""
+    never drift below the driver's internal budget.
+    """
     return 900 + wireup_timeout_s(max_world)
 
 
-def precheck_prefix_lines(cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world,
-                          stage_name=""):
+def precheck_prefix_lines(
+    cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, max_world, stage_name=""
+):
     """Launch-script export lines wiring the precheck gate.
 
     Single owner of the enable/kill-switch policy, the step-timeout default,
@@ -175,14 +178,16 @@ def precheck_prefix_lines(cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, ma
 
 
 def gate_library_content(draft_launch_sh, llm_src):
-    """The precheck gate shell library (defines run_cache_transceiver_precheck),
-    spliced ahead of the disagg draft by both submit.py. Single owner of the
+    """The precheck gate shell library (defines run_cache_transceiver_precheck).
+
+    Spliced ahead of the disagg draft by both submit.py. Single owner of the
     load/splice, so the two launch generators can't drift.
 
     Located next to the draft by default; falls back to the in-repo copy when
     the draft lives outside the repo (a custom --draft-launch-sh), so launch
     generation never dies with FileNotFoundError. Whitespace-only lines are
-    dropped to match the rest of the assembled launch script."""
+    dropped to match the rest of the assembled launch script.
+    """
     candidates = [
         os.path.join(os.path.dirname(draft_launch_sh), "slurm_ct_precheck_gate.sh"),
         os.path.join(
@@ -427,7 +432,10 @@ def unmodelable_kv_reason(hf_cfg):
     just with generic bytes.
     """
     if any(k in hf_cfg for k in ("index_topk", "index_n_heads", "index_head_dim")):
-        return "sparse-attention model (DSA/indexer): using a generic KV pool -- this checks the network/transceiver path, not V4's exact KV layout"
+        return (
+            "sparse-attention model (DSA/indexer): using a generic KV pool -- this checks "
+            "the network/transceiver path, not V4's exact KV layout"
+        )
     return None
 
 
