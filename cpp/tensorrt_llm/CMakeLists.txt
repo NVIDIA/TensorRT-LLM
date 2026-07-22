@@ -190,6 +190,7 @@ set(TRTLLM_LINK_LIBS
     selective_scan_src
     mamba2_mtp_ssm_cache_src
     kda_decode_src
+    kimi_k3_attn_res_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src

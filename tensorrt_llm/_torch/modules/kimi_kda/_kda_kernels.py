@@ -2,15 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kernel dispatch for the in-tree KDA module.
 
-The optimized ``KDA_prefill`` (CuTe / cuTile + Triton chunked prefill) kernel
-lives in the NVIDIA+Moonshot internal collaboration collection at
-``exisiting_optimization_work/``. The fused CUDA C++ single-token decode
-kernel is source-integrated and exposed through a native TensorRT-LLM Torch
-op.
+Both optimized KDA kernels are source-integrated into TensorRT-LLM: the
+chunked prefill (CuTe DSL ``trtllm::kda_prefill``, see
+``tensorrt_llm/_torch/custom_ops/cute_dsl_kimi_k3_custom_ops.py``) and the
+fused CUDA C++ single-token decode (``trtllm::kda_decode`` thop op wrapped
+by ``_kda_decode``). Neither requires the external
+``exisiting_optimization_work`` collection at runtime.
 
-On sm_100 with the optimization tree available the dispatch runs the
-optimized kernels. On any other arch (or when the optimization tree is
-unreachable at runtime) the dispatch falls back to FLA's ``chunk_kda`` /
+On Blackwell (sm_100/sm_103) with the CuTe DSL toolchain available the
+dispatch runs the optimized kernels. On any other arch (or when the in-tree
+prefill op is unavailable) the dispatch falls back to FLA's ``chunk_kda`` /
 ``fused_recurrent_kda`` on-device references.
 
 Callers are the ``KimiKDALinearAttention`` module. The module owns the
@@ -22,9 +23,6 @@ the delta-rule inner loop plus its state update.
 from __future__ import annotations
 
 import importlib
-import importlib.util
-import os
-import sys
 from types import ModuleType
 from typing import Optional, Tuple
 
@@ -36,21 +34,6 @@ try:
     from tensorrt_llm._utils import get_sm_version as _tllm_get_sm_version
 except Exception:  # pragma: no cover — source-loader stub path
     _tllm_get_sm_version = None
-
-
-KIMI_KDA_OPTIMIZED_KERNEL_ENV = "KIMI_KDA_OPTIMIZED_KERNEL_DIR"
-"""Environment variable pointing at the ``exisiting_optimization_work`` root.
-
-The KDA module resolves the ``KDA_prefill/benchmark`` sub-directory from this
-root. If unset the module falls back to the FLA reference path.
-"""
-
-
-def _resolve_optimization_root() -> Optional[str]:
-    root = os.environ.get(KIMI_KDA_OPTIMIZED_KERNEL_ENV)
-    if root and os.path.isdir(root):
-        return root
-    return None
 
 
 def _default_get_sm_version() -> int:
@@ -82,39 +65,38 @@ def is_kda_optimized_supported() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# KDA_prefill kernel loading (CuTe / cuTile + Triton chunked prefill).
+# In-tree KDA prefill op (CuTe DSL, trtllm::kda_prefill).
 # ---------------------------------------------------------------------------
 
 _PREFILL_MODULE: Optional[ModuleType] = None
+_PREFILL_IMPORT_ERROR: Optional[BaseException] = None
 
 
-def _load_prefill_module(root: str) -> ModuleType:
-    global _PREFILL_MODULE
+def _load_prefill_module() -> ModuleType:
+    """Import the in-tree prefill custom-op module (registers the op)."""
+    global _PREFILL_MODULE, _PREFILL_IMPORT_ERROR
     if _PREFILL_MODULE is not None:
         return _PREFILL_MODULE
-
-    benchmark_dir = os.path.join(root, "KDA_prefill", "benchmark")
-    chunk_fwd_path = os.path.join(benchmark_dir, "chunk_fwd.py")
-    if not os.path.isfile(chunk_fwd_path):
-        raise FileNotFoundError(
-            f"KDA_prefill chunk_fwd not found at {chunk_fwd_path}. "
-            f"Set {KIMI_KDA_OPTIMIZED_KERNEL_ENV} to point at "
-            "exisiting_optimization_work/."
+    if _PREFILL_IMPORT_ERROR is not None:
+        raise _PREFILL_IMPORT_ERROR
+    try:
+        module = importlib.import_module(
+            "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops"
         )
-    if benchmark_dir not in sys.path:
-        sys.path.insert(0, benchmark_dir)
-
-    spec = importlib.util.spec_from_file_location(
-        "tensorrt_llm._torch.modules.kimi_kda._optimized_kda_prefill",
-        chunk_fwd_path,
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not build import spec for {chunk_fwd_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    except BaseException as exc:  # ImportError when CuTe DSL is unavailable
+        _PREFILL_IMPORT_ERROR = exc
+        raise
     _PREFILL_MODULE = module
     return module
+
+
+def is_intree_prefill_available() -> bool:
+    """True when the in-tree CuTe DSL prefill op can be imported."""
+    try:
+        _load_prefill_module()
+        return True
+    except Exception:
+        return False
 
 
 def _load_fla_chunk_kda() -> ModuleType:
@@ -132,38 +114,31 @@ class KDAKernelDispatch:
     Attributes
     ----------
     kernel_path : str
-        ``"optimized"`` when the sm_100 CuTe/Triton chunked prefill and fused
-        CUDA decode kernels are selected, ``"fla"`` when the FLA references
+        ``"optimized"`` when the sm_100 CuTe DSL chunked prefill and fused
+        CUDA decode ops are selected, ``"fla"`` when the FLA references
         are selected.
-    optimization_root : Optional[str]
-        Root path of the ``exisiting_optimization_work`` collection when
-        available, else ``None``.
-
     Notes
     -----
     Dispatch is decided at construction time using
-    ``is_kda_optimized_supported()`` and the presence of the optimization
-    collection. Callers can force the fallback by constructing with
+    ``is_kda_optimized_supported()`` and the availability of the in-tree
+    prefill op. Callers can force the fallback by constructing with
     ``force_use_fallback=True``.
     """
 
     def __init__(self, force_use_fallback: bool = False) -> None:
         self.force_use_fallback = force_use_fallback
-        root = _resolve_optimization_root()
-        if force_use_fallback or root is None or not is_kda_optimized_supported():
+        if (
+            force_use_fallback
+            or not is_kda_optimized_supported()
+            or not is_intree_prefill_available()
+        ):
             self.kernel_path = "fla"
-            self.optimization_root: Optional[str] = None
-            self._prefill_module: Optional[ModuleType] = None
         else:
             self.kernel_path = "optimized"
-            self.optimization_root = root
-            self._prefill_module = None
 
     def get_prefill_source(self) -> str:
         if self.kernel_path == "optimized":
-            module = _load_prefill_module(self.optimization_root)
-            self._prefill_module = module
-            return module.__file__
+            return _load_prefill_module().__file__ or "<custom_ops.cute_dsl_kimi_k3>"
         return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
 
     def get_decode_source(self) -> str:
@@ -194,7 +169,7 @@ class KDAKernelDispatch:
         ``ChunkKDAFunction.forward`` performs when the caller enables
         ``use_qk_l2norm_in_kernel``, ``use_beta_sigmoid_in_kernel``,
         ``use_gate_in_kernel``, and ``transpose_state_layout``; then
-        dispatches to the CuTe/Triton chunked forward.
+        dispatches to the in-tree ``trtllm::kda_prefill`` CuTe DSL op.
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
@@ -215,10 +190,9 @@ class KDAKernelDispatch:
             A_log_kernel = A_log.detach() if A_log is not None else None
             dt_bias_kernel = dt_bias.detach() if dt_bias is not None else None
 
-            module = _load_prefill_module(self.optimization_root)
-            self._prefill_module = module
+            _load_prefill_module()  # registers trtllm::kda_prefill
 
-            out_tuple = module.chunk_kda_fwd(
+            out, final_state = torch.ops.trtllm.kda_prefill(
                 q=q,
                 k=k,
                 v=v,
@@ -236,7 +210,7 @@ class KDAKernelDispatch:
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
             )
-            return out_tuple[0], out_tuple[1]
+            return out, final_state
 
         from fla.ops.kda import chunk_kda
 

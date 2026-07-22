@@ -1,11 +1,7 @@
 """Parity test: in-tree KDA decode thop op (optimized path) vs FLA reference."""
 import copy
-import os
 
 import torch
-
-assert os.environ.get("KIMI_KDA_OPTIMIZED_KERNEL_DIR"), \
-    "set KIMI_KDA_OPTIMIZED_KERNEL_DIR (needed for kernel_path=OPTIMIZED)"
 
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import (
     KimiKDACachedState, KimiKDALinearAttention)
