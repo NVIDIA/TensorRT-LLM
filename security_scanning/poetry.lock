@@ -1004,13 +1004,13 @@ cu13 = ["cuda-bindings[all] (==13.*)", "cuda-toolkit (==13.*)"]
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.5.6"
+version = "1.6.0"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_pathfinder-1.5.6-py3-none-any.whl", hash = "sha256:7e4c07c117b78ba1fb35dac4c444d21f3677b1b1ff56175c53a8e3025c5b43c0"},
+    {file = "cuda_pathfinder-1.6.0-py3-none-any.whl", hash = "sha256:1503af579d8379c24bdd65528379bc57039b0455be9f5f9686cf8e473a1fce51"},
 ]
 
 [[package]]
@@ -1327,14 +1327,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.31.1"
+version = "3.32.0"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.31.1-py3-none-any.whl", hash = "sha256:9ea33146c780161bf67cb20c7cb26b651566820d65ad8dfdd79422602a2dcfc0"},
-    {file = "filelock-3.31.1.tar.gz", hash = "sha256:9e0c4e88ebe90833c1beafd3a547ccbc0bf7f491cd3858c3ec7aed63efe02163"},
+    {file = "filelock-3.32.0-py3-none-any.whl", hash = "sha256:d396bea984af47333ef05e50eae7eff88c84256de6112aea0ec48a233c064fe3"},
+    {file = "filelock-3.32.0.tar.gz", hash = "sha256:7be2ad23a14607ccc71808e68fe30848aeace7058ace17852f68e2a68e310402"},
 ]
 
 [[package]]
@@ -1364,21 +1364,23 @@ dev = ["pytest", "pytest-xdist", "ruff"]
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.14"
+version = "0.6.15"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.14-py3-none-any.whl", hash = "sha256:d124369346a3d48eac67e31c42f7a3c813bcc0abc10e2e36db413b7b3dfd97df"},
-    {file = "flashinfer_python-0.6.14.tar.gz", hash = "sha256:f4da8b5e005601784e85e0dcaa3389f908ee2d32c2560142d67124ab10e4a070"},
+    {file = "flashinfer_python-0.6.15-py3-none-any.whl", hash = "sha256:da6c339e14db4831ade0d593324f02907d44bd4b86b640faad4727d9e089477b"},
+    {file = "flashinfer_python-0.6.15.tar.gz", hash = "sha256:2a3f1ed47129f9ac9505a26a8f12cadefc0f27d3104fb623ae281032f49eae5f"},
 ]
 
 [package.dependencies]
 apache-tvm-ffi = ">=0.1.6,<0.1.8 || >0.1.8,<0.1.8.post0 || >0.1.8.post0,<0.2"
 click = "*"
+cuda-python = ">=12.0"
 cuda-tile = ">=1.4.0"
 einops = "*"
+nccl4py = ">=0.3.1"
 ninja = "*"
 numpy = "*"
 nvidia-cudnn-frontend = ">=1.13.0"
@@ -1393,7 +1395,6 @@ tqdm = "*"
 [package.extras]
 cu12 = ["nvidia-cutlass-dsl (>=4.5.0)"]
 cu13 = ["nvidia-cutlass-dsl[cu13] (>=4.5.0)"]
-nvep = ["cuda-python (>=13.0)"]
 
 [[package]]
 name = "frozenlist"
@@ -3067,6 +3068,39 @@ sql = ["narwhals[duckdb]", "sqlparse (>=0.5.5)"]
 sqlframe = ["sqlframe (>=3.22.0,!=3.39.3)"]
 
 [[package]]
+name = "nccl4py"
+version = "0.3.1"
+description = "NCCL4Py: Python bindings for NCCL"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+files = [
+    {file = "nccl4py-0.3.1-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:15517f1255a84cf3f48d36e406ff925afa40425925a1d68a7672621286488e0a"},
+    {file = "nccl4py-0.3.1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a3115d8471cf4c207720c624174a0c023d8ef9893452310e6447dbc78a9e04ee"},
+    {file = "nccl4py-0.3.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d8e247d3a2b6e0253567322d518ec94320caa92649475416abceefaf0bc2db71"},
+    {file = "nccl4py-0.3.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7945acf8c0224f727f87db40eb3a6060ad7809256b0f37dde6b94d9d8fa6b65c"},
+    {file = "nccl4py-0.3.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e0b1bab08b374ba21bb36612710866173e703c06dc197ab13b1e093436ac27ce"},
+    {file = "nccl4py-0.3.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4f96117a0aed13744d2636760962f1cb45be9138846023b69c5a8053e531cc76"},
+    {file = "nccl4py-0.3.1-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:50068bb4e6f60dd831b2d394a9789f08a6f4346f0e51a9d717536868a8fdd398"},
+    {file = "nccl4py-0.3.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:7fd7862777777162f4735b85472951d91b8847cd7010d8f60bfefe58c7285583"},
+    {file = "nccl4py-0.3.1-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:13db9f786c7919ed1df7079c03acbe49eb569d5625fd5cec2344075f37b5e140"},
+    {file = "nccl4py-0.3.1-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5b684a3ac083fd76bf1e57e69e76575502bcd2aface23e2dad7a88461ce8916d"},
+    {file = "nccl4py-0.3.1-cp314-cp314t-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aa09f12a93e0eb7b2dbbffbcb0a3daeeb3c211f2433cc6cc896faeec85ea4b2e"},
+    {file = "nccl4py-0.3.1-cp314-cp314t-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c58bf4db2eb27636587b3ce899fe47d72c16bf1eeb76c5e1c9bb1feaf57048f5"},
+]
+
+[package.dependencies]
+"cuda.core" = ">=1.0,<2.0"
+cuda-pathfinder = ">=1.5.4,<2.0.0"
+numpy = "*"
+packaging = "*"
+typing_extensions = {version = "*", markers = "python_version < \"3.13\""}
+
+[package.extras]
+cu12 = ["cuda-bindings (>=12.0,<13.0)", "nvidia-cutlass-dsl (>=4.5.2,<5.0)", "nvidia-nccl-cu12"]
+cu13 = ["cuda-bindings (>=13.0,<14.0)", "nvidia-cutlass-dsl[cu13] (>=4.5.2,<5.0)", "nvidia-nccl-cu13"]
+
+[[package]]
 name = "networkx"
 version = "3.4.2"
 description = "Python package for creating and manipulating graphs and networks"
@@ -4215,14 +4249,14 @@ xmp = ["defusedxml"]
 
 [[package]]
 name = "platformdirs"
-version = "4.10.1"
+version = "4.11.0"
 description = "A small Python package for determining appropriate platform-specific dirs, e.g. a `user data dir`."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "platformdirs-4.10.1-py3-none-any.whl", hash = "sha256:0e4eff26be2d75293977f7cddc153fd9b8eaa7fb0c7b64ffe4076cb443117443"},
-    {file = "platformdirs-4.10.1.tar.gz", hash = "sha256:ceab4084426fe6319ce18e86deada8ab1b7487c7aee7040c55e277c9ae793695"},
+    {file = "platformdirs-4.11.0-py3-none-any.whl", hash = "sha256:360ccded2b7fce0af0ff80cc8f5942a1c5d99b0e856033acb030bfc634709e74"},
+    {file = "platformdirs-4.11.0.tar.gz", hash = "sha256:0555d18370482847566ffabcaa53ad7c6c1c29f195989ae1ed634a05f76ea1e0"},
 ]
 
 [[package]]
@@ -6904,14 +6938,14 @@ files = [
 
 [[package]]
 name = "xdsl"
-version = "0.68.0"
+version = "0.69.0"
 description = "xDSL"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "xdsl-0.68.0-py3-none-any.whl", hash = "sha256:9f28d722a1828df77b71128a5a725adbaddafcf6e20deb4de85a55cb53d8e90c"},
-    {file = "xdsl-0.68.0.tar.gz", hash = "sha256:e0331528e02bbd6baab529e32a1c942518d37294e14710ab141086e9d77af25f"},
+    {file = "xdsl-0.69.0-py3-none-any.whl", hash = "sha256:40445d6a63d8539ba9527ffea30e5c47138fd9fa19b5f2c4eae978b5450ce76b"},
+    {file = "xdsl-0.69.0.tar.gz", hash = "sha256:cc365cc1c746bd5cbf07f348e6c99e2da85a814f75ee44a91cb9caa20ea3c166"},
 ]
 
 [package.dependencies]
@@ -6920,9 +6954,9 @@ ordered-set = "4.1"
 typing-extensions = ">=4.7,<5"
 
 [package.extras]
-dev = ["coverage (<8)", "filecheck (==1.0.3)", "ipykernel", "lit (<19)", "marimo (>=0.23,<0.24)", "nbconvert (>=7.7.2,<8)", "nbval (<0.12)", "prek (>=0.4.0,<0.5.0)", "pyright (==1.1.410)", "pytest (<9.2)", "pytest-asyncio", "pytest-cov", "ruff (==0.15.20)", "sympy (==1.14)", "textual-dev (==1.8)", "toml (<0.11)"]
+dev = ["coverage (<8)", "filecheck (==1.0.3)", "ipykernel", "lit (<19)", "marimo (>=0.23,<0.24)", "nbconvert (>=7.7.2,<8)", "nbval (<0.12)", "prek (>=0.4.0,<0.5.0)", "pyright (==1.1.411)", "pytest (<9.2)", "pytest-asyncio", "pytest-cov", "ruff (==0.15.20)", "sympy (==1.14)", "textual-dev (==1.8)", "toml (<0.11)"]
 gui = ["pyclip (==0.7)", "textual (>=8,<9)"]
-heir = ["heir-py (==2026.6.5.dev0)"]
+heir = ["heir-py (==2026.7.1)"]
 llvm = ["llvmlite (>=0.47.0,<0.48.0)"]
 
 [[package]]
@@ -7321,4 +7355,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "e4694b9f8d8cec8ebbd8169afc3af5c22414bb4a9e3afec997e6f4d58b2380c6"
+content-hash = "26e270bc32d800f75b2db3240b3694e707588bbaa9d7e89d13b767a0d7e42bda"

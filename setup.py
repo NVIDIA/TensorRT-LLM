@@ -166,7 +166,6 @@ else:
         'deep_gemm/include/**/*',
         'deep_gemm/*.py',
         'deep_gemm_cpp_tllm.*.so',
-        'scripts/install_tensorrt.sh',
         'flash_mla/LICENSE',
         'flash_mla/*.py',
         'flash_mla_cpp_tllm.*.so',
