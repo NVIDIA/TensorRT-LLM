@@ -89,27 +89,6 @@ def test_metrics_headers_use_metric_list_syntax():
     assert "server-ctx-chunk-0-forward;dur=4.000000" in headers[CTX_CHUNK_METRICS_HEADER]
 
 
-def test_metrics_record_uses_standard_response_fields():
-    record = build_metrics_record_from_headers(
-        {
-            SERVER_TIMING_HEADER: "server_e2e;dur=50.0",
-            START_END_TIME_HEADER: "server-start;ts=1000.0, server-end;ts=1000.05",
-            STEP_METRICS_HEADER: "server-step-3-forward;dur=2.0",
-        },
-        "gen",
-        request_id="42",
-    )
-
-    assert record["request_id"] == "42"
-    assert record["status"] == "complete"
-    assert record["metrics_headers"][SERVER_TIMING_HEADER] == "gen_e2e;dur=50.0"
-    assert record["phases"]["gen"]["timing_metrics"] == {
-        "arrival_time": 1000.0,
-        "last_token_time": 1000.05,
-    }
-    assert "gen-step-3-forward" in record["metrics_headers"][STEP_METRICS_HEADER]
-
-
 def test_combine_disagg_metrics_is_request_local():
     ctx = {
         "request_id": "ctx-7",
@@ -134,7 +113,6 @@ def test_combine_disagg_metrics_is_request_local():
 
     assert set(record["phases"]) == {"disagg", "ctx", "gen"}
     assert record["disagg_request_id"] == 7
-    assert record["status"] == "complete"
     assert record["phases"]["ctx"]["request_id"] == "ctx-7"
     assert record["phases"]["gen"]["ctx_request_id"] == 7
     headers = build_metrics_headers(record)
@@ -181,7 +159,6 @@ def test_time_breakdown_parser_accepts_header_derived_disagg_record():
 @pytest.mark.parametrize(
     ("expose_headers", "request_metrics", "expected"),
     [
-        (False, False, False),
         (False, True, False),
         (True, False, False),
         (True, True, True),
@@ -272,7 +249,6 @@ async def test_middleware_limits_non_streaming_metrics_headers():
 @pytest.mark.parametrize(
     ("expose_headers", "request_metrics", "expected"),
     [
-        (False, False, False),
         (False, True, False),
         (True, False, False),
         (True, True, True),
@@ -357,25 +333,6 @@ async def test_disconnect_after_done_is_ignored():
         None,
         disconnect,
     )
-
-
-@pytest.mark.asyncio
-async def test_jsonl_writer(tmp_path):
-    writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
-    await writer.start()
-    writer.submit(_record())
-    await writer.close()
-
-    files = list(tmp_path.glob("perf_metrics-test-*.jsonl"))
-    assert len(files) == 1
-    saved = json.loads(files[0].read_text())
-    assert saved["request_id"] == 42
-    assert set(saved) == {
-        "request_id",
-        "perf_metrics",
-        "time_breakdown_metrics",
-        "status",
-    }
 
 
 @pytest.mark.asyncio

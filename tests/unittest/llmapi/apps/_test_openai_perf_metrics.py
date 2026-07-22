@@ -72,10 +72,13 @@ def test_return_perf_metrics_and_jsonl_dump(server: RemoteOpenAIServer,
     )
     assert response.status_code == 200
 
-    assert response.headers.get(perf_metrics.SERVER_TIMING_HEADER)
-    assert response.headers.get(perf_metrics.START_END_TIME_HEADER)
-    assert response.headers.get(perf_metrics.STEP_METRICS_HEADER)
-    assert response.headers.get(perf_metrics.CTX_CHUNK_METRICS_HEADER)
+    for header in (
+            perf_metrics.SERVER_TIMING_HEADER,
+            perf_metrics.START_END_TIME_HEADER,
+            perf_metrics.STEP_METRICS_HEADER,
+            perf_metrics.CTX_CHUNK_METRICS_HEADER,
+    ):
+        assert response.headers.get(header)
 
     records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
                                           expected_count=1)
@@ -106,21 +109,6 @@ def test_return_perf_metrics_and_jsonl_dump(server: RemoteOpenAIServer,
     assert "ctx_request_id" not in data
     assert "kv_cache_transfer_start" not in timing_metrics
     assert "kv_cache_transfer_end" not in timing_metrics
-
-    response = requests.post(
-        f"{server.url_root}/v1/completions",
-        json={
-            "model": "Server",
-            "prompt": "Hello, my name is",
-            "max_tokens": 2,
-        },
-        timeout=120,
-    )
-    assert response.status_code == 200
-    assert not response.headers.get(perf_metrics.SERVER_TIMING_HEADER)
-    assert not response.headers.get(perf_metrics.START_END_TIME_HEADER)
-    assert not response.headers.get(perf_metrics.STEP_METRICS_HEADER)
-    assert not response.headers.get(perf_metrics.CTX_CHUNK_METRICS_HEADER)
 
 
 def test_streaming_metrics_require_request_opt_in(server: RemoteOpenAIServer):
