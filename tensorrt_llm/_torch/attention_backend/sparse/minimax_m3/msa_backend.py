@@ -976,6 +976,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             head_dim=head_dim,
         )
         self.disable_index_value = bool(sparse_params.disable_index_value)
+        self.indexer_kv_dtype = str(sparse_params.indexer_kv_dtype)
         self._validate_msa_preconditions()
         self.indexer = MsaIndexer(self.m3_config)
 
@@ -1009,7 +1010,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
     def run_indexer(
         self,
         idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_k: Optional[torch.Tensor],
         metadata,
         *,
         idx_sm_scale: Optional[float] = None,
@@ -1028,10 +1029,24 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # reshape to keep them zero-copy. The proxy fmha_sm100 and the index-K
         # scatter below both honor the source strides.
         idx_q_view = idx_q.reshape(num_tokens, config.num_index_heads, config.sparse_index_dim)
-        idx_k_view = idx_k.reshape(num_tokens, 1, config.sparse_index_dim)
-
-        metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
+        if idx_k is not None:
+            idx_k_view = idx_k.reshape(num_tokens, 1, config.sparse_index_dim)
+            metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
+        elif idx_k_cache.dtype != torch.float8_e4m3fn or idx_q_view.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "A missing live index-K is valid only when the fused MiniMax-M3 "
+                "producer already emitted FP8 index-Q and inserted FP8 index-K."
+            )
+        # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
+        # index Q/K are cast directly and the proxy accumulates their QK scores
+        # in FP32. Block ordering is invariant to the omitted positive scale.
+        # The fused production path arrives here with E4M3 Q and an already
+        # populated cache. The explicit conversion is retained for standalone
+        # callers that supply BF16 Q/K to an E4M3-configured backend.
+        if idx_k_cache.dtype == torch.float8_e4m3fn:
+            if idx_q_view.dtype != torch.float8_e4m3fn:
+                idx_q_view = idx_q_view.to(torch.float8_e4m3fn)
 
         # One selection path. Decode passes the graph-safe proxy plan plus the
         # proxy scratch shaped to the live query count. Prefill and mixed batches

@@ -176,7 +176,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # then from ``sparse_attn_config``, then from the M3 checkpoint
         # convention (layers 0..2 dense, 3..N-1 sparse,
         # disable_index_value=True, sparse_index_dim=128).
-        sparse_attn_config = kwargs.get("sparse_attn_config")
+        sparse_attn_config = kwargs.get("sparse_attn_config") or kwargs.get(
+            "sparse_attention_config"
+        )
         num_layers = kwargs.get("num_layers")
 
         if sparse_index_dim is None:
@@ -195,6 +197,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = int(sparse_index_dim)
+        self.indexer_kv_dtype = str(getattr(sparse_attn_config, "indexer_kv_dtype", "bf16"))
+        if self.indexer_kv_dtype not in ("bf16", "fp8"):
+            raise ValueError(
+                "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
+                f"{self.indexer_kv_dtype!r}."
+            )
+        if self.indexer_kv_dtype == "fp8" and (
+            set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
+        ):
+            raise ValueError(
+                "MiniMax M3 FP8 index cache requires disable_index_value=True "
+                "for every sparse layer."
+            )
 
         super().__init__(*args, **kwargs)
 
@@ -265,7 +280,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return int((page_upper // kv_factor) * self.tokens_per_block)
 
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
-        """Match the main cache dtype where possible, fall back to bf16."""
+        """Return the independently configured index-cache storage dtype."""
+        if self.indexer_kv_dtype == "fp8":
+            return torch.float8_e4m3fn
         if self.dtype == DataType.HALF:
             return torch.float16
         if self.dtype == DataType.FLOAT:

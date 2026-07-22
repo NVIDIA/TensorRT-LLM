@@ -1431,6 +1431,16 @@
       "path": "sparse_attention_config.indexer_k_dtype"
     },
     {
+      "allowed_values": [
+        "bf16",
+        "fp8"
+      ],
+      "annotation": "Literal['bf16', 'fp8']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.indexer_kv_dtype"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
