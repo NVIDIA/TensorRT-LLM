@@ -18,7 +18,10 @@ python import): persistent JIT caches and a node-local per-rank
 `TRITON_CACHE_DIR` (the shared NFS `~/.triton` races across ranks). The
 fused MoE path (`KIMI_K3_FUSED_MOE=native`) uses the in-tree TRTLLM-Gen
 SiTU cubins — the model runs from this repo alone, with no external kernel
-collection.
+collection. The private-snapshot `KIMI_K3_FUSED_MOE=1` path (see the
+commented-out lines in the sbatch scripts) is still required for SA
+speculative decoding: the in-tree cubins do not yet cover the bs<=8 and
+EP=4 shapes those runs need.
 
 ## Prerequisites
 
@@ -26,6 +29,11 @@ collection.
    editable build inside the 26.05 sbsa PyTorch container.
 2. `pip install fla-core einops` into the venv (KDA prefill/decode kernels
    use FLA's Triton implementation).
+3. (Private-snapshot path only) When running `KIMI_K3_FUSED_MOE=1`, set up the
+   flashinfer snapshot 3rdparty deps per
+   `$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE/SNAPSHOT_SETUP.md` (clone the pinned
+   `3rdparty/{cutlass,spdlog,cccl}` and create the `flashinfer/data/*`
+   symlinks). Not needed for the default `native` path.
 
 ## Deployment shape
 
@@ -41,16 +49,21 @@ collection.
 * Fused MoE (`KIMI_K3_FUSED_MOE=native`, default): in-tree TRTLLM-Gen SiTU
   op (`mxe4m3_mxe2m1_block_scale_moe_runner`, W4A8 MXFP4 weights × MXFP8
   activations) consuming the checkpoint's MXFP4 weights via a one-time
-  load-time shuffle; ~0.5–0.8 ms/layer vs ~60–140 ms for the reference
-  dequant loop.
+  load-time shuffle. `KIMI_K3_FUSED_MOE=1` selects the private-snapshot
+  flashinfer `trtllm_fp4_block_scale_routed_moe` path (W4A16, requires the
+  snapshot env; still required for SA spec-dec runs — in-tree cubins lack
+  the bs≤8 shapes). Both are ~0.5–0.8 ms/layer vs ~60–140 ms for the
+  reference dequant loop.
 * Required LLM args (see `eval_extra_llm_options.yaml`): chunked prefill
   off, KV block reuse off, `tokens_per_block=64`. CUDA graphs and the
   overlap scheduler are ON by default — the generation-phase MLA
   latent-cache append derives its write positions from device tensors
   (`attention_backend/utils.py`), making it CUDA-graph-safe; verified at
-  GSM8K parity with the eager path (96.82 on the full test set). Keep
+  GSM8K parity with the eager path (96.82 on the full test set). Spec-dec
+  (SA) runs keep both OFF for now: the verify/promote path is certified
+  eager without overlap; enabling them is a measured follow-up. Keep
   `max_batch_size` ≤ ~32 (each KDA state slot costs ~455 MB across the 69
-  KDA layers).
+  KDA layers; ≤8 with SA — SpeculativeState buffers).
 * Unsupported: pipeline parallel, speculative decoding, disagg.
 
 ## Run
@@ -91,6 +104,10 @@ defaults; override on the command line as needed.
   checks only).
 * `KIMI_K3_FUSED_MOE=0` — fall back to the in-tree MXFP4 dequant reference
   MoE (bit-parity oracle for the fused paths, ~100× slower).
+* `KIMI_K3_FUSED_MOE=1` — private-snapshot flashinfer SiTU path (W4A16;
+  the only path with cubins for the truncated 4-GPU/EP=4 shapes and the
+  bs<=8 shapes SA spec-dec runs use); requires the snapshot env and
+  `FLASHINFER_PRIVATE_CUBIN_DIR`.
 * `KIMI_K3_MLA_MAX_POSITIONS` (default 65536) — identity-RoPE table bound
   (K3 MLA is NoPE); raise for longer sequences.
 * `TLLM_LOG_LEVEL_BY_MODULE="debug:_torch"` — verbose model-side logging.

@@ -51,7 +51,13 @@ srun --mpi=pmix \
         # Import path: the repo itself (the editable install records the
         # build-time mount point). The fused MoE default is the in-tree
         # TRTLLM-Gen SiTU op (KIMI_K3_FUSED_MOE=native) — fully
-        # self-contained, no external kernel collection needed.
+        # self-contained, no external kernel collection needed. To run the
+        # private-snapshot flashinfer path (KIMI_K3_FUSED_MOE=1 — still
+        # needed for SA spec dec until in-tree cubins cover the bs<=8
+        # shapes), restore
+        #   SNAP=\$KIMI_K3_OPT_WORK_DIR/trtllmgen_MOE
+        #   export PYTHONPATH=$REPO:\$SNAP:...
+        #   export FLASHINFER_PRIVATE_CUBIN_DIR=\$SNAP/local_cubins/20260617_v0613rc1_situ_v0611_barrierfix
         export PYTHONPATH=$REPO:\${PYTHONPATH:-}
         # Persistent caches for stock flashinfer JIT artifacts (non-MoE ops).
         export FLASHINFER_WORKSPACE_BASE=\$CACHE/fi_workspace
