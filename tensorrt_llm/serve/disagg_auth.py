@@ -15,7 +15,7 @@
 import hashlib
 import hmac
 import json
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
@@ -31,10 +31,16 @@ def request_requires_internal_disagg_auth(request: UCompletionRequest) -> bool:
     )
 
 
+def _canonical_ctx_info_endpoint(endpoint: Any) -> Any:
+    if isinstance(endpoint, list):
+        return endpoint[0] if endpoint else None
+    return endpoint
+
+
 def _auth_payload(request: UCompletionRequest) -> bytes:
     disaggregated_params = request.disaggregated_params
     payload = {
-        "ctx_info_endpoint": disaggregated_params.ctx_info_endpoint,
+        "ctx_info_endpoint": _canonical_ctx_info_endpoint(disaggregated_params.ctx_info_endpoint),
         "encoded_opaque_state": disaggregated_params.encoded_opaque_state,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

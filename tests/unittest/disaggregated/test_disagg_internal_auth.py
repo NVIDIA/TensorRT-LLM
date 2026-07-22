@@ -40,6 +40,15 @@ def _make_request(
     )
 
 
+def _with_raw_ctx_info_endpoint(
+    request: CompletionRequest, ctx_info_endpoint: object
+) -> CompletionRequest:
+    request.disaggregated_params = request.disaggregated_params.model_copy(
+        update={"ctx_info_endpoint": ctx_info_endpoint}
+    )
+    return request
+
+
 def test_unprotected_request_does_not_require_internal_auth():
     request = _make_request()
 
@@ -90,6 +99,21 @@ def test_protected_fields_accept_valid_header_after_wire_roundtrip():
 
     wire_request = CompletionRequest.model_validate_json(
         request.model_dump_json(exclude_unset=True)
+    )
+
+    validate_internal_disagg_request("secret", wire_request, headers)
+
+
+def test_ctx_info_endpoint_list_sender_matches_validated_string_receiver():
+    request = _with_raw_ctx_info_endpoint(
+        _make_request(encoded_opaque_state="b3BhcXVl"),
+        ["tcp://10.0.0.1:5000"],
+    )
+    headers = build_internal_disagg_auth_headers("secret", request)
+
+    wire_request = _make_request(
+        encoded_opaque_state="b3BhcXVl",
+        ctx_info_endpoint="tcp://10.0.0.1:5000",
     )
 
     validate_internal_disagg_request("secret", wire_request, headers)
