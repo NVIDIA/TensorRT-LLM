@@ -29,9 +29,10 @@ a present metric is never lost.
 
 ``test_perf_sanity`` pulls heavy integration imports (conftest ->
 ``tensorrt_llm.bindings``, the OpenSearch DB utils, ...) at module load, so this
-test extracts just the self-contained parser block via ``importlib`` with a
-stubbed ``print_info`` rather than importing the whole module. The block is
-purely regex + file IO + arithmetic, so exec-ing it in isolation is faithful.
+test reads a fixed source slice out of that module and ``exec``-s just the
+self-contained parser block with a stubbed ``print_info`` rather than importing
+the whole module. The block is purely regex + file IO + arithmetic, so exec-ing
+it in isolation is faithful.
 """
 
 import os
@@ -68,7 +69,10 @@ def _load_parser_namespace() -> dict:
         # print_info is imported at module scope in test_perf_sanity; stub it.
         "print_info": lambda *a, **k: None,
     }
-    exec(compile(block, _TPS_PATH, "exec"), ns)
+    # _TPS_PATH is a fixed, repository-local source file (the sibling
+    # test_perf_sanity.py), not external/untrusted input; exec-ing a slice of it
+    # is how we run the shipped parser without its GPU/DB import chain.
+    exec(compile(block, _TPS_PATH, "exec"), ns)  # noqa: S102
     return ns
 
 
@@ -217,8 +221,11 @@ def test_scan_counts_all_usable_rows_regardless_of_ngen(tmp_path):
     Rows whose num_generation_tokens did not parse are still counted, and the
     per-file record still carries the all-iter fallback aggregate for them.
     """
+    # Distinct step times for the bucketed vs fallback-only rows so the asserts
+    # can tell the mode-ngen bucket mean apart from the all-iter mean: a healthy
+    # bucket must win over the fallback when any bucket exists.
     lines = [_iter_line(i, 10.0, "'num_generation_tokens': 8") for i in range(5, 15)]
-    lines += [_iter_line(i, 10.0, ngen_render=None) for i in range(15, 20)]
+    lines += [_iter_line(i, 99.0, ngen_render=None) for i in range(15, 20)]
     _write_gen_log(str(tmp_path), 0, lines)
     per_file_scans, total_count = _scan_gen_worker_device_step_time(str(tmp_path), 1)
     assert total_count == 15  # 10 bucketed + 5 fallback-only, all iter>=5
@@ -226,4 +233,7 @@ def test_scan_counts_all_usable_rows_regardless_of_ngen(tmp_path):
     by_ngen, all_count, all_mean = per_file_scans[0]
     assert by_ngen == {8: (10, pytest.approx(10.0))}
     assert all_count == 15
-    assert all_mean == pytest.approx(10.0)
+    assert all_mean == pytest.approx((10 * 10.0 + 5 * 99.0) / 15)
+    # With a non-empty bucket present, selection uses the bucket mean (10.0),
+    # NOT the all-iter mean — the fallback only fires when buckets are empty.
+    assert _mean_at_mode_ngen(per_file_scans) == pytest.approx(10.0)
