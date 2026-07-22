@@ -15,7 +15,6 @@ import torch
 # Force a deterministic UCX/NIXL config regardless of what the cluster/CI
 # injects; see disaggregated/test_kv_transfer.py for the full rationale.
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
-os.environ.pop("UCX_NET_DEVICES", None)
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 import tensorrt_llm

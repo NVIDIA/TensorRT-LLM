@@ -6,15 +6,10 @@ import time
 import uuid
 
 # Force a deterministic UCX config regardless of what the cluster/CI injects
-# (enroot may inject UCX_TLS=rc_v,sm + UCX_NET_DEVICES=mlx5_*; the CI agent
-# bootstrap exports UCX_TLS=tcp,cuda_copy,cuda_ipc):
-# - exclude IB (no fabric assumed) and gdr_copy (UCX rcache SIGABRT at
-#   teardown);
-# - drop UCX_NET_DEVICES, otherwise with ^ib the remaining transports cannot
-#   use the injected mlx5_* device list and UCX fails with "no active
-#   messages transport".
+# (the CI agent bootstrap exports UCX_TLS=tcp,cuda_copy,cuda_ipc before pytest
+# starts, which a setdefault would leave in place): exclude IB (no fabric
+# assumed) and gdr_copy (UCX rcache SIGABRT at teardown).
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
-os.environ.pop("UCX_NET_DEVICES", None)
 # Each NIXL agent spawns TRTLLM_NIXL_NUM_THREADS (default 8) busy-polling
 # progress threads, and a single case builds up to 8 TransferWorkers (one per
 # rank). On CI nodes shared with other single-GPU jobs the resulting CPU

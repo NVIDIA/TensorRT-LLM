@@ -7,7 +7,6 @@ import pytest
 # injects; see test_kv_transfer.py for the full rationale. The subprocesses
 # spawned below inherit these via os.environ.copy().
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
-os.environ.pop("UCX_NET_DEVICES", None)
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 
