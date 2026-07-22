@@ -22,8 +22,10 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 def _cute_sqrt_keyword_mode() -> str:
@@ -50,6 +52,25 @@ def _cute_sqrt_keyword_mode() -> str:
 
 
 _CUTE_SQRT_KWARG_MODE = _cute_sqrt_keyword_mode()
+
+
+@dsl_user_op
+def _sqrt_approx_ftz(value: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Emit the approximate FTZ square root missing from CuTe DSL 4.5."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
+            "sqrt.approx.ftz.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
 
 CTA_M = 128
 # Minimum tcgen05 MMA tile N: GQA groups below 8 ride zero-padded head
@@ -1286,12 +1307,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                     ftz=self.magnitude_sqrt_ftz,
                                 )
                             elif cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "fastmath"):
-                                # cutlass 4.5 renamed the approximate-sqrt control
-                                # to ``fastmath``; map the measured approx choice
-                                # onto it to preserve the authored behavior.
-                                magnitude = cute.math.sqrt(
-                                    norm2, fastmath=self.sqrt_mode == "approx"
-                                )
+                                magnitude = _sqrt_approx_ftz(norm2)
                             else:
                                 # DSLs with neither spelling get the plain (IEEE)
                                 # sqrt, which is strictly MORE accurate than the
