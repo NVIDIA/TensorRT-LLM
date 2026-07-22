@@ -204,9 +204,9 @@ SLURM_NON_TERMINAL_STATES = [
 
 // How often the background shell watcher snapshots the in-progress
 // ${stageName}/ directory (containing the PeriodicJUnitXML reporter's
-// results.xml) up to Artifactory. 5 minutes balances Artifactory traffic
+// results.xml) up to Artifactory. 10 minutes balances Artifactory traffic
 // against staleness for multi-hour test stages.
-PROGRESS_UPLOAD_INTERVAL_SEC = 300
+PROGRESS_UPLOAD_INTERVAL_SEC = 600
 
 // Typed-exception hierarchy and FailureClassifier (PATTERN_CATALOG, classify(),
 // flattenThrowable) live in trtllm-jenkins-shared-lib under src/trtllm/. They
@@ -343,57 +343,59 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="", boolean suppressTestReporting=false) {
-    CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
-        // Pin one reachable frontend for the whole collect: every download targets
-        // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
-        // so the find + scps must all hit the login node that holds those files.
-        // No whole-closure failover here -- uploadArtifacts/junit must not re-run.
-        def remote = CloudManager.selectReachableSlurmRemote(pipeline, remotes)
-        def hasTimeoutTest = false
-        def downloadResultSucceed = false
-        def downloadPerfResultSucceed = false
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, String postTag="", boolean suppressTestReporting=false) {
+    pipeline.stage('Submit Test Result') {
+        sh "ls -al ${stageName}/ || true"
 
-        pipeline.stage('Submit Test Result') {
-            sh "mkdir -p ${stageName}"
-            // Download timeout test results
-            def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
-            def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
-            if (downloadTimeoutTestSucceed) {
-                if (stageIsInterrupted) {
-                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+        // Check whether the progress watcher ever succeeded in uploading a tar.
+        // progress_upload_snapshot.sh writes this sentinel on each successful PUT.
+        def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
+        def progressEverUploaded = fileExists(progressOkFile)
+
+        if (progressEverUploaded) {
+            // Move the progress tar to the final test-results location via Artifactory server-side
+            // move (no data re-transfer). Virtual repo sw-tensorrt-generic does not support move;
+            // rewrite to the backing local repo as we do for DELETE in deleteProgressArtifact().
+            def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+            def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
+            def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                def rc = sh(
+                    script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
+                        'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
+                    returnStatus: true
+                )
+                if (rc == 0) {
+                    echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
                 } else {
-                    sh "ls -al ${stageName}/"
-                    // Generate timeout test result xml if there are terminated unexpectedly tests
-                    hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                    echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
                 }
             }
-            // Download normal test results
-            def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
-            downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
-
-            // Download perf test results
-            def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
-            def folderListOutput = Utils.exec(
-                pipeline,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "\"find '${perfResultsBasePath}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -printf '%f\\n' || true\""
-                ),
-                returnStdout: true,
-                numRetries: 3
-            )?.trim() ?: ""
-            def perfFolders = folderListOutput.split(/\s+/).collect { it.trim().replaceAll(/\/$/, '') }.findAll { it }
-            echo "Perf Result Folders: ${perfFolders}"
-            if (perfFolders) {
-                def scpSources = perfFolders.size() == 1
-                    ? "${perfResultsBasePath}/${perfFolders[0]}"
-                    : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
-                downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+        } else {
+            // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
+            // Fall back to original approach: tar local XML files and upload directly.
+            // Use --transform so tar contents carry the postTag filename without touching disk files.
+            echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
+            def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
+            if (xmlCount > 0) {
+                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+                ensureStageResultNotUploaded("${stageName}${postTag}")
+                trtllm_utils.uploadArtifacts(
+                    "results-${stageName}${postTag}.tar.gz",
+                    "${UPLOAD_PATH}/test-results/"
+                )
+            } else {
+                println("No results xml to submit")
             }
+        }
 
-            // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
-            if (isCbtsStage(stageName)) {
+        // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
+        if (isCbtsStage(stageName)) {
+            CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
                 def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
                 def cbtsLocalDir = "${stageName}/cbts"
                 def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
@@ -428,44 +430,28 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                     echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
                 }
             }
-
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
-                // On retry attempts, rename freshly-downloaded result XMLs so that
-                // (a) the tar for this attempt is distinguishable from prior attempts
-                //     already uploaded to Artifactory, and
-                // (b) the junit() glob below picks up this attempt's results as a
-                //     separate set, keeping earlier attempts' test data visible in
-                //     the Jenkins build report rather than overwriting it.
-                if (postTag) {
-                    sh """
-                        cd ${stageName}
-                        for f in results*.xml; do
-                            [ -f "\$f" ] || continue
-                            case "\$f" in *${postTag}.xml) continue ;; esac
-                            name=\"\${f%.xml}\"
-                            mv \"\$f\" \"\${name}${postTag}.xml\" || true
-                        done
-                    """
-                }
-                sh "ls -al ${stageName}/"
-                echo "Upload test results."
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
-                ensureStageResultNotUploaded("${stageName}${postTag}")
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            } else {
-                println("No results xml to submit")
-            }
         }
+    }
 
-        if ((hasTimeoutTest || downloadResultSucceed) && !suppressTestReporting) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
-        } else if (suppressTestReporting) {
-            echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
-        }
+    // Rename local results*.xml with postTag so junit() reports each attempt separately.
+    // This is the only place we touch disk files; snapshot.sh uses --transform instead.
+    if (postTag) {
+        sh """
+            cd ${stageName}
+            for f in results*.xml; do
+                [ -f "\$f" ] || continue
+                case "\$f" in *${postTag}.xml) continue ;; esac
+                mv "\$f" "\${f%.xml}${postTag}.xml" || true
+            done
+        """
+    }
+
+    // junit() uses local XML files already downloaded by the final progress snapshot.
+    def hasLocalResults = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger() > 0
+    if (hasLocalResults && !suppressTestReporting) {
+        junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+    } else if (suppressTestReporting) {
+        echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
     }
 }
 
@@ -2323,12 +2309,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // as a background subshell) so Blue Ocean renders the stage
                 // as a single box instead of a nested parallel split.
                 def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
-                def progressTar = "results-${stageName}-progress.tar.gz"
-                def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/${progressTar}"
+                def progressTar = "results-${stageName}${postTag}-progress.tar.gz"
+                def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
                 def remoteWorkspaceTrk = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
                 def trackCmd = Utils.sshUserCmd(remote, scriptTrackPathNode)
                 def sshStatCmd = Utils.sshUserCmd(remote, "\"stat -c %Y ${remoteWorkspaceTrk}/results.xml 2>/dev/null || echo 0\"")
                 def scpXmlCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/results*.xml", "${stageName}/")
+                def scpUnfinishedCmd = scpFromRemoteCmd(remote, "${remoteWorkspaceTrk}/unfinished_test.txt", "${stageName}/")
+                def sshListPerfCmd = Utils.sshUserCmd(remote, "\"find '${remoteWorkspaceTrk}' -maxdepth 1 -type d \\( -name 'aggr*' -o -name 'disagg*' \\) -print 2>/dev/null || true\"")
+                def scpPerfTemplate = scpFromRemoteCmd(remote, "PERF_FOLDER_PLACEHOLDER", "${stageName}/")
                 sh "rm -f ${pytestDoneFile}"
                 withCredentials([usernamePassword(
                         credentialsId: 'urm-artifactory-creds',
@@ -2339,12 +2328,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         export STAGE_NAME='${stageName}'
                         export PROGRESS_TAR='${progressTar}'
                         export PROGRESS_URL='${progressUrl}'
+                        export TIMEOUT_XML_SCRIPT='${llmSrcLocal}/jenkins/scripts/generate_timeout_xml.py'
+                        export POST_TAG='${postTag}'
                         # ---- background watcher: SSH-stat remote XML, SCP, tar, upload ----
                         PROGRESS_DONE_FILE='${pytestDoneFile}' \\
                         PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
                         LABEL_PREFIX='sbatch checkpoint' \\
                         SLURM_SSH_STAT_CMD='${sshStatCmd}' \\
                         SLURM_SCP_XML_CMD='${scpXmlCmd}' \\
+                        SLURM_SCP_UNFINISHED_CMD='${scpUnfinishedCmd}' \\
+                        SLURM_SSH_LIST_PERF_CMD='${sshListPerfCmd}' \\
+                        SLURM_SCP_PERF_TEMPLATE='${scpPerfTemplate}' \\
                         bash '${llmSrcLocal}/jenkins/scripts/progress_upload_watcher.sh' &
                         WATCHER_PID=\$!
 
@@ -2364,9 +2358,30 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                         # ---- immediate final snapshot ----
                         mkdir -p '${WORKSPACE}/${stageName}'
-                        ${scpXmlCmd} || true
+                        for _attempt in 1 2 3; do
+                            ${scpXmlCmd} && break
+                            [ \$_attempt -lt 3 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp xml failed, retry \$_attempt/3" && sleep 10
+                        done || true
+                        _unfinished_ok=0
+                        for _attempt in 1 2 3; do
+                            ${scpUnfinishedCmd} && { _unfinished_ok=1; break; }
+                            echo "[PROGRESS-UPLOAD] ${stageName}: scp unfinished failed (attempt \$_attempt/3)"
+                            [ \$_attempt -lt 3 ] && sleep 10
+                        done
+                        [ "\$_unfinished_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp unfinished not available, skipping"
+                        SCP_PERF_TMPL='${scpPerfTemplate}'
+                        while IFS= read -r perf_folder; do
+                            [ -z "\$perf_folder" ] && continue
+                            _perf_ok=0
+                            for _attempt in 1 2 3; do
+                                eval "\${SCP_PERF_TMPL//PERF_FOLDER_PLACEHOLDER/\$perf_folder}" && { _perf_ok=1; break; }
+                                echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed (attempt \$_attempt/3)"
+                                [ \$_attempt -lt 3 ] && sleep 10
+                            done
+                            [ "\$_perf_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed after 3 attempts"
+                        done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
                         if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                            LABEL='sbatch final snapshot' \\
+                            LABEL='sbatch final snapshot' FINAL_SNAPSHOT=1 \\
                             bash '${llmSrcLocal}/jenkins/scripts/progress_upload_snapshot.sh' || true
                         fi
 
@@ -2446,8 +2461,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // failure classifies as UserFailure -> not suppressed -> reported.
             boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
                 retryContextAllowsRetry(null, retryContext, caughtStageError, false)
-            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag, suppressTestReporting)
-            deleteProgressArtifact(stageName)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
+            deleteProgressArtifact(stageName, postTag)
         } finally {
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
@@ -3171,12 +3186,37 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     done || true
                 """
             }
-            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
-            trtllm_utils.uploadArtifacts(
-                "results-${stageName}${postTag}.tar.gz",
-                "${UPLOAD_PATH}/test-results/"
-            )
-            deleteProgressArtifact(stageName)
+
+            def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
+            if (fileExists(progressOkFile)) {
+                def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
+                def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
+                def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
+                withCredentials([usernamePassword(
+                        credentialsId: 'urm-artifactory-creds',
+                        usernameVariable: 'ART_USER',
+                        passwordVariable: 'ART_PASS')]) {
+                    def rc = sh(
+                        script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
+                            'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
+                        returnStatus: true
+                    )
+                    if (rc == 0) {
+                        echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
+                    } else {
+                        echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
+                    }
+                }
+            } else {
+                echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
+                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+                trtllm_utils.uploadArtifacts(
+                    "results-${stageName}${postTag}.tar.gz",
+                    "${UPLOAD_PATH}/test-results/"
+                )
+            }
+            deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
                 junit(testResults: "${stageName}/results*.xml")
             }
@@ -4025,7 +4065,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--reruns ${times - 1}"
         ]
         def rerunProgressTar = "results-${stageName}-progress.tar.gz"
-        def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/${rerunProgressTar}"
+        def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${rerunProgressTar}"
         def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
         sh "rm -f ${rerunDoneFile}"
         try {
@@ -4054,7 +4094,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     wait \$WATCHER_PID 2>/dev/null || true
 
                     # ---- immediate final snapshot of rerun${times} ----
-                    LABEL='rerun${times} final snapshot' \\
+                    LABEL='rerun${times} final snapshot' FINAL_SNAPSHOT=1 \\
                     bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
 
                     exit \$rc
@@ -4362,12 +4402,12 @@ REUSED_TESTS_EOF
 //
 // Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
 // garbage-collected with the rest of the build's artifacts anyway.
-def deleteProgressArtifact(stageName) {
+def deleteProgressArtifact(stageName, postTag="") {
     // UPLOAD_PATH points to the virtual repo `sw-tensorrt-generic`, which
     // accepts GET/PUT but returns 404 on DELETE. Rewrite to the backing
     // local repo so the delete actually lands.
     def deletePath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
-    def targetUrl = "https://urm.nvidia.com/artifactory/${deletePath}/test-results-progress/results-${stageName}-progress.tar.gz"
+    def targetUrl = "https://urm.nvidia.com/artifactory/${deletePath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
     try {
         withCredentials([usernamePassword(
                 credentialsId: 'urm-artifactory-creds',
@@ -4745,8 +4785,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     // (success or failure). Lives outside ${stageName}/ so the
                     // `rm -rf ${stageName}/` at pytest startup doesn't wipe it.
                     def pytestDoneFile = "${WORKSPACE}/.pytest-done-${stageName}"
-                    def progressTar = "results-${stageName}-progress.tar.gz"
-                    def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/${progressTar}"
+                    def progressTar = "results-${stageName}${postTag}-progress.tar.gz"
+                    def progressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${progressTar}"
                     sh "rm -f ${pytestDoneFile}"
                     try {
                         if (preprocessedLists.regularCount > 0) {
@@ -4765,6 +4805,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     export STAGE_NAME='${stageName}'
                                     export PROGRESS_TAR='${progressTar}'
                                     export PROGRESS_URL='${progressUrl}'
+                                    export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
+                                    export POST_TAG='${postTag}'
                                     # ---- background watcher ----
                                     PROGRESS_DONE_FILE='${pytestDoneFile}' \\
                                     PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
@@ -4784,7 +4826,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
                                     # ---- immediate final snapshot of run 1 ----
                                     if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                                        LABEL='run1 final snapshot' \\
+                                        LABEL='run1 final snapshot' FINAL_SNAPSHOT=1 \\
                                         bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
                                     fi
 
