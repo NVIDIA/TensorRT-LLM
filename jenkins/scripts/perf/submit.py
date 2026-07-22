@@ -502,6 +502,17 @@ def main():
 
     is_gb300 = "GB300" in args.stage_name.upper()
     is_b200 = "B200" in args.stage_name.upper() and "GB200" not in args.stage_name.upper()
+    # GB200 disagg on the aws-dfw cluster runs over an Amazon EFA fabric. There,
+    # UCX auto-selects the gdr_copy transport for the NIXL KV-cache transfer, which
+    # fails (`gdr_copy_from_mapping failed. ret:22`) and hangs the run. Excluding
+    # gdr_copy (UCX_TLS=^gdr_copy) keeps UCX but falls back to a transport that
+    # works on EFA. This is scoped to FUNCTIONAL-ONLY GB200 stages (perf is not
+    # judged there, so the slower EFA path is acceptable) so it never perturbs the
+    # perf numbers of the GB200 post-merge perf-sanity stages, which share the same
+    # config yaml but run on oci-hsg (NVLink/IB). See NVIDIA/TensorRT-LLM PR #16619.
+    is_gb200_functional_only = (
+        "GB200" in args.stage_name.upper() and "FUNCTIONAL-ONLY" in args.stage_name.upper()
+    )
 
     if runtime_mode == "aggregated":
         # Aggregated (incl. ctx_only): single pytestCommand built from the
@@ -566,6 +577,11 @@ def main():
             ucx_tls_cmd = "export UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp &&"
         elif is_b200:
             ucx_tls_cmd = "export UCX_TLS=^ib &&"
+        elif is_gb200_functional_only:
+            # Avoid the EFA gdr_copy transport that crashes KV transfer on aws-dfw
+            # (see comment at is_gb200_functional_only). Functional-only stages do
+            # not judge perf, so the slower EFA fallback is fine here.
+            ucx_tls_cmd = "export UCX_TLS=^gdr_copy &&"
         else:
             ucx_tls_cmd = "unset UCX_TLS UCX_NET_DEVICES &&"
         ucx_tls_server_cmd = ucx_tls_cmd
