@@ -997,8 +997,11 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
-        idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
-        idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
+        # idx_q and idx_k may be strided column-views of a fused buffer, so
+        # reshape to keep them zero-copy. The proxy fmha_sm100 and the index-K
+        # scatter below both honor the source strides.
+        idx_q_view = idx_q.reshape(num_tokens, config.num_index_heads, config.sparse_index_dim)
+        idx_k_view = idx_k.reshape(num_tokens, 1, config.sparse_index_dim)
 
         metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)

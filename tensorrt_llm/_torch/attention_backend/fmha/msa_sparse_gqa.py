@@ -139,16 +139,24 @@ def run_msa_paged_gqa(
             kv_cache_manager, layer_idx, metadata.msa_out_cache_loc[:num_tokens], k, v
         )
 
-    q_view = q.view(num_tokens, attn.num_heads, head_dim)
+    # q may be a strided column-view of a fused [q|k|v] buffer (the model skips
+    # the split contiguous copy on this path). fmha_sm100 reads q's real strides
+    # through the TMA descriptor, so reshape here is a zero-copy view for that
+    # layout; it only falls back to a copy for an otherwise non-viewable q.
+    q_view = q.reshape(num_tokens, attn.num_heads, head_dim)
+    # output is freshly allocated and contiguous; view keeps out_view aliasing it
+    # so the kernel's in-place write lands in the caller's buffer.
     out_view = output.view(num_tokens, attn.num_heads, head_dim)
     k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
 
     # The fmha_sm100 variant is chosen from q.dtype and shares one dtype across
     # q/k/v, so q must be FP8 to match an FP8 paged K/V. MiniMax-M3 has no
-    # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast.
+    # KV-cache scales, so the scale is 1.0 and this is a plain E4M3 cast. When the
+    # model's fused QK-norm+RoPE already emitted FP8 q/k/v (the FP8-KV fast path),
+    # this .to() is a no-op; it stays as a safety net for callers that pass bf16 q.
     use_fp8 = k_paged.dtype == torch.float8_e4m3fn
-    if use_fp8:
+    if use_fp8 and q_view.dtype != torch.float8_e4m3fn:
         q_view = q_view.to(torch.float8_e4m3fn)
 
     run_msa_sparse_gqa(
