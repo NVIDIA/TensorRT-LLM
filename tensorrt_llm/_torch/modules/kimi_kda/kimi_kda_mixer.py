@@ -283,6 +283,17 @@ class KimiKDALinearAttention(nn.Module):
     def decode_kernel_source(self) -> str:
         return self._dispatch.get_decode_source()
 
+    def prefill_chunk_kda(self, **kwargs):
+        """Kernel-level chunked prefill via the dispatch.
+
+        Used by the executor runtime (``KimiKDARuntime``), which owns the
+        projections, convs, and cache pools itself and only needs the
+        delta-rule inner loop. States are exchanged in the V-first
+        ``[N, H, V, K]`` pool layout on both dispatch paths — see
+        ``KDAKernelDispatch.prefill_chunk_kda``.
+        """
+        return self._dispatch.prefill_chunk_kda(**kwargs)
+
     # ------------------------------------------------------------------
     # Prefill entry (Goal 2.1 pass path).
     # ------------------------------------------------------------------

@@ -107,6 +107,12 @@ esac
 
 # Mount every input at its host path so the paths are valid inside too.
 MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro"
+# Optional extra container mounts (srun --container-mounts syntax). Needed
+# e.g. when $REPO is a git worktree whose build artifacts (.venv-3.12,
+# bindings *.so) are symlinks into the main checkout.
+if [ -n "${EXTRA_MOUNTS:-}" ]; then
+    MOUNTS+=",$EXTRA_MOUNTS"
+fi
 
 srun --mpi=pmix \
     --container-image="$CONTAINER_IMAGE" \

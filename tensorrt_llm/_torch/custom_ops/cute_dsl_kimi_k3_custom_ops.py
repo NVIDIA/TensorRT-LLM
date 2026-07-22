@@ -33,6 +33,8 @@ final recurrent state. Intermediate matrices remain private runner workspace.
 
 from typing import Optional, Tuple
 
+import weakref
+
 import torch
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -106,20 +108,44 @@ _varlen_single_seqlen_cache = {}
 
 # id(tensor) -> cute_wrapper. The wrappers themselves are stateless views
 # over the tensor's storage, so they remain valid as long as the tensor's
-# data pointer / shape / strides don't change. Caller is expected to reuse
-# the same tensor objects across iterations (typical PyTorch pattern).
+# data pointer / shape / strides don't change. Callers that reuse the same
+# tensor objects across iterations (typical benchmark pattern) hit the
+# cache; per-call fresh tensors (the executor runtime pattern) rebuild.
 _input_wrap_cache = {}
+
+
+def _prune_on_gc(cache, key, *keyobjs):
+    """Drop ``cache[key]`` when any of ``keyobjs`` is garbage-collected.
+
+    The id()-keyed caches in this module are only sound while the keyed
+    Python objects stay alive — CPython reuses an object's address (its id)
+    the moment it is freed, so a dead entry could otherwise be served for an
+    unrelated new tensor with recycled id but different contents/storage.
+    A finalizer runs at dealloc, before the address can be recycled, so a
+    pruned entry can never alias a new object. This also bounds cache growth
+    when callers pass fresh tensors every call.
+    """
+    for o in keyobjs:
+        weakref.finalize(o, cache.pop, key, None)
 
 
 def _ct_cached(t, etype):
     """`_ct(t, etype)` with id(t)-based cache. Returns the same cute wrapper
     for repeated calls with the same tensor object, avoiding per-call
-    `from_dlpack` overhead (~5-10us each)."""
+    `from_dlpack` overhead (~5-10us each).
+
+    ONLY use for tensors with process-long lifetime (module params, the
+    module-level scratch from ``_get_buffers``): the cached wrapper pins the
+    tensor's storage, so the weakref pruning never fires for the keyed
+    object and a per-call activation would be pinned forever (~100MB/call
+    leak in the executor runtime). Per-call tensors must use plain ``_ct``.
+    """
     key = (id(t), etype)
     w = _input_wrap_cache.get(key)
     if w is None:
         w = _ct(t, etype)
         _input_wrap_cache[key] = w
+        _prune_on_gc(_input_wrap_cache, key, t)
     return w
 
 
@@ -133,9 +159,13 @@ def _get_dt_bias_ct(dt_bias, H, K):
     key = (id(dt_bias), H, K)
     entry = _dt_bias_cache.get(key)
     if entry is None:
-        bias_t = dt_bias.float().contiguous().view(H, K)
+        # Copy (never view) the keyed object: a view would pin it, making
+        # the entry immortal (weakref pruning could never fire). Callers
+        # pass a fresh .detach() per call, so an aliasing entry would leak.
+        bias_t = dt_bias.detach().float().reshape(H, K).clone()
         entry = (bias_t, _ct(bias_t, cutlass.Float32))
         _dt_bias_cache[key] = entry
+        _prune_on_gc(_dt_bias_cache, key, dt_bias)
     return entry[1]
 
 
@@ -161,12 +191,15 @@ def _get_k4_varlen_cu_co(cu_seqlens, chunk_offsets):
     key = (id(cu_seqlens), id(chunk_offsets))
     entry = _k4_varlen_cu_co_cache.get(key)
     if entry is None:
-        cu_int32 = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
-        cu_int32 = cu_int32.contiguous()
-        co_int32 = (
-            chunk_offsets if chunk_offsets.dtype == torch.int32 else chunk_offsets.to(torch.int32)
-        )
-        co_int32 = co_int32.contiguous()
+        # Always materialize copies: if the cached value aliased the keyed
+        # object, the entry would pin it and the weakref pruning could
+        # never fire (immortal entry).
+        cu_int32 = cu_seqlens.to(torch.int32).contiguous()
+        if cu_int32 is cu_seqlens:
+            cu_int32 = cu_seqlens.clone()
+        co_int32 = chunk_offsets.to(torch.int32).contiguous()
+        if co_int32 is chunk_offsets:
+            co_int32 = chunk_offsets.clone()
         cu_ct = from_dlpack(cu_int32, assumed_align=4).mark_layout_dynamic()
         cu_ct.element_type = cutlass.Int32
         co_ct = from_dlpack(co_int32, assumed_align=4).mark_layout_dynamic()
@@ -175,13 +208,8 @@ def _get_k4_varlen_cu_co(cu_seqlens, chunk_offsets):
         # underlying storage remain valid as long as cu_ct / co_ct live.
         entry = (cu_int32, co_int32, cu_ct, co_ct)
         _k4_varlen_cu_co_cache[key] = entry
+        _prune_on_gc(_k4_varlen_cu_co_cache, key, cu_seqlens, chunk_offsets)
     return entry[2], entry[3]
-
-
-# Cache K4's reshaped v wrapper keyed by id(v_beta) — the v.reshape(-1, H, V)
-# view is a fresh Python object every call but the storage is stable when the
-# user reuses the same v tensor (typical benchmark / inference pattern).
-_v_ct_cache = {}
 
 
 # Cache the (cu_for_k4, chunk_offsets_for_k4) pair keyed by id(cu_seqlens).
@@ -195,14 +223,17 @@ def _get_varlen_k4_inputs(cu_seqlens, BT):
     key = id(cu_seqlens)
     entry = _varlen_k4_input_cache.get(key)
     if entry is None:
-        cu_int32 = cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(torch.int32)
-        cu_int32 = cu_int32.contiguous()
+        # Copy (never alias) the keyed object — see _get_k4_varlen_cu_co.
+        cu_int32 = cu_seqlens.to(torch.int32).contiguous()
+        if cu_int32 is cu_seqlens:
+            cu_int32 = cu_seqlens.clone()
         seq_lens = cu_int32[1:] - cu_int32[:-1]
         chunk_counts = (seq_lens + (BT - 1)) // BT
         zero = torch.zeros(1, dtype=torch.int32, device=cu_int32.device)
         co_int32 = torch.cat([zero, torch.cumsum(chunk_counts, dim=0).to(torch.int32)])
         co_int32 = co_int32.contiguous()
         _varlen_k4_input_cache[key] = (cu_int32, co_int32)
+        _prune_on_gc(_varlen_k4_input_cache, key, cu_seqlens)
     return _varlen_k4_input_cache[key]
 
 
@@ -225,7 +256,11 @@ def _get_side_stream(dev):
 
 # Buffer cache: avoid re-allocating ~67us of intermediate tensors per call.
 # Also caches cute.Tensor wrappers (saves ~7us each call from from_dlpack).
+# LRU-bounded: entries are keyed by (B, T, ...) shapes, and the runtime
+# executor calls with a different token count per prefill batch — an
+# unbounded dict would pin ~T*150KB of scratch per distinct shape forever.
 _buf_cache = {}
+_BUF_CACHE_MAX_ENTRIES = 8
 
 # Padded-input scratch cache for the eqlen partial-chunk path. Keyed by
 # (B, T_padded, H, K, dtype_qkv, dtype_g, dtype_beta, device, real_T).
@@ -367,6 +402,8 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
             _k4_fn=None,
         )
 
+        while len(_buf_cache) >= _BUF_CACHE_MAX_ENTRIES:
+            _buf_cache.pop(next(iter(_buf_cache)))
         _buf_cache[key] = (
             k_scaled,
             kg,
@@ -380,6 +417,9 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT):
             co_eqlen,
             cute_wrappers,
         )
+    else:
+        # LRU refresh so hot shapes survive eviction.
+        _buf_cache[key] = _buf_cache.pop(key)
     return _buf_cache[key]
 
 
@@ -396,22 +436,14 @@ def _launch_k4_persistent(
     V_dim=None,
     use_fast_sync=False,
 ):
-    """Launch persistent K4 with cached CuTe wrappers."""
-    # Fast path: cache the pre-built (k4_fn, args_tuple) keyed by
-    # (id(v_beta), id(cu_seqlens), id(S_in), id(S_out)). The state-copy is
-    # done by the caller (_chunk_kda_fwd) on a side stream to overlap with
-    # K123 — this launcher just runs K4.
-    fast_key = (id(v_beta), 0 if cu_eqlen_passed else id(cu_seqlens), id(S_in), id(S_out))
-    fast_cache = cute_wrappers.get("_k4_fast_cache")
-    if fast_cache is None:
-        fast_cache = {}
-        cute_wrappers["_k4_fast_cache"] = fast_cache
-    fast_entry = fast_cache.get(fast_key)
-    if fast_entry is not None:
-        k4_fn, args = fast_entry
-        k4_fn(*args)
-        return
+    """Launch persistent K4 with cached CuTe wrappers.
 
+    No fast-launch (args-tuple) cache here: such a cache pins the per-call
+    v/initial-state tensors via their cute wrappers (the wrapper holds the
+    storage, so the keyed object never dies and weakref pruning never
+    fires) — a per-call GPU memory leak in the executor runtime. The
+    per-call cost is re-wrapping a handful of tensors (~10us each).
+    """
     bf16 = cutlass.BFloat16
     N_seqs = cu_seqlens.shape[0] - 1
     BH = N_seqs * H
@@ -428,15 +460,11 @@ def _launch_k4_persistent(
     o_ct = cute_wrappers["o_ct"]
     gk_ct = cute_wrappers["gk_ct"]
 
-    v_key = id(v_beta)
-    v_entry = _v_ct_cache.get(v_key)
-    if v_entry is None:
-        v_view = v_beta.reshape(-1, H, V_dim) if v_beta.dim() == 4 else v_beta
-        v_ct = from_dlpack(v_view, assumed_align=16).mark_layout_dynamic()
-        v_ct.element_type = bf16
-        _v_ct_cache[v_key] = (v_view, v_ct)
-    else:
-        v_ct = v_entry[1]
+    # v is a per-call activation — wrap fresh every call (never cache; see
+    # _ct_cached docstring).
+    v_view = v_beta.reshape(-1, H, V_dim) if v_beta.dim() == 4 else v_beta
+    v_ct = from_dlpack(v_view, assumed_align=16).mark_layout_dynamic()
+    v_ct.element_type = bf16
 
     if cu_eqlen_passed:
         cu_ct = cute_wrappers["cu_eqlen_ct"]
@@ -478,7 +506,6 @@ def _launch_k4_persistent(
         cute_wrappers["_k4_fn"] = k4_fn
 
     args = (a_ct, b_ct, v_ct, q_ct, aqc_ct, kg_ct, o_ct, gk_ct, s_ct, cu_ct, co_ct, tm_ct)
-    fast_cache[fast_key] = (k4_fn, args)
     k4_fn(*args)
 
 
@@ -509,30 +536,11 @@ def _launch_fused_k123_inv(
     """Persistent K1+K2 (writes A_kk in I+L format with diag=1) chained with
     BF16 akk_inv (in-place inversion). Final A_kk_inv = (I+L)^-1."""
 
-    # Fast path: when (q, k, g, beta, A_log, dt_bias, cu_seqlens, chunk_indices)
-    # are stable across calls (typical benchmark / inference), skip the per-call
-    # wrapper gathering and launch with a pre-built (k123_fn, args) tuple.
-    if cute_wrappers is not None:
-        fast_key = (
-            id(q),
-            id(k),
-            id(g),
-            id(beta),
-            id(A_log),
-            id(dt_bias) if dt_bias is not None else 0,
-            id(cu_seqlens) if cu_seqlens is not None else 0,
-            id(chunk_indices) if chunk_indices is not None else 0,
-            bool(safe_gate),
-            float(lower_bound) if lower_bound is not None else 0.0,
-        )
-        fast_cache = cute_wrappers.setdefault("_k123_fast_cache", {})
-        fast_entry = fast_cache.get(fast_key)
-        if fast_entry is not None:
-            k123_fn, k123_args, akk_fn, akk_args = fast_entry
-            k123_fn(*k123_args)
-            akk_fn(*akk_args)
-            return
-
+    # No fast-launch (args-tuple) cache: it would pin the per-call q/k/g/beta
+    # activations via their cute wrappers (the wrapper holds the storage, so
+    # the keyed objects never die and weakref pruning never fires) — a
+    # per-call GPU memory leak in the executor runtime. Wrapper gathering
+    # below costs ~10us per tensor.
     B, T, H, K = q.shape
     BT = 64
     dev = q.device.index or 0
@@ -549,16 +557,20 @@ def _launch_fused_k123_inv(
             cu_cpu = cu_seqlens.cpu().tolist()
             seq_lens = [cu_cpu[i + 1] - cu_cpu[i] for i in range(len(cu_cpu) - 1)]
             _varlen_pure_cache[_vp_key] = all((sl % BT) == 0 for sl in seq_lens)
+            _prune_on_gc(_varlen_pure_cache, _vp_key, cu_seqlens)
         varlen_pure = _varlen_pure_cache[_vp_key]
     cache_key = (B, NT, H, is_varlen, T_padded, dev, has_bias, safe_gate, varlen_pure)
 
     # Inputs are guaranteed contiguous by upstream linear projections.
     # A_log is fp32 model param; .float() is no-op when dtype already matches.
-    q_ct = _ct_cached(q, cutlass.BFloat16)
-    k_ct = _ct_cached(k, cutlass.BFloat16)
-    g_ct = _ct_cached(g, cutlass.BFloat16)
-    alog_ct = _ct_cached(A_log if A_log.dtype == torch.float32 else A_log.float(), cutlass.Float32)
-    beta_ct = _ct_cached(beta, cutlass.BFloat16)
+    # q/k/g/beta/cu/ci are per-call activations: plain _ct, never cached
+    # (see _ct_cached docstring). The _get_buffers scratch below is
+    # module-persistent, so caching its wrappers is safe and worthwhile.
+    q_ct = _ct(q, cutlass.BFloat16)
+    k_ct = _ct(k, cutlass.BFloat16)
+    g_ct = _ct(g, cutlass.BFloat16)
+    alog_ct = _ct(A_log if A_log.dtype == torch.float32 else A_log.float(), cutlass.Float32)
+    beta_ct = _ct(beta, cutlass.BFloat16)
 
     ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
     kg_ct = _ct_cached(kg, cutlass.BFloat16)
@@ -568,8 +580,8 @@ def _launch_fused_k123_inv(
     akk_ct = _ct_cached(A_kk_inv, cutlass.BFloat16)
 
     if is_varlen:
-        cu_ct = _ct_cached(cu_seqlens, _cute_int_type(cu_seqlens.dtype))
-        ci_ct = _ct_cached(chunk_indices, _cute_int_type(chunk_indices.dtype))
+        cu_ct = _ct(cu_seqlens, _cute_int_type(cu_seqlens.dtype))
+        ci_ct = _ct(chunk_indices, _cute_int_type(chunk_indices.dtype))
     else:
         cu_ct, ci_ct = _get_eqlen_dummies(q.device, torch.int64)
 
@@ -650,10 +662,6 @@ def _launch_fused_k123_inv(
     akk_args = (akk_in_view, akk_out_view, beta_ct, akk_cu_ct, akk_ci_ct)
     akk_fn(*akk_args)
 
-    # Populate the fast cache so subsequent calls with the same input ids skip
-    # all wrapper gathering above.
-    if cute_wrappers is not None:
-        cute_wrappers["_k123_fast_cache"][fast_key] = (k123_fn, ct_args, akk_fn, akk_args)
 
 
 # ========== Fused K1234 compilation cache ==========
@@ -846,6 +854,8 @@ def _chunk_kda_fwd(
             sl = cu_cpu[1] - cu_cpu[0]
             _varlen_pure_cache[_vl_key] = sl % BT == 0
             _varlen_single_seqlen_cache[_vl_key] = sl
+            _prune_on_gc(_varlen_pure_cache, _vl_key, cu_seqlens)
+            _prune_on_gc(_varlen_single_seqlen_cache, _vl_key, cu_seqlens)
         if not _varlen_pure_cache[_vl_key]:
             real_T = _varlen_single_seqlen_cache[_vl_key]
             needs_varlen_single_pad = True

@@ -124,6 +124,8 @@ class KDAKernelDispatch:
     DSL op to be importable.
     """
 
+    _selection_logged = False
+
     def __init__(
         self,
         use_optimized_prefill: bool = True,
@@ -136,6 +138,19 @@ class KDAKernelDispatch:
         self.decode_kernel_path = (
             "optimized" if use_optimized_decode and optimized_supported else "fla"
         )
+        # One line per process so runs record which paths actually executed
+        # (the fallback is otherwise silent).
+        if not KDAKernelDispatch._selection_logged:
+            KDAKernelDispatch._selection_logged = True
+            try:
+                from tensorrt_llm.logger import logger
+
+                logger.info(
+                    f"KDA kernel dispatch: prefill={self.prefill_kernel_path} "
+                    f"decode={self.decode_kernel_path}"
+                )
+            except Exception:  # pragma: no cover — source-loader stub path
+                pass
 
     def get_prefill_source(self) -> str:
         if self.prefill_kernel_path == "optimized":
@@ -169,13 +184,22 @@ class KDAKernelDispatch:
         On the optimized path this replays the preprocessing that FLA's
         ``ChunkKDAFunction.forward`` performs when the caller enables
         ``use_qk_l2norm_in_kernel``, ``use_beta_sigmoid_in_kernel``,
-        ``use_gate_in_kernel``, and ``transpose_state_layout``; then
-        dispatches to the in-tree ``trtllm::kda_prefill`` CuTe DSL op.
+        ``use_gate_in_kernel``, and ``state_v_first``; then dispatches to
+        the in-tree ``trtllm::kda_prefill`` CuTe DSL op.
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
+
+        State layout contract (both paths): ``initial_state`` is consumed
+        and ``final_state`` returned in the V-first ``[N, H, V, K]`` layout —
+        the layout of the executor's ssm pool and of the fused decode
+        kernel. The in-tree prefill op natively uses the FLA-default K-first
+        ``[N, H, K, V]`` layout, so the optimized path transposes at both
+        boundaries (K == V == 128 for Kimi K3, so shapes alone cannot catch
+        a mix-up — the transpose is semantic).
         """
         if self.prefill_kernel_path == "optimized":
+            import torch.nn.functional as F
             from fla.modules.l2norm import l2norm_fwd
             from fla.ops.common.gate import fused_beta_sigmoid
             from fla.ops.utils.index import prepare_chunk_indices
@@ -185,13 +209,31 @@ class KDAKernelDispatch:
             beta = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
 
             chunk_indices = None
+            real_T = q.shape[1]
             if cu_seqlens is not None:
                 chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+                # The op's varlen single-seq path (Phase 2.1) expects the
+                # caller to zero-pad the packed tensors to a chunk multiple
+                # (FLA convention) while cu_seqlens keeps the real length;
+                # the op re-sentinels g's tail itself. Without this the op
+                # would run the mask-free kernel on a partial final chunk.
+                # Multi-seq varlen runs the masked path and needs no pad.
+                if cu_seqlens.shape[0] == 2 and real_T % chunk_size != 0:
+                    pad = chunk_size - real_T % chunk_size
+                    q = F.pad(q, (0, 0, 0, 0, 0, pad))
+                    k = F.pad(k, (0, 0, 0, 0, 0, pad))
+                    v = F.pad(v, (0, 0, 0, 0, 0, pad))
+                    g = F.pad(g, (0, 0, 0, 0, 0, pad))
+                    beta = F.pad(beta, (0, 0, 0, pad))
 
             A_log_kernel = A_log.detach() if A_log is not None else None
             dt_bias_kernel = dt_bias.detach() if dt_bias is not None else None
 
             _load_prefill_module()  # registers trtllm::kda_prefill
+
+            if initial_state is not None:
+                # Pool V-first [N, H, V, K] -> op K-first [N, H, K, V].
+                initial_state = initial_state.transpose(-1, -2).contiguous()
 
             out, final_state = torch.ops.trtllm.kda_prefill(
                 q=q,
@@ -211,6 +253,14 @@ class KDAKernelDispatch:
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
             )
+            if out.shape[1] != real_T:
+                out = out[:, :real_T]
+            if final_state is not None and final_state.numel() > 0:
+                # Op K-first [N, H, K, V] -> pool V-first [N, H, V, K].
+                # .contiguous() also detaches the result from the op's
+                # shared per-shape S_out scratch, which the next same-shape
+                # call overwrites.
+                final_state = final_state.transpose(-1, -2).contiguous()
             return out, final_state
 
         from fla.ops.kda import chunk_kda
@@ -231,7 +281,7 @@ class KDAKernelDispatch:
             use_beta_sigmoid_in_kernel=True,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
-            transpose_state_layout=True,
+            state_v_first=True,
             cu_seqlens=cu_seqlens,
         )
         return o, final_state
