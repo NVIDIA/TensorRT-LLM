@@ -440,7 +440,9 @@ class TestEvictionLifecycle:
         mgr.kv_cache_manager._stream.wait_event.assert_not_called()
         cache.resize.assert_called_once_with(1024 + 4096, None)
         assert timeline == [
+            "enter:triattention.evict_request_group reqs=1",
             "compact_dispatch",
+            "exit:triattention.evict_request_group reqs=1",
             "enter:triattention.resize",
             "exit:triattention.resize",
         ]

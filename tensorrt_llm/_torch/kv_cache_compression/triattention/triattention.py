@@ -1462,7 +1462,14 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not due_requests:
             return
         num_layers = self._num_layers_from_manager()
-        with nvtx_range_debug("triattention.evict_request_group", color="purple"):
+        # Ungated NVTX with the due count in the message, so any nsys capture
+        # shows how many requests each eviction round carries. This path runs
+        # outside CUDA-graph capture, so the dynamic message is safe; the cost
+        # is one host-side f-string per eviction round.
+        with nvtx_range(
+            f"triattention.evict_request_group reqs={len(due_requests)}",
+            color="purple",
+        ):
             capacity_targets = self._evict_requests(
                 due_requests,
                 num_layers,
