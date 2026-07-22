@@ -229,14 +229,6 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 # Inherit the value from the top-level
                 servers[key] = value
 
-    # Downstream ctx/gen servers must return internal metrics when either
-    # public response headers or fleet-worker file output is enabled. This is
-    # an implementation detail of response-carried joining, so it overrides a
-    # worker-level false value rather than creating a configuration conflict.
-    if return_perf_metrics or perf_metrics_output_dir is not None:
-        context_servers["return_perf_metrics"] = True
-        generation_servers["return_perf_metrics"] = True
-
     server_configs = []
     disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)

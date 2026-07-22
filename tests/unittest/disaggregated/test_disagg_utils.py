@@ -127,17 +127,10 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
-@pytest.mark.parametrize(
-    "return_perf_metrics,output_dir,collect_downstream",
-    [
-        (False, None, False),
-        (True, None, True),
-        (False, "/tmp/perf", True),
-        (True, "/tmp/perf", True),
-    ],
-)
-def test_extract_disagg_metrics_controls(return_perf_metrics, output_dir,
-                                         collect_downstream):
+@pytest.mark.parametrize("return_perf_metrics,output_dir",
+                         [(False, None), (True, None), (False, "/tmp/perf"),
+                          (True, "/tmp/perf")])
+def test_extract_disagg_metrics_controls(return_perf_metrics, output_dir):
     yaml_config = get_yaml_config()
     yaml_config["context_servers"]["return_perf_metrics"] = False
     yaml_config["generation_servers"]["return_perf_metrics"] = False
@@ -149,8 +142,6 @@ def test_extract_disagg_metrics_controls(return_perf_metrics, output_dir,
 
     assert config.return_perf_metrics is return_perf_metrics
     assert config.perf_metrics_output_dir == output_dir
-    assert all(server.other_args["return_perf_metrics"] is collect_downstream
-               for server in config.server_configs)
     assert all("perf_metrics_output_dir" not in server.other_args
                for server in config.server_configs)
 
