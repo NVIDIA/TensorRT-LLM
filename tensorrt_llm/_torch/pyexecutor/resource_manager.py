@@ -556,7 +556,14 @@ class KVCacheManager(BaseResourceManager):
                 ) for pc in self.pool_configurations
             ]
 
-        if kv_cache_type != CacheTypeCpp.SELF:
+        # Hybrid linear-attention managers intentionally carry two windows
+        # (the RECURRENT_STATES sentinel window plus the full attention
+        # window), including with the SELFKONLY cache type (e.g. Kimi K3:
+        # MLA latent cache + KDA recurrent state). The C++ WindowBlockManager
+        # treats kSELFKONLY as a self cache (kv_factor=1) with regular
+        # per-window pools, so the single-window normalization below (meant
+        # for cross-KV caches) must not fire for them.
+        if kv_cache_type != CacheTypeCpp.SELF and not self.is_linear_attention:
             assert len(
                 blocks_per_window
             ) == 1, "Only one window size is supported for non-self KV cache"

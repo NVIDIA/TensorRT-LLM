@@ -121,15 +121,20 @@ def get_kv_cache_manager_cls(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
 
-        # Kimi K3 (KDA + MLA hybrid) is only supported with the Mixed
-        # manager (separate KV / recurrent-state pools) for now; the unified
-        # C++ pool path (block reuse) is untested for its MLA + KDA layout.
+        # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
+        # (CppMambaHybridCacheManager) like the other hybrid linear models —
+        # per-block KDA state snapshots every mamba_state_cache_interval
+        # tokens with FORCE_CHUNK context chunking. Without block reuse the
+        # Mixed manager (separate KV / recurrent-state pools) stays the
+        # default. SA speculative decoding is validated on the Mixed
+        # manager's SpeculativeState scratch path only; reuse + SA is
+        # unvalidated.
         if is_kimi_linear(config):
             if kv_cache_config.enable_block_reuse:
-                raise ValueError(
-                    "Kimi K3 (kimi_linear) requires "
-                    "kv_cache_config.enable_block_reuse=False (block reuse "
-                    "is not supported with its KDA recurrent state).")
+                logger.info(
+                    "Using CppMambaHybridCacheManager for Kimi K3 hybrid "
+                    "model (block reuse enabled)")
+                return CppMambaHybridCacheManager
             logger.info(
                 "Using MixedMambaHybridCacheManager for Kimi K3 hybrid model")
             return MixedMambaHybridCacheManager

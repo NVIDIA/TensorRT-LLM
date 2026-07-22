@@ -22,13 +22,19 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: sbatch $0 --model PATH --image PATH"
+    echo "Usage: sbatch $0 --model PATH --image PATH [--enable-block-reuse]"
 }
 
 MODEL=""
 CONTAINER_IMAGE=""
+FEATURE_ARGS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --enable-block-reuse)
+            # Forwarded verbatim to quick_start_kimi_k3.py (see its --help).
+            FEATURE_ARGS="$FEATURE_ARGS $1"
+            shift
+            ;;
         --model)
             [[ $# -ge 2 ]] || { echo "error: --model requires a value" >&2; usage >&2; exit 2; }
             MODEL=$2
@@ -92,5 +98,5 @@ srun --mpi=pmix \
         exec '$REPO/tensorrt_llm/llmapi/trtllm-llmapi-launch' python3 \
             '$REPO/examples/kimi_k3/quick_start_kimi_k3.py' \
             --model \"$MODEL\" \
-            --tp-size 16
+            --tp-size 16$FEATURE_ARGS
     "

@@ -1,0 +1,19 @@
+# Extra LLM-API options for Kimi K3 with KV-cache block reuse enabled, used
+# by trtllm-eval via --config (select with run_gsm8k_kimi_k3.sbatch --reuse;
+# the sbatch also drops trtllm-eval's --disable_kv_cache_reuse flag so this
+# file takes effect). enable_block_reuse routes the model to the
+# unified-pool hybrid cache manager, which snapshots the KDA recurrent
+# state every kv_cache_config.mamba_state_cache_interval tokens
+# (default 256) so prefix-cache hits restore both the MLA latent cache and
+# the KDA state. Otherwise identical to eval_extra_llm_options.yaml.
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+disable_overlap_scheduler: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+enable_chunked_prefill: true
+kv_cache_config:
+  enable_block_reuse: true
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

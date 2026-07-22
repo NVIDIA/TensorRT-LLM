@@ -76,6 +76,22 @@ def _is_lock_infra_error(exc: BaseException) -> bool:
     return False
 
 
+def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
+    """Release ``lock``, downgrading broken-lock-infra errors to a warning.
+
+    NFS can return ENOLCK/ESTALE from the unlock ``flock`` call itself (e.g.
+    lock-daemon exhaustion when many ranks start simultaneously). The config
+    load the lock protected has already completed at release time, so
+    crashing the process here would fail an otherwise healthy executor.
+    """
+    try:
+        lock.release()
+    except (PermissionError, OSError) as e:
+        if not _is_lock_infra_error(e):
+            raise
+        logger.warning(f"config lock release failed ({e}), continuing")
+
+
 @contextlib.contextmanager
 def config_file_lock(timeout: int = 10):
     """
@@ -119,12 +135,12 @@ def config_file_lock(timeout: int = 10):
             try:
                 yield
             finally:
-                tmp_lock.release()
+                _release_lock_ignoring_infra_errors(tmp_lock)
     else:
         try:
             yield
         finally:
-            lock.release()
+            _release_lock_ignoring_infra_errors(lock)
 
 
 @dataclass(kw_only=True)

@@ -3,16 +3,18 @@
 # across the expert-parallel group (assumes tp_size=16). CUDA graphs and
 # the overlap scheduler are enabled: the generation-phase MLA latent-cache
 # append derives its write positions from device tensors
-# (attention_backend/utils.py), so it is CUDA-graph-safe. Remaining Kimi K3
-# runtime constraints: no chunked prefill, no KV block reuse,
-# tokens_per_block=64 (MLA (576,512) trtllm-gen generation kernel).
+# (attention_backend/utils.py), so it is CUDA-graph-safe. Chunked prefill
+# is enabled by default; KV block reuse is opt-in via
+# eval_extra_llm_options_reuse.yaml (run_gsm8k_kimi_k3.sbatch --reuse).
+# Remaining constraint: tokens_per_block=64 (MLA (576,512) trtllm-gen
+# generation kernel).
 enable_attention_dp: true
 moe_expert_parallel_size: 16
 disable_overlap_scheduler: false
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 32
-enable_chunked_prefill: false
+enable_chunked_prefill: true
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.25
