@@ -104,12 +104,12 @@ kv_cache_config:
 
 This retains snapshots after the first 128 tokens, at the end of the prompt,
 and before the final 32 prompt tokens. Positions outside a particular prompt
-are ignored. Exact explicit boundaries currently require aggregated serving
-with `MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector.
-Hybrid Mamba models use the V1 C++ compatibility manager by default; select V2
-explicitly with `use_kv_cache_manager_v2: true`. V1 and the current
-disaggregated-serving route support periodic snapshots only, while V2 does not
-yet support disaggregated serving.
+are ignored. Exact explicit boundaries currently require
+`MambaHybridCacheManagerV2`, `max_beam_width=1`, and no KV connector. Hybrid
+Mamba models use the V1 C++ compatibility manager by default; select V2
+explicitly with `use_kv_cache_manager_v2: true`. In disaggregated serving, V2
+Mamba requires the Python NIXL transceiver (`transceiver_runtime: PYTHON`); V1
+routes support periodic snapshots only.
 
 ### KV Cache Salting for Secure Reuse
 
