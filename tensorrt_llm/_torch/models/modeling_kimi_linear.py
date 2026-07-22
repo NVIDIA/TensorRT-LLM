@@ -481,9 +481,9 @@ class KimiKDARuntime(nn.Module):
             rms_norm_eps=cfg.rms_norm_eps,
             dtype=torch.bfloat16,
             layer_idx=layer_idx,
-            # The optimized decode kernel has batch-shape constraints; the
-            # runtime path below drives the FLA kernels directly.
-            force_use_fallback_kernel=True,
+            # The runtime prefill path below drives FLA directly.
+            use_optimized_prefill=False,
+            use_optimized_decode=True,
         )
         self.proj_size = lin["num_heads"] * lin["head_dim"]
 
@@ -625,64 +625,38 @@ class KimiKDARuntime(nn.Module):
 
     def _forward_decode(self, x2d, conv_pool, ssm_pool,
                         slot_indices) -> torch.Tensor:
-        from einops import rearrange
-        from fla.ops.kda import fused_recurrent_kda
+        from ..modules.kimi_kda.kimi_kda_mixer import KimiKDACachedState
 
         mixer = self.mixer
         d = self.proj_size
         x = x2d.unsqueeze(1)  # [B, 1, hidden]
 
-        q_proj_states = mixer.q_proj(x)
-        k_proj_states = mixer.k_proj(x)
-        v_proj_states = mixer.v_proj(x)
-
         cs = conv_pool.index_select(0, slot_indices)
         conv_q, conv_k, conv_v = _kda_split_conv_sections(cs, d)
-        recurrent_in = ssm_pool.index_select(0, slot_indices)
-
-        # ShortConvolution.step updates the (gathered) caches in place.
-        q, conv_q = mixer.q_conv1d(q_proj_states,
-                                   cache=conv_q,
-                                   output_final_state=True)
-        k, conv_k = mixer.k_conv1d(k_proj_states,
-                                   cache=conv_k,
-                                   output_final_state=True)
-        v, conv_v = mixer.v_conv1d(v_proj_states,
-                                   cache=conv_v,
-                                   output_final_state=True)
-
-        g = mixer.f_b_proj(mixer.f_a_proj(x))
-        g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
-        beta = mixer.b_proj(x).float()
-
-        q = rearrange(q, "... (h d) -> ... h d", d=mixer.head_k_dim)
-        k = rearrange(k, "... (h d) -> ... h d", d=mixer.head_k_dim)
-        v = rearrange(v, "... (h d) -> ... h d", d=mixer.head_dim)
-
-        o, recurrent_out = fused_recurrent_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=mixer.A_log,
-            dt_bias=mixer.dt_bias,
-            initial_state=recurrent_in,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            lower_bound=mixer.gate_lower_bound,
-            state_v_first=True,
+        cache = KimiKDACachedState(
+            conv_state_q=conv_q,
+            conv_state_k=conv_k,
+            conv_state_v=conv_v,
+            recurrent_state=ssm_pool.index_select(0, slot_indices),
         )
+        out, new_cache = mixer.forward_decode(x, cache)
 
         conv_pool.index_copy_(
-            0, slot_indices,
-            torch.cat([conv_q, conv_k, conv_v], dim=1).to(conv_pool.dtype))
-        ssm_pool.index_copy_(0, slot_indices,
-                             recurrent_out.to(ssm_pool.dtype))
+            0,
+            slot_indices,
+            torch.cat(
+                [
+                    new_cache.conv_state_q,
+                    new_cache.conv_state_k,
+                    new_cache.conv_state_v,
+                ],
+                dim=1,
+            ).to(conv_pool.dtype),
+        )
+        ssm_pool.index_copy_(
+            0, slot_indices, new_cache.recurrent_state.to(ssm_pool.dtype))
 
-        return self._output_gate_and_proj(x, o)
+        return out.squeeze(1)
 
     def _forward_verify(self, x2d, num_steps, layer_cache, conv_pool,
                         ssm_pool, slot_indices) -> torch.Tensor:
