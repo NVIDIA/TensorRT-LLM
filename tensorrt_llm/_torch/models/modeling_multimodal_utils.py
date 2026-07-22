@@ -43,9 +43,8 @@ def _is_mm_disagg() -> bool:
 
 def has_raw_multimodal_payload(param: MultimodalParams) -> bool:
     multimodal_data = param.multimodal_data or {}
-    modality_type = multimodal_data.get("modality_type")
-    return (modality_type in ("image", "video", "audio")
-            and multimodal_data.get(modality_type) is not None)
+    return any(multimodal_data.get(m) is not None
+               for m in ("image", "video", "audio"))
 
 
 # Processor *output* keys that transformers 5.x's
