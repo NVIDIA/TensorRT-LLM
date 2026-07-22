@@ -75,6 +75,10 @@ PROMPTS_AND_CHECKS = [
 ]
 
 
+def _graphs_enabled() -> bool:
+    return os.environ.get("KIMI_K3_CUDA_GRAPHS", "1") == "1"
+
+
 def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
     speculative_config = None
     if spec_mode == "sa":
@@ -103,16 +107,19 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         max_seq_len=int(os.environ.get("KIMI_K3_MAX_SEQ_LEN", "4096")),
         max_num_tokens=int(os.environ.get("KIMI_K3_MAX_NUM_TOKENS", "4096")),
         enable_chunked_prefill=False,
-        # Non-spec runs use the upstream defaults (overlap + CUDA graphs,
-        # graph-safe MLA latent-cache append). Spec-dec runs keep the
-        # validated conservative settings: SA supports both features in
-        # principle (graph-safe worker, overlap-capable mode), but the K3
-        # verify/promote path has only been certified eager without
-        # overlap — enabling them is a measured follow-up.
-        disable_overlap_scheduler=speculative_config is not None,
-        cuda_graph_config=(None if speculative_config is not None else
-                           CudaGraphConfig(enable_padding=True,
-                                           max_batch_size=8)),
+        # Non-spec standalone runs use the upstream defaults (overlap +
+        # CUDA graphs). Spec-dec runs keep the validated conservative
+        # settings (SA is graph-safe/overlap-capable in principle, but the
+        # K3 verify/promote path is only certified eager without overlap).
+        # Parity runs force BOTH instances into the conservative regime via
+        # KIMI_K3_CUDA_GRAPHS=0 (set in main) — a baseline compared against
+        # an eager spec run must not execute under a different regime.
+        disable_overlap_scheduler=(speculative_config is not None
+                                   or not _graphs_enabled()),
+        cuda_graph_config=(CudaGraphConfig(enable_padding=True,
+                                           max_batch_size=8)
+                           if speculative_config is None
+                           and _graphs_enabled() else None),
         speculative_config=speculative_config,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
@@ -364,6 +371,8 @@ def main() -> int:
 
     baseline = None
     if spec_parity != "0":
+        # Regime-match the parity baseline to the (eager) spec run.
+        os.environ.setdefault("KIMI_K3_CUDA_GRAPHS", "0")
         # A cross-process baseline permits no-spec regression checks
         # (e.g. verifying a model-class change is behavior-neutral by
         # comparing two spec-off runs across code states).
