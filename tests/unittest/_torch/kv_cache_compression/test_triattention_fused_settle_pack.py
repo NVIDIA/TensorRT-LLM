@@ -420,6 +420,87 @@ def test_fused_kernel_without_pack_matches_standalone_settle():
     assert torch.equal(output_fused, output_reference)
 
 
+def test_settle_handles_topk_sentinel_padding():
+    """Rows shorter than KEEP_COUNT arrive -1-padded and must settle inertly.
+
+    The production top-k pads a row shorter than KEEP_COUNT with -1
+    sentinels (a zero-width padded row is all sentinels). The settle's
+    threshold gather must skip those lanes -- never touching the score byte
+    before the row -- while emitting exactly the real ordinals; the output
+    slots past a short row's length stay untouched (rows that short move
+    nothing downstream). Full rows must keep byte-identical behavior.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows_total, width, keep_count = 4, 33, 7
+    generator = torch.Generator(device=device).manual_seed(23)
+    scores = torch.randint(
+        -2, 3, (rows_total, width), generator=generator, dtype=torch.int32, device=device
+    ).to(torch.float32)
+    row_lengths = torch.tensor([0, 3, 7, 33], dtype=torch.int32, device=device)
+    row_prompt_offsets = torch.tensor([5, 1, 2, 0], dtype=torch.int32, device=device)
+
+    # Provisional rows exactly as the production top-k emits them: rows with
+    # length <= KEEP_COUNT carry [0..length) then -1 sentinels; longer rows
+    # carry a dense top-k.
+    provisional = torch.full((rows_total, keep_count), -1, dtype=torch.int32, device=device)
+    for row, length in enumerate(row_lengths.tolist()):
+        if length <= keep_count:
+            provisional[row, :length] = torch.arange(length, dtype=torch.int32, device=device)
+        else:
+            masked = scores[row].clone()
+            masked[length:] = float("-inf")
+            provisional[row] = torch.topk(masked, keep_count).indices.to(torch.int32)
+
+    stale = 0x5EED
+    output = torch.full((rows_total, keep_count), stale, dtype=torch.int32, device=device)
+    placeholder = row_lengths
+    _settle_ties_and_pack_compaction_sources_kernel[(rows_total, 1)](
+        scores,
+        row_lengths,
+        row_prompt_offsets,
+        provisional,
+        output,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        placeholder,
+        WIDTH=width,
+        KEEP_COUNT=keep_count,
+        OUTPUT_WIDTH=keep_count,
+        SELECTION_ROWS=1,
+        DENSE_TOTAL=0,
+        SWA_TOTAL=0,
+        MOVE_CAPACITY=0,
+        NUM_KV_HEADS=1,
+        SWA_WINDOW=0,
+        UNION=False,
+        PER_LAYER=False,
+        HAS_SWA=False,
+        HAS_SETTLE=True,
+        HAS_PACK=False,
+        BLOCK=_BLOCK,
+        num_warps=_NUM_WARPS,
+    )
+    torch.cuda.synchronize(device)
+
+    for row, length in enumerate(row_lengths.tolist()):
+        prompt = int(row_prompt_offsets[row])
+        emitted = min(length, keep_count)
+        if length > keep_count:
+            # Reference keep set: score-descending with lowest-index ties,
+            # emitted as ascending absolute ordinals.
+            order = sorted(range(length), key=lambda i: (-float(scores[row, i]), i))
+            expected = sorted(order[:keep_count])
+        else:
+            expected = list(range(length))
+        expected_row = torch.tensor(
+            [ordinal + prompt for ordinal in expected], dtype=torch.int32, device=device
+        )
+        assert torch.equal(output[row, :emitted], expected_row), f"row {row}"
+        assert (output[row, emitted:] == stale).all(), f"row {row} tail"
+
+
 def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buffers():
     """The handoff exports the live move buffers, drops the compaction-time
     dense pack launch, and the selector only accepts a packing that reads its

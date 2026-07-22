@@ -932,9 +932,15 @@ def _settle_ties_and_pack_compaction_sources_kernel(
                 mask=selected_mask,
                 other=0,
             )
+            # Rows shorter than KEEP_COUNT arrive padded with -1 sentinels
+            # from the top-k's short-row path (zero-width padded rows are all
+            # sentinels). Mask those lanes out of the gather so no lane
+            # dereferences ``row_scores - 1`` and a sentinel never joins the
+            # threshold; rows without sentinels load exactly as before.
+            selected_valid = selected_mask & (token_index >= 0)
             selected_score = tl.load(
                 row_scores + token_index,
-                mask=selected_mask,
+                mask=selected_valid,
                 other=float("inf"),
             ).to(tl.float32)
             threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
