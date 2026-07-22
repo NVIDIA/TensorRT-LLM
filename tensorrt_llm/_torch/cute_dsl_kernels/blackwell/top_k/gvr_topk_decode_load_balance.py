@@ -247,9 +247,45 @@ class GvrTopKLBKernel:
             enable_warp_parallel_reduce=enable_warp_parallel_reduce,
             compress_ratio=compress_ratio,
             return_output_values=return_output_values,
+            # The two instances are inlined into ONE launch, and the CuTe DSL
+            # sizes the launch's dynamic SMEM from the last-traced
+            # SmemAllocator only (CuTeDSL.track_smem_allocator holds a single
+            # slot). Every smem-affecting knob must therefore resolve
+            # identically for both instances, or the larger branch reads/
+            # writes past the reserved SMEM (CI IMA, 2026-07-21: fp32 K2048
+            # long branch overflowed by the p1b_cache smem_gath the single
+            # instance's default had skipped). Pin the two knobs whose
+            # defaults diverge on cluster_size:
+            #   - p1b_cache: cs>1 default True vs cs=1 fp32 default False.
+            #   - kc_diet:   cs=1 K512 default shrinks kC 4096→3072.
+            p1b_cache=True,
+            kc_diet=False,
         )
         self._cluster_kernel = GvrTopKKernel(cluster_size=cluster_size, **common_kwargs)
         self._single_kernel = GvrTopKKernel(cluster_size=1, **common_kwargs)
+        # Drift guard: fail fast at construction if the derived smem-layout
+        # attributes ever diverge again (new knobs must be added here AND to
+        # the pinned kwargs above).
+        for attr in (
+            "kC",
+            "kNumBins",
+            "M_thr",
+            "M_qf",
+            "p1b_cache",
+            "enable_smem_cache",
+            "smem_cache_elems",
+            "num_threads",
+            "p2_warp_redundant",
+            "p4_warp_redundant",
+        ):
+            a = getattr(self._cluster_kernel, attr)
+            b = getattr(self._single_kernel, attr)
+            assert a == b, (
+                f"GvrTopKLBKernel: smem-layout attribute {attr!r} diverges "
+                f"between the cluster ({a}) and single ({b}) member kernels; "
+                f"the DSL sizes the launch from one SmemAllocator, so the "
+                f"layouts must be byte-identical."
+            )
         # Prepare is decoupled from main: callers run it once per
         # decode step (seq_lens is layer-invariant). Use
         # GvrTopKLBPrepareKernel directly.
