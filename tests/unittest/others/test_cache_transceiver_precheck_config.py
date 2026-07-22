@@ -324,9 +324,7 @@ class TestRendezvousStaleness:
 def test_wireup_timeout_derivation():
     plan = pcfg.resolve_plan(_disagg_yaml())  # ctx dep4 -> gen dep16
     assert plan["wireup_timeout_s"] == min(1800, 150 * 16)
-    plan = pcfg.resolve_plan(
-        _disagg_yaml(gen_extra={"tensor_parallel_size": 4})
-    )
+    plan = pcfg.resolve_plan(_disagg_yaml(gen_extra={"tensor_parallel_size": 4}))
     assert plan["wireup_timeout_s"] == 600
     plan = pcfg.resolve_plan(_disagg_yaml(cache_transceiver_precheck={"wireup_timeout_s": 42}))
     assert plan["wireup_timeout_s"] == 42
@@ -338,9 +336,11 @@ def _enabled_line(cfg):
 
 
 def test_precheck_env_kill_switch_truthy(monkeypatch):
-    """The TRTLLM_DISAGG_CT_PRECHECK global kill switch parses the usual boolean
-    spellings (so a force-enable like =true is not silently read as "off") and
-    rejects anything ambiguous instead of guessing."""
+    """The TRTLLM_DISAGG_CT_PRECHECK kill switch parses the usual boolean spellings.
+
+    So a force-enable like =true is not silently read as "off", and anything
+    ambiguous is rejected instead of guessed at.
+    """
     cfg = {"cache_transceiver_precheck": {"enabled": True}}
     monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
     assert _enabled_line(cfg).endswith("=1")  # yaml default
@@ -359,8 +359,11 @@ def test_precheck_env_kill_switch_truthy(monkeypatch):
 
 
 def test_gate_library_content(tmp_path):
-    """The gate library loads from next to the draft, falls back to the in-repo
-    copy for an external draft, strips blank lines, and errors if truly absent."""
+    """The gate library loads from next to the draft, with an in-repo fallback.
+
+    It falls back to the in-repo copy for an external draft, strips blank
+    lines, and errors if truly absent.
+    """
     dd = tmp_path / "disaggregated"
     dd.mkdir()
     (dd / "slurm_ct_precheck_gate.sh").write_text(
@@ -383,8 +386,11 @@ def test_gate_library_content(tmp_path):
 
 
 def test_rid_tags_dense_within_session():
-    """The C++ notification tag is rid & 0xFFF: rids must be dense within a
-    (ctx, gen) session so tags cannot alias across reps/lengths."""
+    """Rids must be dense within a (ctx, gen) session.
+
+    The C++ notification tag is rid & 0xFFF, so dense rids keep tags from
+    aliasing across reps/lengths.
+    """
     plan = pcfg.resolve_plan(_disagg_yaml())  # n_pairs=16
     total_reps = plan["warmup_requests"] + plan["num_requests"]
     n_pairs = plan["n_pairs"]
@@ -463,9 +469,7 @@ class TestMultiPeerOrchestration:
 
         runner.ctx_run_wave = ctx_run_wave
         runner.ctx_finish_wave = lambda reqs: None
-        runner.gen_run_wave = (
-            lambda peer_idx, li, req_len, rep, wave, params: (True, "")
-        )
+        runner.gen_run_wave = lambda peer_idx, li, req_len, rep, wave, params: (True, "")
         runner._calls = calls
         return runner
 
@@ -494,7 +498,11 @@ class TestMultiPeerOrchestration:
         gen = self._mk_runner("gen", 0, plan, work, monkeypatch)
         ctxs = [
             self._mk_runner(
-                "ctx", i, plan, work, monkeypatch,
+                "ctx",
+                i,
+                plan,
+                work,
+                monkeypatch,
                 fail_ctx=(fail_ctx_idx is not None and i == fail_ctx_idx),
             )
             for i in range(2)
@@ -531,9 +539,7 @@ class TestMultiPeerOrchestration:
         }
         # every ctx served the full schedule (reps x waves) and got its
         # deferred done (PASS recorded only after done/bye completes)
-        total_waves = len(pcfg.waves(plan)) * (
-            plan["warmup_requests"] + plan["num_requests"]
-        )
+        total_waves = len(pcfg.waves(plan)) * (plan["warmup_requests"] + plan["num_requests"])
         for c in ctxs:
             assert c._calls["waves"] == total_waves
             assert [x["status"] for x in c.recorder.cases] == ["PASS"]
@@ -578,11 +584,13 @@ class TestMultiPeerOrchestration:
 
 
 def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
-    """#4 regression: the "missing context_phase_params" verdict is computed
-    only on the instance leader (only it holds the gathered params), so it must
-    be broadcast -- otherwise a NON-leader rank keeps reason=None, returns, and
-    enters the next collective while the leader raises, deadlocking the step
-    until the watchdog SIGKILLs it (misreported as TIMEOUT).
+    """#4 regression: the "missing context_phase_params" verdict must be broadcast.
+
+    It is computed only on the instance leader (only it holds the gathered
+    params) -- without the broadcast, a NON-leader rank keeps reason=None,
+    returns, and enters the next collective while the leader raises,
+    deadlocking the step until the watchdog SIGKILLs it (misreported as
+    TIMEOUT).
 
     Run the real ctx_run_wave on a non-leader rank: with the leader's verdict
     delivered via bcast the rank must raise; with a clean (None) broadcast it
@@ -650,9 +658,12 @@ def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
 
 
 def test_status_env_snapshot_excludes_nixl(tmp_path, monkeypatch):
-    """NIXL_* is not captured: the only such variable seen in practice is
-    NIXL_VERSION, a stale NGC-base-image marker that misstates the version of
-    the actually-linked library."""
+    """NIXL_* is not captured.
+
+    The only such variable seen in practice is NIXL_VERSION, a stale
+    NGC-base-image marker that misstates the version of the actually-linked
+    library.
+    """
     monkeypatch.setenv("NIXL_VERSION", "1.0.0")
     monkeypatch.setenv("NIXL_PLUGIN_DIR", "/opt/x")
     monkeypatch.setenv("UCX_TLS", "rc,cuda_copy")
@@ -662,10 +673,12 @@ def test_status_env_snapshot_excludes_nixl(tmp_path, monkeypatch):
 
 
 def test_sparse_attention_model_uses_simplified_mla_pool(tmp_path):
-    """DeepSeek V4 / DSA can't be modeled as a single KV pool. The precheck is
-    a NETWORK check, so it falls back to a simple MLA-flavored stand-in pool
-    (real layer count, one latent head, is_mla=True) and still runs -- never
-    skips."""
+    """DeepSeek V4 / DSA can't be modeled as a single KV pool.
+
+    The precheck is a NETWORK check, so it falls back to a simple MLA-flavored
+    stand-in pool (real layer count, one latent head, is_mla=True) and still
+    runs -- never skips.
+    """
     d = tmp_path / "v4"
     d.mkdir()
     (d / "config.json").write_text(
@@ -699,8 +712,11 @@ def test_sparse_attention_model_uses_simplified_mla_pool(tmp_path):
 
 
 def test_python_transceiver_bandwidth_csv(tmp_path):
-    """Bandwidth from the Python transceiver's perf_logger CSVs: median over
-    KVSendTask throughput_mbs (MB/s -> GB/s), receiver rows ignored."""
+    """Bandwidth from the Python transceiver's perf_logger CSVs.
+
+    Median over KVSendTask throughput_mbs (MB/s -> GB/s), receiver rows
+    ignored.
+    """
     header = (
         "timestamp,task_type,unique_rid,peer_rank,transfer_size_bytes,"
         "avg_segment_size_bytes,transfer_entry_count,prepare_args_latency_ms,"
@@ -709,12 +725,11 @@ def test_python_transceiver_bandwidth_csv(tmp_path):
     # two ctx ranks, each its own perf file; KVSendTask rows carry throughput
     (tmp_path / "perf_abc_0.csv").write_text(
         header + "\n"
-        "t,KVSendTask,1,0,1000,,,0,0,0,0,102400.00\n"   # 100 GB/s
-        "t,AuxSendTask,1,0,10,,,0,0,0,0,1.00\n"          # tiny metadata, ignored
+        "t,KVSendTask,1,0,1000,,,0,0,0,0,102400.00\n"  # 100 GB/s
+        "t,AuxSendTask,1,0,10,,,0,0,0,0,1.00\n"  # tiny metadata, ignored
     )
     (tmp_path / "perf_abc_1.csv").write_text(
-        header + "\n"
-        "t,KVSendTask,2,1,1000,,,0,0,0,0,204800.00\n"   # 200 GB/s
+        header + "\nt,KVSendTask,2,1,1000,,,0,0,0,0,204800.00\n"  # 200 GB/s
     )
     # a receiver file (no throughput) must not contribute
     (tmp_path / "perf_def_8.csv").write_text(header + "\nt,KVRecvTask,3,0,,,,,,,5.0,\n")

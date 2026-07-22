@@ -151,8 +151,11 @@ def params_to_wire(p):
 
 
 def params_from_wire(d):
-    """Inverse of params_to_wire, via the maintained DisaggregatedParams
-    converter (keeps us off the raw nanobind ctor signature)."""
+    """Inverse of params_to_wire.
+
+    Uses the maintained DisaggregatedParams converter (keeps us off the raw
+    nanobind ctor signature).
+    """
     from tensorrt_llm import DisaggregatedParams
 
     return DisaggregatedParams(
@@ -229,7 +232,6 @@ def _lookup_model_cls(model_dir):
     if not archs:
         return None, hf_view
     import tensorrt_llm._torch.models  # noqa: F401 - populates the registry
-
     from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 
     return MODEL_CLASS_MAPPING.get(archs[0]), hf_view
@@ -258,8 +260,10 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
             try:
                 defaults = model_cls.get_model_defaults(None) or {}
             except Exception as e:  # noqa: BLE001 - model hooks may need llm_args
-                print(f"[precheck] WARNING: get_model_defaults failed ({e!r}); "
-                      f"assuming V1", flush=True)
+                print(
+                    f"[precheck] WARNING: get_model_defaults failed ({e!r}); assuming V1",
+                    flush=True,
+                )
         try:
             # The REAL serving resolver, via the same shim pattern as the
             # runtime resolution below -- one owner for the 'auto' semantics.
@@ -270,8 +274,9 @@ def resolve_model_prefs(model_dir, side, cache_cfg):
             )
             use_v2 = bool(_resolve_kv_cache_manager_v2_auto(shim, defaults))
         except Exception as e:  # noqa: BLE001 - fall back like a missing model
-            print(f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); "
-                  f"assuming V1", flush=True)
+            print(
+                f"[precheck] WARNING: V2 'auto' resolution failed ({e!r}); assuming V1", flush=True
+            )
             use_v2 = False
     else:
         use_v2 = bool(setting)
@@ -479,9 +484,12 @@ def run_token():
 
 
 def write_addr(path, payload):
-    """Atomically publish an addr file (os.replace overwrites stale ones;
-    readers reject wrong-job stamps). It carries the session HMAC key, so
-    restrict it to the owning user before it becomes visible."""
+    """Atomically publish an addr file.
+
+    os.replace overwrites stale ones; readers reject wrong-job stamps. It
+    carries the session HMAC key, so restrict it to the owning user before it
+    becomes visible.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = dict(payload, job=run_token())
     tmp = f"{path}.tmp.{os.getpid()}"
@@ -494,8 +502,11 @@ def write_addr(path, payload):
 
 
 def wait_for_addr(path, timeout_s):
-    """Wait for THIS run's addr file; files stamped with another run's job id
-    are treated as stale and skipped (keep polling)."""
+    """Wait for THIS run's addr file.
+
+    Files stamped with another run's job id are treated as stale and skipped
+    (keep polling).
+    """
     expect_job = run_token()
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -519,11 +530,14 @@ def abort_flag_path(work_dir):
 
 
 def raise_abort_flag(work_dir, reason):
-    """Fail-fast signal, shared across instances through the work dir: the
-    first peer failure (in ANY ctx/gen instance) drops this file so the others
-    stop starting new sessions instead of each re-discovering the dead fabric
-    on its own. Best-effort and write-once. Stamped with the job id so a stale
-    flag in a reused work dir (Slurm requeue) is ignored, like addr files."""
+    """Fail-fast signal, shared across instances through the work dir.
+
+    The first peer failure (in ANY ctx/gen instance) drops this file so the
+    others stop starting new sessions instead of each re-discovering the dead
+    fabric on its own. Best-effort and write-once. Stamped with the job id so
+    a stale flag in a reused work dir (Slurm requeue) is ignored, like addr
+    files.
+    """
     path = abort_flag_path(work_dir)
     if abort_flag_reason(work_dir) is not None:
         return
@@ -540,8 +554,10 @@ def raise_abort_flag(work_dir, reason):
 
 
 def abort_flag_reason(work_dir):
-    """The reason recorded by the first failing peer of THIS run, or None. A
-    flag stamped with another job id is stale (reused work dir) and ignored."""
+    """The reason recorded by the first failing peer of THIS run, or None.
+
+    A flag stamped with another job id is stale (reused work dir) and ignored.
+    """
     try:
         with open(abort_flag_path(work_dir)) as f:
             payload = json.load(f)
@@ -653,8 +669,9 @@ def parse_bandwidth_gbps(csv_dir, rank, tag="recv"):
 
 
 def parse_python_bandwidth_gbps(csv_dir):
-    """Median KV-send throughput in GB/s from the Python transceiver's perf
-    CSVs (perf_logger.py). Enabled via TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
+    """Median KV-send throughput in GB/s from the Python transceiver's perf CSVs.
+
+    Written by perf_logger.py; enabled via TLLM_ENABLE_CACHE_TRANSFER_PERF_INFO=1
     + TLLM_KV_TRANSFER_PERF_LOG_FILE=<base>, which writes
     <base>_<instance>_<rank>.csv. throughput_mbs (MB/s) is on the SENDER
     (ctx) side, task_type=KVSendTask; receiver rows have no throughput.
@@ -755,8 +772,10 @@ class PrecheckRunner:
         # match what the real model runs (e.g. V4 -> V2 + Python).
         self.use_v2 = resolve_model_prefs(self.plan.get("_model_dir"), self.side, cache_cfg)
         if kv_shape.get("simplified") and self.is_leader:
-            print(f"[precheck {self.role}_{self.server_idx}] SIMPLIFIED: "
-                  f"{kv_shape['simplified']}", flush=True)
+            print(
+                f"[precheck {self.role}_{self.server_idx}] SIMPLIFIED: {kv_shape['simplified']}",
+                flush=True,
+            )
         # KVCacheManagerV2 only works with the Python transceiver (see
         # cache_transceiver_test/report.py); reject the pairing up front with
         # a clear INIT_ERROR instead of a C++ binding type error.
@@ -998,8 +1017,11 @@ def hello_timeout_s(plan, num_peers):
 
 
 def wave_timeout_s(plan, li, rep):
-    """Per-wave budget: the first rep additionally pays the one-time NIXL
-    agent wire-up (see PRECHECK_DEFAULTS['wireup_timeout_s'])."""
+    """Per-wave budget.
+
+    The first rep additionally pays the one-time NIXL agent wire-up (see
+    PRECHECK_DEFAULTS['wireup_timeout_s']).
+    """
     extra = plan["wireup_timeout_s"] if (li == 0 and rep == 0) else 0
     return plan["wave_timeout_s"] + extra
 
@@ -1090,10 +1112,9 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
 
 
 def _gen_open_session(runner, peer_idx, arm):
-    """Rendezvous with ctx server `peer_idx` and complete the hello/welcome
-    handshake; return (sock, key) on an OPEN REQ socket.
+    """Rendezvous with ctx server `peer_idx`; return (sock, key) on an OPEN REQ socket.
 
-    Shared by gen_run_peer (runs the schedule) and gen_abort_peer (sends an
+    Completes the hello/welcome handshake. Shared by gen_run_peer (runs the schedule) and gen_abort_peer (sends an
     early abort for fail-fast). Rendezvous reaches instance-wide consensus via
     bcast: if only the leader raised, the other ranks would deadlock in the
     next bcast. The socket is closed here if the handshake itself fails.
@@ -1193,9 +1214,12 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
 
 
 def gen_abort_peer(runner, peer_idx, reason, arm, disarm):
-    """Fail-fast teardown of a not-yet-run ctx peer: open the session and tell
-    it to abort (it is blocked awaiting our hello), so it stops promptly
-    instead of waiting out the handshake alarm. Best-effort; always closes."""
+    """Fail-fast teardown of a not-yet-run ctx peer.
+
+    Open the session and tell it to abort (it is blocked awaiting our hello),
+    so it stops promptly instead of waiting out the handshake alarm.
+    Best-effort; always closes.
+    """
     sock = None
     try:
         sock, key = _gen_open_session(runner, peer_idx, arm)
@@ -1302,10 +1326,12 @@ def _install_watchdog(runner, plan, rank):
 
 
 def _make_peer_failure_recorder(runner, disarm, current_cell):
-    """Exception -> verdict mapping shared by all per-peer loops. Recording a
-    failure also drops the fail-fast flag so the remaining peers (here and in
-    the other instances) are skipped instead of tested against a fabric
-    already known bad -- see _drive_ctx_peers / raise_abort_flag."""
+    """Exception -> verdict mapping shared by all per-peer loops.
+
+    Recording a failure also drops the fail-fast flag so the remaining peers
+    (here and in the other instances) are skipped instead of tested against a
+    fabric already known bad -- see _drive_ctx_peers / raise_abort_flag.
+    """
 
     def record_peer_failure(peer, exc):
         disarm()
@@ -1322,10 +1348,12 @@ def _make_peer_failure_recorder(runner, disarm, current_cell):
 
 
 def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
-    """ctx role: bind one dedicated REP socket per gen peer (avoids REQ
-    interleaving across sessions on a shared socket), publish the addr files,
-    then serve each peer's full schedule. Each session gets a fresh HMAC key,
-    shared only through the work-dir addr file (0600)."""
+    """Ctx role: bind per-peer REP sockets, publish addrs, serve each schedule.
+
+    One dedicated REP socket per gen peer avoids REQ interleaving across
+    sessions on a shared socket. Each session gets a fresh HMAC key, shared
+    only through the work-dir addr file (0600).
+    """
     num_peers = runner.side["num_peers"]
     socks, keys = {}, {}
     if runner.is_leader:
@@ -1361,7 +1389,7 @@ def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
 
 
 def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
-    """gen role: run every ctx peer's schedule, then release all sessions.
+    """Gen role: run every ctx peer's schedule, then release all sessions.
 
     Fail-fast: once any pair has failed (this instance or another -- signalled
     through the work-dir abort flag), the remaining ctx peers are not tested;
@@ -1372,7 +1400,8 @@ def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
     The release ("done") is deferred until EVERY driven peer's schedule
     finished, so those ctx instances stay alive for the whole precheck --
     matching real serving, where no transceiver ever holds connections to a
-    dead agent while transfers are still running."""
+    dead agent while transfers are still running.
+    """
     open_sessions = []
     for ci in range(runner.side["num_peers"]):
         reason = abort_flag_reason(runner.work_dir)

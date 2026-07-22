@@ -9,10 +9,14 @@ import subprocess
 import sys
 from datetime import datetime
 
+import yaml
+
 
 def _import_precheck_config(llm_src):
-    """Import the pure-stdlib precheck config module from the repo tree
-    (single owner of the gate's enable policy and timeout formulas)."""
+    """Import the pure-stdlib precheck config module from the repo tree.
+
+    It is the single owner of the gate's enable policy and timeout formulas.
+    """
     path = os.path.join(llm_src, "tests", "scripts", "perf-sanity", "cache_transceiver_precheck")
     if path not in sys.path:
         sys.path.insert(0, path)
@@ -20,7 +24,6 @@ def _import_precheck_config(llm_src):
 
     return precheck_config
 
-import yaml
 
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
