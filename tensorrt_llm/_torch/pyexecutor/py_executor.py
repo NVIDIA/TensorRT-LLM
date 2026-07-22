@@ -114,6 +114,12 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# TEST ONLY: allow generation-first CTX metadata waiters to occupy a bounded
+# request window without consuming model execution capacity. The default is
+# zero so production behavior is unchanged.
+_GEN_FIRST_EXTRA_WAITER_CAPACITY_ENV = (
+    "TRTLLM_PYTHON_GEN_FIRST_EXTRA_WAITER_CAPACITY")
+
 
 class PPCommTag(IntEnum):
     """
@@ -729,6 +735,21 @@ class PyExecutor:
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
+        self._gen_first_extra_waiter_capacity = max(
+            0,
+            int(os.environ.get(_GEN_FIRST_EXTRA_WAITER_CAPACITY_ENV, "0")),
+        )
+        self._gen_first_waiter_capacity_logged = False
+        if self._gen_first_extra_waiter_capacity:
+            logger.warning(
+                "PYTHON_GF_WAITER_WINDOW mode=active rank=%d "
+                "base_capacity=%d extra_waiter_capacity=%d total_window=%d",
+                self.dist.rank,
+                self.max_num_active_requests,
+                self._gen_first_extra_waiter_capacity,
+                self.max_num_active_requests +
+                self._gen_first_extra_waiter_capacity,
+            )
         # nvbug-6133201: under attention DP, tighten the per-rank request
         # cap so per-rank gen-phase step-token load cannot exceed
         # max_num_tokens. No-op for correctly-sized configs.
@@ -5109,6 +5130,45 @@ class PyExecutor:
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
 
+    def _new_request_capacity_occupancy(
+            self, active_requests: List[LlmRequest]) -> int:
+        """Return active capacity occupied before fetching new requests.
+
+        Generation-first CTX requests waiting for peer metadata are below the
+        scheduler's lower state bound and do not own KV/model resources.  The
+        TEST ONLY waiter-window diagnostic discounts a bounded number of those
+        requests from fetch admission while preserving the physical active
+        count used to keep the executor loop nonblocking.
+        """
+        physical_occupancy = len(active_requests)
+        extra_capacity = self._gen_first_extra_waiter_capacity
+        if (extra_capacity <= 0 or self.enable_attention_dp
+                or self.kv_cache_transceiver is None):
+            return physical_occupancy
+
+        waiter_count = sum(
+            1 for req in active_requests
+            if req.is_context_only_request and req.state == LlmRequestState.
+            DISAGG_CONTEXT_WAIT_SCHEDULER and req.py_disaggregated_params.
+            schedule_style == DisaggScheduleStyle.GENERATION_FIRST)
+        excluded_waiters = min(waiter_count, extra_capacity)
+        if excluded_waiters and not self._gen_first_waiter_capacity_logged:
+            effective_occupancy = physical_occupancy - excluded_waiters
+            logger.warning(
+                "PYTHON_GF_WAITER_WINDOW mode=excluding rank=%d "
+                "base_capacity=%d total_window=%d physical_occupancy=%d "
+                "waiters=%d excluded=%d effective_occupancy=%d",
+                self.dist.rank,
+                self.max_num_active_requests,
+                self.max_num_active_requests + extra_capacity,
+                physical_occupancy,
+                waiter_count,
+                excluded_waiters,
+                effective_occupancy,
+            )
+            self._gen_first_waiter_capacity_logged = True
+        return physical_occupancy - excluded_waiters
+
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: WaitingQueue,
@@ -5147,10 +5207,13 @@ class PyExecutor:
                 s.num_active_requests for s in all_rank_states
             ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
+            capacity_occupancy = total_num_active_requests
         else:
             total_num_active_requests = len(active_requests)
             all_ranks_num_active_requests = None
             all_rank_states = None
+            capacity_occupancy = self._new_request_capacity_occupancy(
+                active_requests)
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue,
@@ -5158,8 +5221,7 @@ class PyExecutor:
 
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+            waiting_queue, capacity_occupancy, all_ranks_num_active_requests)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:

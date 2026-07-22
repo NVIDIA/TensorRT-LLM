@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.llmapi import DisaggScheduleStyle
 
 
 class MockPyExecutor:
@@ -142,6 +143,94 @@ def test_handle_special_queue_items(mock_executor):
     assert valid_requests[0] == normal_req
     assert mock_executor.is_shutdown
     assert 2 in mock_executor.canceled_req_ids
+
+
+def _make_capacity_request(
+    *, waiting: bool, context_only: bool = True, schedule_style=DisaggScheduleStyle.GENERATION_FIRST
+):
+    state = (
+        LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER if waiting else LlmRequestState.CONTEXT_INIT
+    )
+    return types.SimpleNamespace(
+        state=state,
+        is_context_only_request=context_only,
+        py_disaggregated_params=types.SimpleNamespace(schedule_style=schedule_style),
+    )
+
+
+@pytest.mark.parametrize(
+    "extra_capacity,enable_attention_dp,has_transceiver,expected",
+    [
+        (0, False, True, 4),
+        (3, True, True, 4),
+        (3, False, False, 4),
+        (2, False, True, 2),
+        (8, False, True, 2),
+    ],
+)
+def test_generation_first_waiter_window_capacity_occupancy(
+    extra_capacity, enable_attention_dp, has_transceiver, expected
+):
+    executor = types.SimpleNamespace(
+        _gen_first_extra_waiter_capacity=extra_capacity,
+        _gen_first_waiter_capacity_logged=True,
+        enable_attention_dp=enable_attention_dp,
+        kv_cache_transceiver=object() if has_transceiver else None,
+        dist=types.SimpleNamespace(rank=0),
+        max_num_active_requests=4,
+    )
+    requests = [
+        _make_capacity_request(waiting=True),
+        _make_capacity_request(waiting=True),
+        _make_capacity_request(waiting=True, context_only=False),
+        _make_capacity_request(waiting=False),
+    ]
+
+    occupancy = PyExecutor._new_request_capacity_occupancy(executor, requests)
+
+    assert occupancy == expected
+
+
+def test_generation_first_waiter_window_boundary_preserves_compute_capacity():
+    executor = types.SimpleNamespace(
+        _gen_first_extra_waiter_capacity=252,
+        _gen_first_waiter_capacity_logged=True,
+        enable_attention_dp=False,
+        kv_cache_transceiver=object(),
+        dist=types.SimpleNamespace(rank=0),
+        max_num_active_requests=4,
+    )
+    waiters = [_make_capacity_request(waiting=True) for _ in range(252)]
+    compute_requests = [_make_capacity_request(waiting=False) for _ in range(4)]
+
+    full_occupancy = PyExecutor._new_request_capacity_occupancy(
+        executor, waiters + compute_requests
+    )
+    one_slot_occupancy = PyExecutor._new_request_capacity_occupancy(
+        executor, waiters + compute_requests[:-1]
+    )
+
+    assert executor.max_num_active_requests - full_occupancy == 0
+    assert executor.max_num_active_requests - one_slot_occupancy == 1
+
+
+def test_generation_first_waiter_window_does_not_discount_other_schedule_style():
+    executor = types.SimpleNamespace(
+        _gen_first_extra_waiter_capacity=252,
+        _gen_first_waiter_capacity_logged=True,
+        enable_attention_dp=False,
+        kv_cache_transceiver=object(),
+        dist=types.SimpleNamespace(rank=0),
+        max_num_active_requests=4,
+    )
+    request = _make_capacity_request(
+        waiting=True,
+        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+    )
+
+    occupancy = PyExecutor._new_request_capacity_occupancy(executor, [request])
+
+    assert occupancy == 1
 
 
 def test_clear_canceled_req_ids(mock_executor):
