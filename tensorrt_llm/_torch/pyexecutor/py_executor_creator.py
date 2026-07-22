@@ -417,8 +417,6 @@ def create_py_executor(
     ) = llm_args.get_runtime_sizes()
 
     tokens_per_block = kv_cache_config.tokens_per_block
-    if llm_args.attn_backend == "VANILLA":
-        tokens_per_block = max_num_tokens
 
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention

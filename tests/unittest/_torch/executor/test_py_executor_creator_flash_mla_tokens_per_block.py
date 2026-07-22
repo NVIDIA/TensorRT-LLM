@@ -89,3 +89,14 @@ def test_flash_mla_tokens_per_block_propagates_to_kv_cache_config():
         "(LMCache, Dynamo KVBM, ...) read the effective value instead of the "
         "stale user/default. See https://github.com/NVIDIA/TensorRT-LLM/issues/13320."
     )
+
+
+def test_vanilla_preserves_configured_tokens_per_block():
+    """Vanilla supports paged KV and must honor the configured page size."""
+    source = _get_create_py_executor_source()
+
+    assert not re.search(
+        r"if\s+llm_args\.attn_backend\s*==\s*[\"']VANILLA[\"']\s*:\s*\n"
+        r"\s*tokens_per_block\s*=\s*max_num_tokens",
+        source,
+    ), "Vanilla must not linearize the KV cache by overriding tokens_per_block."
