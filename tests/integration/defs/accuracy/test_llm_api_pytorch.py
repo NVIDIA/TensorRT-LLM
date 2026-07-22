@@ -6241,9 +6241,15 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_bf16_mtp(self, mocker):
+    @pytest.mark.parametrize(
+        "v2_kv_cache",
+        [False, True],
+        ids=["v1_kv_cache", "v2_kv_cache"],
+    )
+    def test_bf16_mtp(self, v2_kv_cache, mocker):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
                                             max_batch_size=32)
 
@@ -6262,6 +6268,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  cuda_graph_config=cuda_graph_config,
                  speculative_config=mtp_config) as llm:
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is v2_kv_cache
             mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
                                 self.GSM8K_MAX_OUTPUT_LEN)
             task = GSM8K(self.MODEL_NAME)
@@ -7164,7 +7171,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_nvfp4_8gpus_mtp(self):
+    @pytest.mark.parametrize(
+        "v2_kv_cache",
+        [False, True],
+        ids=["v1_kv_cache", "v2_kv_cache"],
+    )
+    def test_nvfp4_8gpus_mtp(self, v2_kv_cache):
         # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
         # This test uses MTP with max_draft_len=3 and one_model mode.
         mtp_config = MTPDecodingConfig(
@@ -7178,6 +7190,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=True,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
+                    use_kv_cache_manager_v2=v2_kv_cache,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=8,
@@ -7190,6 +7203,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 moe_config=MoeConfig(backend="CUTLASS"),
                 decoding_config=mtp_config,
         ) as llm:
+            assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is v2_kv_cache
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
