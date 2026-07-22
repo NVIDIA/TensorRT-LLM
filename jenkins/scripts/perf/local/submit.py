@@ -1016,13 +1016,11 @@ def main():
     draft_launch_lines = remove_whitespace_lines(draft_launch_lines)
     draft_launch_content = "\n".join(draft_launch_lines)
 
-    # The disagg draft calls run_cache_transceiver_precheck; splice in the
-    # gate function library (sibling of the draft) ahead of it.
+    # The disagg draft calls run_cache_transceiver_precheck; splice in the gate
+    # function library ahead of it (single owner: precheck_config).
     gate_content = ""
     if runtime_mode == "disaggregated":
-        gate_sh = os.path.join(os.path.dirname(draft_launch_sh), "slurm_ct_precheck_gate.sh")
-        with open(gate_sh, "r") as f:
-            gate_content = "\n".join(remove_whitespace_lines(f.read().split("\n"))) + "\n\n"
+        gate_content = pcfg.gate_library_content(draft_launch_sh, llm_src)
 
     # Combine and write launch script
     script_prefix = "\n".join(script_prefix_lines)

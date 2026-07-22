@@ -131,10 +131,24 @@ def precheck_prefix_lines(cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, ma
     expressions ($llmSrcNode etc.), expanded at sbatch runtime.
     """
     knobs = cfg.get("cache_transceiver_precheck", {}) or {}
-    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
     # On by default; yaml opts out per test; the env var (when set) overrides
-    # the yaml either way (global kill switch).
-    enabled = env == "1" if env is not None else bool(knobs.get("enabled", True))
+    # the yaml either way (global kill switch). Parse the usual boolean spellings
+    # so a well-meant TRTLLM_DISAGG_CT_PRECHECK=true force-enable is not silently
+    # read as "off"; reject anything ambiguous instead of guessing.
+    env = os.environ.get("TRTLLM_DISAGG_CT_PRECHECK")
+    if env is not None:
+        val = env.strip().lower()
+        if val in ("1", "true", "on", "yes"):
+            enabled = True
+        elif val in ("0", "false", "off", "no"):
+            enabled = False
+        else:
+            raise ValueError(
+                "TRTLLM_DISAGG_CT_PRECHECK must be a boolean "
+                f"(1/0/true/false/on/off/yes/no), got {env!r}"
+            )
+    else:
+        enabled = bool(knobs.get("enabled", True))
     cmd = (
         "python3 $llmSrcNode/tests/scripts/perf-sanity/cache_transceiver_precheck/"
         f"run_precheck.py --config {config_path_expr} "
@@ -158,6 +172,32 @@ def precheck_prefix_lines(cfg, benchmark_mode, config_path_expr, ucx_tls_cmd, ma
         # (absent -> the gate falls back to $SLURM_JOB_NAME).
         lines.append(f'export stageName="{stage_name}"')
     return lines
+
+
+def gate_library_content(draft_launch_sh, llm_src):
+    """The precheck gate shell library (defines run_cache_transceiver_precheck),
+    spliced ahead of the disagg draft by both submit.py. Single owner of the
+    load/splice, so the two launch generators can't drift.
+
+    Located next to the draft by default; falls back to the in-repo copy when
+    the draft lives outside the repo (a custom --draft-launch-sh), so launch
+    generation never dies with FileNotFoundError. Whitespace-only lines are
+    dropped to match the rest of the assembled launch script."""
+    candidates = [
+        os.path.join(os.path.dirname(draft_launch_sh), "slurm_ct_precheck_gate.sh"),
+        os.path.join(
+            llm_src, "jenkins", "scripts", "perf", "disaggregated", "slurm_ct_precheck_gate.sh"
+        ),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                lines = [ln.strip() for ln in f.read().split("\n") if ln.strip()]
+            return "\n".join(lines) + "\n"
+    raise FileNotFoundError(
+        "precheck gate library slurm_ct_precheck_gate.sh not found; looked in: "
+        + ", ".join(candidates)
+    )
 
 
 def resolve_plan(cfg, benchmark_mode="e2e"):
