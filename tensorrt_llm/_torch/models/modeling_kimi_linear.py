@@ -233,9 +233,15 @@ class KimiK3MoERuntime(nn.Module):
         assert self.moe_hidden_size is not None, \
             "Kimi K3 runtime expects the latent MoE (routed_expert_hidden_size)"
 
-        self.ep_size = (mapping.tp_size
-                        if not mapping.enable_attention_dp else 1)
-        self.ep_rank = mapping.tp_rank if self.ep_size > 1 else 0
+        if mapping.enable_attention_dp and mapping.tp_size > 1:
+            # DEP: attention runs data-parallel, experts stay sharded across
+            # the EP group; tokens are exchanged via dispatch/combine below.
+            self.ep_size = mapping.moe_ep_size
+            self.ep_rank = mapping.moe_ep_rank
+        else:
+            self.ep_size = (mapping.tp_size
+                            if not mapping.enable_attention_dp else 1)
+            self.ep_rank = mapping.tp_rank if self.ep_size > 1 else 0
         assert self.num_experts % self.ep_size == 0, (
             f"num_experts={self.num_experts} not divisible by "
             f"ep_size={self.ep_size}")
@@ -279,10 +285,16 @@ class KimiK3MoERuntime(nn.Module):
                                                 eps=cfg.rms_norm_eps,
                                                 dtype=dtype)
 
+        self.dep_comm = None
+        if mapping.enable_attention_dp and mapping.tp_size > 1:
+            from ..modules.fused_moe.communication.allgather_reducescatter \
+                import AllGatherReduceScatter
+            self.dep_comm = AllGatherReduceScatter(mapping)
         self.allreduce = (AllReduce(mapping=mapping,
                                     strategy=model_config.allreduce_strategy,
                                     dtype=dtype)
-                          if self.ep_size > 1 else None)
+                          if (self.ep_size > 1 and self.dep_comm is None)
+                          else None)
 
         # Fused SiTU MoE paths. KIMI_K3_FUSED_MOE selects the backend:
         #   "0" (default) — Python per-expert fallback;
@@ -301,17 +313,31 @@ class KimiK3MoERuntime(nn.Module):
                                        if situ_linear_beta is not None else 1.0)
         self._native_fused_weights = None
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         # Gate expects a 3D layout (HF contract).
         topk_idx, topk_weight = self.gate(hidden_states.unsqueeze(0))
 
         routed_in = self.routed_expert_down_proj(hidden_states)
+        use_dep_comm = (self.dep_comm is not None
+                        and all_rank_num_tokens is not None)
+        if use_dep_comm:
+            # DEP: exchange tokens in the latent space (half the payload of
+            # hidden). Gate ids are GLOBAL expert ids, so gathered tokens go
+            # through the same local-expert kernel unchanged.
+            routed_in, _, topk_idx, topk_weight = self.dep_comm.dispatch(
+                routed_in, None, topk_idx, topk_weight,
+                all_rank_num_tokens, use_dp_padding=False)
         y = self._moe_infer_local(routed_in, topk_idx, topk_weight)
         # EP: each rank holds partial routed sums (its experts only) in the
         # latent space; sum them BEFORE the (nonlinear) latent norm.
-        if self.allreduce is not None:
+        if use_dep_comm:
+            # Varsize reduce-scatter: this rank gets its own tokens' completed
+            # latent sums (same addends as the allreduce below).
+            y = self.dep_comm.combine(y)
+        elif self.allreduce is not None:
             y = self.allreduce(y)
         y = self.routed_expert_norm(y)
         y = self.routed_expert_up_proj(y)
@@ -883,7 +909,9 @@ class KimiLinearDecoderLayer(nn.Module):
 
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
-            hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states = self.block_sparse_moe(
+                hidden_states,
+                getattr(attn_metadata, "all_rank_num_tokens", None))
         else:
             hidden_states = self.mlp(hidden_states)
 
