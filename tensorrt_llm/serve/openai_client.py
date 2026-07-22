@@ -404,8 +404,14 @@ class OpenAIHttpClient(OpenAIClient):
                 data_index = metrics_event.find(data_prefix)
                 if data_index >= 0:
                     data = metrics_event[data_index + len(data_prefix) :].split(b"\n", 1)[0]
-                    headers = json.loads(data)
-                    metrics = build_metrics_record_from_headers(headers, _metrics_phase(self._role))
+                    try:
+                        headers = json.loads(data)
+                        metrics = build_metrics_record_from_headers(
+                            headers, _metrics_phase(self._role)
+                        )
+                    except (TypeError, ValueError) as error:
+                        logger.warning("Ignoring malformed perf metrics event: %s", error)
+                        metrics = None
                     if metrics:
                         hooks.on_perf_metrics(server, _metrics_phase(self._role), metrics)
 

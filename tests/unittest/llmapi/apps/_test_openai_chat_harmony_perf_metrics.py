@@ -2,15 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests JSONL performance metrics for the Harmony chat path."""
 
-import json
 import os
 import tempfile
-import time
-from pathlib import Path
 
 import openai
 import pytest
 import yaml
+from test_common.perf_metrics_utils import read_perf_metrics_jsonl, wait_for_perf_metrics_jsonl
 from utils.llm_data import llm_datasets_root
 
 from ..test_llm import get_model_path
@@ -82,27 +80,10 @@ def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
 
 
-def _read_perf_metrics(output_dir: str):
-    records = []
-    for path in Path(output_dir).glob("perf_metrics-*.jsonl"):
-        records.extend(json.loads(line) for line in path.read_text().splitlines())
-    return records
-
-
-def _wait_for_new_metric(output_dir: str, previous_count: int):
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        records = _read_perf_metrics(output_dir)
-        if len(records) > previous_count:
-            return records[-1]
-        time.sleep(0.1)
-    raise AssertionError("timed out waiting for performance metrics JSONL")
-
-
 def _assert_perf_metrics_entry_well_formed(entry: dict):
     assert "request_id" in entry
     assert entry["status"] == "complete"
-    pm = entry["phases"]["server"]
+    pm = entry["perf_metrics"]
     assert pm["first_iter"] <= pm["last_iter"]
 
     tm = pm["timing_metrics"]
@@ -120,7 +101,7 @@ async def test_non_streaming_perf_metrics(
     model: str,
     kv_cache_time_output_dir: str,
 ):
-    previous_count = len(_read_perf_metrics(kv_cache_time_output_dir))
+    previous_count = len(read_perf_metrics_jsonl(kv_cache_time_output_dir))
     response = await async_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "Reply with exactly the single word: PONG."}],
@@ -128,7 +109,8 @@ async def test_non_streaming_perf_metrics(
     )
     assert response.choices[0].message.content is not None
 
-    entry = _wait_for_new_metric(kv_cache_time_output_dir, previous_count)
+    records = wait_for_perf_metrics_jsonl(kv_cache_time_output_dir, previous_count + 1)
+    entry = records[-1]
     _assert_perf_metrics_entry_well_formed(entry)
 
 
@@ -139,7 +121,7 @@ async def test_streaming_perf_metrics(
     model: str,
     kv_cache_time_output_dir: str,
 ):
-    previous_count = len(_read_perf_metrics(kv_cache_time_output_dir))
+    previous_count = len(read_perf_metrics_jsonl(kv_cache_time_output_dir))
     stream = await async_client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "Explain transformers in one sentence."}],
@@ -153,5 +135,6 @@ async def test_streaming_perf_metrics(
         saw_done = True
     assert saw_done, "Streaming chat returned no chunks"
 
-    entry = _wait_for_new_metric(kv_cache_time_output_dir, previous_count)
+    records = wait_for_perf_metrics_jsonl(kv_cache_time_output_dir, previous_count + 1)
+    entry = records[-1]
     _assert_perf_metrics_entry_well_formed(entry)
