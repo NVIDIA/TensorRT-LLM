@@ -1,11 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -13,19 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 1-GPU Qwen-Image-Edit-2511 with selective NVFP4 dynamic quantization.
-# Q/K/V projections remain in BF16 because they preserve accuracy
+# 1-GPU Qwen-Image-Edit-2511 with FP8 blockwise dynamic quantization.
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 quant_config:
-  quant_algo: NVFP4
+  quant_algo: FP8_BLOCK_SCALES
   dynamic: true
-  ignore:
-    - "transformer_blocks.*.attn.to_q"
-    - "transformer_blocks.*.attn.to_k"
-    - "transformer_blocks.*.attn.to_v"
-    - "transformer_blocks.*.attn.add_q_proj"
-    - "transformer_blocks.*.attn.add_k_proj"
-    - "transformer_blocks.*.attn.add_v_proj"
 attention_config:
   backend: VANILLA
 parallel_config:
