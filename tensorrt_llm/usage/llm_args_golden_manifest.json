@@ -1018,6 +1018,13 @@
       "path": "num_postprocess_workers"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_serve_frontends"
+    },
+    {
       "allowed_values": [
         "cutlass",
         "cublaslt",

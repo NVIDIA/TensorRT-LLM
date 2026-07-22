@@ -167,10 +167,19 @@ class FilteredTopKKernelVarlen:
             f"Unknown overflow_policy: {overflow_policy}"
         )
 
-        # Tested with top_k in {512, 1024, 2048}. Other values may work but
-        # have not been validated and may require minor changes.
-        assert top_k <= 2048, f"top_k must be <= 2048, but got {top_k}"
-        # s_indices only needs top_k slots; size to top_k to save SMEM.
+        # top_k sizes the shared-memory index staging (s_indices), so bound it
+        # here. Direct callers and the run_topk_decode CLI bypass the decode
+        # wrappers, and an oversized top_k would otherwise surface as an opaque
+        # smem launch failure. 16384 matches the wrapper guards in
+        # cute_dsl_custom_ops.py.
+        if top_k <= 0 or top_k > 16384:
+            raise ValueError(
+                f"top_k must be in range [1, 16384], got {top_k}. "
+                "Maximum supported top_k is 16384 for Blackwell architecture."
+            )
+
+        # s_indices only needs top_k slots; size to top_k to save SMEM. Still
+        # referenced by the prefill kernel (filtered_top_k_prefill_varlen.py).
         self.filtered_topk_max_k = top_k
         # 8 bits for radix-based filter.
         self.radix = 256
@@ -261,6 +270,17 @@ class FilteredTopKKernelVarlen:
                        Uint32/nb=2→4096  Uint32/nb=1→8192
           1 block/SM:  Uint16/nb=2→32768 Uint16/nb=1→65536
                        Uint32/nb=2→16384 Uint32/nb=1→32768
+
+        NOTE (large top_k): this budget only accounts for the s_input_idx
+        candidate buffer. The separate s_indices staging is sized to top_k
+        (top_k * idx_sz bytes) and stacks on top of the 128 KB reserved here,
+        without being subtracted from it. That extra term is negligible at
+        top_k<=2048 (4-8 KB) but grows to 32 KB (Uint16) / 64 KB (Uint32) at
+        the top_k=16384 limit, eroding the ~104 KB L1 assumption above (L1 can
+        drop to ~90 KB / ~60 KB respectively) and, together with s_input_val
+        when cache_smem_values=True, risks exceeding the 228 KB SMEM cap. If
+        large top_k is exercised in practice, subtract top_k * idx_sz from
+        input_idx_budget here so S leaves room for s_indices.
         """
         idx_sz = 2 if self.index_type == cutlass.Uint16 else 4
         if not self.cache_smem_values:
@@ -1501,13 +1521,14 @@ class FilteredTopKKernelVarlen:
         single-pass multi-CTA path can dispatch between this and a cluster collector.
         """
         # Phase 3: Output phase
+        output_vector_width = 2 if self.top_k % 2 == 0 else 1
         vecsize_out = cutlass.const_expr(
             min(
                 self.top_k,
                 cute.ceil_div(self.top_k, self.num_threads_per_cta),
                 self.num_copy_bits // self.dtype.width,
                 # TODO: only tested for float32. need to check for other dtypes.
-                2,
+                output_vector_width,
             )
         )
         assert self.top_k % vecsize_out == 0

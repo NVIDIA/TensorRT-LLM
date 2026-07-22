@@ -63,7 +63,6 @@ To run this example:
       --top_k 2048 --do_ref_check --return_val --do_benchmark
 
 Constraints for this example:
-* The problem size of top_k <= 2048.
 * The input tensor has data contiguous on the n dimension (row-major).
 * The supported input data types are Float32, Float16, or BFloat16.
 """
@@ -263,7 +262,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             g_num_input = None
         s_indices = smem.allocate_tensor(
             element_type=self.index_type,
-            layout=cute.make_ordered_layout((self.filtered_topk_max_k,), order=(0)),
+            layout=cute.make_ordered_layout((self.top_k,), order=(0)),
             byte_alignment=128,
         )
         if cutlass.const_expr(not self.enable_reread_always):
@@ -1375,9 +1374,6 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    if args.top_k % 2 != 0:
-        parser.error("top_k must be a multiple of 2 (got top_k={})".format(args.top_k))
-
     run_topk_decode(
         dtype=args.dtype,
         batch_size=args.batch_size,

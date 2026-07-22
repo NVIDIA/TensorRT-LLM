@@ -1971,8 +1971,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
     )
     dynamic_tree_max_topK: Optional[int] = Field(
         default=None,
-        description="The topK value for each layer when dynamic tree is enabled."
-    )
+        description=
+        "The topK value for each layer when dynamic tree is enabled. Required "
+        "when use_dynamic_tree is True; ignored (with a warning) when "
+        "use_dynamic_tree is False.")
     num_eagle_layers: Optional[int] = Field(
         default=None,
         description=
@@ -2048,9 +2050,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
             # So the number of choices also represents the number of max draft nodes.
             self.max_total_draft_tokens = len(self.eagle_choices)
 
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
         # Dynamic tree logic
-        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
-            self.use_dynamic_tree = True
+        if self.use_dynamic_tree:
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -2070,16 +2080,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 logger.warning(
                     f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
-            else:
-                if self.max_total_draft_tokens < self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
-                    )
-                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
-                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
-                    )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
 
         # Linear tree
         if self.max_total_draft_tokens is None:
@@ -2425,6 +2431,22 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
+    use_dynamic_tree: bool = Field(
+        default=False,
+        description=
+        "Enable EAGLE-style dynamic-tree drafting for one-model MTP. When True, "
+        "each draft step expands dynamic_tree_max_topK candidates per node and the "
+        "tree is verified against the target, instead of a linear chain.")
+    dynamic_tree_max_topK: Optional[int] = Field(
+        default=None,
+        description=
+        "Top-K candidates expanded per node per draft layer when use_dynamic_tree "
+        "is enabled. Required when use_dynamic_tree is True; ignored (with a "
+        "warning) when use_dynamic_tree is False.")
+
+    # Internal max batch size for dynamic-tree worker buffers.
+    _max_batch_size: Optional[int] = PrivateAttr(default=None)
+
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
         status="beta",
@@ -2469,15 +2491,43 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Leave max_draft_len as None ("use the model's num_nextn_predict_layers")
-        # when the user doesn't set it; update_spec_config_from_model_config
-        # resolves it from the checkpoint before the model runs. When the user
-        # does set it, validate and mirror to max_total_draft_tokens (current MTP
-        # only supports a linear tree).
+        # None means update_spec_config_from_model_config resolves it from checkpoint.
         if self.max_draft_len is not None:
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
-            self.max_total_draft_tokens = self.max_draft_len
+
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
+        # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
+        if self.use_dynamic_tree:
+            if self.max_draft_len is None:
+                raise ValueError(
+                    "max_draft_len must be set when use_dynamic_tree is True")
+            if self.dynamic_tree_max_topK is None or self.dynamic_tree_max_topK <= 0:
+                raise ValueError(
+                    "dynamic_tree_max_topK must be > 0 when use_dynamic_tree is True"
+                )
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
+                )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
+        elif self.max_draft_len is not None:
+            self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
     @model_validator(mode="after")
@@ -3625,7 +3675,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     max_util_for_resume: float = Field(
         default=0.95,
-        ge=0,
+        gt=0,
         le=1,
         status="prototype",
         description=
@@ -3779,14 +3829,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
-        return v
-
-    @field_validator('max_util_for_resume')
-    @classmethod
-    def validate_max_util_for_resume(cls, v: float):
-        if not 0 <= v <= 1:
-            raise ValueError(
-                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
     @field_validator('pool_ratio')
@@ -4220,6 +4262,19 @@ class BaseLlmArgs(StrictBaseModel):
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
         description="The path to the tokenizer directory for postprocessing.",
+        status="prototype")
+
+    num_serve_frontends: int = Field(
+        default=1,
+        ge=1,
+        # = executor.utils.MAX_NUM_FRONTENDS (cannot be imported here);
+        # test_multi_frontend_routing pins the two together.
+        le=64,
+        description=
+        "The number of HTTP frontend processes serving one executor. Used by "
+        "trtllm-serve: values > 1 run additional attached frontend processes "
+        "that share the serving port via SO_REUSEPORT (classic IPC executor "
+        "path only).",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
