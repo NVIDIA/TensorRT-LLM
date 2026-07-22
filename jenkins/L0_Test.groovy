@@ -2889,7 +2889,7 @@ def runLLMDocBuild(pipeline, config)
     sh "pwd && ls -alh"
     sh "env | sort"
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
@@ -3097,10 +3097,6 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-PyTorch-", add "backend=pytorch" to makoArgs
         // At this point, only tests with backend=pytorch or unspecified backend will be run
         makoArgs += ["backend=pytorch"]
-    } else if (stageName.contains("-TensorRT-")) {
-        // If stageName contains "-TensorRT-", add "backend=tensorrt" to makoArgs
-        // At this point, only tests with backend=tensorrt or unspecified backend will be run
-        makoArgs += ["backend=tensorrt"]
     } else if (stageName.contains("-CPP-")) {
         // If stageName contains "-CPP-", add "backend=cpp" to makoArgs
         // At this point, only tests with backend=cpp or unspecified backend will be run
@@ -3125,7 +3121,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // At this point, only tests with backend=verl or unspecified backend will be run
         makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", "-FMHA-", "-AutoDeploy-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", "-AutoDeploy-", or "-Verl-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -4316,7 +4312,7 @@ def runLLMBuild(
     sh "env | sort"
     sh "ccache -sv"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", false, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -4777,9 +4773,9 @@ def launchTestJobs(pipeline, testFilter)
     x86TestConfigs = [
         "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
-        "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
-        "A10-TensorRT-1": ["a10", "l0_a10", 1, 1],
+        "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
+        "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
+        "A10-PyTorch-3": ["a10", "l0_a10", 3, 3],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A30-CPP-1": ["a30", "l0_a30", 1, 1],
@@ -4790,55 +4786,29 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
-        "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
-        "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
+        "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
+        "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
-        "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 3],
-        "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 3],
-        "A10-TensorRT-Post-Merge-3": ["a10", "l0_a10", 3, 3],
+        "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 4],
+        "A10-PyTorch-Post-Merge-2": ["a10", "l0_a10", 2, 4],
+        "A10-PyTorch-Post-Merge-3": ["a10", "l0_a10", 3, 4],
+        "A10-PyTorch-Post-Merge-4": ["a10", "l0_a10", 4, 4],
         "A10-FMHA-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        // "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
-        // "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
-        // "A30-TensorRT-Post-Merge-3": ["a30", "l0_a30", 3, 6],
-        // "A30-TensorRT-Post-Merge-4": ["a30", "l0_a30", 4, 6],
-        // "A30-TensorRT-Post-Merge-5": ["a30", "l0_a30", 5, 6],
-        // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         // "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         // "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
-        // "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
-        // "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],
-        // "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
-        // "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
-        // "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
-        // "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
-        // "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
-        // "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
-        // "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
-        // "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
+        "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
+        "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "H100_PCIe-AutoDeploy-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        // "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
-        // "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
-        // "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
-        // "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
-        // "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        // "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
-        // "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
-        // "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
-        // "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
-        // "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
         // Disable RTXPro6000 stages due to nodes will be offline temporarily.
         // [TODO] Split tests between RTXPro6000 and RTXPro6000D and move reasonable mount of tests to pre-merge.
         // "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
@@ -4981,7 +4951,7 @@ def launchTestJobs(pipeline, testFilter)
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
         "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
-        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
+        "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
@@ -5442,7 +5412,7 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
-                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
@@ -5584,7 +5554,6 @@ def launchTestJobs(pipeline, testFilter)
         def backendMode = testFilter[(TEST_BACKEND)].collect { it.toLowerCase() }
         def changeMap = [
             "pytorch": "-PyTorch-",
-            "tensorrt": "-TensorRT-",
             "cpp": "-CPP-",
             "triton": "-Triton-",
             "fmha": "-FMHA-",
@@ -5611,9 +5580,9 @@ def launchTestJobs(pipeline, testFilter)
         } else {
             echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
             def excludedBackends = new HashMap()
-            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-FMHA-"]     // Only pytorch file change also need to run triton tests
-            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-FMHA-"]
-            excludedBackends["FMHA"] = ["-PyTorch-", "-CPP-", "-TensorRT-", "-Triton-"]
+            excludedBackends["PyTorch"] = ["-CPP-", "-FMHA-"]     // Only pytorch file change also need to run triton tests
+            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-FMHA-"]
+            excludedBackends["FMHA"] = ["-PyTorch-", "-CPP-", "-Triton-"]
             def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]
             if (excludedBackends.containsKey(group)) {
                 parallelJobsFiltered = parallelJobsFiltered.findAll { key, value ->
