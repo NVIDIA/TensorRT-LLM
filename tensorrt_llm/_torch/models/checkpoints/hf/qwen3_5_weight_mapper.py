@@ -97,14 +97,16 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         self.abort_update_weights()
         super().cleanup()
 
-    def _stage_partial_bf16_split_projections(self,
-                                              weights: dict) -> dict:
-        """Emit only complete QKVZ and BA groups from incremental BF16 input.
+    def _stage_partial_split_projections(self, weights: dict,
+                                         quant_algo: QuantAlgo | None) -> dict:
+        """Emit complete QKVZ and BA groups from incremental input.
 
         Packed broadcast boundaries are byte based and may split projections
         that must be fused before the normal Qwen3Next mapping runs. Retain
         those tensors on each inference rank until their complete fusion group
-        is available. Non-projection tensors pass through immediately.
+        is available. Block-FP8 QKVZ tensors are dequantized into the temporary
+        BF16 runtime representation, so their weights and scales must be
+        released together. Non-projection tensors pass through immediately.
         """
         if not self._update_weights_active:
             self.begin_update_weights()
@@ -127,7 +129,13 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             grouped_names[(prefix, suffix)][projection_name] = name
 
         consumed_names = set()
-        for names in grouped_names.values():
+        for (prefix, suffix), names in grouped_names.items():
+            if (quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                    and suffix == "weight_scale_inv"):
+                # DeepSeek-format block scales must be emitted with the FP8
+                # weights that consume them below.
+                continue
+
             qkvz_names = {"qkv", "q", "k", "v", "z"} & names.keys()
             if "qkv" in qkvz_names:
                 required = {"qkv", "z"}
@@ -136,7 +144,22 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             else:
                 required = set()
             if required and required.issubset(names):
-                consumed_names.update(names[key] for key in required)
+                required_names = [names[key] for key in required]
+                requires_block_scales = (
+                    quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                    and suffix == "weight"
+                    and any(
+                        self._partial_split_weights[name].dtype
+                        == torch.float8_e4m3fn for name in required_names))
+                if requires_block_scales:
+                    scale_names = grouped_names.get(
+                        (prefix, "weight_scale_inv"), {})
+                    if required.issubset(scale_names):
+                        consumed_names.update(required_names)
+                        consumed_names.update(
+                            scale_names[key] for key in required)
+                else:
+                    consumed_names.update(required_names)
 
             required_ba = {"b", "a"}
             if required_ba.issubset(names):
@@ -650,9 +673,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         quant_algo = self.config.quant_config.quant_algo
 
         normalized_weights = self._normalize_weight_names(weights)
-        if allow_partial_loading and quant_algo is None:
-            normalized_weights = self._stage_partial_bf16_split_projections(
-                normalized_weights)
+        if allow_partial_loading:
+            normalized_weights = self._stage_partial_split_projections(
+                normalized_weights, quant_algo)
         normalized_weights, is_modelopt_pb_wo = self._normalize_scale_names(
             normalized_weights, quant_algo
         )

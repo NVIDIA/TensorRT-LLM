@@ -278,6 +278,10 @@ def _flashinfer_gdn_decode(
     assert T_per_seq == 1, (
         f"_flashinfer_gdn_decode expects standard decode (T_per_seq == 1), got "
         f"{T_per_seq}; _can_use_flashinfer_gdn_decode should keep T == N")
+    # TP8 leaves eight BF16 ``a`` values per Qwen3.5 GDN shard. Odd shards can
+    # start 16 bytes into fused projection storage, but CuTe requires 32B.
+    if a_bat.data_ptr() % 32:
+        a_bat = a_bat.clone(memory_format=torch.contiguous_format)
     _fi_gdn_decode_bf16_state_t1(
         A_log=A_log,
         a=a_bat,
