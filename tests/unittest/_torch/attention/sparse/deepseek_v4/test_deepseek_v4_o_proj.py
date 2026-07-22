@@ -25,8 +25,8 @@ from _torch.helpers import per_block_cast_to_fp8_e8m0, per_token_cast_to_fp8_e8m
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.mla_module import (
-    project_sparse_mla_output,
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+    project_sparse_attn_output,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
@@ -212,6 +212,10 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         num_groups=num_groups,
         o_lora_rank=o_lora_rank,
     ).to(device)
+    assert mla.mha is None
+    assert not hasattr(mla, "kv_b_proj")
+    assert not hasattr(mla, "v_b_proj")
+    assert not hasattr(mla, "o_proj")
 
     # Initialize weights
     nn_init_std = 0.02
@@ -274,7 +278,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
     # in-place, so clone before passing to preserve original for reference)
-    output = project_sparse_mla_output(mla, attn_out_latent.clone(), position_ids)
+    output = project_sparse_attn_output(mla, [attn_out_latent.clone()], position_ids)
 
     # Calculate reference output
     if dtype_str == "bf16":

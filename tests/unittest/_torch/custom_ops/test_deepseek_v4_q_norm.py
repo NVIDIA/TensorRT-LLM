@@ -205,39 +205,37 @@ def test_deepseek_v4_q_norm_fused_fp8_zero_rows():
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 129])
-def test_deepseek_v4_q_b_layernorm_fused_fp8_returns_3d_q_pe(num_tokens):
+def test_deepseek_v4_q_norm_fused_fp8_accepts_3d_q_pe_buffer(num_tokens):
     """Lock down the q_pe dim==3 contract expected by thop.attention's
     sparse-MLA context branch (TORCH_CHECK(q_pe->dim() == 3))."""
-    import types
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.mla_module import (
-        deepseek_v4_q_b_layernorm_fused_fp8,
-    )
-
     num_heads = 16
     qk_head_dim = 512
     kv_lora_rank = 448
     rope_dim = qk_head_dim - kv_lora_rank
-    stub = SimpleNamespace(
-        num_heads_tp=num_heads,
-        qk_head_dim=qk_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        q_b_layernorm=SimpleNamespace(variance_epsilon=1e-6),
-    )
-    fused = types.MethodType(deepseek_v4_q_b_layernorm_fused_fp8, stub)
     q_proj = torch.randn(
         num_tokens, num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda"
     ).contiguous()
-
-    placeholder_q, quant_q_buffer, q_pe, scale = fused(q_proj)
+    quant_q_buffer = q_proj.new_empty(
+        (num_tokens, num_heads * qk_head_dim), dtype=torch.float8_e4m3fn
+    )
+    q_pe = q_proj.new_empty((num_tokens, num_heads, rope_dim))
+    scale = torch.tensor([1.0], dtype=torch.float32, device="cuda")
+    torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(
+        q_proj,
+        quant_q_buffer,
+        q_pe.view(num_tokens, num_heads * rope_dim),
+        num_heads,
+        qk_head_dim,
+        kv_lora_rank,
+        1e-6,
+        scale,
+    )
 
     assert q_pe.shape == (num_tokens, num_heads, rope_dim)
     assert q_pe.stride(2) == 1
     assert q_pe.is_contiguous()
     assert quant_q_buffer.shape == (num_tokens, num_heads * qk_head_dim)
     assert quant_q_buffer.dtype == torch.float8_e4m3fn
-    assert placeholder_q.data_ptr() == q_proj.data_ptr()
     assert scale.shape == (1,) and scale.dtype == torch.float32
     assert float(scale.item()) == 1.0
 

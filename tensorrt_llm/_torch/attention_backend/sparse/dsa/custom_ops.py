@@ -9,7 +9,7 @@ import torch
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
-from .mla_module import forward_dsa_attn, forward_dsa_proj
+from .module import _forward_dsa_attn, forward_dsa_proj
 
 
 def _extract_extra_attrs(layer_idx: str):
@@ -39,7 +39,7 @@ def mla_dsa_proj(
     compile, _should_use_short_mha returns False so the result is always
     length 9, keeping control flow straight-line for CUDA graph capture.
     The trailing q_scale is only consumed by the FP4 dispatch; the FP8
-    path ignores it in forward_dsa_attn.
+    path ignores it in _forward_dsa_attn.
     """
     metadata, mla_layer = _extract_extra_attrs(layer_idx)
     if hidden_states_fp4 is not None or hidden_states_sf is not None:
@@ -121,7 +121,7 @@ def mla_dsa_attn_inplace(
     attention. This op is excluded from CUDA graph capture.
     """
     metadata, mla_layer = _extract_extra_attrs(layer_idx)
-    forward_dsa_attn(
+    _forward_dsa_attn(
         mla_layer,
         q,
         compressed_kv,

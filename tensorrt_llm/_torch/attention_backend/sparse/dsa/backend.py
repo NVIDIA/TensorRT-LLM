@@ -97,9 +97,12 @@ class DSATrtllmAttention(TrtllmAttention):
         """Transform local TopK indices to global paged KV cache indices."""
         # Transform the local topk indices to global topk indices in paged kv cache
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
+        topk_indices = getattr(metadata, "runtime_topk_indices", None)
+        if topk_indices is None:
+            topk_indices = forward_args.topk_indices
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            forward_args.topk_indices, metadata,
-            self.get_local_layer_idx(metadata), is_generation)
+            topk_indices, metadata, self.get_local_layer_idx(metadata),
+            is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
