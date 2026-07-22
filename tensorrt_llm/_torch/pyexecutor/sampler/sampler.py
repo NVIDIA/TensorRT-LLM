@@ -88,7 +88,6 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.top_p_decay import top_p_decay_update
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -4680,7 +4679,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if not self._top_p_decay_slots:
             return
         store = self.store.top_p_decay_store
-        top_p_decay_update(
+        Fusions.top_p_decay_update(
             runtime_top_p=store.runtime_top_p_decay_cuda,
             initial_top_p=store.initial_top_p_decay_cuda,
             top_p_decay=store.top_p_decay_cuda,

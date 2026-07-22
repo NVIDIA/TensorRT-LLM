@@ -39,7 +39,6 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_renorm_probs_op,
     top_p_sampling_from_probs_op,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.ops.top_p_decay import top_p_decay_gather
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     GREEDY_TEMPERATURE_THRESHOLD,
     BeamSearchMetadata,
@@ -411,7 +410,7 @@ class _StrategyImpls:
                 self._top_p.shape,
                 group_metadata.slots.shape,
             )
-            self._top_p = top_p_decay_gather(
+            self._top_p = Fusions.top_p_decay_gather(
                 runtime_top_p=group_metadata.runtime_top_p,
                 is_decay_slot=group_metadata.is_decay_slot,
                 static_top_p=self._top_p,
