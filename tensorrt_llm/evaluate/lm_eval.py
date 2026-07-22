@@ -104,8 +104,12 @@ class _RunningScoreTracker:
             probe.filtered_resps = {}
             for ensemble in task._filters:
                 ensemble.apply([probe])
+                # lm-eval evaluator passes a list of filtered responses (one
+                # per repeat/request), so process_results does results[0] to
+                # get the prediction.  Match that contract here — wrapping in
+                # a list gives the same calling convention.
                 metrics = task.process_results(
-                    probe.doc, probe.filtered_resps[ensemble.name])
+                    probe.doc, [probe.filtered_resps[ensemble.name]])
                 for metric, value in metrics.items():
                     if isinstance(value, (int, float)):
                         key = f"{metric},{ensemble.name}"
