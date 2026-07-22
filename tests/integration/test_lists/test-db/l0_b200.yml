@@ -228,14 +228,13 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
-  - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
-  - examples/visual_gen/test_visual_gen.py::test_flux1_example
-  - examples/visual_gen/test_visual_gen.py::test_flux2_example
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_example
-  - examples/visual_gen/test_visual_gen.py::test_wan_i2v_example
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
-  - examples/visual_gen/test_visual_gen.py::test_qwen_image_example
-  # - examples/visual_gen/test_visual_gen.py
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_i2v_example
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_example
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwen_image_example
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -322,21 +321,62 @@ l0_b200:
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4]
   # ------------- VisualGen single-GPU tests ---------------
-  - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
-  - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
-  - examples/visual_gen/test_visual_gen.py::test_flux1_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
-  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend
-  - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
-  - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-baseline]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-teacache]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cache-dit]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cuda-graph]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-torch-compile]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-baseline]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-teacache]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-cache-dit]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-cuda-graph]
+  - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-torch-compile]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[baseline]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[cuda-graph]
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[torch-compile]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[baseline]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[torch-compile]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[baseline] TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[fp8-blockwise] TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4] TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[cache-dit] TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[torch-compile] TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-baseline]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-nvfp4]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-teacache]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-cache-dit]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-cuda-graph]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-torch-compile]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-baseline]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-nvfp4]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-teacache]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cache-dit]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-cuda-graph]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan22-torch-compile]
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan_feature_accuracy_against_golden[wan21-vsa]
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_lpips_matches_eager
+  - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_cuda_graph_trtllm_backend
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan21_t2v_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_wan.py::test_wan22_t2v_lpips_against_golden
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
   # QwenImage ~5 min, Cosmos3-Nano T2I ~3 min, and T2V ~5 min.
-  - examples/visual_gen/test_visual_gen.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_cuda_graph_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----

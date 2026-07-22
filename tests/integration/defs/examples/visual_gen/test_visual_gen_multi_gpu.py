@@ -23,7 +23,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from defs.examples.visual_gen.test_visual_gen import (
+from defs.examples.visual_gen.visual_gen_test_utils import (
     WAN22_LPIPS_FRAME_RATE,
     WAN22_LPIPS_GUIDANCE_SCALE,
     WAN22_LPIPS_HEIGHT,

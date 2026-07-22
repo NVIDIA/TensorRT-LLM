@@ -17,5 +17,5 @@ l0_gh200:
   - unittest/bindings
   - unittest/llmapi/test_llm_quant.py
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
-  - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
-  - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_quickstart
+  - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough
