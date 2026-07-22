@@ -68,6 +68,11 @@ def get_visual_gen_attention_backend(
         return FlashAttn4Attention
     elif backend_name == "CUTEDSL":
         return CuTeDSLAttention
+    elif backend_name == "TE":
+        # Lazy import: TransformerEngine is only needed for the FP8 attn path.
+        from .te import TEAttention
+
+        return TEAttention
     else:
         # Default to VANILLA for maximum compatibility
         return VanillaAttention
