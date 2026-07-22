@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import plotly.graph_objects as go
 
+from tensorrt_llm.serve._perf_metrics_schema import PerfMetricsRecord
+
 
 @dataclass
 class TimingMetric:
@@ -181,51 +183,8 @@ class TimingMetricsConfig:
 class RequestDataParser:
     """Parser for disaggregated format with ctx_perf_metrics and gen_perf_metrics."""
 
-    def parse_request(self, request_data: Dict,
+    def parse_request(self, request_data: PerfMetricsRecord,
                       request_index: int) -> Dict[str, Any]:
-        phases = request_data.get('phases')
-        if phases:
-            request_id = request_data.get('request_id', request_index)
-            disagg_phase = phases.get('disagg')
-            if disagg_phase is not None:
-                disagg_timing = disagg_phase.get('timing_metrics') or {}
-                ctx_phase = phases.get('ctx') or {}
-                gen_phase = phases.get('gen') or {}
-                request_data = {
-                    'request_id':
-                    request_id,
-                    'ctx_perf_metrics': {
-                        'request_id':
-                        request_id,
-                        'perf_metrics':
-                        ctx_phase,
-                        'time_breakdown_metrics':
-                        ctx_phase.get('time_breakdown_metrics'),
-                    },
-                    'gen_perf_metrics': {
-                        'request_id':
-                        request_id,
-                        'perf_metrics':
-                        gen_phase,
-                        'time_breakdown_metrics':
-                        gen_phase.get('time_breakdown_metrics'),
-                    },
-                    'disagg_server_arrival_time':
-                    disagg_timing.get('server_arrival_time'),
-                    'disagg_server_first_token_time':
-                    disagg_timing.get('server_first_token_time'),
-                }
-            else:
-                server_phase = phases.get('server') or {}
-                request_data = {
-                    'request_id':
-                    request_id,
-                    'perf_metrics':
-                    server_phase,
-                    'time_breakdown_metrics':
-                    server_phase.get('time_breakdown_metrics'),
-                }
-
         # Check if both ctx_perf_metrics and gen_perf_metrics exist and are not None
         ctx_perf = request_data.get('ctx_perf_metrics')
         gen_perf = request_data.get('gen_perf_metrics')
@@ -250,15 +209,18 @@ class RequestDataParser:
                                                    float('nan'))
         ctx_first_token_time = ctx_metrics.get('first_token_time', float('nan'))
         ctx_server_arrival_time = ctx_metrics.get('server_arrival_time',
-                                                  float('nan'))
-        ctx_server_first_token_time = ctx_metrics.get('server_first_token_time',
-                                                      float('nan'))
+                                                  ctx_arrival_time)
+        ctx_server_first_token_time = ctx_metrics.get(
+            'server_first_token_time',
+            ctx_metrics.get('last_token_time', float('nan')))
 
         # Generation timing
-        gen_server_first_token_time = gen_metrics.get('server_first_token_time',
-                                                      float('nan'))
-        gen_server_arrival_time = gen_metrics.get('server_arrival_time',
-                                                  float('nan'))
+        gen_server_first_token_time = gen_metrics.get(
+            'server_first_token_time',
+            gen_metrics.get('last_token_time', float('nan')))
+        gen_server_arrival_time = gen_metrics.get(
+            'server_arrival_time', gen_metrics.get('arrival_time',
+                                                   float('nan')))
         gen_arrival_time = gen_metrics.get('arrival_time', float('nan'))
         gen_first_token_time = gen_metrics.get('first_token_time', float('nan'))
         gen_first_scheduled_time = gen_metrics.get('first_scheduled_time',
@@ -283,15 +245,13 @@ class RequestDataParser:
         else:
             request_id = request_data.get('request_id', request_index)
 
-        # Time breakdown metrics - check new unified structure first, then fall back to legacy
+        # Time breakdown metrics
         step_metrics = None
         ctx_gpu_forward_time = None
         ctx_gpu_sample_time = None
         ctx_chunk_metrics = None
 
-        # Try new unified time_breakdown_metrics structure
         if is_disaggregated:
-            # time_breakdown_metrics is at gen_perf_metrics top level, not inside perf_metrics
             time_breakdown = (gen_perf or {}).get('time_breakdown_metrics')
             if time_breakdown:
                 step_metrics = time_breakdown.get('step_metrics')
@@ -303,7 +263,6 @@ class RequestDataParser:
                 # Legacy: step_metrics inside perf_metrics
                 gen_perf_data = (gen_perf or {}).get('perf_metrics') or {}
                 step_metrics = gen_perf_data.get('step_metrics')
-            # ctx GPU timing / chunk metrics from ctx_perf
             if ctx_gpu_forward_time is None:
                 ctx_time_breakdown = (ctx_perf
                                       or {}).get('time_breakdown_metrics')
@@ -321,7 +280,6 @@ class RequestDataParser:
                     ctx_gpu_sample_time = (ctx_perf
                                            or {}).get('ctx_gpu_sample_time')
         else:
-            # Try time_breakdown_metrics at top level first (new structure)
             time_breakdown = request_data.get('time_breakdown_metrics')
             if time_breakdown:
                 step_metrics = time_breakdown.get('step_metrics')

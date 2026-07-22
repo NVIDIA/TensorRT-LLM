@@ -256,35 +256,35 @@ class TestRequestDataParser(unittest.TestCase):
         self.assertEqual(parsed['disagg_server_arrival_time'], 0.5)
         self.assertEqual(parsed['disagg_server_first_token_time'], 3.0)
 
-    def test_parse_phased_disaggregated_format(self):
+    def test_parse_disaggregated_time_breakdown(self):
         parser = RequestDataParser()
         request_data = {
-            'request_id': 'req789',
-            'phases': {
-                'disagg': {
-                    'timing_metrics': {
-                        'server_arrival_time': 0.5,
-                        'server_first_token_time': 3.0,
-                    }
-                },
-                'ctx': {
+            'ctx_perf_metrics': {
+                'request_id': 'req789',
+                'perf_metrics': {
                     'timing_metrics': {
                         'server_arrival_time': 1.0,
                         'arrival_time': 1.1,
                     }
                 },
-                'gen': {
+            },
+            'gen_perf_metrics': {
+                'request_id': 'req789',
+                'perf_metrics': {
                     'timing_metrics': {
                         'server_arrival_time': 2.0,
                         'arrival_time': 2.1,
-                    },
-                    'time_breakdown_metrics': {
-                        'step_metrics': [{
-                            'iter': 1
-                        }]
-                    },
+                    }
+                },
+                'time_breakdown_metrics': {
+                    'step_metrics': [{
+                        'iter': 1
+                    }]
                 },
             },
+            'disagg_server_arrival_time': 0.5,
+            'disagg_server_first_token_time': 3.0,
+            'status': 'complete',
         }
 
         parsed = parser.parse_request(request_data, 0)
