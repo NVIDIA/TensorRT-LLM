@@ -2083,7 +2083,12 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     #    ZMQ ingest server, started once here).
     def _client_factory(router, role, max_retries=1):
         from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+        return OpenAIHttpClient(
+            router,
+            role,
+            request_timeout,
+            max_retries,
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,

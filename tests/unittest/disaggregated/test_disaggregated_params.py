@@ -26,6 +26,8 @@ def test_receiver_ctx_info_endpoint_required():
 
     with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
         Receiver._extract_info_endpoint(DisaggregatedParams())
+    with pytest.raises(ValueError, match="ctx_info_endpoint is required"):
+        Receiver._extract_info_endpoint(DisaggregatedParams(ctx_info_endpoint=[]))
     assert (
         Receiver._extract_info_endpoint(
             DisaggregatedParams(ctx_info_endpoint="tcp://10.0.0.1:5000")

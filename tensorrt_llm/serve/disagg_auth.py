@@ -33,7 +33,10 @@ def request_requires_internal_disagg_auth(request: UCompletionRequest) -> bool:
 
 def _auth_payload(request: UCompletionRequest) -> bytes:
     disaggregated_params = request.disaggregated_params
-    payload = disaggregated_params.model_dump(mode="json", exclude_none=False)
+    payload = {
+        "ctx_info_endpoint": disaggregated_params.ctx_info_endpoint,
+        "encoded_opaque_state": disaggregated_params.encoded_opaque_state,
+    }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
