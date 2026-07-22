@@ -521,6 +521,10 @@ def test_pool_session_shutdown_never_blocks_after_release():
     from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
     session = MpiPoolSession.__new__(MpiPoolSession)
+    # __new__ bypasses __init__ (which would spawn real MPI workers), so the
+    # attributes shutdown() reads must be provided here.
+    session.n_workers = 2
+    session._wait_shutdown = False
     pool = _Mock()
     pool._pool.thread = None  # no real manager thread to deregister
     session.mpi_pool = pool
