@@ -379,8 +379,8 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
             return_value=score_staging,
         ) as score_cls,
         mock.patch.object(
-            manager,
-            "_build_cross_request_keep_set_selector",
+            module,
+            "_BatchedKeepSetSelector",
             return_value=keep_set_selector,
         ),
     ):

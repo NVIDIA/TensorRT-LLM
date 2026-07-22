@@ -10,8 +10,7 @@ from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    _BatchedPerHeadKeepSetSelector,
-    _BatchedUnionKeepSetSelector,
+    _BatchedKeepSetSelector,
 )
 
 
@@ -95,7 +94,7 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
-        selector = _BatchedPerHeadKeepSetSelector(
+        selector = _BatchedKeepSetSelector(
             eviction_mode=eviction_mode,
             dense_layers=tuple(range(layers)),
             num_query_heads=query_heads,
@@ -137,7 +136,8 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         device=device,
     ).to(torch.float32)
     valid_widths = (width, width - 32)
-    selector = _BatchedUnionKeepSetSelector(
+    selector = _BatchedKeepSetSelector(
+        eviction_mode="union",
         rows=rows,
         width=width,
         keep_count=keep_count,
@@ -488,7 +488,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     score_staging.round_starts_device.fill_(0)
     score_staging.valid_seq_lens_device.fill_(seq_len)
     score_staging.token_starts_device.fill_(0)
-    keep_set_selector = _BatchedPerHeadKeepSetSelector(
+    keep_set_selector = _BatchedKeepSetSelector(
         eviction_mode="per_layer_perhead",
         dense_layers=tuple(dense_layers),
         num_query_heads=num_q_heads,
@@ -681,7 +681,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             decode_width=seq_len - prompt_len,
             page_table_token_capacity=seq_len + protected_tail,
         )
-        keep_set_selector = _BatchedUnionKeepSetSelector(
+        keep_set_selector = _BatchedKeepSetSelector(
+            eviction_mode="union",
             rows=num_q_heads,
             width=seq_len - prompt_len,
             keep_count=keep_count,

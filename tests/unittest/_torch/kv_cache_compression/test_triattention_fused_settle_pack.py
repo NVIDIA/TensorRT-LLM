@@ -22,7 +22,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
     BatchedKVCacheCompaction,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-    _BatchedUnionKeepSetSelector,
+    _BatchedKeepSetSelector,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _settle_ties_and_pack_compaction_sources_kernel,
@@ -410,7 +410,8 @@ def test_pack_handoff_disables_compaction_dense_pack_and_selector_validates_buff
     ]
     page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
 
-    selector = _BatchedUnionKeepSetSelector(
+    selector = _BatchedKeepSetSelector(
+        eviction_mode="union",
         rows=3,
         width=width,
         keep_count=keep_count,

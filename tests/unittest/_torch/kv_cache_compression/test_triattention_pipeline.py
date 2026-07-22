@@ -642,8 +642,8 @@ class TestFixedScoreMetadata:
                 return_value=score_staging,
             ),
             mock.patch.object(
-                manager,
-                "_build_cross_request_keep_set_selector",
+                module,
+                "_BatchedKeepSetSelector",
                 return_value=keep_set_selector,
             ) as build_selection,
         ):
@@ -653,8 +653,7 @@ class TestFixedScoreMetadata:
             keep_set_selector.valid_widths,
             "mean",
         )
-        plan = build_selection.call_args.args[0]
-        assert plan.eviction_mode == eviction_mode
+        assert build_selection.call_args.kwargs["eviction_mode"] == eviction_mode
         assert resources.score_staging is score_staging
         assert resources.keep_set_selector is keep_set_selector
 

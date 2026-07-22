@@ -218,7 +218,9 @@ def make_fixed_resources_stubs(manager, *, decode_width=260):
     )
     keep_set_selector = SimpleNamespace(
         valid_widths=torch.empty(8, dtype=torch.int32),
+        # The builder zero-fills the mode's provisional top-k buffer.
         top_indices_i32=torch.zeros(8, 4, dtype=torch.int32),
+        final_indices=torch.zeros(8, 4, dtype=torch.int32),
     )
     return layout, score_staging, keep_set_selector
 
@@ -287,10 +289,16 @@ def mocked_eviction_internals(manager):
     """Run the real ``_evict_requests`` body around mocked GPU launches."""
     score_staging = SimpleNamespace(
         launch_prepared_score=mock.Mock(return_value=torch.zeros(1)),
+        launch_prepared_union_fusion=mock.Mock(),
         mark_page_tables_consumed=mock.Mock(),
     )
+    # The dispatch reads the selector's own eviction mode, so the stub
+    # mirrors the manager's and carries both mode paths' launch surfaces.
     keep_set_selector = SimpleNamespace(
+        eviction_mode=manager.eviction_mode,
+        combined=torch.zeros(1),
         select_requests=mock.Mock(),
+        select_prepared_union_scores=mock.Mock(),
         refresh_row_prompt_offsets=mock.Mock(),
     )
     resources = SimpleNamespace(

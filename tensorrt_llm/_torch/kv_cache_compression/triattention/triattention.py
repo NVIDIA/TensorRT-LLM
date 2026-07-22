@@ -54,7 +54,7 @@ The scoring math follows the same upstream reference (``methods/pruning_utils.py
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -99,21 +99,6 @@ class _FixedScoreStreamMismatch(RuntimeError):
     """Raised when fixed score staging buffers are used from another CUDA stream."""
 
 
-class _CrossRequestSelectionPlan(NamedTuple):
-    """Selection dimensions used to allocate reusable fixed buffers."""
-
-    eviction_mode: str
-    dense_layers: Tuple[int, ...]
-    num_query_heads: int
-    num_kv_heads: int
-    rows: int
-    width: int
-    keep_count: int
-    dtype: torch.dtype
-    device: torch.device
-    max_requests: int
-
-
 class _RuntimeKVLayout(NamedTuple):
     """Manager-lifetime layer and pool views used by every eviction."""
 
@@ -132,24 +117,48 @@ class _RuntimeKVLayout(NamedTuple):
     pool_view_fingerprint: Tuple[tuple, ...]
 
 
-class _BatchedKeepSetSelectorBase:
-    """Shared fixed buffers and row views for keep-set selectors."""
+class _BatchedKeepSetSelector:
+    """Fixed ``[request, ...]`` keep-set selection buffers for every eviction mode.
+
+    Union mode: the fused score+stats+union CuTe pipeline is THE union score
+    producer -- it writes the normalized per-request union rows straight into
+    ``combined``, so the selector owns only the top-k settle-and-pack stage.
+    The per-head modes (``per_head``, ``per_layer_perhead``) own the per-head
+    score preparation buffers and settle one selection row per head or per
+    (layer, head).
+    """
 
     def __init__(
         self,
         *,
         eviction_mode: str,
-        dense_layers: Tuple[int, ...],
-        num_query_heads: int,
-        num_kv_heads: int,
         width: int,
         keep_count: int,
-        selection_rows_per_request: int = 1,
-        prompt_offsets_buffer: Optional[torch.Tensor] = None,
         dtype: torch.dtype,
         device: torch.device,
         max_requests: int,
+        dense_layers: Tuple[int, ...] = (),
+        num_query_heads: int = 0,
+        num_kv_heads: int = 0,
+        rows: Optional[int] = None,
+        prompt_offsets_buffer: Optional[torch.Tensor] = None,
     ) -> None:
+        if eviction_mode == "union":
+            if rows is None or rows <= 0:
+                raise ValueError("cross-request selection requires rows > 0")
+            selection_rows = 1
+        elif eviction_mode in ("per_head", "per_layer_perhead"):
+            if not dense_layers or min(num_query_heads, num_kv_heads, max_requests) <= 0:
+                raise ValueError(
+                    "per-head selection requires positive layer, head, and request counts"
+                )
+            if num_query_heads % num_kv_heads:
+                raise ValueError("query heads must be divisible by KV heads")
+            selection_rows = (
+                num_kv_heads if eviction_mode == "per_head" else len(dense_layers) * num_kv_heads
+            )
+        else:
+            raise ValueError(f"unsupported per-head eviction mode: {eviction_mode}")
         if width <= keep_count or keep_count <= 0:
             raise ValueError("keep-set selection requires width > keep_count > 0")
         if max_requests <= 0:
@@ -169,7 +178,7 @@ class _BatchedKeepSetSelectorBase:
         # decode-relative and these offsets rebase emitted ordinals, so one
         # cohort may mix prompt lengths. ``row_prompt_offsets`` is the
         # row-major expansion consumed by the finalizer.
-        self.selection_rows_per_request = int(selection_rows_per_request)
+        self.selection_rows_per_request = int(selection_rows)
         # Optional compaction move packing fused into the settle launch; set
         # once the compaction buffers exist (see ``fuse_move_source_pack``).
         self._move_source_pack = None
@@ -195,6 +204,56 @@ class _BatchedKeepSetSelectorBase:
                 dtype=torch.int32,
                 device=self.device,
             )
+        if eviction_mode == "union":
+            self.combined = torch.empty((max_requests, width), dtype=dtype, device=self.device)
+            self.final_indices = torch.empty(
+                (max_requests, keep_count), dtype=torch.int32, device=self.device
+            )
+            # Kept decode ordinals only: rows are prompt-length independent, so
+            # one selector serves cohorts with mixed prompt lengths.
+            self.keep = torch.empty(
+                (max_requests, self.keep_count), dtype=torch.int32, device=self.device
+            )
+            # Row-major views consumed by the top-k settle launch.
+            self._selection_scores_rows = self.combined
+            self._selection_row_lengths = self.valid_widths
+            self._provisional_rows = self.final_indices
+            self._keep_rows = self.keep
+        else:
+            self.num_layers = len(self.dense_layers)
+            self.selection_rows = selection_rows
+            score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
+            self.row_mean = torch.empty(score_shape[:-1] + (1,), dtype=dtype, device=self.device)
+            self.row_std = torch.empty_like(self.row_mean)
+            self.selection_scores = torch.empty(
+                (self.max_requests, self.selection_rows, self.width),
+                dtype=dtype,
+                device=self.device,
+            )
+            self.row_seq_lens = torch.full(
+                (self.max_requests, self.selection_rows),
+                self.width,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            selection_shape = (self.max_requests, self.selection_rows, self.keep_count)
+            self.top_indices_i32 = torch.empty(
+                selection_shape, dtype=torch.int32, device=self.device
+            )
+            # Kept decode ordinals only: rows are prompt-length independent, so
+            # one selector serves cohorts with mixed prompt lengths.
+            self.keep = torch.empty(selection_shape, dtype=torch.int32, device=self.device)
+            self.selection_scores_flat = self.selection_scores.view(
+                self.max_requests * self.selection_rows, self.width
+            )
+            self.row_seq_lens_flat = self.row_seq_lens.view(-1)
+            self.top_indices_i32_flat = self.top_indices_i32.view(-1, self.keep_count)
+            self.keep_flat = self.keep.view(-1, self.keep_count)
+            # Row-major views consumed by the top-k settle launch.
+            self._selection_scores_rows = self.selection_scores_flat
+            self._selection_row_lengths = self.row_seq_lens_flat
+            self._provisional_rows = self.top_indices_i32_flat
+            self._keep_rows = self.keep_flat
 
     def refresh_row_prompt_offsets(self) -> None:
         """Re-expand the per-request prompt offsets into their row-major view.
@@ -205,19 +264,6 @@ class _BatchedKeepSetSelectorBase:
             self.row_prompt_offsets.view(self.max_requests, self.selection_rows_per_request).copy_(
                 self.prompt_offsets.unsqueeze(1).expand(-1, self.selection_rows_per_request)
             )
-
-    def _bind_selection_rows(
-        self,
-        scores_rows: torch.Tensor,
-        row_lengths: torch.Tensor,
-        provisional_indices: torch.Tensor,
-        keep_rows: torch.Tensor,
-    ) -> None:
-        """Keep row-major views of the buffers the top-k selection reads."""
-        self._selection_scores_rows = scores_rows
-        self._selection_row_lengths = row_lengths
-        self._provisional_rows = provisional_indices
-        self._keep_rows = keep_rows
 
     def fuse_move_source_pack(self, pack_arguments) -> None:
         """Pack compaction move sources inside this selector's settle launch.
@@ -318,55 +364,6 @@ class _BatchedKeepSetSelectorBase:
             num_warps=4,
         )
 
-
-class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
-    """Persistent ``[request, ...]`` buffers for union selection.
-
-    The fused score+stats+union CuTe pipeline is THE union score producer:
-    it writes the normalized per-request union rows straight into
-    ``combined``, so this selector owns only the top-k settle-and-pack
-    stage.
-    """
-
-    def __init__(
-        self,
-        rows: int,
-        width: int,
-        keep_count: int,
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-        max_requests: int,
-        dense_layers: Tuple[int, ...] = (),
-        num_query_heads: int = 0,
-        num_kv_heads: int = 0,
-        prompt_offsets_buffer: Optional[torch.Tensor] = None,
-    ) -> None:
-        if rows <= 0:
-            raise ValueError("cross-request selection requires rows > 0")
-        super().__init__(
-            eviction_mode="union",
-            dense_layers=dense_layers,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            width=width,
-            keep_count=keep_count,
-            prompt_offsets_buffer=prompt_offsets_buffer,
-            dtype=dtype,
-            device=device,
-            max_requests=max_requests,
-        )
-        self.combined = torch.empty((max_requests, width), dtype=dtype, device=self.device)
-        self.final_indices = torch.empty(
-            (max_requests, keep_count), dtype=torch.int32, device=self.device
-        )
-        # Kept decode ordinals only: rows are prompt-length independent, so
-        # one selector serves cohorts with mixed prompt lengths.
-        self.keep = torch.empty(
-            (max_requests, self.keep_count), dtype=torch.int32, device=self.device
-        )
-        self._bind_selection_rows(self.combined, self.valid_widths, self.final_indices, self.keep)
-
     def select_prepared_union_scores(self) -> None:
         """Select from normalized union rows already written into ``combined``.
 
@@ -374,85 +371,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         rows on the device, so only the top-k settle-and-pack launch remains.
         """
         self._select_top_tokens()
-
-
-class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
-    """Fixed ``[request, ...]`` selector for both per-head modes."""
-
-    def __init__(
-        self,
-        *,
-        eviction_mode: str,
-        dense_layers: Tuple[int, ...],
-        num_query_heads: int,
-        num_kv_heads: int,
-        width: int,
-        keep_count: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        max_requests: int,
-        prompt_offsets_buffer: Optional[torch.Tensor] = None,
-    ) -> None:
-        if eviction_mode not in ("per_head", "per_layer_perhead"):
-            raise ValueError(f"unsupported per-head eviction mode: {eviction_mode}")
-        if not dense_layers or min(num_query_heads, num_kv_heads, max_requests) <= 0:
-            raise ValueError("per-head selection requires positive layer, head, and request counts")
-        if num_query_heads % num_kv_heads:
-            raise ValueError("query heads must be divisible by KV heads")
-        selection_rows = (
-            num_kv_heads if eviction_mode == "per_head" else len(dense_layers) * num_kv_heads
-        )
-        super().__init__(
-            eviction_mode=eviction_mode,
-            dense_layers=dense_layers,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            width=width,
-            keep_count=keep_count,
-            selection_rows_per_request=selection_rows,
-            prompt_offsets_buffer=prompt_offsets_buffer,
-            dtype=dtype,
-            device=device,
-            max_requests=max_requests,
-        )
-        self.num_layers = len(self.dense_layers)
-        self.selection_rows = selection_rows
-
-        score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
-        self.row_mean = torch.empty(score_shape[:-1] + (1,), dtype=dtype, device=self.device)
-        self.row_std = torch.empty_like(self.row_mean)
-        self.selection_scores = torch.empty(
-            (self.max_requests, self.selection_rows, self.width),
-            dtype=dtype,
-            device=self.device,
-        )
-        self.row_seq_lens = torch.full(
-            (self.max_requests, self.selection_rows),
-            self.width,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        selection_shape = (self.max_requests, self.selection_rows, self.keep_count)
-        self.top_indices_i32 = torch.empty(selection_shape, dtype=torch.int32, device=self.device)
-        # Kept decode ordinals only: rows are prompt-length independent, so
-        # one selector serves cohorts with mixed prompt lengths.
-        self.keep = torch.empty(
-            (self.max_requests, self.selection_rows, self.keep_count),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.selection_scores_flat = self.selection_scores.view(
-            self.max_requests * self.selection_rows, self.width
-        )
-        self.row_seq_lens_flat = self.row_seq_lens.view(-1)
-        self.top_indices_i32_flat = self.top_indices_i32.view(-1, self.keep_count)
-        self.keep_flat = self.keep.view(-1, self.keep_count)
-        self._bind_selection_rows(
-            self.selection_scores_flat,
-            self.row_seq_lens_flat,
-            self.top_indices_i32_flat,
-            self.keep_flat,
-        )
 
     def select_requests(
         self,
@@ -1067,7 +985,7 @@ class _EvictionBuffers:
     """Reusable fixed score and selection buffers for one runtime shape."""
 
     score_staging: _FixedScoreStagingBuffers
-    keep_set_selector: Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector]
+    keep_set_selector: _BatchedKeepSetSelector
 
 
 class TriAttention(BaseKVCacheCompressionManager):
@@ -1562,39 +1480,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             raise RuntimeError("KVCacheManagerV2 exposes an invalid protected-tail capacity")
         return capacity
 
-    @staticmethod
-    def _build_cross_request_keep_set_selector(
-        plan: _CrossRequestSelectionPlan,
-        *,
-        prompt_offsets_buffer: Optional[torch.Tensor] = None,
-    ) -> Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector]:
-        """Allocate one fixed ``[request, ...]`` keep-set selector."""
-        if plan.eviction_mode == "union":
-            return _BatchedUnionKeepSetSelector(
-                plan.rows,
-                plan.width,
-                plan.keep_count,
-                dtype=plan.dtype,
-                device=plan.device,
-                max_requests=plan.max_requests,
-                dense_layers=plan.dense_layers,
-                num_query_heads=plan.num_query_heads,
-                num_kv_heads=plan.num_kv_heads,
-                prompt_offsets_buffer=prompt_offsets_buffer,
-            )
-        return _BatchedPerHeadKeepSetSelector(
-            eviction_mode=plan.eviction_mode,
-            dense_layers=plan.dense_layers,
-            num_query_heads=plan.num_query_heads,
-            num_kv_heads=plan.num_kv_heads,
-            width=plan.width,
-            keep_count=plan.keep_count,
-            dtype=plan.dtype,
-            device=plan.device,
-            max_requests=plan.max_requests,
-            prompt_offsets_buffer=prompt_offsets_buffer,
-        )
-
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
         request_id = request.py_request_id
@@ -2042,27 +1927,25 @@ class TriAttention(BaseKVCacheCompressionManager):
             page_table_token_capacity=page_table_token_capacity,
             **draft_kwargs,
         )
-        keep_set_selector = self._build_cross_request_keep_set_selector(
-            _CrossRequestSelectionPlan(
-                eviction_mode=self.eviction_mode,
-                dense_layers=tuple(layout.dense_layers),
-                num_query_heads=int(self._H),
-                num_kv_heads=int(first_pool.shape[2]),
-                rows=len(layout.dense_layers) * int(self._H),
-                width=decode_width,
-                keep_count=self.top_B,
-                dtype=torch.float32,
-                device=first_pool.device,
-                max_requests=request_capacity,
-            ),
+        keep_set_selector = _BatchedKeepSetSelector(
+            eviction_mode=self.eviction_mode,
+            dense_layers=tuple(layout.dense_layers),
+            num_query_heads=int(self._H),
+            num_kv_heads=int(first_pool.shape[2]),
+            rows=len(layout.dense_layers) * int(self._H),
+            width=decode_width,
+            keep_count=self.top_B,
+            dtype=torch.float32,
+            device=first_pool.device,
+            max_requests=request_capacity,
             prompt_offsets_buffer=score_staging.token_starts_device,
         )
         # Padded rows carry zero valid width; their provisional TopK entries
         # must still be in-range ordinals for the finalizer's score gather.
-        provisional = getattr(keep_set_selector, "final_indices", None)
-        if provisional is None:
-            provisional = keep_set_selector.top_indices_i32
-        provisional.zero_()
+        if self.eviction_mode == "union":
+            keep_set_selector.final_indices.zero_()
+        else:
+            keep_set_selector.top_indices_i32.zero_()
         score_staging.bind_score_launcher(
             keep_set_selector.valid_widths,
             "mean",
@@ -2081,7 +1964,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         layout: _RuntimeKVLayout,
         prepared: Sequence[_PreparedEviction],
         score_staging: _FixedScoreStagingBuffers,
-        keep_set_selector: Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector],
+        keep_set_selector: _BatchedKeepSetSelector,
     ):
         """Build or reuse the C++ compaction launches for one cohort."""
         from .compaction import BatchedKVCacheCompaction
@@ -2304,7 +2187,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             keep_set_selector.refresh_row_prompt_offsets()
 
         try:
-            fused_union = isinstance(keep_set_selector, _BatchedUnionKeepSetSelector)
+            fused_union = keep_set_selector.eviction_mode == "union"
             with nvtx_range("triattention.score", color="blue"):
                 # Union rounds run the fused pipeline (score, row stats,
                 # normalization, and the cross-row union maximum in two CuTe
