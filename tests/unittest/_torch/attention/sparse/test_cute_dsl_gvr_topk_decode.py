@@ -33,7 +33,7 @@ skip_not_sm100 = pytest.mark.skipif(
 )
 
 
-def _make_inputs(
+def _make_inputs_impl(
     num_rows: int,
     N: int,
     top_k: int,
@@ -102,8 +102,7 @@ def _make_inputs(
 
     if preidx_hit_rate <= 0.0:
         # Worst-case: only slot 0 is meaningful, rest are junk arange.
-        for j in range(1, top_k):
-            pre_idx[:, j] = j
+        pre_idx[:, 1:] = torch.arange(1, top_k, dtype=torch.int32, device="cuda")
     else:
         # Realistic: mix ``preidx_hit_rate`` real torch.topk indices with
         # random in-range fillers. Tests the Guess-phase short-circuit
@@ -118,6 +117,66 @@ def _make_inputs(
         pre_idx[:, :] = guess
 
     return logits, pre_idx, seq_lens
+
+
+# Module-level input memoization. ``_make_inputs_impl`` is fully deterministic
+# (seed-keyed RNG), and the parametrized sweeps below request the same
+# (shape, dtype, hit-rate, ...) combination once per cluster_size / dispatch
+# variant — regenerating logits + the reference topk dominated suite
+# wall-clock, not the kernel under test. Cached tensors are returned WITHOUT
+# cloning under a strict read-only convention: the op writes only
+# ``out_indices`` (allocated fresh by every test), never its inputs.
+_inputs_cache: dict = {}
+# Reference top-K values memoized per cached-inputs identity (see
+# ``_tie_aware_check``). Keyed on object ids, which is safe only because the
+# keying tensors are pinned for the process lifetime by ``_inputs_cache``.
+_ref_vals_cache: dict = {}
+
+
+def _make_inputs(
+    num_rows: int,
+    N: int,
+    top_k: int,
+    dtype: torch.dtype,
+    next_n: int,
+    seed: int,
+    compress_ratio: int = 1,
+    preidx_hit_rate: float = 0.0,
+    varlen: bool = False,
+    seq_lens: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Memoizing wrapper around ``_make_inputs_impl`` (same signature).
+
+    Caller-provided ``seq_lens`` bypasses the cache (the tensor identity is
+    not part of a hashable key).
+    """
+    if seq_lens is not None:
+        return _make_inputs_impl(
+            num_rows,
+            N,
+            top_k,
+            dtype,
+            next_n,
+            seed,
+            compress_ratio=compress_ratio,
+            preidx_hit_rate=preidx_hit_rate,
+            varlen=varlen,
+            seq_lens=seq_lens,
+        )
+    key = (num_rows, N, top_k, dtype, next_n, seed, compress_ratio, preidx_hit_rate, varlen)
+    if key not in _inputs_cache:
+        _inputs_cache[key] = _make_inputs_impl(
+            num_rows,
+            N,
+            top_k,
+            dtype,
+            next_n,
+            seed,
+            compress_ratio=compress_ratio,
+            preidx_hit_rate=preidx_hit_rate,
+            varlen=varlen,
+        )
+    return _inputs_cache[key]
 
 
 def _tie_aware_check(
@@ -160,13 +219,23 @@ def _tie_aware_check(
     actual_kv_len = seq_lens_per_row - next_n + ofs + 1
     N_eff = actual_kv_len // compress_ratio  # [num_rows]
 
-    # Mask logits beyond per-row N_eff to -inf so torch.topk ignores tails.
-    col_idx = torch.arange(N, device=device)
-    in_range_mask = col_idx[None, :] < N_eff[:, None]  # [num_rows, N]
-    masked_logits = torch.where(in_range_mask, logits_f32, float("-inf"))
-
-    # Reference per-row top-K, sorted descending.
-    ref_vals, _ = torch.topk(masked_logits, k=top_k, largest=True, sorted=True, dim=-1)
+    # Reference per-row top-K, sorted descending, over logits masked beyond
+    # per-row N_eff. Memoized when (logits, seq_lens) come from the pinned
+    # ``_inputs_cache`` (identity match), since the reference only depends on
+    # (logits, seq_lens, top_k, next_n, compress_ratio) — not on the launch
+    # variant (cluster_size / order_row / ...) the test is exercising.
+    ref_key = None
+    if any(logits is v[0] and seq_lens is v[2] for v in _inputs_cache.values()):
+        ref_key = (id(logits), id(seq_lens), top_k, next_n, compress_ratio)
+    if ref_key is not None and ref_key in _ref_vals_cache:
+        ref_vals = _ref_vals_cache[ref_key]
+    else:
+        col_idx = torch.arange(N, device=device)
+        in_range_mask = col_idx[None, :] < N_eff[:, None]  # [num_rows, N]
+        masked_logits = torch.where(in_range_mask, logits_f32, float("-inf"))
+        ref_vals, _ = torch.topk(masked_logits, k=top_k, largest=True, sorted=True, dim=-1)
+        if ref_key is not None:
+            _ref_vals_cache[ref_key] = ref_vals
 
     # ---- 1. Out-of-range / -1 placeholder check (single fused mask) ----
     out_of_range = (out_indices < 0) | (out_indices >= N_eff[:, None])
@@ -233,7 +302,6 @@ def _tie_aware_check(
 @pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
 @pytest.mark.parametrize("cluster_size", [1, 4])
-@pytest.mark.parametrize("seqlen_sorted", [False, True])
 def test_cute_dsl_gvr_topk_decode(
     dtype,
     top_k,
@@ -244,7 +312,6 @@ def test_cute_dsl_gvr_topk_decode(
     compress_ratio,
     preidx_hit_rate,
     cluster_size,
-    seqlen_sorted,
 ):
     """Compare custom op output against torch.topk reference (tie-aware).
 
@@ -256,14 +323,9 @@ def test_cute_dsl_gvr_topk_decode(
     ``varlen=False`` uses uniform seq_lens=N*cr across the batch;
     ``varlen=True`` draws per-row seq_lens uniformly in [N/2, N]*cr.
 
-    ``seqlen_sorted=True`` exercises the LJF host-side dispatch order:
-    we build ``order_row`` as a descending argsort over ``seq_lens`` and
-    pass it through the custom op. The
-    kernel must produce the same per-row top-K (rows are still written
-    back at their original positions, since the kernel uses
-    ``row_idx = order_row[req] * next_n + nn`` for both reads and
-    writes). The reference comparison is unchanged — it asserts that
-    each row's output is a valid top-K of that row's masked logits.
+    The LJF host-side dispatch order (``order_row``) is covered by the
+    dedicated ``test_cute_dsl_gvr_topk_decode_seqlen_sorted`` below on
+    representative cells instead of doubling this whole sweep.
     """
     if N - next_n + 1 < top_k:
         pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path")
@@ -285,12 +347,66 @@ def test_cute_dsl_gvr_topk_decode(
 
     out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
 
-    # LJF dispatch order — request-level descending argsort of seq_lens.
-    order_row = (
-        torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
-        if seqlen_sorted
-        else None
+    torch.ops.trtllm.cute_dsl_gvr_topk_decode(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        top_k=top_k,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        cluster_size=cluster_size,
     )
+    torch.cuda.synchronize()
+
+    _tie_aware_check(out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k,N,batch_size,varlen,next_n,compress_ratio,cluster_size",
+    [
+        # Representative cells for the LJF host-side dispatch order
+        # (previously a full extra dimension on the sweep above): varlen
+        # batches so the argsort is a real permutation, both SMEM layout
+        # endpoints (bf16/K=512, fp32/K=2048), next_n=2 for the
+        # ``order_row[req] * next_n + nn`` row expansion, cr=4 for the
+        # order_row + compressed seq_lens interaction, cluster and
+        # single-CTA paths, and a batch_size=1 trivial-permutation smoke.
+        (torch.bfloat16, 512, 65536, 32, True, 1, 1, 4),
+        (torch.float32, 2048, 65536, 32, True, 2, 1, 1),
+        (torch.bfloat16, 1024, 4096, 32, True, 2, 4, 1),
+        (torch.float16, 1024, 65536, 1, False, 1, 1, 1),
+    ],
+)
+def test_cute_dsl_gvr_topk_decode_seqlen_sorted(
+    dtype, top_k, N, batch_size, varlen, next_n, compress_ratio, cluster_size
+):
+    """LJF host-side dispatch order: ``order_row`` = descending argsort of
+    ``seq_lens`` passed through the custom op.
+
+    The kernel must produce the same per-row top-K as the unsorted launch
+    (rows are still written back at their original positions, since the
+    kernel uses ``row_idx = order_row[req] * next_n + nn`` for both reads
+    and writes). The reference comparison is unchanged — it asserts that
+    each row's output is a valid top-K of that row's masked logits.
+    """
+    num_rows = batch_size * next_n
+    logits, pre_idx, seq_lens = _make_inputs(
+        num_rows,
+        N,
+        top_k,
+        dtype,
+        next_n,
+        seed=42,
+        compress_ratio=compress_ratio,
+        preidx_hit_rate=0.5,
+        varlen=varlen,
+    )
+    out_indices = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+
+    # LJF dispatch order — request-level descending argsort of seq_lens.
+    order_row = torch.argsort(seq_lens, descending=True, stable=False).to(torch.int32)
 
     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
         logits,
@@ -594,9 +710,11 @@ def test_lb_main_branches(dtype, top_k, scenario, N, seq_lens_mode, batch_size, 
 @pytest.mark.parametrize(
     "dtype,top_k",
     [
+        # SMEM-layout endpoints only. LB dispatch (prepare partition +
+        # long/short branch selection) is dtype-insensitive; the full
+        # dtype x K production map stays covered by the main sweep above
+        # and by test_cute_dsl_gvr_topk_decode_r0_equivalence.
         (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
         (torch.float32, 2048),
     ],
 )
