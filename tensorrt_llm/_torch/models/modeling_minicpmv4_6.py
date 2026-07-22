@@ -516,6 +516,14 @@ class MiniCPMV4_6VisionModel(nn.Module):
         # dataclasses.replace gives a fresh extra_attrs (init=False), so the
         # vision attention's transient layer registration can't collide with
         # the LLM's.
+        # NOTE: mapping=Mapping() (tp=1) is load-bearing for correctness, not
+        # just perf. It makes the whole vision tower run REPLICATED on every
+        # rank (all vision Linears use tensor_parallel_mode=None and vision
+        # attention uses reduce_output=False). Under TP that means every rank
+        # computes identical vision embeds from the broadcast multimodal data;
+        # do NOT switch this to the LLM's real mapping -- a row-parallel
+        # projection would then all-reduce data that was never sharded across
+        # ranks and produce wrong output.
         vision_model_config = dataclasses.replace(
             model_config, quant_config=QuantConfig(), mapping=Mapping()
         )
@@ -568,7 +576,10 @@ class MiniCPMV4_6VisionModel(nn.Module):
                 if layer_index == self.insert_layer_id:
                     cu_seqlens = self._grid_cu_seqlens(target_sizes)
                     hidden_states = self.vit_merger(hidden_states, target_sizes, cu_seqlens)
-                    target_sizes = target_sizes // 2
+                    window_h, window_w = self.vit_merger.window_kernel_size
+                    target_sizes = target_sizes // torch.tensor(
+                        [window_h, window_w], dtype=target_sizes.dtype
+                    )
                     attn_metadata = self._make_attn_metadata(self._grid_seq_lens(target_sizes))
         else:
             attn_metadata = self._make_attn_metadata(self._grid_seq_lens(target_sizes))
@@ -584,9 +595,11 @@ class MiniCPMV4_6VisionModel(nn.Module):
         pixel_values_list = []
         target_sizes_list = []
         for param in multimodal_params:
-            # Image and video share the NaViT-packed vision path; a request may
-            # carry either (or both). Concatenate in image-then-video order to
-            # match the placeholder order the input processor emits.
+            # Image and video share the NaViT-packed vision path. A request
+            # carries at most one modality (the input processor rejects mixed
+            # image+video requests), so the fixed image-then-video iteration
+            # order here is unambiguous and matches the placeholder order in
+            # `input_ids`.
             for modality in ("image", "video"):
                 modality_data = param.multimodal_data.get(modality)
                 if modality_data is None:
@@ -611,7 +624,31 @@ class MiniCPMV4_6VisionModel(nn.Module):
         target_sizes = target_sizes.to("cpu")
 
         features = self._get_image_features(pixel_values, target_sizes)
-        return [torch.cat(features, dim=0)]
+        fused = torch.cat(features, dim=0)
+
+        # Contract-4 invariants (this forward returns ONE pre-concatenated
+        # tensor that find_input_mm_embeds / _cache_multimodal_embeddings slice
+        # back per request):
+        #   I.  Order -- `features` are concatenated in `multimodal_params`
+        #       order; the loop above and the per-grid merger both preserve it,
+        #       which is exactly the order the downstream slicers assume. (Not
+        #       assertable cheaply -- covered by the multi-request E2E test.)
+        #   II. Count -- the produced row count must equal the sum of each
+        #       request's placeholder count (`total_embeds_in_request`). A
+        #       mismatch means the vision output and the fused `input_ids` will
+        #       misalign, so fail loudly here instead of silently scattering
+        #       wrong rows downstream. Only checked when every request carries
+        #       runtime counts (absent on some warmup / JIT paths).
+        runtimes = [p.multimodal_runtime for p in multimodal_params]
+        if all(r is not None and r.total_embeds_in_request is not None
+               for r in runtimes):
+            expected = sum(r.total_embeds_in_request for r in runtimes)
+            assert fused.shape[0] == expected, (
+                f"MiniCPMV4_6 vision produced {fused.shape[0]} embedding rows "
+                f"but the batch's per-request placeholder counts sum to "
+                f"{expected}; vision output would misalign with input_ids."
+            )
+        return [fused]
 
     def load_weights(self, weights: Dict[str, torch.Tensor]):
         converted_weights = {}
@@ -772,6 +809,22 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
         images = mm_data.get("image")
         video_datas = mm_data.get("video")
+        # Single-modality-per-request guard. `_postprocess` rewrites both the
+        # image and video placeholders to the same sentinel
+        # (`tllm_multimodal_token_id`), so once fused into `input_ids` the two
+        # modalities are indistinguishable and their relative order is lost.
+        # The vision tower, meanwhile, always concatenates embeddings in a
+        # fixed image-then-video order. A request that interleaves image and
+        # video placeholders would therefore misalign embeddings with their
+        # placeholder positions. Until order-preserving fusion is implemented,
+        # reject mixed image+video requests instead of producing silently
+        # wrong output (single-modality requests are unaffected).
+        if images and video_datas:
+            raise ValueError(
+                "MiniCPM-V 4.6 supports only a single modality (image OR "
+                "video) per request, but this request carries both. Please "
+                "split the image and video content into separate requests."
+            )
         videos = video_metadata = None
         if video_datas is not None:
             # Each item is a VideoData (frames + decode metadata) from
@@ -902,11 +955,10 @@ class MiniCPMV4_6Model(PreTrainedModel):
         return ["image.pixel_values", "video.pixel_values", "multimodal_embedding"]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if self.mm_encoder is not None:
-            self.mm_encoder.load_weights(weights)
-            if hasattr(weights, "mark_consumed"):
-                weights.mark_consumed("model.vision_tower")
-                weights.mark_consumed("model.merger")
+        self.mm_encoder.load_weights(weights)
+        if hasattr(weights, "mark_consumed"):
+            weights.mark_consumed("model.vision_tower")
+            weights.mark_consumed("model.merger")
 
         llm_weight_mapper = Qwen3_5MoeHfWeightMapper()
         llm_weight_mapper.init_model_and_config(self.llm, self.model_config)
