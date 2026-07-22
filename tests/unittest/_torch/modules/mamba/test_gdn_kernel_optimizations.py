@@ -481,6 +481,40 @@ def test_pack_gdn_decode_qkv(
 # ---- Tests for the GDN compile boundary and derived state ----
 
 
+@skip_no_cuda
+def test_reset_gdn_states_preserves_initialized_and_invalid_slots():
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import _reset_gdn_states
+
+    num_slots = 4
+    ssm_state_size = 6
+    conv_state_size = 8
+    state_pool = (
+        torch.arange(
+            num_slots * (ssm_state_size + conv_state_size),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        .to(torch.bfloat16)
+        .reshape(num_slots, -1)
+    )
+    state_pool_before = state_pool.clone()
+    ssm_states = state_pool[:, :ssm_state_size].view(num_slots, 2, 3)
+    conv_states = state_pool[:, ssm_state_size:].view(num_slots, 2, 4)
+    state_indices = torch.tensor([1, 3, -1], device="cuda", dtype=torch.int32)
+    has_initial_states = torch.tensor([False, True, False], device="cuda", dtype=torch.bool)
+
+    _reset_gdn_states(
+        ssm_states,
+        conv_states,
+        state_indices,
+        has_initial_states,
+    )
+
+    torch.testing.assert_close(state_pool[1], torch.zeros_like(state_pool[1]))
+    for state_idx in (0, 2, 3):
+        torch.testing.assert_close(state_pool[state_idx], state_pool_before[state_idx])
+
+
 def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
     """The compile boundary consumes split inputs and mutates its output."""
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
