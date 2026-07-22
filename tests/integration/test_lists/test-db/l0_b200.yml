@@ -375,6 +375,9 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_lpips_against_golden TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_edge_t2v_lpips_against_golden TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_edge_i2v_lpips_against_golden TIMEOUT (15)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_edge_t2i_lpips_against_golden TIMEOUT (15)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
