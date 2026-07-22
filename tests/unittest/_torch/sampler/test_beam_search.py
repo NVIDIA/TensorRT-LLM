@@ -1124,6 +1124,10 @@ def _make_cba_metadata(max_batch, K, attn_len, snap_len, seq_len, prompt_len,
                                      dtype=torch.float32),
         cba_lengths=torch.zeros((max_batch, K), dtype=torch.int32),
         batch_dones=torch.zeros((max_batch, ), dtype=torch.bool),
+        original_log_probs=torch.zeros((max_batch, K, attn_len),
+                                       dtype=torch.float32),
+        cba_log_probs=torch.zeros((max_batch, K, snap_len),
+                                  dtype=torch.float32),
         max_seq_len=attn_len,
     )
     return m

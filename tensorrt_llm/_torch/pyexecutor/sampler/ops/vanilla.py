@@ -89,6 +89,13 @@ class BeamSearchMetadata(StrategyMetadata):
     """[max_num_sequences, max_beam_width] int32, generated lengths."""
     batch_dones: Optional[torch.Tensor] = None
     """[max_num_sequences] bool, per-slot beam-search termination verdict."""
+    original_log_probs: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width, max_seq_len] float32, uncorrected
+    per-slot sampled log-prob per step (log-prob analog of original_tokens;
+    C++ logProbsTiled). Written and read by the CBA path for logprobs."""
+    cba_log_probs: Optional[torch.Tensor] = None
+    """[max_num_sequences, max_beam_width, max_seq_len] float32, per-token
+    log-probs of the CBA path snapshots (C++ logProbsCBA analog)."""
     max_seq_len: int = 0
     """Maximum sequence length (prompt + generated), used by the
     best-attainable-score bound of the "never" early-stopping modes."""
@@ -494,6 +501,8 @@ def beam_search_sampling_batch_cba(
         and args.cba_normed_scores is not None
         and args.cba_lengths is not None
         and args.batch_dones is not None
+        and args.original_log_probs is not None
+        and args.cba_log_probs is not None
     ), "CBA metadata is required for early_stopping != 1"
     assert logits.dim() == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
     batch_size, vocab_size = logits.size()
@@ -595,23 +604,32 @@ def beam_search_sampling_batch_cba(
     )  # source beam per (beam, step)
     orig = args.original_tokens[slots, :beam_width_in]
     tok_at = torch.gather(orig, 2, step_idx_c.unsqueeze(1).expand(-1, beam_width_in, -1).long())
+    orig_lp = args.original_log_probs[slots, :beam_width_in]
+    lp_at = torch.gather(orig_lp, 2, step_idx_c.unsqueeze(1).expand(-1, beam_width_in, -1).long())
     parent_exp = cand_pred.long().unsqueeze(-1).expand(-1, -1, snap_len)
     # Indirection entries beyond the current length are uninitialized; the
     # resulting lanes are masked below, but the intermediate gather index must
     # be clamped in-bounds first.
     src_beam = torch.gather(ind_at.long(), 1, parent_exp).clamp_(0, beam_width_in - 1)
-    new_paths = torch.gather(tok_at, 1, src_beam)  # [bs, 2K, snap_len]
+    new_paths = torch.gather(tok_at, 1, src_beam)  # [bs, num_candidates, snap_len]
+    new_lp_paths = torch.gather(lp_at, 1, src_beam)
     t_valid = torch.arange(snap_len, device=device).view(1, 1, -1) < gen_lens.view(-1, 1, 1)
     new_paths = new_paths.masked_fill(~t_valid, BEAM_SEARCH_PAD_TOKEN)
+    new_lp_paths = new_lp_paths.masked_fill(~t_valid, 0.0)
     end_pos = gen_lens.view(-1, 1, 1).expand(-1, num_candidates, 1).clamp(max=snap_len - 1).long()
     new_paths.scatter_(2, end_pos, cand_tok.unsqueeze(-1).to(new_paths.dtype))
+    # the terminating token's own log-prob = candidate cum - parent cum
+    parent_cum = args.cum_log_probs[slots, :beam_width_in].gather(1, cand_pred.long())
+    new_lp_paths.scatter_(2, end_pos, (cand_cum - parent_cum).unsqueeze(-1))
 
     # Harvested beams (stop-word finishes latched after the previous step):
     # their recorded tokens already include the terminating stop word, so the
     # snapshot is the beam's own path (parent = itself) at the current length.
     # (same OOB caveat as src_beam above: clamp uninitialized indirection)
-    harvest_paths = torch.gather(tok_at, 1, ind_at.long().clamp(0, beam_width_in - 1))
+    harvest_src = ind_at.long().clamp(0, beam_width_in - 1)
+    harvest_paths = torch.gather(tok_at, 1, harvest_src)
     harvest_paths = harvest_paths.masked_fill(~t_valid, BEAM_SEARCH_PAD_TOKEN)
+    harvest_lp_paths = torch.gather(lp_at, 1, harvest_src).masked_fill(~t_valid, 0.0)
     harvest_cum = args.cum_log_probs[slots, :beam_width_in]
     if length_penalty is not None:
         harvest_normed = harvest_cum / gen_lens.to(harvest_cum.dtype).pow(exponent)
@@ -631,13 +649,16 @@ def beam_search_sampling_batch_cba(
         dim=1,
     )
     all_tokens = torch.cat([args.cba_tokens[slots], new_paths, harvest_paths], dim=1)
+    all_lps = torch.cat([args.cba_log_probs[slots], new_lp_paths, harvest_lp_paths], dim=1)
     merged_cum = all_cum.gather(1, top_i)
     merged_len = all_len.gather(1, top_i)
-    merged_tokens = all_tokens.gather(1, top_i.unsqueeze(-1).expand(-1, -1, snap_len))
+    top_i_wide = top_i.unsqueeze(-1).expand(-1, -1, snap_len)
+    merged_tokens = all_tokens.gather(1, top_i_wide)
     args.cba_normed_scores[slots] = top_normed
     args.cba_cum_log_probs[slots] = merged_cum
     args.cba_lengths[slots] = merged_len
     args.cba_tokens[slots] = merged_tokens
+    args.cba_log_probs[slots] = all_lps.gather(1, top_i_wide)
 
     # --- Done verdict (C++ batchDones): CBA full, and the best candidate's
     # attainable normalized score cannot beat the worst kept entry.
@@ -699,7 +720,17 @@ def beam_search_sampling_batch_cba(
 
     old_cum_log_probs = args.cum_log_probs[slots].view(-1)
     offset_pred = slot_pred + args.seq_offsets[: slot_pred.size(0)].unsqueeze(1)
-    args.new_log_probs[slots, :num_beams] = slot_cum - old_cum_log_probs[offset_pred]
+    step_log_probs = slot_cum - old_cum_log_probs[offset_pred]
+    args.new_log_probs[slots, :num_beams] = step_log_probs
+    # Record this step's per-slot log-prob at the emission position so path
+    # snapshots can recover per-token log-probs (analog of original_tokens).
+    olp = args.original_log_probs[slots, :num_beams]
+    olp.scatter_(
+        2,
+        args.seq_lens.view(-1, 1, 1).expand(-1, num_beams, 1).long(),
+        step_log_probs.unsqueeze(-1),
+    )
+    args.original_log_probs[slots, :num_beams] = olp
     args.cum_log_probs[slots, :num_beams] = slot_cum
     return slot_tok, softmax
 

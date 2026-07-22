@@ -156,8 +156,7 @@ Parameter Configuration:
   soon as `best_of` finished candidates exist. The exhaustive modes (`0`, and other values for
   intermediate heuristics) keep a pool of finished candidates and continue searching while an
   unfinished beam could still outscore the worst of them (`0` bounds attainability with the
-  current length; other values with the maximum length when `length_penalty > 0`). With the
-  default `TorchSampler`, the exhaustive modes do not support `logprobs` yet.
+  current length; other values with the maximum length when `length_penalty > 0`).
 
 The following example demonstrates beam search with a beam width of 4, returning the top 3 sequences:
 

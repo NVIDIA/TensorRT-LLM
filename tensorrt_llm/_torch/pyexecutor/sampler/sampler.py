@@ -2267,6 +2267,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: batch_size, beam_width — generated lengths of CBA entries."""
         batch_dones: torch.Tensor
         """Shape: (max_num_sequences,), dtype bool — CBA-mode termination verdicts."""
+        original_log_probs: torch.Tensor
+        """Shape: batch_size, beam_width, max_seq_len
+           Usage: Uncorrected per-slot sampled log-prob at each step (the
+           log-prob analog of original_tokens, mirroring the C++
+           logProbsTiled workspace). Only written by the CBA path."""
+        cba_log_probs: torch.Tensor
+        """Shape: batch_size, beam_width, max_seq_len
+           Usage: Per-token log-probs of the CBA path snapshots (the C++
+           logProbsCBA analog). Only maintained for early_stopping != 1."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2428,6 +2437,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             cba_lengths = int_tensor(self.CACHE_INDIRECTION_SHAPE[:-1])
             batch_dones = torch.zeros((self.max_num_sequences,), device="cuda", dtype=torch.bool)
+            original_log_probs = torch.zeros(
+                self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.float32
+            )
+            cba_log_probs = torch.zeros(
+                self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.float32
+            )
             beam_search_store = self.BeamSearchStore(
                 cache_indirection=cache_indirection,
                 cache_indirection_buffer=cache_indirection_buffer,
@@ -2444,6 +2459,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 cba_normed_scores=cba_normed_scores,
                 cba_lengths=cba_lengths,
                 batch_dones=batch_dones,
+                original_log_probs=original_log_probs,
+                cba_log_probs=cba_log_probs,
             )
         # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
         # sampler instances; only slots in self._top_p_decay_slots are ever read.
@@ -3135,10 +3152,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # (see beam_search_sampling_batch_cba), which does not support the
             # combinations rejected below yet.
             if early_stopping is not None and early_stopping != 1:
-                if request.py_return_log_probs:
-                    raise ValueError(
-                        "Beam search with early_stopping != 1 does not support logprobs yet"
-                    )
                 if request.sampling_config.beam_width_array is not None:
                     raise ValueError(
                         "Beam search with early_stopping != 1 does not support "
@@ -3358,6 +3371,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store.cba_normed_scores.index_fill_(0, seq_slots_long, float("-inf"))
         beam_search_store.cba_lengths.index_fill_(0, seq_slots_long, 0)
         beam_search_store.batch_dones.index_fill_(0, seq_slots_long, False)
+        beam_search_store.original_log_probs.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.cba_log_probs.index_fill_(0, seq_slots_long, 0)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -3573,8 +3588,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         The final beams are the top ``beam_width`` of (CBA finished paths |
         current active slot paths) ranked by length-normalized score,
         mirroring the C++ finalize kernel (which inserts the unfinished paths
-        into the CBA and ranks everything by normed score). Logprobs are not
-        supported on this path (rejected in validate_request).
+        into the CBA and ranks everything by normed score). When logprobs are
+        requested, per-token log-probs come from the CBA snapshots
+        (finished paths) and the original_log_probs history (active paths).
         """
         should_stop = self._check_beam_search_stop_criteria(request, finish_reasons=finish_reasons)
         need_history = self._copy_to_host(should_stop)
@@ -3601,6 +3617,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         cba_cum = d2h_copier(store.cba_cum_log_probs[slot, :num_beams])
         cba_normed = d2h_copier(store.cba_normed_scores[slot, :num_beams])
         cba_lengths = d2h_copier(store.cba_lengths[slot, :num_beams])
+        return_log_probs = request.py_return_log_probs
+        cba_log_probs: torch.Tensor | None = None
+        current_lp_path: torch.Tensor | None = None
+        if return_log_probs:
+            cba_log_probs = d2h_copier(store.cba_log_probs[slot, :num_beams])
+            current_lp_path = d2h_copier(
+                store.original_log_probs[slot, :num_beams, prompt_length:num_tokens]
+            )
 
         length_penalty = (
             _unwrap_singleton(cast(Optional[list[float]], request.sampling_config.length_penalty))
@@ -3620,9 +3644,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             all_normed = torch.cat([cba_normed, active_normed])
             order = torch.argsort(all_normed, descending=True)[:num_beams]
 
+            active_lp_path: torch.Tensor | None = None
+            if return_log_probs:
+                assert current_lp_path is not None
+                active_lp_path = _gather_beam_path(
+                    current_path=current_lp_path, cache_indirection=cache_indirection
+                )
+
             width = max(num_generated_tokens, int(cba_lengths.max().item()))
             tokens = torch.full((num_beams, width), BEAM_SEARCH_PAD_TOKEN, dtype=torch.int32)
             cum_logprobs = torch.empty((num_beams,), dtype=torch.float32)
+            log_probs: torch.Tensor | None = None
+            if return_log_probs:
+                log_probs = torch.zeros((num_beams, width), dtype=torch.float32)
             for out_idx, merged_idx in enumerate(order.tolist()):
                 if merged_idx < num_beams:  # CBA entry (always finite here: the
                     # actives provide num_beams finite scores, so empty -inf CBA
@@ -3630,14 +3664,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     entry_len = int(cba_lengths[merged_idx].item())
                     tokens[out_idx, :entry_len] = cba_tokens[merged_idx, :entry_len]
                     cum_logprobs[out_idx] = cba_cum[merged_idx]
+                    if log_probs is not None:
+                        assert cba_log_probs is not None
+                        log_probs[out_idx, :entry_len] = cba_log_probs[merged_idx, :entry_len]
                 else:
                     active_idx = merged_idx - num_beams
                     tokens[out_idx, :num_generated_tokens] = active_path[active_idx]
                     cum_logprobs[out_idx] = active_cum[active_idx]
+                    if log_probs is not None:
+                        assert active_lp_path is not None
+                        log_probs[out_idx, :num_generated_tokens] = active_lp_path[active_idx]
             return BeamHistory(
                 tokens=tokens,
-                logprobs=None,
-                logprobs_indices=None,
+                # [beam, tokens, 1]: the sampled token's logprob per position,
+                # matching the shape contract of _convert_logprobs_tensor_to_list.
+                logprobs=log_probs.unsqueeze(-1) if log_probs is not None else None,
+                logprobs_indices=tokens.unsqueeze(-1) if return_log_probs else None,
                 cum_logprobs=cum_logprobs,
             )
 
@@ -3961,6 +4003,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     cba_lengths=beam_search_store.cba_lengths,
                     batch_dones=beam_search_store.batch_dones,
                     stop_past_tokens=self._finish_reasons_handler.store.past_tokens_cuda,
+                    original_log_probs=beam_search_store.original_log_probs,
+                    cba_log_probs=beam_search_store.cba_log_probs,
                     max_seq_len=self.max_seq_len,
                 )
             elif metadata_type is TopPDecayMetadata:
