@@ -29,6 +29,8 @@ import importlib
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.evaluate.covost2 import CoVoST2
 from tensorrt_llm.evaluate.lm_eval import (
     LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER,
@@ -745,7 +747,6 @@ class _FakeEnsemble:
 
 
 class _FakeTask:
-
     def __init__(self):
         self._filters = [_FakeEnsemble("strict-match")]
 
@@ -756,7 +757,6 @@ class _FakeTask:
 
 
 class _FakeInstance:
-
     def __init__(self, task_name, doc):
         self.task_name = task_name
         self.doc = doc
@@ -766,6 +766,7 @@ class _FakeInstance:
 
 def _make_tracker(interval=2):
     from tensorrt_llm.evaluate.lm_eval import _RunningScoreTracker
+
     return _RunningScoreTracker({"fake_task": _FakeTask()}, interval)
 
 
@@ -777,7 +778,7 @@ def test_running_score_tracker_aggregates_mean():
     for doc, text in zip(docs, responses):
         tracker.update(_FakeInstance("fake_task", doc), text)
     assert not tracker.disabled
-    key = "exact_match,strict-match"
+    key = "fake_task,exact_match,strict-match"
     assert tracker.metric_counts[key] == 3
     assert tracker.metric_sums[key] == 2.0
 
@@ -802,7 +803,7 @@ def test_running_score_tracker_unknown_task_disables():
     tracker.maybe_log(10, 100)
 
 
-def test_running_score_tracker_logs_on_interval(caplog):
+def test_running_score_tracker_logs_on_interval():
     """maybe_log emits at every `interval` responses and at completion."""
     tracker = _make_tracker(interval=2)
     with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
@@ -818,7 +819,7 @@ def test_running_score_tracker_logs_on_interval(caplog):
     message = mock_logger.info.call_args[0][0]
     assert "2/3" not in message  # latest call reports 3/3
     assert "3/3" in message
-    assert "exact_match,strict-match" in message
+    assert "fake_task,exact_match,strict-match" in message
     # 2 of 3 correct -> ~66.67 on the 0~100 scale.
     assert "66.67" in message
 
@@ -839,7 +840,7 @@ def test_running_score_tracker_process_results_list_convention():
     doc = {"answer": "42"}
     tracker.update(_FakeInstance("fake_task", doc), "42")
     assert not tracker.disabled
-    key = "exact_match,strict-match"
+    key = "fake_task,exact_match,strict-match"
     assert tracker.metric_sums[key] == 1.0, (
         "multi-digit answer scored as miss — process_results likely received "
         "a bare string so results[0] returned only the first character"
@@ -849,7 +850,103 @@ def test_running_score_tracker_process_results_list_convention():
 def test_running_score_tracker_task_groups_flattened():
     """Nested task_dict groups resolve to their leaf tasks."""
     from tensorrt_llm.evaluate.lm_eval import _RunningScoreTracker
+
     tracker = _RunningScoreTracker({"group": {"fake_task": _FakeTask()}}, 1)
     tracker.update(_FakeInstance("fake_task", {"answer": "42"}), "42")
     assert not tracker.disabled
-    assert tracker.metric_counts["exact_match,strict-match"] == 1
+    assert tracker.metric_counts["fake_task,exact_match,strict-match"] == 1
+
+
+def test_running_score_tracker_separate_keys_per_task():
+    """Two tasks with the same metric/filter don't mix their running estimates."""
+    from tensorrt_llm.evaluate.lm_eval import _RunningScoreTracker
+
+    task_a = _FakeTask()
+    task_b = _FakeTask()
+    tracker = _RunningScoreTracker({"task_a": task_a, "task_b": task_b}, 999)
+    tracker.update(_FakeInstance("task_a", {"answer": "x"}), "x")  # correct
+    tracker.update(_FakeInstance("task_b", {"answer": "x"}), "y")  # wrong
+    assert not tracker.disabled
+    assert tracker.metric_sums["task_a,exact_match,strict-match"] == 1.0
+    assert tracker.metric_sums["task_b,exact_match,strict-match"] == 0.0
+
+
+# ===========================================================================
+# _parse_partial_scores_env — env-var parsing
+# ===========================================================================
+
+
+def test_parse_partial_scores_env_positive(monkeypatch):
+    """A positive integer returns that interval."""
+    from tensorrt_llm.evaluate.lm_eval import PARTIAL_SCORES_ENV_VAR, _parse_partial_scores_env
+
+    monkeypatch.setenv(PARTIAL_SCORES_ENV_VAR, "100")
+    assert _parse_partial_scores_env() == 100
+
+
+def test_parse_partial_scores_env_zero_disables(monkeypatch):
+    """Zero disables partial scoring (returns None)."""
+    from tensorrt_llm.evaluate.lm_eval import PARTIAL_SCORES_ENV_VAR, _parse_partial_scores_env
+
+    monkeypatch.setenv(PARTIAL_SCORES_ENV_VAR, "0")
+    assert _parse_partial_scores_env() is None
+
+
+def test_parse_partial_scores_env_negative_disables(monkeypatch):
+    """Negative values disable partial scoring (returns None)."""
+    from tensorrt_llm.evaluate.lm_eval import PARTIAL_SCORES_ENV_VAR, _parse_partial_scores_env
+
+    monkeypatch.setenv(PARTIAL_SCORES_ENV_VAR, "-5")
+    assert _parse_partial_scores_env() is None
+
+
+def test_parse_partial_scores_env_invalid_raises(monkeypatch):
+    """A non-integer value raises ValueError."""
+    from tensorrt_llm.evaluate.lm_eval import PARTIAL_SCORES_ENV_VAR, _parse_partial_scores_env
+
+    monkeypatch.setenv(PARTIAL_SCORES_ENV_VAR, "abc")
+    with pytest.raises(ValueError, match=PARTIAL_SCORES_ENV_VAR):
+        _parse_partial_scores_env()
+
+
+def test_parse_partial_scores_env_unset_returns_none(monkeypatch):
+    """Unset env var returns None."""
+    from tensorrt_llm.evaluate.lm_eval import PARTIAL_SCORES_ENV_VAR, _parse_partial_scores_env
+
+    monkeypatch.delenv(PARTIAL_SCORES_ENV_VAR, raising=False)
+    assert _parse_partial_scores_env() is None
+
+
+# ===========================================================================
+# LmEvalWrapper.generate_until — partial scorer invocation
+# ===========================================================================
+
+
+def test_generate_until_invokes_partial_scorer():
+    """generate_until calls scorer.update and scorer.maybe_log for each response."""
+    from tensorrt_llm.evaluate.lm_eval import LmEvalWrapper, _RunningScoreTracker
+
+    fake_output = MagicMock()
+    fake_output.result.return_value.outputs = [MagicMock(text="42")]
+    fake_llm = MagicMock()
+    fake_llm.generate_async.return_value = fake_output
+
+    wrapper = LmEvalWrapper(
+        llm=fake_llm,
+        partial_scores_every=1,
+        partial_scoring_task_dict={"fake_task": _FakeTask()},
+    )
+
+    fake_request = MagicMock()
+    fake_request.args = ("hello world", {})
+    fake_request.task_name = "fake_task"
+    fake_request.doc = {"answer": "42"}
+
+    with (
+        patch.object(_RunningScoreTracker, "update") as mock_update,
+        patch.object(_RunningScoreTracker, "maybe_log") as mock_log,
+    ):
+        wrapper.generate_until([fake_request], disable_tqdm=True)
+
+    mock_update.assert_called_once()
+    mock_log.assert_called_once_with(1, 1)
