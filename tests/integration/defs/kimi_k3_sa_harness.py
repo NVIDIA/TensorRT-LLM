@@ -62,6 +62,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
@@ -161,12 +162,18 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         # Parity runs force BOTH instances into the conservative regime via
         # KIMI_K3_CUDA_GRAPHS=0 (set in main) — a baseline compared against
         # an eager spec run must not execute under a different regime.
+        # KIMI_K3_SPEC_CUDA_GRAPHS=1 opts a spec-dec run into CUDA graphs
+        # (EXPERIMENTAL: SA is graph-safe by design — draft padding keeps
+        # shapes static — but the K3 verify/promote path is not yet
+        # certified under capture). Overlap stays off for spec runs.
         disable_overlap_scheduler=(speculative_config is not None
                                    or not _graphs_enabled()),
         cuda_graph_config=(CudaGraphConfig(enable_padding=True,
                                            max_batch_size=8)
-                           if speculative_config is None
-                           and _graphs_enabled() else None),
+                           if _graphs_enabled()
+                           and (speculative_config is None or os.environ.get(
+                               "KIMI_K3_SPEC_CUDA_GRAPHS", "0") == "1")
+                           else None),
         speculative_config=speculative_config,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
@@ -211,7 +218,11 @@ def _generate(llm, prompts, max_tokens: int, want_logprobs: bool = False):
                               temperature=0.0,
                               logprobs=5 if want_logprobs else None,
                               return_perf_metrics=want_stats)
+    t0 = time.monotonic()
     outputs = llm.generate(prompts, sampling)
+    wall = time.monotonic() - t0
+    print(f"[sanity] generate wall: {wall:.1f}s for {len(prompts)} prompts "
+          f"x {max_tokens} max_tokens")
     if want_stats:
         _print_spec_stats(outputs)
     return [out.outputs[0] for out in outputs]
