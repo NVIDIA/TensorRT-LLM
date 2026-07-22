@@ -13,461 +13,515 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import io
-import logging
+import json
 import os
 import subprocess
 import sys
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_common import s3_output_hooks
-from test_common.s3_output import (
-    FDRedirector,
-    FileSlice,
-    FileSliceReader,
-    SessionCapture,
-    UploadLogPlugin,
-)
+from test_common import s3_output, s3_output_hooks
+from test_common.s3_output import UploadLogPlugin
 
 
 class Report:
-    def __init__(self, when=None, outcome=None):
-        self.sections = []
+    def __init__(
+        self,
+        sections,
+        nodeid="test_module.py::test_case",
+        when="call",
+        outcome="passed",
+    ):
+        self.sections = sections
+        self.nodeid = nodeid
         self.when = when
         self.outcome = outcome
-
-
-class CaptureContext:
-    def __init__(self):
-        self.closed = False
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.closed = True
 
 
 class RecordingS3Client:
     def __init__(self):
         self.uploads = []
-        self.fileobj_uploads = []
 
     def upload_file(self, filepath, bucket, object_key, ExtraArgs=None):
-        self.uploads.append((filepath, bucket, object_key, ExtraArgs))
+        content = Path(filepath).read_bytes()
+        self.uploads.append((content, bucket, object_key, ExtraArgs))
 
-    def upload_fileobj(self, fileobj, bucket, object_key, ExtraArgs=None):
-        self.fileobj_uploads.append((fileobj.read(), bucket, object_key, ExtraArgs))
+
+class FailingS3Client:
+    def upload_file(self, filepath, bucket, object_key, ExtraArgs=None):
+        raise RuntimeError("upload error")
+
+
+class BlockingS3Client(RecordingS3Client):
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def upload_file(self, filepath, bucket, object_key, ExtraArgs=None):
+        self.started.set()
+        assert self.release.wait(timeout=10)
+        super().upload_file(filepath, bucket, object_key, ExtraArgs)
+
+
+class ConcurrentS3Client(RecordingS3Client):
+    def __init__(self, workers):
+        super().__init__()
+        self.barrier = threading.Barrier(workers)
+
+    def upload_file(self, filepath, bucket, object_key, ExtraArgs=None):
+        self.barrier.wait(timeout=5)
+        super().upload_file(filepath, bucket, object_key, ExtraArgs)
+
+
+class PluginManager:
+    def __init__(self):
+        self.plugins = {}
+
+    def getplugin(self, name):
+        return self.plugins.get(name)
+
+    def register(self, plugin, name):
+        self.plugins[name] = plugin
+
+
+class Config:
+    def __init__(self, **options):
+        self.options = options
+        self.option = SimpleNamespace(numprocesses=options.get("numprocesses"))
+        self.known_args_namespace = self.option
+        self.pluginmanager = PluginManager()
+
+    def getoption(self, name, default=None):
+        return self.options.get(name, default)
 
 
 def make_plugin(
     tmp_path,
-    inline_output_max_bytes,
-    capture_mode="timestamped",
-    session_capture=None,
+    inline_output_max_bytes=256,
+    skip_upload=True,
+    upload_mode="sync",
+    upload_workers=8,
 ):
     return UploadLogPlugin(
         endpoint_url="https://example.com",
         aws_access_key_id="user",
-        aws_secret_access_key=None,
+        aws_secret_access_key=None if skip_upload else "secret",
         bucket="bucket",
         upload_path="logs",
         output_path=str(tmp_path),
-        skip_upload=True,
-        capture_mode=capture_mode,
+        skip_upload=skip_upload,
+        upload_mode=upload_mode,
+        upload_workers=upload_workers,
         inline_output_max_bytes=inline_output_max_bytes,
-        session_capture=session_capture,
     )
 
 
-def write_log(tmp_path, test_name, filename, content):
-    test_dir = tmp_path / test_name
-    test_dir.mkdir()
-    (test_dir / filename).write_text(content, encoding="utf-8")
+def make_uploading_plugin(tmp_path, monkeypatch, client, **kwargs):
+    monkeypatch.setattr(s3_output, "_create_s3_client", lambda *args: client)
+    return make_plugin(tmp_path, skip_upload=False, **kwargs)
 
 
-def complete_makereport_hook(plugin, nodeid, report):
-    item = type("Item", (), {"nodeid": nodeid})()
-    hook = plugin.pytest_runtest_makereport(item, call=None)
+def process_report(plugin, report):
+    hook = plugin.pytest_runtest_logreport(report)
     next(hook)
-    with pytest.raises(StopIteration) as stop:
-        hook.send(report)
-    assert stop.value.value is report
-
-
-def test_capture_stays_open_after_successful_setup_report(tmp_path):
-    nodeid = "test_module.py::test_case"
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
-    capture = CaptureContext()
-    plugin._active_capture[nodeid] = {"stdout_redir": capture}
-
-    complete_makereport_hook(plugin, nodeid, Report(when="setup", outcome="passed"))
-
-    assert not capture.closed
-    assert nodeid in plugin._active_capture
-    plugin._close_capture(plugin._active_capture.pop(nodeid))
-
-
-@pytest.mark.parametrize(
-    ("when", "outcome"),
-    [
-        ("call", "passed"),
-        ("call", "failed"),
-        ("setup", "failed"),
-        ("setup", "skipped"),
-    ],
-)
-def test_capture_closes_before_terminal_report(tmp_path, when, outcome):
-    nodeid = "test_module.py::test_case"
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
-    capture = CaptureContext()
-    plugin._active_capture[nodeid] = {"stdout_redir": capture}
-
-    complete_makereport_hook(plugin, nodeid, Report(when=when, outcome=outcome))
-
-    assert capture.closed
-    assert nodeid not in plugin._active_capture
-
-
-def test_teardown_fallback_warns_when_capture_is_still_active(tmp_path, caplog):
-    nodeid = "test_module.py::test_case"
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
-    capture = CaptureContext()
-    plugin._active_capture[nodeid] = {"stdout_redir": capture}
-    item = type("Item", (), {"nodeid": nodeid})()
-
-    caplog.set_level(logging.WARNING, logger="test_common.s3_output")
-    hook = plugin.pytest_runtest_teardown(item, nextitem=None)
-    next(hook)
-
-    assert capture.closed
-    assert nodeid not in plugin._active_capture
-    assert "remained active until teardown" in caplog.text
-
     with pytest.raises(StopIteration):
         next(hook)
 
 
-def test_session_capture_closes_after_teardown(tmp_path):
-    nodeid = "test_module.py::test_case"
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=256, capture_mode="session")
-    capture = CaptureContext()
-    plugin._active_capture[nodeid] = {"stdout_redir": capture}
-    item = type("Item", (), {"nodeid": nodeid})()
-
-    hook = plugin.pytest_runtest_teardown(item, nextitem=None)
-    next(hook)
-    assert not capture.closed
-
-    with pytest.raises(StopIteration):
-        next(hook)
-    assert capture.closed
-    assert nodeid not in plugin._active_capture
-
-
-def test_small_stdout_is_inlined_without_upload(tmp_path):
-    test_name = "test-small"
-    write_log(tmp_path, test_name, "stdout.log", "ok\n")
+def test_small_stdout_remains_inline(tmp_path):
     plugin = make_plugin(tmp_path, inline_output_max_bytes=4)
-    report = Report()
+    report = Report([("Captured stdout call", "ok\n")])
 
-    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+    process_report(plugin, report)
 
-    assert report.sections == [("Captured stdout", "ok\n")]
-    assert plugin._deferred_uploads == []
-    assert not (tmp_path / test_name).exists()
+    assert report.sections == [("Captured stdout call", "ok\n")]
+    assert not s3_output._spool_root(str(tmp_path)).exists()
 
 
-def test_empty_stdout_is_removed_after_report(tmp_path):
-    test_name = "test-empty"
-    write_log(tmp_path, test_name, "stdout.log", "")
+def test_stdout_at_threshold_is_replaced_with_url(tmp_path):
     plugin = make_plugin(tmp_path, inline_output_max_bytes=4)
-    report = Report()
+    report = Report([("Captured stdout call", "four")])
 
-    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+    process_report(plugin, report)
 
-    assert report.sections == [("Captured stdout", "<empty>")]
-    assert plugin._deferred_uploads == []
-    assert not (tmp_path / test_name).exists()
-
-
-def test_large_stdout_keeps_existing_upload_report(tmp_path):
-    test_name = "test-large"
-    write_log(tmp_path, test_name, "stdout.log", "large output")
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=3)
-    report = Report()
-
-    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
-
-    assert len(report.sections) == 1
     section_name, section_content = report.sections[0]
-    assert section_name == "Captured stdout"
-    assert "upload skipped" in section_content
-    assert "large output" not in section_content
-    assert (tmp_path / test_name / "stdout.log").exists()
+    assert section_name == "Captured stdout call"
+    assert "4 bytes (upload skipped" in section_content
+    assert "/stdout-call.log" in section_content
+    assert "four" not in section_content
 
 
-def test_uploaded_stdout_is_removed_after_sync_upload(tmp_path):
-    test_name = "test-uploaded"
-    write_log(tmp_path, test_name, "stdout.log", "large output")
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=3)
-    plugin.skip_upload = False
-    plugin.s3 = RecordingS3Client()
-    report = Report()
+def test_logging_section_is_uploaded_even_when_small(tmp_path):
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
+    report = Report([("Captured log call", "log\n")])
 
-    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+    process_report(plugin, report)
 
-    assert len(plugin.s3.uploads) == 1
-    assert plugin.s3.uploads[0][1:] == (
-        "bucket",
-        "logs/test-uploaded/stdout.log",
-        {"ContentType": "text/plain"},
+    assert "upload skipped" in report.sections[0][1]
+    assert "/logging-call.log" in report.sections[0][1]
+
+
+def test_sync_upload_transforms_native_sections(tmp_path, monkeypatch):
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path,
+        monkeypatch,
+        client,
+        inline_output_max_bytes=0,
     )
-    assert len(report.sections) == 1
-    assert "uploaded to" in report.sections[0][1]
-    assert not (tmp_path / test_name).exists()
-
-
-def test_deferred_stdout_is_removed_after_upload_finishes(tmp_path):
-    test_name = "test-deferred"
-    write_log(tmp_path, test_name, "stdout.log", "large output")
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=3)
-    plugin.skip_upload = False
-    plugin.upload_mode = "deferred"
-    plugin.s3 = RecordingS3Client()
-    report = Report()
-
-    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
-
-    assert (tmp_path / test_name / "stdout.log").exists()
-    assert len(plugin._deferred_uploads) == 1
-
-    plugin.pytest_sessionfinish(session=None, exitstatus=0)
-
-    assert len(plugin.s3.uploads) == 1
-    assert plugin._deferred_uploads == []
-    assert not (tmp_path / test_name).exists()
-
-
-def test_file_slice_upload_reads_only_test_range(tmp_path):
-    test_name = "test-slice"
-    spool = tmp_path / "stdout-spool.log"
-    prefix = b"previous test\n"
-    content = b"parent\nchild\nparent again\n"
-    spool.write_bytes(prefix + content + b"next test\n")
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=3, capture_mode="session")
-    plugin.skip_upload = False
-    plugin.s3 = RecordingS3Client()
-    plugin._captured_slices[(test_name, "stdout.log")] = FileSlice(
-        str(spool), len(prefix), len(content)
+    report = Report(
+        [
+            ("Captured stdout setup", "setup output\n"),
+            ("custom", "keep me"),
+            ("Captured stderr call", "call error\n"),
+        ]
     )
-    report = Report()
 
-    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+    process_report(plugin, report)
+    plugin.pytest_sessionfinish(None, 0)
 
-    assert plugin.s3.fileobj_uploads == [
-        (
-            content,
-            "bucket",
-            "logs/test-slice/stdout.log",
-            {"ContentType": "text/plain"},
-        )
+    assert [upload[0] for upload in client.uploads] == [
+        b"setup output\n",
+        b"call error\n",
     ]
-    assert "uploaded to" in report.sections[0][1]
+    assert client.uploads[0][2].endswith("/stdout-setup.log")
+    assert client.uploads[1][2].endswith("/stderr-call.log")
+    assert report.sections[1] == ("custom", "keep me")
+    assert all("uploaded to" in report.sections[index][1] for index in (0, 2))
+    assert not s3_output._spool_root(str(tmp_path)).exists()
 
 
-def test_file_slice_reader_supports_upload_size_probe(tmp_path):
-    spool = tmp_path / "stdout-spool.log"
-    spool.write_bytes(b"prefix\ntest output\nsuffix\n")
-    file_slice = FileSlice(str(spool), len(b"prefix\n"), len(b"test output\n"))
-
-    with io.BufferedReader(FileSliceReader(file_slice)) as source_file:
-        assert source_file.tell() == 0
-        assert source_file.seek(0, os.SEEK_END) == file_slice.size
-        assert source_file.tell() == file_slice.size
-        assert source_file.seek(0) == 0
-        assert source_file.read() == b"test output\n"
-
-
-def test_session_capture_preserves_parent_and_child_stdout_order(tmp_path):
-    capture = SessionCapture(str(tmp_path))
-    capture.start()
-    child = None
-    try:
-        child = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import os, sys; sys.stdin.buffer.read(1); "
-                "os.write(1, b'child stdout\\n'); os.write(2, b'child stderr\\n')",
-            ],
-            stdin=subprocess.PIPE,
-        )
-        offsets = capture.snapshot()
-        os.write(1, b"parent before\n")
-        child.stdin.write(b"x")
-        child.stdin.close()
-        assert child.wait(timeout=10) == 0
-        os.write(1, b"parent after\n")
-        slices = capture.slices_since(offsets)
-    finally:
-        if child is not None and child.poll() is None:
-            child.kill()
-            child.wait()
-        capture.stop()
-
-    with io.BufferedReader(FileSliceReader(slices["stdout.log"])) as stdout_file:
-        assert stdout_file.read() == b"parent before\nchild stdout\nparent after\n"
-    with io.BufferedReader(FileSliceReader(slices["stderr.log"])) as stderr_file:
-        assert stderr_file.read() == b"child stderr\n"
-    capture.remove_files()
-
-
-class _EarlyConfig:
-    def __init__(self, capture="no", numprocesses=None):
-        self.option = SimpleNamespace(numprocesses=numprocesses)
-        self.known_args_namespace = SimpleNamespace(
-            capture=capture,
-            numprocesses=numprocesses,
-        )
-        self.cleanups = []
-
-    def add_cleanup(self, cleanup):
-        self.cleanups.append(cleanup)
-
-
-def test_early_capture_preserves_conftest_child_output_for_case(tmp_path, monkeypatch):
-    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
-    early_config = _EarlyConfig()
-    initial_hook = s3_output_hooks.pytest_load_initial_conftests(
-        early_config,
+def test_duplicate_capture_sections_get_distinct_objects(tmp_path):
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=0)
+    report = Report(
         [
-            "-s",
-            "--s3-upload-path=logs",
-            f"--output-dir={tmp_path}",
-        ],
-    )
-    child = None
-    capture = None
-    try:
-        next(initial_hook)
-        state = s3_output_hooks._capture_state(early_config)
-        assert state is not None
-        capture = state.capture
-        assert capture is not None
-        child = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import os, sys; sys.stdin.buffer.read(1); "
-                "os.write(1, b'child stdout\\n'); os.write(2, b'child stderr\\n')",
-            ],
-            stdin=subprocess.PIPE,
-        )
-
-        with pytest.raises(StopIteration):
-            next(initial_hook)
-
-        plugin = make_plugin(
-            tmp_path,
-            inline_output_max_bytes=0,
-            capture_mode="session",
-            session_capture=capture,
-        )
-        session = SimpleNamespace(config=SimpleNamespace())
-        session_hook = plugin.pytest_sessionstart(session)
-        next(session_hook)
-        with pytest.raises(StopIteration):
-            next(session_hook)
-
-        offsets = capture.snapshot()
-        os.write(1, b"parent before\n")
-        child.stdin.write(b"x")
-        child.stdin.close()
-        assert child.wait(timeout=10) == 0
-        os.write(1, b"parent after\n")
-        slices = capture.slices_since(offsets)
-        capture.stop()
-
-        with io.BufferedReader(FileSliceReader(slices["stdout.log"])) as stdout_file:
-            assert stdout_file.read() == b"parent before\nchild stdout\nparent after\n"
-        with io.BufferedReader(FileSliceReader(slices["stderr.log"])) as stderr_file:
-            assert stderr_file.read() == b"child stderr\n"
-    finally:
-        if child is not None and child.poll() is None:
-            child.kill()
-            child.wait()
-        if capture is not None:
-            capture.stop()
-        for cleanup in early_config.cleanups:
-            cleanup()
-
-
-def test_early_capture_skips_xdist_controller(tmp_path, monkeypatch):
-    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
-    early_config = _EarlyConfig(numprocesses=2)
-    initial_hook = s3_output_hooks.pytest_load_initial_conftests(
-        early_config,
-        [
-            "-s",
-            "-n",
-            "2",
-            "--s3-upload-path=logs",
-            f"--output-dir={tmp_path}",
-        ],
+            ("Captured stdout call", "first"),
+            ("Captured stdout call", "second"),
+        ]
     )
 
-    next(initial_hook)
-    assert s3_output_hooks._capture_state(early_config) is None
-    with pytest.raises(StopIteration):
-        next(initial_hook)
+    process_report(plugin, report)
+
+    assert "/stdout-call.log" in report.sections[0][1]
+    assert "/stdout-call-1.log" in report.sections[1][1]
 
 
-def test_s3_plugin_registration_runs_on_xdist_worker_only(monkeypatch):
+def test_same_nodeid_rerun_gets_distinct_test_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(s3_output.time, "time", lambda: 1234)
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=0)
+    nodeid = "test_module.py::test_case"
+
+    plugin.pytest_runtest_logstart(nodeid, None)
+    first_name = plugin._test_names[nodeid]
+    plugin.pytest_runtest_logfinish(nodeid, None)
+    plugin.pytest_runtest_logstart(nodeid, None)
+    second_name = plugin._test_names[nodeid]
+
+    assert second_name == f"{first_name}-1"
+
+
+def test_failed_report_keeps_only_recent_bounded_output(tmp_path):
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=0)
+    content = "".join(f"line-{index:03d}\n" for index in range(250))
+    report = Report(
+        [("Captured stdout call", content)],
+        outcome="failed",
+    )
+
+    process_report(plugin, report)
+
+    section_content = report.sections[0][1]
+    assert "Last 200 lines:" in section_content
+    assert "line-000" not in section_content
+    assert "line-249" in section_content
+
+    large_line = "x" * 70000
+    report = Report(
+        [("Captured stderr call", large_line)],
+        nodeid="test_module.py::test_other",
+        outcome="failed",
+    )
+    process_report(plugin, report)
+    assert "... [truncated]" in report.sections[0][1]
+    assert len(report.sections[0][1].encode()) < 66000
+
+
+def test_deferred_upload_starts_before_session_finish(tmp_path, monkeypatch):
+    client = BlockingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path,
+        monkeypatch,
+        client,
+        inline_output_max_bytes=0,
+        upload_mode="deferred",
+        upload_workers=1,
+    )
+    report = Report([("Captured stdout call", "background output")])
+
+    process_report(plugin, report)
+
+    assert client.started.wait(timeout=5)
+    assert "scheduled for upload" in report.sections[0][1]
+    client.release.set()
+    plugin.pytest_sessionfinish(None, 0)
+    assert client.uploads[0][0] == b"background output"
+    assert not s3_output._spool_root(str(tmp_path)).exists()
+
+
+def test_parent_drain_retries_upload_left_by_failed_process(tmp_path, monkeypatch):
+    plugin = make_uploading_plugin(
+        tmp_path,
+        monkeypatch,
+        FailingS3Client(),
+        inline_output_max_bytes=0,
+    )
+    report = Report([("Captured stdout call", "recover me")])
+    process_report(plugin, report)
+    assert "upload failed" in report.sections[0][1]
+
+    config_path = Path(plugin._spool_config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["pid"] = 99999999
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    client = RecordingS3Client()
+    monkeypatch.setattr(s3_output, "_create_s3_client", lambda *args: client)
+    assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
+    assert client.uploads[0][0] == b"recover me"
+    assert client.uploads[0][2].endswith("/stdout-call.log")
+    assert not s3_output._spool_root(str(tmp_path)).exists()
+
+
+def test_parent_drain_uses_configured_upload_workers(tmp_path, monkeypatch):
+    plugin = make_uploading_plugin(
+        tmp_path,
+        monkeypatch,
+        RecordingS3Client(),
+        upload_workers=2,
+    )
+    plugin._write_spool_file("test", "stdout-call.log", "stdout")
+    plugin._write_spool_file("test", "stderr-call.log", "stderr")
+    config_path = Path(plugin._spool_config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["pid"] = 99999999
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    client = ConcurrentS3Client(workers=2)
+    monkeypatch.setattr(s3_output, "_create_s3_client", lambda *args: client)
+
+    assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
+    assert sorted(upload[0] for upload in client.uploads) == [b"stderr", b"stdout"]
+    assert not s3_output._spool_root(str(tmp_path)).exists()
+
+
+def test_parent_drain_skips_live_pytest_process(tmp_path, monkeypatch):
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path,
+        monkeypatch,
+        client,
+        inline_output_max_bytes=0,
+        upload_mode="deferred",
+    )
+    plugin._write_spool_file("test", "stdout-call.log", "still active")
+
+    assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
+    assert client.uploads == []
+    assert Path(plugin._spool_config_path).exists()
+    plugin.pytest_sessionfinish(None, 0)
+
+
+def test_register_plugin_requires_native_fd_capture(tmp_path):
+    config = Config(
+        **{
+            "--s3-upload-path": "logs",
+            "--output-dir": str(tmp_path),
+            "--s3-skip-upload": True,
+            "capture": "no",
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires pytest --capture=fd"):
+        s3_output.register_plugin(config)
+
+
+def test_register_plugin_uses_report_transformer(tmp_path):
+    config = Config(
+        **{
+            "--s3-upload-path": "logs",
+            "--output-dir": str(tmp_path),
+            "--s3-skip-upload": True,
+            "--s3-endpoint": "https://example.com",
+            "--s3-username": "user",
+            "--s3-bucket": "bucket",
+            "capture": "fd",
+        }
+    )
+
+    plugin = s3_output.register_plugin(config)
+
+    assert isinstance(plugin, UploadLogPlugin)
+    assert config.pluginmanager.getplugin("upload_log_plugin") is plugin
+
+
+def test_s3_hook_skips_xdist_controller(monkeypatch):
+    registered = []
+    monkeypatch.setattr(s3_output_hooks.s3_output, "register_plugin", registered.append)
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
-    registered_configs = []
 
-    def register_plugin(config, session_capture=None):
-        registered_configs.append(config)
-        return object()
-
-    monkeypatch.setattr(s3_output_hooks.s3_output, "register_plugin", register_plugin)
-    controller_config = _EarlyConfig(numprocesses=2)
-    s3_output_hooks.pytest_configure(controller_config)
-    assert registered_configs == []
+    controller = Config(numprocesses=2)
+    s3_output_hooks.pytest_configure(controller)
+    assert registered == []
 
     monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
-    worker_config = _EarlyConfig(numprocesses=2)
-    s3_output_hooks.pytest_configure(worker_config)
-    assert registered_configs == [worker_config]
+    worker = Config(numprocesses=2)
+    s3_output_hooks.pytest_configure(worker)
+    assert registered == [worker]
 
 
-def test_small_log_file_is_not_inlined(tmp_path):
-    test_name = "test-log"
-    write_log(tmp_path, test_name, "logging.log", "ok\n")
-    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
-    report = Report()
+def _write_nested_pytest_plugin(tmp_path, register_plugin=True):
+    tests_root = Path(s3_output.__file__).parents[1]
+    conftest = (
+        "from test_common import s3_output\n"
+        "def pytest_addoption(parser):\n"
+        "    parser.addoption('--output-dir')\n"
+        "    s3_output.add_options(parser)\n"
+    )
+    if register_plugin:
+        conftest += "def pytest_configure(config):\n    s3_output.register_plugin(config)\n"
+    (tmp_path / "conftest.py").write_text(conftest, encoding="utf-8")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join([str(tests_root), env.get("PYTHONPATH", "")])
+    return env
 
-    plugin.upload_and_report(report, test_name, "logging.log", "Captured log")
 
-    assert len(report.sections) == 1
-    section_name, section_content = report.sections[0]
-    assert section_name == "Captured log"
-    assert "upload skipped" in section_content
+def test_native_capture_is_replaced_before_junit_consumes_report(tmp_path):
+    env = _write_nested_pytest_plugin(tmp_path)
+    (tmp_path / "test_native.py").write_text(
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        "def test_output():\n"
+        "    os.write(1, b'parent before\\n')\n"
+        "    subprocess.run([sys.executable, '-c', "
+        "\"import os; os.write(1, b'child capture ' + b'x' * 300 + b'\\\\n')\"], check=True)\n"
+        "    os.write(1, b'parent after\\n')\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    xml_path = tmp_path / "results.xml"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--capture=fd",
+            "--s3-upload-path=logs",
+            f"--output-dir={output_dir}",
+            "--s3-skip-upload",
+            f"--junitxml={xml_path}",
+            "-o",
+            "junit_logging=all",
+            str(tmp_path / "test_native.py"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    xml = xml_path.read_text(encoding="utf-8")
+    assert "upload skipped" in xml
+    assert "child capture xxxxx" not in xml
+    assert "stdout-call.log" in xml
+    stdout_files = list(s3_output._spool_root(str(output_dir)).rglob("stdout-call.log"))
+    assert len(stdout_files) == 1
+    assert stdout_files[0].read_bytes() == (
+        b"parent before\n" + b"child capture " + b"x" * 300 + b"\nparent after\n"
+    )
 
 
-def test_fd_redirector_reader_thread_is_daemon_when_pipe_writer_lingers(tmp_path):
-    redir = FDRedirector(1, str(tmp_path / "stdout.log"))
-    proc = None
-    try:
-        redir.__enter__()
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        redir.__exit__(None, None, None)
+def test_xdist_worker_transforms_report_before_controller_junit(tmp_path):
+    env = _write_nested_pytest_plugin(tmp_path, register_plugin=False)
+    (tmp_path / "test_xdist.py").write_text(
+        "import os\ndef test_output():\n    os.write(1, b'xdist capture ' + b'x' * 300)\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    xml_path = tmp_path / "results.xml"
 
-        assert redir._reader_thread is not None
-        assert redir._reader_thread.is_alive()
-        assert redir._reader_thread.daemon
-    finally:
-        if proc is not None:
-            proc.kill()
-            proc.wait()
-        if redir._reader_thread is not None:
-            redir._reader_thread.join(timeout=2.0)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-n",
+            "2",
+            "-p",
+            "test_common.s3_output_hooks",
+            "--capture=fd",
+            "--s3-upload-path=logs",
+            f"--output-dir={output_dir}",
+            "--s3-skip-upload",
+            f"--junitxml={xml_path}",
+            "-o",
+            "junit_logging=all",
+            str(tmp_path / "test_xdist.py"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    xml = xml_path.read_text(encoding="utf-8")
+    assert "upload skipped" in xml
+    assert "xdist capture xxxxx" not in xml
+    assert "stdout-call.log" in xml
+
+
+def test_native_capture_restores_timeout_output_to_console(tmp_path):
+    env = _write_nested_pytest_plugin(tmp_path)
+    (tmp_path / "test_timeout.py").write_text(
+        "import os\n"
+        "import time\n"
+        "import pytest\n"
+        "@pytest.mark.timeout(0.2, method='thread')\n"
+        "def test_timeout():\n"
+        "    os.write(1, b'timeout stdout\\n')\n"
+        "    os.write(2, b'timeout stderr\\n')\n"
+        "    time.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--capture=fd",
+            "--s3-upload-path=logs",
+            f"--output-dir={tmp_path / 'output'}",
+            "--s3-skip-upload",
+            str(tmp_path / "test_timeout.py"),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    console = result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "timeout stdout" in console
+    assert "timeout stderr" in console
+    assert "Timeout" in console
