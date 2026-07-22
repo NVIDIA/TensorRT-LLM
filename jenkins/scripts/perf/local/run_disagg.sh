@@ -67,6 +67,7 @@ source "$config_file"
 : "${build_wheel_flag:=}"
 : "${capture_nsys_flag:=}"
 : "${time_limit:=02:00:00}"
+: "${cluster_name:=}"
 
 # Normalize test list: prefer 'test_ids' bash array if set, else fall back to
 # legacy single 'test_id'. Either declares a non-empty list at this point.
@@ -231,6 +232,7 @@ for idx in "${!test_ids[@]}"; do
         --mounts "$mounts" \
         --llm-models-root "$llm_models_path" \
         --time "$time_limit" \
+        ${cluster_name:+--cluster-name "$cluster_name"} \
         "${install_args[@]}" \
         $build_wheel_flag \
         $capture_nsys_flag; then
