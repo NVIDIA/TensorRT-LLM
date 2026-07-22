@@ -1214,6 +1214,8 @@ class _KVCache:
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
         self._status = self.Status.SUSPENDED
+        if self._should_record_stats():
+            self.manager.record_request_suspended()
 
     # Resume, migrate buffers to GPU memory.
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
@@ -1403,8 +1405,15 @@ class _KVCache:
             # Clear tree_block for the partial block — it's now uncommitted.
             if self.num_committed_tokens % self.tokens_per_block != 0:
                 self._blocks[last_ordinal].tree_block = None
+        # A freshly-created cache starts SUSPENDED and is activated by this same
+        # resume() call, so gate the counter on _never_resumed: only a cache that
+        # was previously ACTIVE and got suspended counts as a preemption recovery.
+        # Without this, the counter would track request admissions, not preemption.
+        first_activation = self._never_resumed
         self._never_resumed = False
         self._status = self.Status.ACTIVE
+        if not first_activation and self._should_record_stats():
+            self.manager.record_request_resumed()
         return True
 
     def prefetch(self, target: CacheLevel) -> bool:

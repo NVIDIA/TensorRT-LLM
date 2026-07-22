@@ -3301,6 +3301,9 @@ class KVCacheManagerV2(BaseResourceManager):
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
         raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
+        suspended_requests, resumed_requests = (
+            self.impl.get_and_reset_iteration_suspend_resume_stats()
+        )
         primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)
         secondary_peak_stats_by_level = [
@@ -3386,6 +3389,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 primary_peak_stats,
                 secondary_peak_stats_by_level,
             ),
+            suspended_requests=suspended_requests,
+            resumed_requests=resumed_requests,
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
