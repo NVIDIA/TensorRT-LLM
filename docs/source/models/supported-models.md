@@ -78,7 +78,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Gemma4ForConditionalGeneration` | Untested          | Yes        | Untested                   | No                    | Yes             | No  | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Gemma4UnifiedForConditionalGeneration` | Untested          | Untested   | Untested                   | No                    | Yes             | No  | No               | No                | No     | Yes           | Untested         | No             | Yes                      | Untested              | Untested        |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | Yes | No               | No                | No     | Yes           | Untested         | Untested       | Yes                      | Untested              | Untested        |
-| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No  | No               | No                | No     | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
+| `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | No  | Yes              | No                | No     | Yes           | Untested         | No             | N/A                      | Untested              | Untested        |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120/SM121 and in BF16/FP8 KV cache dtype.
@@ -90,7 +90,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^9]: Audio modality only supported on E2B/E4B variants.
 [^10]: Audio requires a checkpoint with a `sound_config` and is supported only on the full (non-disaggregated) model path, not the EPD disaggregated path.
 [^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
-[^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release.
+[^12]: Supports text, image, and video inputs over the block-sparse attention path. The published MXFP8 checkpoint is dequantized on load so the runtime sees an effectively BF16 model. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture. KV cache reuse and MTP are not supported on the sparse-attention path in this release. One-model linear EAGLE-3 is supported; combining it with CUDA graphs requires the MSA kernels (`sparse_use_msa=True`, SM100).
 [^13]: The Cosmos 3 family also supports visual generation through the VisualGen API. See [Visual Generation Models](#visual-generation-models).
 
 # Multimodal Feature Support Matrix (PyTorch Backend)

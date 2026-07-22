@@ -480,10 +480,8 @@ class KvCacheCreator:
                 # External drafter: layers start from 0, normal PP distribution
                 # Resolve draft manager class from draft config — may differ
                 # from target (e.g. hybrid target + plain transformer draft).
-                draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-                    effective_draft_config,
-                    kv_cache_config,
-                    is_disagg=self._is_disagg)
+                draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+                    effective_draft_config, kv_cache_config)
                 total += self._per_manager_cache_cost(
                     draft_kv_cache_manager_cls, effective_draft_config,
                     kv_cache_config)
@@ -1048,10 +1046,17 @@ class KvCacheCreator:
         in the target model and don't produce a separate ModelConfig. We fall
         back to the target model's config via _get_effective_draft_config().
         """
-        if self._mapping.enable_attention_dp:
-            logger.info(
-                "Attention DP is enabled, separate draft KV cache is not supported."
-            )
+        if self._mapping.enable_attention_dp and getattr(
+                self._kv_cache_manager_cls, 'supports_shared_draft_layers',
+                True):
+            # Under attention DP, draft layers share the target manager (the
+            # layout existing deployments were validated with). A manager can
+            # opt out: MiniMax-M3's coalesces an index-K pool into its KV
+            # pages and exposes only synthetic AttentionOp tensors, which the
+            # dense Eagle3 drafter cannot attend against, so it requires the
+            # separate draft manager even under attention DP.
+            logger.info("Attention DP: draft layers share the target KV "
+                        "cache manager.")
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
@@ -1081,6 +1086,17 @@ class KvCacheCreator:
         if self._speculative_config.spec_dec_mode.is_external_drafter():
             return self._draft_config.pretrained_config.num_hidden_layers
         return get_num_spec_layers(self._speculative_config)
+
+    def _get_draft_kv_cache_manager_cls(self, effective_draft_config,
+                                        draft_kv_config):
+        """Resolve the draft manager class from the draft config, promoted
+        to V2 when the target manager is V2."""
+        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+        if self._is_kv_cache_manager_v2 and not issubclass(
+                draft_kv_cache_manager_cls, KVCacheManagerV2):
+            draft_kv_cache_manager_cls = KVCacheManagerV2
+        return draft_kv_cache_manager_cls
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -1146,8 +1162,8 @@ class KvCacheCreator:
                 f"Derived draft KV cache max_attention_window for separate "
                 f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
-        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
+        draft_kv_cache_manager_cls = self._get_draft_kv_cache_manager_cls(
+            effective_draft_config, draft_kv_config)
         draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
@@ -1157,12 +1173,23 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
+        # A target manager class may request a different page size for the
+        # separate draft manager (e.g. MiniMax-M3, see
+        # draft_manager_tokens_per_block there for the rationale).
+        draft_tpb = getattr(self._kv_cache_manager_cls,
+                            'draft_manager_tokens_per_block',
+                            self._tokens_per_block)
+        if draft_tpb != self._tokens_per_block:
+            logger.info(
+                f"Draft KV cache manager uses tokens_per_block={draft_tpb} "
+                f"(target uses {self._tokens_per_block}).")
+            draft_kv_config.tokens_per_block = draft_tpb
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=draft_kv_config,
-            tokens_per_block=self._tokens_per_block,
+            tokens_per_block=draft_tpb,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
