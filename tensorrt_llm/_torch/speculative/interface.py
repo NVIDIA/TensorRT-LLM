@@ -526,6 +526,16 @@ class SpecMetadata:
     # Defaults to True so non-one-engine paths (where populate is a no-op)
     # never accidentally select the advanced graph variant.
     is_all_greedy_sample: bool = True
+    # Group-synchronized override for ``is_all_greedy_sample`` (AND over the
+    # TP group's local flags; None = no group sync configured, use the local
+    # value). Under ADP + LM-head TP with rejection sampling, the greedy-vs-
+    # advanced choice gates group collectives, so all ranks must take the same
+    # path even though their batches (and thus local flags) differ. Set by
+    # ``_sync_group_all_greedy_sample`` before the CUDA graph key is built and
+    # re-applied by ``_scan_one_model_sampling`` on every rescan. AND is safe:
+    # a greedy rank pulled onto the advanced path still samples greedily via
+    # its sentinel params.
+    group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
@@ -830,7 +840,28 @@ class SpecMetadata:
                 for (_, _, _, num_tokens) in per_request_normalized
             ]
 
+        # Apply the group-synchronized override last (semantics: see the
+        # ``group_all_greedy_sample`` field comment). Local contract: the
+        # synced value already incorporates any capture override, and rescans
+        # (e.g. populate after the graph key) must converge to it rather than
+        # resurrect the local value.
+        if self.group_all_greedy_sample is not None:
+            self.is_all_greedy_sample = self.group_all_greedy_sample
+
         return per_request_normalized, per_request_slot_ids
+
+    @property
+    def wants_advanced_draft_sampling(self) -> bool:
+        """Whether the current batch takes the advanced (rejection) draft
+        path: rejection sampling enabled AND not an all-greedy batch.
+
+        Single source of truth for the greedy-vs-advanced decision: the
+        sampler branch (``sample_draft_tokens``) and the worker's LM-head-TP
+        bypass (``_forward_linear_draft_loop``) must agree exactly -- a
+        divergence feeds the wrong logits layout to the sampler -- so both
+        read this property instead of re-deriving the predicate.
+        """
+        return self.use_rejection_sampling and not self.is_all_greedy_sample
 
     def update_is_all_greedy_sample(self, requests: list["LlmRequest"]) -> None:
         """Refresh ``is_all_greedy_sample`` for the *current* batch.
@@ -1441,15 +1472,16 @@ class SpecWorkerBase(nn.Module, ABC):
         (see ``_draft_logits_are_sharded``); replicated full-vocab logits are
         returned unchanged.
 
-        Plain TP gathers vocab shards over ``self.mapping``. ADP + LM-head TP
-        never reaches this path: rejection sampling (the only consumer of
-        advanced draft sampling) is config-gated off under attention DP, and
-        the group-stacked sharded logits it produces are handled by the greedy
-        path in ``greedy_sample_draft_with_tp_gather``.
+        Plain TP gathers vocab shards over ``self.mapping``. The LM-head-TP
+        stacked/sharded layout never reaches this path: an advanced-sampling
+        batch bypasses the LM-head-TP fast path in the worker and computes
+        full-vocab logits locally from the (ADP-replicated) lm_head weight, so
+        ``mapping_lm_head_tp`` is only ever passed alongside greedy sampling.
         """
         assert mapping_lm_head_tp is None, (
-            "Advanced draft sampling is not supported under ADP + LM-head TP "
-            "(rejection sampling is config-gated off with attention DP)")
+            "Advanced draft sampling must not receive LM-head-TP "
+            "stacked/sharded logits; the worker bypasses the LM-head-TP fast "
+            "path for non-all-greedy batches (see _forward_linear_draft_loop)")
         if (spec_metadata is None or spec_metadata.is_all_greedy_sample
                 or not self._draft_logits_are_sharded(logits, spec_metadata)):
             return logits
@@ -1972,7 +2004,6 @@ class SpecWorkerBase(nn.Module, ABC):
         no slicing is needed.
         """
         is_block = logits.dim() == 3
-        use_rejection = getattr(spec_metadata, "use_rejection_sampling", False)
 
         # Draft tokens use argmax unless rejection sampling is engaged for a
         # non-greedy batch. Rejection sampling is the only path that needs the
@@ -1983,7 +2014,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # max_i p_i >= sum_i p_i^2 = E[accept] for a stochastic draft). This
         # matches sglang/vLLM, which draft with argmax/top-k by default and apply
         # sampling params only on the target/acceptance side.
-        advanced = use_rejection and not spec_metadata.is_all_greedy_sample
+        advanced = spec_metadata.wants_advanced_draft_sampling
 
         # All samplers below return tokens in draft-vocab space; d2t is applied
         # once after the branch.
