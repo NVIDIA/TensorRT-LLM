@@ -39,6 +39,9 @@ from .impl import (
     scatter_write_result,
 )
 
+# Deprecated compatibility name retained for imports from the #15618 API.
+TransferContext = RecvBounceContext
+
 __all__ = [
     "BounceTransport",
     "Buffer",
@@ -53,6 +56,7 @@ __all__ = [
     "Sizing",
     "SizingContext",
     "SlotAllocator",
+    "TransferContext",
     "TransferState",
     "VmmBounceTransport",
     "WriterState",

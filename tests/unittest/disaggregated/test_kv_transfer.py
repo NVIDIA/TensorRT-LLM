@@ -55,6 +55,7 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 
@@ -645,6 +646,9 @@ def add_and_verify_request(
         valid_gen_transfer_workers = gen_transfer_workers
 
     unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    schedule_style = (
+        DisaggScheduleStyle.CONTEXT_FIRST if send_first else DisaggScheduleStyle.GENERATION_FIRST
+    )
     ctx_request = LlmRequest(
         request_id=ctx_request_id,
         max_new_tokens=1,
@@ -655,7 +659,10 @@ def add_and_verify_request(
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
     )
-    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+    ctx_request.py_disaggregated_params = DisaggregatedParams(
+        disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
+    )
 
     ctx_request.add_new_token(8 + ctx_request_id, 0)
     ctx_request.py_draft_tokens = [
@@ -695,6 +702,7 @@ def add_and_verify_request(
         ctx_dp_rank=ctx_dp_rank,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
     )
     # Add sequence to gen KV cache managers
     gen_kv_caches = []

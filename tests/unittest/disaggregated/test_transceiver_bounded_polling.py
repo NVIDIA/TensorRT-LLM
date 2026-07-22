@@ -49,6 +49,44 @@ class _FakeRequest:
     py_disaggregated_params: Optional[object] = None
 
 
+class _RetirementRequest:
+    """Request with an optionally fallible terminal-state assignment."""
+
+    def __init__(
+        self,
+        rid: int,
+        *,
+        fail_state: Optional[LlmRequestState] = None,
+    ) -> None:
+        self.request_id = rid
+        self.py_request_id = rid
+        self.py_disaggregated_params = None
+        self.py_kv_cache_xfer_bytes = 64
+        self.set_kv_cache_size = Mock()
+        self._state: Optional[LlmRequestState] = None
+        self._fail_state = fail_state
+        self._failure_pending = fail_state is not None
+        self.terminal_state_set_calls = 0
+
+    @property
+    def state(self) -> Optional[LlmRequestState]:
+        return self._state
+
+    @state.setter
+    def state(self, value: LlmRequestState) -> None:
+        if value in (
+            LlmRequestState.DISAGG_CONTEXT_COMPLETE,
+            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+            LlmRequestState.DISAGG_TRANS_ERROR,
+        ):
+            self.terminal_state_set_calls += 1
+        if value == self._fail_state:
+            if self._failure_pending:
+                self._failure_pending = False
+                raise RuntimeError("terminal state update failed")
+        self._state = value
+
+
 class _FakeTransferWorker:
     def __init__(self, shutdown_results: Optional[list[bool]] = None) -> None:
         self.sweep_count = 0
@@ -163,10 +201,10 @@ def _make_transceiver(
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
     transceiver._ctx_consensus_outcome = (
-        lambda _to_process, cancelled, failed, completed, timed_out, _cleanup_ready: (
-            cancelled,
-            failed,
-            completed,
+        lambda _to_process, cancelled, failed, completed, timed_out, cleanup_ready: (
+            [rid for rid in cancelled if rid in cleanup_ready],
+            [rid for rid in failed if rid in cleanup_ready],
+            [rid for rid in completed if rid in cleanup_ready],
             timed_out,
         )
     )
@@ -288,6 +326,275 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert 13 not in transceiver._send_reqs
 
 
+def test_context_provisional_cleanup_retries_and_readvertises_without_extra_consensus() -> None:
+    rid = 70
+    request = _RetirementRequest(rid)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    session.close = Mock(side_effect=[RuntimeError("close failed"), None])
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+    transceiver._ctx_consensus = Mock(side_effect=lambda local_ids: list(local_ids))
+
+    assert transceiver.check_context_transfer_status(0, mark_complete=True) == ([], [])
+    assert request.state is None
+    assert transceiver._send_sessions == {rid: session}
+    assert transceiver._send_reqs == {rid: request}
+    assert set(transceiver._get_context_retirements()) == {rid}
+
+    # The closed/provisional candidate remains in the normal ready
+    # advertisement. The existing outcome consensus is the only prepare
+    # barrier; no post-decision consensus round is added.
+    assert transceiver.check_context_transfer_status(0, mark_complete=True) == ([rid], [])
+    consensus_inputs = [call.args[0] for call in transceiver._ctx_consensus.call_args_list]
+    assert consensus_inputs == [[rid], [rid]]
+    assert transceiver._get_context_retirements() == {}
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+    assert session.close.call_count == 2
+
+
+def test_context_commit_invariant_failure_latches_fail_stop() -> None:
+    rid = 76
+    request = _RetirementRequest(rid, fail_state=LlmRequestState.DISAGG_CONTEXT_COMPLETE)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+
+    with pytest.raises(RuntimeError, match="terminal state update failed"):
+        transceiver.check_context_transfer_status(0, mark_complete=True)
+
+    assert transceiver._shutdown_started
+    assert transceiver._retirement_fault is not None
+    assert set(transceiver._get_context_retirements()) == {rid}
+    with pytest.raises(RuntimeError, match="retirement invariant failed"):
+        transceiver.check_context_transfer_status(0, mark_complete=True)
+    _NON_DRAINED_TRANSCEIVERS.discard(transceiver)
+
+
+def test_pending_context_retirement_does_not_block_positive_wait_on_unrelated_request() -> None:
+    rid = 71
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    session.close = Mock(side_effect=[RuntimeError("close failed"), None])
+    request = _RetirementRequest(rid)
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+    transceiver._ctx_consensus = Mock(side_effect=lambda local_ids: list(local_ids))
+
+    assert transceiver.check_context_transfer_status(0, mark_complete=True) == ([], [])
+
+    unrelated_rid = 72
+    unrelated_session = _FakeSession(rid=unrelated_rid, wait_result=None)
+    transceiver._send_sessions[unrelated_rid] = unrelated_session
+    transceiver._send_reqs[unrelated_rid] = _FakeRequest(request_id=unrelated_rid)
+
+    assert transceiver.check_context_transfer_status(1, mark_complete=True) == ([rid], [])
+    assert unrelated_session.blocking_calls == []
+    assert unrelated_rid in transceiver._send_sessions
+
+
+def test_provisional_context_owner_blocks_cancellation_and_rid_replacement() -> None:
+    rid = 77
+    request = _RetirementRequest(rid)
+    replacement = _RetirementRequest(rid)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    session.close = Mock(side_effect=RuntimeError("close pending"))
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+    transceiver._wait_reqs = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+
+    assert transceiver.check_context_transfer_status(0) == ([], [])
+    assert set(transceiver._get_context_retirements()) == {rid}
+    assert not transceiver.cancel_request(request)
+    with pytest.raises(RuntimeError, match="pending terminal retirement"):
+        transceiver.respond_and_send_async(replacement)
+
+    assert transceiver._send_sessions == {rid: session}
+    assert transceiver._send_reqs == {rid: request}
+
+
+def test_active_status_snapshot_blocks_cancellation_retirement_until_enrollment() -> None:
+    rid = 76
+    request = _RetirementRequest(rid)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+    transceiver._wait_reqs = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+
+    snapshot_taken = threading.Event()
+    release_consensus = threading.Event()
+
+    def pause_after_snapshot(local_ids: list[int]) -> list[int]:
+        snapshot_taken.set()
+        assert release_consensus.wait(timeout=2)
+        return list(local_ids)
+
+    transceiver._ctx_consensus = pause_after_snapshot
+    status_results: list[tuple[list[int], list[int]]] = []
+    errors: list[BaseException] = []
+
+    def poll_status() -> None:
+        try:
+            status_results.append(transceiver.check_context_transfer_status(0))
+        except BaseException as error:
+            errors.append(error)
+
+    poll_thread = threading.Thread(target=poll_status)
+    poll_thread.start()
+    assert snapshot_taken.wait(timeout=1)
+    try:
+        assert transceiver.cancel_request(request) is False
+        assert session.cancel_calls == 1
+        assert not session.closed
+        assert transceiver._send_sessions == {rid: session}
+        assert transceiver._send_reqs == {rid: request}
+    finally:
+        release_consensus.set()
+        poll_thread.join(timeout=2)
+
+    assert not poll_thread.is_alive()
+    assert errors == []
+    assert status_results == [([rid], [])]
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
+
+
+def test_prepare_context_cancellation_does_not_reverse_consensus_promotion() -> None:
+    rid = 75
+    request = _FakeRequest(request_id=rid)
+    transceiver = _make_transceiver({})
+    transceiver._wait_reqs = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker.has_all_peer_req_infos_for_send = Mock(return_value=True)
+
+    consensus_started = threading.Event()
+    release_consensus = threading.Event()
+
+    def pause_consensus(local_ids: list[int]) -> list[int]:
+        consensus_started.set()
+        assert release_consensus.wait(timeout=2)
+        return list(local_ids)
+
+    transceiver._ctx_consensus = pause_consensus
+    errors: list[BaseException] = []
+
+    def prepare() -> None:
+        try:
+            transceiver.prepare_context_requests([request])
+        except BaseException as error:
+            errors.append(error)
+
+    prepare_thread = threading.Thread(target=prepare)
+    prepare_thread.start()
+    assert consensus_started.wait(timeout=1)
+    try:
+        assert transceiver.cancel_request(request) is False
+        assert transceiver._wait_reqs == {rid: request}
+        assert transceiver._get_cancelled_wait_reqs() == {rid: request}
+    finally:
+        release_consensus.set()
+        prepare_thread.join(timeout=2)
+
+    assert not prepare_thread.is_alive()
+    assert errors == []
+    assert request.state == LlmRequestState.CONTEXT_INIT
+    assert transceiver._wait_reqs == {}
+    assert transceiver._get_cancelled_wait_reqs() == {rid: request}
+
+    assert transceiver.cancel_request(request) is True
+    assert transceiver._wait_reqs == {}
+    assert transceiver._get_cancelled_wait_reqs() == {}
+
+
+def test_prepare_context_cancellation_before_wait_enrollment_blocks_admission() -> None:
+    rid = 73
+    request = _FakeRequest(request_id=rid)
+    transceiver = _make_transceiver({})
+    transceiver._wait_reqs = {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._transfer_worker.has_all_peer_req_infos_for_send = Mock(return_value=True)
+    transceiver._ctx_consensus = Mock(side_effect=lambda local_ids: list(local_ids))
+
+    status_admitted = threading.Event()
+    release_enrollment = threading.Event()
+    prepare_impl = transceiver._prepare_context_requests_impl
+
+    def pause_before_enrollment(requests: list[_FakeRequest]) -> None:
+        status_admitted.set()
+        assert release_enrollment.wait(timeout=2)
+        prepare_impl(requests)
+
+    transceiver._prepare_context_requests_impl = pause_before_enrollment
+    errors: list[BaseException] = []
+
+    def prepare() -> None:
+        try:
+            transceiver.prepare_context_requests([request])
+        except BaseException as error:
+            errors.append(error)
+
+    prepare_thread = threading.Thread(target=prepare)
+    prepare_thread.start()
+    assert status_admitted.wait(timeout=1)
+    try:
+        assert transceiver.cancel_request(request) is False
+        assert transceiver._wait_reqs == {}
+        assert transceiver._get_cancelled_wait_reqs() == {rid: request}
+    finally:
+        release_enrollment.set()
+        prepare_thread.join(timeout=2)
+
+    assert not prepare_thread.is_alive()
+    assert errors == []
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+    assert transceiver._wait_reqs == {rid: request}
+    assert transceiver._get_cancelled_wait_reqs() == {rid: request}
+    transceiver._ctx_consensus.assert_called_once_with([])
+
+    assert transceiver.cancel_request(request) is True
+    assert transceiver._wait_reqs == {}
+    assert transceiver._get_cancelled_wait_reqs() == {}
+
+
+def test_respond_and_send_rejects_wait_ledger_owner_collision() -> None:
+    rid = 74
+    original = _FakeRequest(request_id=rid)
+    replacement = _FakeRequest(request_id=rid)
+    transceiver = _make_transceiver({})
+    transceiver._shutdown_started = False
+    transceiver._wait_reqs = {rid: original}
+
+    with pytest.raises(RuntimeError, match="different live source owner"):
+        transceiver.respond_and_send_async(replacement)
+    with pytest.raises(RuntimeError, match="still waiting for scheduler promotion"):
+        transceiver.respond_and_send_async(original)
+
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
+    assert transceiver._wait_reqs == {rid: original}
+
+
 def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
     # A worker that never sends skips the ctx consensus even when TP sync would need it, but still
     # sweeps so nothing leaks.
@@ -328,7 +635,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver._gen_consensus = Mock(return_value=[])
     transceiver._build_to_process = Mock(return_value=[])
     transceiver._gen_consensus_outcome = Mock(return_value=([], [], []))
-    transceiver._close_failed_sessions = Mock()
+    transceiver._dist = Mock(rank=0)
 
     completed, failed, cancelled = transceiver.check_gen_transfer_status(at_least_request_num=0)
 
@@ -336,6 +643,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+    transceiver._gen_consensus_outcome.assert_called_once_with([], [], [], [], [])
 
 
 def test_gen_transfer_status_retains_logical_failure_until_physical_drain() -> None:
@@ -427,6 +735,166 @@ def test_gen_transfer_status_retains_cancelled_session_until_wait_is_terminal() 
     assert rid not in transceiver._recv_reqs
 
 
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["kv_size", "aux", "history", "close"],
+)
+def test_generation_provisional_preparation_retries_each_fallible_phase(failure_stage: str) -> None:
+    rid = 73
+    request = _RetirementRequest(rid)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    session.close = Mock()
+    if failure_stage == "close":
+        session.close.side_effect = [RuntimeError("close failed"), None]
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver.kv_transfer_poll_interval_ms = 0
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    transceiver._gen_consensus = Mock(side_effect=lambda local_ids: list(local_ids))
+    transceiver._gen_consensus_outcome = (
+        lambda _to_process, cancelled, failed, completed, cleanup_ready: (
+            [rid for rid in cancelled if rid in cleanup_ready],
+            [rid for rid in failed if rid in cleanup_ready],
+            [rid for rid in completed if rid in cleanup_ready],
+        )
+    )
+    transceiver._need_aux_transfer = Mock(return_value=True)
+    transceiver._apply_aux = Mock()
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._dist = Mock(rank=0)
+    if failure_stage == "kv_size":
+        request.set_kv_cache_size.side_effect = [
+            RuntimeError("kv size failed"),
+            None,
+        ]
+    elif failure_stage == "aux":
+        transceiver._apply_aux.side_effect = [RuntimeError("aux failed"), None]
+    elif failure_stage == "history":
+        transceiver._assert_disagg_history_declared.side_effect = [
+            RuntimeError("history failed"),
+            None,
+        ]
+
+    assert transceiver.check_gen_transfer_status(0) == ([], [], [])
+    progress = transceiver._get_generation_retirements()[rid]
+    failed_flag = {
+        "kv_size": "kv_size_set",
+        "aux": "aux_applied",
+        "history": "history_checked",
+        "close": "session_closed",
+    }[failure_stage]
+    assert not getattr(progress, failed_flag)
+    assert request.state is None
+    assert transceiver._recv_sessions == {rid: session}
+    assert transceiver._recv_reqs == {rid: request}
+
+    assert transceiver.check_gen_transfer_status(0) == ([rid], [], [])
+    consensus_inputs = [call.args[0] for call in transceiver._gen_consensus.call_args_list]
+    assert consensus_inputs == [[rid], [rid]]
+    assert transceiver._get_generation_retirements() == {}
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+    expected_kv_size_calls = 2 if failure_stage == "kv_size" else 1
+    assert request.set_kv_cache_size.call_count == expected_kv_size_calls
+    request.set_kv_cache_size.assert_called_with(64)
+    expected_aux_calls = 2 if failure_stage == "aux" else 1
+    assert transceiver._apply_aux.call_count == expected_aux_calls
+    expected_history_calls = 2 if failure_stage == "history" else 1
+    assert transceiver._assert_disagg_history_declared.call_count == expected_history_calls
+    expected_close_calls = 2 if failure_stage == "close" else 1
+    assert session.close.call_count == expected_close_calls
+    assert request.terminal_state_set_calls == 1
+
+
+def test_generation_provisional_candidate_waits_for_peer_and_readvertises() -> None:
+    rid = 75
+    request = _RetirementRequest(rid)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = True
+    transceiver.kv_transfer_poll_interval_ms = 0
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    transceiver._gen_consensus = Mock(side_effect=lambda local_ids: list(local_ids))
+    # The local candidate is fully prepared on the first poll, but the peer is
+    # not cleanup-ready. On the next poll the peer catches up and the same
+    # existing outcome consensus admits the decision.
+    transceiver._gen_consensus_outcome = Mock(side_effect=[([], [], []), ([], [], [rid])])
+    transceiver._need_aux_transfer = Mock(return_value=False)
+    transceiver._assert_disagg_history_declared = Mock()
+    transceiver._dist = Mock(rank=0)
+
+    assert transceiver.check_gen_transfer_status(0) == ([], [], [])
+    assert request.state is None
+    assert transceiver._recv_sessions == {rid: session}
+    assert transceiver._recv_reqs == {rid: request}
+    assert set(transceiver._get_generation_retirements()) == {rid}
+    assert session.closed
+    assert session.blocking_calls == [False]
+
+    assert transceiver.check_gen_transfer_status(0) == ([rid], [], [])
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    assert session.blocking_calls == [False]
+    assert [call.args[0] for call in transceiver._gen_consensus.call_args_list] == [[rid], [rid]]
+
+
+def test_shutdown_retains_decided_retirement_until_local_commit() -> None:
+    rid = 74
+    close_allowed = False
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+
+    def close_session() -> None:
+        if not close_allowed:
+            raise RuntimeError("close still pending")
+        session.closed = True
+
+    session.close = Mock(side_effect=close_session)
+    request = _RetirementRequest(rid)
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+    transceiver._shutdown = False
+    transceiver._shutdown_started = False
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._wait_reqs = {}
+
+    assert transceiver.check_context_transfer_status(0, mark_complete=True) == ([], [])
+    try:
+        assert transceiver.shutdown() is False
+        assert transceiver in _NON_DRAINED_TRANSCEIVERS
+        assert set(transceiver._get_context_retirements()) == {rid}
+        assert transceiver._send_sessions == {rid: session}
+        assert session.cancel_calls == 0
+
+        close_allowed = True
+        assert transceiver.shutdown() is True
+        assert transceiver not in _NON_DRAINED_TRANSCEIVERS
+        assert transceiver._get_context_retirements() == {}
+        assert transceiver._send_sessions == {}
+        assert request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+    finally:
+        _NON_DRAINED_TRANSCEIVERS.discard(transceiver)
+
+
 def test_gen_transfer_timeout_is_not_cleanup_ready() -> None:
     rid = 22
     session = _FakeSession(rid=rid, wait_result=WaitResult.TIMEOUT)
@@ -507,7 +975,7 @@ def test_async_send_rejects_a_distinct_owner_for_a_live_request_id() -> None:
     assert transceiver._send_sessions == {rid: session}
 
 
-def test_context_status_poll_does_not_retire_replacement_owner() -> None:
+def test_context_status_poll_retains_owner_and_blocks_replacement() -> None:
     rid = 21
     original = _FakeRequest(request_id=rid)
     replacement = _FakeRequest(request_id=rid)
@@ -529,8 +997,6 @@ def test_context_status_poll_does_not_retire_replacement_owner() -> None:
         return WaitResult.FAILED
 
     original_session.wait_complete.side_effect = wait_complete
-    replacement_session = Mock()
-
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown_started = False
@@ -563,23 +1029,25 @@ def test_context_status_poll_does_not_retire_replacement_owner() -> None:
     poll_thread.start()
     assert wait_started.wait(timeout=1)
     try:
-        assert transceiver.cancel_request(original)
-        with transceiver._session_admission_lock:
-            transceiver._send_sessions[rid] = replacement_session
-            transceiver._send_reqs[rid] = replacement
+        assert transceiver.cancel_request(original) is False
+        assert transceiver._send_sessions == {rid: original_session}
+        assert transceiver._send_reqs == {rid: original}
+        with pytest.raises(RuntimeError, match="different live source owner"):
+            transceiver.respond_and_send_async(replacement)
     finally:
         release_wait.set()
         poll_thread.join(timeout=2)
 
     assert not poll_thread.is_alive()
     assert errors == []
-    assert results == [([], [])]
-    assert transceiver._send_sessions == {rid: replacement_session}
-    assert transceiver._send_reqs == {rid: replacement}
-    replacement_session.close.assert_not_called()
+    assert results == [([], [rid])]
+    assert transceiver._send_sessions == {}
+    assert transceiver._send_reqs == {}
+    original_session.cancel.assert_called_once_with()
+    original_session.close.assert_called_once_with()
 
 
-def test_gen_status_poll_does_not_retire_replacement_owner() -> None:
+def test_gen_status_poll_retains_owner_and_blocks_replacement() -> None:
     rid = 23
     original = _FakeRequest(request_id=rid)
     replacement = _FakeRequest(request_id=rid)
@@ -601,8 +1069,6 @@ def test_gen_status_poll_does_not_retire_replacement_owner() -> None:
         return WaitResult.FAILED
 
     original_session.wait_complete.side_effect = wait_complete
-    replacement_session = Mock()
-
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._session_admission_lock = threading.RLock()
     transceiver._shutdown_started = False
@@ -633,20 +1099,22 @@ def test_gen_status_poll_does_not_retire_replacement_owner() -> None:
     poll_thread.start()
     assert wait_started.wait(timeout=1)
     try:
-        assert transceiver.cancel_request(original)
-        with transceiver._session_admission_lock:
-            transceiver._recv_sessions[rid] = replacement_session
-            transceiver._recv_reqs[rid] = replacement
+        assert transceiver.cancel_request(original) is False
+        assert transceiver._recv_sessions == {rid: original_session}
+        assert transceiver._recv_reqs == {rid: original}
+        with pytest.raises(RuntimeError, match="different live destination owner"):
+            transceiver.request_and_receive_async(replacement)
     finally:
         release_wait.set()
         poll_thread.join(timeout=2)
 
     assert not poll_thread.is_alive()
     assert errors == []
-    assert results == [([], [], [])]
-    assert transceiver._recv_sessions == {rid: replacement_session}
-    assert transceiver._recv_reqs == {rid: replacement}
-    replacement_session.close.assert_not_called()
+    assert results == [([], [rid], [])]
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+    original_session.cancel.assert_called_once_with()
+    original_session.close.assert_called_once_with()
 
 
 def test_cancel_request_retains_receive_session_until_writers_drain() -> None:
@@ -881,6 +1349,7 @@ def test_check_context_runs_consensus_after_a_send() -> None:
 
     transceiver.check_context_transfer_status(0)
     transceiver._ctx_consensus.assert_called_once()
+    transceiver._ctx_consensus_outcome.assert_called_once_with([], [], [], [], [], [])
 
 
 def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None:
@@ -1134,6 +1603,130 @@ def test_transceiver_shutdown_retains_owner_when_cleanup_raises(failure_stage: s
         assert transceiver._wait_reqs == {}
     finally:
         _NON_DRAINED_TRANSCEIVERS.discard(transceiver)
+
+
+def test_shutdown_does_not_drain_provisional_owner_during_active_status_call() -> None:
+    rid = 78
+    request = _RetirementRequest(rid)
+    session = _FakeSession(
+        rid=rid,
+        wait_result=WaitResult.COMPLETED,
+        is_completed=True,
+    )
+    transceiver = _make_transceiver({rid: session}, {rid: request})
+    transceiver._shutdown = False
+    transceiver._shutdown_started = False
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+    transceiver._wait_reqs = {}
+
+    enrolled = threading.Event()
+    release_prepare = threading.Event()
+    original_prepare = transceiver._prepare_context_retirements
+    prepare_calls = 0
+
+    def pause_after_enrollment() -> None:
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 2:
+            enrolled.set()
+            assert release_prepare.wait(timeout=2)
+        original_prepare()
+
+    transceiver._prepare_context_retirements = pause_after_enrollment
+    status_results: list[tuple[list[int], list[int]]] = []
+    errors: list[BaseException] = []
+
+    def poll_status() -> None:
+        try:
+            status_results.append(transceiver.check_context_transfer_status(0, mark_complete=True))
+        except BaseException as error:
+            errors.append(error)
+
+    poll_thread = threading.Thread(target=poll_status)
+    poll_thread.start()
+    assert enrolled.wait(timeout=1)
+    try:
+        assert transceiver.shutdown() is False
+        assert set(transceiver._get_context_retirements()) == {rid}
+        assert transceiver._send_sessions == {rid: session}
+        assert transceiver._transfer_worker.shutdown_count == 0
+    finally:
+        release_prepare.set()
+        poll_thread.join(timeout=2)
+
+    assert not poll_thread.is_alive()
+    assert errors == []
+    assert status_results == [([rid], [])]
+    assert transceiver.shutdown() is True
+    assert transceiver._transfer_worker.shutdown_count == 1
+    _NON_DRAINED_TRANSCEIVERS.discard(transceiver)
+
+
+def test_blocking_generation_poll_shutdown_cancels_without_deadlock() -> None:
+    rid = 79
+    request = _RetirementRequest(rid)
+    wait_started = threading.Event()
+    cancel_seen = threading.Event()
+    session = _FakeSession(rid=rid, wait_result=None)
+
+    def wait_complete(*, blocking: bool) -> WaitResult:
+        assert blocking
+        wait_started.set()
+        assert cancel_seen.wait(timeout=2)
+        return WaitResult.FAILED
+
+    def cancel_session() -> None:
+        session.cancel_calls += 1
+        session._status = SessionStatus.CANCELLED
+        cancel_seen.set()
+
+    session.wait_complete = wait_complete
+    session.cancel = cancel_session
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._session_admission_lock = threading.RLock()
+    transceiver._shutdown = False
+    transceiver._shutdown_started = False
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver.kv_transfer_poll_interval_ms = 0
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+    transceiver._wait_reqs = {}
+    transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._gen_consensus = lambda local_ids: list(local_ids)
+    transceiver._gen_consensus_outcome = (
+        lambda _to_process, cancelled, failed, completed, cleanup_ready: (
+            [candidate for candidate in cancelled if candidate in cleanup_ready],
+            [candidate for candidate in failed if candidate in cleanup_ready],
+            [candidate for candidate in completed if candidate in cleanup_ready],
+        )
+    )
+
+    status_results: list[tuple[list[int], list[int], list[_RetirementRequest]]] = []
+    errors: list[BaseException] = []
+
+    def poll_status() -> None:
+        try:
+            status_results.append(transceiver.check_gen_transfer_status(None))
+        except BaseException as error:
+            errors.append(error)
+
+    poll_thread = threading.Thread(target=poll_status)
+    poll_thread.start()
+    assert wait_started.wait(timeout=1)
+    assert transceiver.shutdown() is False
+    poll_thread.join(timeout=2)
+
+    assert not poll_thread.is_alive()
+    assert errors == []
+    assert status_results == [([], [], [request])]
+    assert transceiver._transfer_worker.shutdown_count == 0
+    assert transceiver.shutdown() is True
+    assert transceiver._transfer_worker.shutdown_count == 1
+    _NON_DRAINED_TRANSCEIVERS.discard(transceiver)
 
 
 @pytest.mark.parametrize("direction", ["send", "receive"])

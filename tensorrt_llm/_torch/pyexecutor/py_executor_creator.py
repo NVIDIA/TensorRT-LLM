@@ -339,6 +339,13 @@ def _teardown_kv_cache_managers_after_transceiver_shutdown(
     transceiver = getattr(py_executor, "kv_cache_transceiver", None)
     if transceiver is not None:
         shutdown_result = transceiver.shutdown()
+        requires_physical_drain = (getattr(
+            transceiver, "requires_physical_drain_before_request_release",
+            False) is True)
+        if requires_physical_drain and shutdown_result is not True:
+            raise RuntimeError(
+                "KV cache transceiver did not prove physical drain; refusing "
+                "to tear down KV cache managers")
         if shutdown_result is False:
             raise RuntimeError(
                 "KV cache transceiver still owns active transfer targets; "

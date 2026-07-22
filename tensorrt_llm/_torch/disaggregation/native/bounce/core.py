@@ -96,6 +96,7 @@ class RecvBounceContext:
     writer_ranks: Tuple[int, ...]
     destination_intervals: InitVar[Optional[Iterable[tuple[int, int]]]] = None
     on_done: Optional[Callable[[bool], None]] = None
+    on_logical_failure: Optional[Callable[[], None]] = None
 
     # Whether each physically terminal writer succeeded, keyed by its exact planned rank.
     _writer_ok: Dict[int, bool] = field(default_factory=dict)
@@ -110,6 +111,8 @@ class RecvBounceContext:
     scatter_state: ScatterState = ScatterState.IDLE
     state: TransferState = TransferState.INIT
     settled: bool = False
+    _logical_failure_notification_in_progress: bool = False
+    _logical_failure_notification_delivered: bool = False
 
     def __post_init__(self, destination_intervals: Optional[Iterable[tuple[int, int]]]) -> None:
         self.writer_ranks = tuple(self.writer_ranks)
@@ -148,6 +151,14 @@ class RecvBounceContext:
                     merged_intervals[-1] = (previous_start, max(previous_end, end))
                 else:
                     merged_intervals.append((start, end))
+            authorized_bytes = sum(end - start for start, end in merged_intervals)
+            reserved_bytes = self.per_writer_bytes * len(self.writer_ranks)
+            if authorized_bytes != reserved_bytes:
+                raise ValueError(
+                    "trusted destination interval union covers "
+                    f"{authorized_bytes} bytes, but the bounce reservation covers "
+                    f"{reserved_bytes} bytes"
+                )
             self._destination_intervals = tuple(merged_intervals)
 
     @staticmethod
@@ -254,6 +265,36 @@ class RecvBounceContext:
     def set_on_done(self, on_done: Optional[Callable[[bool], None]]) -> None:
         if on_done is not None:
             self.on_done = on_done
+
+    def set_on_logical_failure(self, on_logical_failure: Optional[Callable[[], None]]) -> None:
+        """Install the notification used when launched local CUDA work fails.
+
+        This notification is deliberately separate from ``on_done``.  The
+        latter acknowledges physical slot settlement, which is not safe after
+        a scatter error without a positive CUDA quiescence fence.
+        """
+        if on_logical_failure is not None:
+            self.on_logical_failure = on_logical_failure
+
+    def begin_logical_failure_notification(self) -> Optional[Callable[[], None]]:
+        """Claim the one retryable logical-failure notification, if ready."""
+        if (
+            self.scatter_state is not ScatterState.FAILED
+            or self.on_logical_failure is None
+            or self._logical_failure_notification_delivered
+            or self._logical_failure_notification_in_progress
+        ):
+            return None
+        self._logical_failure_notification_in_progress = True
+        return self.on_logical_failure
+
+    def finish_logical_failure_notification(self, delivered: bool) -> None:
+        """Commit or reopen a claimed logical-failure notification."""
+        if not self._logical_failure_notification_in_progress:
+            return
+        self._logical_failure_notification_in_progress = False
+        if delivered:
+            self._logical_failure_notification_delivered = True
 
     def mark_writer_exposed(self, peer_rank: int) -> bool:
         """Enter the publication boundary for a planned writer.
@@ -370,8 +411,13 @@ class RecvBounceContext:
                 scatter_intervals = self._non_overlapping_destination_intervals(
                     dst_values, size_values
                 )
-                valid_tail = scatter_intervals is not None and (
-                    sum(size_values) <= self.per_writer_bytes
+                # ``src_base`` names this writer's fixed bounce sub-region and
+                # scatter consumes the fragments contiguously from that base.
+                # Requiring the exact contribution prevents a success tail
+                # from silently truncating the authorized source mapping while
+                # still allowing any equivalent fragment segmentation.
+                valid_tail = (
+                    scatter_intervals is not None and sum(size_values) == self.per_writer_bytes
                 )
                 valid_tail = valid_tail and self._scatter_destinations_authorized(
                     dst_values, size_values
@@ -417,6 +463,10 @@ class RecvBounceContext:
         making the slot or destination KV observable as drained.
         """
         self.scatter_state = ScatterState.DONE if ok else ScatterState.FAILED
+        if not ok:
+            # Logical failure is known even though the slot and destination
+            # remain physically owned until local CUDA quiescence is proven.
+            self.mark_logical_failure()
 
     def suppress_scatter(self) -> None:
         """Fail work that was queued but provably never launched on CUDA."""
@@ -535,14 +585,30 @@ class BounceTransport(ABC):
         """Record backend-wide evidence and report when the bounce resource settles."""
 
     @abstractmethod
-    def retry_settlements(self) -> bool:
-        """Retry durable physical-settlement acknowledgements; return whether all were delivered."""
+    def retry_settlements(self, scope=None) -> bool:
+        """Retry durable settlement acknowledgements in scope.
+
+        ``scope`` is ``None`` for the whole transport, a request ID for every
+        slice of that request, or an exact ``(request_id, slice_id)`` key.
+        Return whether the selected scope has no pending acknowledgement.
+        """
 
     @abstractmethod
     def record_result(
-        self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
+        self,
+        rid_slice,
+        peer_rank,
+        dst_ptrs=None,
+        sizes=None,
+        src_base=None,
+        on_done=None,
+        on_logical_failure=None,
     ) -> None:
-        """Handle a writer's success; scatter and finalize once all writers reported."""
+        """Handle a writer's success; scatter and finalize once all writers reported.
+
+        ``on_logical_failure`` reports a launched local scatter failure without
+        claiming that the bounce slot has physically settled.
+        """
 
     @abstractmethod
     def record_failure(self, rid_slice, peer_rank, on_done=None) -> None:

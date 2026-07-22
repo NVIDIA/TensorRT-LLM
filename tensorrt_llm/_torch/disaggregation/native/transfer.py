@@ -2357,47 +2357,52 @@ class TxSession(TxSessionBase):
         beam_width: int = 1,
         source_owner: Optional[LlmRequest] = None,
     ):
-        super().__init__(
-            sender,
-            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
-        )
-        self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._sender: Sender  # narrow base class type for Pylance
-        self.request_id = request_id
-        self._aux_buffer = aux_buffer
-        # Keep the allocator-level request owner alive until every queued,
-        # active, or in-doubt source operation has terminal evidence.
+        # Keep the allocator-level request owner alive until every source
+        # operation is terminal. Enroll it before fallible initialization,
+        # then clear the parameter so propagated tracebacks are ownership-
+        # neutral.
         self._source_owner = source_owner
-        self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
-        # AUX contents become immutable once an AuxSendTask is published. This
-        # prevents fill_slot() from racing a worker/NIXL read of the same slot.
-        self._aux_packed = False
-        self.receiver_ready: bool = False
-        self.kv_tasks = []
-        self.aux_task = None
-        self.lock = threading.Lock()
-        self._close_lock = threading.Lock()
-
-        self._exception: Optional[Exception] = None
-        self._closed = False
-        self._accepting_operations = True
-        self._terminal_status: Optional[SessionStatus] = None
-        # Cancellation can precede task creation. Keep those no-access frames
-        # in the session lifecycle so a transient send failure cannot be
-        # discarded by close().
-        self._unbound_terminal_results: dict[UnboundTerminalKey, UnboundTerminalResult] = {}
-        self._terminal_retry_lock = threading.Lock()
-        self._next_terminal_retry_at = 0.0
-        # Must be last: makes session visible to listener thread,
-        # so all attributes above must be initialized first.
+        source_owner = None
+        self._aux_buffer = aux_buffer
+        self.aux_slot = None
         try:
+            super().__init__(
+                sender,
+                SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+            )
+            self._timeout_s = timeout_s
+            self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            self._sender: Sender  # narrow base class type for Pylance
+            self.request_id = request_id
+            self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
+            # AUX contents become immutable once an AuxSendTask is published.
+            # This prevents fill_slot() from racing a worker/NIXL read of the
+            # same slot.
+            self._aux_packed = False
+            self.receiver_ready: bool = False
+            self.kv_tasks = []
+            self.aux_task = None
+            self.lock = threading.Lock()
+            self._close_lock = threading.Lock()
+
+            self._exception: Optional[Exception] = None
+            self._closed = False
+            self._accepting_operations = True
+            self._terminal_status: Optional[SessionStatus] = None
+            # Cancellation can precede task creation. Keep those no-access
+            # frames in the session lifecycle so a transient send failure
+            # cannot be discarded by close().
+            self._unbound_terminal_results: dict[UnboundTerminalKey, UnboundTerminalResult] = {}
+            self._terminal_retry_lock = threading.Lock()
+            self._next_terminal_retry_at = 0.0
+            # Must be last: makes session visible to listener thread, so all
+            # attributes above must be initialized first.
             self._sender.setup_session(self)
         except Exception:
+            self._source_owner = None
             if self._aux_buffer is not None and self.aux_slot is not None:
                 self._aux_buffer.free_slot(self.aux_slot)
                 self.aux_slot = None
-            self._source_owner = None
             self._closed = True
             raise
 
@@ -2577,23 +2582,19 @@ class TxSession(TxSessionBase):
     def cancel(self) -> None:
         """Cancel the session and notify the remote receiver.
 
-        Safe to call multiple times. TRANSFERRING tasks keep running (mid-write).
-        Only INIT tasks have their events signalled immediately.
+        Safe to call multiple times. Active physical work keeps running, but
+        every unfinished task latches logical failure immediately. Source
+        access and pending-result ledgers remain authoritative for retirement.
         The lock serializes with _deliver_kv_to_agent() so has_transferring_tasks()
         is accurate the moment this returns.
         """
         admission_lock = getattr(self._sender, "_operation_admission_lock", None)
         with admission_lock if admission_lock is not None else nullcontext():
-            with self.lock:
-                self._accepting_operations = False
-                if self._terminal_status != SessionStatus.CANCELLED:
-                    self._terminal_status = SessionStatus.CANCELLED
-                    exc = RuntimeError(f"TxSession {self.disagg_request_id} cancelled")
-                    for task in self.kv_tasks:
-                        if task.status == TaskStatus.INIT:
-                            task.fail(exc)
-                    if self.aux_task is not None and self.aux_task.status == TaskStatus.INIT:
-                        self.aux_task.fail(exc)
+            self._latch_terminal_failure(
+                SessionStatus.CANCELLED,
+                RuntimeError(f"TxSession {self.disagg_request_id} cancelled"),
+                record_exception=False,
+            )
             # Tombstone, settle unused channels, and perform I/O outside the
             # session lock. Repeated cancel retries cached terminal decisions.
             self._sender.cancel_session(self)
@@ -2676,6 +2677,30 @@ class TxSession(TxSessionBase):
             return None
         return WaitResult.FAILED if terminal_failure else WaitResult.COMPLETED
 
+    def _latch_terminal_failure(
+        self,
+        status: SessionStatus,
+        exception: Exception,
+        *,
+        record_exception: bool,
+    ) -> bool:
+        """Atomically publish the first terminal failure and fail open tasks."""
+        if status not in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+            raise ValueError(f"invalid terminal failure status {status}")
+        with self.lock:
+            self._accepting_operations = False
+            if self._terminal_status is not None:
+                return False
+            self._terminal_status = status
+            if record_exception:
+                self._exception = exception
+            for task in self.kv_tasks:
+                if not task.is_done:
+                    task.fail(exception)
+            if self.aux_task is not None and not self.aux_task.is_done:
+                self.aux_task.fail(exception)
+            return True
+
     def set_exception(self, reason: str = ""):
         msg = f"TxSession {self.disagg_request_id} exception"
         if reason:
@@ -2683,15 +2708,11 @@ class TxSession(TxSessionBase):
         sender = getattr(self, "_sender", None)
         admission_lock = getattr(sender, "_operation_admission_lock", None)
         with admission_lock if admission_lock is not None else nullcontext():
-            with self.lock:
-                self._exception = RuntimeError(msg)
-                self._terminal_status = SessionStatus.ERROR
-                self._accepting_operations = False
-                for task in self.kv_tasks:
-                    if not task.is_done:
-                        task.fail(self._exception)
-                if self.aux_task is not None and not self.aux_task.is_done:
-                    self.aux_task.fail(self._exception)
+            self._latch_terminal_failure(
+                SessionStatus.ERROR,
+                RuntimeError(msg),
+                record_exception=True,
+            )
             # ERROR seals admission just like cancellation. Install the durable
             # tombstone outside the session lock so late REQUEST_DATA is settled.
             if sender is not None:
@@ -2702,6 +2723,11 @@ class TxSession(TxSessionBase):
         return self._exception
 
     def close(self):
+        # Constructor rollback marks the partially initialized object closed.
+        # Check that terminal marker before touching locks or retry ledgers that
+        # may not have been created yet; __del__ can run after any init failure.
+        if getattr(self, "_closed", False):
+            return
         close_lock = getattr(self, "_close_lock", None)
         if close_lock is None:
             close_lock = threading.Lock()
@@ -2713,6 +2739,8 @@ class TxSession(TxSessionBase):
                 self._close_locked()
 
     def _close_locked(self):
+        if getattr(self, "_closed", False):
+            return
         self._retry_terminal_results()
         with self.lock:
             if getattr(self, "_closed", False):
@@ -2930,6 +2958,9 @@ class Receiver(ReceiverBase):
         # been consumed by the registry.
         self._bounce_lifecycle_delivery_lock = threading.Lock()
         self._pending_bounce_lifecycle_deliveries: dict[
+            tuple[int, int], _PendingLifecycleDelivery
+        ] = {}
+        self._pending_bounce_logical_failure_deliveries: dict[
             tuple[int, int], _PendingLifecycleDelivery
         ] = {}
         self._shutdown_started = False
@@ -3210,6 +3241,36 @@ class Receiver(ReceiverBase):
             if self._pending_bounce_lifecycle_deliveries.get(key) is delivery:
                 self._pending_bounce_lifecycle_deliveries.pop(key, None)
 
+    def _fail_bounce_logically(self, key: tuple[int, int]) -> None:
+        """Report local scatter failure without claiming physical settlement.
+
+        The transport retains the bounce slot and destination owner because a
+        CUDA error is not a positive stream fence.  Keep the one-shot registry
+        update replayable until its optional session consumer accepts it.
+        """
+        with self._bounce_lifecycle_delivery_lock:
+            deliveries = getattr(self, "_pending_bounce_logical_failure_deliveries", None)
+            if deliveries is None:
+                deliveries = {}
+                self._pending_bounce_logical_failure_deliveries = deliveries
+            delivery = deliveries.get(key)
+            if delivery is None:
+                delivery = _PendingLifecycleDelivery(
+                    update=self._recv_registry.fail_context(
+                        key,
+                        "bounce scatter failed without a positive local CUDA fence",
+                    ),
+                    peer_rank=None,
+                    succeeded=False,
+                )
+                deliveries[key] = delivery
+
+        self._handle_lifecycle_update(delivery.update)
+
+        with self._bounce_lifecycle_delivery_lock:
+            if deliveries.get(key) is delivery:
+                deliveries.pop(key, None)
+
     def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
         self_ri = self._registrar.self_rank_info
         assert task._params.ctx_request_id is not None, (
@@ -3230,25 +3291,94 @@ class Receiver(ReceiverBase):
         )
 
     @staticmethod
-    def _fanin_bounce_safe(overlap, peer_ri) -> bool:
+    def _fanin_bounce_safe(overlap) -> bool:
         """Whether equal-size fan-in bounce is safe for this overlap.
 
         Exact writer ranks do not change the equal-split requirement. TP head
-        duplication is unsafe in either direction; PP fan-in is safe only when
-        the complete per-stage layer counts are uniform. ``reserve`` separately
-        rejects heterogeneous layer-group block sizes.
+        duplication is unsafe in either direction. PP fan-in is always direct:
+        uniform peer PP-stage layer counts do not prove that this receiver's
+        local layer interval intersects each writer by an equal number of bytes.
         """
-        if overlap.duplicate_head_factor != 1 or overlap.peer_duplicate_head_factor != 1:
+        return (
+            overlap.overlap_pp_size == 1
+            and overlap.duplicate_head_factor == 1
+            and overlap.peer_duplicate_head_factor == 1
+        )
+
+    def _single_writer_bounce_exact(self, peer_info: RankInfo) -> bool:
+        """Whether the receiver can prove that one writer maps every reserved byte.
+
+        ``IdentityMapper`` proves positional mapping, not physical extent
+        equality.  Bounce admission additionally requires identical block
+        geometry and a byte-equal bijection over every attention pool view so
+        the sender's coalesced write cannot exceed the receiver-owned slot.
+        """
+        self_ri = self._registrar.self_rank_info
+        local_layers = getattr(self_ri, "layer_num_per_pp", None)
+        peer_layers = getattr(peer_info, "layer_num_per_pp", None)
+        if local_layers is not None and peer_layers is not None:
+            if sum(local_layers) != sum(peer_layers):
+                return False
+
+        get_pool_mapping = getattr(self._registrar, "get_pool_mapping", None)
+        get_kv_map = getattr(self._registrar, "get_kv_map", None)
+        page_table = getattr(self_ri, "page_table", None)
+        peer_page_table = getattr(peer_info, "page_table", None)
+        # If topology metadata is absent, the exact byte contribution is
+        # unknowable. Fail closed to the direct descriptor path.
+        if (
+            not callable(get_pool_mapping)
+            or not callable(get_kv_map)
+            or page_table is None
+            or peer_page_table is None
+            or page_table.tokens_per_block != peer_page_table.tokens_per_block
+        ):
             return False
-        if overlap.overlap_pp_size > 1:
-            layer_num_per_pp = getattr(peer_ri, "layer_num_per_pp", None)
+
+        from ..resource.utils import get_physical_pool
+        from .mixers.attention.peer import IdentityMapper
+
+        try:
+            mapping = get_pool_mapping(peer_info)
+            expected_local_pool_keys = {
+                (layer_group_id, pool_view_id)
+                for layer_group_id, layer_group in enumerate(page_table.layer_groups)
+                if isinstance(layer_group, AttentionLayerGroup)
+                for pool_view_id, _pool_view in enumerate(layer_group.pool_views)
+            }
+            expected_peer_pool_keys = {
+                (layer_group_id, pool_view_id)
+                for layer_group_id, layer_group in enumerate(peer_page_table.layer_groups)
+                if isinstance(layer_group, AttentionLayerGroup)
+                for pool_view_id, _pool_view in enumerate(layer_group.pool_views)
+            }
+            mapped_peer_pool_keys = tuple(mapping.values())
             if (
-                not layer_num_per_pp
-                or len(layer_num_per_pp) < overlap.overlap_pp_size
-                or len(set(layer_num_per_pp)) != 1
+                set(mapping) != expected_local_pool_keys
+                or len(mapped_peer_pool_keys) != len(set(mapped_peer_pool_keys))
+                or set(mapped_peer_pool_keys) != expected_peer_pool_keys
             ):
                 return False
-        return True
+
+            for self_key, peer_key in mapping.items():
+                if not isinstance(get_kv_map(peer_info, self_key, peer_key), IdentityMapper):
+                    return False
+                self_lg, self_pool_view_id = self_key
+                peer_lg, peer_pool_view_id = peer_key
+                self_pool_view = page_table.layer_groups[self_lg].pool_views[self_pool_view_id]
+                peer_pool_view = peer_page_table.layer_groups[peer_lg].pool_views[peer_pool_view_id]
+                self_pool = get_physical_pool(page_table, self_lg, self_pool_view.pool_idx)
+                peer_pool = get_physical_pool(peer_page_table, peer_lg, peer_pool_view.pool_idx)
+                if self_pool.slot_bytes != peer_pool.slot_bytes:
+                    return False
+            return True
+        except Exception as e:
+            logger.warning_once(
+                f"Receive bounce disabled because the exact single-writer byte mapping "
+                f"could not be proven: {e}",
+                key="kv-bounce-single-writer-plan-unproven",
+            )
+            return False
 
     def _destination_intervals(self, task: KVRecvTask) -> set[tuple[int, int]]:
         """Build trusted allocation ranges for bounce-tail validation.
@@ -3336,16 +3466,20 @@ class Receiver(ReceiverBase):
         # groups, but expected_transfers should reflect per-DP-group count since
         # only one DP group will actually process the context request.
         task.set_valid_writer_cohorts(valid_writer_cohorts)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
-        # _fanin_bounce_safe() (TP-by-head with no PP fan-in), and never under ADP broadcast (sender_dp_rank
-        # None), where the exact writer cohort is not selected before publication.
+        # The transport currently accepts only one writer, and only when the
+        # receiver can prove that its complete slot layout maps byte-for-byte.
+        # Fan-in remains direct until byte-accurate per-writer extents are
+        # authorized before any address is published. ADP broadcast also
+        # remains direct because it does not select the exact writer cohort.
         allow_bounce = (
             self._bounce.enabled
             and sender_dp_rank is not None
             # The bound-buffer layout currently covers attention pool views;
             # Mamba state bytes remain on the direct descriptor path.
             and task._kv_slice.mamba_state_index is None
-            and (task.expected_transfers == 1 or self._fanin_bounce_safe(peer_overlap, peer_infos))
+            and peer_overlap.overlap_pp_size == 1
+            and task.expected_transfers == 1
+            and self._single_writer_bounce_exact(peer_infos)
         )
         session = self._get_session(task._unique_rid)
         if session is None:
@@ -3785,6 +3919,7 @@ class Receiver(ReceiverBase):
                         sizes,
                         src_base,
                         on_done,
+                        on_logical_failure=lambda key=key: self._fail_bounce_logically(key),
                     )
                 else:
                     self._bounce.record_failure(key, peer_rank, on_done=on_done)
@@ -3893,53 +4028,58 @@ class RxSession(RxSessionBase):
         beam_width: int = 1,
         destination_owner: object | None = None,
     ):
-        super().__init__(
-            receiver,
-            SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
-        )
-        self._timeout_s = timeout_s
-        self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._receiver: Receiver  # narrow base class type for Pylance
-        self.request_id = request_id
-        # Receive dispatch owns the address-publication order for every slice
-        # in this session.  Keep it separate from ``lock`` so cancellation can
-        # still close the publication gate while a bounce reservation blocks.
-        self._receive_lock = threading.Lock()
-        self._close_lock = threading.Lock()
-        self.lock = threading.Lock()
-        self._aux_buffer = aux_buffer
-        self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
-        self._exception: Optional[Exception] = None
-        self._closed = False
-        self._accepting_receives = True
-        self._active_receive_dispatches = 0
-        self._last_slice_admitted = False
-        self._receiver_retired = False
-        # The current containment slice has no allocator-enforced destination
-        # lease. Retain the request that owns its KV allocation until receiver
-        # retirement proves every accessor and scatter is drained.
+        # Retain the request that owns its KV allocation until every accessor
+        # and scatter is drained. Enroll it before fallible initialization,
+        # then clear the parameter so propagated tracebacks are ownership-
+        # neutral.
         self._destination_owner = destination_owner
-        self._terminal_status: Optional[SessionStatus] = None
-        self._kv_tasks: list[KVRecvTask] = []
-        self._aux_results: dict[int, AgentResult] = {}
-        # AUX storage is session-scoped and its address can be repeated in
-        # every KV-slice publication. Keep one exposure ledger across slices;
-        # a later suppressed publication cannot revoke an earlier exposure.
-        self._aux_exposed_writer_ranks: set[int] = set()
-        self._aux_publication_closed = not self._need_aux
-        self._aux_result_conflict = False
-        self._aux_drained = not self._need_aux
-        self._aux_status: TaskStatus = TaskStatus.INIT
-        self._sender_endpoints: set[str] = set()
-        self._selected_writer_cohort: Optional[frozenset[int]] = None
+        destination_owner = None
+        self._aux_buffer = aux_buffer
+        self.aux_slot = None
         try:
+            super().__init__(
+                receiver,
+                SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
+            )
+            self._timeout_s = timeout_s
+            self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            self._receiver: Receiver  # narrow base class type for Pylance
+            self.request_id = request_id
+            # Receive dispatch owns the address-publication order for every
+            # slice in this session. Keep it separate from ``lock`` so
+            # cancellation can still close the publication gate while a
+            # bounce reservation blocks.
+            self._receive_lock = threading.Lock()
+            self._close_lock = threading.Lock()
+            self.lock = threading.Lock()
+            self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
+            self._exception: Optional[Exception] = None
+            self._closed = False
+            self._accepting_receives = True
+            self._active_receive_dispatches = 0
+            self._last_slice_admitted = False
+            self._receiver_retired = False
+            self._terminal_status: Optional[SessionStatus] = None
+            self._kv_tasks: list[KVRecvTask] = []
+            self._aux_results: dict[int, AgentResult] = {}
+            # AUX storage is session-scoped and its address can be repeated in
+            # every KV-slice publication. Keep one exposure ledger across
+            # slices; a later suppressed publication cannot revoke an earlier
+            # exposure.
+            self._aux_exposed_writer_ranks: set[int] = set()
+            self._aux_publication_closed = not self._need_aux
+            self._aux_result_conflict = False
+            self._aux_drained = not self._need_aux
+            self._aux_status: TaskStatus = TaskStatus.INIT
+            self._sender_endpoints: set[str] = set()
+            self._selected_writer_cohort: Optional[frozenset[int]] = None
             self._receiver.setup_session(self)
         except Exception:
+            self._destination_owner = None
             if self._aux_buffer is not None and self.aux_slot is not None:
                 self._aux_buffer.free_slot(self.aux_slot)
                 self.aux_slot = None
             self._accepting_receives = False
-            self._destination_owner = None
             self._closed = True
             raise
 
@@ -4173,6 +4313,28 @@ class RxSession(RxSessionBase):
                     self._last_slice_admitted = True
             try:
                 self._receiver.dispatch_task(task)
+            except Exception as dispatch_error:
+                # Admission and dispatch form one transaction for standalone
+                # callers too.  Cancellation settles any context prepared
+                # before the exception, while preserving every possibly
+                # exposed target until terminal evidence arrives.
+                cleanup_errors: list[Exception] = []
+                try:
+                    self.cancel()
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                with self.lock:
+                    task.close_publication()
+                    task.fail(dispatch_error)
+                    self._exception = dispatch_error
+                    self._terminal_status = SessionStatus.ERROR
+                    self._close_aux_publication_locked()
+                if cleanup_errors:
+                    logger.error(
+                        f"RxSession {self.disagg_request_id} retained ownership after dispatch "
+                        f"cleanup failed: {cleanup_errors[0]}"
+                    )
+                raise
             finally:
                 with self.lock:
                     self._active_receive_dispatches -= 1
@@ -4459,7 +4621,7 @@ class RxSession(RxSessionBase):
     def resources_drained(self) -> bool:
         """Whether request cleanup can release every receive-side target."""
         try:
-            if not self._receiver._bounce.retry_settlements():
+            if not self._receiver._bounce.retry_settlements(self.disagg_request_id):
                 return False
         except Exception as e:
             logger.error(

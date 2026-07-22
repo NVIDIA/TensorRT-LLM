@@ -151,6 +151,7 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_q = None
         self._scatter_ready = None
         self._scatter_start_error = None
+        self._scatter_worker_error = None
         # gather_scatter metadata is reused per stream and remains live until
         # its async H2D copy completes, so one owner holds this through launch
         # and event completion.
@@ -528,9 +529,13 @@ class VmmBounceTransport(BounceTransport):
         destination_intervals: Optional[Iterable[tuple[int, int]]] = None,
         destination_intervals_factory: Optional[Callable[[], Iterable[tuple[int, int]]]] = None,
     ) -> bool:
-        """Reserve a region and create its state, recording the address for the senders. Returns
-        False to fall back to the per-fragment path. A fan-in splits the region evenly, so the total
-        must divide across the writers."""
+        """Reserve a region and create its state, recording the address for one sender.
+
+        Multi-writer bounce is intentionally rejected until the caller can
+        provide receiver-owned, byte-accurate offsets and extents for every
+        writer.  Divisibility and uniform slot sizes do not constrain the size
+        of the NIXL descriptor that a remote writer will submit.
+        """
         ranks = self._normalize_writer_ranks(writer_ranks)
         if not ranks:
             return self._skip_bounce("writer plan is empty, invalid, or contains duplicate ranks")
@@ -539,40 +544,28 @@ class VmmBounceTransport(BounceTransport):
                 "trusted destination intervals and their lazy factory are mutually exclusive"
             )
         num_writers = len(ranks)
+        if num_writers > 1:
+            return self._skip_bounce(
+                "multi-writer bounce requires byte-accurate receiver-owned writer extents",
+                warn_key="kv-bounce-multiwriter-without-extents",
+            )
         with self._reserved_map_lock:
             if not self._accepting_reservations or not self._scatter_stream_healthy:
                 return self._skip_bounce("transport is closing")
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        valid_block_counts = [
+            int(np.count_nonzero(np.asarray(block_ids, dtype=np.int64) >= 0))
+            for block_ids in recv_req.block_ids_per_layer_groups
+        ]
+        nblocks = sum(valid_block_counts)
         if nblocks < self._min_blocks:
             return self._skip_bounce(f"{nblocks} blocks < min {self._min_blocks} (too small)")
         total = 0
-        for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
+        for g, valid_blocks in enumerate(valid_block_counts):
             if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(f"layer group {g} has no known slot size (e.g. mamba)")
-            total += int(block_ids.size) * self._block_bytes_per_group[g]
+            total += valid_blocks * self._block_bytes_per_group[g]
         if total <= 0:
             return self._skip_bounce(f"computed transfer size {total} <= 0")
-        if num_writers > 1 and total % num_writers != 0:
-            return self._skip_bounce(
-                f"fan-in {total}B across {num_writers} senders is not an even split "
-                f"({total % num_writers}B remainder); head-mismatch explosion NOT mitigated",
-                warn_key="kv-bounce-uneven-fanin",
-            )
-        if num_writers > 1:
-            # Fan-in gives each writer an equal share of the region, which only matches where it
-            # writes when all writers send the same bytes. Equal layer count guarantees that only
-            # when the per-block sizes match, so require that here, else fall back.
-            present_slot_bytes = {
-                self._block_bytes_per_group[g]
-                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
-                if int(block_ids.size) > 0
-            }
-            if len(present_slot_bytes) > 1:
-                return self._skip_bounce(
-                    f"fan-in across {num_writers} senders with non-uniform layer-group slot bytes "
-                    f"{sorted(present_slot_bytes)}; the equal split would overrun a sub-region",
-                    warn_key="kv-bounce-heterogeneous-fanin",
-                )
         if total > self._recv_alloc.capacity:  # too big to ever fit, unlike transient backpressure
             return self._skip_bounce(
                 f"transfer {total // _MIB}MiB exceeds the {self._recv_alloc.capacity // _MIB}MiB bounce "
@@ -694,6 +687,38 @@ class VmmBounceTransport(BounceTransport):
                         retry_settlement = True
         if retry_settlement:
             self._commit_pending_settlement(rid_slice)
+        self._retry_logical_failure_notification(rid_slice)
+
+    def _retry_logical_failure_notification(self, rid_slice: RidSlice) -> bool:
+        """Deliver logical scatter failure without releasing its physical lease."""
+        with self._reserved_map_lock:
+            ctx = self._reserved_map.get(rid_slice)
+            if ctx is None:
+                return True
+            callback = ctx.begin_logical_failure_notification()
+            if callback is None:
+                return not (
+                    ctx.scatter_state is ScatterState.FAILED
+                    and ctx.on_logical_failure is not None
+                    and not ctx._logical_failure_notification_delivered
+                )
+        try:
+            callback()
+        except Exception as e:
+            with self._reserved_map_lock:
+                current = self._reserved_map.get(rid_slice)
+                if current is ctx:
+                    current.finish_logical_failure_notification(False)
+            logger.error(
+                f"[kv-bounce] logical scatter-failure notification failed "
+                f"(slot={ctx.slot_id}); retaining it for retry: {e}"
+            )
+            return False
+        with self._reserved_map_lock:
+            current = self._reserved_map.get(rid_slice)
+            if current is ctx:
+                current.finish_logical_failure_notification(True)
+        return True
 
     def _enqueue_scatter(self, ctx: RecvBounceContext, descs: List[tuple]) -> None:
         """Hand the per-writer fragments to the worker. Each is scattered from its own source, so a
@@ -719,10 +744,15 @@ class VmmBounceTransport(BounceTransport):
                     self._recv_alloc.quarantine(settlement.slot_id)
                 else:
                     self._recv_alloc.release(settlement.slot_id)
-            except Exception:
+            except Exception as e:
                 with self._reserved_map_lock:
                     pending.physical_in_progress = False
-                raise
+                logger.error(
+                    f"[kv-bounce] physical settlement failed "
+                    f"(slot={settlement.slot_id}, disposition={settlement.disposition.name}); "
+                    f"retaining it for retry: {e}"
+                )
+                return False
             with self._reserved_map_lock:
                 pending.physical_in_progress = False
                 pending.physical_committed = True
@@ -758,17 +788,37 @@ class VmmBounceTransport(BounceTransport):
                 self._pending_settlements.pop(rid_slice, None)
         return True
 
-    def _retry_pending_settlements(self) -> bool:
+    @staticmethod
+    def _settlement_in_scope(rid_slice: RidSlice, scope) -> bool:
+        """Whether an exact key belongs to a global, request, or exact-key retry."""
+        if scope is None:
+            return True
+        if isinstance(scope, tuple):
+            return rid_slice == scope
+        return rid_slice[0] == scope
+
+    def _retry_pending_settlements(self, scope=None) -> bool:
         with self._reserved_map_lock:
-            keys = tuple(self._pending_settlements)
+            keys = tuple(
+                key for key in self._pending_settlements if self._settlement_in_scope(key, scope)
+            )
         for key in keys:
             self._commit_pending_settlement(key)
         with self._reserved_map_lock:
-            return not self._pending_settlements
+            return not any(
+                self._settlement_in_scope(key, scope) for key in self._pending_settlements
+            )
 
-    def retry_settlements(self) -> bool:
-        """Public non-blocking retry hook for the receiver's bounded poll path."""
-        return self._retry_pending_settlements()
+    def retry_settlements(self, scope=None) -> bool:
+        """Retry pending acknowledgements globally, for one request RID, or for one exact key."""
+        with self._reserved_map_lock:
+            keys = tuple(key for key in self._reserved_map if self._settlement_in_scope(key, scope))
+        notifications_delivered = True
+        for key in keys:
+            notifications_delivered = (
+                self._retry_logical_failure_notification(key) and notifications_delivered
+            )
+        return notifications_delivered and self._retry_pending_settlements(scope)
 
     def record_result(
         self,
@@ -778,6 +828,7 @@ class VmmBounceTransport(BounceTransport):
         sizes=None,
         src_base=None,
         on_done: Optional[Callable[[bool], None]] = None,
+        on_logical_failure: Optional[Callable[[], None]] = None,
     ) -> None:
         """A writer reported success. The completion callback fires only after the scatter lands, so
         the reader never sees completion before the cache is in place."""
@@ -788,6 +839,7 @@ class VmmBounceTransport(BounceTransport):
             )
             if accepted:
                 ctx.set_on_done(on_done)
+                ctx.set_on_logical_failure(on_logical_failure)
 
         self._apply(rid_slice, mut)
 
@@ -888,7 +940,49 @@ class VmmBounceTransport(BounceTransport):
             finally:
                 self._scatter_q.task_done()
 
-    def _scatter_loop(self):
+    def _fail_scatter_worker(self, error: Exception) -> None:
+        """Fail closed if an unexpected error escapes normal per-scatter handling."""
+        with self._reserved_map_lock:
+            self._scatter_stream_healthy = False
+            self._accepting_reservations = False
+            self._scatter_worker_error = error
+        logger.error(
+            f"[kv-bounce] scatter worker stopped unexpectedly; "
+            f"disabling receive-bounce admission: {error}"
+        )
+        try:
+            # Entries still in the queue never launched, so they can settle as
+            # failures. The entry that escaped remains owned because its local
+            # CUDA-access state is ambiguous.
+            self._suppress_queued_scatters()
+        except Exception as cleanup_error:
+            logger.error(
+                f"[kv-bounce] failed to suppress unlaunched scatters after worker failure; "
+                f"retaining them for teardown retry: {cleanup_error}"
+            )
+
+    def _fail_current_scatter(self, ctx: RecvBounceContext) -> None:
+        """Latch logical failure for the dequeued item without claiming a fence.
+
+        This is the last-resort boundary for an exception that escapes the
+        normal per-scatter path, including a state-update failure after CUDA
+        work was launched. The context remains physically owned because the
+        exception site does not itself prove local stream quiescence.
+        """
+        with self._reserved_map_lock:
+            current = self._reserved_map.get(ctx.rid_slice)
+            if current is ctx:
+                current.finish_scatter(False)
+        self._retry_logical_failure_notification(ctx.rid_slice)
+
+    def _scatter_loop(self) -> None:
+        """Run the worker with a fail-closed boundary around unexpected errors."""
+        try:
+            self._run_scatter_loop()
+        except Exception as e:
+            self._fail_scatter_worker(e)
+
+    def _run_scatter_loop(self) -> None:
         try:
             CUASSERT(cudart.cudaSetDevice(self._device_id))
         except Exception as e:
@@ -902,40 +996,45 @@ class VmmBounceTransport(BounceTransport):
                 if item is None:
                     return  # FIFO poison pill: every earlier scatter has finished
                 ctx, descs = item
-                ok = True
                 try:
-                    # Scatter each writer's fragments from its own source, never one global offset,
-                    # so a missing or fallback writer cannot shift where the others are read from.
-                    for src_base, dst_ptrs, sizes in descs:
-                        p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
-                        scatter_contiguous(
-                            src_base,
-                            p.dst_ptrs,
-                            p.sizes,
-                            p.offsets,
-                            stream=self._scatter_stream,
-                        )
-                        # The metadata staging buffer is shared per stream, so
-                        # it cannot be refilled for another writer until this
-                        # writer's async metadata copy has completed.
-                        CUASSERT(cudart.cudaStreamSynchronize(self._scatter_stream))
-                except Exception as e:
-                    # a scatter failure must not kill the worker nor be reported as success
-                    ok = False
-                    logger.error(f"[kv-bounce] scatter failed (slot={ctx.slot_id}): {e}")
+                    ok = True
+                    try:
+                        # Scatter each writer's fragments from its own source, never one global
+                        # offset, so a missing or fallback writer cannot shift where the others
+                        # are read from.
+                        for src_base, dst_ptrs, sizes in descs:
+                            p = Plan(dst_ptrs, dst_ptrs, sizes, int(sizes.sum()))
+                            scatter_contiguous(
+                                src_base,
+                                p.dst_ptrs,
+                                p.sizes,
+                                p.offsets,
+                                stream=self._scatter_stream,
+                            )
+                            # The metadata staging buffer is shared per stream, so it cannot be
+                            # refilled for another writer until this writer's async metadata copy
+                            # has completed.
+                            CUASSERT(cudart.cudaStreamSynchronize(self._scatter_stream))
+                    except Exception as e:
+                        # A scatter failure must not kill the worker nor be reported as success.
+                        ok = False
+                        logger.error(f"[kv-bounce] scatter failed (slot={ctx.slot_id}): {e}")
 
-                # Success settles after the positive fence above. Failure is
-                # retained and poisons the shared stream: a CUDA error does not
-                # prove queued accesses stopped, so no later job may use it.
-                def finish(c, ok=ok):
+                    # Success settles after the positive fence above. Failure is retained and
+                    # poisons the shared stream: a CUDA error does not prove queued accesses
+                    # stopped, so no later job may use it.
+                    def finish(c, ok=ok):
+                        if not ok:
+                            self._scatter_stream_healthy = False
+                        c.finish_scatter(ok)
+
+                    self._apply(ctx.rid_slice, finish)
                     if not ok:
-                        self._scatter_stream_healthy = False
-                    c.finish_scatter(ok)
-
-                self._apply(ctx.rid_slice, finish)
-                if not ok:
-                    self._suppress_queued_scatters()
-                    return
+                        self._suppress_queued_scatters()
+                        return
+                except Exception:
+                    self._fail_current_scatter(ctx)
+                    raise
             finally:
                 self._scatter_q.task_done()
 
@@ -1062,11 +1161,18 @@ class NoBounceTransport(BounceTransport):
     def mark_backend_quiesced(self, rid_slice=None, on_done=None) -> None:
         pass
 
-    def retry_settlements(self) -> bool:
+    def retry_settlements(self, scope=None) -> bool:
         return True
 
     def record_result(
-        self, rid_slice, peer_rank, dst_ptrs=None, sizes=None, src_base=None, on_done=None
+        self,
+        rid_slice,
+        peer_rank,
+        dst_ptrs=None,
+        sizes=None,
+        src_base=None,
+        on_done=None,
+        on_logical_failure=None,
     ):
         pass
 

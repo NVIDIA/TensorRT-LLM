@@ -31,6 +31,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     WaitResult,
 )
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import IdentityMapper
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap
 from tensorrt_llm._torch.disaggregation.native.receive_lifecycle import (
     LogicalState,
@@ -108,6 +109,53 @@ def _make_send_task_and_session(*, channel: str = "kv"):
     return task, session
 
 
+def _make_owned_send_task_and_session(*, channel: str, expected_transfers: int):
+    sender = _make_sender_for_shutdown()
+    sender._shutdown_complete = True
+    sender.setup_session = Mock()
+    sender.cancel_session = Mock()
+    sender.retry_terminal_results = Mock()
+    sender._send_operation_message = Mock(return_value=True)
+    sender._enqueue_owned = Mock()
+    sender._instance_rank = 0
+    sender._bounce = Mock()
+
+    params = _params()
+    session = TxSession(REQUEST_ID, params, sender, source_owner=object())
+    session.receiver_ready = True
+    if channel == "kv":
+        task = KVSendTask(KVSlice(), params, 0, session=session)
+        session.kv_tasks.append(task)
+    else:
+        completed_kv_task = KVSendTask(KVSlice(), params, 0, session=session)
+        assert completed_kv_task.complete()
+        session.kv_tasks.append(completed_kv_task)
+        task = AuxSendTask(params, 7, session=session)
+        session.aux_task = task
+        session._need_aux = True
+    task._unique_rid = REQUEST_ID
+
+    write_meta = WriteMeta(
+        task=task,
+        expected_transfers=expected_transfers,
+        peer_name="receiver1",
+        peer_rank=1,
+        peer_endpoint="tcp://receiver",
+        unique_rid=REQUEST_ID,
+        src_ptrs=np.array([], dtype=np.int64),
+        dst_ptrs=np.array([], dtype=np.int64),
+        sizes=np.array([], dtype=np.int64),
+        slice_id=0 if channel == "kv" else None,
+        meta_type=WriteMetaType.KV if channel == "kv" else WriteMetaType.AUX,
+        session=session,
+    )
+    if channel == "kv":
+        sender._build_kv_write_meta = Mock(return_value=write_meta)
+    else:
+        sender._build_aux_write_meta = Mock(return_value=write_meta)
+    return sender, session, task, write_meta
+
+
 def _make_sender_for_shutdown() -> Sender:
     sender = object.__new__(Sender)
     sender._shutdown_attempt_lock = threading.Lock()
@@ -170,7 +218,7 @@ class _FakeBounce:
     def mark_backend_quiesced(self, key, on_done) -> None:
         self.backend_quiesced_callbacks.append((key, on_done))
 
-    def retry_settlements(self) -> bool:
+    def retry_settlements(self, _scope=None) -> bool:
         return True
 
 
@@ -240,6 +288,7 @@ def _make_receiver(*, bounce=None, writer_ranks=(WRITER_RANK,)) -> Receiver:
     receiver._recv_registry = RecvTransferRegistry()
     receiver._bounce_lifecycle_delivery_lock = threading.Lock()
     receiver._pending_bounce_lifecycle_deliveries = {}
+    receiver._pending_bounce_logical_failure_deliveries = {}
     receiver._bounce = bounce or _FakeBounce()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0),
@@ -265,6 +314,10 @@ def _make_receiver(*, bounce=None, writer_ranks=(WRITER_RANK,)) -> Receiver:
     )
     receiver._request_sender_data = Mock()
     receiver.send_cancel_to_senders = Mock()
+    # Most object.__new__ fixtures intentionally omit the real registrar's
+    # page-table/mapping metadata. Tests exercising bounce admission opt in to
+    # a proven single-writer map unless they explicitly test proof failure.
+    receiver._single_writer_bounce_exact = Mock(return_value=True)
     return receiver
 
 
@@ -842,12 +895,19 @@ def test_rx_session_cancel_retries_legacy_idle_release_after_task_failure() -> N
 
 def test_rx_session_serializes_slice_dispatch_before_closing_aux_publication() -> None:
     receiver = _make_receiver()
+    aux_buffer = SimpleNamespace(
+        alloc_slot=Mock(return_value=SimpleNamespace(id=7)),
+        free_slot=Mock(),
+    )
     session = RxSession(
         REQUEST_ID,
         _params(schedule_style=DisaggScheduleStyle.GENERATION_FIRST),
         receiver,
+        aux_buffer=aux_buffer,
     )
     session._closed = True
+    aux_buffer.alloc_slot.assert_called_once_with()
+    assert session.aux_slot == 7
     first_send_started = threading.Event()
     allow_first_send = threading.Event()
     second_receive_started = threading.Event()
@@ -998,7 +1058,7 @@ def test_receiver_shutdown_waits_for_admitted_receive_dispatch() -> None:
 
     def get_sender_info(_params):
         discovery_started.set()
-        assert allow_discovery.wait(timeout=2)
+        allow_discovery.wait()
         return peer_info
 
     receiver._get_sender_info = get_sender_info
@@ -1014,18 +1074,50 @@ def test_receiver_shutdown_waits_for_admitted_receive_dispatch() -> None:
     receive_thread = threading.Thread(
         target=receive,
         name="blocked-receive",
+        daemon=True,
     )
+    shutdown_thread = None
     receive_thread.start()
-    assert discovery_started.wait(timeout=1)
+    try:
+        assert discovery_started.wait(timeout=1)
 
-    assert receiver.shutdown() is False
-    receiver._messenger.stop.assert_not_called()
-    assert not receiver.transfers_drained
-    with pytest.raises(RuntimeError, match="new receive slices are not accepted"):
-        session.receive(KVSlice())
+        shutdown_results: list[bool] = []
+        shutdown_errors: list[Exception] = []
+        shutdown_finished = threading.Event()
 
-    allow_discovery.set()
-    receive_thread.join(timeout=2)
+        def shutdown() -> None:
+            try:
+                shutdown_results.append(receiver.shutdown())
+            except Exception as e:
+                shutdown_errors.append(e)
+            finally:
+                shutdown_finished.set()
+
+        shutdown_thread = threading.Thread(
+            target=shutdown,
+            name="receiver-shutdown",
+            daemon=True,
+        )
+        shutdown_thread.start()
+        assert shutdown_finished.wait(timeout=5), (
+            "receiver.shutdown() blocked behind admitted sender discovery"
+        )
+        assert not shutdown_errors
+        assert shutdown_results == [False]
+        receiver._messenger.stop.assert_not_called()
+        assert not receiver.transfers_drained
+        with pytest.raises(RuntimeError, match="new receive slices are not accepted"):
+            session.receive(KVSlice())
+    finally:
+        # Always unblock discovery so a failed deadlock assertion cannot leak
+        # either worker into the rest of the test process.
+        allow_discovery.set()
+        if shutdown_thread is not None:
+            shutdown_thread.join(timeout=2)
+        receive_thread.join(timeout=2)
+
+    assert shutdown_thread is not None
+    assert not shutdown_thread.is_alive()
     assert not receive_thread.is_alive()
     assert not receive_errors
     assert receiver.transfers_drained
@@ -1102,6 +1194,208 @@ def test_mamba_receive_uses_direct_path_until_bound_layout_includes_state_bytes(
     bounce.reserve.assert_not_called()
     receiver._destination_intervals.assert_not_called()
     assert receiver._recv_registry.target_mode((REQUEST_ID, 0)) is not None
+
+
+def test_standalone_receive_dispatch_error_closes_publication_transactionally() -> None:
+    receiver = _make_receiver()
+    receiver.dispatch_task = Mock(side_effect=RuntimeError("prepare failed"))
+    destination_owner = object()
+    session = RxSession(
+        REQUEST_ID,
+        _params(),
+        receiver,
+        destination_owner=destination_owner,
+    )
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        session.receive(KVSlice())
+
+    task = session._kv_tasks[0]
+    assert task.status is TaskStatus.ERROR
+    assert task._publication_closed
+    assert session._active_receive_dispatches == 0
+    assert session.status is SessionStatus.ERROR
+    assert session.resources_drained()
+    session.close()
+    assert REQUEST_ID not in receiver._sessions
+    assert session._destination_owner is None
+
+
+def test_standalone_receive_dispatch_error_retains_ambiguous_target_owner() -> None:
+    receiver = _make_receiver()
+    destination_owner = object()
+    session = RxSession(
+        REQUEST_ID,
+        _params(),
+        receiver,
+        destination_owner=destination_owner,
+    )
+    key = (REQUEST_ID, 0)
+
+    def fail_after_publication_started(task) -> None:
+        task.set_valid_writer_cohorts(((WRITER_RANK,),))
+        task.lifecycle_managed = True
+        task.status = TaskStatus.TRANSFERRING
+        assert receiver._recv_registry.prepare(key, (WRITER_RANK,), has_bounce_slot=False).accepted
+        assert receiver._recv_registry.begin_publication(key, WRITER_RANK).publication_allowed
+        task.mark_writer_exposed(WRITER_RANK)
+        raise RuntimeError("publication outcome is ambiguous")
+
+    receiver.dispatch_task = fail_after_publication_started
+
+    with pytest.raises(RuntimeError, match="publication outcome is ambiguous"):
+        session.receive(KVSlice())
+
+    snapshot = receiver._recv_registry.context_snapshot(key)
+    assert snapshot.logical_state is LogicalState.CANCELLED
+    assert snapshot.physical_state is PhysicalState.IN_DOUBT
+    assert session._kv_tasks[0]._publication_closed
+    assert not session.resources_drained()
+    with pytest.raises(RuntimeError, match="not drained"):
+        session.close()
+    assert receiver._sessions[REQUEST_ID] is session
+    assert session._destination_owner is destination_owner
+    session._closed = True
+
+
+def test_pp_fanin_with_uniform_peer_stages_uses_direct_path() -> None:
+    bounce = _FakeBounce()
+    bounce.enabled = True
+    bounce.reserve = Mock(return_value=True)
+    receiver = _make_receiver(bounce=bounce, writer_ranks=(0, 1))
+    receiver._registrar.get_peer_overlap = lambda _peer_info, _dp_rank: PeerOverlap(
+        overlap_pp_size=2,
+        duplicate_head_factor=1,
+        peer_duplicate_head_factor=1,
+        ranks=[0, 1],
+    )
+    receiver._get_sender_info = lambda _params: SimpleNamespace(
+        dp_size=1,
+        layer_num_per_pp=[20, 20],
+        sender_endpoints=["tcp://sender-0", "tcp://sender-1"],
+    )
+    receiver._destination_intervals = Mock(return_value=())
+    session = RxSession(REQUEST_ID, _params(), receiver)
+    session._closed = True
+
+    # A local [0, 30) stage intersects the uniform peer stages [0, 20) and
+    # [20, 40) by 20 and 10 layers. Peer uniformity therefore cannot authorize
+    # an equal two-writer bounce subdivision.
+    session.receive(KVSlice())
+
+    bounce.reserve.assert_not_called()
+    receiver._destination_intervals.assert_not_called()
+    assert receiver._request_sender_data.call_count == 2
+
+
+def test_tp_fanin_uses_direct_path_without_byte_accurate_writer_extents() -> None:
+    bounce = _FakeBounce()
+    bounce.enabled = True
+    bounce.reserve = Mock(return_value=True)
+    receiver = _make_receiver(bounce=bounce, writer_ranks=(0, 1))
+    receiver._destination_intervals = Mock(return_value=())
+    session = RxSession(REQUEST_ID, _params(), receiver)
+    session._closed = True
+
+    session.receive(KVSlice())
+
+    bounce.reserve.assert_not_called()
+    receiver._destination_intervals.assert_not_called()
+    assert receiver._request_sender_data.call_count == 2
+
+
+def test_partial_layer_mapping_uses_direct_path() -> None:
+    bounce = _FakeBounce()
+    bounce.enabled = True
+    bounce.reserve = Mock(return_value=True)
+    receiver = _make_receiver(bounce=bounce)
+    receiver._single_writer_bounce_exact = Receiver._single_writer_bounce_exact.__get__(
+        receiver, Receiver
+    )
+    receiver._registrar.self_rank_info.layer_num_per_pp = [12]
+    receiver._get_sender_info = lambda _params: SimpleNamespace(
+        dp_size=1,
+        layer_num_per_pp=[10],
+        sender_endpoints=["tcp://sender-0"] * (WRITER_RANK + 1),
+    )
+    receiver._destination_intervals = Mock(return_value=())
+    session = RxSession(REQUEST_ID, _params(), receiver)
+    session._closed = True
+
+    session.receive(KVSlice())
+
+    bounce.reserve.assert_not_called()
+    receiver._destination_intervals.assert_not_called()
+    receiver._request_sender_data.assert_called_once()
+
+
+def _bounce_proof_page_table(*slot_bytes: int, tokens_per_block: int = 32):
+    pool_views = [
+        PoolView(
+            pool_idx=pool_idx,
+            buffer_entries=np.empty(0, dtype=BUFFER_ENTRY_DTYPE),
+        )
+        for pool_idx in range(len(slot_bytes))
+    ]
+    return KVCachePageTable(
+        tokens_per_block=tokens_per_block,
+        layer_groups=[AttentionLayerGroup(pool_group_idx=0, pool_views=pool_views)],
+        pool_groups=[
+            PhysicalPoolGroup(
+                pools=[
+                    PhysicalPool(
+                        base_address=0x1000 + pool_idx * 0x1000,
+                        slot_bytes=size,
+                        num_slots=16,
+                    )
+                    for pool_idx, size in enumerate(slot_bytes)
+                ]
+            )
+        ],
+    )
+
+
+def _single_writer_bounce_proof(local_page_table, peer_page_table, mapping) -> bool:
+    receiver = object.__new__(Receiver)
+    receiver._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(layer_num_per_pp=[1], page_table=local_page_table),
+        get_pool_mapping=Mock(return_value=mapping),
+        get_kv_map=Mock(return_value=IdentityMapper()),
+    )
+    peer_info = SimpleNamespace(layer_num_per_pp=[1], page_table=peer_page_table)
+    return receiver._single_writer_bounce_exact(peer_info)
+
+
+def test_single_writer_bounce_requires_byte_exact_pool_bijection() -> None:
+    local_page_table = _bounce_proof_page_table(64, 128)
+    peer_page_table = _bounce_proof_page_table(64, 128)
+
+    assert _single_writer_bounce_proof(
+        local_page_table,
+        peer_page_table,
+        {(0, 0): (0, 0), (0, 1): (0, 1)},
+    )
+    assert not _single_writer_bounce_proof(
+        local_page_table,
+        peer_page_table,
+        {(0, 0): (0, 0), (0, 1): (0, 0)},
+    )
+
+
+def test_single_writer_bounce_rejects_asymmetric_slot_bytes() -> None:
+    assert not _single_writer_bounce_proof(
+        _bounce_proof_page_table(64),
+        _bounce_proof_page_table(128),
+        {(0, 0): (0, 0)},
+    )
+
+
+def test_single_writer_bounce_rejects_mismatched_block_geometry() -> None:
+    assert not _single_writer_bounce_proof(
+        _bounce_proof_page_table(64, tokens_per_block=32),
+        _bounce_proof_page_table(64, tokens_per_block=64),
+        {(0, 0): (0, 0)},
+    )
 
 
 def test_receiver_clear_session_does_not_hold_map_lock_during_bounce_retry() -> None:
@@ -1359,7 +1653,7 @@ def test_tx_session_setup_failure_rolls_back_sender_and_source_owner() -> None:
     source_owner = SourceOwner()
     source_owner_ref = weakref.ref(source_owner)
 
-    with pytest.raises(RuntimeError, match="peer lookup failed"):
+    with pytest.raises(RuntimeError, match="peer lookup failed") as exc_info:
         TxSession(
             request_id=REQUEST_ID,
             params=_params(),
@@ -1371,7 +1665,112 @@ def test_tx_session_setup_failure_rolls_back_sender_and_source_owner() -> None:
     gc.collect()
     assert sender._sessions == {}
     assert source_owner_ref() is None
+    assert str(exc_info.value) == "peer lookup failed"
     sender._shutdown_complete = True
+
+
+def test_rx_session_setup_failure_rolls_back_destination_owner() -> None:
+    class DestinationOwner:
+        pass
+
+    receiver = _make_receiver()
+    receiver.begin_shutdown()
+    destination_owner = DestinationOwner()
+    destination_owner_ref = weakref.ref(destination_owner)
+
+    with pytest.raises(RuntimeError, match="shutting down") as exc_info:
+        RxSession(
+            request_id=REQUEST_ID,
+            params=_params(),
+            receiver=receiver,
+            destination_owner=destination_owner,
+        )
+
+    del destination_owner
+    gc.collect()
+    assert destination_owner_ref() is None
+    assert "shutting down" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "session_type",
+    [
+        pytest.param(TxSession, id="tx"),
+        pytest.param(RxSession, id="rx"),
+    ],
+)
+@pytest.mark.parametrize("failure_stage", ["base-init", "aux-allocation"])
+def test_early_session_constructor_failure_releases_allocator_owner(
+    session_type, failure_stage, monkeypatch
+) -> None:
+    class AllocatorOwner:
+        pass
+
+    if session_type is TxSession:
+        endpoint_name = "sender"
+        endpoint = _make_sender_for_shutdown()
+        owner_name = "source_owner"
+    else:
+        endpoint_name = "receiver"
+        endpoint = _make_receiver()
+        owner_name = "destination_owner"
+
+    aux_buffer = SimpleNamespace(
+        alloc_slot=Mock(),
+        free_slot=Mock(),
+    )
+    error_message = f"{failure_stage} failed"
+    base_type = session_type.__mro__[1]
+    original_base_init = base_type.__init__
+    failed_instances = []
+    if failure_stage == "base-init":
+
+        def capture_and_fail_base_init(session, *_args, **_kwargs) -> None:
+            failed_instances.append(session)
+            raise RuntimeError(error_message)
+
+        monkeypatch.setattr(base_type, "__init__", capture_and_fail_base_init)
+    else:
+
+        def capture_base_init(session, *args, **kwargs) -> None:
+            failed_instances.append(session)
+            original_base_init(session, *args, **kwargs)
+
+        monkeypatch.setattr(base_type, "__init__", capture_base_init)
+        aux_buffer.alloc_slot.side_effect = RuntimeError(error_message)
+
+    owner = AllocatorOwner()
+    owner_ref = weakref.ref(owner)
+    with pytest.raises(RuntimeError, match=error_message) as exc_info:
+        session_type(
+            request_id=REQUEST_ID,
+            params=_params(schedule_style=DisaggScheduleStyle.GENERATION_FIRST),
+            aux_buffer=aux_buffer,
+            **{endpoint_name: endpoint, owner_name: owner},
+        )
+
+    assert len(failed_instances) == 1
+    failed_session = failed_instances.pop()
+    # Constructor rollback already retired every resource it could have
+    # acquired. Explicit close, and therefore the later __del__, must stop at
+    # that marker without touching terminal fields that may not exist yet.
+    failed_session.close()
+    failed_session_ref = weakref.ref(failed_session)
+    observed_error = str(exc_info.value)
+    del exc_info
+    del failed_session
+    del owner
+    gc.collect()
+    assert owner_ref() is None
+    assert failed_session_ref() is None
+    assert observed_error == error_message
+    if failure_stage == "base-init":
+        aux_buffer.alloc_slot.assert_not_called()
+    else:
+        aux_buffer.alloc_slot.assert_called_once_with()
+    aux_buffer.free_slot.assert_not_called()
+    if session_type is TxSession:
+        endpoint._shutdown_complete = True
 
 
 def test_pre_session_terminal_result_is_retried_by_sender_shutdown() -> None:
@@ -1535,6 +1934,150 @@ def test_sender_failure_is_monotonic_while_sibling_source_access_drains(channel)
     assert not task.source_access_active
 
 
+@pytest.mark.parametrize("channel", ["kv", "aux"])
+def test_cancelled_partial_fanout_drains_and_late_writer_gets_no_access(channel) -> None:
+    sender, session, task, first_meta = _make_owned_send_task_and_session(
+        channel=channel, expected_transfers=2
+    )
+    first_info = _recv_info(writer_rank=1)
+    late_info = _recv_info(writer_rank=2)
+
+    assert sender._dispatch_operation(task, first_info) is None
+    assert task.mark_transferring()
+    session.cancel()
+
+    assert session.status is SessionStatus.CANCELLED
+    assert task.status is TaskStatus.ERROR
+    assert task.source_access_active
+    assert session.has_transferring_tasks()
+
+    first_key = (first_info.instance_name, first_info.instance_rank)
+    task.cache_terminal_message(first_key, (b"first-writer-terminal",))
+    task.mark_operation_result_delivered(first_key)
+    task.finish_source_access()
+    first_meta.source_access_enrolled = False
+    if channel == "kv":
+        task.transferred_count = 1
+    else:
+        task._transfer_count = 1
+
+    assert not session.has_transferring_tasks()
+    assert sender._dispatch_operation(task, late_info) is None
+    late_key = (late_info.instance_name, late_info.instance_rank)
+    late_snapshot = task.operation_snapshot(late_key)
+    assert late_snapshot is not None
+    assert late_snapshot[0] is SendOperationState.TERMINAL
+    assert late_snapshot[2]
+    assert not task.source_access_active
+    assert task.status is TaskStatus.ERROR
+    assert session.status is SessionStatus.CANCELLED
+    assert session.wait_complete(blocking=False) is WaitResult.FAILED
+    assert not session.has_transferring_tasks()
+
+
+@pytest.mark.parametrize("channel", ["kv", "aux"])
+@pytest.mark.parametrize("transfer_succeeded", [True, False])
+def test_active_writer_completion_after_cancel_preserves_cancelled(
+    channel, transfer_succeeded, monkeypatch
+) -> None:
+    sender, session, task, write_meta = _make_owned_send_task_and_session(
+        channel=channel, expected_transfers=1
+    )
+    info = _recv_info(writer_rank=1)
+    write_meta.src_ptrs = np.array([1], dtype=np.int64)
+    write_meta.dst_ptrs = np.array([2], dtype=np.int64)
+    write_meta.sizes = np.array([4], dtype=np.int64)
+    assert sender._dispatch_operation(task, info) is None
+
+    transfer_started = threading.Event()
+    release_transfer = threading.Event()
+    transfer_status = Mock()
+
+    def wait_for_transfer() -> bool:
+        transfer_started.set()
+        assert release_transfer.wait(timeout=1)
+        return transfer_succeeded
+
+    transfer_status.wait.side_effect = wait_for_transfer
+    sender._agent.submit_transfer_requests.return_value = transfer_status
+    sender._device_id = 0
+    sender._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(instance_name="sender", instance_rank=0)
+    )
+    dealer = Mock()
+    sender._get_or_connect_thread_dealer = Mock(return_value=dealer)
+    if channel == "kv":
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.disaggregation.native.bounce.build_send_request",
+            lambda _bounce, _write_meta, _factory: (object(), None),
+        )
+    else:
+        monkeypatch.setattr(
+            Sender, "_make_agent_request", staticmethod(lambda *_args, **_kwargs: object())
+        )
+
+    errors = []
+
+    def deliver() -> None:
+        try:
+            if channel == "kv":
+                sender._deliver_kv_to_agent(write_meta)
+            else:
+                sender._deliver_aux_to_agent(write_meta)
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=deliver)
+    thread.start()
+    assert transfer_started.wait(timeout=1)
+    assert task.status is TaskStatus.TRANSFERRING
+
+    session.cancel()
+    assert session.status is SessionStatus.CANCELLED
+    assert task.status is TaskStatus.ERROR
+    assert session.has_transferring_tasks()
+
+    release_transfer.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert errors == []
+    assert session.status is SessionStatus.CANCELLED
+    assert task.status is TaskStatus.ERROR
+    assert not task.source_access_active
+    assert not task.has_pending_result_delivery
+    assert not session.has_transferring_tasks()
+
+
+@pytest.mark.parametrize("first_terminal", ["cancel", "error"])
+def test_tx_session_first_terminal_failure_wins_and_settlement_retries(
+    first_terminal,
+) -> None:
+    sender, session, task, _write_meta = _make_owned_send_task_and_session(
+        channel="kv", expected_transfers=1
+    )
+
+    if first_terminal == "cancel":
+        session.cancel()
+        first_exception = session.exception
+        session.set_exception("late worker failure")
+        session.cancel()
+
+        assert session.status is SessionStatus.CANCELLED
+        assert session.exception is first_exception is None
+    else:
+        session.set_exception("first worker failure")
+        first_exception = session.exception
+        session.cancel()
+        session.set_exception("late worker failure")
+
+        assert session.status is SessionStatus.ERROR
+        assert session.exception is first_exception
+        assert str(session.exception).endswith(": first worker failure")
+
+    assert task.status is TaskStatus.ERROR
+    assert sender.cancel_session.call_count == 3
+
+
 def test_local_cancel_installs_tombstone_and_retries_settlement() -> None:
     info = _recv_info()
     session = object.__new__(TxSession)
@@ -1551,6 +2094,7 @@ def test_local_cancel_installs_tombstone_and_retries_settlement() -> None:
     session._sender = None
     sender = object.__new__(Sender)
     sender._shutdown_complete = False
+    sender._instance_rank = 0
     sender._sessions = {}
     sender._sessions_lock = threading.Lock()
     sender._peer_requests = {REQUEST_ID: {(WRITER_RANK, 0): info}}
@@ -1624,6 +2168,7 @@ def test_sender_req_info_returns_a_stable_snapshot() -> None:
     info = _recv_info()
     sender = object.__new__(Sender)
     sender._shutdown_complete = True
+    sender._instance_rank = 0
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests = {REQUEST_ID: {(WRITER_RANK, 0): info}}
 
@@ -1664,6 +2209,7 @@ def test_external_backend_fence_coordinates_registry_and_bounce_settlement() -> 
 
 def test_sender_retries_listener_stop_after_first_failure() -> None:
     sender = object.__new__(Sender)
+    sender._instance_rank = 0
     sender._shutdown = False
     sender._shutdown_complete = False
     sender._listener_stopped = False
@@ -1824,6 +2370,7 @@ def test_sender_shutdown_is_serialized_and_closes_late_control_admission() -> No
 
 def test_tx_send_admission_finishes_before_sender_shutdown_sentinel() -> None:
     sender = object.__new__(Sender)
+    sender._instance_rank = 0
     sender._operation_admission_lock = threading.RLock()
     sender._shutdown = False
     sender._shutdown_complete = False
@@ -1918,6 +2465,7 @@ def test_tx_send_admission_finishes_before_sender_shutdown_sentinel() -> None:
 
 def test_sender_retries_failed_worker_local_dealer_close() -> None:
     sender = object.__new__(Sender)
+    sender._instance_rank = 0
     sender._failed_thread_dealers = []
     sender._failed_thread_dealers_lock = threading.Lock()
     dealer = Mock()
@@ -1959,6 +2507,7 @@ def test_sender_retries_failed_worker_local_dealer_close() -> None:
 
 def test_sender_shutdown_retains_agent_for_in_doubt_transfer_context() -> None:
     sender = object.__new__(Sender)
+    sender._instance_rank = 0
     sender._shutdown = False
     sender._shutdown_complete = False
     sender._listener_stopped = True

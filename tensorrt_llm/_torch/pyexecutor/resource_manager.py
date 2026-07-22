@@ -2571,6 +2571,7 @@ class _ResourceReleaseProgress:
     release_plan: Tuple[BaseResourceManager, ...]
     next_manager: int = 0
     in_doubt_manager: Optional[int] = None
+    manager_call_active: bool = False
     failure: Optional[str] = None
 
 
@@ -2579,6 +2580,7 @@ class _TransferResourceReleaseProgress:
     request: LlmRequest
     completed_managers: Set[ResourceManagerType]
     in_doubt_manager: Optional[ResourceManagerType] = None
+    manager_call_active: bool = False
     failure: Optional[str] = None
 
 
@@ -2636,67 +2638,101 @@ class ResourceManager:
 
     def free_resources(self, request: LlmRequest):
         request_key = id(request)
-        with self._resource_release_lock:
-            transfer_progress = self._transfer_resource_release_progress.get(
-                request_key)
-            if (transfer_progress is not None
-                    and transfer_progress.request is not request):
-                raise RuntimeError(
-                    "transfer resource release identity collision for request "
-                    f"{request.py_request_id}")
-            if (transfer_progress is not None
-                    and transfer_progress.in_doubt_manager is not None):
-                raise RuntimeError(
-                    "transfer resource release outcome is in doubt for request "
-                    f"{request.py_request_id} at manager "
-                    f"{transfer_progress.in_doubt_manager.value}: "
-                    f"{transfer_progress.failure}")
+        while True:
+            with self._resource_release_lock:
+                transfer_progress = self._transfer_resource_release_progress.get(
+                    request_key)
+                if (transfer_progress is not None
+                        and transfer_progress.request is not request):
+                    raise RuntimeError(
+                        "transfer resource release identity collision for request "
+                        f"{request.py_request_id}")
+                if (transfer_progress is not None
+                        and transfer_progress.in_doubt_manager is not None):
+                    if transfer_progress.manager_call_active:
+                        raise RuntimeError(
+                            "transfer resource release is already in progress for "
+                            f"request {request.py_request_id} at manager "
+                            f"{transfer_progress.in_doubt_manager.value}")
+                    raise RuntimeError(
+                        "transfer resource release outcome is in doubt for request "
+                        f"{request.py_request_id} at manager "
+                        f"{transfer_progress.in_doubt_manager.value}: "
+                        f"{transfer_progress.failure}")
 
-            progress = self._resource_release_progress.get(request_key)
-            if progress is not None and progress.request is not request:
-                raise RuntimeError(
-                    "resource release identity collision for request "
-                    f"{request.py_request_id}")
+                progress = self._resource_release_progress.get(request_key)
+                if progress is not None and progress.request is not request:
+                    raise RuntimeError(
+                        "resource release identity collision for request "
+                        f"{request.py_request_id}")
 
-            if progress is None:
-                release_plan = tuple(
-                    resource_manager
-                    for resource_mgr_type, resource_manager in reversed(
-                        self.resource_managers.items())
-                    if (transfer_progress is None or resource_mgr_type not in
-                        transfer_progress.completed_managers)
-                    if hasattr(resource_manager, "free_resources"))
-                progress = _ResourceReleaseProgress(request, release_plan)
-                self._resource_release_progress[request_key] = progress
+                if progress is None:
+                    release_plan = tuple(
+                        resource_manager
+                        for resource_mgr_type, resource_manager in reversed(
+                            self.resource_managers.items())
+                        if (transfer_progress is None or resource_mgr_type
+                            not in transfer_progress.completed_managers)
+                        if hasattr(resource_manager, "free_resources"))
+                    progress = _ResourceReleaseProgress(request, release_plan)
+                    self._resource_release_progress[request_key] = progress
 
-            if progress.in_doubt_manager is not None:
-                raise RuntimeError(
-                    "resource release outcome is in doubt for request "
-                    f"{request.py_request_id} at manager index "
-                    f"{progress.in_doubt_manager}: {progress.failure}")
+                if progress.in_doubt_manager is not None:
+                    if progress.manager_call_active:
+                        raise RuntimeError(
+                            "resource release is already in progress for request "
+                            f"{request.py_request_id} at manager index "
+                            f"{progress.in_doubt_manager}")
+                    raise RuntimeError(
+                        "resource release outcome is in doubt for request "
+                        f"{request.py_request_id} at manager index "
+                        f"{progress.in_doubt_manager}: {progress.failure}")
 
-            while progress.next_manager < len(progress.release_plan):
-                # Mark the individual manager attempt ambiguous before calling
-                # it. An exception may be raised after that manager has already
-                # released some state, so blindly invoking it again could
-                # double-free. Only a normal return proves this step complete.
-                progress.in_doubt_manager = progress.next_manager
-                try:
-                    progress.release_plan[progress.next_manager].free_resources(
-                        request)
-                except Exception as error:
-                    progress.failure = f"{type(error).__name__}: {error}"
-                    raise
+                if progress.next_manager == len(progress.release_plan):
+                    if self._resource_release_progress.get(
+                            request_key) is progress:
+                        self._resource_release_progress.pop(request_key)
+                    if (transfer_progress is not None
+                            and self._transfer_resource_release_progress.get(
+                                request_key) is transfer_progress):
+                        self._transfer_resource_release_progress.pop(
+                            request_key)
+                    return
+
+                # Reserve one exact manager attempt under synchronization, then
+                # release the global metadata lock before arbitrary allocator or
+                # callback code runs. A concurrent call for this same request
+                # fails closed, while unrelated requests can continue.
+                manager_index = progress.next_manager
+                manager = progress.release_plan[manager_index]
+                progress.in_doubt_manager = manager_index
+                progress.manager_call_active = True
+
+            try:
+                manager.free_resources(request)
+            except Exception as error:
+                with self._resource_release_lock:
+                    if (self._resource_release_progress.get(request_key)
+                            is progress):
+                        progress.manager_call_active = False
+                        progress.failure = f"{type(error).__name__}: {error}"
+                raise
+
+            with self._resource_release_lock:
+                if self._resource_release_progress.get(
+                        request_key) is not progress:
+                    raise RuntimeError(
+                        "resource release progress disappeared for request "
+                        f"{request.py_request_id}")
+                if (progress.in_doubt_manager != manager_index
+                        or not progress.manager_call_active):
+                    raise RuntimeError(
+                        "resource release progress changed during callback for "
+                        f"request {request.py_request_id}")
                 progress.next_manager += 1
                 progress.in_doubt_manager = None
+                progress.manager_call_active = False
                 progress.failure = None
-
-            if self._resource_release_progress.get(request_key) is progress:
-                self._resource_release_progress.pop(request_key)
-            if (transfer_progress is not None and
-                    self._transfer_resource_release_progress.get(request_key)
-                    is transfer_progress):
-                self._transfer_resource_release_progress.pop(request_key)
 
     def release_resource_for_transfer(
             self, request: LlmRequest,
@@ -2725,6 +2761,11 @@ class ResourceManager:
                 self._transfer_resource_release_progress[request_key] = progress
 
             if progress.in_doubt_manager is not None:
+                if progress.manager_call_active:
+                    raise RuntimeError(
+                        "transfer resource release is already in progress for "
+                        f"request {request.py_request_id} at manager "
+                        f"{progress.in_doubt_manager.value}")
                 raise RuntimeError(
                     "transfer resource release outcome is in doubt for request "
                     f"{request.py_request_id} at manager "
@@ -2738,13 +2779,32 @@ class ResourceManager:
                 return
 
             progress.in_doubt_manager = resource_mgr_type
-            try:
-                manager.free_resources(request)
-            except Exception as error:
-                progress.failure = f"{type(error).__name__}: {error}"
-                raise
+            progress.manager_call_active = True
+
+        try:
+            manager.free_resources(request)
+        except Exception as error:
+            with self._resource_release_lock:
+                if self._transfer_resource_release_progress.get(
+                        request_key) is progress:
+                    progress.manager_call_active = False
+                    progress.failure = f"{type(error).__name__}: {error}"
+            raise
+
+        with self._resource_release_lock:
+            if self._transfer_resource_release_progress.get(
+                    request_key) is not progress:
+                raise RuntimeError(
+                    "transfer resource release progress disappeared for request "
+                    f"{request.py_request_id}")
+            if (progress.in_doubt_manager != resource_mgr_type
+                    or not progress.manager_call_active):
+                raise RuntimeError(
+                    "transfer resource release progress changed during callback "
+                    f"for request {request.py_request_id}")
             progress.completed_managers.add(resource_mgr_type)
             progress.in_doubt_manager = None
+            progress.manager_call_active = False
             progress.failure = None
 
     def has_in_doubt_resource_releases(self) -> bool:
@@ -2752,8 +2812,10 @@ class ResourceManager:
         with self._resource_release_lock:
             return (any(
                 progress.in_doubt_manager is not None
+                and not progress.manager_call_active
                 for progress in self._resource_release_progress.values())
-                    or any(progress.in_doubt_manager is not None for progress in
+                    or any(progress.in_doubt_manager is not None
+                           and not progress.manager_call_active for progress in
                            self._transfer_resource_release_progress.values()))
 
     def has_pending_resource_releases(self) -> bool:

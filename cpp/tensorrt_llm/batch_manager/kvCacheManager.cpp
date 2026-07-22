@@ -42,7 +42,7 @@
 #include <map>
 #include <optional>
 #include <sstream>
-#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -272,11 +272,6 @@ void KVCacheBlock::decSchedulingRefCount()
 {
     TLLM_CHECK_WITH_INFO(hasSchedulingRefs(), "Can't remove link from block that is not allocated");
     mSchedulingRefCount--;
-}
-
-SizeType32 KVCacheBlock::getRefCount() const
-{
-    return mRefCount;
 }
 
 bool KVCacheBlock::hasRefs() const
@@ -2984,11 +2979,22 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
 
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    // Shared beams repeat the same BlockPtr in mAllocatedBlocksPerSeq. One
+    // reference is sufficient to pin that physical block. The matching unpin
+    // operation must likewise provide that physical block ID only once.
+    std::unordered_set<KVCacheBlock*> pinnedBlocks;
+    pinnedBlocks.reserve(allocatedBlocks.size());
     for (auto& block : allocatedBlocks)
     {
-        block->incRefCount();
+        // Placeholders have no addressable pool slot or non-negative block ID,
+        // so they cannot produce a token accepted by unpinBlocksById.
+        if (!block->isPlaceholder() && pinnedBlocks.insert(block.get()).second)
+        {
+            block->incRefCount();
+        }
     }
 }
 
@@ -3001,24 +3007,24 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
 
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
-    // Validate the complete operation before changing any refcount. Repeated
-    // IDs represent multiple pin tokens, so aggregate their decrements and
-    // prove that the block has enough references for the entire batch.
-    std::unordered_map<KVCacheBlock::IdType, SizeType32> decrementCounts;
+    // Validate the complete operation before changing any refcount. Raw block
+    // IDs do not identify which refcount contribution is a pin token, so a
+    // duplicate could consume a live sequence or another owner's reference.
+    std::unordered_set<KVCacheBlock::IdType> seenBlockIds;
     std::vector<BlockPtr> blocksToUnpin;
-    decrementCounts.reserve(blockIds.size());
+    seenBlockIds.reserve(blockIds.size());
     blocksToUnpin.reserve(blockIds.size());
     for (auto const& blockId : blockIds)
     {
         TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
             "Block id %d is out of range", blockId);
+        auto const inserted = seenBlockIds.insert(blockId).second;
+        TLLM_CHECK_WITH_INFO(inserted, "Duplicate block id %d in one unpin operation", blockId);
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            auto const decrementCount = ++decrementCounts[blockId];
-            TLLM_CHECK_WITH_INFO(block->getRefCount() >= decrementCount,
-                "Can't unpin block (id=%d) %d time(s) with refcount %d", static_cast<int>(blockId), decrementCount,
-                block->getRefCount());
+            TLLM_CHECK_WITH_INFO(
+                block->hasRefs(), "Can't unpin block (id=%d) that is not allocated", static_cast<int>(blockId));
             blocksToUnpin.push_back(block);
         }
     }

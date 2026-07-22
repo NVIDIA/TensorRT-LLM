@@ -53,6 +53,13 @@ except ImportError:  # pragma: no cover - CPU-only env without CUDA bindings
 _MIB = 1024 * 1024
 
 
+def test_transfer_context_compatibility_alias():
+    from tensorrt_llm._torch.disaggregation.native import bounce
+
+    assert bounce.TransferContext is bounce.RecvBounceContext
+    assert "TransferContext" in bounce.__all__
+
+
 # --------------------------------------------------------------------------- #
 # config.py — sizing + OOM guard (pure math, always runnable)
 # --------------------------------------------------------------------------- #
@@ -195,10 +202,10 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
 
 
 # --------------------------------------------------------------------------- #
-# fan-in safety gate — equal split for uniform TP-by-head and even PP
+# fan-in safety gate — equal split only within one PP stage
 # --------------------------------------------------------------------------- #
 def test_fanin_bounce_safe_gate():
-    """Require uniform PP layers and no TP head duplication in either direction."""
+    """Require one PP stage and no TP head duplication in either direction."""
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     safe = tfr.Receiver._fanin_bounce_safe
 
@@ -209,22 +216,36 @@ def test_fanin_bounce_safe_gate():
             overlap_pp_size=pp,
         )
 
-    def ri(lpp):
-        return SimpleNamespace(layer_num_per_pp=lpp)
-
     # A single PP stage is safe only when neither peer duplicates KV heads.
-    assert safe(ov(1, 1), ri([24])) is True
-    assert safe(ov(1, 0), ri([24])) is True
-    assert safe(ov(2, 1), ri([24])) is False  # duplicate heads / MLA -> some don't send
-    assert safe(ov(1, 1, peer_dup=2), ri([24])) is False  # reciprocal duplication
-    # Equal PP layers are safe; reserve separately checks per-block byte sizes.
-    assert safe(ov(1, 4), ri([20, 20, 20, 20])) is True
-    # Uneven PP fan-in also falls back.
-    assert safe(ov(1, 4), ri([20, 20, 20, 19])) is False
-    # incomplete per-stage info (single element for a multi-stage fan-in) -> conservative fall back
-    assert safe(ov(1, 4), ri([20])) is False
-    # duplicate heads blocks even an otherwise-even PP split
-    assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+    assert safe(ov(1, 1)) is True
+    assert safe(ov(1, 0)) is False
+    assert safe(ov(2, 1)) is False  # duplicate heads / MLA -> some don't send
+    assert safe(ov(1, 1, peer_dup=2)) is False  # reciprocal duplication
+    # Every PP fan-in falls back regardless of peer-stage metadata.
+    assert safe(ov(1, 4)) is False
+    assert safe(ov(2, 4)) is False
+
+
+def test_fanin_bounce_rejects_uniform_peer_pp_with_mismatched_boundaries():
+    """Uniform peer stages can intersect one local PP stage by unequal extents."""
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+
+    # Local PP rank 0 owns layers [0, 30), while globally uniform peer stages
+    # own [0, 20) and [20, 40). Their local intersections are 20 and 10 layers,
+    # so an equal two-writer bounce split would authorize the wrong boundary.
+    local_start, local_end = 0, 30
+    peer_boundaries = ((0, 20), (20, 40))
+    intersections = [
+        max(0, min(local_end, end) - max(local_start, start)) for start, end in peer_boundaries
+    ]
+    assert intersections == [20, 10]
+
+    overlap = SimpleNamespace(
+        duplicate_head_factor=1,
+        peer_duplicate_head_factor=1,
+        overlap_pp_size=2,
+    )
+    assert tfr.Receiver._fanin_bounce_safe(overlap) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -253,6 +274,8 @@ class TestNoBounce:
         nb.mark_protocol_conflict(("r", 0))
         nb.mark_backend_quiesced()
         assert nb.retry_settlements()
+        assert nb.retry_settlements("r")
+        assert nb.retry_settlements(("r", 0))
         nb.record_result(("r", 0), 1)  # no-op, must not raise
         nb.record_failure(("r", 0), 1)  # no-op, must not raise
         nb.release_idle_reservation(("r", 0))  # no-op, must not raise
@@ -386,7 +409,7 @@ def _make_transport(monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bl
 
 def _recv_req(block_counts, rid=1, slice_id=0):
     return SimpleNamespace(
-        block_ids_per_layer_groups=[SimpleNamespace(size=n) for n in block_counts],
+        block_ids_per_layer_groups=[np.arange(n, dtype=np.int64) for n in block_counts],
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
@@ -402,6 +425,22 @@ def _write_meta():
         dst_device_id=0,
         peer_name="peer",
     )
+
+
+def _run_mock_scatter_worker(transport, monkeypatch) -> None:
+    transport._scatter_ready = threading.Event()
+    monkeypatch.setattr(
+        btr,
+        "cudart",
+        SimpleNamespace(
+            cudaSetDevice=lambda device_id: ("ok",),
+            cudaStreamSynchronize=lambda stream: ("ok",),
+        ),
+    )
+    monkeypatch.setattr(btr, "CUASSERT", lambda result: result[1:])
+    monkeypatch.setattr(btr, "scatter_contiguous", lambda *args, **kwargs: None)
+    transport._scatter_q.put(None)
+    transport._scatter_loop()
 
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
@@ -1045,35 +1084,22 @@ class TestTransportRollback:
 
 
 @pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
-class TestFanInReserve:
-    def test_reserve_stamps_base_and_per_writer(self, monkeypatch):
+class TestReceiveReserve:
+    def test_reserve_stamps_single_writer_base(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         req = _recv_req([2])  # total = 2 * 100 = 200
-        assert t.reserve(req, writer_ranks=[7, 3]) is True
+        assert t.reserve(req, writer_ranks=[7]) is True
         assert req.bounce_dst_base == 0x100000
-        # Exact rank order determines layout; per_writer = 100.
         assert t.writer_base((req.unique_rid, req.slice_id), 7) == 0x100000
-        assert t.writer_base((req.unique_rid, req.slice_id), 3) == 0x100000 + 100
         assert t.writer_base((req.unique_rid, req.slice_id), 9) is None
 
-    def test_reserve_uneven_fanin_falls_back(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[3])
-        req = _recv_req([1])  # total = 3, not divisible by 2
+    @pytest.mark.parametrize("slot_bytes", [[3], [100], [100, 100], [100, 200]])
+    def test_reserve_rejects_every_multiwriter_plan(self, monkeypatch, slot_bytes):
+        t = _make_transport(monkeypatch, block_bytes_per_group=slot_bytes)
+        req = _recv_req([2] * len(slot_bytes))
         assert t.reserve(req, writer_ranks=[7, 3]) is False
         assert req.bounce_dst_base is None
-
-    def test_reserve_heterogeneous_fanin_falls_back(self, monkeypatch):
-        # Two groups with different per-block sizes: the equal split would overrun a sub-region, so
-        # fall back (even though the total is divisible).
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 200])
-        req = _recv_req([2, 2])  # total = 2*100 + 2*200 = 600
-        assert t.reserve(req, writer_ranks=[7, 3]) is False
-        assert req.bounce_dst_base is None
-
-    def test_reserve_uniform_multigroup_fanin_ok(self, monkeypatch):
-        # Uniform slot bytes across present groups -> even byte split -> bounce allowed.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100, 100])
-        assert t.reserve(_recv_req([2, 2]), writer_ranks=[7, 3]) is True
+        assert not t._recv_alloc.has_outstanding
 
     def test_reserve_heterogeneous_single_writer_ok(self, monkeypatch):
         # A single writer has no split, so heterogeneous slot bytes are fine.
@@ -1085,6 +1111,34 @@ class TestFanInReserve:
         req = _recv_req([1])  # total = 3, one writer -> no even-split requirement
         assert t.reserve(req, writer_ranks=[3]) is True
 
+    def test_reserve_counts_only_valid_block_ids(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([0])
+        # Prefix/SWA tables may retain BAD_PAGE_INDEX entries for evicted
+        # blocks. Only the two extractable slots contribute bytes.
+        req.block_ids_per_layer_groups = [np.array([4, -1, 9, -1], dtype=np.int64)]
+
+        assert t.reserve(req, writer_ranks=[3]) is True
+        ctx = t._reserved_map[(req.unique_rid, req.slice_id)]
+        assert ctx.per_writer_bytes == 200
+
+    @pytest.mark.parametrize(
+        "remaining_blocks",
+        [
+            np.array([8, 9], dtype=np.int64),
+            np.array([31], dtype=np.int64),
+        ],
+        ids=["prefix-trimmed", "swa-trimmed"],
+    )
+    def test_reserve_sizes_only_the_remaining_trimmed_suffix(self, monkeypatch, remaining_blocks):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[64])
+        req = _recv_req([0])
+        req.block_ids_per_layer_groups = [remaining_blocks]
+
+        assert t.reserve(req, writer_ranks=[3]) is True
+        ctx = t._reserved_map[(req.unique_rid, req.slice_id)]
+        assert ctx.per_writer_bytes == remaining_blocks.size * 64
+
     def test_reserve_binds_trusted_destination_intervals(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[8])
         req = _recv_req([1])
@@ -1095,6 +1149,21 @@ class TestFanInReserve:
         )
         ctx = t._reserved_map[(req.unique_rid, req.slice_id)]
         assert ctx._destination_intervals == ((0x2000, 0x2008),)
+
+    def test_reserve_rejects_aliased_destination_union_before_publication(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[200])
+        req = _recv_req([1])
+
+        assert not t.reserve(
+            req,
+            writer_ranks=[3],
+            destination_intervals=[(0x2000, 100), (0x2000, 100)],
+        )
+
+        assert req.bounce_dst_base is None
+        assert t._reserved_map == {}
+        assert t._recv_alloc.released == [0]
+        assert not t._recv_alloc.has_outstanding
 
     def test_destination_intervals_factory_runs_only_after_allocator_admission(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[8])
@@ -1185,80 +1254,6 @@ class TestFanInReserve:
         t = _make_transport(monkeypatch, block_bytes_per_group=[1000], capacity=500)
         assert t.reserve(_recv_req([2]), writer_ranks=[3]) is False  # total 2000 > cap 500
 
-    def test_fanin_scatters_in_exact_rank_plan_order(self, monkeypatch):
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        req = _recv_req([2])
-        assert t.reserve(req, writer_ranks=[3, 7]) is True
-        rid_slice = (req.unique_rid, req.slice_id)
-        # Writer for the higher planned base reports first; scatter follows the rank plan.
-        t.record_result(
-            rid_slice,
-            7,
-            np.array([20], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=0x100000 + 100,
-        )
-        assert t._scatter_q.empty()  # only 1 of 2 writers terminal -> no scatter
-        assert not t._recv_alloc.released  # region NOT freed while a writer is still pending
-        t.record_result(
-            rid_slice,
-            3,
-            np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=0x100000,
-        )
-        ctx, descs = t._scatter_q.get_nowait()
-        # Each tail carries its own planned src_base in exact rank-plan order.
-        assert [t[0] for t in descs] == [0x100000, 0x100000 + 100]
-        assert [list(t[1]) for t in descs] == [[10], [20]]  # dst_ptrs
-        assert [list(t[2]) for t in descs] == [[8], [8]]  # sizes
-
-    def test_fanin_fallback_writer_leaves_survivor_at_its_own_base(self, monkeypatch):
-        # Regression: if one fan-in writer falls back to in-place (SUCCESS, empty tail) while a
-        # sibling bounces, the survivor must be scattered from ITS OWN src_base, not packed to 0.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        req = _recv_req([2])
-        assert t.reserve(req, writer_ranks=[7, 3]) is True
-        rid_slice = (req.unique_rid, req.slice_id)
-        t.record_result(
-            rid_slice, 7, None, None
-        )  # writer 0 fell back to in-place: SUCCESS, no tail
-        assert t._scatter_q.empty()  # only 1 of 2 writers terminal
-        t.record_result(
-            rid_slice,
-            3,
-            np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=0x100000 + 100,
-        )  # writer 1 bounced to base+100
-        ctx, descs = t._scatter_q.get_nowait()
-        assert [t[0] for t in descs] == [0x100000 + 100]
-        assert [list(t[1]) for t in descs] == [[10]]
-
-    def test_fanin_failed_then_success_releases_only_after_both(self, monkeypatch):
-        # A FAILED writer must not free the shared region until every writer is terminal.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        req = _recv_req([2])
-        assert t.reserve(req, writer_ranks=[7, 3]) is True
-        rid_slice = (req.unique_rid, req.slice_id)
-        assert t.mark_writer_exposed(rid_slice, 7)
-        assert t.mark_writer_exposed(rid_slice, 3)
-        t.record_failure(rid_slice, 7)  # first writer fails
-        assert not t._recv_alloc.released  # region held while a sibling may still be in flight
-        assert t.is_bounced(rid_slice) is True
-        t.record_result(
-            rid_slice,
-            3,
-            np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
-            src_base=0x100000 + 100,
-        )
-        # all terminal, >=1 FAILED -> no scatter, release (both drained), region freed.
-        assert t._scatter_q.empty()
-        assert t._recv_alloc.released
-        assert not t._recv_alloc.quarantined  # FAILED has drained -> release, NOT quarantine
-        assert t.is_bounced(rid_slice) is False
-
     def test_on_done_fires_after_scatter_lands(self, monkeypatch):
         # The completion cb rides the context and fires only when the worker records the scatter as
         # done -> the gen never observes completion before the KV is scattered into place.
@@ -1271,7 +1266,7 @@ class TestFanInReserve:
             rid_slice,
             3,
             np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
+            np.array([200], dtype=np.int64),
             src_base=0x100000,
             on_done=lambda ok: calls.append(ok),
         )
@@ -1310,18 +1305,6 @@ class TestFanInReserve:
             on_done=lambda ok: calls.append(ok),
         )
         assert calls == []  # no-op, no callback
-
-    def test_duplicate_writer_is_ignored(self, monkeypatch):
-        # A duplicate SUCCESS from the same peer_rank must not double-count toward all-terminal.
-        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
-        req = _recv_req([2])
-        assert t.reserve(req, writer_ranks=[7, 3]) is True
-        rid_slice = (req.unique_rid, req.slice_id)
-        arr = (np.array([10], dtype=np.int64), np.array([8], dtype=np.int64))
-        t.record_result(rid_slice, 7, *arr, src_base=0x100000)
-        t.record_result(rid_slice, 7, *arr, src_base=0x100000)  # duplicate same writer
-        assert t._scatter_q.empty()  # still only 1 distinct writer -> not all terminal
-        assert not t._recv_alloc.released
 
     def test_scatter_write_result_non_bounce_fires_on_done(self):
         # Non-bounced path completes inline (the in-place WRITE already landed the KV).
@@ -1456,7 +1439,7 @@ class TestFanInReserve:
             key,
             7,
             np.array([0x2000], dtype=np.int64),
-            np.array([8], dtype=np.int64),
+            np.array([200], dtype=np.int64),
             src_base=0x100000,
             on_done=lambda succeeded: receiver._finish_bounce(key, succeeded, 7),
         )
@@ -1502,6 +1485,136 @@ class TestFanInReserve:
         assert t._recv_alloc.released == [0]
         assert t.retry_settlements()
 
+    def test_scatter_worker_continues_after_physical_settlement_failure(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        first_req = _recv_req([1], rid=1)
+        second_req = _recv_req([1], rid=2)
+        assert t.reserve(first_req, writer_ranks=[7])
+        assert t.reserve(second_req, writer_ranks=[7])
+        first_key = (first_req.unique_rid, first_req.slice_id)
+        second_key = (second_req.unique_rid, second_req.slice_id)
+        for key, dst_ptr in ((first_key, 0x2000), (second_key, 0x3000)):
+            t.record_result(
+                key,
+                7,
+                np.array([dst_ptr], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                src_base=0x100000,
+            )
+
+        release = t._recv_alloc.release
+        failed_once = False
+
+        def fail_first_release(slot_id):
+            nonlocal failed_once
+            if slot_id == 0 and not failed_once:
+                failed_once = True
+                raise RuntimeError("allocator temporarily unavailable")
+            release(slot_id)
+
+        t._recv_alloc.release = fail_first_release
+        _run_mock_scatter_worker(t, monkeypatch)
+
+        assert t.is_bounced(first_key)
+        assert not t.is_bounced(second_key)
+        assert t._recv_alloc.released == [1]
+        assert t._scatter_worker_error is None
+        assert t._scatter_stream_healthy
+        assert t._accepting_reservations
+        assert t.retry_settlements(first_key)
+        assert t._recv_alloc.released == [1, 0]
+
+    def test_scoped_settlement_retry_ignores_unrelated_request(self, monkeypatch):
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        first_req = _recv_req([1], rid=1)
+        second_req = _recv_req([1], rid=2)
+        assert t.reserve(first_req, writer_ranks=[7])
+        assert t.reserve(second_req, writer_ranks=[7])
+        first_key = (first_req.unique_rid, first_req.slice_id)
+        second_key = (second_req.unique_rid, second_req.slice_id)
+        second_calls = []
+
+        def reject_first(_succeeded):
+            raise RuntimeError("request A consumer unavailable")
+
+        def accept_second_on_retry(succeeded):
+            second_calls.append(succeeded)
+            if len(second_calls) == 1:
+                raise RuntimeError("request B consumer temporarily unavailable")
+
+        t.record_result(first_key, 7, None, None, on_done=reject_first)
+        t.record_result(second_key, 7, None, None, on_done=accept_second_on_retry)
+        assert t.is_bounced(first_key)
+        assert t.is_bounced(second_key)
+
+        assert t.retry_settlements(second_key)
+        assert not t.is_bounced(second_key)
+        assert t.is_bounced(first_key)
+
+        # Request-scoped drain must not inherit request A's retry failure.
+        session = SimpleNamespace(
+            disagg_request_id=second_req.unique_rid,
+            _receiver=SimpleNamespace(
+                _bounce=t,
+                _recv_registry=SimpleNamespace(is_request_drained=lambda rid: rid == 2),
+            ),
+            has_untracked_receive_activity=lambda: False,
+        )
+        assert tfr.RxSession.resources_drained(session)
+        assert not t.retry_settlements(first_req.unique_rid)
+        assert not t.retry_settlements()
+        assert second_calls == [True, True]
+
+    def test_unexpected_scatter_worker_failure_closes_admission(self, monkeypatch):
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        first_req = _recv_req([1], rid=1)
+        second_req = _recv_req([1], rid=2)
+        assert t.reserve(first_req, writer_ranks=[7])
+        assert t.reserve(second_req, writer_ranks=[7])
+        first_key = (first_req.unique_rid, first_req.slice_id)
+        second_key = (second_req.unique_rid, second_req.slice_id)
+        first_logical_failures, second_calls = [], []
+        for key, dst_ptr, on_done, on_logical_failure in (
+            (first_key, 0x2000, None, lambda: first_logical_failures.append(True)),
+            (second_key, 0x3000, lambda ok: second_calls.append(ok), None),
+        ):
+            t.record_result(
+                key,
+                7,
+                np.array([dst_ptr], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                src_base=0x100000,
+                on_done=on_done,
+                on_logical_failure=on_logical_failure,
+            )
+
+        apply = t._apply
+        failed_once = False
+
+        def fail_first_state_update(rid_slice, mutate):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise RuntimeError("unexpected state-machine failure")
+            apply(rid_slice, mutate)
+
+        t._apply = fail_first_state_update
+        _run_mock_scatter_worker(t, monkeypatch)
+
+        assert isinstance(t._scatter_worker_error, RuntimeError)
+        assert not t._scatter_stream_healthy
+        assert not t._accepting_reservations
+        assert t.is_bounced(first_key)
+        first = t._reserved_map[first_key]
+        assert first.logical_failed
+        assert first.scatter_state is bcore.ScatterState.FAILED
+        assert first_logical_failures == [True]
+        assert not t.is_bounced(second_key)
+        assert second_calls == [False]
+        assert t._recv_alloc.released == [1]
+        assert not t.reserve(_recv_req([1], rid=3), writer_ranks=[7])
+
     def test_scatter_failure_suppresses_later_unlaunched_queue_entries(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
         first_req = _recv_req([1], rid=1)
@@ -1510,20 +1623,21 @@ class TestFanInReserve:
         assert t.reserve(second_req, writer_ranks=[7])
         first_key = (first_req.unique_rid, first_req.slice_id)
         second_key = (second_req.unique_rid, second_req.slice_id)
-        first_calls, second_calls = [], []
+        first_calls, second_calls, first_logical_failures = [], [], []
         t.record_result(
             first_key,
             7,
             np.array([0x2000], dtype=np.int64),
-            np.array([8], dtype=np.int64),
+            np.array([100], dtype=np.int64),
             src_base=0x100000,
             on_done=lambda ok: first_calls.append(ok),
+            on_logical_failure=lambda: first_logical_failures.append(True),
         )
         t.record_result(
             second_key,
             7,
             np.array([0x3000], dtype=np.int64),
-            np.array([8], dtype=np.int64),
+            np.array([100], dtype=np.int64),
             src_base=0x100000,
             on_done=lambda ok: second_calls.append(ok),
         )
@@ -1544,9 +1658,81 @@ class TestFanInReserve:
 
         assert t.is_bounced(first_key)  # the launched CUDA work remains ambiguous
         assert first_calls == []
+        assert first_logical_failures == [True]
         assert not t.is_bounced(second_key)  # this entry never launched and settles as failed
         assert second_calls == [False]
         assert t._recv_alloc.released == [1]
+
+    def test_scatter_failure_fails_request_but_retains_physical_ownership(self, monkeypatch):
+        tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+        from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionArgsBase
+        from tensorrt_llm._torch.disaggregation.native.receive_lifecycle import LogicalState
+        from tensorrt_llm.disaggregated_params import DisaggregatedParams
+
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100])
+        req = _recv_req([1], rid=101)
+        assert t.reserve(req, writer_ranks=[7])
+        key = (req.unique_rid, req.slice_id)
+
+        registry = RecvTransferRegistry()
+        assert registry.prepare(key, {7}, has_bounce_slot=True).accepted
+        assert registry.begin_publication(key, 7).publication_allowed
+        assert registry.mark_published(key, 7).accepted
+        registry.record_result(key, 7, WriterResult.SUCCESS, WriterMode.BOUNCE)
+
+        params = DisaggregatedParams(
+            disagg_request_id=key[0],
+            ctx_request_id=key[0],
+            ctx_dp_rank=0,
+        )
+        task = tfr.KVRecvTask(key[0], KVSlice(), key[1], params, aux_slot=None)
+        task.status = tfr.TaskStatus.TRANSFERRING
+        task.lifecycle_managed = True
+        task._perf_timer = None
+
+        receiver = object.__new__(tfr.Receiver)
+        receiver._shutdown = True
+        receiver._recv_registry = registry
+        receiver._bounce = t
+        receiver._sessions_lock = threading.Lock()
+        receiver._bounce_lifecycle_delivery_lock = threading.Lock()
+        receiver._pending_bounce_lifecycle_deliveries = {}
+        receiver._pending_bounce_logical_failure_deliveries = {}
+        receiver._registrar = SimpleNamespace(
+            self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
+        )
+
+        session = object.__new__(tfr.RxSession)
+        session._closed = True
+        session.request_id = key[0]
+        session._base_args = SessionArgsBase(params)
+        session.lock = threading.Lock()
+        session._kv_tasks = [task]
+        session._receiver = receiver
+        session._need_aux = False
+        session._terminal_status = None
+        session._active_receive_dispatches = 0
+        receiver._sessions = {key[0]: session}
+
+        t.record_result(
+            key,
+            7,
+            np.array([0x2000], dtype=np.int64),
+            np.array([100], dtype=np.int64),
+            src_base=0x100000,
+            on_done=lambda succeeded: receiver._finish_bounce(key, succeeded, 7),
+            on_logical_failure=lambda: receiver._fail_bounce_logically(key),
+        )
+        bounce_context, _descs = t._scatter_q.get_nowait()
+        t._apply(bounce_context.rid_slice, lambda context: context.finish_scatter(False))
+
+        snapshot = registry.context_snapshot(key)
+        assert snapshot.logical_state is LogicalState.FAILED
+        assert snapshot.physical_state is not PhysicalState.DRAINED
+        assert task.status is tfr.TaskStatus.ERROR
+        assert not tfr.RxSession.resources_drained(session)
+        assert t.is_bounced(key)
+        assert t._recv_alloc.released == []
 
     def test_backend_quiescence_callback_fires_after_slot_settlement(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
@@ -1580,7 +1766,7 @@ class TestFanInReserve:
             key,
             3,
             np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
+            np.array([200], dtype=np.int64),
             src_base=0x100000,
         )
 
@@ -1617,7 +1803,7 @@ class TestFanInReserve:
             key,
             3,
             np.array([10], dtype=np.int64),
-            np.array([8], dtype=np.int64),
+            np.array([200], dtype=np.int64),
             src_base=0x100000,
             on_done=acknowledge,
         )
@@ -1786,7 +1972,10 @@ class TestLifecycle:
         )
 
     def _dst(self, v=10):
-        return dict(dst_ptrs=np.array([v], dtype=np.int64), sizes=np.array([8], dtype=np.int64))
+        return dict(
+            dst_ptrs=np.array([v], dtype=np.int64),
+            sizes=np.array([100], dtype=np.int64),
+        )
 
     def test_writer_base_layout(self):
         c = self._ctx((7, 3, 11), per_writer_bytes=0x64, base_addr=0x1000)
@@ -1813,7 +2002,7 @@ class TestLifecycle:
         c.record_writer_result(7, succeeded=True, src_base=0x1000, **self._dst())
         assert not c.ready_to_scatter()  # 1/2 writers
         assert not c.ready_to_settle()  # drain-before-release
-        c.record_writer_result(3, succeeded=True, src_base=0x1000 + 100, **self._dst(20))
+        c.record_writer_result(3, succeeded=True, src_base=0x1000 + 100, **self._dst(110))
         assert c.ready_to_scatter()  # all success -> scatter
 
     def test_fanin_failed_then_success_releases(self):
@@ -1911,8 +2100,8 @@ class TestLifecycle:
             3,
             succeeded=True,
             src_base=0x1000,
-            dst_ptrs=np.array([0x2000, 0x2004], dtype=np.int64),
-            sizes=np.array([8, 8], dtype=np.int64),
+            dst_ptrs=np.array([0x2000, 0x2030], dtype=np.int64),
+            sizes=np.array([60, 40], dtype=np.int64),
         )
         assert not c.ready_to_scatter()
         assert c.ready_to_settle()
@@ -1925,14 +2114,14 @@ class TestLifecycle:
             succeeded=True,
             src_base=0x1000,
             dst_ptrs=np.array([0x2000], dtype=np.int64),
-            sizes=np.array([8], dtype=np.int64),
+            sizes=np.array([100], dtype=np.int64),
         )
         c.record_writer_result(
             3,
             succeeded=True,
             src_base=0x1000 + 100,
-            dst_ptrs=np.array([0x2004], dtype=np.int64),
-            sizes=np.array([8], dtype=np.int64),
+            dst_ptrs=np.array([0x2030], dtype=np.int64),
+            sizes=np.array([100], dtype=np.int64),
         )
         assert c.logical_failed
         assert not c.ready_to_scatter()
@@ -1949,13 +2138,13 @@ class TestLifecycle:
             succeeded=True,
             src_base=0x1000,
             dst_ptrs=np.array([0x20F0], dtype=np.int64),
-            sizes=np.array([0x20], dtype=np.int64),
+            sizes=np.array([0x100], dtype=np.int64),
         )
         assert not c.ready_to_scatter()
         assert c.ready_to_settle()
         assert c.settle().success is False
 
-    def test_scatter_destinations_accept_complete_in_range_intervals(self):
+    def test_scatter_destinations_reject_truncated_in_range_intervals(self):
         c = self._ctx(
             per_writer_bytes=0x100,
             destination_intervals=[(0x2000, 0x100)],
@@ -1966,6 +2155,22 @@ class TestLifecycle:
             src_base=0x1000,
             dst_ptrs=np.array([0x2000, 0x2080], dtype=np.int64),
             sizes=np.array([0x80, 0x20], dtype=np.int64),
+        )
+        assert not c.ready_to_scatter()
+        assert c.ready_to_settle()
+        assert c.settle().success is False
+
+    def test_scatter_destinations_accept_exact_heterogeneous_fragment_shapes(self):
+        c = self._ctx(
+            per_writer_bytes=0x100,
+            destination_intervals=[(0x2000, 0x100)],
+        )
+        c.record_writer_result(
+            3,
+            succeeded=True,
+            src_base=0x1000,
+            dst_ptrs=np.array([0x2000, 0x2040], dtype=np.int64),
+            sizes=np.array([0x40, 0xC0], dtype=np.int64),
         )
         assert c.ready_to_scatter()
 
@@ -2007,6 +2212,7 @@ class TestLifecycle:
         assert not c.ready_to_settle()
         assert c.settle() is None
         assert c.scatter_state is bcore.ScatterState.FAILED
+        assert c.logical_failed
 
     def test_logical_failure_during_scatter_waits_and_reports_failure(self):
         c = self._ctx()

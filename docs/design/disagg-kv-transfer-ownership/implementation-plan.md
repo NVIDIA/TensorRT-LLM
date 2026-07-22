@@ -12,7 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 | **Owner** | Chien-Chun Hung |
 | **Status** | Draft implementation plan |
 | **Created** | 2026-07-08 |
-| **Last updated** | 2026-07-14 |
+| **Last updated** | 2026-07-21 |
 
 ## Performance and Capacity Contract
 
@@ -67,6 +67,20 @@ capacity can increase memory residence and reduce admission throughput; that is
 the intended fail-closed result. The detailed metrics below are the target
 instrumentation contract and are not all exported by this first slice.
 
+A non-empty initial legacy bounce result tail is not an exact fixed manifest. It
+proves the expected bounce-source base, exact aggregate writer bytes,
+receiver-authorized destination-union containment, and disjoint destinations.
+It cannot reject an equal-sized source-to-destination permutation within the
+sole enabled writer (or across writers if multi-writer bounce is later enabled)
+because the frame does not carry the receiver's expected mapping. Exact
+manifest matching and permutation rejection remain O13 follow-up gates; the
+containment slice keeps every multi-writer cohort on the direct path until
+byte-accurate per-writer extents can be authorized. Single-writer bounce also
+falls back to direct transfer unless the complete receiver pool mapping is
+provably a byte-equal bijection: both peers use equal tokens-per-block, every
+attention pool view maps exactly once through `IdentityMapper`, and each mapped
+physical pool has equal slot bytes.
+
 | Scenario | Expected impact |
 |---|---|
 | Healthy direct or bounce transfer | With admission piggybacked on the existing request/target response, throughput, TTFT, and transfer-task latency should remain within benchmark noise. CPU time and host memory rise slightly with O(contexts + writer operations + descriptor/scatter segments + lifecycle records + outstanding generations) metadata and state transitions. An implementation that adds a per-transfer RTT must declare and qualify that separate behavior. |
@@ -77,6 +91,34 @@ instrumentation contract and are not all exported by this first slice.
 | Lost result or ambiguous transport failure | Exact unique bounce-slot bytes and unique/pending-free KV bytes remain unavailable, so high-water marks, admission failures, and tail latency can worsen as safe capacity is exhausted. This is an intentional safety tradeoff until bounded recovery exists. |
 | Many dynamic streams reserve maximum envelopes but materialize little work | Host allocation may stay low while reserved credits reduce admissible concurrency and goodput. Reservation utilization/slack and reservation-caused rejection determine whether a configured envelope is rollout-safe. |
 | Shutdown with in-flight work | Graceful shutdown may take longer or return non-drained. Unsafe deregistration/unmapping events must fall to zero. |
+
+The containment implementation also moves fallible local retirement preparation
+before the transceiver's existing outcome-consensus barrier. It re-advertises a
+provisional candidate until every rank reports cleanup-ready and adds no new
+healthy-path collective round. Cancellation may be conservatively delayed while
+one collective-bearing status/preparation call owns a snapshot; this affects
+only overlapping control work, not the data path.
+
+Request-level response arbitration likewise has no expected healthy-path metric
+gain. It prevents duplicate terminal responses across native, connector, and
+cancellation paths. If the response sink raises after its side-effect boundary,
+the implementation refuses replay because the sink exposes no acknowledgement;
+that trades a possible lost response for duplicate prevention and should be
+counted separately from transfer failures.
+
+The two extra rank-uniform votes occur only during Python-native executor
+shutdown. The first
+follows connector completion draining and fallible sampler/DWDP finalization,
+then gates entry to resource-manager shutdown. The second publishes the outcome
+of the non-replayable, per-manager shutdown phase before any engine deletion;
+the phase stops at its first ambiguous manager so later dependencies remain
+live. The votes do not affect
+TTFT or steady-state throughput. A connector-disabled shutdown executes these
+two reductions in total; a connector-enabled shutdown executes three, including
+its earlier connector-drain outcome consensus. This cost applies only to an
+otherwise-ready Python-native shutdown attempt and prevents rank-divergent retry
+deadlocks before and after manager destruction begins. Default C++-transceiver
+and non-disaggregated shutdown retain their existing local-only manager teardown.
 
 The main capacity metrics are:
 
@@ -256,9 +298,10 @@ rollout-safe until the full Phase 1 gate passes.
   without changing the C++ transceiver's boolean contract. Let PyExecutor drop
   destination-KV ownership while the lease makes it pending-free, but preserve
   independent session/auxiliary cleanup gates; retain the sender-side legacy
-  gate until Phase 2. Shared manager accounting may veto teardown for a live
-  generic owner or release, but the adapter must not retire a C++ transport
-  owner or treat local C++ object destruction as quiescence evidence.
+  gate until Phase 2. Enter the shared manager drain/veto protocol only for the
+  lifecycle-capable Python transceiver. Default C++ and non-disaggregated paths
+  retain baseline local manager teardown; the adapter must not audit or retire a
+  C++ transport owner or treat local object destruction as quiescence evidence.
 - Make receiver context insertion and `TransferHandle` enrollment atomic with
   respect to handle abort/sealing. Gate every access boundary on the durable
   gate before taking the context lock, abort the gate on first failure,
@@ -401,13 +444,23 @@ adapters in `tensorrt_llm/_torch/pyexecutor/_util.py`.
 - Consider per-operation abort only if the backend can guarantee no later memory
   access after acknowledgement.
 
-The core effort is approximately 4,000–7,300 production lines plus substantial
-concurrency and integration tests. The C++ `CacheTransceiver` implementation,
-data path, and wire protocol remain outside this scope. Cross-language work is
-limited to shared KV-manager or NIXL binding contracts that the Python runtime
-consumes. Shared `AsyncTransferManager`/`ResourceManager` accounting may observe
-live generic ownership and fail closed, but it does not implement or retire the
-C++ transport lifecycle.
+The original pre-implementation estimate of 4,000–7,300 production lines is
+obsolete. The 2026-07-21 implementation snapshot is approximately +10,300/-1,400
+production lines, +11,000/-260 test lines, and +2,700 documentation lines. That
+is too large for one effective code review. After landing the design-only
+#16347 prerequisite, the implementation should be split into stacked review
+units for (1) C++ V1 pin hardening, (2) native operation/session ledgers and
+transport cancellation, (3) bounce containment, and (4) PyExecutor/manager
+ownership and shutdown. Unit, integration, and test-list wiring travels with
+the stack unit it validates. Each boundary must preserve a safe, testable
+fail-closed state rather than temporarily weakening ownership.
+
+The C++ `CacheTransceiver` implementation, data path, and wire protocol remain
+outside this scope. Cross-language work is limited to shared KV-manager or NIXL
+binding contracts that the Python runtime consumes. The Python-native path may
+use shared `AsyncTransferManager`/`ResourceManager` accounting to fail closed on
+its own live ownership, but default C++ and non-disaggregated teardown bypass
+that Python lifecycle protocol.
 
 ## Rollout and Rollback
 
@@ -645,9 +698,10 @@ publication and teardown races.
 ### Configuration matrix
 
 - bounce not requested, requested but factory-inactive, and arena-active;
-- positive bounce-engagement evidence on candidate GB200/GB300 MNNVL fabric-VMM
-  cells; the merged config-enabled GB200 test is not proof, and
-  configured-but-inactive runs count as direct fallback;
+- positive bounce-engagement evidence on fabric-VMM cells; merged #16116
+  provides a scheduled GB200 assertion, GB300 remains marker-eligible but is not
+  claimed as scheduled coverage, and configured-but-inactive runs count as
+  direct fallback;
 - Python KV manager V2 and C++-backed V1;
 - phase-matched new/new negotiation plus new/legacy, missing-capability,
   unknown-capability, and downgrade rejection;
