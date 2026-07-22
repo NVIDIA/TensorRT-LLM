@@ -155,6 +155,8 @@ the eager path.
 
 Suffix-automaton (SA) speculative decoding is supported as an opt-in for
 evaluation (see `eval_extra_llm_options_sa.yaml`). SA runs keep CUDA graphs
-and the overlap scheduler off, need `max_batch_size` ≤ 8, and use the plain
-expert-parallel deployment rather than DEP16 (SA with attention DP is not
-yet certified).
+and the overlap scheduler off, need `max_batch_size` ≤ 8, and use the same
+DEP16 deployment as the non-SA config (SA with attention DP is
+parity-certified; DEP16 is also the only deployment with the memory
+headroom for larger draft lengths — plain EP replicates attention weights
+and only fits the minimal `max_draft_len=2` eager configuration).
