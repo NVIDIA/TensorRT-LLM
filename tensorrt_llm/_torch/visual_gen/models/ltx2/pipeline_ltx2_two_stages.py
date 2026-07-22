@@ -1402,6 +1402,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 # prepare_text_cache (topology-dependent) inside
                 # _refinement_denoise and is restored in the finally below.
                 self.transformer.set_ulysses_topology(is_stage2=True)
+                if self.rank == 0:
+                    vgm = self.pipeline_config.visual_gen_mapping
+                    logger.info(
+                        f"Stage 2: switched parallel topology from cfg{vgm.cfg_size} "
+                        f"uly{vgm.ulysses_size} to uly {self.transformer._sharder_s2.size} "
+                        "(there is no cfg in stage 2)"
+                    )
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
