@@ -51,6 +51,13 @@ from typing import Any, Dict, List, Literal, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._perf_metrics_schema import (
+    DisaggPerfMetricsRecord,
+    PerfMetrics,
+    PerfMetricsRecord,
+    WorkerPerfMetrics,
+    WorkerPerfMetricsRecord,
+)
 
 COUNTER_METRICS = [
     ("total_requests", "Total number of requests"),
@@ -459,6 +466,93 @@ def combine_disagg_metrics(
     return combined
 
 
+def _jsonl_perf_metrics(phase_record: Dict[str, Any]) -> PerfMetrics:
+    perf_metrics: PerfMetrics = {
+        "timing_metrics": dict(phase_record.get("timing_metrics", {})),
+    }
+    if "first_iter" in phase_record:
+        perf_metrics["first_iter"] = phase_record["first_iter"]
+    if "last_iter" in phase_record:
+        perf_metrics["last_iter"] = phase_record["last_iter"]
+    if "kv_cache_metrics" in phase_record:
+        perf_metrics["kv_cache_metrics"] = phase_record["kv_cache_metrics"]
+    if "speculative_decoding" in phase_record:
+        perf_metrics["speculative_decoding"] = phase_record["speculative_decoding"]
+
+    timing_metrics = dict(perf_metrics.get("timing_metrics", {}))
+    if not timing_metrics.get("kv_cache_size"):
+        for name in ("kv_cache_size", "kv_cache_transfer_start", "kv_cache_transfer_end"):
+            timing_metrics.pop(name, None)
+    perf_metrics["timing_metrics"] = timing_metrics
+
+    kv_cache_metrics = dict(perf_metrics.get("kv_cache_metrics", {}))
+    kv_cache_metrics.pop("kv_cache_hit_rate", None)
+    if kv_cache_metrics:
+        perf_metrics["kv_cache_metrics"] = kv_cache_metrics
+    return perf_metrics
+
+
+def _jsonl_worker_metrics(
+    record: Dict[str, Any], phase_record: Dict[str, Any]
+) -> WorkerPerfMetrics:
+    request_id = record["request_id"]
+    try:
+        request_id = int(request_id)
+    except (TypeError, ValueError):
+        pass
+    worker_metrics: WorkerPerfMetrics = {
+        "request_id": request_id,
+        "perf_metrics": _jsonl_perf_metrics(phase_record),
+    }
+    if record.get("ctx_request_id") is not None:
+        worker_metrics["ctx_request_id"] = record["ctx_request_id"]
+    if phase_record.get("time_breakdown_metrics") is not None:
+        worker_metrics["time_breakdown_metrics"] = phase_record["time_breakdown_metrics"]
+    return worker_metrics
+
+
+def _jsonl_record(record: Dict[str, Any]) -> PerfMetricsRecord:
+    phases = record.get("phases", {})
+    if "disagg" not in phases:
+        worker_metrics = _jsonl_worker_metrics(record, phases["server"])
+        jsonl_record: WorkerPerfMetricsRecord = {
+            **worker_metrics,
+            "status": record.get("status", "complete"),
+        }
+        if record.get("disagg_request_id") is not None:
+            jsonl_record["disagg_request_id"] = record["disagg_request_id"]
+        return jsonl_record
+
+    disagg_phase = phases["disagg"]
+    disagg_timing = disagg_phase["timing_metrics"]
+    disagg_record: DisaggPerfMetricsRecord = {
+        "ctx_server": disagg_phase["ctx_server"],
+        "gen_server": disagg_phase["gen_server"],
+        "disagg_server_arrival_time": disagg_timing["server_arrival_time"],
+        "disagg_ctx_dispatch_time": disagg_timing["ctx_dispatch_time"],
+        "disagg_server_first_token_time": disagg_timing["server_first_token_time"],
+        "status": record.get("status", "complete"),
+    }
+    for phase, field in (
+        ("ctx", "ctx_perf_metrics"),
+        ("gen", "gen_perf_metrics"),
+    ):
+        phase_record = phases.get(phase)
+        if phase_record:
+            worker_record = {
+                "request_id": phase_record.get("request_id", record["request_id"]),
+                "ctx_request_id": phase_record.get("ctx_request_id"),
+            }
+            worker_metrics = _jsonl_worker_metrics(worker_record, phase_record)
+            if field == "ctx_perf_metrics":
+                disagg_record["ctx_perf_metrics"] = worker_metrics
+            else:
+                disagg_record["gen_perf_metrics"] = worker_metrics
+    if record.get("disagg_request_id") is not None:
+        disagg_record["disagg_request_id"] = record["disagg_request_id"]
+    return disagg_record
+
+
 class PerfMetricsJsonlWriter:
     """Best-effort bounded JSONL writer shared by both serving apps."""
 
@@ -490,16 +584,8 @@ class PerfMetricsJsonlWriter:
     def submit(self, record: Dict[str, Any]) -> None:
         if self._task is None:
             return
-        record = {
-            **record,
-            "worker": {
-                "server_kind": self._server_kind,
-                "hostname": socket.gethostname(),
-                "pid": os.getpid(),
-            },
-        }
         try:
-            self._queue.put_nowait(record)
+            self._queue.put_nowait(_jsonl_record(record))
         except asyncio.QueueFull:
             self.dropped_records += 1
             if self.dropped_records == 1 or self.dropped_records % 1000 == 0:

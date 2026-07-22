@@ -81,13 +81,14 @@ def test_return_perf_metrics_and_jsonl_dump(server: RemoteOpenAIServer,
                                           expected_count=1)
     data = records[-1]
     assert data["status"] == "complete"
-    assert "request_id" in data
-    assert "disagg_request_id" not in data
-    assert perf_metrics.START_END_TIME_HEADER in data["metrics_headers"]
-    assert perf_metrics.STEP_METRICS_HEADER in data["metrics_headers"]
-    assert perf_metrics.CTX_CHUNK_METRICS_HEADER in data["metrics_headers"]
+    assert set(data) == {
+        "request_id",
+        "perf_metrics",
+        "time_breakdown_metrics",
+        "status",
+    }
 
-    request_metrics = data["phases"]["server"]
+    request_metrics = data["perf_metrics"]
     assert request_metrics["first_iter"] <= request_metrics["last_iter"]
 
     timing_metrics = request_metrics["timing_metrics"]
@@ -103,14 +104,8 @@ def test_return_perf_metrics_and_jsonl_dump(server: RemoteOpenAIServer,
         "num_total_allocated_blocks"]
 
     assert "ctx_request_id" not in data
-    assert timing_metrics["kv_cache_transfer_start"] is None
-    assert timing_metrics["kv_cache_transfer_end"] is None
-
-    record = next(record for record in records
-                  if record["request_id"] == data["request_id"])
-    assert record["status"] == "complete"
-    assert record["streaming"] is False
-    assert record["worker"]["server_kind"] == "server"
+    assert "kv_cache_transfer_start" not in timing_metrics
+    assert "kv_cache_transfer_end" not in timing_metrics
 
     response = requests.post(
         f"{server.url_root}/v1/completions",

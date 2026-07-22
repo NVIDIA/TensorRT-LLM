@@ -205,34 +205,42 @@ def test_return_perf_metrics_and_jsonl_dump(
 
     timing_metrics = get_timing_metrics(perf_metrics_output_dir)
     validate_timing_metrics(timing_metrics, "test_return_perf_metrics_and_jsonl_dump")
-    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, expected_count=3)
-    expected_kinds = {"context", "generation", "disagg"}
-    records_by_kind = {
-        record["worker"]["server_kind"]: record
-        for record in records
-        if record["worker"]["server_kind"] in expected_kinds
+    worker_metric_keys = {
+        "ctx_request_id",
+        "perf_metrics",
+        "request_id",
+        "time_breakdown_metrics",
     }
-    assert expected_kinds <= records_by_kind.keys()
-
-    disagg_request_id = records_by_kind["disagg"]["disagg_request_id"]
-    for record in records_by_kind.values():
+    perf_metric_keys = {
+        "first_iter",
+        "kv_cache_metrics",
+        "last_iter",
+        "timing_metrics",
+    }
+    for worker_metrics in (
+        timing_metrics["ctx_perf_metrics"],
+        timing_metrics["gen_perf_metrics"],
+    ):
+        assert set(worker_metrics) == worker_metric_keys
+        assert set(worker_metrics["perf_metrics"]) == perf_metric_keys
+        assert "kv_cache_hit_rate" not in worker_metrics["perf_metrics"]["kv_cache_metrics"]
+    ctx_timing_metrics = timing_metrics["ctx_perf_metrics"]["perf_metrics"]["timing_metrics"]
+    assert "kv_cache_transfer_start" not in ctx_timing_metrics
+    assert "kv_cache_transfer_end" not in ctx_timing_metrics
+    assert "kv_cache_size" not in ctx_timing_metrics
+    records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir, expected_count=3)
+    disagg_record = next(record for record in records if "ctx_server" in record)
+    disagg_request_id = disagg_record["disagg_request_id"]
+    for record in records:
         assert record["status"] == "complete"
-        assert record["streaming"] is False
         assert record["disagg_request_id"] == disagg_request_id
 
-    disagg_record = records_by_kind["disagg"]
-    assert set(disagg_record["phases"]) == {"disagg", "ctx", "gen"}
-    for phase in ("ctx", "gen"):
-        phase_record = disagg_record["phases"][phase]
-        assert phase_record["timing_metrics"]["arrival_time"] > 0
-        assert (
-            phase_record["timing_metrics"]["arrival_time"]
-            <= phase_record["timing_metrics"]["last_token_time"]
-        )
-        assert SERVER_TIMING_HEADER in phase_record["metrics_headers"]
-        assert START_END_TIME_HEADER in phase_record["metrics_headers"]
-    assert CTX_CHUNK_METRICS_HEADER in disagg_record["phases"]["ctx"]["metrics_headers"]
-    assert STEP_METRICS_HEADER in disagg_record["phases"]["gen"]["metrics_headers"]
+    assert "ctx_perf_metrics" in disagg_record
+    assert "gen_perf_metrics" in disagg_record
+    assert (
+        disagg_record["disagg_server_arrival_time"]
+        <= disagg_record["disagg_server_first_token_time"]
+    )
 
     payload = {
         "model": model_name,

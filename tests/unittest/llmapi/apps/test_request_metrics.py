@@ -25,6 +25,7 @@ from tensorrt_llm.serve.perf_metrics import (
     STEP_METRICS_HEADER,
     PerfMetricsJsonlWriter,
     PerfMetricsMiddleware,
+    _jsonl_record,
     build_metrics_headers,
     build_metrics_record_from_headers,
     combine_disagg_metrics,
@@ -148,24 +149,31 @@ def test_time_breakdown_parser_accepts_header_derived_disagg_record():
     record = combine_disagg_metrics(
         "42",
         {
+            "ctx_server": "ctx:8000",
+            "gen_server": "gen:8000",
             "timing_metrics": {
                 "server_arrival_time": 0.99,
+                "ctx_dispatch_time": 1.0,
                 "server_first_token_time": 1.03,
-            }
+            },
         },
         ctx,
         gen,
         disagg_request_id=42,
     )
 
-    parsed = RequestDataParser().parse_request(record, 0)
+    parsed = RequestDataParser().parse_request(_jsonl_record(record), 0)
 
     assert parsed["ctx_arrival_time"] == pytest.approx(1.0)
     assert parsed["ctx_first_scheduled_time"] == pytest.approx(1.01)
     assert parsed["ctx_first_token_time"] == pytest.approx(1.02)
+    assert parsed["ctx_server_arrival_time"] == pytest.approx(1.0)
+    assert parsed["ctx_server_first_token_time"] == pytest.approx(1.05)
     assert parsed["gen_arrival_time"] == pytest.approx(1.0)
     assert parsed["gen_first_scheduled_time"] == pytest.approx(1.01)
     assert parsed["gen_first_token_time"] == pytest.approx(1.02)
+    assert parsed["gen_server_arrival_time"] == pytest.approx(1.0)
+    assert parsed["gen_server_first_token_time"] == pytest.approx(1.05)
     assert parsed["disagg_server_arrival_time"] == pytest.approx(0.99)
 
 
@@ -361,9 +369,13 @@ async def test_jsonl_writer(tmp_path):
     files = list(tmp_path.glob("perf_metrics-test-*.jsonl"))
     assert len(files) == 1
     saved = json.loads(files[0].read_text())
-    assert saved["request_id"] == _record()["request_id"]
-    assert saved["worker"]["server_kind"] == "test"
-    assert saved["worker"]["pid"] > 0
+    assert saved["request_id"] == 42
+    assert set(saved) == {
+        "request_id",
+        "perf_metrics",
+        "time_breakdown_metrics",
+        "status",
+    }
 
 
 @pytest.mark.asyncio
@@ -406,5 +418,5 @@ async def test_file_middleware_intercepts_detail_headers(tmp_path):
     output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
     saved = json.loads(output_file.read_text())
     assert saved["disagg_request_id"] == 17
-    assert STEP_METRICS_HEADER in saved["metrics_headers"]
-    assert CTX_CHUNK_METRICS_HEADER in saved["metrics_headers"]
+    assert saved["time_breakdown_metrics"]["step_metrics"]
+    assert saved["time_breakdown_metrics"]["ctx_chunk_metrics"]
