@@ -74,7 +74,14 @@ def _get_num_cuda_graph_padding_dummy_slots(
     spec_config: Optional["DecodingBaseConfig"],
     max_batch_size: int,
 ) -> int:
-    """Return the number of persistent CUDA-graph padding dummy IDs."""
+    """Return the number of persistent CUDA-graph padding dummy IDs.
+
+    This is computed before ``ModelEngine`` exists and covers draft lengths
+    reachable at every batch size, including the zero-length acceptance-rate
+    fallback. ``ModelEngine._compute_dynamic_draft_len_mapping`` is created
+    later and covers only configured CUDA-graph batch sizes, so it cannot size
+    this persistent ID set.
+    """
     if spec_config is None:
         return 1
 
@@ -2536,7 +2543,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update else None)
-        self.replay_history_size: Optional[int] = self.replay_step_width
+        self.replay_history_size: Optional[int] = (
+            max(MIN_REPLAY_HISTORY_SIZE, self.replay_step_width)
+            if self.replay_step_width is not None else None)
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0

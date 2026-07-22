@@ -59,13 +59,21 @@ class MapperKind(IntEnum):
 
 @dataclass
 class PhysicalPool:
+    """Affine view of a physical pool over logical layers and slots.
+
+    ``slot_bytes`` is the transferable payload for one ``(layer, slot)`` and
+    ``num_slots`` is the number of logical slots. The payload address is
+    ``base_address + layer * layer_stride_bytes + slot * slot_stride_bytes``.
+    The strides describe the physical layout independently of payload size and
+    slot count. Their defaults describe dense layer-major storage, where
+    ``slot_stride_bytes == slot_bytes`` and
+    ``layer_stride_bytes == num_slots * slot_stride_bytes``. V2 Mamba supplies
+    both explicitly for its slot-major, role-interleaved pools.
+    """
+
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
-    # Distance between adjacent slots in this logical pool view. Mamba also
-    # consumes ``layer_stride_bytes`` to address its per-layer state. The
-    # defaults preserve V1 Mamba's dense ``[layer][slot][payload]`` layout;
-    # V2 Mamba overrides both strides for its slot-major coalesced layout.
     slot_stride_bytes: Optional[int] = None
     layer_stride_bytes: Optional[int] = None
 

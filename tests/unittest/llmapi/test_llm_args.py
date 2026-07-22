@@ -3311,6 +3311,126 @@ class _ArchSensitiveTransceiverModel:
         return None
 
 
+class _NoModelDefaults:
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        return {}
+
+
+class TestMambaSnapshotConfigResolution:
+
+    @staticmethod
+    def _load_config(monkeypatch, args, architecture):
+        from unittest.mock import MagicMock
+
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM,
+            "_resolve_class",
+            staticmethod(lambda config: _NoModelDefaults),
+        )
+        fake_loader = MagicMock()
+        fake_config = MagicMock()
+        fake_config.pretrained_config.architectures = [architecture]
+        fake_config.pretrained_config.hybrid_override_pattern = None
+        fake_loader.load_config.return_value = fake_config
+        return model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+
+    @staticmethod
+    def _capture_warnings(monkeypatch):
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        messages = []
+        monkeypatch.setattr(
+            model_loader_mod.logger, "warning",
+            lambda message, *args: messages.append(message % args
+                                                   if args else message))
+        return messages
+
+    @pytest.mark.parametrize(
+        ("kv_cache_config", "expected_reuse", "expected_warning"),
+        [
+            (KvCacheConfig(), False, True),
+            (
+                KvCacheConfig(
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=64),
+                    use_kv_cache_manager_v2=False,
+                ),
+                True,
+                False,
+            ),
+            (
+                KvCacheConfig(
+                    mamba_state_config=MambaStateConfig(
+                        additional_snapshot_offsets_from_end=[0]),
+                    use_kv_cache_manager_v2=True,
+                ),
+                True,
+                False,
+            ),
+            (
+                KvCacheConfig(
+                    block_reuse_policy="per_conversation",
+                    mamba_state_config=MambaStateConfig(
+                        periodic_snapshot_interval=64),
+                    use_kv_cache_manager_v2=True,
+                ),
+                False,
+                True,
+            ),
+        ],
+        ids=["none", "periodic", "fixed", "per-conversation-no-fixed"],
+    )
+    def test_hybrid_snapshot_policy_controls_block_reuse(
+        self,
+        monkeypatch,
+        kv_cache_config,
+        expected_reuse,
+        expected_warning,
+    ):
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            kv_cache_config=kv_cache_config)
+        warnings = self._capture_warnings(monkeypatch)
+
+        self._load_config(monkeypatch, args, "Qwen3NextForCausalLM")
+
+        assert args.kv_cache_config.enable_block_reuse is expected_reuse
+        assert bool(warnings) is expected_warning
+        if expected_warning:
+            assert "no Mamba state snapshot policy" in warnings[0]
+
+    def test_hybrid_fixed_snapshot_rejects_auto_resolved_v1(self, monkeypatch):
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(
+                mamba_state_config=MambaStateConfig(
+                    additional_snapshot_offsets_from_start=[128]),
+                use_kv_cache_manager_v2="auto",
+            ),
+        )
+
+        with pytest.raises(
+                ValueError,
+                match="use_kv_cache_manager_v2=True after resolving"):
+            self._load_config(monkeypatch, args, "Qwen3NextForCausalLM")
+
+    def test_non_hybrid_without_snapshot_policy_preserves_block_reuse(
+            self, monkeypatch):
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        warnings = self._capture_warnings(monkeypatch)
+
+        self._load_config(monkeypatch, args, "LlamaForCausalLM")
+
+        assert args.kv_cache_config.enable_block_reuse is True
+        assert warnings == []
+
+
 class TestTransceiverRuntimeAutoResolution:
     """Tests for the transceiver_runtime 'auto' selection mechanism."""
 

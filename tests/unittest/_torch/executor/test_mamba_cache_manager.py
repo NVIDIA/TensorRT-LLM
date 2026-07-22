@@ -369,7 +369,7 @@ def test_hybrid_cache_manager_factory_requires_v2_for_explicit_snapshots(
         (True, MambaHybridCacheManagerV2),
     ],
 )
-def test_hybrid_cache_manager_factory_allows_reuse_without_snapshot_policy(
+def test_hybrid_cache_manager_factory_selects_manager_when_snapshot_reuse_disabled(
     monkeypatch, use_v2, expected
 ):
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
@@ -379,7 +379,7 @@ def test_hybrid_cache_manager_factory_allows_reuse_without_snapshot_policy(
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
             KvCacheConfig(
-                enable_block_reuse=True,
+                enable_block_reuse=False,
                 mamba_state_config=MambaStateConfig(periodic_snapshot_interval=0),
                 use_kv_cache_manager_v2=use_v2,
             ),
@@ -2280,7 +2280,9 @@ def test_v2_hybrid_replay_buffers_size_by_tokens_per_gen_step():
         assert mgr.use_replay_state_update is True
         assert replay_metadata is not None
         assert replay_metadata.replay_step_width == spec_config.tokens_per_gen_step
-        assert replay_metadata.replay_history_size == spec_config.tokens_per_gen_step
+        assert replay_metadata.replay_history_size == max(
+            MIN_REPLAY_HISTORY_SIZE, spec_config.tokens_per_gen_step
+        )
         layer_cache = mgr.mamba_layer_cache(0)
         _assert_replay_layer_cache_uses_history_size(
             layer_cache, replay_metadata.replay_history_size

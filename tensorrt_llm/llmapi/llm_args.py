@@ -3573,6 +3573,8 @@ class MambaStateConfig(StrictBaseModel):
 
     periodic_snapshot_interval: NonNegativeInt = Field(
         default=0,
+        status="prototype",
+        telemetry=True,
         description=
         "The number of tokens between periodic snapshots in the Mamba "
         "prefix cache. Periodic snapshots are disabled by default; set this "
