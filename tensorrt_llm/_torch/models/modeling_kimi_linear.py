@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KimiLinearForCausalLM — Kimi K3 ("golden prairie") text model, PyTorch backend.
+"""KimiLinearForCausalLM — Kimi K3 text model, PyTorch backend.
 
 Runtime integration of the Kimi K3 hybrid architecture for the standard
 TRT-LLM PyTorch-backend flow (``LLM(model=<ckpt>) -> generate``):
@@ -301,18 +301,20 @@ class KimiK3MoERuntime(nn.Module):
                           if (self.ep_size > 1 and self.dep_comm is None)
                           else None)
 
-        # Fused SiTU MoE paths. KIMI_K3_FUSED_MOE selects the backend:
-        #   "0" (default) — Python per-expert fallback;
-        #   "native"      — in-tree TRTLLM-Gen SiTU op (W4A8 MXFP4xMXFP8,
-        #                   torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner;
-        #                   no external cubin env needed, SM100/SM103 only).
-        # In the fused mode the kernel-layout weights are prepared lazily on
-        # the first forward (after load_weights has populated the bank); the
+        # Fused SiTU MoE path selection is automatic: Blackwell
+        # (SM100/SM103) uses the in-tree TRTLLM-Gen SiTU op (W4A8
+        # MXFP4xMXFP8, torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner);
+        # any other arch falls back to the Python per-expert dequant
+        # reference. An explicit ``moe_config.backend="VANILLA"`` forces the
+        # reference on any arch — the bit-parity oracle for tests. In the
+        # fused mode the kernel-layout weights are prepared lazily on the
+        # first forward (after load_weights has populated the bank); the
         # bank's packed buffers are freed afterwards to avoid holding the
         # expert slice twice.
-        import os as _os
-        _fused_mode = _os.environ.get("KIMI_K3_FUSED_MOE", "0")
-        self.use_native_fused_moe = _fused_mode == "native"
+        from ..modules.kimi_k3_moe._moe_kernels import get_moe_sm_version
+        self.use_native_fused_moe = (
+            str(model_config.moe_backend).upper() != "VANILLA"
+            and get_moe_sm_version() in (100, 103))
         self._situ_alpha = float(situ_beta)
         self._situ_linear_beta = float(situ_linear_beta
                                        if situ_linear_beta is not None else 1.0)

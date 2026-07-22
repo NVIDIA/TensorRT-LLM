@@ -1,39 +1,41 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 ("golden prairie") end-to-end sanity test via the LLM API.
+"""Kimi K3 SA spec-dec / sanity test harness via the LLM API.
 
-Runs a few greedy prompts through the standard TRT-LLM PyTorch backend and
-asserts the outputs contain expected content. Two modes:
+Runs greedy prompts through the standard TRT-LLM PyTorch backend and
+asserts the outputs contain expected content, optionally with SA
+(suffix-automaton) speculative decoding and parity checking against a
+baseline run. Two modes:
 
 * full model (default): needs 16 GPUs (4x GB300 trays), asserts output
   quality (coherent completions, correct GSM8K-style answer).
-* truncated debug (``KIMI_K3_NUM_LAYERS_OVERRIDE=<N>``, e.g. 4 on a single
-  4-GPU tray): only asserts the pipeline runs e2e (load -> prefill ->
-  decode -> shutdown); output text is NOT checked (a 4/93-layer model
-  produces gibberish by construction).
+* truncated (``KIMI_K3_NUM_LAYERS=<N>``, e.g. 4 on a single 4-GPU tray):
+  the harness builds a temporary truncated copy of the checkpoint config
+  (weight shards are symlinked; extra layers are ignored at load time) and
+  only asserts the pipeline runs e2e (load -> prefill -> decode ->
+  shutdown); output text is NOT checked (a 4/93-layer model produces
+  gibberish by construction).
 
-Launch with ``sanity_kimi_k3.sbatch`` (same directory), or manually inside
-the run container on every rank:
+Driven by tests/integration/defs/test_kimi_k3_specdec.py; can also be run
+standalone:
 
-    trtllm-llmapi-launch python examples/kimi_k3/sanity_kimi_k3.py
+    python tests/integration/defs/kimi_k3_sa_harness.py
 
-Environment (the sbatch launcher sets everything up):
+Environment:
   KIMI_K3_CKPT                 model dir (required)
   KIMI_K3_TP                   tensor_parallel_size == EP width (default 16;
                                896 % TP must be 0)
-  KIMI_K3_FUSED_MOE            native (default) = in-tree TRTLLM-Gen SiTU
-                               fused MoE (mxe4m3_mxe2m1_block_scale_moe_runner,
-                               no external cubin env needed);
-                               1 = private-snapshot flashinfer SiTU MXFP4 fused
-                               MoE (snapshot env + FLASHINFER_PRIVATE_CUBIN_DIR
-                               required; still needed for SA spec dec —
-                               in-tree cubins lack the bs<=8 shapes);
-                               0 = slow reference dequant loop
   KIMI_K3_ADP                  1 (default) = DEP deployment (attention-DP +
                                MoE EP dispatch/combine, EP width == TP);
-                               0 = plain EP (replicated attention + allreduce)
-  KIMI_K3_NUM_LAYERS_OVERRIDE  truncate to first N layers (debug; skips
-                               output-quality assertions)
+                               0 = plain EP (replicated attention +
+                               allreduce) — both modes are test-coverable
+  KIMI_K3_NUM_LAYERS           truncate to first N layers via a temporary
+                               checkpoint copy (skips output-quality
+                               assertions)
+  KIMI_K3_MOE_BACKEND          moe_config.backend passed to the LLM
+                               (default AUTO = fused on SM100/SM103;
+                               VANILLA = reference dequant MoE — the
+                               parity oracle, no fused-cubin dependency)
   KIMI_K3_SPEC_MODE            'off' (default) or 'sa' (suffix
                                automaton, one-engine)
   KIMI_K3_SPEC_DRAFT_LEN       SA max_draft_len (default 2)
@@ -56,11 +58,52 @@ Environment (the sbatch launcher sets everything up):
 Exit code 0 = PASS, 1 = FAIL.
 """
 
+import json
 import os
 import sys
+import tempfile
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
+
+# Keeps the truncated-checkpoint temp dir alive for the process lifetime.
+_TRUNCATED_CKPT_DIR = None
+
+
+def _truncated_checkpoint(ckpt: str, num_layers: int) -> str:
+    """Build a temporary checkpoint dir truncated to the first N layers.
+
+    The doctored ``config.json`` sets ``num_hidden_layers`` and filters the
+    1-indexed ``linear_attn_config`` layer schedules consistently; every
+    other file (tokenizer, index, weight shards) is symlinked. Extra
+    checkpoint layers are ignored at load time, so the full shard set can
+    stay in place.
+
+    The copy lives in node-local tmp, so truncated runs are single-node
+    only (remote ranks could not resolve the doctored config); the 4-GPU
+    integration test this serves always fits one node.
+    """
+    global _TRUNCATED_CKPT_DIR
+    _TRUNCATED_CKPT_DIR = tempfile.TemporaryDirectory(
+        prefix="kimi-k3-truncated-")
+    out = _TRUNCATED_CKPT_DIR.name
+    with open(os.path.join(ckpt, "config.json")) as f:
+        config = json.load(f)
+    text = config.get("text_config", config)
+    assert 0 < num_layers <= text["num_hidden_layers"]
+    text["num_hidden_layers"] = num_layers
+    lin = dict(text["linear_attn_config"])
+    lin["kda_layers"] = [l for l in lin["kda_layers"] if l <= num_layers]
+    lin["full_attn_layers"] = [
+        l for l in lin["full_attn_layers"] if l <= num_layers
+    ]
+    text["linear_attn_config"] = lin
+    with open(os.path.join(out, "config.json"), "w") as f:
+        json.dump(config, f)
+    for entry in os.scandir(ckpt):
+        if entry.name != "config.json":
+            os.symlink(entry.path, os.path.join(out, entry.name))
+    return out
 
 PROMPTS_AND_CHECKS = [
     ("The capital of France is", "Paris"),
@@ -103,6 +146,10 @@ def _build_llm(ckpt: str, tp: int, spec_mode: str, adp: bool):
         enable_attention_dp=adp,
         moe_expert_parallel_size=tp if adp else None,
         trust_remote_code=True,  # tiktoken tokenizer ships with the ckpt
+        # VANILLA = per-expert dequant reference MoE (parity oracle, no
+        # fused-cubin dependency); AUTO = fused on SM100/SM103.
+        moe_config=MoeConfig(
+            backend=os.environ.get("KIMI_K3_MOE_BACKEND", "AUTO")),
         max_batch_size=int(os.environ.get("KIMI_K3_MAX_BATCH_SIZE", "8")),
         max_seq_len=int(os.environ.get("KIMI_K3_MAX_SEQ_LEN", "4096")),
         max_num_tokens=int(os.environ.get("KIMI_K3_MAX_NUM_TOKENS", "4096")),
@@ -327,9 +374,12 @@ def _compare_logits_parity(base, spec, prompt, failures,
 
 
 def main() -> int:
-    ckpt = os.environ["KIMI_K3_CKPT"]  # exported by the sbatch launcher
+    ckpt = os.environ["KIMI_K3_CKPT"]
     tp = int(os.environ.get("KIMI_K3_TP", "16"))
-    truncated = os.environ.get("KIMI_K3_NUM_LAYERS_OVERRIDE") is not None
+    num_layers = os.environ.get("KIMI_K3_NUM_LAYERS")
+    truncated = num_layers is not None
+    if truncated:
+        ckpt = _truncated_checkpoint(ckpt, int(num_layers))
     max_tokens = int(os.environ.get("KIMI_K3_MAX_TOKENS", "64"))
     spec_mode = os.environ.get("KIMI_K3_SPEC_MODE", "off")
     # Spec-dec parity modes (baseline greedy runs first, then spec):
@@ -347,7 +397,7 @@ def main() -> int:
     # selects the plain EP mode (replicated attention + latent allreduce).
     adp = os.environ.get("KIMI_K3_ADP", "1") == "1"
     print(f"[sanity] ckpt={ckpt} tp(EP)={tp} adp={adp} truncated={truncated} "
-          f"fused_moe={os.environ.get('KIMI_K3_FUSED_MOE', '0')} "
+          f"moe_backend={os.environ.get('KIMI_K3_MOE_BACKEND', 'AUTO')} "
           f"spec_mode={spec_mode} spec_parity={spec_parity}")
 
     want_logprobs = (spec_parity == "logits"
