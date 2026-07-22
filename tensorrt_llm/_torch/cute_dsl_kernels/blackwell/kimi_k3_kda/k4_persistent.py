@@ -21,7 +21,8 @@ addressing. Supports variable-length sequences via cu_seqlens.
 K4 chunk loop with 6 MMAs per chunk:
   MMA1: W = AB @ KS          (K-MN, K=64)
   MMA2: U = AB @ V           (K-MN, K=64)
-  MMA3: NV = U + W_bf16 @ S  (SS-mode: A=SMEM sO, B=SMEM sST, K=128, accumulate)
+  MMA3: NV = U - W_bf16 @ S  (SS-mode: A=SMEM sO, B=SMEM sST, K=128, accumulate;
+                              W is negated in its readout, FLA: b_v = u - w @ h)
   MMA4: OI = QS @ S          (K-MN, K=128)
   MMA5: O = OI + AQC @ NV    (K-MN, K=64, accumulate)
   MMA6: State += NV^T @ KG   (MN-MN, K=64, accumulate on decayed state)
@@ -1219,7 +1220,9 @@ def k4_persistent_kernel(
                 wh = w_cons.wait_and_advance()
                 for sub in cutlass.range(num_subs):
                     cute.copy(tiled_t2r, tTR_W[None, 0, sub], tRrR[None, 0, sub])
-                    tRrR_out[None, 0, sub].store(tRrR[None, 0, sub].load().to(mma_dtype))
+                    # Negate W in its readout so MMA3 accumulates NV = U - W @ S
+                    # (FLA: b_v = u - w @ h). Folded into the bf16 cast — free.
+                    tRrR_out[None, 0, sub].store((-(tRrR[None, 0, sub].load())).to(mma_dtype))
                     cute.copy(tiled_r2s_k, tCrR_k[None, 0, sub], tCsO[None, 0, sub, 0])
                 cute.arch.fence_view_async_tmem_load()
                 wh.release()

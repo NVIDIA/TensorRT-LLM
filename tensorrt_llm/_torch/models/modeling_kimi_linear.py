@@ -492,8 +492,10 @@ class KimiKDARuntime(nn.Module):
             rms_norm_eps=cfg.rms_norm_eps,
             dtype=torch.bfloat16,
             layer_idx=layer_idx,
-            # The runtime prefill path below drives FLA directly.
-            use_optimized_prefill=False,
+            # Prefill dispatches through the mixer's KDAKernelDispatch:
+            # in-tree trtllm::kda_prefill on sm_100/sm_103 when the CuTe DSL
+            # toolchain is importable, FLA chunk_kda otherwise.
+            use_optimized_prefill=True,
             use_optimized_decode=True,
         )
         self.proj_size = lin["num_heads"] * lin["head_dim"]
@@ -563,7 +565,6 @@ class KimiKDARuntime(nn.Module):
     def _forward_prefill(self, x2d, cu_seqlens, mamba_metadata, num_prefills,
                          conv_pool, ssm_pool, slot_indices) -> torch.Tensor:
         from einops import rearrange
-        from fla.ops.kda import chunk_kda
 
         mixer = self.mixer
         d = self.proj_size
@@ -607,8 +608,11 @@ class KimiKDARuntime(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=mixer.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=mixer.head_dim)
 
+        # Kernel dispatch (in-tree trtllm::kda_prefill or FLA chunk_kda).
+        # Both paths exchange states in the pool's V-first [N, H, V, K]
+        # layout, so recurrent_in / final_state map to ssm_pool 1:1.
         lower_bound = mixer.gate_lower_bound
-        o, final_state = chunk_kda(
+        o, final_state = mixer.prefill_chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -616,14 +620,10 @@ class KimiKDARuntime(nn.Module):
             beta=beta,
             A_log=mixer.A_log,
             dt_bias=mixer.dt_bias,
+            scale=mixer.head_k_dim**-0.5,
             initial_state=recurrent_in,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
             safe_gate=lower_bound is not None,
             lower_bound=lower_bound,
-            state_v_first=True,
             cu_seqlens=cu_seqlens,
         )
 
