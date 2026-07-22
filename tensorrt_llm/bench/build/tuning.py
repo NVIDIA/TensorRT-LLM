@@ -66,8 +66,17 @@ def calc_engine_setting(
     logger.info(
         f"Number of attention layers: {model_config.num_attention_layers}")
 
-    gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
-        * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
+    if model_config.is_mla():
+        # MLA stores a single compressed KV entry per token:
+        # head_dim = kv_lora_rank + qk_rope_head_dim, kv_factor = 1.
+        # Mirrors tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and
+        # resource_manager.py, so the bench heuristic agrees with the runtime.
+        mla_head_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+        gb_per_token = model_config.num_attention_layers * mla_head_dim \
+            * byte_per_kv_elem / (1024 ** 3)
+    else:
+        gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
+            * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
 
     # Number of GPU used for this run.
     n_gpus = tp_size * pp_size
