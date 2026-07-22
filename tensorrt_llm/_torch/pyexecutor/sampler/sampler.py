@@ -1114,6 +1114,7 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
+    single_step_greedy: bool = False
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -2412,6 +2413,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._prev_first_finish_reasons_host: list[torch.Tensor | None] = [
             None
         ] * self.max_num_sequences
+        self._stable_greedy_request_ids: list[int] = []
+        self._stable_greedy_seq_slots_host: Optional[torch.Tensor] = None
+        self._stable_greedy_seq_slots_cuda: Optional[torch.Tensor] = None
 
     @staticmethod
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
@@ -3654,6 +3658,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     self._pending_steps[slot] -= 1
 
         assert state.host is not None
+        # Reuse sample_async's qualification instead of rechecking every
+        # request after the asynchronous sample completes.
+        if state.single_step_greedy:
+            self._update_requests_single_beam_single_step(state)
+            return
+
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
         first_finish_reasons = (
@@ -3749,6 +3759,48 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
 
+    @nvtx_range("_update_requests_single_beam_single_step")
+    def _update_requests_single_beam_single_step(self, state: SampleStateTorch) -> None:
+        """Update the common greedy, single-token case without draft machinery."""
+        assert state.host is not None
+        requests = [
+            request
+            for request in state.requests
+            if request.state != LlmRequestState.GENERATION_COMPLETE
+        ]
+        if not requests:
+            return
+
+        all_new_tokens = state.host.new_tokens.tolist()
+        if len(requests) == len(state.requests):
+            new_tokens = all_new_tokens
+        else:
+            new_tokens = [
+                new_token
+                for request, new_token in zip(state.requests, all_new_tokens)
+                if request.state != LlmRequestState.GENERATION_COMPLETE
+            ]
+        add_new_tokens_to_requests(requests, new_tokens, DEFAULT_BEAM_IDX)
+
+        # sample_async deliberately omits the device finish-reason tensor for
+        # this qualified path; completion is derived from compact host tokens.
+        assert state.host.finish_reasons is None
+        for request, new_token in zip(requests, new_tokens):
+            # The stable greedy path excludes stop words. Keep EOS ahead of the
+            # length check so a terminal EOS at the token limit is reported as
+            # END_ID, matching _handle_stop_criteria.
+            if new_token == request.py_end_id:
+                request.finish_by(FinishReason.END_ID, DEFAULT_BEAM_IDX)
+            elif (
+                request.max_beam_num_tokens - request.py_orig_prompt_len
+                >= request.py_max_new_tokens
+                or request.max_beam_num_tokens >= self.max_seq_len
+            ):
+                request.finish_by(FinishReason.LENGTH, DEFAULT_BEAM_IDX)
+            request.py_num_accepted_draft_tokens = 0
+            request.py_rewind_len = 0
+            request.py_decoding_iter += 1
+
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
 
@@ -3806,6 +3858,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
+            single_step_greedy,
         ) = self._process_requests(
             scheduled_requests,
             model_outputs,
@@ -3832,22 +3885,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # their buffers in the store.
             # Assume that either all requests are drafts or none are drafts
             is_draft_batch = requests[0].py_is_draft
-            finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
-                seq_slots_host=seq_slots_host,
-                is_draft_batch=is_draft_batch,
-                seq_slots_cuda=seq_slots_cuda,
-                seq_lens_cuda=seq_lens_cuda,
-                new_tokens_cuda=new_tokens,
-                first_finish_reasons_cuda=(
-                    beam_search_store.first_finish_reasons
-                    if beam_search_store is not None
-                    else None
-                ),
-            )
-            finish_reasons_host = self._copy_to_host(finish_reasons_device)
+            if not single_step_greedy:
+                assert seq_lens_host is not None
+                assert seq_lens_cuda is not None
+                finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
+                    seq_slots_host=seq_slots_host,
+                    is_draft_batch=is_draft_batch,
+                    seq_slots_cuda=seq_slots_cuda,
+                    seq_lens_cuda=seq_lens_cuda,
+                    new_tokens_cuda=new_tokens,
+                    first_finish_reasons_cuda=(
+                        beam_search_store.first_finish_reasons
+                        if beam_search_store is not None
+                        else None
+                    ),
+                )
+                finish_reasons_host = self._copy_to_host(finish_reasons_device)
 
             if self._use_beam_search:
                 assert beam_search_store is not None
+                assert seq_lens_cuda is not None
                 first_finish_reasons = beam_search_store.first_finish_reasons
                 first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
                 self._update_original_tokens(
@@ -3890,6 +3947,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
+            single_step_greedy=single_step_greedy,
         )
 
     @staticmethod
@@ -3910,7 +3968,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_dest_indices: torch.Tensor,
         max_beam_width: int,
         d2t: torch.Tensor | None,
-    ) -> None:
+    ) -> torch.Tensor:
         """Applies fast greedy sampling to the logits.
 
         Performs argmax, applies d2t translation if present, and scatters
@@ -3929,6 +3987,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda.view(-1, *new_tokens_cuda.shape[2:]).scatter_(
             0, batch_dest_indices_expanded, next_tokens_expanded
         )
+        return next_tokens
 
     @staticmethod
     def _apply_embedding_bias(
@@ -4799,9 +4858,79 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
     ) -> tuple[
-        list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        list[LlmRequest],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        Optional[torch.Tensor],
+        torch.Tensor,
+        bool,
     ]:
         raw_logits_cuda = model_outputs["logits"]
+
+        generation_requests = scheduled_requests.generation_requests
+        request_ids = [request.py_request_id for request in generation_requests]
+        has_stable_request_ids = self._stable_greedy_request_ids == request_ids
+        can_use_stable_greedy_path = (
+            bool(generation_requests)
+            and self.max_beam_width == 1
+            and scheduled_requests.num_context_requests == 0
+            and len(generation_requests) <= raw_logits_cuda.shape[0]
+            and model_outputs.get("d2t") is None
+            and (
+                has_stable_request_ids
+                or all(
+                    not request.is_dummy
+                    and get_draft_token_length(request) == 0
+                    and request._py_embedding_bias_1d is None
+                    and not getattr(request, "py_bad_words", None)
+                    and not request.py_min_length
+                    and not request.py_return_log_probs
+                    and not request.py_stop_words_list
+                    and _request_strategy(request, vocab_size=2**31) == GREEDY
+                    for request in generation_requests
+                )
+            )
+        )
+        if can_use_stable_greedy_path:
+            if has_stable_request_ids:
+                assert self._stable_greedy_seq_slots_host is not None
+                assert self._stable_greedy_seq_slots_cuda is not None
+                seq_slots_host = self._stable_greedy_seq_slots_host
+                seq_slots_cuda = self._stable_greedy_seq_slots_cuda
+            else:
+                maybe_seq_slots = [request.py_seq_slot for request in generation_requests]
+                assert all(seq_slot is not None for seq_slot in maybe_seq_slots)
+                seq_slots = [cast(int, seq_slot) for seq_slot in maybe_seq_slots]
+                seq_slots_host = torch.tensor(
+                    seq_slots, dtype=torch.int32, pin_memory=prefer_pinned()
+                )
+                seq_slots_cuda = seq_slots_host.to(
+                    device="cuda", dtype=torch.int64, non_blocking=True
+                )
+                self._stable_greedy_request_ids = request_ids
+                self._stable_greedy_seq_slots_host = seq_slots_host
+                self._stable_greedy_seq_slots_cuda = seq_slots_cuda
+
+            next_tokens = self._fast_greedy_sample_kernel(
+                raw_logits_cuda[: len(generation_requests)],
+                new_tokens_cuda,
+                seq_slots_cuda,
+                self.max_beam_width,
+                None,
+            )
+            new_tokens_host = self._copy_to_host(next_tokens)
+            return (
+                generation_requests,
+                seq_slots_host,
+                None,
+                seq_slots_cuda,
+                None,
+                new_tokens_host,
+                True,
+            )
+
+        self._stable_greedy_request_ids = []
 
         sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
             scheduled_requests,
@@ -4910,6 +5039,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 seq_slots_cuda,
                 seq_lens_cuda,
                 new_tokens_host,
+                False,
             )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
@@ -4963,6 +5093,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
+            False,
         )
 
     @override
