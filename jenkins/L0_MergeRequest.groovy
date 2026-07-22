@@ -659,7 +659,8 @@ def hasGithubPRLabel(pipeline, githubPrApiUrl, labelName) {
         ]) {
             rawDataJson = pipeline.sh(
                 script: """
-                    curl --silent --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
+                    curl --silent --fail --show-error \
+                         --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
                          --url "${githubPrApiUrl}"
                 """,
                 returnStdout: true
@@ -674,6 +675,29 @@ def hasGithubPRLabel(pipeline, githubPrApiUrl, labelName) {
         echo "[hasGithubPRLabel] Warning: failed to check GitHub PR labels: ${e.toString()}. Failing open."
         return true  // fail-open: do not block CI if the label check itself fails
     }
+}
+
+// Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
+// Returns true if the stage should be blocked (label absent), false otherwise.
+// Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
+def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
+    if (!globalVars[GITHUB_PR_API_URL] || (env.JOB_NAME ==~ /.*PostMerge.*/)) {
+        return false
+    }
+    if (hasGithubPRLabel(pipeline, globalVars[GITHUB_PR_API_URL],
+                          "ci: full pre-merge approved")) {
+        return false
+    }
+    def existingDesc = currentBuild.description ?: ""
+    currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
+        "<span data-multi-gpu-label-required='true'>" +
+        "Multi-GPU tests require label 'ci: full pre-merge approved'" +
+        "</span>"
+    error "${arch} Multi-GPU tests require the GitHub label " +
+          "'ci: full pre-merge approved' on this PR. " +
+          "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
+          "then re-trigger CI."
+    return true  // unreachable, but keeps intent clear
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -1605,22 +1629,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
-                    // Gate: require 'ci: full pre-merge approved' label for GitHub PRs.
-                    // PostMerge pipelines and GitLab MR builds are exempt.
-                    if (globalVars[GITHUB_PR_API_URL] && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
-                        if (!hasGithubPRLabel(pipeline, globalVars[GITHUB_PR_API_URL],
-                                              "ci: full pre-merge approved")) {
-                            def existingDesc = currentBuild.description ?: ""
-                            currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
-                                "<span data-multi-gpu-label-required='true'>" +
-                                "Multi-GPU tests require label 'ci: full pre-merge approved'" +
-                                "</span>"
-                            error "x86_64 Multi-GPU tests require the GitHub label " +
-                                  "'ci: full pre-merge approved' on this PR. " +
-                                  "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
-                                  "then re-trigger CI."
-                        }
-                    }
+                    requireMultiGpuApprovalLabel(pipeline, globalVars, "x86_64")
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
@@ -1737,22 +1746,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "SBSA test job is skipped due to Jenkins configuration"
                         return
                     }
-                    // Gate: require 'ci: full pre-merge approved' label for GitHub PRs.
-                    // PostMerge pipelines and GitLab MR builds are exempt.
-                    if (globalVars[GITHUB_PR_API_URL] && !(env.JOB_NAME ==~ /.*PostMerge.*/)) {
-                        if (!hasGithubPRLabel(pipeline, globalVars[GITHUB_PR_API_URL],
-                                              "ci: full pre-merge approved")) {
-                            def existingDesc = currentBuild.description ?: ""
-                            currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
-                                "<span data-multi-gpu-label-required='true'>" +
-                                "Multi-GPU tests require label 'ci: full pre-merge approved'" +
-                                "</span>"
-                            error "SBSA Multi-GPU tests require the GitHub label " +
-                                  "'ci: full pre-merge approved' on this PR. " +
-                                  "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
-                                  "then re-trigger CI."
-                        }
-                    }
+                    requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
                     try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
