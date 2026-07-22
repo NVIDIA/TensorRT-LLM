@@ -449,3 +449,156 @@ def test_union_fusion_rejects_unsupported_frequency_count() -> None:
             pool_dtype=cutlass.BFloat16,
             page_shards=3,
         )
+
+
+@_SM100_ONLY
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 32 * 1024**3,
+    reason="the giant-scratch geometry needs ~15 GiB of device memory",
+)
+@pytest.mark.parametrize(
+    "max_requests",
+    [
+        # Qwen3-8B serve geometry at max_batch_size 64 with the 16384-token
+        # bucket: the score scratch spans 2,415,919,104 elements, past 2^31.
+        # Before the finalizer's fallback loads were folded into a 64-bit
+        # pointer, this leg died with an illegal memory access whenever a
+        # window start was not lane-aligned (the serve-mode eviction crash).
+        64,
+        # Same shape at max_batch_size 32 stays below 2^31 and covers the
+        # boundary from the always-correct side.
+        32,
+    ],
+)
+def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
+    """Unaligned window starts must survive a past-2^31-element score scratch.
+
+    The union finalizer reads the score scratch at flat offsets up to
+    ``plane * capacity * layers * bucket``; the production Qwen3-8B serve
+    shape (capacity 64, 36 layers, bucket 16384) pushes those offsets past
+    2^31. Requests whose pinned prompt length is not a multiple of the lane
+    width take the per-token load branch, which must fold the Int64 offset
+    into the pointer instead of the DSL's 32-bit dynamic coordinate. The leg
+    launches at full capacity with zero-length tail rows, exactly like a
+    production eviction round, and checks the fused rows against the split
+    score-gather plus the standalone union reference.
+    """
+    pytest.importorskip("cutlass")
+
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        _FixedScoreGroup,
+    )
+
+    torch.manual_seed(20260722)
+    device = torch.device("cuda")
+    num_layers = 36
+    num_q_heads = 32
+    num_kv_heads = 8
+    num_freqs = 64
+    tokens_per_block = 32
+    seq_len = 16384
+    decode_window = 8192
+    # Window starts deliberately off the 4-token lane grid (real prompt
+    # lengths are arbitrary), one of them also off the page grid.
+    score_starts = [897, 641]
+    valid_lens = [start + decode_window for start in score_starts]
+    request_count = len(score_starts)
+
+    # Every layer shares one physical pool: the scratch magnitude only needs
+    # the segment count, not distinct K content per layer.
+    num_pages = (max(valid_lens) + tokens_per_block - 1) // tokens_per_block
+    pool = (
+        0.125
+        * torch.randn(num_pages, 2, num_kv_heads, tokens_per_block, 2 * num_freqs, device=device)
+    ).to(torch.bfloat16)
+    layer_pools = [pool] * num_layers
+    calib_shape = (num_layers, num_q_heads, num_freqs)
+    q_real = 0.125 * torch.randn(calib_shape, device=device)
+    q_imag = 0.125 * torch.randn_like(q_real)
+    mlr_coef = 0.125 * torch.randn_like(q_real)
+    freq_scale_sq = torch.linspace(0.5, 1.5, num_freqs, device=device)
+    omega = torch.linspace(0.01, 0.03, num_freqs, device=device)
+    offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
+    round_starts = torch.arange(max_requests, dtype=torch.float32, device=device) + seq_len
+    phase = (round_starts[:, None, None] + offsets[None, :, None]) * omega[None, None]
+    mean_cos = torch.cos(phase).mean(dim=1).contiguous()
+    mean_sin = torch.sin(phase).mean(dim=1).contiguous()
+
+    page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
+    block_offsets = torch.zeros(1, max_requests, 2, num_pages, dtype=torch.int32, device=device)
+    block_offsets[0, :request_count, 0] = 2 * page_ids
+    block_offsets[0, :request_count, 1] = 2 * page_ids + 1
+    group = _FixedScoreGroup(
+        layer_pools,
+        list(range(num_layers)),
+        max_requests,
+        num_pages,
+        seq_len,
+        num_q_heads,
+        block_offsets,
+        [0] * num_layers,
+        q_real,
+        q_imag,
+        mlr_coef,
+        freq_scale_sq,
+        omega,
+        offsets,
+        output_width=decode_window,
+    )
+    assert (num_kv_heads * 8 * max_requests * num_layers * seq_len > 2**31) == (max_requests == 64)
+
+    valid_seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    token_starts = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    valid_seq_lens[:request_count] = torch.tensor(valid_lens, dtype=torch.int32, device=device)
+    token_starts[:request_count] = torch.tensor(score_starts, dtype=torch.int32, device=device)
+
+    # Reference: the split score gather over the same decode windows, then
+    # the standalone normalize-and-union copy.
+    split_widths = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    per_head = group.launch(
+        request_count,
+        valid_seq_lens,
+        split_widths,
+        token_starts,
+        mean_cos,
+        mean_sin,
+    )
+    rows = per_head.shape[1] * per_head.shape[2]
+    scores_rows = per_head.reshape(request_count, rows, decode_window).contiguous()
+    row_mean = torch.empty((request_count, rows, 1), dtype=torch.float32, device=device)
+    row_inv_std = torch.empty_like(row_mean)
+    expected = torch.empty((request_count, decode_window), dtype=torch.float32, device=device)
+    _reference_prepare_union_scores(
+        scores_rows,
+        split_widths,
+        row_mean,
+        row_inv_std,
+        expected,
+        request_count,
+        normalize_scores=True,
+    )
+
+    # Fused pipeline at FULL capacity (zero-length tails), like production.
+    fused_widths = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    fused_out = torch.full(
+        (max_requests, seq_len), float("nan"), dtype=torch.float32, device=device
+    )
+    group.launch_cute_union_fusion(
+        max_requests,
+        valid_seq_lens,
+        fused_widths,
+        token_starts,
+        mean_cos,
+        mean_sin,
+        fused_out,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(fused_widths[:request_count], split_widths[:request_count])
+    for request in range(request_count):
+        width = valid_lens[request] - score_starts[request]
+        torch.testing.assert_close(
+            fused_out[request, :width],
+            expected[request, :width],
+            rtol=5.0e-3,
+            atol=5.0e-3,
+        )

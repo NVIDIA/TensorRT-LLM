@@ -391,12 +391,28 @@ class _TriAttentionNormalizeUnionKernel:
                         cute.coalesce(score_value_tiles[token_subtile]),
                     )
                 else:
+                    # Fold the 64-bit flat index into the pointer BEFORE the
+                    # per-element loads, exactly like the vectorized branch:
+                    # the score scratch exceeds 2^31 elements at large
+                    # request counts, and indexing ``scores`` with the flat
+                    # Int64 goes through the DSL's 32-bit dynamic coordinate,
+                    # which wraps. This branch runs whenever a request's
+                    # window start is not lane-aligned (any pinned prompt
+                    # length not divisible by ``tokens_per_lane``), so real
+                    # serve cohorts hit it on every eviction round.
+                    score_tail = cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Float32,
+                            (scores.iterator + score_index).toint(),
+                            AddressSpace.gmem,
+                            assumed_align=4,
+                        ),
+                        cute.make_layout(self.tokens_per_lane),
+                    )
                     for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                         token = subtile_first_token + token_slot
                         if cutlass.dynamic_expr(token < valid_width):
-                            score_value_tiles[token_subtile][token_slot] = scores[
-                                score_index + token_slot
-                            ]
+                            score_value_tiles[token_subtile][token_slot] = score_tail[token_slot]
                         else:
                             score_value_tiles[token_subtile][token_slot] = cutlass.Float32(
                                 float("-inf")
