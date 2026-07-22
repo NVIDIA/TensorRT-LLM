@@ -103,6 +103,11 @@ class KVCacheV2IterationStatsReport:
     by_life_cycle: dict[
         int, KVCacheV2LifeCycleIterationStats | KVCacheV2SsmLifeCycleIterationStats
     ] = field(default_factory=dict)
+    # Preemption counters for this iteration. resumed_requests counts recoveries
+    # only -- a request's initial admission also drives a SUSPENDED->ACTIVE
+    # transition internally, but it is not a preemption and is excluded.
+    suspended_requests: int = 0
+    resumed_requests: int = 0
 
 
 def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = None) -> dict:
@@ -174,6 +179,9 @@ def append_kv_cache_iteration_stats(stats_dict: dict, kv_iter_stats) -> None:
     }
     if by_pool_group is None:
         return
+
+    stats_dict["iterSuspendedRequests"] = kv_iter_stats.suspended_requests
+    stats_dict["iterResumedRequests"] = kv_iter_stats.resumed_requests
 
     stats_dict["kvCacheIterationStatsByPoolGroup"] = {
         str(pool_group_id): {

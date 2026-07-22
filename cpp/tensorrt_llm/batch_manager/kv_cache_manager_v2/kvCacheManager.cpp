@@ -505,6 +505,35 @@ SsmSnapshotIterationStatsByLifeCycle KvCacheManager::getAndResetSsmSnapshotItera
     return stats;
 }
 
+void KvCacheManager::recordRequestSuspended()
+{
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    ++mIterSuspendedRequests;
+}
+
+void KvCacheManager::recordRequestResumed()
+{
+    if (!mConfig.enableStats)
+    {
+        return;
+    }
+    ++mIterResumedRequests;
+}
+
+std::pair<int64_t, int64_t> KvCacheManager::getAndResetIterationSuspendResumeStats()
+{
+    // Suspend/resume is a per-request, manager-level event (not per-pool-group), so it
+    // is drained alongside getAndResetIterationStats once per iteration-stats fetch.
+    auto const suspended = mIterSuspendedRequests;
+    auto const resumed = mIterResumedRequests;
+    mIterSuspendedRequests = 0;
+    mIterResumedRequests = 0;
+    return {suspended, resumed};
+}
+
 PeakBlockStatsByCacheLevel KvCacheManager::_currentBlockStatsByCacheLevel() const
 {
     PeakBlockStatsByCacheLevel result(mStorage->numCacheLevels());

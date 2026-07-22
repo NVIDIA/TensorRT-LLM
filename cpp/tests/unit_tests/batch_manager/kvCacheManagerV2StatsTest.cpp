@@ -370,4 +370,57 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     cache->close();
 }
 
+TEST(KvCacheManagerV2StatsTest, SuspendResumeIterationCountersTrackPreemptionOnly)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig());
+    auto cache = manager->createKvCache({}, {}, 1);
+
+    // A freshly-created cache starts SUSPENDED and is activated by its first resume().
+    // That is an admission, not a preemption recovery, so neither counter moves.
+    ASSERT_TRUE(cache->resume(stream));
+    auto [admittedSuspended, admittedResumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(admittedSuspended, 0);
+    EXPECT_EQ(admittedResumed, 0);
+
+    // A real ACTIVE->SUSPENDED->ACTIVE cycle is a preemption and does count.
+    cache->suspend();
+    EXPECT_FALSE(cache->isActive());
+    ASSERT_TRUE(cache->resume(stream));
+    EXPECT_TRUE(cache->isActive());
+    auto [suspended, resumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(suspended, 1);
+    EXPECT_EQ(resumed, 1);
+
+    // The drain resets both counters for the next iteration window.
+    auto [drainedSuspended, drainedResumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(drainedSuspended, 0);
+    EXPECT_EQ(drainedResumed, 0);
+
+    cache->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressSuspendResumeCounters)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeConfig(false));
+    auto cache = manager->createKvCache({}, {}, 1);
+
+    ASSERT_TRUE(cache->resume(stream));
+    cache->suspend();
+    ASSERT_TRUE(cache->resume(stream));
+
+    auto [suspended, resumed] = manager->getAndResetIterationSuspendResumeStats();
+    EXPECT_EQ(suspended, 0);
+    EXPECT_EQ(resumed, 0);
+
+    cache->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 } // namespace
