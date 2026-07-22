@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,27 @@ def _to_device_if_needed(x: torch.Tensor, device: torch.device) -> torch.Tensor:
     if x.device == device:
         return x
     return x.to(device)
+
+
+def _decode_chunk_size() -> int:
+    value = os.environ.get("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE", "1")
+    try:
+        chunk_size = int(value)
+    except ValueError:
+        raise ValueError("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE must be a positive integer") from None
+    if chunk_size < 1:
+        raise ValueError("TRTLLM_WAN_VAE_DECODE_CHUNK_SIZE must be a positive integer")
+    return chunk_size
+
+
+def _decode_chunk_slices(num_frames: int, chunk_size: int) -> list[slice]:
+    """Keep the first latent frame separate, then batch later causal chunks."""
+    if num_frames < 1:
+        return []
+    return [slice(0, 1)] + [
+        slice(start, min(start + chunk_size, num_frames))
+        for start in range(1, num_frames, chunk_size)
+    ]
 
 
 def _causal_conv_with_cache(
@@ -1021,13 +1043,13 @@ class WanVAE(nn.Module):
         z = _channels_last_3d_if_needed(z)
         x = self.post_quant_conv(z)
         out_chunks: list[torch.Tensor] = []
-        for i in range(num_frame):
+        for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, _decode_chunk_size())):
             self._conv_idx = [0]
             out_chunk = self.decoder(
-                x[:, :, i : i + 1, :, :],
+                x[:, :, frame_slice, :, :],
                 feat_cache=self._feat_map,
                 feat_idx=self._conv_idx,
-                first_chunk=i == 0,
+                first_chunk=index == 0,
             )
             out_chunks.append(out_chunk)
 
