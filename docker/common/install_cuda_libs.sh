@@ -2,7 +2,6 @@
 
 set -ex
 
-TRT_VER="10.16.1.11"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-05.html#rel-26-05
 CUDA_VER="13.2" # 13.2.1
@@ -19,7 +18,6 @@ CUDA_DRIVER_VERSION="595.58.03-1.el8"
 
 for i in "$@"; do
     case $i in
-        --TRT_VER=?*) TRT_VER="${i#*=}";;
         --CUDA_VER=?*) CUDA_VER="${i#*=}";;
         --CUDNN_VER=?*) CUDNN_VER="${i#*=}";;
         --NCCL_VER=?*) NCCL_VER="${i#*=}";;
@@ -166,47 +164,14 @@ install_rockylinux_requirements() {
     ldconfig
 }
 
-install_tensorrt() {
-    PY_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[0:2])))')
-    PARSED_PY_VERSION=$(echo "${PY_VERSION//./}")
-
-    TRT_CUDA_VERSION=${CUDA_VER}
-    TRT_VER_SHORT=$(echo $TRT_VER | cut -d. -f1-3)
-
-    if [ -z "$RELEASE_URL_TRT" ];then
-        ARCH=${TRT_TARGETARCH}
-        if [ -z "$ARCH" ];then ARCH=$(uname -m);fi
-        if [ "$ARCH" = "arm64" ];then ARCH="aarch64";fi
-        if [ "$ARCH" = "amd64" ];then ARCH="x86_64";fi
-        RELEASE_URL_TRT="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/${TRT_VER_SHORT}/tars/TensorRT-${TRT_VER}.Linux.${ARCH}-gnu.cuda-${TRT_CUDA_VERSION}.tar.gz"
-    fi
-
-    wget --retry-connrefused --timeout=180 --tries=10 --continue ${RELEASE_URL_TRT} -O /tmp/TensorRT.tar
-    tar -xf /tmp/TensorRT.tar -C /usr/local/
-    mv /usr/local/TensorRT-${TRT_VER} /usr/local/tensorrt
-    pip3 install --no-cache-dir /usr/local/tensorrt/python/tensorrt-*-cp${PARSED_PY_VERSION}-*.whl
-    rm -rf /tmp/TensorRT.tar
-    echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
-
-    rm -f /usr/local/tensorrt/lib/libnvinfer_vc_plugin_static.a \
-          /usr/local/tensorrt/lib/libnvinfer_plugin_static.a \
-          /usr/local/tensorrt/lib/libnvinfer_static.a \
-          /usr/local/tensorrt/lib/libnvinfer_dispatch_static.a \
-          /usr/local/tensorrt/lib/libnvinfer_lean_static.a \
-          /usr/local/tensorrt/lib/libnvonnxparser_static.a \
-          /usr/local/tensorrt/lib/libnvinfer_builder_resource_win.so.*
-}
-
 # Install base packages depending on the base OS
 ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 case "$ID" in
   ubuntu)
     install_ubuntu_requirements
-    install_tensorrt
     ;;
   rocky)
     install_rockylinux_requirements
-    install_tensorrt
     ;;
   *)
     echo "Unable to determine OS..."
