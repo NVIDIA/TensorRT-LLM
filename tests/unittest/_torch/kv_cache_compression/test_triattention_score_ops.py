@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """The CuTe score kernel vs an independent PyTorch oracle, through group.launch.
 
-The SM100 CuTe-DSL kernel (``triattention_cute_score.py``) is the ONLY score
-implementation. These tests drive it through ``_FixedScoreGroup.launch`` --
-the exact production entry point -- across the supported production
-geometries, with multi-layer segments, permuted page tables, ragged valid
-lengths, and per-request prompt windows, and compare against a pure-PyTorch
-oracle that recomputes everything independently. They also pin the
-loud-failure contract: unsupported geometry, removed aggregations, and
-uncompiled request counts raise instead of routing to another kernel.
+The SM100 CuTe-DSL fused score pack (``triattention_cute_score_fused.py``,
+score-only entry) is the ONLY score implementation. These tests drive it
+through ``_FixedScoreGroup.launch`` -- the exact production entry point --
+across the supported production geometries, with multi-layer segments,
+permuted page tables, ragged valid lengths, and per-request prompt windows,
+and compare against a pure-PyTorch oracle that recomputes everything
+independently. They also pin the loud-failure contract: unsupported
+geometry, removed aggregations, and request counts beyond the group
+capacity raise instead of routing to another kernel.
 """
 
 import pytest
@@ -194,9 +195,9 @@ class TestTriAttentionScoreLaunch:
             list(range(num_layers)),
         )
 
-        # The runner precompiles exactly the request counts production
-        # launches: one and the full group capacity.
-        for request_count in dict.fromkeys((1, max_requests)):
+        # The fused runner dispatches every request count up to the group
+        # capacity; cover one, an intermediate count, and the capacity.
+        for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
             group.output.fill_(float("nan"))
             valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
             scores = group.launch(
@@ -229,11 +230,13 @@ class TestTriAttentionScoreLaunch:
                     )
 
     @requires_sm100
-    def test_uncompiled_request_count_raises(self):
-        """A request count outside the precompiled variants fails loudly.
+    def test_request_count_beyond_capacity_raises(self):
+        """A request count beyond the group capacity fails loudly.
 
-        There is no fallback kernel, so ``supports()`` misses must raise
-        instead of silently scoring through a slower path.
+        The fused runner dispatches every request count up to the group
+        capacity (covered by the oracle matrix above); there is no fallback
+        kernel, so anything beyond it must raise instead of silently
+        scoring through a slower path.
         """
         pytest.importorskip("cutlass")
         (
@@ -248,9 +251,9 @@ class TestTriAttentionScoreLaunch:
         valid_widths = torch.empty(
             _QWEN3_CASE["max_requests"], dtype=torch.int32, device=group.output.device
         )
-        with pytest.raises(RuntimeError, match="no compiled variant"):
+        with pytest.raises(ValueError, match="exceeds fixed score capacity"):
             group.launch(
-                _QWEN3_CASE["max_requests"] - 1,
+                _QWEN3_CASE["max_requests"] + 1,
                 valid_seq_lens,
                 valid_widths,
                 token_starts,

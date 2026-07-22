@@ -4,15 +4,16 @@
 
 The production path uses one fixed-shape trig-score launch across all dense
 layers, CuTE-DSL TopK selection, and grouped C++ compaction. Scoring runs
-EXCLUSIVELY through the SM100 CuTe-DSL kernel
-(``triattention_cute_score.py``): mean aggregation, BF16 KV pools, head size
-64/128, 32/128-token pages, GQA group 4 or 8. There is deliberately no other
-score path -- any geometry outside that contract raises loudly at setup
-instead of routing to a slower kernel (the original Triton score kernel and
-the C++ CUDA score stack have both been deleted). Union eviction likewise
-runs EXCLUSIVELY through the fused score+stats+union CuTe pipeline
-(``triattention_cute_score_fused.py`` + ``triattention_cute_selection.py``);
-the split Triton row-stats/union-reduce launches were retired with it, and
+EXCLUSIVELY through the SM100 CuTe-DSL fused score pack
+(``triattention_cute_score_fused.py``): mean aggregation, BF16 KV pools,
+head size 64/128, 32/128-token pages, GQA group 4 or 8, per-request score
+window starts. There is deliberately no other score path -- any geometry
+outside that contract raises loudly at setup instead of routing to a slower
+kernel (the original Triton score kernel, the C++ CUDA score stack, and the
+single-shot CuTe score kernel have all been deleted). The per-head modes use
+the pack's score-only entry; union eviction runs its fused score+stats+union
+pipeline (with ``triattention_cute_selection.py``). The split Triton
+row-stats/union-reduce launches were retired with the union fusion, and
 their standalone copies live in the fused-pipeline unit test as references
 (the row-stats kernel itself remains: the per-head modes still normalize
 with it). The unit tests validate the CuTe kernels against independent
@@ -310,11 +311,12 @@ class _FixedScoreGroup:
             mlr_coef_LHF.view(-1),
         )
         self.pointer_tail = (freq_scale_sq, omega, offsets)
-        # The SM100 CuTe score kernel (see triattention_cute_score.py) is THE
-        # score implementation; it is compiled by the first
-        # ``prepare_cute_score`` call. The runner encodes TMA descriptors from
-        # the actual pool tensors, hence the pool references retained here
-        # (see the LIFETIME note in the class docstring).
+        # The SM100 CuTe fused score pack (see
+        # triattention_cute_score_fused.py) is THE score implementation; its
+        # score-only entry is compiled by the first ``prepare_cute_score``
+        # call. The runner encodes TMA descriptors from the actual pool
+        # tensors, hence the pool references retained here (see the LIFETIME
+        # note in the class docstring).
         self.seq_len = int(seq_len)
         self._cute_score_runner = None
         self._cute_score_attempted = False
@@ -322,18 +324,18 @@ class _FixedScoreGroup:
         self._cute_layer_indices = [int(layer) for layer in layer_indices]
 
     def prepare_cute_score(self, mean_cos: torch.Tensor, mean_sin: torch.Tensor) -> None:
-        """Compile the SM100 CuTe score kernel once; raise loudly otherwise.
+        """Compile the fused CuTe runner's score-only entry; raise loudly otherwise.
 
         Call this outside CUDA graph capture: compilation allocates memory
-        and synchronizes. The CuTe kernel is the ONLY score implementation,
-        so an unsupported geometry raises ValueError here and a runner
-        construction failure raises RuntimeError -- there is deliberately no
-        fallback path.
+        and synchronizes. The fused score pack is the ONLY score
+        implementation, so an unsupported geometry raises ValueError here
+        and a runner construction failure raises RuntimeError -- there is
+        deliberately no fallback path.
 
         Supported contract: SM100 exactly, BF16 pools, 32- or 128-token
         pages, 32 or 64 frequencies (head size 64/128), 4 or 8 query heads
         per KV head, and a bucket capacity (``seq_len``) aligned to the
-        kernel's compute tile — this covers the Qwen3 and GPT-OSS production
+        historical score tile — this covers the Qwen3 and GPT-OSS production
         geometries as well as the original validation shape.
         """
         if self._cute_score_attempted:
@@ -342,11 +344,11 @@ class _FixedScoreGroup:
         anchor = self.pointer_prefix[0]
         num_q_heads, num_kv_heads, num_freqs, tokens_per_block, kv_factor = self.geometry_args
         max_segments = self.max_requests * self.num_layers
-        # The kernel's epilogue stores full compute tiles (64 tokens, or one
-        # page for 128-token pages) into a scratch whose per-segment stride
-        # is seq_len, without masking the ragged tail of the LAST tile; an
-        # unaligned bucket would silently spill scores into the next
-        # segment's region, so it is rejected here instead.
+        # The retired single-shot kernel stored full unmasked compute tiles
+        # (64 tokens, or one page for 128-token pages), which forced
+        # tile-aligned buckets. The fused kernel masks its ragged tail, but
+        # the bucket contract is kept unchanged so the kernel swap cannot
+        # silently admit new geometry (production pow2 buckets satisfy it).
         score_tile_tokens = max(64, int(tokens_per_block))
         supported = (
             torch.cuda.get_device_capability(anchor.device) == (10, 0)
@@ -379,14 +381,14 @@ class _FixedScoreGroup:
             )
         device = anchor.device
         try:
-            from .triattention_cute_score import TriAttentionCuteScoreRunner
+            from .triattention_cute_score_fused import TriAttentionCuteScoreRunner
 
-            # The kernel scores the FULL sequence from physical token zero
-            # into its own head-major scratch (row = query head, column =
-            # segment * seq_len + token); ``launch`` gathers each request's
-            # decode window from that scratch into ``self.output``. All
-            # buffers below are persistent because the compiled kernel
-            # captures their device pointers.
+            # The kernel scores each request's window (from its staged
+            # per-request start) into its own head-major scratch (row =
+            # query head, column = segment * seq_len + token); ``launch``
+            # gathers each request's decode window from that scratch into
+            # ``self.output``. All buffers below are persistent because the
+            # compiled kernel captures their device pointers.
             # The kernel writes one scratch row per padded head column
             # (GQA group below 8 pads up to the MMA tile); the gather in
             # ``launch`` reads only the real heads.
@@ -399,6 +401,10 @@ class _FixedScoreGroup:
             seg_out_offset = (
                 torch.arange(max_segments, dtype=torch.int64, device=device) * self.seq_len
             ).to(torch.int32)
+            # Per-request score window starts, staged before each launch;
+            # the compiled kernels capture this buffer's device pointer.
+            # The union fusion runner shares it (and the segment buffers).
+            token_starts = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
             gather_columns = torch.arange(self.output_width, dtype=torch.int64, device=device)
             self._cute_score_runner = TriAttentionCuteScoreRunner(
                 layer_pools=self._cute_layer_pools,
@@ -406,10 +412,6 @@ class _FixedScoreGroup:
                 max_requests=self.max_requests,
                 num_layers=self.num_layers,
                 seq_len=self.seq_len,
-                # Always score from physical token zero: per-request prompt
-                # windows are applied by the gather in ``launch`` instead of
-                # one global page-aligned start.
-                score_start=0,
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
                 num_freqs=num_freqs,
@@ -420,6 +422,7 @@ class _FixedScoreGroup:
                 seg_layer_id=self.pointer_prefix[5],
                 seg_seq_len=seg_seq_len,
                 seg_out_offset=seg_out_offset,
+                token_starts=token_starts,
                 q_real=self.pointer_middle[0],
                 q_imag=self.pointer_middle[1],
                 mlr_coef=self.pointer_middle[2],
@@ -427,6 +430,10 @@ class _FixedScoreGroup:
                 mean_sin=mean_sin,
                 freq_scale_sq=self.pointer_tail[0],
                 output=scratch,
+                # Score-only mode: the stats and union-finalize kernels are
+                # compiled lazily by ``_union_fusion_runner`` when (and only
+                # when) union eviction actually launches.
+                enable_partial_stats=False,
             )
         except (ImportError, RuntimeError, ValueError, AssertionError) as error:
             raise RuntimeError(
@@ -434,6 +441,8 @@ class _FixedScoreGroup:
             ) from error
         self._cute_scratch = scratch
         self._cute_seg_seq_len = seg_seq_len
+        self._cute_seg_out_offset = seg_out_offset
+        self._cute_token_starts = token_starts
         self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
         # Fused score+stats+union pipeline (Fanrong Li's two-kernel scheme):
         # THE union path, built lazily on the first union launch. ONE runner
@@ -459,11 +468,13 @@ class _FixedScoreGroup:
     ) -> torch.Tensor:
         """Return decode-only scores as ``[request, layer, head, token]``.
 
-        Runs the SM100 CuTe score kernel (the only score implementation) and
-        writes each request's decode width (``valid_seq_len - token_start``)
-        into ``valid_widths``, which the selection reduce kernels consume.
-        Only mean aggregation exists; ``request_count`` must be one of the
-        precompiled variants (1 or the group capacity).
+        Runs the fused CuTe runner's score-only entry (the only score
+        implementation) and writes each request's decode width
+        (``valid_seq_len - token_start``) into ``valid_widths``, which the
+        selection reduce kernels consume. Each request scores its own window
+        from its staged start, so one cohort may mix prompt lengths. Only
+        mean aggregation exists; the runner dispatches every request count
+        up to the group capacity.
         """
         if aggregation != "mean":
             raise ValueError(
@@ -506,13 +517,16 @@ class _FixedScoreGroup:
             self.pointer_prefix[4][:num_segments],
             out=self._cute_seg_seq_len[:num_segments],
         )
+        # Stage the per-request score window starts: the compiled kernel
+        # captured this buffer's pointer and reads one start per request.
+        self._cute_token_starts[:request_count].copy_(token_starts_device[:request_count])
         runner.launch(request_count, mean_cos, mean_sin)
-        # The kernel wrote full-sequence scores from physical token zero into
-        # its head-major scratch. Gather each request's decode window
-        # (starting at its pinned prompt length) into the group output, the
-        # ``[request, layer, head, token]`` layout the selection kernels
-        # read. Columns past a request's valid width carry unscored scratch
-        # data; consumers mask by ``valid_widths``.
+        # The kernel wrote each request's window scores (from its pinned
+        # prompt length) into its head-major scratch. Gather each request's
+        # decode window into the group output, the ``[request, layer, head,
+        # token]`` layout the selection kernels read. Columns past a
+        # request's valid width carry unscored scratch data; consumers mask
+        # by ``valid_widths``.
         num_q_heads = int(self.geometry_args[0])
         num_kv_heads = int(self.geometry_args[1])
         group_size = num_q_heads // num_kv_heads
@@ -565,10 +579,6 @@ class _FixedScoreGroup:
             )
 
             device = self.output.device
-            seg_out_offset = (
-                torch.arange(self.max_requests * self.num_layers, dtype=torch.int64, device=device)
-                * self.seq_len
-            ).to(torch.int32)
             # The union output rows are sized by the whole bucket (the widest
             # possible window); consumers mask by the per-request widths.
             union_rows = torch.empty(
@@ -576,9 +586,10 @@ class _FixedScoreGroup:
                 dtype=torch.float32,
                 device=device,
             )
-            # Per-request score window starts, staged before each launch; the
-            # compiled kernels capture this buffer's device pointer.
-            token_starts = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
+            # The scratch, segment buffers, and staged per-request window
+            # starts are shared with the score-only runner built by
+            # ``prepare_cute_score``; the compiled kernels capture their
+            # device pointers.
             runner = _FusedUnionScoreRunner(
                 layer_pools=self._cute_layer_pools,
                 layer_indices=self._cute_layer_indices,
@@ -594,8 +605,8 @@ class _FixedScoreGroup:
                 seg_req_id=self.pointer_prefix[4],
                 seg_layer_id=self.pointer_prefix[5],
                 seg_seq_len=self._cute_seg_seq_len,
-                seg_out_offset=seg_out_offset,
-                token_starts=token_starts,
+                seg_out_offset=self._cute_seg_out_offset,
+                token_starts=self._cute_token_starts,
                 q_real=self.pointer_middle[0],
                 q_imag=self.pointer_middle[1],
                 mlr_coef=self.pointer_middle[2],
@@ -609,7 +620,7 @@ class _FixedScoreGroup:
             raise RuntimeError(
                 "TriAttention CuTe union fusion setup failed and no other union path exists"
             ) from error
-        self._union_fusion_runner_entry = (runner, union_rows, token_starts)
+        self._union_fusion_runner_entry = (runner, union_rows, self._cute_token_starts)
         return self._union_fusion_runner_entry
 
     def launch_cute_union_fusion(

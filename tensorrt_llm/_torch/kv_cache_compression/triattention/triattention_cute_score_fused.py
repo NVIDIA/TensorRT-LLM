@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM100 CuTe-DSL scorer for the TriAttention mean-score path.
 
-This is the production specialization of the final workbench kernel. It
-uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ, and
-producer-only page-ID lookahead. The public integration keeps a Triton
-fallback for every geometry outside the exact contract validated here.
+This is the production specialization of the final workbench kernel — and
+the ONLY score implementation: the per-head modes launch its score-only
+entry and union eviction launches its fused score+stats+union pipeline. It
+uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ,
+and producer-only page-ID lookahead. Geometries outside the exact contract
+validated here raise loudly at setup
+(``_FixedScoreGroup.prepare_cute_score``); there is no fallback path.
 """
 
 from __future__ import annotations

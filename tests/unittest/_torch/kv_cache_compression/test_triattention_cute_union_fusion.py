@@ -356,7 +356,12 @@ def test_reference_union_preparation_matches_ragged_torch_reference() -> None:
 
 @_SM100_ONLY
 def test_union_fusion_setup_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A fused-runner construction failure raises loudly: no fallback remains."""
+    """A fused-runner construction failure raises loudly: no fallback remains.
+
+    The single fused pack serves both the score-only and union entries, so
+    the construction failure surfaces at score setup (``prepare_cute_score``
+    runs before the union runner is built).
+    """
     pytest.importorskip("cutlass")
 
     import tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused as fused_module  # noqa: E501
@@ -411,7 +416,7 @@ def test_union_fusion_setup_failure_raises(monkeypatch: pytest.MonkeyPatch) -> N
     widths = torch.empty(2, dtype=torch.int32, device=device)
     token_starts = torch.zeros(2, dtype=torch.int32, device=device)
     union_out = torch.empty((2, seq_len), dtype=torch.float32, device=device)
-    with pytest.raises(RuntimeError, match="no other union path exists"):
+    with pytest.raises(RuntimeError, match="no other score path exists"):
         group.launch_cute_union_fusion(
             2,
             valid_seq_lens,
