@@ -8,17 +8,12 @@ EXCLUSIVELY through the SM100 CuTe-DSL fused score pack
 (``triattention_cute_score_fused.py``): mean aggregation, BF16 KV pools,
 head size 64/128, 32/128-token pages, GQA group 4 or 8, per-request score
 window starts. There is deliberately no other score path -- any geometry
-outside that contract raises loudly at setup instead of routing to a slower
-kernel (the original Triton score kernel, the C++ CUDA score stack, and the
-single-shot CuTe score kernel have all been deleted). The per-head modes use
-the pack's score-only entry; union eviction runs its fused score+stats+union
-pipeline (with ``triattention_cute_selection.py``). The split Triton
-row-stats/union-reduce launches were retired with the union fusion, and
-their standalone copies live in the fused-pipeline unit test as references
-(the row-stats kernel itself remains: the per-head modes still normalize
-with it). The unit tests validate the CuTe kernels against independent
-PyTorch oracles. Selection and compaction live in their respective runtime
-modules.
+outside that contract raises loudly at setup. The per-head modes use the
+pack's score-only entry plus the row-stats kernel for normalization; union
+eviction runs the fused score+stats+union pipeline (with
+``triattention_cute_selection.py``). The unit tests validate the CuTe
+kernels against independent PyTorch oracles. Selection and compaction live
+in their respective runtime modules.
 
 House rules honored throughout:
   * fp32 math (loads up-cast to fp32, fp32 accumulators, fp32 score output).
@@ -125,8 +120,8 @@ class MeanPhaseTable:
             (target, self.omega.numel()), dtype=torch.float32, device=self.omega.device
         )
         sin_table = torch.zeros_like(cos_table)
-        # Accumulate offset-by-offset in fp32, mirroring the retired
-        # per-round Triton kernel's summation order.
+        # Accumulate offset-by-offset in fp32 (fixed summation order keeps
+        # the table bit-stable across rebuilds).
         for offset in self._offset_values:
             phase = torch.outer(positions + offset, self.omega)
             cos_table += torch.cos(phase)
@@ -344,10 +339,9 @@ class _FixedScoreGroup:
         anchor = self.pointer_prefix[0]
         num_q_heads, num_kv_heads, num_freqs, tokens_per_block, kv_factor = self.geometry_args
         max_segments = self.max_requests * self.num_layers
-        # The retired single-shot kernel stored full unmasked compute tiles
-        # (64 tokens, or one page for 128-token pages), which forced
-        # tile-aligned buckets. The fused kernel masks its ragged tail, but
-        # the bucket contract is kept unchanged so the kernel swap cannot
+        # The fused kernel masks its ragged tail, but the scratch bucket
+        # contract stays tile-aligned (64 tokens, or one page for
+        # 128-token pages) so bucket geometry cannot
         # silently admit new geometry (production pow2 buckets satisfy it).
         score_tile_tokens = max(64, int(tokens_per_block))
         supported = (
@@ -444,7 +438,7 @@ class _FixedScoreGroup:
         self._cute_seg_out_offset = seg_out_offset
         self._cute_token_starts = token_starts
         self._cute_gather_columns = gather_columns.view(1, 1, 1, -1)
-        # Fused score+stats+union pipeline (Fanrong Li's two-kernel scheme):
+        # Fused score+stats+union pipeline (two launches):
         # THE union path, built lazily on the first union launch. ONE runner
         # serves every cohort: the score window start is per-request runtime
         # metadata, not a compile-time constant.
@@ -503,8 +497,8 @@ class _FixedScoreGroup:
                 f"request_count={request_count} (capacity {self.max_requests}) "
                 "and no other score path exists"
             )
-        # Per-request decode widths for the selection reduce kernels; the
-        # deleted C++ score op used to write these (seq_len - token_start).
+        # Per-request decode widths (seq_len - token_start) for the
+        # selection reduce kernels.
         torch.sub(
             valid_seq_lens[:request_count],
             token_starts_device[:request_count],
@@ -638,8 +632,7 @@ class _FixedScoreGroup:
         Each request scores its own window (``token_starts_device`` carries
         the per-request pinned prompt lengths), so mixed-prompt cohorts are
         served directly. There is deliberately no fallback: an unsupported
-        geometry or request count raises loudly instead of routing to the
-        retired split score/row-stats/union launches.
+        geometry or request count raises loudly.
         """
         self.prepare_cute_score(mean_cos, mean_sin)
         if request_count <= 0 or request_count > self.max_requests:
@@ -893,23 +886,19 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     """Settle one selection row's ties, then pack its compaction move sources.
 
     One program per (request, selection row). The first half settles the
-    provisional top-k: recover the top-k threshold
-    from the provisional selection, count the strictly greater scores, then
-    emit the kept ordinals in increasing order, rebased by the row's pinned
-    prompt length. With ``HAS_PACK`` the same program then packs the move
-    sources for the packed rows this selection row feeds: the kept ordinals
-    it just wrote, followed by the request's protected tail, plus the SWA
-    rows (latest window) under the
-    same conditions as the retired standalone kernel. Union selection has one row per
-    request feeding every KV head's packed row, so that single program writes
-    all of them. ``HAS_PACK=False`` compiles the second half away, leaving
-    exactly the settle stage; ``HAS_SETTLE=False`` compiles the first half
-    away instead, packing pre-settled ordinals read from
-    ``output_indices`` -- the draft co-compaction flow, whose keep set is
-    the target's and needs no settling. The pre-fusion standalone copies
-    live in the fused-kernel unit test as the bit-equality references.
-    Fusing the launches was suggested by Fanrong Li (torch-graph review
-    2026-07-20).
+    provisional top-k: recover the threshold from the provisional
+    selection, count the strictly greater scores, then emit the kept
+    ordinals in increasing order, rebased by the row's pinned prompt
+    length. With ``HAS_PACK`` the same program then packs the move sources
+    for the packed rows this selection row feeds: the kept ordinals it
+    just wrote, the request's protected tail, plus the SWA rows (latest
+    window). Union selection has one row per request feeding every KV
+    head's packed row, so that single program writes all of them.
+    ``HAS_PACK=False`` compiles the second half away, leaving exactly the
+    settle stage; ``HAS_SETTLE=False`` compiles the first half away
+    instead, packing pre-settled ordinals read from ``output_indices`` --
+    the draft co-compaction flow, whose keep set is the target's and needs
+    no settling.
     """
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)

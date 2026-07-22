@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """SM100 CuTe-DSL scorer for the TriAttention mean-score path.
 
-This is the production specialization of the final workbench kernel — and
-the ONLY score implementation: the per-head modes launch its score-only
+This is the ONLY score implementation: the per-head modes launch its score-only
 entry and union eviction launches its fused score+stats+union pipeline. It
 uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ,
 and producer-only page-ID lookahead. Geometries outside the exact contract
@@ -1981,27 +1980,6 @@ class TriAttentionCuteScoreRunner:
             stream,
         )
 
-    def launch_with_partial_stats(
-        self,
-        request_count: int,
-        mean_cos: torch.Tensor,
-        mean_sin: torch.Tensor,
-    ) -> tuple[torch.Tensor, int]:
-        """Launch score and write deterministic partial row statistics."""
-        stream = cuda.CUstream(torch.cuda.current_stream(mean_cos.device).cuda_stream)
-        self._compiled_stats[request_count](
-            *self._cute_prefix,
-            _to_cute(mean_cos.view(-1)),
-            _to_cute(mean_sin.view(-1)),
-            *self._cute_tail,
-            request_count,
-            stream,
-        )
-        row_count = request_count * self.num_layers * self.num_q_heads
-        page_shards = self._page_shards[request_count]
-        stats = self.partial_stats[: row_count * page_shards * 3]
-        return stats.view(row_count, page_shards, 3), page_shards
-
     def supports_union_fusion(self, request_count: int) -> bool:
         """Return whether the score/stats/union pipeline was precompiled."""
         return (
@@ -2048,12 +2026,3 @@ class TriAttentionCuteScoreRunner:
             request_count,
             stream,
         )
-
-    def launch_union_finalize(
-        self,
-        request_count: int,
-        union_scores: torch.Tensor,
-    ) -> None:
-        """Launch only the union finalizer for isolated validation and profiling."""
-        stream = cuda.CUstream(torch.cuda.current_stream(union_scores.device).cuda_stream)
-        self._launch_union_finalize(request_count, union_scores, stream)

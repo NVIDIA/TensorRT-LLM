@@ -223,8 +223,7 @@ class _BatchedKeepSetSelectorBase:
         """Pack compaction move sources inside this selector's settle launch.
 
         ``pack_arguments`` is the dense/SWA packing description exported by
-        ``BatchedKVCacheCompaction.hand_move_source_pack_to_selection``
-        (fusion suggested by Fanrong Li, torch-graph review 2026-07-20). The
+        ``BatchedKVCacheCompaction.hand_move_source_pack_to_selection``. The
         fused kernel reads back the kept ordinals it just wrote, so the
         packing must read this selector's own keep buffer, and the packing
         geometry must match the selection rows this selector settles.
@@ -326,9 +325,7 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
     The fused score+stats+union CuTe pipeline is THE union score producer:
     it writes the normalized per-request union rows straight into
     ``combined``, so this selector owns only the top-k settle-and-pack
-    stage. The split row-stats/union-reduce Triton launches were retired
-    with their buffers; their standalone copies live in the fused-pipeline
-    unit test as references.
+    stage.
     """
 
     def __init__(
@@ -725,7 +722,7 @@ class _FixedScoreStagingBuffers:
         self.mean_phase_table = mean_phase_table
         # ONE fused group across ALL dense layers: segments carry their own
         # layer base address and page-table slot, so distinct per-layer
-        # storages/block tables no longer force one launch per storage group.
+        # storages/block tables share a single launch.
         _rep_of = {layer: layers[0] for layers in dense_groups for layer in layers}
         _page_table_slots = [self.representative_slots[_rep_of[layer]] for layer in dense_layers]
         self.fused_group = _FixedScoreGroup(
@@ -778,8 +775,7 @@ class _FixedScoreStagingBuffers:
         """Run the fused score+stats+union pipeline over these buffers.
 
         This is THE union score path; there is deliberately no fallback. A
-        geometry or capacity the fused pipeline cannot serve raises loudly
-        instead of routing to the retired split launches.
+        geometry or capacity the fused pipeline cannot serve raises loudly.
         """
         if not self._score_launcher_bound:
             raise RuntimeError("TriAttention score launcher is not bound")
@@ -1116,9 +1112,8 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         self.normalize_scores = bool(normalize_scores)
         if self.eviction_mode == "union" and not self.normalize_scores:
-            # The fused score+stats+union CuTe pipeline is THE union path and
-            # always z-normalizes; the split un-normalized union launches
-            # were retired with the Triton/C++ score stacks.
+            # The fused score+stats+union CuTe pipeline is THE union path
+            # and always z-normalizes.
             raise ValueError(
                 "TriAttention union eviction requires normalize_scores=True: "
                 "the fused union pipeline always z-normalizes score rows"

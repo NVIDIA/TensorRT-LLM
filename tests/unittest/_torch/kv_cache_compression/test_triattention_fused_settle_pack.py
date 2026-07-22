@@ -100,7 +100,7 @@ def _pack_compaction_sources_kernel(
 
 # --------------------------------------------------------------------------- #
 # Fused finalize: settle the top-k ties and pack the move indices in one      #
-# launch (fusion suggested by Fanrong Li, torch-graph review 2026-07-20).     #
+# launch.                                                                     #
 # --------------------------------------------------------------------------- #
 
 

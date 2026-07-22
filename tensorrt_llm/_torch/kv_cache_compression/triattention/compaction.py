@@ -224,9 +224,8 @@ _PACK_NUM_WARPS = 4
 class _MoveSourcePackArguments(NamedTuple):
     """One cache family's move-index packing, described as plain launch data.
 
-    The selection-side fused settle-and-pack launch (design suggested by
-    Fanrong Li, torch-graph review 2026-07-20) consumes this to pack the
-    dense/SWA move sources in the same kernel that finalizes the kept
+    The selection-side fused settle-and-pack launch consumes this to pack
+    the dense/SWA move sources in the same kernel that finalizes the kept
     ordinals, instead of a second launch at compaction time.
     """
 
