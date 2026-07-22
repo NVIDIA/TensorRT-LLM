@@ -596,6 +596,8 @@ def test_KvCacheConfig_declaration():
         use_kv_cache_manager_v2=False).use_kv_cache_manager_v2 is False
     with pytest.raises(ValidationError, match="use_kv_cache_manager_v2"):
         KvCacheConfig(use_kv_cache_manager_v2="invalid")
+    with pytest.raises(ValidationError, match="max_util_for_resume"):
+        KvCacheConfig(max_util_for_resume=0)
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
