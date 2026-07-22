@@ -96,15 +96,10 @@ _REQUIRED_CALIBRATION_KEYS = frozenset({"E_q", "E_q_norm", "omega", "freq_scale_
 # caller ever tuned it, so it is a constant rather than a constructor knob.
 _OFFSET_MAX_LENGTH = 65536
 
+
 # Stream-affinity contract: the staged buffers and compiled launches are bound
-# to the first CUDA stream that uses them.
-_STREAM_MISMATCH = "TriAttention eviction launches must stay on the staging CUDA stream"
-
-
 def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Tensor:
     """Upstream pruning_utils.build_geometric_offsets: [1, 2, 4, ... <=max]."""
-    if max_length < 1:
-        raise ValueError("offset_max_length must be >= 1")
     offsets: List[float] = []
     value = 1
     while value <= max_length:
@@ -118,8 +113,6 @@ def _page_table_slot_layout(
     page_table_keys: List[object],
 ) -> Tuple[Dict[int, int], int]:
     """Map representative layers to page-table snapshot slots."""
-    if len(page_table_keys) != len(page_representatives):
-        raise ValueError("page-table keys must match the representative count")
     use_pool_ids = all(
         isinstance(key, tuple)
         and len(key) == 2
@@ -142,16 +135,6 @@ def _page_table_slot_layout(
     return representative_slots, slot_count
 
 
-def _bind_workspace_stream(ws: SimpleNamespace) -> torch.cuda.Stream:
-    """Bind the workspace to the current stream on first use, then enforce it."""
-    stream = torch.cuda.current_stream(ws.device)
-    if ws.stream is None:
-        ws.stream = stream
-    elif (stream.device, stream.cuda_stream) != (ws.stream.device, ws.stream.cuda_stream):
-        raise RuntimeError(_STREAM_MISMATCH)
-    return stream
-
-
 def _allocate_page_table_plane(
     layer_pools: List[torch.Tensor],
     page_representatives: List[int],
@@ -168,18 +151,8 @@ def _allocate_page_table_plane(
     )
     if num_page_table_slots is None:
         num_page_table_slots = minimum_slots
-    if num_page_table_slots < minimum_slots:
-        raise ValueError(f"{what}page-table slot capacity does not cover every V2 pool")
     tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
-    if int(layer_pools[page_representatives[0]].shape[1]) != 2:
-        raise ValueError(f"{what}page-table staging requires an interleaved K/V pool")
     page_count = (token_capacity + tokens_per_block - 1) // tokens_per_block
-    if any(
-        (token_capacity + int(layer_pools[layer].shape[3]) - 1) // int(layer_pools[layer].shape[3])
-        != page_count
-        for layer in page_representatives
-    ):
-        raise ValueError(f"{what}page-table staging requires a uniform page count")
     copy_block_count = (page_count + 3) // 4 * 4
     plane_shape = (num_page_table_slots, max_requests, 2, copy_block_count)
     host = torch.empty(plane_shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned())
@@ -215,7 +188,6 @@ def prepare_eviction_workspace(
     decode_width: Optional[int] = None,
     page_table_token_capacity: Optional[int] = None,
     protected_tail_capacity: int = 0,
-    build_compaction: bool = True,
     draft_layer_pools: Optional[List[torch.Tensor]] = None,
     draft_layers: Optional[List[int]] = None,
     draft_layer_group_representative: Optional[Dict[int, int]] = None,
@@ -228,55 +200,31 @@ def prepare_eviction_workspace(
 ) -> SimpleNamespace:
     """Build the ONE plain-namespace workspace for the whole eviction stack.
 
-    This is the single one-time constructor: geometry validation, buffer
-    staging, eager CuTe compilation for exactly the entries the eviction mode
-    launches, selection buffers, and the C++ compaction launch data. It runs
-    outside CUDA graph capture (compilation allocates and synchronizes) and
-    raises loudly on any unsupported geometry -- there is deliberately no
-    fallback path. The returned namespace holds tensors, events, streams,
-    compiled runners, and ints; all flow logic lives in
-    ``stage_eviction_cohort`` and ``run_eviction_round``.
-
-    The workspace retains references to every scored layer pool: the SM100
-    CuTe score kernel encodes immutable TMA descriptors from their raw device
-    addresses at compile time, so the pools must stay alive and stay put for
-    as long as the workspace launches (the V2 manager owns them for its own
-    lifetime in production).
+    The single one-time constructor: buffer staging, eager CuTe compilation
+    for exactly the entries the eviction mode launches, selection buffers,
+    and the C++ compaction launch data. Runs outside CUDA graph capture
+    (compilation allocates and synchronizes); the CuTe runner validates its
+    own geometry contract and raises loudly -- there is no fallback path.
+    The returned namespace holds tensors, events, compiled runners, and
+    ints; all flow logic lives in ``stage_eviction_cohort`` and
+    ``run_eviction_round``. The workspace retains references to every scored
+    layer pool: the compiled kernels encode immutable TMA descriptors from
+    their raw device addresses, so the pools must stay alive and stay put.
     """
     from .triattention_cute_score_fused import TriAttentionCuteScoreRunner
 
-    if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
-        raise ValueError(f"unsupported eviction mode: {eviction_mode}")
-    if not dense_groups or not dense_layers or not page_representatives or max_requests <= 0:
-        raise ValueError("fixed score metadata requires non-empty positive geometry")
-    grouped_layers = [layer for layers in dense_groups for layer in layers]
-    if (
-        len(grouped_layers) != len(dense_layers)
-        or len(set(grouped_layers)) != len(grouped_layers)
-        or len(set(dense_layers)) != len(dense_layers)
-        or set(dense_layers) != set(grouped_layers)
-    ):
-        raise ValueError("dense layer order must cover every grouped layer exactly once")
     device = layer_pools[page_representatives[0]].device
-    if device.type != "cuda":
-        raise ValueError("fixed score metadata is CUDA-only")
     max_requests = int(max_requests)
     seq_len = int(seq_len)
     if page_table_token_capacity is None:
         page_table_token_capacity = seq_len
-    if page_table_token_capacity < seq_len:
-        raise ValueError("page-table capacity cannot be smaller than the score bucket")
     page_table_token_capacity = int(page_table_token_capacity)
     # Decode-width capacity of the score buffers; per-request prompt lengths
     # are staged runtime metadata.
     if decode_width is None:
         decode_width = seq_len
-    if decode_width <= 0 or decode_width > seq_len:
-        raise ValueError("fixed score decode width exceeds the sequence capacity")
     decode_width = int(decode_width)
     keep_count = int(keep_count)
-    if decode_width <= keep_count or keep_count <= 0:
-        raise ValueError("keep-set selection requires width > keep_count > 0")
 
     q_real = q_real.to(device=device, dtype=torch.float32).contiguous()
     q_imag = q_imag.to(device=device, dtype=torch.float32).contiguous()
@@ -318,15 +266,6 @@ def prepare_eviction_workspace(
     ws.draft_representative_slots = {}
     ws.draft_copy_block_count = 0
     if draft_layer_pools is not None:
-        if (
-            not draft_page_representatives
-            or draft_page_table_keys is None
-            or draft_page_table_token_capacity is None
-            or draft_page_table_token_capacity <= 0
-        ):
-            raise ValueError(
-                "draft page-table staging requires representatives, keys, and capacity"
-            )
         (
             ws.draft_representative_slots,
             ws.draft_copy_block_count,
@@ -377,27 +316,10 @@ def prepare_eviction_workspace(
 
     # ---- score state: ONE fused group across ALL dense layers --------------
     # Segments carry their own page-table slot, so distinct per-layer
-    # storages/block tables share a single launch.
+    # storages/block tables share a single launch. Pool geometry, dtype, and
+    # layout are validated by the CuTe runner itself below.
     p0 = layer_pools[dense_layers[0]]
-    if p0.ndim != 5:
-        raise ValueError("fixed score group requires HND pools")
     _, kv_factor, num_kv_heads, tokens_per_block, head_dim = p0.shape
-    if num_q_heads % num_kv_heads:
-        raise ValueError("query heads must be divisible by KV heads")
-    if int(num_freqs) != head_dim // 2:
-        raise ValueError("calibration frequency count must match half the head dim")
-    strides = tuple(int(value) for value in p0.stride())
-    element_size = p0.element_size()
-    for layer in dense_layers:
-        pool = layer_pools[layer]
-        if (
-            tuple(pool.shape[1:]) != tuple(p0.shape[1:])
-            or tuple(pool.stride()) != strides
-            or pool.dtype != p0.dtype
-        ):
-            raise ValueError("fixed score layers must share one uniform geometry")
-        if int(pool.data_ptr()) % element_size:
-            raise ValueError("fixed score layer base is not element-aligned")
     ws.num_layers = len(dense_layers)
     ws.num_q_heads = int(num_q_heads)
     ws.num_kv_heads = int(num_kv_heads)
@@ -419,8 +341,6 @@ def prepare_eviction_workspace(
     )
     block_offsets = ws.block_offsets_device
     slots_t = torch.tensor(page_table_slots, dtype=torch.int64, device=device)
-    if int(slots_t.max()) >= int(block_offsets.shape[0]):
-        raise ValueError("page table slot exceeds staged page-id planes")
     req_idx = torch.arange(max_requests, dtype=torch.int64, device=device).repeat_interleave(
         ws.num_layers
     )
@@ -428,43 +348,15 @@ def prepare_eviction_workspace(
     seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
 
     max_segments = max_requests * ws.num_layers
-    # The fused kernel masks its ragged tail, but the scratch bucket contract
-    # stays tile-aligned (64 tokens, or one page for 128-token pages) so
-    # bucket geometry cannot silently admit new geometry.
-    score_tile_tokens = max(64, ws.tokens_per_block)
-    supported = (
-        torch.cuda.get_device_capability(device) == (10, 0)
-        and p0.dtype == torch.bfloat16
-        and kv_factor == 2
-        and ws.tokens_per_block in (32, 128)
-        and ws.num_freqs in (32, 64)
-        and ws.num_q_heads % ws.num_kv_heads == 0
-        and ws.num_q_heads // ws.num_kv_heads in (4, 8)
-        and int(p0.stride(-1)) == 1
-        and seq_len % score_tile_tokens == 0
-        # The kernel's head-plane base offset is 64-bit; the widest 32-bit
-        # product left is one plane (N-1 head columns of one segment stride),
-        # which the score bucket keeps far below 2^31. Group-4 geometries pad
-        # the head axis to the MMA tile N=8.
-        and (8 - 1) * max_segments * seq_len < 2**31
-    )
-    if not supported:
+    # Head axis pads to the MMA tile N=8; one padded scratch plane must stay
+    # 32-bit indexable (wraparound = silent wild reads, not a clean error).
+    if (8 - 1) * max_segments * seq_len >= 2**31:
         raise ValueError(
-            "TriAttention score requires SM100, bf16 KV pools, head size "
-            "64/128, 32/128-token pages, GQA group 4 or 8, and a bucket "
-            "capacity aligned to the score compute tile; got "
-            f"capability={torch.cuda.get_device_capability(device)}, "
-            f"dtype={p0.dtype}, kv_factor={kv_factor}, "
-            f"tokens_per_block={ws.tokens_per_block}, num_freqs={ws.num_freqs}, "
-            f"heads={ws.num_q_heads}q/{ws.num_kv_heads}kv, "
-            f"stride={int(p0.stride(-1))}, "
-            f"seq_len={seq_len} (tile {score_tile_tokens}), "
-            f"offset_audit={ws.num_kv_heads * 8 * max_segments * seq_len}"
+            f"score bucket overflows the 32-bit scratch plane: {(8 - 1) * max_segments * seq_len}"
         )
-    # The kernel scores each request's window (from its staged per-request
-    # start) into a head-major scratch padded to the MMA tile N=8 per KV
-    # head; consumers read only the real heads. All buffers below are
-    # persistent because the compiled kernels capture their device pointers.
+    # The kernel scores each request's window into a head-major scratch;
+    # all buffers below are persistent because the compiled kernels capture
+    # their device pointers.
     ws.cute_scratch = torch.empty(
         ws.num_kv_heads * 8 * max_segments * seq_len, dtype=torch.float32, device=device
     )
@@ -514,7 +406,7 @@ def prepare_eviction_workspace(
             output=ws.cute_scratch,
             enable_partial_stats=union,
         )
-    except (ImportError, RuntimeError, ValueError, AssertionError) as error:
+    except (ImportError, RuntimeError, TypeError, ValueError, AssertionError) as error:
         raise RuntimeError(
             "TriAttention CuTe score setup failed and no other score path exists"
         ) from error
@@ -587,92 +479,64 @@ def prepare_eviction_workspace(
         ws.top_indices_i32.zero_()
 
     # ---- compaction launch data + settle/pack fusion ------------------------
-    ws.compaction = None
     # One settle program per (request, selection row).
     ws.settle_grid = (max_requests, ws.selection_rows_per_request)
-    if build_compaction:
-        if layer_group_representative is None or layer_pool_keys is None:
-            raise ValueError("compaction requires the layer grouping and pool keys")
-        draft_kwargs = {}
-        if draft_layers:
-            draft_kwargs = dict(
-                draft_layer_pools=draft_layer_pools,
-                draft_layers=list(draft_layers),
-                draft_layer_group_representative=draft_layer_group_representative,
-                draft_layer_pool_keys=draft_layer_pool_keys,
-                draft_protected_tail_capacity=int(draft_protected_tail_capacity),
-                draft_kv_block_offsets=ws.draft_block_offsets_device,
-                draft_page_table_slots=ws.draft_representative_slots,
-                draft_move_offsets=ws.draft_move_offsets,
-            )
-        ws.compaction = build_cache_compactions(
-            eviction_mode=eviction_mode,
-            layer_pools=layer_pools,
-            dense_layers=list(dense_layers),
-            swa_layers=list(swa_layers),
-            layer_group_representative=layer_group_representative,
-            kept_token_ordinals=ws.keep,
-            valid_sequence_lengths=ws.valid_seq_lens_device,
-            kv_block_offsets=ws.block_offsets_device,
-            page_table_slots=ws.representative_slots,
-            request_count=max_requests,
-            prompt_offsets=ws.token_starts_device,
-            decode_keep_count=keep_count,
-            swa_window=swa_window,
-            layer_pool_keys=list(layer_pool_keys),
-            protected_tail_capacity=int(protected_tail_capacity),
-            # Tails vary per round (in-flight growth), so the per-family move
-            # offsets ride the staged metadata rows each round.
-            dense_move_offsets=ws.dense_move_offsets,
-            swa_move_offsets=ws.swa_move_offsets,
-            # ONE launch settles the kept ordinals and packs the dense/SWA
-            # move sources; ``run_cache_compactions`` then only runs the C++
-            # moves (plus the draft's own pack).
-            fuse_dense_pack_into_selection=True,
-            **draft_kwargs,
+    draft_kwargs = {}
+    if draft_layers:
+        draft_kwargs = dict(
+            draft_layer_pools=draft_layer_pools,
+            draft_layers=list(draft_layers),
+            draft_layer_group_representative=draft_layer_group_representative,
+            draft_layer_pool_keys=draft_layer_pool_keys,
+            draft_protected_tail_capacity=int(draft_protected_tail_capacity),
+            draft_kv_block_offsets=ws.draft_block_offsets_device,
+            draft_page_table_slots=ws.draft_representative_slots,
+            draft_move_offsets=ws.draft_move_offsets,
         )
-        pack = ws.compaction["dense_pack"]
-        # The fused kernel reads back the kept ordinals it just wrote, so the
-        # packing must read this workspace's own keep buffer.
-        assert (
-            pack["kept_token_ordinals"].data_ptr() == ws.keep_rows.data_ptr()
-            and pack["selection_rows"] == ws.selection_rows_per_request
-            and pack["keep_count"] == keep_count
-        ), "fused move packing must match the selection geometry"
-        ws.settle_pack_tensors = (
-            pack["valid_sequence_lengths"],
-            pack["dense_offsets"],
-            pack["dense_indices"],
-            pack["swa_offsets"],
-            pack["swa_indices"],
-        )
-        ws.settle_pack_shape = dict(
-            DENSE_TOTAL=pack["dense_total"],
-            SWA_TOTAL=pack["swa_total"],
-            MOVE_CAPACITY=pack["move_capacity"],
-            NUM_KV_HEADS=pack["num_kv_heads"],
-            SWA_WINDOW=pack["swa_window"],
-            UNION=pack["union"],
-            PER_LAYER=pack["per_layer"],
-            HAS_SWA=pack["has_swa"],
-            HAS_PACK=True,
-        )
-    else:
-        # Settle-only workspaces (unit tests): the pack half is compiled
-        # away, so its tensor parameters are never read.
-        placeholder = ws.selection_row_lengths
-        ws.settle_pack_tensors = (placeholder,) * 5
-        ws.settle_pack_shape = dict(
-            DENSE_TOTAL=0,
-            SWA_TOTAL=0,
-            MOVE_CAPACITY=0,
-            NUM_KV_HEADS=1,
-            SWA_WINDOW=0,
-            UNION=False,
-            PER_LAYER=False,
-            HAS_SWA=False,
-            HAS_PACK=False,
-        )
+    ws.compaction = build_cache_compactions(
+        eviction_mode=eviction_mode,
+        layer_pools=layer_pools,
+        dense_layers=list(dense_layers),
+        swa_layers=list(swa_layers),
+        layer_group_representative=layer_group_representative,
+        kept_token_ordinals=ws.keep,
+        valid_sequence_lengths=ws.valid_seq_lens_device,
+        kv_block_offsets=ws.block_offsets_device,
+        page_table_slots=ws.representative_slots,
+        request_count=max_requests,
+        prompt_offsets=ws.token_starts_device,
+        decode_keep_count=keep_count,
+        swa_window=swa_window,
+        layer_pool_keys=list(layer_pool_keys),
+        protected_tail_capacity=int(protected_tail_capacity),
+        # Tails vary per round (in-flight growth), so the per-family move
+        # offsets ride the staged metadata rows each round.
+        dense_move_offsets=ws.dense_move_offsets,
+        swa_move_offsets=ws.swa_move_offsets,
+        # ONE launch settles the kept ordinals and packs the dense/SWA
+        # move sources; ``run_cache_compactions`` then only runs the C++
+        # moves (plus the draft's own pack).
+        fuse_dense_pack_into_selection=True,
+        **draft_kwargs,
+    )
+    pack = ws.compaction["dense_pack"]
+    ws.settle_pack_tensors = (
+        pack["valid_sequence_lengths"],
+        pack["dense_offsets"],
+        pack["dense_indices"],
+        pack["swa_offsets"],
+        pack["swa_indices"],
+    )
+    ws.settle_pack_shape = dict(
+        DENSE_TOTAL=pack["dense_total"],
+        SWA_TOTAL=pack["swa_total"],
+        MOVE_CAPACITY=pack["move_capacity"],
+        NUM_KV_HEADS=pack["num_kv_heads"],
+        SWA_WINDOW=pack["swa_window"],
+        UNION=pack["union"],
+        PER_LAYER=pack["per_layer"],
+        HAS_SWA=pack["has_swa"],
+    )
 
     # ---- round-ordering events ----------------------------------------------
     ws.copy_done = torch.cuda.Event()
@@ -683,7 +547,6 @@ def prepare_eviction_workspace(
     ws.bulk_consume_done = torch.cuda.Event()
     ws.copy_pending = False
     ws.page_tables_active = False
-    ws.stream = None
     return ws
 
 
@@ -736,7 +599,6 @@ def stage_eviction_cohort(
     round_starts: List[int],
     token_starts: List[int],
     seq_lens: Optional[List[int]] = None,
-    page_table_seq_lens: Optional[List[int]] = None,
     draft_manager: Optional[KVCacheManagerV2] = None,
     dense_move_offsets: Optional[List[int]] = None,
     swa_move_offsets: Optional[List[int]] = None,
@@ -746,30 +608,17 @@ def stage_eviction_cohort(
 
     ``token_starts`` carries each request's pinned prompt length; the score
     kernel starts that request's decode window there, so the cohort may mix
-    prompt lengths. Raises on any invalid cohort -- there is no fallback.
+    prompt lengths.
     """
     request_count = len(request_ids)
-    if (
-        request_count == 0
-        or request_count > ws.max_requests
-        or len(round_starts) != request_count
-        or len(token_starts) != request_count
-    ):
-        raise ValueError("eviction cohort does not fit the workspace request capacity")
-    stream = _bind_workspace_stream(ws)
+    stream = torch.cuda.current_stream(ws.device)
+    # Reuse guard: staging over a cohort whose pages are still being read
+    # would silently corrupt the in-flight compaction.
     if ws.page_tables_active:
         raise RuntimeError("previous page-table cohort is still active")
     if seq_lens is None:
         seq_lens = [ws.bucket_seq_len] * request_count
-    if page_table_seq_lens is None:
-        page_table_seq_lens = seq_lens
-    if len(seq_lens) != request_count or len(page_table_seq_lens) != request_count:
-        raise ValueError("eviction cohort length lists do not match the request count")
-    if (draft_manager is None) != (ws.draft_block_offsets_device is None):
-        raise RuntimeError("draft staging requires the workspace built with the draft cache")
     request_metadata = torch.as_tensor((round_starts, seq_lens, token_starts), dtype=torch.int32)
-    if min(round_starts) < 0:
-        raise ValueError("eviction round starts must be non-negative")
     # Grow the phase table while this cohort's round starts are still host
     # integers: a stale-capacity gather is an out-of-bounds index_select on
     # the device.
@@ -868,7 +717,6 @@ def settle_top_tokens(ws: SimpleNamespace) -> None:
         *ws.settle_pack_tensors,
         WIDTH=ws.decode_width,
         KEEP_COUNT=ws.keep_count,
-        OUTPUT_WIDTH=ws.keep_count,
         SELECTION_ROWS=ws.selection_rows_per_request,
         **ws.settle_pack_shape,
         HAS_SETTLE=True,
@@ -887,7 +735,6 @@ def run_eviction_round(ws: SimpleNamespace, normalize_scores: bool) -> None:
     capacity; padded rows past the staged cohort carry zero lengths and stay
     inert.
     """
-    _bind_workspace_stream(ws)
     request_count = ws.max_requests
     num_segments = request_count * ws.num_layers
     union = ws.eviction_mode == "union"
@@ -912,24 +759,12 @@ def run_eviction_round(ws: SimpleNamespace, normalize_scores: bool) -> None:
         )
         ws.cute_token_starts[:request_count].copy_(ws.token_starts_device[:request_count])
         if union:
-            if not ws.runner.supports_union_fusion(request_count):
-                raise RuntimeError(
-                    f"TriAttention CuTe union fusion has no compiled variant for "
-                    f"request_count={request_count} (capacity {ws.max_requests}) "
-                    "and no other union path exists"
-                )
             ws.runner.launch_union_fusion(
                 request_count, ws.mean_cos, ws.mean_sin, ws.union_rows[:request_count]
             )
             columns = min(ws.union_rows.shape[1], ws.combined.shape[1])
             ws.combined[:request_count, :columns].copy_(ws.union_rows[:request_count, :columns])
         else:
-            if not ws.runner.supports(request_count):
-                raise RuntimeError(
-                    f"TriAttention CuTe score has no compiled variant for "
-                    f"request_count={request_count} (capacity {ws.max_requests}) "
-                    "and no other score path exists"
-                )
             ws.runner.launch(request_count, ws.mean_cos, ws.mean_sin)
             # The kernel wrote each request's window scores (from its pinned
             # prompt length) into the head-major scratch, padded to the MMA
@@ -1266,9 +1101,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         with nvtx_range_debug("triattention.generation_step_end", color="blue"):
             self._periodic_evict(scheduled_batch)
 
-    def prepare_resources(self, scheduled_batch: "ScheduledRequests") -> None:
+    def on_generation_step_begin(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
         """Snapshot fixed-linear target growth; mutation remains in final update."""
-        super().prepare_resources(scheduled_batch)
         generation_growth = {}
         for request in scheduled_batch.generation_requests:
             request_id = request.py_request_id
@@ -1853,6 +1687,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         # costs at most one tile of scratch per segment.
         score_tile_tokens = max(64, int(mgr.tokens_per_block))
         seq_capacity = -(-seq_capacity // score_tile_tokens) * score_tile_tokens
+        # Mis-tiled buckets stripe the score scratch silently; the builder
+        # guarantees alignment right here.
+        assert seq_capacity % score_tile_tokens == 0
         page_table_token_capacity = max(needed_page_tokens, seq_capacity + tail_capacity)
 
         dense_groups = list(layout["storage_groups"].values())
@@ -1878,18 +1715,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 draft_page_table_token_capacity=seq_capacity + draft_tail_capacity,
                 draft_protected_tail_capacity=draft_tail_capacity,
             )
-
-        # One-time shape gate on the V2-allocated host block-offset tables the
-        # bulk staging reads every round (int32 [pools, slots, K/V, blocks]).
-        checked_managers = [("", mgr)]
-        if self.draft_kv_cache_manager is not None:
-            checked_managers.append(("draft ", self.draft_kv_cache_manager))
-        for what, manager in checked_managers:
-            table = manager.host_kv_cache_block_offsets
-            if table.dtype != torch.int32 or table.ndim != 4 or table.shape[2] != 2:
-                raise RuntimeError(
-                    f"KVCacheManagerV2 exposes an invalid {what}host block-offset table"
-                )
 
         first_pool = layout["layer_pools"][layout["dense_layers"][0]]
         if self._offsets is None:
@@ -2075,7 +1900,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 [item["round_start"] for item in prepared],
                 [item["prompt_len"] for item in prepared],
                 [item["seq_len"] for item in prepared],
-                [item["seq_len"] + item["protected_tail"] for item in prepared],
                 draft_manager=self.draft_kv_cache_manager,
                 dense_move_offsets=dense_offsets,
                 swa_move_offsets=swa_offsets,

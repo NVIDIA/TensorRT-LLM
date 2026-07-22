@@ -77,14 +77,6 @@ def build_mean_phase_table(
     the round starts are still host integers; the gather kernel clamps stale
     rows instead of faulting.
     """
-    if (
-        offsets.numel() <= 0
-        or omega.numel() <= 0
-        or offsets.dtype != torch.float32
-        or omega.dtype != torch.float32
-        or offsets.device != omega.device
-    ):
-        raise ValueError("mean-phase tables require same-device FP32 offsets and frequencies")
     phase: Dict[str, object] = {
         "offsets": offsets.contiguous(),
         "omega": omega.contiguous(),
@@ -137,9 +129,6 @@ def gather_mean_phases(
     destination buffers' device pointers. CUDA-only; eviction never runs
     under CUDA graph capture.
     """
-    request_count = int(request_count)
-    if request_count <= 0 or request_count > round_starts.numel():
-        raise ValueError("phase gather request count is outside its fixed buffers")
     num_freqs = phase["omega"].numel()
     _gather_mean_phase_kernel[(request_count,)](
         round_starts,
@@ -283,25 +272,8 @@ def prepare_per_head_scores(
     """Normalize and reduce score rows for either per-head eviction mode."""
     request_count = int(request_count)
     num_kv_heads = int(num_kv_heads)
-    # Essentials only: the buffers were allocated together at workspace
-    # construction with matching geometry; dtype/layout is the kernel contract.
-    assert scores.is_cuda and scores.ndim == 4 and scores.dtype == torch.float32, (
-        "per-head score preparation requires CUDA FP32 [request, layer, head, token] rows"
-    )
-    assert scores.is_contiguous() and request_count == scores.shape[0], (
-        "per-head score preparation request geometry does not match"
-    )
     _, num_layers, num_query_heads, width = scores.shape
-    assert num_kv_heads > 0 and num_query_heads % num_kv_heads == 0, (
-        "per-head score preparation requires valid GQA geometry"
-    )
     selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
-    assert (
-        selection_scores.shape == (request_count, selection_rows, width)
-        and selection_seq_lens.shape == (request_count, selection_rows)
-        and row_mean.numel() >= request_count * num_layers * num_query_heads
-    ), "per-head score preparation buffers do not match"
-
     stats_block = 256
     rows = num_layers * num_query_heads
     if normalize_scores:
@@ -357,7 +329,6 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     swa_indices,
     WIDTH: tl.constexpr,
     KEEP_COUNT: tl.constexpr,
-    OUTPUT_WIDTH: tl.constexpr,
     SELECTION_ROWS: tl.constexpr,
     DENSE_TOTAL: tl.constexpr,
     SWA_TOTAL: tl.constexpr,
@@ -368,23 +339,20 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     PER_LAYER: tl.constexpr,
     HAS_SWA: tl.constexpr,
     HAS_SETTLE: tl.constexpr,
-    HAS_PACK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Settle one selection row's ties, then pack its compaction move sources.
 
-    One program per (request, selection row). The first half settles the
-    provisional top-k: recover the threshold from the provisional
-    selection, count the strictly greater scores, then emit the kept
-    ordinals in increasing order, rebased by the row's pinned prompt
-    length. With ``HAS_PACK`` the same program then packs the move sources
-    for the packed rows this selection row feeds: the kept ordinals it
-    just wrote, the request's protected tail, plus the SWA rows (latest
-    window). Union selection has one row per request feeding every KV
-    head's packed row, so that single program writes all of them.
-    ``HAS_PACK=False`` compiles the second half away, leaving exactly the
-    settle stage; ``HAS_SETTLE=False`` compiles the first half away
-    instead, packing pre-settled ordinals read from ``output_indices`` --
+    One program per (request, selection row). The settle half recovers the
+    threshold from the provisional top-k, counts the strictly greater
+    scores, then emits the kept ordinals in increasing order
+    (lowest-index-wins ties), rebased by the row's pinned prompt length.
+    The pack half then writes the move sources for the packed rows this
+    selection row feeds: the kept ordinals it just wrote, the request's
+    protected tail, plus the SWA rows (latest window). Union selection has
+    one row per request feeding every KV head's packed row, so that single
+    program writes all of them. ``HAS_SETTLE=False`` compiles the settle
+    half away, packing pre-settled ordinals read from ``output_indices`` --
     the draft co-compaction flow, whose keep set is the target's and needs
     no settling.
     """
@@ -393,7 +361,7 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     row = request * SELECTION_ROWS + selection_domain
     row_scores = scores + row * WIDTH
     row_selected = provisional_indices + row * KEEP_COUNT
-    row_output = output_indices + row * OUTPUT_WIDTH
+    row_output = output_indices + row * KEEP_COUNT
     if HAS_SETTLE:
         # Scores are decode-relative; this row's pinned prompt length rebases
         # the emitted ordinals to absolute positions (per row, so one launch
@@ -460,63 +428,62 @@ def _settle_ties_and_pack_compaction_sources_kernel(
             output_count += tl.sum(selected_i32)
             ties_seen += tl.sum(tied_i32)
 
-    if HAS_PACK:
-        if HAS_SETTLE:
-            # The emission above scatters through other lanes of this
-            # program; make those global stores visible to every lane
-            # before the pack half reads the row back.
-            tl.debug_barrier()
-        dense_begin = tl.load(dense_offsets + request)
-        dense_end = tl.load(dense_offsets + request + 1)
-        dense_count = dense_end - dense_begin
-        valid_len = tl.load(valid_seq_lens + request)
+    if HAS_SETTLE:
+        # The emission above scatters through other lanes of this program;
+        # make those global stores visible to every lane before the pack
+        # half reads the row back.
+        tl.debug_barrier()
+    dense_begin = tl.load(dense_offsets + request)
+    dense_end = tl.load(dense_offsets + request + 1)
+    dense_count = dense_end - dense_begin
+    valid_len = tl.load(valid_seq_lens + request)
+    if HAS_SWA:
+        swa_begin = tl.load(swa_offsets + request)
+        swa_end = tl.load(swa_offsets + request + 1)
+        swa_count = swa_end - swa_begin
+    for move_start in tl.static_range(0, MOVE_CAPACITY, BLOCK):
+        move = move_start + tl.arange(0, BLOCK)
+        selected = tl.load(
+            row_output + move,
+            mask=move < KEEP_COUNT,
+            other=0,
+        )
+        dense_source = tl.where(move < KEEP_COUNT, selected, valid_len + move - KEEP_COUNT)
+        if UNION:
+            # The one union row per request feeds every KV head's packed
+            # row with the same move sources.
+            for head in tl.static_range(0, NUM_KV_HEADS):
+                tl.store(
+                    dense_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
+                    dense_source,
+                    mask=move < dense_count,
+                )
+        else:
+            domain = tl.program_id(1)
+            dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
+            tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
         if HAS_SWA:
-            swa_begin = tl.load(swa_offsets + request)
-            swa_end = tl.load(swa_offsets + request + 1)
-            swa_count = swa_end - swa_begin
-        for move_start in tl.static_range(0, MOVE_CAPACITY, BLOCK):
-            move = move_start + tl.arange(0, BLOCK)
-            selected = tl.load(
-                row_output + move,
-                mask=move < KEEP_COUNT,
-                other=0,
-            )
-            dense_source = tl.where(move < KEEP_COUNT, selected, valid_len + move - KEEP_COUNT)
+            swa_source = valid_len - SWA_WINDOW + move
             if UNION:
-                # The one union row per request feeds every KV head's packed
-                # row with the same move sources.
                 for head in tl.static_range(0, NUM_KV_HEADS):
                     tl.store(
-                        dense_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
-                        dense_source,
-                        mask=move < dense_count,
+                        swa_indices + head * SWA_TOTAL + swa_begin.to(tl.int64) + move,
+                        swa_source,
+                        mask=move < swa_count,
                     )
             else:
                 domain = tl.program_id(1)
-                dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
-                tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
-            if HAS_SWA:
-                swa_source = valid_len - SWA_WINDOW + move
-                if UNION:
-                    for head in tl.static_range(0, NUM_KV_HEADS):
-                        tl.store(
-                            swa_indices + head * SWA_TOTAL + swa_begin.to(tl.int64) + move,
-                            swa_source,
-                            mask=move < swa_count,
-                        )
+                # Per-layer selection has one dense domain per (layer,
+                # head). SWA uses one shared source row per head, so only
+                # the first layer writes it.
+                if PER_LAYER:
+                    write_swa = domain < NUM_KV_HEADS
                 else:
-                    domain = tl.program_id(1)
-                    # Per-layer selection has one dense domain per (layer,
-                    # head). SWA uses one shared source row per head, so only
-                    # the first layer writes it.
-                    if PER_LAYER:
-                        write_swa = domain < NUM_KV_HEADS
-                    else:
-                        write_swa = move >= 0
-                    head = domain % NUM_KV_HEADS
-                    swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
-                    tl.store(
-                        swa_indices + swa_output,
-                        swa_source,
-                        mask=write_swa & (move < swa_count),
-                    )
+                    write_swa = move >= 0
+                head = domain % NUM_KV_HEADS
+                swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
+                tl.store(
+                    swa_indices + swa_output,
+                    swa_source,
+                    mask=write_swa & (move < swa_count),
+                )

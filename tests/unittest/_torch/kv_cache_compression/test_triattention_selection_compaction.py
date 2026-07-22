@@ -100,18 +100,21 @@ def _make_selection_ws(
         ws.provisional_rows = ws.top_indices_i32.view(-1, keep_count)
         ws.keep_rows = ws.keep.view(-1, keep_count)
     ws.settle_grid = (max_requests, ws.selection_rows_per_request)
-    placeholder = ws.selection_row_lengths
-    ws.settle_pack_tensors = (placeholder,) * 5
+    # The settle launch always packs now; zero per-request move counts mask
+    # every pack store off, so these workspaces stay selection-only.
+    zero_offsets = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
+    zero_lengths = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    zero_indices = torch.zeros(1, dtype=torch.int32, device=device)
+    ws.settle_pack_tensors = (zero_lengths, zero_offsets, zero_indices, zero_offsets, zero_indices)
     ws.settle_pack_shape = dict(
         DENSE_TOTAL=0,
         SWA_TOTAL=0,
-        MOVE_CAPACITY=0,
+        MOVE_CAPACITY=keep_count,
         NUM_KV_HEADS=1,
         SWA_WINDOW=0,
         UNION=False,
         PER_LAYER=False,
         HAS_SWA=False,
-        HAS_PACK=False,
     )
     return ws
 
@@ -580,7 +583,8 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         omega=torch.zeros(num_freqs, dtype=torch.float32, device=device),
         page_table_keys=[("pool", 0), ("pool", 1)],
         num_page_table_slots=2,
-        build_compaction=False,
+        layer_group_representative=layer_group_representative,
+        layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
     )
     ws.block_offsets_device.zero_()
     ws.block_offsets_device[..., :2].copy_(_encode_block_offsets(torch.stack(page_tables)))
@@ -588,8 +592,8 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     ws.valid_seq_lens_device.fill_(seq_len)
     ws.token_starts_device.fill_(0)
 
-    # The compaction packs its own move indices here (the settle's pack half
-    # is compiled away in a workspace built without compaction).
+    # This compaction packs its own move indices; the workspace's fused pack
+    # stays masked off (its staged move-offsets row is all zeros).
     ws.compaction = _build_compaction(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
@@ -785,7 +789,6 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
                 [0],
                 [prompt_len],
                 [seq_len],
-                [seq_len + protected_tail],
                 dense_move_offsets=[0, keep_count + protected_tail],
             )
             # THE union path: the fused pipeline writes normalized union rows

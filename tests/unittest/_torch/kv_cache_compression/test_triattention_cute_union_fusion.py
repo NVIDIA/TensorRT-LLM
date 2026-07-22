@@ -33,7 +33,7 @@ def _make_union_workspace(
     offsets,
     decode_width=None,
 ):
-    """A union-mode workspace over one shared page-table slot (no compaction).
+    """A union-mode workspace over one shared page-table slot.
 
     The union runner also compiles the score-only entries, so one workspace
     serves both the fused pipeline and the split reference leg.
@@ -61,7 +61,8 @@ def _make_union_workspace(
         offsets=offsets,
         omega=omega,
         decode_width=decode_width,
-        build_compaction=False,
+        layer_group_representative={layer: 0 for layer in range(num_layers)},
+        layer_pool_keys=[("pool", 0)] * num_layers,
     )
 
 

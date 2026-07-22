@@ -164,7 +164,6 @@ def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None
     staging.copy_block_count = copy_block_count
     if page_count is not None:
         staging.page_count = page_count
-    staging.stream = None
     staging.bulk_copy_done = torch.cuda.Event()
     staging.bulk_consume_done = torch.cuda.Event()
     staging.page_tables_active = False

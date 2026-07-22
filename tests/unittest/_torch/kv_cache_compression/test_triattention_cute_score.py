@@ -12,12 +12,10 @@ workspaces across the named production geometries (Qwen3, GPT-OSS, the
 originally validated 128-token-page shape) against the shared pure-PyTorch
 oracle, sweeps request counts up to the workspace capacity, and checks the
 per-request decode-width metadata the selection reduce kernels consume. The
-contract tests pin the loud-failure behavior: unsupported geometry raises at
-workspace construction and an oversized cohort is rejected at staging --
-there is no fallback score kernel.
+contract test pins the loud-failure behavior: unsupported geometry raises
+from the CuTe runner's own validation at workspace construction -- there is
+no fallback score kernel.
 """
-
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -45,7 +43,7 @@ def _make_score_workspace(
     decode_width=None,
     eviction_mode="per_head",
 ):
-    """A score-only workspace over one shared page-table slot (no compaction)."""
+    """A score-only workspace over one shared page-table slot."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         prepare_eviction_workspace,
     )
@@ -69,7 +67,8 @@ def _make_score_workspace(
         offsets=offsets,
         omega=omega,
         decode_width=decode_width,
-        build_compaction=False,
+        layer_group_representative={layer: 0 for layer in range(num_layers)},
+        layer_pool_keys=[("pool", 0)] * num_layers,
     )
 
 
@@ -414,10 +413,9 @@ def test_cute_kernel_matches_torch_oracle(case):
                 )
 
 
-# The loud-failure contract, one representative per guard family: unsupported
-# geometry raises at workspace construction (the only score path compiles
-# eagerly there -- no fallback), and an oversized cohort is rejected by the
-# host-side staging gate before any GPU work.
+# The loud-failure contract: unsupported geometry raises from the CuTe
+# runner's own validation during the eager compile at workspace
+# construction, surfaced as the no-fallback RuntimeError.
 def test_unsupported_geometry_raises_at_workspace_construction():
     pytest.importorskip("cutlass")
     device = torch.device("cuda", torch.cuda.current_device())
@@ -431,7 +429,7 @@ def test_unsupported_geometry_raises_at_workspace_construction():
         for _ in range(num_layers)
     ]
     calib = torch.randn(num_layers, 2, num_freqs, device=device)
-    with pytest.raises(ValueError, match="TriAttention score requires SM100"):
+    with pytest.raises(RuntimeError, match="no other score path exists"):
         _make_score_workspace(
             layer_pools=pools,
             max_requests=max_requests,
@@ -445,13 +443,3 @@ def test_unsupported_geometry_raises_at_workspace_construction():
             offsets=torch.tensor([1.0, 2.0], dtype=torch.float32, device=device),
             decode_width=page_count * tokens_per_block - 1,
         )
-
-
-def test_oversized_cohort_is_rejected_at_staging():
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        stage_eviction_cohort,
-    )
-
-    ws = SimpleNamespace(max_requests=2)
-    with pytest.raises(ValueError, match="does not fit the workspace request capacity"):
-        stage_eviction_cohort(ws, None, [1, 2, 3], [0, 0, 0], [0, 0, 0])

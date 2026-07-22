@@ -33,43 +33,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-_SUPPORTED_POOL_DTYPES = (torch.bfloat16,)
-
-
-def _validated_kv_head_count(
-    pools: List[torch.Tensor],
-    layers: Tuple[int, ...],
-    device: torch.device,
-    what: str,
-) -> int:
-    """Return the common KV-head count of one launch side's pools.
-
-    The C++ compact op reads the interleaved V2 layout
-    ``[page, K/V, head, token, dim]`` and takes the KV-head count from each
-    launch's pool shape, so every layer on one side must agree on it.
-    """
-    first = pools[layers[0]]
-    if first.ndim != 5 or first.shape[2] <= 0:
-        raise ValueError(
-            f"{what} pools must be 5-D interleaved V2 pools "
-            f"[pages, K/V, heads, tokens, dim]; layer {layers[0]} has shape "
-            f"{tuple(first.shape)}"
-        )
-    num_kv_heads = int(first.shape[2])
-    if not all(
-        pools[layer].ndim == 5
-        and pools[layer].shape[1] == 2
-        and pools[layer].device == device
-        and int(pools[layer].shape[2]) == num_kv_heads
-        and pools[layer].is_contiguous()
-        and pools[layer].dtype in _SUPPORTED_POOL_DTYPES
-        for layer in layers
-    ):
-        raise ValueError(
-            f"{what} requires contiguous interleaved BF16 pools with one common KV-head count"
-        )
-    return num_kv_heads
-
 
 def _make_move_buffers(
     index_prefix: Tuple[int, ...],
@@ -99,18 +62,13 @@ def _page_table_provider(
     request_count: int,
     what: str,
 ) -> Callable[[int], torch.Tensor]:
-    """Return validated per-slot K block-offset views, cached per slot."""
+    """Return per-slot K block-offset views, cached per slot."""
     tables: Dict[int, torch.Tensor] = {}
 
     def page_table_for(representative: int) -> torch.Tensor:
         slot = page_table_slots[representative]
         if slot not in tables:
-            block_offsets = kv_block_offsets[slot, :request_count, 0]
-            if block_offsets.device != device or block_offsets.dtype != torch.int32:
-                raise ValueError(f"{what} block offsets must be int32 tensors on the pool device")
-            if block_offsets.ndim != 2 or block_offsets.stride(1) != 1:
-                raise ValueError(f"{what} K block offsets must have a contiguous block dimension")
-            tables[slot] = block_offsets
+            tables[slot] = kv_block_offsets[slot, :request_count, 0]
         return tables[slot]
 
     return page_table_for
@@ -145,10 +103,6 @@ def _compact_groups(
         layers = tuple(entry[0] for entry in group_entries)
         pools = tuple(entry[1] for entry in group_entries)
         page_tables = tuple(entry[2] for entry in group_entries)
-        if len({int(pool.data_ptr()) for pool in pools}) != len(pools):
-            raise ValueError("layered compaction requires a distinct pool view for every layer")
-        if len({int(page_table.data_ptr()) for page_table in page_tables}) != 1:
-            raise ValueError("layers in one V2 pool must share one block-offset table")
         source_layer_indices = None
         if per_layer_slots is not None:
             source_layer_indices = torch.tensor(
@@ -208,22 +162,8 @@ def build_move_pack_arguments(
         selection_rows = num_dense_layers * num_kv_heads
     else:
         selection_rows = num_kv_heads
-    selection_prefix = (request_count,) if union else (request_count, selection_rows)
     # Selection rows carry decode-only kept ordinals (already absolute), so
     # the rectangle is prompt-length independent.
-    expected_selection = (*selection_prefix, decode_keep_count)
-    if (
-        request_count <= 0
-        or tuple(kept_token_ordinals.shape) != expected_selection
-        or valid_sequence_lengths.shape != (request_count,)
-    ):
-        raise ValueError(
-            f"prepared compaction packing expects kept ordinals of shape "
-            f"{expected_selection} and one valid length per request; got "
-            f"{tuple(kept_token_ordinals.shape)} and "
-            f"{tuple(valid_sequence_lengths.shape)}"
-        )
-
     if swa_move_source_indices is not None:
         swa_offsets_arg = swa_move_source_offsets
         swa_indices_arg = swa_move_source_indices
@@ -287,7 +227,6 @@ def launch_move_pack(pack: Dict[str, object]) -> None:
         pack["swa_indices"],
         WIDTH=pack["keep_count"],
         KEEP_COUNT=pack["keep_count"],
-        OUTPUT_WIDTH=pack["keep_count"],
         SELECTION_ROWS=pack["selection_rows"],
         DENSE_TOTAL=pack["dense_total"],
         SWA_TOTAL=pack["swa_total"],
@@ -298,7 +237,6 @@ def launch_move_pack(pack: Dict[str, object]) -> None:
         PER_LAYER=pack["per_layer"],
         HAS_SWA=pack["has_swa"],
         HAS_SETTLE=False,
-        HAS_PACK=True,
         BLOCK=_PACK_BLOCK_TOKENS,
         num_warps=_PACK_NUM_WARPS,
     )
@@ -359,46 +297,18 @@ def build_cache_compactions(
     ``{"pack": dict|None, "groups": (...), "source": t, "offsets": t,
     "destination_bases": t}``.
     """
-    if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
-        raise ValueError(f"unsupported compaction mode: {eviction_mode}")
-    if request_count <= 0 or decode_keep_count <= 0:
-        raise ValueError("batched compaction requires requests and retained tokens")
-    if not dense_layers:
-        raise ValueError("batched compaction requires at least one dense layer")
-    if draft_layers and eviction_mode != "union":
-        raise ValueError("draft co-compaction supports only union eviction")
-    if draft_layer_pools is not None and not draft_layers:
-        raise ValueError("draft pools were given without any draft layers")
-    if not swa_layers and swa_window:
-        raise ValueError("swa_window was given without any SWA layers")
-
     device = layer_pools[dense_layers[0]].device
-    # The move buffers are allocated on the pool device, so the selection
-    # tensors feeding the pack kernel must already live there.
-    if kept_token_ordinals.device != device:
-        raise ValueError("kept-token ordinals must live on the pool device")
     request_count = int(request_count)
-    if (
-        prompt_offsets.shape != (request_count,)
-        or prompt_offsets.dtype != torch.int32
-        or prompt_offsets.device != device
-        or not prompt_offsets.is_contiguous()
-    ):
-        raise ValueError("per-request prompt offsets do not match the cohort")
     decode_keep_count = int(decode_keep_count)
-    if protected_tail_capacity < 0:
-        raise ValueError("the protected-tail capacity must be non-negative")
     protected_tail_capacity = int(protected_tail_capacity)
     dense_layers = tuple(int(layer) for layer in dense_layers)
     swa_layers = tuple(int(layer) for layer in swa_layers)
-    if len(layer_pool_keys) != len(layer_pools):
-        raise ValueError("pool keys must match the layer-pool count")
     layer_pool_keys = tuple(layer_pool_keys)
 
     per_layer = eviction_mode == "per_layer_perhead"
-    num_kv_heads = _validated_kv_head_count(
-        layer_pools, (*dense_layers, *swa_layers), device, "batched compaction"
-    )
+    # The C++ compact op takes the KV-head count from each launch's pool
+    # shape [pages, K/V, heads, tokens, dim].
+    num_kv_heads = int(layer_pools[dense_layers[0]].shape[2])
     dense_index_prefix = (len(dense_layers), num_kv_heads) if per_layer else (num_kv_heads,)
     dense_move_indices, dense_move_offsets = _make_move_buffers(
         dense_index_prefix,
@@ -424,8 +334,6 @@ def build_cache_compactions(
         swa_move_offsets = None
         swa_window = 0
     else:
-        if swa_window is None or swa_window <= 0:
-            raise ValueError("SWA compaction requires a valid retained window")
         # Per-request window validity (prompt + decode keep >= window) is
         # prompt-dependent and checked by the caller each round.
         swa_window = int(swa_window)
@@ -481,25 +389,11 @@ def build_cache_compactions(
         )
 
     if draft_layers:
-        if (
-            draft_layer_pools is None
-            or draft_layer_group_representative is None
-            or draft_layer_pool_keys is None
-        ):
-            raise ValueError("draft co-compaction requires the full draft layout")
-        if draft_kv_block_offsets is None or draft_page_table_slots is None:
-            raise ValueError("draft co-compaction requires staged draft page tables")
-        if draft_protected_tail_capacity is not None and draft_protected_tail_capacity < 0:
-            raise ValueError("the draft protected-tail capacity must be non-negative")
         draft_tail = int(draft_protected_tail_capacity or 0)
-        if len(draft_layer_pool_keys) != len(draft_layer_pools):
-            raise ValueError("draft pool keys must match the draft layer-pool count")
         draft_layers = tuple(int(layer) for layer in draft_layers)
         # The draft forms its own launch groups so it may use a different
         # KV-head count than the target.
-        draft_num_kv_heads = _validated_kv_head_count(
-            draft_layer_pools, draft_layers, device, "draft co-compaction"
-        )
+        draft_num_kv_heads = int(draft_layer_pools[draft_layers[0]].shape[2])
         draft_move_indices, draft_move_offsets = _make_move_buffers(
             (draft_num_kv_heads,),
             [decode_keep_count + draft_tail] * request_count,

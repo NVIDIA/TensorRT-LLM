@@ -265,10 +265,12 @@ class TestCompressedTokenPublication:
 
 class TestEvictionLifecycle:
     def test_prepare_does_not_evict_and_update_runs_final_hook_once(self):
-        # Structural: prepare is a snapshot-only override; the eviction runs
-        # from the framework's final on_generation_step_end hook.
-        assert "prepare_resources" in TriAttention.__dict__
+        # Structural: TriAttention implements hooks only, never the base
+        # template methods; the growth snapshot rides the step-begin hook and
+        # the eviction runs from the final on_generation_step_end hook.
+        assert "prepare_resources" not in TriAttention.__dict__
         assert "update_resources" not in TriAttention.__dict__
+        assert "on_generation_step_begin" in TriAttention.__dict__
         assert "on_generation_step_end" in TriAttention.__dict__
 
         manager = _make_triattention()
@@ -771,14 +773,13 @@ class TestFixedScoreMetadata:
             )
 
         # One batched staging call carries the whole cohort: request ids,
-        # round starts, pinned prompt lengths, valid lengths, and page-table
-        # lengths (valid + protected tail). top_B=4: per-request moves are
-        # keep + tail = [6, 7]; padded rows repeat the final offset out to
-        # the request capacity.
+        # round starts, pinned prompt lengths, and valid lengths. top_B=4:
+        # per-request moves are keep + tail = [6, 7]; padded rows repeat the
+        # final offset out to the request capacity.
         args = internals.stage.call_args
         assert args.args[0] is internals.workspace
         assert args.args[1] is manager.kv_cache_manager
-        assert args.args[2:7] == ([7, 8], [8, 10], [3, 5], [8, 10], [10, 13])
+        assert args.args[2:6] == ([7, 8], [8, 10], [3, 5], [8, 10])
         assert args.kwargs["draft_manager"] is None
         assert args.kwargs["dense_move_offsets"] == [0, 6, 13, 13, 13, 13, 13, 13, 13]
         assert args.kwargs["swa_move_offsets"] is None
@@ -789,7 +790,7 @@ class TestFixedScoreMetadata:
 
     @requires_sm100
     @pytest.mark.parametrize("request_count", [1, 7, 8])
-    def test_staging_stages_dense_and_swa_tables_and_rejects_stream_changes(self, request_count):
+    def test_staging_stages_dense_and_swa_tables(self, request_count):
         pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             prepare_eviction_workspace,
@@ -855,7 +856,8 @@ class TestFixedScoreMetadata:
             offsets=offsets,
             omega=omega,
             page_table_token_capacity=page_table_token_capacity,
-            build_compaction=False,
+            layer_group_representative={0: 0, 1: 0, 2: 2},
+            layer_pool_keys=[("pool", 0), ("pool", 0), ("pool", 2), ("pool", 3)],
         )
         assert staging.bucket_seq_len == seq_len
         assert staging.page_table_token_capacity == page_table_token_capacity
@@ -917,7 +919,6 @@ class TestFixedScoreMetadata:
                 [2**31] * request_count,
                 token_starts,
                 [seq_len] * request_count,
-                [10] * request_count,
             )
         assert gather.call_count == 0
         with mock.patch.object(
@@ -932,7 +933,6 @@ class TestFixedScoreMetadata:
                 round_starts,
                 token_starts,
                 [seq_len] * request_count,
-                [10] * request_count,
             )
         torch.cuda.current_stream(device).synchronize()
         assert staging.round_starts_device.untyped_storage().data_ptr() == (
@@ -956,12 +956,6 @@ class TestFixedScoreMetadata:
                 staging.block_offsets_device[slot, :request_count, 0, :page_count],
                 expected,
             )
-        calls = gather.call_count
-        other_stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(other_stream):
-            with pytest.raises(RuntimeError, match="staging CUDA stream"):
-                stage_eviction_cohort(staging, manager, request_ids, round_starts, token_starts)
-        assert gather.call_count == calls
 
     @requires_sm100
     @pytest.mark.parametrize("request_count", [1, 7, 8])
@@ -1041,7 +1035,8 @@ class TestFixedScoreMetadata:
             offsets=offsets,
             omega=omega,
             decode_width=seq_len - prompt_len,
-            build_compaction=False,
+            layer_group_representative={layer: layer for layer in layer_order},
+            layer_pool_keys=[("pool", layer) for layer in layer_order],
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 

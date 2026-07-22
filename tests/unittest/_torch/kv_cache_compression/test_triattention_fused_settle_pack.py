@@ -228,7 +228,6 @@ def test_fused_settle_pack_matches_torch_oracle(eviction_mode, has_swa, width, k
             swa_fused_arg,
             WIDTH=width,
             KEEP_COUNT=keep_count,
-            OUTPUT_WIDTH=keep_count,
             SELECTION_ROWS=selection_rows,
             DENSE_TOTAL=dense_total,
             SWA_TOTAL=swa_total if has_swa else 0,
@@ -239,7 +238,6 @@ def test_fused_settle_pack_matches_torch_oracle(eviction_mode, has_swa, width, k
             PER_LAYER=per_layer,
             HAS_SWA=has_swa,
             HAS_SETTLE=True,
-            HAS_PACK=True,
             BLOCK=_BLOCK,
             num_warps=_NUM_WARPS,
         )
@@ -248,64 +246,6 @@ def test_fused_settle_pack_matches_torch_oracle(eviction_mode, has_swa, width, k
         assert torch.equal(output_fused, output_reference), f"kept ordinals differ (seed {seed})"
         assert torch.equal(dense_fused, dense_reference), f"dense moves differ (seed {seed})"
         assert torch.equal(swa_fused, swa_reference), f"SWA moves differ (seed {seed})"
-
-
-def test_fused_kernel_without_pack_matches_settle_oracle():
-    """``HAS_PACK=False`` must leave exactly the settle stage."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    rows_total, width, keep_count = 6, 33, 7
-    generator = torch.Generator(device=device).manual_seed(11)
-    scores = torch.randint(
-        -2, 3, (rows_total, width), generator=generator, dtype=torch.int32, device=device
-    ).to(torch.float32)
-    row_lengths = torch.tensor([0, 3, 9, 17, 33, 33], dtype=torch.int32, device=device)
-    row_prompt_offsets = torch.tensor([5, 0, 2, 0, 1, 4], dtype=torch.int32, device=device)
-    masked = scores.clone()
-    for row in range(rows_total):
-        masked[row, int(row_lengths[row]) :] = float("-inf")
-    provisional = torch.topk(masked, keep_count, dim=1).indices.to(torch.int32).contiguous()
-    output_stale = torch.randint(
-        -(2**30), 2**30, (rows_total, keep_count), dtype=torch.int32, device=device
-    )
-
-    output_reference = output_stale.clone()
-    _settle_oracle(
-        scores, row_lengths, row_prompt_offsets, provisional, output_reference, keep_count
-    )
-
-    output_fused = output_stale.clone()
-    placeholder = row_lengths
-    _settle_ties_and_pack_compaction_sources_kernel[(rows_total, 1)](
-        scores,
-        row_lengths,
-        row_prompt_offsets,
-        provisional,
-        output_fused,
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
-        WIDTH=width,
-        KEEP_COUNT=keep_count,
-        OUTPUT_WIDTH=keep_count,
-        SELECTION_ROWS=1,
-        DENSE_TOTAL=0,
-        SWA_TOTAL=0,
-        MOVE_CAPACITY=0,
-        NUM_KV_HEADS=1,
-        SWA_WINDOW=0,
-        UNION=False,
-        PER_LAYER=False,
-        HAS_SWA=False,
-        HAS_SETTLE=True,
-        HAS_PACK=False,
-        BLOCK=_BLOCK,
-        num_warps=_NUM_WARPS,
-    )
-    torch.cuda.synchronize(device)
-
-    assert torch.equal(output_fused, output_reference)
 
 
 def test_settle_handles_topk_sentinel_padding():
@@ -341,32 +281,33 @@ def test_settle_handles_topk_sentinel_padding():
 
     stale = 0x5EED
     output = torch.full((rows_total, keep_count), stale, dtype=torch.int32, device=device)
-    placeholder = row_lengths
+    # The pack half always runs now; zero per-request move counts mask every
+    # pack store off, so the settle assertions below stay byte-exact.
+    dense_offsets = torch.zeros(rows_total + 1, dtype=torch.int32, device=device)
+    dense_indices = torch.zeros(1, dtype=torch.int32, device=device)
     _settle_ties_and_pack_compaction_sources_kernel[(rows_total, 1)](
         scores,
         row_lengths,
         row_prompt_offsets,
         provisional,
         output,
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
-        placeholder,
+        row_lengths,
+        dense_offsets,
+        dense_indices,
+        dense_offsets,
+        dense_indices,
         WIDTH=width,
         KEEP_COUNT=keep_count,
-        OUTPUT_WIDTH=keep_count,
         SELECTION_ROWS=1,
         DENSE_TOTAL=0,
         SWA_TOTAL=0,
-        MOVE_CAPACITY=0,
+        MOVE_CAPACITY=keep_count,
         NUM_KV_HEADS=1,
         SWA_WINDOW=0,
         UNION=False,
         PER_LAYER=False,
         HAS_SWA=False,
         HAS_SETTLE=True,
-        HAS_PACK=False,
         BLOCK=_BLOCK,
         num_warps=_NUM_WARPS,
     )
