@@ -16,18 +16,31 @@ DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
 
 
-def _manager(*, is_draft: bool, kv_compression_manages_history: bool = False) -> KVCacheManagerV2:
+def _manager(
+    *,
+    is_draft: bool,
+    kv_compression_manages_history: bool = False,
+    kv_reserve_draft_tokens: int = 0,
+) -> KVCacheManagerV2:
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.is_draft = is_draft
     manager.kv_compression_manages_history = kv_compression_manages_history
+    manager._kv_reserve_draft_tokens = kv_reserve_draft_tokens
     manager.kv_cache_map = {}
     return manager
 
 
-def _request(request_id: int, *, rewind: int = 0, complete: bool = False) -> SimpleNamespace:
+def _request(
+    request_id: int,
+    *,
+    rewind: int = 0,
+    accepted_draft_tokens: int = 0,
+    complete: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
         py_rewind_len=rewind,
+        py_num_accepted_draft_tokens=accepted_draft_tokens,
         max_beam_num_tokens=201,
         state=LlmRequestState.GENERATION_COMPLETE
         if complete
@@ -105,6 +118,30 @@ def test_capacity_only_is_scoped_to_target_manager() -> None:
 
     draft_cache.resize.assert_called_once_with(253, 200)
     target_cache.resize.assert_called_once_with(253, None)
+
+
+def test_dynamic_tree_draft_reclaims_reserved_capacity() -> None:
+    manager = _manager(is_draft=True, kv_reserve_draft_tokens=60)
+    # The runtime tree used 31 draft positions: 26 rejected and 5 accepted.
+    request = _request(1, rewind=26, accepted_draft_tokens=5)
+    cache = _cache()
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    # Rewind 26 rejected positions plus the 60 - 31 reserve slack.
+    cache.resize.assert_called_once_with(201, 200)
+
+
+def test_dynamic_tree_target_does_not_reclaim_unallocated_reserve() -> None:
+    manager = _manager(is_draft=False, kv_reserve_draft_tokens=60)
+    request = _request(1, rewind=26, accepted_draft_tokens=5)
+    cache = _cache()
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    cache.resize.assert_called_once_with(230, 200)
 
 
 def test_capacity_only_completion_preserves_history() -> None:

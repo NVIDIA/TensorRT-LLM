@@ -22,12 +22,59 @@ from tensorrt_llm._torch.pyexecutor._util import \
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
+from tensorrt_llm._torch.speculative.mtp_dynamic_tree import \
+    MTPEagleDynamicTreeWorker
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_mtp_dynamic_tree_relocation_uses_full_attention_window(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = object.__new__(MTPEagleDynamicTreeWorker)
+    worker._kv_head_dim_bytes = 256
+    worker._accepted_draft_indices_tensor = torch.tensor([[0, 1], [2, -1]],
+                                                         dtype=torch.int32)
+    worker._num_accepted_tokens_buf = torch.tensor([2, 1], dtype=torch.int32)
+
+    attention_pool_pointers = object()
+    attention_block_offsets = object()
+    cache_manager = SimpleNamespace(
+        num_kv_heads_per_layer=[0, 8, 0, 8],
+        kv_cache_pool_mapping=[[0, 0], [2, 0], [1, 0], [2, 1]],
+        kv_cache_pool_pointers=[object(),
+                                object(), attention_pool_pointers],
+        max_attention_window_vec=[None],
+        max_seq_len=8192,
+        max_total_draft_tokens=31,
+        max_blocks_per_seq=256,
+        tokens_per_block=32,
+    )
+    attention_metadata = SimpleNamespace(
+        kv_cache_manager=cache_manager,
+        kv_lens_cuda=torch.tensor([128, 256], dtype=torch.int32),
+        kv_cache_block_offsets=[object(),
+                                object(), attention_block_offsets],
+    )
+    update_op = MagicMock()
+    monkeypatch.setattr(
+        torch.ops.tensorrt_llm,
+        "update_kv_cache_draft_token_location_2d",
+        update_op,
+    )
+
+    worker._relocate_kv_eagerly(attention_metadata, batch_size=2)
+
+    update_op.assert_called_once()
+    args = update_op.call_args.args
+    assert args[4] == 2
+    assert args[5] == 8
+    assert args[8] == cache_manager.max_seq_len
+    assert args[9] is attention_pool_pointers
+    assert args[10] is attention_block_offsets
 
 
 def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:

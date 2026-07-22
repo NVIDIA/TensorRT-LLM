@@ -3423,10 +3423,19 @@ class KVCacheManagerV2(BaseResourceManager):
             # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
                 continue
+            rewind_len = req.py_rewind_len
+            if self.is_draft:
+                runtime_draft_len = req.py_rewind_len + req.py_num_accepted_draft_tokens
+                # Dynamic-tree draft managers reserve K * max_draft_len slots,
+                # which can exceed the tree's runtime draft width. Reclaim that
+                # reserve slack together with rejected draft tokens; otherwise
+                # it accumulates in the draft KV cache after every generation
+                # step. Target managers do not allocate this reserve slack.
+                rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
             new_capacity = (
                 None
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - req.py_rewind_len
+                else kv_cache.capacity - rewind_len
             )
             history_length = (
                 None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
