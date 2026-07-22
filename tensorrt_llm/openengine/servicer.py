@@ -44,6 +44,7 @@ from tensorrt_llm.serve.request_tracker import RequestTracker
 from tensorrt_llm.serve.stats_fanout import StatsFanout
 
 from .converters import (
+    HANDOFF_ATTRIBUTE,
     decode_handoff,
     encode_handoff,
     handoff_requires_decode_media,
@@ -127,6 +128,14 @@ class OpenEngineServicer(
     ) -> None:
         self.llm = llm
         self.model = model
+        model_id = _arg(llm, "model", model)
+        self.model_id = str(model_id) if model_id else model
+        tokenizer_source = _arg(llm, "tokenizer", None)
+        self.tokenizer_source = str(tokenizer_source) if tokenizer_source else self.model_id
+        tokenizer_mode = _arg(llm, "tokenizer_mode", "auto")
+        self.tokenizer_mode = str(tokenizer_mode) if tokenizer_mode else "auto"
+        self.model_aliases = [self.model_id] if self.model_id != self.model else []
+        self._accepted_model_names = {self.model, *self.model_aliases}
         self.role = role
         self.tracker = tracker
         self.media_config = media_config
@@ -438,7 +447,7 @@ class OpenEngineServicer(
     ) -> None:
         if not request.request_id:
             raise ValueError("request_id must not be empty")
-        if request.model and request.model != self.model:
+        if request.model and request.model not in self._accepted_model_names:
             raise ValueError(f"Unknown model {request.model!r}")
         if request.WhichOneof("input") is None:
             raise ValueError("Generate requires prompt or token_ids input")
@@ -485,6 +494,8 @@ class OpenEngineServicer(
         if self.role == server_pb2.ENGINE_ROLE_DECODE:
             if not request.kv.HasField("session"):
                 raise ValueError("Decode requests require a prefill KV session")
+            if request.kv.session.HasField("bootstrap"):
+                raise ValueError("TensorRT-LLM does not support client-created KV bootstrap")
             requires_media = handoff_requires_decode_media(request.kv.session)
             if requires_media and not request.media:
                 raise ValueError("Decode request must resend the ordered context-phase media")
@@ -735,10 +746,14 @@ class OpenEngineServicer(
                 guided_modes.append(model_pb2.GUIDED_DECODING_MODE_STRUCTURAL_TAG)
         max_context = getattr(args, "max_seq_len", None) or getattr(args, "max_input_len", None)
         info = model_pb2.ModelInfo(
-            model_id=self.model,
+            model_id=self.model_id,
             served_model_name=self.model,
-            served_model_aliases=[self.model],
-            tokenizer_modes=["auto"],
+            served_model_aliases=self.model_aliases,
+            tokenizer_modes=[self.tokenizer_mode],
+            tokenizer=model_pb2.TokenizerInfo(
+                source=self.tokenizer_source,
+                mode=self.tokenizer_mode,
+            ),
             supports_text_input=True,
             supports_token_ids_input=True,
             supports_lora=self._supports_lora(),
@@ -777,6 +792,13 @@ class OpenEngineServicer(
                 supports_per_request_media_options=True,
             ),
         )
+        routing_token_getter = getattr(
+            input_processor, "get_openengine_routing_image_token_id", None
+        )
+        if "image" in aggregate and callable(routing_token_getter):
+            routing_image_token_id = routing_token_getter()
+            if routing_image_token_id is not None:
+                info.multimodal_capabilities.routing_image_token_id = routing_image_token_id
         if max_context is not None:
             info.max_context_length = max_context
         return info
@@ -1047,6 +1069,8 @@ class OpenEngineServicer(
             supports_abort_cleanup=enabled,
             supports_drain=enabled,
             schema_version=1,
+            handoff_profile=HANDOFF_ATTRIBUTE,
+            supports_client_bootstrap=False,
         )
 
     def _kv_events_enabled(self) -> bool:

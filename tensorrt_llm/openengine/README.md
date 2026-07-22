@@ -7,8 +7,9 @@
 `--openengine-port`. The feature remains disabled when the flag is absent and
 keeps the OpenEngine bindings out of TensorRT-LLM's required dependencies.
 
-The exact sibling source revision is recorded in `OPENENGINE_COMMIT`. Verify
-and install its generated Python package with:
+The exact schema-revision-3 sibling source revision and `openengine-proto`
+0.3.0 package are recorded in `OPENENGINE_COMMIT`. Verify and install its
+generated Python package with:
 
 ```bash
 python scripts/install_openengine.py

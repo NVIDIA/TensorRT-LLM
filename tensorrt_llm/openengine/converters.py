@@ -254,12 +254,15 @@ def encode_handoff(
         session_id=str(params.disagg_request_id or params.ctx_request_id or ""),
         transfer_backend="tensorrt_llm",
         dp_rank=params.ctx_dp_rank or 0,
+        handoff_profile=HANDOFF_ATTRIBUTE,
     )
     session.attributes_struct[HANDOFF_ATTRIBUTE] = canonical
     return session
 
 
 def _decode_handoff_payload(session: kv_pb2.KvSessionRef) -> dict[str, Any]:
+    if session.handoff_profile and session.handoff_profile != HANDOFF_ATTRIBUTE:
+        raise ValueError(f"Unsupported TensorRT-LLM handoff profile {session.handoff_profile!r}")
     if HANDOFF_ATTRIBUTE not in session.attributes_struct:
         raise ValueError(f"KV session is missing {HANDOFF_ATTRIBUTE!r}")
     encoded = session.attributes_struct[HANDOFF_ATTRIBUTE]

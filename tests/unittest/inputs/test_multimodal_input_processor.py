@@ -96,6 +96,22 @@ def test_get_num_tokens_per_video_delegates_to_hf_processor():
     sub._processor._get_num_multimodal_tokens.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        (SimpleNamespace(image_token_id=151655), 151655),
+        (SimpleNamespace(image_token_id=151655, image_token_index=151646), None),
+    ],
+)
+def test_openengine_routing_image_token_requires_one_stable_config_value(
+    config: SimpleNamespace, expected: int | None
+) -> None:
+    sub = _make_subclass()
+    sub._config = config
+
+    assert sub.get_openengine_routing_image_token_id() == expected
+
+
 # ---------------------------------------------------------------------------
 # Dummy contract defaults (BaseMultimodalDummyInputsBuilder).
 # ---------------------------------------------------------------------------

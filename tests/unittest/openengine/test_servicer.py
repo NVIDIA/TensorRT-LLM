@@ -607,14 +607,33 @@ def test_kv_batch_fails_closed_for_unrepresentable_cache_namespace(unsupported) 
 
 
 @pytest.mark.asyncio
-async def test_discovery_and_load_use_config_and_shared_stats() -> None:
+async def test_discovery_and_load_use_config_and_shared_stats(monkeypatch) -> None:
+    class _Processor:
+        def get_openengine_modalities(self) -> tuple[str, ...]:
+            return ("image",)
+
+        def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
+            return ("image",)
+
+        def get_openengine_routing_image_token_id(self) -> int:
+            return 151655
+
+        def get_required_lora_spec(self, modalities: tuple[str, ...]) -> None:
+            del modalities
+            return None
+
+    monkeypatch.setattr("tensorrt_llm.openengine.servicer.BaseMultimodalInputProcessor", _Processor)
     llm = _Llm()
     llm.args = SimpleNamespace(
+        model="Qwen/Qwen3-VL-2B-Instruct",
+        tokenizer="Qwen/Qwen3-VL-2B-Instruct",
+        tokenizer_mode="slow",
         guided_decoding_backend=None,
         lora_config=None,
         enable_lora=False,
         kv_cache_config=SimpleNamespace(tokens_per_block=64),
     )
+    llm.input_processor = _Processor()
     llm.get_kv_cache_capacity = lambda: {
         "maxNumBlocks": 100,
         "tokensPerBlock": 64,
@@ -636,16 +655,27 @@ async def test_discovery_and_load_use_config_and_shared_stats() -> None:
     )
     service = OpenEngineServicer(
         llm,
-        "model",
+        "qwen3-vl",
         server_pb2.ENGINE_ROLE_AGGREGATED,
         RequestTracker(llm),
         stats_fanout=stats,
     )
 
     server_info = await service.GetServerInfo(server_pb2.GetServerInfoRequest(), _Context())
+    assert server_info.schema_revision == 3
+    assert server_info.minimum_client_revision == 1
     assert server_info.capacity.kv_block_size == 64
     assert server_info.capacity.total_kv_blocks == 100
+    assert server_info.kv_connector.handoff_profile == "tensorrt_llm.disaggregated_params.v1"
+    assert server_info.kv_connector.HasField("supports_client_bootstrap")
+    assert not server_info.kv_connector.supports_client_bootstrap
     model_info = await service.GetModelInfo(model_pb2.GetModelInfoRequest(), _Context())
+    assert model_info.model_id == "Qwen/Qwen3-VL-2B-Instruct"
+    assert model_info.served_model_name == "qwen3-vl"
+    assert list(model_info.served_model_aliases) == ["Qwen/Qwen3-VL-2B-Instruct"]
+    assert model_info.tokenizer.source == "Qwen/Qwen3-VL-2B-Instruct"
+    assert model_info.tokenizer.mode == "slow"
+    assert model_info.multimodal_capabilities.routing_image_token_id == 151655
     assert not model_info.generation.guided_decoding.supported
     assert not model_info.supports_lora
 

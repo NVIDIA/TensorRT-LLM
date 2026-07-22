@@ -42,6 +42,7 @@ def test_context_first_handoff_round_trip_large_ids_and_binary() -> None:
     )
 
     session = encode_handoff(params)
+    assert session.handoff_profile == HANDOFF_ATTRIBUTE
     payload = json.loads(session.attributes_struct[HANDOFF_ATTRIBUTE])
     assert payload["ctx_request_id"] == str(2**63 - 2)
     assert payload["disagg_request_id"] == str(2**63 - 1)
@@ -108,6 +109,14 @@ def test_decode_rejects_non_decimal_identifier() -> None:
         }
     )
     with pytest.raises(ValueError, match="decimal string"):
+        decode_handoff(session)
+
+
+def test_decode_rejects_foreign_handoff_profile() -> None:
+    session = kv_pb2.KvSessionRef(handoff_profile="vllm.kv_transfer_params.v1")
+    session.attributes_struct[HANDOFF_ATTRIBUTE] = json.dumps({"schedule_style": "context_first"})
+
+    with pytest.raises(ValueError, match="Unsupported TensorRT-LLM handoff profile"):
         decode_handoff(session)
 
 

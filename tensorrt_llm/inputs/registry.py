@@ -192,6 +192,22 @@ class BaseMultimodalInputProcessor(ABC):
         """Modalities supported in context-first OpenEngine P/D requests."""
         return ()
 
+    def get_openengine_routing_image_token_id(self) -> int | None:
+        """Return a stable image placeholder token for OpenEngine routing."""
+        if "image" not in self.get_openengine_modalities():
+            return None
+        candidates: set[int] = set()
+        for config in (self._config, getattr(self._config, "text_config", None),
+                       getattr(self._config, "vision_config", None)):
+            for field_name in ("image_token_id", "image_token_index"):
+                value = getattr(config, field_name, None)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    candidates.add(value)
+        if len(candidates) != 1:
+            return None
+        token_id = candidates.pop()
+        return token_id if 0 <= token_id <= (1 << 32) - 1 else None
+
     def get_required_lora_spec(
             self, modalities: tuple[str, ...]) -> MultimodalLoraSpec | None:
         """Return a model-owned adapter required to process these modalities."""

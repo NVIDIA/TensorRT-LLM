@@ -427,7 +427,7 @@ def launch_server(
                 if error.name and error.name.startswith("openengine"):
                     llm.shutdown()
                     raise click.ClickException(
-                        "OpenEngine support requires openengine-proto 0.2.0. "
+                        "OpenEngine support requires openengine-proto 0.3.0. "
                         "Run scripts/install_openengine.py against the pinned "
                         "local OpenEngine sibling checkout.") from error
                 raise
