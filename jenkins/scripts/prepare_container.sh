@@ -12,9 +12,15 @@
 #   FAT_BUILD_SBATCH_PATH   - path to the fat_build_sbatch.sh wrapper on the login node
 #   FAT_BUILD_LOG_TEMPLATE  - SLURM log path template (may contain %j for job ID)
 
-set -euo pipefail
+set -euxo pipefail
 echo "=== [Prepare Container] STAGE START: $(date '+%Y-%m-%d %H:%M:%S') on $(hostname) ==="
-mkdir -p "${FAT_SQSH_DIR}"
+
+if ! mkdir -p "${FAT_SQSH_DIR}" 2>&1; then
+    echo "Warning: mkdir -p ${FAT_SQSH_DIR} failed; fat sqsh will not be built on this run."
+    echo "=== [Prepare Container] STAGE END (mkdir failed): $(date '+%Y-%m-%d %H:%M:%S') ==="
+    exit 0
+fi
+
 fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 

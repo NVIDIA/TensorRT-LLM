@@ -748,6 +748,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         placementContext.lastSlurmClusterName = partition.clusterName
     }
 
+    // Fat sqsh has requirements-dev.txt and the TRT-LLM wheel pre-baked, so
+    // there is no need to reinstall them in Setup Environment.
+    if (cluster.fatBuilderArgs != null) {
+        skipInstallWheel = true
+    }
+
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
     // Create a unique suffix for the node name and workspace
@@ -1097,9 +1103,7 @@ bash "${scriptPrepareBodyPathNode}"
         }
         long executeStartMs = System.currentTimeMillis()
         try {
-          stage("[${stageName}] Run Pytest") {
             executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
-          }
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -3972,11 +3976,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
+        // skipInstallWheel=true means the fat sqsh has requirements-dev.txt and
+        // the TRT-LLM wheel pre-baked; skip both to avoid redundant reinstalls.
+        // opencv-python-headless is not in the fat sqsh and is always installed.
         timeout(time: 45, unit: 'MINUTES') {
-            if (env.alternativeTRT) {
-                sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+            if (!skipInstallWheel) {
+                if (env.alternativeTRT) {
+                    sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+                }
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
