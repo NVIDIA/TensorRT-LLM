@@ -49,8 +49,12 @@ def dataset_path(dataset_name: str):
     pytest.param("gpt_oss/gpt-oss-20b", marks=skip_pre_hopper)
 ],
                          indirect=True)
+@pytest.mark.parametrize("backend", [
+    "openai",
+    "openai-responses",
+])
 def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
-                                model_path: str):
+                                model_path: str, backend: str):
     model_name = model_path.split("/")[-1]
     client_script = os.path.join(benchmark_root, "benchmark_serving.py")
     dataset = dataset_path("sharegpt")
@@ -58,6 +62,8 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
     benchmark_cmd = [
         "python3",
         client_script,
+        "--backend",
+        backend,
         "--dataset-name",
         "sharegpt",
         "--model",
