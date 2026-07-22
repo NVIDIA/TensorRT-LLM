@@ -5,9 +5,8 @@
 This is the ONLY score implementation: the per-head modes launch its score-only
 entry and union eviction launches its fused score+stats+union pipeline. It
 uses split real/imag TMA loads, BF16 and FP16 compensated UMMA, sqrt FTZ,
-and producer-only page-ID lookahead. Geometries outside the exact contract
-validated here raise loudly at setup
-(``triattention.prepare_eviction_workspace``); there is no fallback path.
+and producer-only page-ID lookahead. Geometry outside the exact contract
+raises loudly at kernel construction; there is no fallback path.
 """
 
 from __future__ import annotations
@@ -82,6 +81,8 @@ RAW_PAGE_BUFFERS = 2
 RAW_K_VECTOR_ELEMENTS = 8
 TMA_DESCRIPTOR_QWORDS = 16
 _SUPPORTED_PAGE_SHARDS = (2, 3)
+# Extra page shard for small workloads (few CTAs relative to the SM count).
+SMALL_WORKLOAD_PAGE_SHARDS = 3
 
 
 class _TriScoreEpilogue:
@@ -133,7 +134,6 @@ class _TriScoreEpilogue:
         tiled_copy: cute.TiledCopy,
         output: cute.Tensor,
         epilogue_tile: cute.Tile,
-        _unused_smem: cute.Tensor,
     ) -> tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]:
         output_epilogue = cute.flat_divide(
             output[((None, None), 0, 0, None, None, None)],
@@ -193,11 +193,10 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         # cos/sin/mlr coefficient planes per frequency.
         self.k_coeff = 3 * num_freqs
         self.tokens_per_block = tokens_per_block
-        # One 128-token compute tile either matches a page exactly (the
-        # validated 128-token geometry, one TMA box per phase) or spans
-        # several pages (32-token pages: four page fragments per phase,
-        # one TMA box each into the same transaction barrier). The
-        # single-fragment schedule of the validated geometry is unchanged.
+        # One 128-token compute tile either matches a page exactly
+        # (128-token pages: one TMA box per phase) or spans several pages
+        # (32-token pages: four page fragments per phase, one TMA box each
+        # into the same transaction barrier).
         self.box_tokens = min(CTA_M, tokens_per_block)
         self.fragments_per_phase = CTA_M // self.box_tokens
         self.pages_per_tile = self.fragments_per_phase
@@ -205,13 +204,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         self.tile_tokens = self.halves_per_page * CTA_M
         self.max_tiles = (seq_len + self.tile_tokens - 1) // self.tile_tokens
 
-        # Measured final choices that still shape layouts or generated code.
+        # Producer staging constants baked into the generated code.
         self.prefetch_depth = 4
-        self.sqrt_mode = "approx"
-        self.k_staging_mode = "half_page_tma"
-        self.use_tma = True
-        self.cpasync_schedule = "sync_each_half"
-        self.split_raw_tma = True
         self.raw_tma_feature_extent = num_freqs
         # Barrier transaction bytes for one phase: the full 128-token tile
         # of one coefficient plane, regardless of how many page fragments
@@ -219,19 +213,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         self.raw_tma_copy_bytes = CTA_M * num_freqs * (cutlass.BFloat16.width // 8)
         self.raw_tma_pipeline_stages = 2 * RAW_PAGE_BUFFERS if write_partial_stats else 1
         self.accumulator_pipeline_stages = 1
-        self.umma_accumulator_partitions = 1
-        self.raw_cpasync_direct_a = True
-        self.weight_builder_mode = "coefficient_scalar_bf16_two_term"
-        self.main_operand_mode = "bf16_raw_three_term_weight"
-        self.numerical_policy = "three_term"
-        self.magnitude_residual_mode = "fp16_mma_two_term_single_commit"
-        self.fp16_magnitude_two_term = True
-        self.magnitude_sqrt_ftz = True
-        self.producer_page_id_prefetch = True
         self.producer_warp_id = 0
         self.physical_threads = THREADS
-        self.shared_a_raw_alias = False
-        self.compact_token_loop = True
 
         self.num_physical_pages, _, pool_kv_heads, pool_tokens, pool_dim = pool_shape
         if (
@@ -291,29 +274,13 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             tcgen05.CtaGroup.ONE,
             self.mma_tiler[:2],
         )
-        main_a_shape = (
-            (CTA_M, N, self.num_freqs)
-            if self.main_operand_mode == "bf16_raw_three_term_weight"
-            else self.mma_tiler
-        )
-        a_smem_layout = sm100_utils.make_smem_layout_a(tiled_mma, main_a_shape, cutlass.Float32, 1)
-        raw_bf16_a_smem_layout = sm100_utils.make_smem_layout_a(
-            raw_bf16_tiled_mma,
-            (CTA_M, N, 2 * self.num_freqs),
-            cutlass.BFloat16,
-            1,
-        )
-        raw_bf16_split_a_smem_layout = sm100_utils.make_smem_layout_a(
+        # Split raw-K transport: two K_SW64 4-KiB stages per raw-page buffer,
+        # one each for the real and imaginary K bands.
+        raw_bf16_direct_a_smem_layout = sm100_utils.make_smem_layout_a(
             raw_bf16_tiled_mma,
             (CTA_M, N, self.num_freqs),
             cutlass.BFloat16,
             2 * RAW_PAGE_BUFFERS,
-        )
-        # The full transport uses one K_SW128 8-KiB tile.  The split transport
-        # packs two K_SW64 4-KiB stages into that same allocation, one each for
-        # real and imaginary data; the compile-time schedule selects the view.
-        raw_bf16_direct_a_smem_layout = (
-            raw_bf16_split_a_smem_layout if self.split_raw_tma else raw_bf16_a_smem_layout
         )
         raw_tma_smem_layout = cute.make_composed_layout(
             raw_bf16_direct_a_smem_layout.inner,
@@ -351,12 +318,6 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             cutlass.BFloat16,
             1,
         )
-        # The magnitude residual has only the frequency-count K.  A separate
-        # compact descriptor lets the producer issue its UMMA steps before the
-        # first commit, rather than waiting for and overwriting the main A tile.
-        magnitude_lo_smem_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma, (CTA_M, N, self.num_freqs), cutlass.Float32, 1
-        )
         magnitude_lo_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             cutlass.Float16,
             tcgen05.OperandMajorMode.K,
@@ -364,18 +325,6 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             cutlass.Float32,
             tcgen05.CtaGroup.ONE,
             self.mma_tiler[:2],
-        )
-        magnitude_lo_fp16_smem_layout = sm100_utils.make_smem_layout_a(
-            magnitude_lo_tiled_mma,
-            (CTA_M, N, self.num_freqs),
-            cutlass.Float16,
-            1,
-        )
-        magnitude_hi_fp16_smem_layout = sm100_utils.make_smem_layout_b(
-            magnitude_lo_tiled_mma,
-            (CTA_M, N, self.num_freqs),
-            cutlass.Float16,
-            1,
         )
         magnitude_fp16_a_smem_layout = sm100_utils.make_smem_layout_a(
             magnitude_lo_tiled_mma,
@@ -389,81 +338,19 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             cutlass.Float16,
             1,
         )
-        main_b_shape = (
-            (CTA_M, N, self.num_freqs)
-            if self.main_operand_mode == "bf16_raw_three_term_weight"
-            else self.mma_tiler
-        )
-        b_smem_layout = sm100_utils.make_smem_layout_b(tiled_mma, main_b_shape, cutlass.Float32, 1)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        # Keep an explicit stage mode even for the one-stage control.  The
-        # singleton mode folds away in codegen and lets both specializations
-        # share the same producer/consumer slicing protocol.
-        self.num_accumulator_slots = (
-            self.accumulator_pipeline_stages * self.umma_accumulator_partitions
-        )
+        # One accumulator slot; the explicit slot mode keeps the shared
+        # producer/consumer slicing protocol and folds away in codegen.
+        self.num_accumulator_slots = self.accumulator_pipeline_stages
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_accumulator_slots))
         self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
 
-        b_hi_elements = cute.cosize(b_smem_layout.outer) * int(not self.fp16_magnitude_two_term)
-        b_lo_elements = cute.cosize(b_smem_layout.outer) * int(
-            self.numerical_policy == "three_term" and not self.fp16_magnitude_two_term
-        )
-        magnitude_lo_elements = cute.cosize(magnitude_lo_fp16_smem_layout.outer) * int(
-            self.numerical_policy == "three_term"
-            and self.magnitude_residual_mode in ("fp16_smem", "fp16_mma_single_commit")
-        )
-        magnitude_lo_fp32_elements = cute.cosize(magnitude_lo_smem_layout.outer) * int(
-            self.numerical_policy == "three_term"
-            and self.magnitude_residual_mode == "fp32_smem_single_commit"
-        )
-        magnitude_hi_fp16_elements = cute.cosize(magnitude_hi_fp16_smem_layout.outer) * int(
-            self.numerical_policy == "three_term"
-            and self.magnitude_residual_mode == "fp16_mma_single_commit"
-        )
-        a_elements = cute.cosize(a_smem_layout.outer) * int(
-            not self.shared_a_raw_alias and not self.fp16_magnitude_two_term
-        )
-        raw_k_half_elements = CTA_M * 2 * self.num_freqs * RAW_PAGE_BUFFERS
-        raw_k_elements = raw_k_half_elements * int(
-            self.k_staging_mode in ("half_page_cpasync", "half_page_tma")
-            and not self.shared_a_raw_alias
-        )
-        alias_a_elements = cute.cosize(a_smem_layout.outer) * int(self.shared_a_raw_alias)
-        alias_raw_k_elements = raw_k_half_elements * int(self.shared_a_raw_alias)
-        raw_bf16_a_elements = cute.cosize(raw_bf16_a_smem_layout.outer) * int(
-            self.main_operand_mode == "bf16_raw_three_term_weight"
-            and (
-                not self.raw_cpasync_direct_a
-                or self.cpasync_schedule not in ("sync_each_half", "intra_half_overlap")
-            )
-        )
-        raw_bf16_b_elements = cute.cosize(raw_bf16_b_smem_layout.outer) * int(
-            self.main_operand_mode == "bf16_raw_three_term_weight"
-        )
-        raw_bf16_b2_elements = raw_bf16_b_elements * int(
-            self.weight_builder_mode != "coefficient_scalar_bf16_two_term"
-        )
-        magnitude_fp16_a_elements = cute.cosize(magnitude_fp16_a_smem_layout.outer) * int(
-            self.fp16_magnitude_two_term
-        )
-        magnitude_fp16_b_elements = cute.cosize(magnitude_fp16_b_smem_layout.outer) * int(
-            self.fp16_magnitude_two_term
-        )
+        # Two double-buffered raw-K stages (real+imag halves per page buffer).
+        raw_k_elements = CTA_M * 2 * self.num_freqs * RAW_PAGE_BUFFERS
+        raw_bf16_b_elements = cute.cosize(raw_bf16_b_smem_layout.outer)
+        magnitude_fp16_a_elements = cute.cosize(magnitude_fp16_a_smem_layout.outer)
+        magnitude_fp16_b_elements = cute.cosize(magnitude_fp16_b_smem_layout.outer)
         stats_scratch_elements = 72 * int(self.write_partial_stats)
-
-        @cute.union
-        class SharedARawAlias:
-            # The two descriptors are byte-identical in size (8 KiB) and have
-            # disjoint lifetimes in the alias specialization.
-            sA: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, alias_a_elements],
-                1024,
-            ]
-            sRawK: cute.struct.Align[
-                cute.struct.MemRange[cutlass.BFloat16, alias_raw_k_elements],
-                16,
-            ]
 
         @cute.struct
         class SharedStorage:
@@ -471,39 +358,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.accumulator_pipeline_stages * 2]
             raw_tma_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64,
-                2 * self.raw_tma_pipeline_stages * int(self.use_tma),
+                2 * self.raw_tma_pipeline_stages,
             ]
             tmem_holding_buf: cutlass.Int32
-            sA: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, a_elements],
-                1024,
-            ]
-            sB_hi: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, b_hi_elements],
-                1024,
-            ]
-            sB_lo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, b_lo_elements],
-                1024,
-            ]
-            sMagnitudeLo: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float16, magnitude_lo_elements],
-                1024,
-            ]
-            sMagnitudeLoFp32: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, magnitude_lo_fp32_elements],
-                1024,
-            ]
-            sMagnitudeHiFp16: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float16, magnitude_hi_fp16_elements],
-                1024,
-            ]
             sRawK: cute.struct.Align[
                 cute.struct.MemRange[cutlass.BFloat16, raw_k_elements],
-                1024,
-            ]
-            sRawBf16A: cute.struct.Align[
-                cute.struct.MemRange[cutlass.BFloat16, raw_bf16_a_elements],
                 1024,
             ]
             sRawBf16B0: cute.struct.Align[
@@ -512,10 +371,6 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             ]
             sRawBf16B1: cute.struct.Align[
                 cute.struct.MemRange[cutlass.BFloat16, raw_bf16_b_elements],
-                1024,
-            ]
-            sRawBf16B2: cute.struct.Align[
-                cute.struct.MemRange[cutlass.BFloat16, raw_bf16_b2_elements],
                 1024,
             ]
             sMagnitudeFp16A0: cute.struct.Align[
@@ -538,7 +393,6 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                 cute.struct.MemRange[cutlass.Float32, stats_scratch_elements],
                 16,
             ]
-            sARawAlias: SharedARawAlias
 
         self.shared_storage = SharedStorage
         # 64-bit: at large request counts this product exceeds 2^31 (the
@@ -569,18 +423,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             output,
             partial_stats,
             sum_seq,
-            a_smem_layout,
-            raw_bf16_a_smem_layout,
             raw_bf16_direct_a_smem_layout,
-            raw_bf16_split_a_smem_layout,
             raw_tma_smem_layout,
             raw_bf16_b_smem_layout,
-            magnitude_lo_smem_layout,
-            magnitude_lo_fp16_smem_layout,
-            magnitude_hi_fp16_smem_layout,
             magnitude_fp16_a_smem_layout,
             magnitude_fp16_b_smem_layout,
-            b_smem_layout,
         ).launch(
             grid=(num_ctas, 1, 1),
             block=(self.physical_threads, 1, 1),
@@ -612,18 +459,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         output: cute.Tensor,
         partial_stats: cute.Tensor,
         sum_seq: cutlass.Int64,
-        a_smem_layout: cute.ComposedLayout,
-        raw_bf16_a_smem_layout: cute.ComposedLayout,
         raw_bf16_direct_a_smem_layout: cute.ComposedLayout,
-        raw_bf16_split_a_smem_layout: cute.ComposedLayout,
         raw_tma_smem_layout: cute.ComposedLayout,
         raw_bf16_b_smem_layout: cute.ComposedLayout,
-        magnitude_lo_smem_layout: cute.ComposedLayout,
-        magnitude_lo_fp16_smem_layout: cute.ComposedLayout,
-        magnitude_hi_fp16_smem_layout: cute.ComposedLayout,
         magnitude_fp16_a_smem_layout: cute.ComposedLayout,
         magnitude_fp16_b_smem_layout: cute.ComposedLayout,
-        b_smem_layout: cute.ComposedLayout,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         cta_index, _, _ = cute.arch.block_idx()
@@ -855,6 +695,10 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             num_threads=EPILOGUE_THREADS,
         )
         cute.arch.mbarrier_init_fence()
+        # Build the per-(head, frequency) score coefficients: the cos/sin
+        # bands rotated by the mean future phase (scale*(qr*C - qi*S),
+        # scale*(qr*S + qi*C)) split into bf16 value+residual pairs, and the
+        # MLR magnitude coefficient split into fp16 pairs.
         for weight_round in cutlass.range_constexpr(N * self.k_coeff // THREADS):
             linear_index = tidx + weight_round * THREADS
             qg = linear_index // self.k_coeff
@@ -1071,9 +915,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             )
                         raw_tma_producer_state.advance()
 
-                if cutlass.const_expr(
-                    self.producer_page_id_prefetch and page_half == self.halves_per_page - 1
-                ):
+                if cutlass.const_expr(page_half == self.halves_per_page - 1):
                     next_page_id_lane0 = cutlass.Int32(0)
                     if warp_idx == self.producer_warp_id:
                         if lane_idx == 0:
@@ -1257,15 +1099,13 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                 # frequency heads take two passes.
                 for freq_rep in cutlass.range_constexpr(self.num_freqs // 32):
                     frequency = lane_idx + 32 * freq_rep
-                    # Issue several independent token loads before consuming
-                    # any of them.  This bounded RMEM window is unchanged; the
-                    # optional half-page staging only switches its K source
-                    # from global to the single raw shared buffer.
+                    # Stage prefetch_depth independent token loads from the
+                    # raw-K shared buffer before consuming any of them.
                     for token_base in cutlass.range(
                         0,
                         CTA_M // (THREADS // 32),
                         self.prefetch_depth,
-                        unroll_full=not self.compact_token_loop,
+                        unroll_full=False,
                     ):
                         staged_real = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
                         staged_imag = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
@@ -1300,18 +1140,12 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             imag = staged_imag[prefetch_index]
                             norm2 = real * real + imag * imag
                             if cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "approx_ftz"):
-                                magnitude = cute.math.sqrt(
-                                    norm2,
-                                    approx=self.sqrt_mode == "approx",
-                                    ftz=self.magnitude_sqrt_ftz,
-                                )
+                                magnitude = cute.math.sqrt(norm2, approx=True, ftz=True)
                             elif cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "fastmath"):
                                 magnitude = _sqrt_approx_ftz(norm2)
                             else:
-                                # DSLs with neither spelling get the plain (IEEE)
-                                # sqrt, which is strictly MORE accurate than the
-                                # measured approx choice; the equivalence test's
-                                # tolerance absorbs the difference.
+                                # Plain IEEE sqrt (more accurate than approx);
+                                # the equivalence tolerance covers the difference.
                                 magnitude = cute.math.sqrt(norm2)
                             magnitude_fp16_0 = cutlass.Float16(magnitude)
                             magnitude_fp16_1 = cutlass.Float16(
@@ -1364,10 +1198,9 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             tCrRawBf16B1[(None, None, imag_b_block, 0)],
                             tCtAcc,
                         )
-                    # Keep the full four-product control unchanged.
-                    # The independent omit_a1b1 mode drops only the
-                    # second-order residual product; all other FP16
-                    # K16 products retain their original order.
+                    # Compensated FP16 magnitude accumulation:
+                    # |K|*coeff = A0*B0 + A0*B1 + A1*B0 (the A1*B1 term is
+                    # below fp32 accumulation resolution and dropped).
                     magnitude_lo_tiled_mma.set(
                         tcgen05.Field.ACCUMULATE,
                         True,
@@ -1434,7 +1267,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     epilogue_tidx, tCtAcc, tCgC, self.epi_tile, False
                 )
                 simt_atom, tTR_rC, tTR_gC = self.epilog_gmem_copy_and_partition(
-                    epilogue_tidx, tiled_copy_t2r, tCgC, self.epi_tile, None
+                    epilogue_tidx, tiled_copy_t2r, tCgC, self.epi_tile
                 )
                 tTR_gC = tTR_gC[(None, None, None, None, None, 0, 0, 0)]
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -1707,7 +1540,6 @@ class TriAttentionCuteScoreRunner:
         freq_scale_sq: torch.Tensor,
         output: torch.Tensor,
         enable_partial_stats: bool = False,
-        small_workload_page_shards: int = 3,
     ) -> None:
         self.max_requests = int(max_requests)
         self.num_layers = int(num_layers)
@@ -1719,11 +1551,8 @@ class TriAttentionCuteScoreRunner:
         self.num_kv_heads = int(num_kv_heads)
         self.sm_count = int(torch.cuda.get_device_properties(output.device).multi_processor_count)
         self.enable_partial_stats = bool(enable_partial_stats)
-        if small_workload_page_shards not in _SUPPORTED_PAGE_SHARDS:
-            raise ValueError("TriAttention CuTe score has unsupported page shards")
-        self.small_workload_page_shards = int(small_workload_page_shards)
         partial_stats_elements = (
-            max_requests * num_layers * num_q_heads * self.small_workload_page_shards * 3
+            max_requests * num_layers * num_q_heads * SMALL_WORKLOAD_PAGE_SHARDS * 3
             if self.enable_partial_stats
             else 1
         )
@@ -1798,7 +1627,7 @@ class TriAttentionCuteScoreRunner:
                 *self._torch_tail,
             )
         )
-        variants = [(1, self.small_workload_page_shards)]
+        variants = [(1, SMALL_WORKLOAD_PAGE_SHARDS)]
         if max_requests > 1:
             variants.append((max_requests, 2))
         for request_count, page_shards in variants:
@@ -1894,7 +1723,7 @@ class TriAttentionCuteScoreRunner:
                     small_score if use_extra_score_shard else large_score
                 )
                 self._page_shards[request_count] = (
-                    self.small_workload_page_shards if use_extra_score_shard else 2
+                    SMALL_WORKLOAD_PAGE_SHARDS if use_extra_score_shard else 2
                 )
                 if self.enable_partial_stats:
                     self._compiled_stats[request_count] = (
@@ -2012,13 +1841,6 @@ class TriAttentionCuteScoreRunner:
         union_scores: torch.Tensor,
         stream: cuda.CUstream,
     ) -> None:
-        if (
-            union_scores.shape != (request_count, self.width)
-            or union_scores.dtype != torch.float32
-            or union_scores.device != self.partial_stats.device
-            or not union_scores.is_contiguous()
-        ):
-            raise ValueError("TriAttention union output does not match the compiled geometry")
         self._compiled_normalize_union[request_count](
             _to_cute(self.partial_stats),
             *self._cute_selection_prefix,

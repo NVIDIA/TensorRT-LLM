@@ -36,7 +36,6 @@ _MAX_ROW_CLUSTER_CTAS = 4
 _SMALL_TILE_RESIDENT_CTAS_PER_SM = 6
 _STATS_FIELDS = 3
 _STD_EPSILON = 1.0e-6
-_SUPPORTED_PAGE_SHARDS = (2, 3)
 # The fused score kernel pads each KV head's group of score planes up to the
 # minimum tcgen05 MMA tile (GQA groups below 8 ride zero-padded columns).
 _PADDED_HEAD_COLUMNS = 8
@@ -122,40 +121,17 @@ class _TriAttentionNormalizeUnionKernel:
         num_layers: int,
         seq_len: int,
         num_q_heads: int,
-        num_kv_heads: int | None = None,
+        num_kv_heads: int,
         page_shards: int,
         tokens_per_lane: int,
         token_subtiles: int,
         row_cluster_ctas: int,
     ) -> None:
-        if min(num_layers, seq_len, num_q_heads) <= 0:
-            raise ValueError("TriAttention stats/union reduction requires positive geometry")
-        if page_shards not in _SUPPORTED_PAGE_SHARDS:
-            raise ValueError("TriAttention stats/union has unsupported page shards")
-        # ``num_kv_heads`` declares that the score scratch pads each KV
-        # head's group of head planes up to the MMA tile: real head row
-        # ``q_head`` then lives in scratch plane ``kv * 8 + qg``. Omitting
-        # it keeps the compact plane-per-head layout (GQA group 8 is
-        # identical either way). The partial-stats rows are always compact.
-        if num_kv_heads is None:
-            self.score_group_size = num_q_heads
-            self.score_head_pad = 0
-        else:
-            if num_kv_heads <= 0 or num_q_heads % num_kv_heads:
-                raise ValueError("TriAttention stats/union requires uniform GQA groups")
-            self.score_group_size = num_q_heads // num_kv_heads
-            if self.score_group_size > _PADDED_HEAD_COLUMNS:
-                raise ValueError(
-                    "TriAttention stats/union supports GQA groups up to the "
-                    f"padded head tile ({_PADDED_HEAD_COLUMNS})"
-                )
-            self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
-        if tokens_per_lane not in (_SMALL_TOKENS_PER_LANE, _LARGE_TOKENS_PER_LANE):
-            raise ValueError("TriAttention stats/union has unsupported load width")
-        if token_subtiles not in (_SMALL_TOKEN_SUBTILES, _LARGE_TOKEN_SUBTILES):
-            raise ValueError("TriAttention stats/union has unsupported token subtiles")
-        if row_cluster_ctas not in (1, 2, 4):
-            raise ValueError("TriAttention stats/union has unsupported row cluster")
+        # The score scratch pads each KV head's group of head planes up to
+        # the MMA tile: real head row ``q_head`` lives in scratch plane
+        # ``kv * 8 + qg``. The partial-stats rows are always compact.
+        self.score_group_size = num_q_heads // num_kv_heads
+        self.score_head_pad = _PADDED_HEAD_COLUMNS - self.score_group_size
         self.num_layers = num_layers
         self.seq_len = seq_len
         # The score window start is per-request runtime metadata

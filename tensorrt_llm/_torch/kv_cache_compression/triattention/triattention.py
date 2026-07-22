@@ -98,16 +98,6 @@ _OFFSET_MAX_LENGTH = 65536
 
 
 # Stream-affinity contract: the staged buffers and compiled launches are bound
-def _build_geometric_offsets(max_length: int, device: torch.device) -> torch.Tensor:
-    """Upstream pruning_utils.build_geometric_offsets: [1, 2, 4, ... <=max]."""
-    offsets: List[float] = []
-    value = 1
-    while value <= max_length:
-        offsets.append(float(value))
-        value *= 2
-    return torch.tensor(offsets, device=device, dtype=torch.float32)
-
-
 def _page_table_slot_layout(
     page_representatives: List[int],
     page_table_keys: List[object],
@@ -133,6 +123,14 @@ def _page_table_slot_layout(
         representative_slots[representative] = slot
     slot_count = max(unique_slots, default=-1) + 1
     return representative_slots, slot_count
+
+
+def _protected_tail_capacity(manager: KVCacheManagerV2, what: str) -> int:
+    """The V2 tail (extra KV + draft reserve + 1) moved with every compaction."""
+    capacity = int(manager.num_extra_kv_tokens) + int(manager._kv_reserve_draft_tokens) + 1
+    if capacity <= 0:
+        raise RuntimeError(f"{what}KVCacheManagerV2 exposes an invalid protected-tail capacity")
+    return capacity
 
 
 def _allocate_page_table_plane(
@@ -992,13 +990,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _draft_protected_tail_capacity(self) -> int:
         """Return the draft tail moved and re-reserved by every co-compression."""
-        draft_manager = self.draft_kv_cache_manager
-        capacity = (
-            int(draft_manager.num_extra_kv_tokens) + int(draft_manager._kv_reserve_draft_tokens) + 1
-        )
-        if capacity <= 0:
-            raise RuntimeError("draft KVCacheManagerV2 exposes an invalid protected-tail capacity")
-        return capacity
+        return _protected_tail_capacity(self.draft_kv_cache_manager, "draft ")
 
     def _ensure_calibrated(self) -> None:
         """Resolve calibration once for the first request."""
@@ -1305,14 +1297,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _configured_protected_tail_capacity(self) -> int:
         """Return the largest target tail reserved by the native V2 lifecycle."""
-        capacity = (
-            int(self.kv_cache_manager.num_extra_kv_tokens)
-            + int(self.kv_cache_manager._kv_reserve_draft_tokens)
-            + 1
-        )
-        if capacity <= 0:
-            raise RuntimeError("KVCacheManagerV2 exposes an invalid protected-tail capacity")
-        return capacity
+        return _protected_tail_capacity(self.kv_cache_manager, "")
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
         """Drop this request's per-request length and eviction state."""
@@ -1718,7 +1703,12 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         first_pool = layout["layer_pools"][layout["dense_layers"][0]]
         if self._offsets is None:
-            self._offsets = _build_geometric_offsets(_OFFSET_MAX_LENGTH, first_pool.device)
+            # Upstream pruning_utils.build_geometric_offsets: [1, 2, 4, ... <= max].
+            self._offsets = torch.tensor(
+                [float(1 << i) for i in range(_OFFSET_MAX_LENGTH.bit_length())],
+                device=first_pool.device,
+                dtype=torch.float32,
+            )
         if self._phase is None:
             self._phase = build_mean_phase_table(
                 self._offsets,
@@ -1956,9 +1946,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         raw = torch.load(self.calibration_path, map_location="cpu", weights_only=False)
         if isinstance(raw, dict) and _REQUIRED_CALIBRATION_KEYS <= set(raw):
-            calib = {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in raw.items()}
-            self._validate_calibration(calib)
-            return calib
+            return {k: (v.to("cuda") if torch.is_tensor(v) else v) for k, v in raw.items()}
         if isinstance(raw, dict) and {"metadata", "stats"} <= set(raw):
             return self._convert_official_calibration(raw)
         got = sorted(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
@@ -2001,7 +1989,6 @@ class TriAttention(BaseKVCacheCompressionManager):
             "omega": omega.to("cuda"),
             "freq_scale_sq": freq_scale_sq.to("cuda"),
         }
-        self._validate_calibration(calib)
         logger.info(
             f"TriAttention: converted official calibration {self.calibration_path}"
             f" -> E_q[L={num_layers}, H={num_heads}, F={freq_count}]"
@@ -2033,12 +2020,3 @@ class TriAttention(BaseKVCacheCompressionManager):
             omega = (1.0 / (base ** (idx / head_dim)))[:freq_count].clone()
             scale_sq = 1.0
         return omega, torch.full((freq_count,), scale_sq, dtype=torch.float32)
-
-    def _validate_calibration(self, calibration: Dict[str, torch.Tensor]) -> None:
-        """Verify the calibration dict has the expected keys."""
-        missing = _REQUIRED_CALIBRATION_KEYS - set(calibration.keys())
-        if missing:
-            raise ValueError(
-                f"TriAttention calibration is missing keys: {sorted(missing)}; "
-                f"got {sorted(calibration.keys())}."
-            )

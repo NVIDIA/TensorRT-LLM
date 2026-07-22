@@ -201,7 +201,13 @@ def _score_per_head_reduce_kernel(
     NORMALIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Reduce query-head score rows into one selector row per KV-head domain."""
+    """Reduce query-head score rows into one selector row per KV-head domain.
+
+    per_layer: row (layer, kv_head) = max over the KV head's query group.
+    Otherwise: row kv_head = mean over layers of that per-layer group max.
+    Optionally z-normalizes each query-head row with the precomputed
+    mean/inv-std before reducing.
+    """
     request = tl.program_id(0)
     selection_row = tl.program_id(1)
     token_block = tl.program_id(2)
