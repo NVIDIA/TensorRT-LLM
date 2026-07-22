@@ -769,6 +769,29 @@ def _chunk_kda_fwd(
 
     is_varlen = cu_seqlens is not None
 
+    if q.shape[1] == 0:
+        # Zero-token call: the runtime can emit a context batch whose token
+        # payload is empty (observed under the overlap scheduler + logprobs
+        # flows; the FLA fallback tolerates it). No tokens means no output
+        # rows and an unchanged recurrent state — return before any kernel
+        # or buffer setup (whose arange(step=T) would raise "step must be
+        # nonzero").
+        B, _, H, K = q.shape
+        V_dim = v.shape[-1]
+        n_seqs = B if cu_seqlens is None else cu_seqlens.shape[0] - 1
+        o = v.new_empty(B, 0, H, V_dim)
+        if not output_final_state:
+            final_state = None
+        elif initial_state is not None:
+            # clone: the caller index_copy_s final_state back into the state
+            # pool the initial state may alias.
+            final_state = initial_state.to(torch.float32).clone()
+        else:
+            final_state = torch.zeros(
+                n_seqs, H, K, V_dim, dtype=torch.float32, device=q.device)
+        return (o, final_state, None, None, None, None, None, None, None,
+                None, None, initial_state)
+
     # ===== Fused K1234 path (eqlen only, single kernel launch) =====
     if use_fused_k1234 and not is_varlen:
         o, final_state = _launch_fused_k1234(
