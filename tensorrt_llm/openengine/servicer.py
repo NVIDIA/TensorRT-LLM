@@ -49,6 +49,7 @@ from .converters import (
     encode_handoff,
     handoff_requires_decode_media,
     load_media,
+    media_uuids,
     stable_request_id,
     to_priority,
     to_sampling_params,
@@ -224,7 +225,8 @@ class OpenEngineServicer(
                 target_dp_rank = session_dp_rank
             self._validate_generate(request, target_dp_rank)
             params = to_sampling_params(request)
-            media = await load_media(list(request.media), request.media_options, self.media_config)
+            media_items = list(request.media)
+            media = await load_media(media_items, request.media_options, self.media_config)
             input_kind = request.WhichOneof("input")
             inputs: dict[str, Any]
             if input_kind == "prompt":
@@ -233,6 +235,9 @@ class OpenEngineServicer(
                 inputs = {"prompt_token_ids": list(request.token_ids.ids)}
             if media:
                 inputs["multi_modal_data"] = media
+                uuids = media_uuids(media_items)
+                if uuids is not None:
+                    inputs["multi_modal_uuids"] = uuids
             lora_request = self._required_multimodal_lora(request)
             if lora_request is not None and request.lora_name:
                 raise ValueError(
@@ -720,7 +725,7 @@ class OpenEngineServicer(
     async def GetModelInfo(
         self, request: model_pb2.GetModelInfoRequest, context: grpc.aio.ServicerContext
     ) -> model_pb2.ModelInfo:
-        if request.model and request.model != self.model:
+        if request.model and request.model not in self._accepted_model_names:
             await context.abort(grpc.StatusCode.NOT_FOUND, f"Unknown model {request.model!r}")
             raise ValueError(f"Unknown model {request.model!r}")
         input_processor = getattr(self.llm, "input_processor", None)

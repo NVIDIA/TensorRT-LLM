@@ -183,6 +183,20 @@ async def load_media(
     return output
 
 
+def media_uuids(media: list[object]) -> dict[str, list[str | None]] | None:
+    """Preserve caller media IDs for engine KV-event key correlation."""
+    output: dict[str, list[str | None]] = {}
+    any_uuid = False
+    for item in media:
+        modality = _MODALITY_NAMES.get(item.modality)
+        if modality is None:
+            raise ValueError(f"Unsupported media modality {item.modality}")
+        uuid = item.uuid or None
+        any_uuid = any_uuid or uuid is not None
+        output.setdefault(modality, []).append(uuid)
+    return output if any_uuid else None
+
+
 def stable_request_id(request_id: str) -> int:
     """Map arbitrary wire request IDs into TRT-LLM's positive int64 domain."""
     digest = hashlib.sha256(request_id.encode("utf-8")).digest()

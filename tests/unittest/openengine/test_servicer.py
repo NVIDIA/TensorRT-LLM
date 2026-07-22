@@ -241,12 +241,17 @@ async def test_generate_selects_model_owned_multimodal_lora(monkeypatch, tmp_pat
         llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, RequestTracker(llm)
     )
     request = generation_pb2.GenerateRequest(request_id="audio", model="model", prompt="transcribe")
-    request.media.add(modality=input_pb2.MODALITY_AUDIO, raw_bytes=b"audio")
+    request.media.add(
+        modality=input_pb2.MODALITY_AUDIO,
+        raw_bytes=b"audio",
+        uuid="0123456789abcdef",
+    )
 
     _ = [response async for response in service.Generate(request, _Context())]
 
     assert llm.kwargs["lora_request"].lora_name == "speech-lora"
     assert llm.kwargs["lora_request"].lora_int_id == 1
+    assert llm.kwargs["inputs"]["multi_modal_uuids"] == {"audio": ["0123456789abcdef"]}
     assert await service.loras.list() == []
 
 
@@ -669,7 +674,10 @@ async def test_discovery_and_load_use_config_and_shared_stats(monkeypatch) -> No
     assert server_info.kv_connector.handoff_profile == "tensorrt_llm.disaggregated_params.v1"
     assert server_info.kv_connector.HasField("supports_client_bootstrap")
     assert not server_info.kv_connector.supports_client_bootstrap
-    model_info = await service.GetModelInfo(model_pb2.GetModelInfoRequest(), _Context())
+    model_info = await service.GetModelInfo(
+        model_pb2.GetModelInfoRequest(model="Qwen/Qwen3-VL-2B-Instruct"),
+        _Context(),
+    )
     assert model_info.model_id == "Qwen/Qwen3-VL-2B-Instruct"
     assert model_info.served_model_name == "qwen3-vl"
     assert list(model_info.served_model_aliases) == ["Qwen/Qwen3-VL-2B-Instruct"]
