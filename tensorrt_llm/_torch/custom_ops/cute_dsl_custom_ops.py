@@ -3651,6 +3651,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         8192,
         16384,
     )
+    _INDEXER_Q_POSITION_IDS_INPUT_INDEX = 3
 
     def _map_cutedsl_indexer_q_tuning_bucket(num_tokens: int) -> int:
         if num_tokens <= 4:
@@ -3663,7 +3664,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     def _prepare_cutedsl_indexer_q_tuning_inputs(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        inputs[3] = torch.zeros_like(inputs[3])
+        # The autotuner resizes position_ids to the token bucket, leaving newly
+        # allocated values uninitialized. Use position zero for every tuning
+        # row so the fused RoPE lookup always stays inside cos_sin_cache.
+        position_ids = inputs[_INDEXER_Q_POSITION_IDS_INPUT_INDEX]
+        inputs[_INDEXER_Q_POSITION_IDS_INPUT_INDEX] = torch.zeros_like(
+            position_ids)
         return inputs
 
     class CuteDSLIndexerQBlackwellRunner(TunableRunner):
@@ -3726,7 +3732,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = inputs[0].shape
             n = inputs[1].shape[0]
             tactics = []
-            if 0 < m <= 16 and n % 128 == 0 and k % 128 == 0:
+            if self._small_m_kernel_is_supported(m, n, k):
                 tactics.extend(self.__class__._small_m_tactics)
 
             tactics.extend([
@@ -3750,12 +3756,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return tactics
 
         @staticmethod
-        def _fallback_tactic(m: int) -> Tuple:
+        def _small_m_kernel_is_supported(m: int, n: int, k: int) -> bool:
+            return 0 < m <= 16 and n % 128 == 0 and k % 128 == 0
+
+        @classmethod
+        def _fallback_tactic(cls, m: int, n: int, k: int) -> Tuple:
             """Safe eager-mode fallback when TRT-LLM autotuning is disabled."""
-            if m <= 4:
-                return ("swap_ab", (128, 16), (1, 1), False, 4)
-            if m <= 8:
-                return ("swap_ab", (128, 16), (1, 1), False, 8)
+            if cls._small_m_kernel_is_supported(m, n, k):
+                if m <= 4:
+                    return ("swap_ab", (128, 16), (1, 1), False, 4)
+                if m <= 8:
+                    return ("swap_ab", (128, 16), (1, 1), False, 8)
             return ("native", (256, 128), (2, 1), False, 0)
 
         @staticmethod
@@ -3776,7 +3787,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = input.shape
             n = weight.shape[0]
             if tactic == -1:
-                tactic = self._fallback_tactic(m)
+                tactic = self._fallback_tactic(m, n, k)
             (kernel_kind, mma_tiler_mn, cluster_shape_mn, use_prefetch,
              transform_warps) = tactic
             if kernel_kind == "swap_ab":
