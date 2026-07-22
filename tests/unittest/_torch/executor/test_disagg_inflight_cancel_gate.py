@@ -1061,7 +1061,7 @@ def test_non_root_rank_enters_transfer_poll_after_broadcast():
 
 
 def test_true_disagg_idle_fetch_uses_bounded_heartbeat_without_status_poll():
-    executor = _make_async_context_poll_executor(local_inflight=False)
+    executor = _make_async_context_poll_executor(local_inflight=False, world_size=2)
     waiting_queue = MagicMock()
     waiting_queue.__len__.return_value = 0
 
