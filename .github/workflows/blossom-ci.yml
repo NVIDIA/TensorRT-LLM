@@ -435,7 +435,7 @@ jobs:
   Vulnerability-scan:
     name: Vulnerability scan
     needs: [Authorization]
-    runs-on: ubuntu-latest
+    runs-on: vulnerability-scan11
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
