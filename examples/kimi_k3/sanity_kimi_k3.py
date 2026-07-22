@@ -25,6 +25,9 @@ Environment (the sbatch launcher sets everything up):
                                fused MoE (mxe4m3_mxe2m1_block_scale_moe_runner,
                                no external cubin env needed);
                                0 = slow reference dequant loop
+  KIMI_K3_ADP                  1 (default) = DEP deployment (attention-DP +
+                               MoE EP dispatch/combine, EP width == TP);
+                               0 = plain EP (replicated attention + allreduce)
   KIMI_K3_NUM_LAYERS_OVERRIDE  truncate to first N layers (debug; skips
                                output-quality assertions)
 Exit code 0 = PASS, 1 = FAIL.
@@ -54,13 +57,21 @@ def main() -> int:
     tp = int(os.environ.get("KIMI_K3_TP", "16"))
     truncated = os.environ.get("KIMI_K3_NUM_LAYERS_OVERRIDE") is not None
     max_tokens = int(os.environ.get("KIMI_K3_MAX_TOKENS", "64"))
+    # DEP deployment (attention data-parallel + MoE expert-parallel
+    # dispatch/combine; EP width == tp) is the default. KIMI_K3_ADP=0
+    # selects the plain EP mode (replicated attention + latent allreduce).
+    adp = os.environ.get("KIMI_K3_ADP", "1") == "1"
 
-    print(f"[sanity] ckpt={ckpt} tp(EP)={tp} truncated={truncated} "
-          f"fused_moe={os.environ.get('KIMI_K3_FUSED_MOE', '0')}")
+    print(
+        f"[sanity] ckpt={ckpt} tp(EP)={tp} adp={adp} truncated={truncated} "
+        f"fused_moe={os.environ.get('KIMI_K3_FUSED_MOE', '0')}"
+    )
 
     llm = LLM(
         model=ckpt,
         tensor_parallel_size=tp,
+        enable_attention_dp=adp,
+        moe_expert_parallel_size=tp if adp else None,
         trust_remote_code=True,  # tiktoken tokenizer ships with the ckpt
         max_batch_size=8,
         max_seq_len=4096,
@@ -74,8 +85,7 @@ def main() -> int:
                                           max_batch_size=8),
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
-            free_gpu_memory_fraction=float(
-                os.environ.get("KIMI_K3_FREE_GPU_FRACTION", "0.25")),
+            free_gpu_memory_fraction=float(os.environ.get("KIMI_K3_FREE_GPU_FRACTION", "0.25")),
             # tokens_per_block=64 keeps the MLA (576, 512) generation path
             # on the flashinfer trtllm-gen kernel (32 falls back to a C++
             # path requiring num_heads % 64 == 0; K3 has 96 query heads).
@@ -102,8 +112,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("[sanity] PASS" + (" (pipeline only, truncated model)"
-                             if truncated else ""))
+    print("[sanity] PASS" + (" (pipeline only, truncated model)" if truncated else ""))
     return 0
 
 

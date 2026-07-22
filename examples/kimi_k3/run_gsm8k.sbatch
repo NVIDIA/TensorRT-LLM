@@ -78,6 +78,6 @@ srun --mpi=pmix \
             --kv_cache_free_gpu_memory_fraction 0.25 \
             --disable_kv_cache_reuse \
             --trust_remote_code \
-            --config '$REPO/examples/kimi_k3/eval_extra_llm_options.yaml' \
+            --config '${KIMI_K3_EVAL_CONFIG:-$REPO/examples/kimi_k3/eval_extra_llm_options_dep16.yaml}' \
             gsm8k ${GSM8K_EXTRA_ARGS:-}
     "

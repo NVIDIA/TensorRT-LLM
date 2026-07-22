@@ -1,0 +1,12 @@
+# Extra LLM-API options for Kimi K3 DEP16 runs (attention-DP + MoE EP
+# dispatch/combine), used by trtllm-eval via --config. Same runtime
+# constraints as eval_extra_llm_options.yaml plus the DEP knobs.
+enable_attention_dp: true
+moe_expert_parallel_size: 16
+disable_overlap_scheduler: true
+cuda_graph_config: null
+enable_chunked_prefill: false
+kv_cache_config:
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.25
+  tokens_per_block: 64

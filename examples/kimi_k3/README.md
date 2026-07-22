@@ -29,10 +29,15 @@ collection.
 
 ## Deployment shape
 
-* **16 GPUs (4× GB300 trays), EP-only parallelism**: `tensor_parallel_size=16`
-  is reinterpreted by the model as expert-parallel width — each rank holds
-  the full ~70 GB bf16 non-expert model plus 896/16 = 56 experts per MoE
-  layer (~90 GB MXFP4), with an allreduce of the routed latent partial sums.
+* **16 GPUs (4× GB300 trays), DEP16 by default**: attention runs
+  data-parallel and the 896 experts shard across the EP group
+  (`enable_attention_dp=true`, `moe_expert_parallel_size=16`); tokens are
+  exchanged with AllGather/ReduceScatter around the local-expert kernels.
+  Each rank holds the full ~70 GB bf16 non-expert model plus 896/16 = 56
+  experts per MoE layer (~90 GB MXFP4). Set `KIMI_K3_ADP=0` (sanity) or
+  `KIMI_K3_EVAL_CONFIG=.../eval_extra_llm_options.yaml` (gsm8k) for the
+  plain-EP mode (replicated attention + latent allreduce). The DEP16 eval
+  config assumes TP=16; other TP widths need a custom config.
 * Fused MoE (`KIMI_K3_FUSED_MOE=native`, default): in-tree TRTLLM-Gen SiTU
   op (`mxe4m3_mxe2m1_block_scale_moe_runner`, W4A8 MXFP4 weights × MXFP8
   activations) consuming the checkpoint's MXFP4 weights via a one-time
@@ -79,6 +84,8 @@ defaults; override on the command line as needed.
 
 ## Debug knobs
 
+* `KIMI_K3_ADP=0` — disable the default DEP deployment in the sanity
+  (plain EP: replicated attention + latent allreduce).
 * `KIMI_K3_NUM_LAYERS_OVERRIDE=<N>` — truncate to the first N decoder layers
   (loads only those shards; output is gibberish by construction, pipeline
   checks only).
