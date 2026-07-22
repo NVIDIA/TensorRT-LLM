@@ -48,6 +48,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttnLifeCycle,
     BatchDesc,
     BufferConfig,
+    BufferId,
     CacheLevel,
     CacheTierConfig,
     CuError,
@@ -1888,17 +1889,15 @@ class KVCacheManagerV2(BaseResourceManager):
         if layer_idx not in self.layer_offsets:
             return None
         layer_offset = self.layer_offsets[layer_idx]
-        try:
-            addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
-            page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
-            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
-            converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
-        except KeyError:
-            # INDEX_KEY not registered for this layer (default V2 manager
-            # registers only K/V/scale; sparse subclasses register
-            # INDEX_KEY only on sparse layers via
-            # ``_extra_buffers_per_layer``).
+        buffer_id = BufferId(layer_offset, Role.INDEX_KEY)
+        if buffer_id not in self.impl.all_buffer_ids:
+            # The default V2 manager registers only K/V/scale buffers;
+            # sparse subclasses register INDEX_KEY only on sparse layers.
             return None
+        addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
+        page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
+        converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
 
         if isinstance(dtype, DataType):
             torch_dtype = binding_to_torch_dtype(dtype)
