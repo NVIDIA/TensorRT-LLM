@@ -168,7 +168,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
         # Must be set BEFORE super().__init__ — the base
-        # ``_build_cache_config`` invokes ``_extra_buffers_per_layer``
+        # ``_build_base_config`` invokes ``_extra_buffers_per_layer``
         # which reads these attributes.
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
@@ -198,7 +198,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         ``size`` is bytes per **block**: ``1 * sparse_index_dim *
         elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_cache_config`` iterates local ids, so keying
+        the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
         """
