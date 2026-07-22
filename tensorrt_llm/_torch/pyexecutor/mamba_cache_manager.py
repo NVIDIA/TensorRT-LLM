@@ -784,14 +784,20 @@ class PythonMambaCacheManager(BaseResourceManager):
         torch.cuda.empty_cache()
 
     @torch.compile(options={"max-autotune": True})
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: torch.Tensor):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: torch.Tensor,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
+        accepted_positions = (accepted_leaf_positions if accepted_leaf_positions
+                              is not None else num_accepted_draft_tokens)
         state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
@@ -828,7 +834,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             ssm_states = self.mamba_cache.temporal
             intermediate_ssm_cache = self.mamba_cache.intermediate_ssm
             accepted_ssm_state = intermediate_ssm_cache[:, src_state_indices,
-                                                        num_accepted_draft_tokens]
+                                                        accepted_positions]
             ssm_states[:, state_indices_d, :] = accepted_ssm_state
 
         # Conv: both paths save all intermediate conv windows, carry over the accepted one.
@@ -836,7 +842,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
-                                                             num_accepted_draft_tokens]
+                                                             accepted_positions]
         conv_states[:, state_indices_d, :] = accepted_conv_state
 
 
@@ -980,15 +986,18 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: torch.Tensor):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: torch.Tensor,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         # Non-speculative configs don't allocate intermediate state; the
         # promotion is a clean no-op.
         if not self._impl.is_speculative():
             return
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
-                                       state_indices)
+                                       state_indices, accepted_leaf_positions)
 
 
 class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
@@ -1791,10 +1800,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         return self.spec_config is not None
 
     @nvtx_range("hybrid_update_mamba_states")
-    def update_mamba_states(self,
-                            attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: Optional[torch.Tensor] = None):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: Optional[torch.Tensor] = None,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
         batch_size = attn_metadata.num_seqs
@@ -1803,6 +1814,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_accepted_draft_tokens = (
             num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
                 torch.int32)
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
+        accepted_positions = (accepted_leaf_positions.to(torch.int32)
+                              if accepted_leaf_positions is not None else
+                              num_accepted_draft_tokens)
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
@@ -1855,16 +1870,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # Legacy: copy the accepted SSM state from the intermediate buffer.
             _promote_mamba_state_triton(self.all_ssm_states,
                                         self.intermediate_ssm_states,
-                                        src_state_indices,
-                                        num_accepted_draft_tokens,
+                                        src_state_indices, accepted_positions,
                                         state_indices_d)
 
         # Conv: both paths save all intermediate conv windows, carry over the
         # accepted one.
         _promote_mamba_state_triton(self.all_conv_states,
                                     self.intermediate_conv_states,
-                                    src_state_indices,
-                                    num_accepted_draft_tokens, state_indices_d)
+                                    src_state_indices, accepted_positions,
+                                    state_indices_d)
 
     @torch.inference_mode()
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:

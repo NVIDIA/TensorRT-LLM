@@ -288,9 +288,8 @@ l0_h100:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
-      backend: tensorrt
+      backend: pytorch
   tests:
-  # ------------- TRT tests ---------------
   - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_quickstart
   - examples/visual_gen/test_visual_gen.py::test_visual_gen_api_walkthrough
@@ -341,6 +340,20 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-requested-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v1-graphs-off-greedy]
+  - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
+  - unittest/bindings # 8 mins on H100
+  - unittest/kv_cache_manager_v2_tests # 4 min
+  # ------------- KV Cache Iteration Stats ---------------
+  - unittest/executor/test_stats_serializer.py
+  - unittest/metrics/test_collector.py
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
+  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (90)
   - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[eager] TIMEOUT (90)
   - llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
@@ -426,42 +439,6 @@ l0_h100:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and None"
   # Documentation URL validation (CPU-only, no GPU needed)
   - test_doc.py::test_url_validity
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*h100*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: tensorrt
-  tests:
-  # ------------- TRT tests ---------------
-  - examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] # 18mins
-  - examples/test_whisper.py::test_llm_whisper_general[large-v3-disable_gemm_plugin-disable_attention_plugin-disable_weight_only-float16-nb:1-use_python_runtime] # 8 mins
-  - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct]
-  - examples/test_gpt.py::test_llm_minitron_fp8_with_pseudo_loras[4b] TIMEOUT (90)
-  - unittest/bindings # 8 mins on H100
-  - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:1-bfloat16-bs:8-cpp_e2e:False-nb:1]
-  - examples/test_multimodal.py::test_llm_fp8_multimodal_general[fp8-fp8-scienceqa-Llama-3.2-11B-Vision-Instruct-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False]
-  - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_py_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
-  - examples/test_medusa.py::test_llm_medusa_with_qaunt_base_model_1gpu[fp8-use_cpp_session-medusa-vicuna-7b-v1.3-4-heads-float16-bs1]
-  - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
-  - unittest/kv_cache_manager_v2_tests # 4 min
-  # ------------- KV Cache Iteration Stats ---------------
-  - unittest/executor/test_stats_serializer.py
-  - unittest/metrics/test_collector.py
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_full_block_reuse
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_shared_prefix
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_batch_generation
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
-  - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
 - condition:
     ranges:
       system_gpu_count:

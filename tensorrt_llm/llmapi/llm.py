@@ -364,7 +364,11 @@ class BaseLLM:
             load_post_processor_hook(_post_processor_path)
             if _post_processor_path else None)
 
-        if self.args.parallel_config.is_multi_gpu:
+        # Attached serving frontends connect to an already-running worker:
+        # they must not spawn an MPI session (see GenerationExecutor.create).
+        is_attached_frontend = os.getenv(
+            "TLLM_EXECUTOR_ATTACH_INFO") is not None
+        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
