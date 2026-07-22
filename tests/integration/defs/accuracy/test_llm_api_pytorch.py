@@ -7787,18 +7787,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             # rate 0.839, length 3.518. Our testing thresholds: rate > 0.78,
             # length > 3.3.
             ref_rate, ref_length = 0.839, 3.518
+            ref_source = "the Inferact/MiniMax-M3-EAGLE3 drafter model card"
             print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
                   f"{chat_length:.3f} ({steps} spec iterations)")
             assert chat_rate > 0.78, \
                 f"Eagle3 chat-GSM8K acceptance rate too low: {chat_rate:.3f} " \
-                f"(reference {ref_rate})"
+                f"(threshold 0.78, reference {ref_rate} from {ref_source})"
             assert chat_length > 3.3, \
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
-                f"{chat_length:.3f} (reference {ref_length})"
+                f"{chat_length:.3f} (threshold 3.3, reference {ref_length} " \
+                f"from {ref_source})"
             print(f"Eagle3 acceptance references: rate {ref_rate}, length "
-                  f"{ref_length} — from the Inferact/MiniMax-M3-EAGLE3 "
-                  f"drafter model card.")
+                  f"{ref_length} — from {ref_source}.")
 
 
 @skip_pre_blackwell
