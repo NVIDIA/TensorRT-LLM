@@ -1894,11 +1894,22 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
-    def __init__(self, model: TModel, model_config: ModelConfig[TConfig]):
+    def __init__(self,
+                 model: TModel,
+                 model_config: ModelConfig[TConfig],
+                 hidden_size: Optional[int] = None,
+                 vocab_size: Optional[int] = None):
+        # Composite configs (e.g. vision-language wrappers) may not expose
+        # hidden_size/vocab_size at the top level; callers can pass the
+        # text-config values explicitly.
+        if hidden_size is None:
+            hidden_size = model_config.pretrained_config.hidden_size
+        if vocab_size is None:
+            vocab_size = model_config.pretrained_config.vocab_size
         super().__init__(model,
                          config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+                         hidden_size=hidden_size,
+                         vocab_size=vocab_size)
         self.draft_model = None
         self.draft_config = None
         self.spec_worker = None
