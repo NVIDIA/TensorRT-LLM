@@ -1981,6 +1981,65 @@ def test_cosmos3_i2v_4step_example(_visual_gen_deps, llm_root, llm_venv):
     assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
 
 
+def _write_cosmos3_edge_conditioning_image(path):
+    """Deterministic 832x480 conditioning image (Edge's native 480p 16:9)."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (832, 480))
+    draw = ImageDraw.Draw(image)
+    for y in range(480):
+        draw.line([(0, y), (832, y)], fill=(30, 60 + y // 6, 140))
+    draw.ellipse([320, 130, 520, 330], fill=(230, 120, 40), outline=(255, 255, 255), width=4)
+    draw.rectangle([60, 330, 260, 450], fill=(40, 160, 90))
+    image.save(path)
+
+
+def test_cosmos3_edge_i2v_example(_visual_gen_deps, llm_root, llm_venv):
+    """Run the Edge checkpoint through the recommended invocation.
+
+    Validates the documented deployment for ``Cosmos3-Edge``: the example
+    script with a conditioning image and no config override (the Edge
+    defaults — 480p x 121 frames, 50 UniPC steps on the native flow schedule,
+    guidance 5.0, shift 3.0 — are the deployed shape). The run must produce a
+    video.
+    """
+    model_path = _lpips_model_path("Cosmos3-Edge")
+    _skip_if_missing(model_path, "Cosmos3-Edge checkpoint", is_dir=True)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "cosmos3_edge_i2v_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    image_path = os.path.join(out_dir, "conditioning.png")
+    _write_cosmos3_edge_conditioning_image(image_path)
+    output_path = os.path.join(out_dir, "cosmos3_edge_i2v_output.mp4")
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "cosmos3", "cosmos3.py"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+
+    venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--prompt",
+            "The orange sphere slowly rises while the camera pans right across the scene",
+            "--image_path",
+            image_path,
+            "--output_path",
+            output_path,
+        ],
+        env={"TRTLLM_DISABLE_COSMOS3_GUARDRAILS": "1"},
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+    assert os.path.getsize(output_path) > 0, f"Example produced an empty video at {output_path}"
+
+
 def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
     """Run the distilled I2V pipeline on the deterministic conditioning image.
 

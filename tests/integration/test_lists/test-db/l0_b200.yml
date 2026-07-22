@@ -259,6 +259,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
+  - unittest/_torch/visual_gen/test_cosmos3_edge.py
   - examples/visual_gen/test_visual_gen.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen.py::test_flux1_example
   - examples/visual_gen/test_visual_gen.py::test_flux2_example
@@ -267,6 +268,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_example
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
+  - examples/visual_gen/test_visual_gen.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen.py::test_qwen_image_example
   # - examples/visual_gen/test_visual_gen.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
