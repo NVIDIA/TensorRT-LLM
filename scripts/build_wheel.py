@@ -264,7 +264,7 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
-def fmha_generation_stamp(fmha_v2_cu_dir):
+def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
     # Written as the last step of generate_fmha_cu; its absence means a
     # previous generation was interrupted and the directory contents cannot
     # be trusted (the bare directory exists from the moment generation
@@ -275,7 +275,7 @@ def fmha_generation_stamp(fmha_v2_cu_dir):
 def generate_fmha_cu(project_dir, venv_python):
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
-    fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
+    _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
 
@@ -332,7 +332,7 @@ def generate_fmha_cu(project_dir, venv_python):
             if file_path not in generated_files:
                 os.remove(file_path)
 
-    fmha_generation_stamp(fmha_v2_cu_dir).touch()
+    _fmha_generation_stamp(fmha_v2_cu_dir).touch()
 
 
 def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
@@ -690,7 +690,7 @@ def main(*,
 
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     if (clean or generate_fmha
-            or not fmha_generation_stamp(fmha_v2_cu_dir).exists()):
+            or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
