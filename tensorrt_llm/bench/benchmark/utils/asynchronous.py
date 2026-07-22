@@ -61,10 +61,20 @@ class LlmManager:
         self._iteration_log_task: Optional[asyncio.Task] = None
         self._concurrency_semaphore = asyncio.Semaphore(
             concurrency) if concurrency > 0 else None
+        if duration is not None and self._concurrency_semaphore is None:
+            logger.warning(
+                "--duration requires a concurrency limit to take effect; "
+                "without one, all requests are submitted to the engine "
+                "immediately and the full dataset will run.")
         self.streaming = streaming
         self.request_seen = asyncio.Event()
         self.modality = modality
         self.tokenizer = tokenizer
+
+    def _duration_exceeded(self) -> bool:
+        """Return whether the duration limit has elapsed since the first request."""
+        return (self.duration is not None and self.start_time is not None
+                and time.perf_counter() - self.start_time >= self.duration)
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
@@ -87,6 +97,10 @@ class LlmManager:
         sampling_params.max_tokens = request.output_tokens
 
         async with semaphore_guard(self._concurrency_semaphore):
+            # The worker dispatches the whole inbox eagerly, so the duration
+            # limit must be enforced here, after a concurrency slot is acquired.
+            if self._duration_exceeded():
+                return
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
             logger.debug(f"request.lora_request: {request.lora_request}")
@@ -144,11 +158,18 @@ class LlmManager:
         all_output_tokens: List[int] = []
 
         async with semaphore_guard(self._concurrency_semaphore):
+            # Enforce the duration limit at execution time (see
+            # _process_single_request).
+            if self._duration_exceeded():
+                return
             request_start_timestamp = time.perf_counter_ns()
             time_on_first_token = None
             last_response = None
 
             for turn_id, question in enumerate(request.turns):
+                # Completed turns are still recorded below.
+                if turn_id > 0 and self._duration_exceeded():
+                    break
                 messages.append({"role": "user", "content": question})
 
                 input_ids = await loop.run_in_executor(
@@ -224,8 +245,11 @@ class LlmManager:
             while not self._stop.is_set():
                 self._raise_for_failed_tasks()
 
-                if self.duration is not None and self.start_time and time.perf_counter(
-                ) - self.start_time >= self.duration:
+                # Dispatch below never awaits, so this cannot fire until the
+                # inbox is fully dispatched; enforcement happens in the request
+                # coroutines (see _process_single_request). This exits the idle
+                # loop, and the drain keeps `busy` able to reach False.
+                if self._duration_exceeded():
                     logger.info("Duration reached. Stopping pulling requests.")
                     while not self._inbox.empty():
                         try:

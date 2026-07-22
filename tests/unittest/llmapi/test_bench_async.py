@@ -72,14 +72,86 @@ async def test_llm_manager_duration():
 
     manager.run()
 
-    # Wait for more than 1 second (e.g., 1.5s)
-    await asyncio.sleep(1.5)
+    # Wait for the worker to fully drain: it exits its loop when the duration
+    # elapses and then awaits all in-flight tasks. Asserting after full drain
+    # (rather than sampling mid-flight) ensures requests dispatched past the
+    # deadline were actually skipped, not merely still running.
+    await asyncio.wait_for(manager._backend_task, timeout=10)
 
     # The worker should have stopped and cleared the inbox.
     assert manager._inbox.empty()
 
-    # 2 requests should have been processed and put into outbox.
+    # Requests 1 and 2 complete (0.6s + 0.6s); request 3 acquires its
+    # concurrency slot at t=1.2s, past the 1s deadline, and must be skipped.
     assert outbox.qsize() == 2
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_manager_duration_bounds_runtime_with_eager_dispatch():
+    """Regression test for duration enforcement under eager task dispatch.
+
+    The worker dispatches the entire inbox into tasks before any request
+    runs, so the duration must be enforced at execution time; otherwise
+    every dispatched request runs to completion and duration has no
+    effect on runtime.
+    """
+    mock_llm = MagicMock(spec=LLM)
+    mock_llm.args = MagicMock()
+    mock_llm.args.parallel_config = MagicMock()
+    mock_llm.args.parallel_config.world_size = 1
+
+    mock_output = MagicMock()
+    mock_output.prompt_token_ids = [1, 2, 3]
+    mock_output.outputs = [MagicMock(token_ids=[4, 5])]
+    mock_output.finished = True
+    mock_output.id = 1
+    mock_output.decoding_iter = 1
+
+    request_latency = 0.2
+
+    async def mock_aresult():
+        await asyncio.sleep(request_latency)
+        return mock_output
+
+    mock_output.aresult = mock_aresult
+    mock_llm.generate_async.return_value = mock_output
+
+    outbox = asyncio.Queue()
+    num_requests = 20
+    concurrency = 2
+    duration = 1
+
+    manager = LlmManager(
+        llm=mock_llm,
+        outbox=outbox,
+        streaming=False,
+        concurrency=concurrency,
+        duration=duration,
+    )
+
+    req = InferenceRequest(input_ids=[1, 2, 3], output_tokens=10)
+    sampling_params = SamplingParams()
+    post_proc_params = PostprocParams()
+
+    for _ in range(num_requests):
+        await manager.enqueue(req, sampling_params, post_proc_params)
+
+    start = asyncio.get_running_loop().time()
+    manager.run()
+    await asyncio.wait_for(manager._backend_task, timeout=30)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    # Unbounded behavior would process all 20 requests in ~2s
+    # (20 / 2 slots * 0.2s). With enforcement, roughly
+    # duration / request_latency * concurrency = 10 requests complete.
+    # Generous bounds to stay robust on loaded CI machines.
+    assert outbox.qsize() < num_requests, (
+        "Duration limit had no effect: all requests were processed."
+    )
+    # Wall time is duration plus at most one in-flight drain, with slack.
+    assert elapsed < duration + request_latency + 0.5
 
     await manager.stop()
 
