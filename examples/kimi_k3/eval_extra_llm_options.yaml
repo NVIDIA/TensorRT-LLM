@@ -1,9 +1,15 @@
 # Extra LLM-API options for Kimi K3 (golden prairie) runs, used by
-# trtllm-eval via --config. Kimi K3 runtime constraints: no overlap
-# scheduler, no CUDA graphs, no chunked prefill, no KV block reuse,
-# tokens_per_block=64 (MLA (576,512) trtllm-gen generation kernel).
-disable_overlap_scheduler: true
-cuda_graph_config: null
+# trtllm-eval via --config. CUDA graphs and the overlap scheduler are
+# enabled: the generation-phase MLA latent-cache append derives its write
+# positions from device tensors (attention_backend/utils.py), so it is
+# CUDA-graph-safe — verified at GSM8K parity with the eager path (96.82 on
+# the full test set). Remaining Kimi K3 runtime constraints: no chunked
+# prefill, no KV block reuse, tokens_per_block=64 (MLA (576,512) trtllm-gen
+# generation kernel).
+disable_overlap_scheduler: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
 enable_chunked_prefill: false
 kv_cache_config:
   enable_block_reuse: false

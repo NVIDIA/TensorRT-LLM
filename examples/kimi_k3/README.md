@@ -38,10 +38,14 @@ collection.
   activations) consuming the checkpoint's MXFP4 weights via a one-time
   load-time shuffle; ~0.5–0.8 ms/layer vs ~60–140 ms for the reference
   dequant loop.
-* Required LLM args (see `eval_extra_llm_options.yaml`): overlap scheduler
-  off, CUDA graphs off, chunked prefill off, KV block reuse off,
-  `tokens_per_block=64`. Keep `max_batch_size` ≤ ~32 (each KDA state slot
-  costs ~455 MB across the 69 KDA layers).
+* Required LLM args (see `eval_extra_llm_options.yaml`): chunked prefill
+  off, KV block reuse off, `tokens_per_block=64`. CUDA graphs and the
+  overlap scheduler are ON by default — the generation-phase MLA
+  latent-cache append derives its write positions from device tensors
+  (`attention_backend/utils.py`), making it CUDA-graph-safe; verified at
+  GSM8K parity with the eager path (96.82 on the full test set). Keep
+  `max_batch_size` ≤ ~32 (each KDA state slot costs ~455 MB across the 69
+  KDA layers).
 * Unsupported: pipeline parallel, speculative decoding, disagg.
 
 ## Run

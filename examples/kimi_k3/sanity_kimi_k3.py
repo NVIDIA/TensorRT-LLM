@@ -34,7 +34,7 @@ import os
 import sys
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 PROMPTS_AND_CHECKS = [
     ("The capital of France is", "Paris"),
@@ -66,8 +66,12 @@ def main() -> int:
         max_seq_len=4096,
         max_num_tokens=4096,
         enable_chunked_prefill=False,
-        disable_overlap_scheduler=True,
-        cuda_graph_config=None,  # CUDA graphs unsupported for Kimi K3
+        disable_overlap_scheduler=False,
+        # CUDA graphs require the graph-safe MLA latent-cache append (write
+        # positions derived from device tensors, attention_backend/utils.py);
+        # verified at GSM8K parity with the eager path.
+        cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                          max_batch_size=8),
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             free_gpu_memory_fraction=float(

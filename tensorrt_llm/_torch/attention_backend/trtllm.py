@@ -1565,21 +1565,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             else:
                 forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
-            from .utils import append_mla_latent_cache
-            append_mla_latent_cache(
-                metadata.kv_cache_manager,
-                # NOTE: get_buffers / get_batch_cache_indices take the GLOBAL
-                # layer index (they map through layer_offsets internally).
-                # Passing the local offset double-maps and breaks hybrid
-                # models whose KV manager covers a masked layer subset (e.g.
-                # Kimi K3); identical for dense-attention models.
+            from .utils import \
+                append_mla_latent_cache_generation_cuda_graph_safe
+            # The write positions must come from device tensors: the host
+            # lists (request ids, seq lens, cached-token counts) are frozen
+            # into the graph at capture time and corrupt the cache on replay.
+            # The helper falls back to the host-side loop for eager forwards
+            # and q_len > 1 (speculative decoding).
+            append_mla_latent_cache_generation_cuda_graph_safe(
+                metadata,
+                # NOTE: get_buffers / layer_offsets take the GLOBAL layer
+                # index (they map through layer_offsets internally). Passing
+                # the local offset double-maps and breaks hybrid models whose
+                # KV manager covers a masked layer subset (e.g. Kimi K3);
+                # identical for dense-attention models.
                 self.layer_idx,
-                metadata.request_ids,
-                metadata.seq_lens.tolist(),
-                metadata.kv_cache_params.num_cached_tokens_per_seq,
                 forward_args.latent_cache,
-                kv_layout=metadata.kv_layout,
-                seq_start=num_ctx,
             )
 
         # RocketKV and DSA predict which blocks to keep, so build their sparse
