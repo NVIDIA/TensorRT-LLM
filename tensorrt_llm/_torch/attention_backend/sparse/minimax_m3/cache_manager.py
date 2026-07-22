@@ -13,7 +13,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -168,7 +168,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
         # Must be set BEFORE super().__init__ — the base
-        # ``_build_cache_config`` invokes ``_extra_buffers_per_layer``
+        # ``_build_base_config`` invokes ``_extra_buffers_per_layer``
         # which reads these attributes.
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
@@ -198,7 +198,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
         ``size`` is bytes per **block**: ``1 * sparse_index_dim *
         elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_cache_config`` iterates local ids, so keying
+        the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
         """
@@ -417,6 +417,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         *,
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
+        index_scale: Optional[int] = None,
     ):
         """Return per-request slot ids in ``[0, num_slots)`` directly.
 
@@ -427,15 +429,27 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         breaks the V1 conversion and produces out-of-bounds block ids
         during V2 warmup.
 
+        ``index_scale`` (per-layer scale supplied by the base
+        :meth:`get_batch_cache_indices`) is accepted for
+        signature compatibility but intentionally ignored: this
+        override bypasses the scale conversion entirely.
+
         Bypass the conversion: the M3 forward path indexes paged
         views (built by :meth:`get_buffers` /
         :meth:`get_index_k_buffer`) directly by slot id.
         ``BAD_PAGE_INDEX`` slots stay as 0 to match the legacy
         padding contract.
+
+        ``num_blocks_per_seq``, when provided by the base
+        :meth:`get_batch_cache_indices`, truncates each request's slot
+        ids to the blocks it actually owns (matching the base method's
+        contract); the padded tail is discarded by attention callers.
         """
         res = []
-        for req_id in request_ids:
+        for req_idx, req_id in enumerate(request_ids):
             idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+            if num_blocks_per_seq is not None:
+                idx_tensor = idx_tensor[: num_blocks_per_seq[req_idx]]
             res.append(
                 (
                     torch.where(

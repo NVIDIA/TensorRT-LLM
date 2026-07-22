@@ -680,20 +680,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
     Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
 
-      1. An index attention branch projects a per-head Q vector and a
-         **single replicated** K vector, scores main K/V cache blocks,
-         and selects the top-``topk`` blocks per ``(num_kv_heads, q_token)``
-         pair (with ``init_blocks`` forced at the head and ``local_blocks``
-         forced at the tail).
+      1. An index attention branch projects a per-head Q vector and a single
+         replicated K vector, scores main K/V cache blocks, and selects the
+         top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced
+         at the head and local_blocks forced at the tail.
       2. A sparse GQA attention runs only over the selected blocks.
 
-    The selected backend at runtime uses
-    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
-    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
-    paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
-    parallel to the main K/V cache. The M3 checkpoint sets
-    ``disable_index_value=True`` on every sparse layer so no index V
-    cache is allocated for the bring-up.
+    At runtime one of the MiniMax-M3 sparse attention backends under
+    tensorrt_llm._torch.attention_backend.sparse.minimax_m3 is selected. The
+    chosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a
+    paged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel
+    to the main K/V cache. The M3 checkpoint sets disable_index_value=True on
+    every sparse layer, so no index V cache is allocated.
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
@@ -730,6 +728,34 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    num_attention_heads: Optional[int] = Field(
+        default=None,
+        description=
+        "Global number of attention (query) heads. When unset, it falls back "
+        "to pretrained_config.num_attention_heads.",
+    )
+    num_key_value_heads: Optional[int] = Field(
+        default=None,
+        description=
+        "Global number of key/value heads. When unset, it falls back to "
+        "pretrained_config.num_key_value_heads, then to num_attention_heads.",
+    )
+    implementation: Literal["triton", "msa"] = Field(
+        default="triton",
+        description=
+        "Sparse attention implementation: 'triton' reference (default) or 'msa' "
+        "(fmha_sm100 kernels). The 'msa' implementation requires an SM100 GPU, "
+        "the fmha_sm100 package, and sparse_block_size == 128.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def _validate_msa_block_size(self):
+        if self.implementation == "msa" and self.sparse_block_size != 128:
+            raise ValueError(
+                "MiniMax-M3 'msa' implementation requires sparse_block_size == "
+                f"128, got {self.sparse_block_size}.")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -738,7 +764,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         return self.sparse_block_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
             MiniMaxM3SparseParams
 
         return MiniMaxM3SparseParams(
@@ -750,6 +776,36 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             local_blocks=self.sparse_local_blocks,
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
+            implementation=self.implementation,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        """Lower into MiniMaxM3SparseMetadataParams for the attention metadata.
+
+        Head counts resolve as this config, then pretrained_config, then a
+        default; num_key_value_heads falls back to num_attention_heads. Setting
+        them on the config lets tests skip building a pretrained_config.
+        """
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
+            MiniMaxM3SparseMetadataParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+
+        def _value(name: str, default=None):
+            value = getattr(self, name)
+            if value is not None:
+                return value
+            if pretrained_config is not None:
+                return getattr(pretrained_config, name, default)
+            return default
+
+        num_attention_heads = int(_value("num_attention_heads", 0))
+        num_kv_heads = int(_value("num_key_value_heads", num_attention_heads))
+        return MiniMaxM3SparseMetadataParams(
+            global_num_q_heads=num_attention_heads,
+            global_num_kv_heads=num_kv_heads,
+            num_index_heads=self.sparse_num_index_heads,
+            topk=self.sparse_topk_blocks,
         )
 
 
@@ -1971,8 +2027,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
     )
     dynamic_tree_max_topK: Optional[int] = Field(
         default=None,
-        description="The topK value for each layer when dynamic tree is enabled."
-    )
+        description=
+        "The topK value for each layer when dynamic tree is enabled. Required "
+        "when use_dynamic_tree is True; ignored (with a warning) when "
+        "use_dynamic_tree is False.")
     num_eagle_layers: Optional[int] = Field(
         default=None,
         description=
@@ -2048,9 +2106,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
             # So the number of choices also represents the number of max draft nodes.
             self.max_total_draft_tokens = len(self.eagle_choices)
 
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
         # Dynamic tree logic
-        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
-            self.use_dynamic_tree = True
+        if self.use_dynamic_tree:
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -2070,16 +2136,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 logger.warning(
                     f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
-            else:
-                if self.max_total_draft_tokens < self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
-                    )
-                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
-                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
-                    )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
 
         # Linear tree
         if self.max_total_draft_tokens is None:
@@ -2425,6 +2487,22 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
+    use_dynamic_tree: bool = Field(
+        default=False,
+        description=
+        "Enable EAGLE-style dynamic-tree drafting for one-model MTP. When True, "
+        "each draft step expands dynamic_tree_max_topK candidates per node and the "
+        "tree is verified against the target, instead of a linear chain.")
+    dynamic_tree_max_topK: Optional[int] = Field(
+        default=None,
+        description=
+        "Top-K candidates expanded per node per draft layer when use_dynamic_tree "
+        "is enabled. Required when use_dynamic_tree is True; ignored (with a "
+        "warning) when use_dynamic_tree is False.")
+
+    # Internal max batch size for dynamic-tree worker buffers.
+    _max_batch_size: Optional[int] = PrivateAttr(default=None)
+
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
         status="beta",
@@ -2469,15 +2547,43 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Leave max_draft_len as None ("use the model's num_nextn_predict_layers")
-        # when the user doesn't set it; update_spec_config_from_model_config
-        # resolves it from the checkpoint before the model runs. When the user
-        # does set it, validate and mirror to max_total_draft_tokens (current MTP
-        # only supports a linear tree).
+        # None means update_spec_config_from_model_config resolves it from checkpoint.
         if self.max_draft_len is not None:
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
-            self.max_total_draft_tokens = self.max_draft_len
+
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
+        # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
+        if self.use_dynamic_tree:
+            if self.max_draft_len is None:
+                raise ValueError(
+                    "max_draft_len must be set when use_dynamic_tree is True")
+            if self.dynamic_tree_max_topK is None or self.dynamic_tree_max_topK <= 0:
+                raise ValueError(
+                    "dynamic_tree_max_topK must be > 0 when use_dynamic_tree is True"
+                )
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
+                )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
+        elif self.max_draft_len is not None:
+            self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
     @model_validator(mode="after")
@@ -3625,7 +3731,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     max_util_for_resume: float = Field(
         default=0.95,
-        ge=0,
+        gt=0,
         le=1,
         status="prototype",
         description=
@@ -3779,14 +3885,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
-        return v
-
-    @field_validator('max_util_for_resume')
-    @classmethod
-    def validate_max_util_for_resume(cls, v: float):
-        if not 0 <= v <= 1:
-            raise ValueError(
-                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
     @field_validator('pool_ratio')
@@ -4220,6 +4318,19 @@ class BaseLlmArgs(StrictBaseModel):
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
         description="The path to the tokenizer directory for postprocessing.",
+        status="prototype")
+
+    num_serve_frontends: int = Field(
+        default=1,
+        ge=1,
+        # = executor.utils.MAX_NUM_FRONTENDS (cannot be imported here);
+        # test_multi_frontend_routing pins the two together.
+        le=64,
+        description=
+        "The number of HTTP frontend processes serving one executor. Used by "
+        "trtllm-serve: values > 1 run additional attached frontend processes "
+        "that share the serving port via SO_REUSEPORT (classic IPC executor "
+        "path only).",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
