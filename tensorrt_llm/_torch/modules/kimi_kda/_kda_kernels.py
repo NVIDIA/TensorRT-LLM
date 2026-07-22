@@ -113,36 +113,37 @@ class KDAKernelDispatch:
 
     Attributes
     ----------
-    kernel_path : str
-        ``"optimized"`` when the sm_100 CuTe DSL chunked prefill and fused
-        CUDA decode ops are selected, ``"fla"`` when the FLA references
-        are selected.
+    prefill_kernel_path : str
+        Selected prefill path: ``"optimized"`` or ``"fla"``.
+    decode_kernel_path : str
+        Selected decode path: ``"optimized"`` or ``"fla"``.
     Notes
     -----
-    Dispatch is decided at construction time using
-    ``is_kda_optimized_supported()`` and the availability of the in-tree
-    prefill op. Callers can force the fallback by constructing with
-    ``force_use_fallback=True``.
+    Prefill and decode dispatch are decided independently. Both require a
+    supported GPU; optimized prefill additionally requires the in-tree CuTe
+    DSL op to be importable.
     """
 
-    def __init__(self, force_use_fallback: bool = False) -> None:
-        self.force_use_fallback = force_use_fallback
-        if (
-            force_use_fallback
-            or not is_kda_optimized_supported()
-            or not is_intree_prefill_available()
-        ):
-            self.kernel_path = "fla"
-        else:
-            self.kernel_path = "optimized"
+    def __init__(
+        self,
+        use_optimized_prefill: bool = True,
+        use_optimized_decode: bool = True,
+    ) -> None:
+        optimized_supported = is_kda_optimized_supported()
+        self.prefill_kernel_path = "fla"
+        if use_optimized_prefill and optimized_supported and is_intree_prefill_available():
+            self.prefill_kernel_path = "optimized"
+        self.decode_kernel_path = (
+            "optimized" if use_optimized_decode and optimized_supported else "fla"
+        )
 
     def get_prefill_source(self) -> str:
-        if self.kernel_path == "optimized":
+        if self.prefill_kernel_path == "optimized":
             return _load_prefill_module().__file__ or "<custom_ops.cute_dsl_kimi_k3>"
         return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
 
     def get_decode_source(self) -> str:
-        if self.kernel_path == "optimized":
+        if self.decode_kernel_path == "optimized":
             return _kda_decode.__file__ or "<kimi_kda._kda_decode>"
         return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
 
@@ -174,7 +175,7 @@ class KDAKernelDispatch:
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
         """
-        if self.kernel_path == "optimized":
+        if self.prefill_kernel_path == "optimized":
             from fla.modules.l2norm import l2norm_fwd
             from fla.ops.common.gate import fused_beta_sigmoid
             from fla.ops.utils.index import prepare_chunk_indices
@@ -242,7 +243,7 @@ class KDAKernelDispatch:
         ``fla.ops.kda.fused_recurrent_kda`` directly and does not use this
         wrapper (see ``_decode_via_fla`` on the module).
         """
-        if self.kernel_path != "optimized":
+        if self.decode_kernel_path != "optimized":
             raise RuntimeError(
                 "decode_kda called on non-optimized path; use FLA path via "
                 "the module's fallback handling instead."

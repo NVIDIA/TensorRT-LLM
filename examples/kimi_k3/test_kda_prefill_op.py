@@ -4,6 +4,7 @@
 
 The in-tree ``trtllm::kda_prefill`` op needs no external kernel collection.
 """
+
 import torch
 
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
@@ -12,15 +13,23 @@ torch.manual_seed(0)
 dev = "cuda"
 H, D, W = 96, 128, 4
 
-common = dict(hidden_size=7168, num_heads=H, head_dim=D, conv_kernel_size=W,
-              use_full_rank_gate=True, gate_lower_bound=-5.0,
-              rms_norm_eps=1e-5, dtype=torch.bfloat16)
+common = dict(
+    hidden_size=7168,
+    num_heads=H,
+    head_dim=D,
+    conv_kernel_size=W,
+    use_full_rank_gate=True,
+    gate_lower_bound=-5.0,
+    rms_norm_eps=1e-5,
+    dtype=torch.bfloat16,
+)
 
 opt = KimiKDALinearAttention(**common).to(dev)
-assert opt.kernel_path == "optimized", opt.kernel_path
-ref = KimiKDALinearAttention(**common, force_use_fallback_kernel=True).to(dev)
+assert opt.prefill_kernel_path == "optimized", opt.prefill_kernel_path
+ref = KimiKDALinearAttention(**common, use_optimized_prefill=False).to(dev)
 ref.load_state_dict(opt.state_dict())
-assert ref.kernel_path == "fla", ref.kernel_path
+assert ref.prefill_kernel_path == "fla", ref.prefill_kernel_path
+assert ref.decode_kernel_path == opt.decode_kernel_path
 
 
 def rep(name, a, b):
@@ -51,8 +60,9 @@ with torch.no_grad():
 
     # Varlen: packed B=1 with cu_seqlens (64-aligned lengths).
     lens = [128, 256, 192]
-    cu = torch.tensor([0] + list(torch.cumsum(torch.tensor(lens), 0).tolist()),
-                      dtype=torch.long, device=dev)
+    cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(lens), 0).tolist()), dtype=torch.long, device=dev
+    )
     x = torch.randn(1, sum(lens), 7168, dtype=torch.bfloat16, device=dev) * 0.05
     out_opt = opt.forward_prefill(x, cu_seqlens=cu)
     out_ref = ref.forward_prefill(x, cu_seqlens=cu)

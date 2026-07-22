@@ -116,8 +116,10 @@ def run_kda_decode_fusion_cuda(
     HV = x_v.shape[2]
     if x_k.shape[1:3] != (B, H) or x_v.shape[1] != B:
         raise ValueError("x_q, x_k, and x_v batch/head dimensions are inconsistent")
-    if (B, H, HV) not in ((128, 2, 2), (32, 12, 12)):
-        raise ValueError("CUDA KDA decode fusion supports only (B,H,HV)=(128,2,2) and (32,12,12)")
+    if H != HV or H not in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 96):
+        raise ValueError(
+            "CUDA KDA decode fusion supports H == HV in {1,2,3,4,6,8,12,16,24,32,48,96}"
+        )
     if not state.is_contiguous():
         raise ValueError("state must be contiguous because it is updated in place")
     if out is not None:

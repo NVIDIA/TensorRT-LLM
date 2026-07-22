@@ -37,7 +37,7 @@ prove they are actually being enforced:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from einops import rearrange
@@ -169,9 +169,10 @@ class KimiKDALinearAttention(nn.Module):
     rms_norm_eps : float
     dtype : Optional[torch.dtype]
     layer_idx : int
-    force_use_fallback_kernel : bool
-        Force the FLA path even on sm_100. Used by the sm_100 fallback
-        dispatch test.
+    use_optimized_prefill : bool
+        Enable the optimized prefill path when supported.
+    use_optimized_decode : bool
+        Enable the optimized decode path when supported.
     gate_lower_bound_override : Optional[float]
         Override the ``linear_attn_config`` gate lower bound. Test knob for
         the "wrong gate lower bound" mutation control.
@@ -193,7 +194,8 @@ class KimiKDALinearAttention(nn.Module):
         rms_norm_eps: float = 1e-5,
         dtype: Optional[torch.dtype] = None,
         layer_idx: int = 0,
-        force_use_fallback_kernel: bool = False,
+        use_optimized_prefill: bool = True,
+        use_optimized_decode: bool = True,
         gate_lower_bound_override: Optional[float] = None,
         wrong_state_layout: bool = False,
     ) -> None:
@@ -248,22 +250,28 @@ class KimiKDALinearAttention(nn.Module):
             self.g_a_proj = nn.Linear(hidden_size, head_dim, bias=False)
             self.g_b_proj = nn.Linear(head_dim, projection_size, bias=False)
 
-        self.o_norm = _MetaSafeFusedRMSNormGated(
-            head_dim, eps=rms_norm_eps, activation="sigmoid")
+        self.o_norm = _MetaSafeFusedRMSNormGated(head_dim, eps=rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, hidden_size, bias=False)
 
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
 
-        self._dispatch = KDAKernelDispatch(force_use_fallback=force_use_fallback_kernel)
+        self._dispatch = KDAKernelDispatch(
+            use_optimized_prefill=use_optimized_prefill,
+            use_optimized_decode=use_optimized_decode,
+        )
 
     # ------------------------------------------------------------------
     # Introspection helpers used by the test smoke.
     # ------------------------------------------------------------------
 
     @property
-    def kernel_path(self) -> str:
-        return self._dispatch.kernel_path
+    def prefill_kernel_path(self) -> str:
+        return self._dispatch.prefill_kernel_path
+
+    @property
+    def decode_kernel_path(self) -> str:
+        return self._dispatch.decode_kernel_path
 
     @property
     def sm_100_optimized_supported(self) -> bool:
@@ -384,32 +392,13 @@ class KimiKDALinearAttention(nn.Module):
         b, q_len, _ = hidden_states.shape
         assert q_len == 1, f"KimiKDALinearAttention.forward_decode expects T=1, got T={q_len}"
 
-        if self._dispatch.kernel_path == KimiKDAKernelPath.OPTIMIZED:
+        if self._dispatch.decode_kernel_path == KimiKDAKernelPath.OPTIMIZED:
             return self._decode_via_optimized(hidden_states, cache, b)
         return self._decode_via_fla(hidden_states, cache, b)
 
     # ------------------------------------------------------------------
     # Internals — optimized decode dispatch.
     # ------------------------------------------------------------------
-
-    def _select_tile(self) -> Tuple[int, int]:
-        """Return ``(num_heads_per_tile, per_tile_batch)`` for the KDA_decode kernel.
-
-        The optimized decode kernel supports ``(B, H, HV) ∈ {(128, 2, 2),
-        (32, 12, 12)}`` with ``K = V = 128``. For real K3 (H=96) we tile
-        into 8 kernel calls with ``H_per_tile = 12`` since KDA's recurrent
-        update is head-diagonal.
-        """
-        if self.num_heads == 2:
-            return 2, 128
-        if self.num_heads == 12:
-            return 12, 32
-        if self.num_heads == 96:
-            return 12, 32
-        raise NotImplementedError(
-            "KimiKDALinearAttention has no default decode tile size for "
-            f"num_heads={self.num_heads}. Supported: 2, 12, 96."
-        )
 
     def _decode_via_optimized(
         self,
@@ -423,16 +412,6 @@ class KimiKDALinearAttention(nn.Module):
         K_dim = self.head_dim
         V_dim = self.head_dim
         W = self.conv_size
-
-        tile_H, tile_B = self._select_tile()
-        num_tiles = H // tile_H
-        if H % tile_H != 0:
-            raise ValueError(f"num_heads={H} is not divisible by tile size {tile_H}")
-        if b != tile_B:
-            raise ValueError(
-                f"Optimized KDA_decode expects batch={tile_B} for tile_H={tile_H} "
-                f"(got hidden_states batch={b})."
-            )
 
         projection_size = H * K_dim
         projection_v_size = HV * V_dim
@@ -507,88 +486,53 @@ class KimiKDALinearAttention(nn.Module):
         else:
             state_full = torch.zeros(b, HV, V_dim, K_dim, device=dev, dtype=torch.float32)
 
-        A_log_full = self.A_log.detach().contiguous()
-        dt_bias_full = self.dt_bias.detach().contiguous()
+        # The decode op requires fp32 A_log/dt_bias even in a bf16-cast module.
+        A_log_full = self.A_log.detach().float().contiguous()
+        dt_bias_full = self.dt_bias.detach().float().contiguous()
         onorm_weight_full = self.o_norm.weight.detach().to(torch.float32).contiguous()
+        lower_bound = (
+            self.gate_lower_bound_override
+            if self.gate_lower_bound_override is not None
+            else self.gate_lower_bound
+        )
 
-        cs_q_grouped = cs_q_full.view(b, num_tiles, tile_H * K_dim, W - 1)
-        cs_k_grouped = cs_k_full.view(b, num_tiles, tile_H * K_dim, W - 1)
-        cs_v_grouped = cs_v_full.view(b, num_tiles, tile_H * V_dim, W - 1)
-        w_q_t_grouped = w_q_t_full.view(W, num_tiles, tile_H * K_dim)
-        w_k_t_grouped = w_k_t_full.view(W, num_tiles, tile_H * K_dim)
-        w_v_t_grouped = w_v_t_full.view(W, num_tiles, tile_H * V_dim)
-        A_log_grouped = A_log_full.view(num_tiles, tile_H)
-        dt_bias_grouped = dt_bias_full.view(num_tiles, tile_H * K_dim)
-        state_grouped = state_full.view(b, num_tiles, tile_H, V_dim, K_dim)
+        kernel_state = (
+            state_full.transpose(-1, -2).contiguous() if self.wrong_state_layout else state_full
+        )
+        o_bfhvk = self._dispatch.decode_kda(
+            x_q=x_q_full,
+            x_k=x_k_full,
+            x_v=x_v_full,
+            w_q_t=w_q_t_full,
+            w_k_t=w_k_t_full,
+            w_v_t=w_v_t_full,
+            bias_q=None,
+            bias_k=None,
+            bias_v=None,
+            cs_q=cs_q_full,
+            cs_k=cs_k_full,
+            cs_v=cs_v_full,
+            A_log=A_log_full,
+            g=g_full,
+            dt_bias=dt_bias_full,
+            beta=beta_full,
+            state=kernel_state,
+            onorm_g=onorm_g_full,
+            onorm_weight=onorm_weight_full,
+            out=None,
+            ssm_state_indices=None,
+            cu_seqlens=None,
+            scale=K_dim**-0.5,
+            onorm_eps=self.o_norm.eps,
+            lower_bound=lower_bound,
+            use_beta_sigmoid_in_kernel=True,
+            verbose=False,
+            update_conv_cache=False,
+        )
+        state_full = (
+            kernel_state.transpose(-1, -2).contiguous() if self.wrong_state_layout else kernel_state
+        )
 
-        outs_per_tile: List[torch.Tensor] = []
-        for tile_idx in range(num_tiles):
-            lo = tile_idx * tile_H
-            hi = lo + tile_H
-            x_q_tile = x_q_full[:, :, lo:hi, :].contiguous()
-            x_k_tile = x_k_full[:, :, lo:hi, :].contiguous()
-            x_v_tile = x_v_full[:, :, lo:hi, :].contiguous()
-            g_tile = g_full[:, :, lo:hi, :].contiguous()
-            onorm_g_tile = onorm_g_full[:, :, lo:hi, :].contiguous()
-            beta_tile = beta_full[:, :, lo:hi].contiguous()
-
-            w_q_t_tile = w_q_t_grouped[:, tile_idx, :].contiguous()
-            w_k_t_tile = w_k_t_grouped[:, tile_idx, :].contiguous()
-            w_v_t_tile = w_v_t_grouped[:, tile_idx, :].contiguous()
-            cs_q_tile = cs_q_grouped[:, tile_idx, :, :].contiguous()
-            cs_k_tile = cs_k_grouped[:, tile_idx, :, :].contiguous()
-            cs_v_tile = cs_v_grouped[:, tile_idx, :, :].contiguous()
-
-            # The in-tree decode op requires fp32 A_log/dt_bias (and fp32
-            # onorm_weight); in a bf16-cast module these params are bf16,
-            # so upcast the (tiny) tiles at the call boundary.
-            A_log_tile = A_log_grouped[tile_idx, :].contiguous().float()
-            dt_bias_tile = dt_bias_grouped[tile_idx, :].contiguous().float()
-
-            state_tile_view = state_grouped[:, tile_idx, :, :, :]
-            state_tile = state_tile_view.clone().contiguous()
-
-            if self.wrong_state_layout:
-                state_tile = state_tile.transpose(-1, -2).contiguous()
-
-            out_tile = self._dispatch.decode_kda(
-                x_q=x_q_tile,
-                x_k=x_k_tile,
-                x_v=x_v_tile,
-                w_q_t=w_q_t_tile,
-                w_k_t=w_k_t_tile,
-                w_v_t=w_v_t_tile,
-                bias_q=None,
-                bias_k=None,
-                bias_v=None,
-                cs_q=cs_q_tile,
-                cs_k=cs_k_tile,
-                cs_v=cs_v_tile,
-                A_log=A_log_tile,
-                g=g_tile,
-                dt_bias=dt_bias_tile,
-                beta=beta_tile,
-                state=state_tile,
-                onorm_g=onorm_g_tile,
-                onorm_weight=onorm_weight_full,
-                out=None,
-                ssm_state_indices=None,
-                cu_seqlens=None,
-                scale=K_dim**-0.5,
-                onorm_eps=self.o_norm.eps,
-                lower_bound=self.gate_lower_bound,
-                use_beta_sigmoid_in_kernel=True,
-                verbose=False,
-                update_conv_cache=False,
-            )
-            outs_per_tile.append(out_tile)
-
-            if self.wrong_state_layout:
-                state_grouped[:, tile_idx, :, :, :].copy_(state_tile.transpose(-1, -2))
-            else:
-                state_grouped[:, tile_idx, :, :, :].copy_(state_tile)
-
-        o_bfhvk = torch.cat(outs_per_tile, dim=2)
         o_flat = rearrange(o_bfhvk, "b t h d -> b t (h d)")
         o = self.o_proj(o_flat)
 
