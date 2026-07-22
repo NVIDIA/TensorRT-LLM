@@ -1307,10 +1307,33 @@ class PyTorchModelEngine(ModelEngine):
 
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
-        if not self.llm_args.enable_autotuner:
+        from ..modules.linear import (MXFP8LinearMethod,
+                                      flashinfer_mxfp8_autotune)
+
+        enable_trtllm_autotuner = self.llm_args.enable_autotuner
+        use_mxfp8_flashinfer_graph_default = (
+            self.cuda_graph_runner.enabled
+            and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ and any(
+                getattr(module, "_use_flashinfer_mxfp8_decode_graph_default",
+                        False) for module in self.model.modules()))
+        flashinfer_mxfp8_methods = []
+        for module in self.model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if not isinstance(quant_method, MXFP8LinearMethod):
+                continue
+            if use_mxfp8_flashinfer_graph_default:
+                quant_method.enable_flashinfer_auto()
+            if quant_method.needs_flashinfer_autotune:
+                flashinfer_mxfp8_methods.append(quant_method)
+        enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
+
+        if not enable_trtllm_autotuner and not enable_flashinfer_mxfp8_autotuner:
             return
-        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
-        logger.info("Running autotuner warmup...")
+        if enable_trtllm_autotuner:
+            AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
+        logger.info(
+            f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
+            f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -1320,7 +1343,15 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=self.original_max_draft_len)
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        with self.no_cuda_graph(), autotune(cache_path=cache_path):
+        trtllm_autotune_context = (autotune(
+            cache_path=cache_path) if enable_trtllm_autotuner else
+                                   contextlib.nullcontext())
+        flashinfer_autotune_context = (flashinfer_mxfp8_autotune()
+                                       if enable_flashinfer_mxfp8_autotuner else
+                                       contextlib.nullcontext())
+        ran_forward = False
+        with self.no_cuda_graph(
+        ), trtllm_autotune_context, flashinfer_autotune_context:
             warmup_request = self._create_warmup_request(
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
@@ -1342,21 +1373,41 @@ class PyTorchModelEngine(ModelEngine):
                     self.forward(batch,
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
+                    ran_forward = True
 
-                    # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
-                    # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
-                    AutoTuner.get().cache_pp_recv()
-                    # Send the cache after the tuning process to the next PP rank
-                    AutoTuner.get().cache_pp_send()
-                    # Clean the pp flag to avoid deadlock with synchronous send/recv
-                    AutoTuner.get().clean_pp_flag()
+                    if enable_trtllm_autotuner:
+                        # pp_recv in AutoTuner choose_one will never be called if there is no tuning op during the forward pass.
+                        # So we need to make an extra call to consume the previous rank's pp_send to guarantee that the previous rank's pp_send is released.
+                        AutoTuner.get().cache_pp_recv()
+                        # Send the cache after the tuning process to the next PP rank
+                        AutoTuner.get().cache_pp_send()
+                        # Clean the pp flag to avoid deadlock with synchronous send/recv
+                        AutoTuner.get().clean_pp_flag()
 
                     torch.cuda.synchronize()
 
-        logger.info(
-            f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
-        )
-        AutoTuner.get().print_profiling_cache()
+        if enable_flashinfer_mxfp8_autotuner:
+            if ran_forward:
+                for method in flashinfer_mxfp8_methods:
+                    method.mark_flashinfer_autotuned()
+            else:
+                forced_flashinfer = any(method.backend == "flashinfer"
+                                        for method in flashinfer_mxfp8_methods)
+                for method in flashinfer_mxfp8_methods:
+                    method.disable_flashinfer_auto()
+                if forced_flashinfer:
+                    raise RuntimeError(
+                        "FlashInfer MXFP8 was explicitly requested but its autotuner "
+                        "warmup forward could not run")
+                logger.warning(
+                    "FlashInfer MXFP8 autotuning could not run; using the native "
+                    "TensorRT-LLM GEMM backend.")
+
+        if enable_trtllm_autotuner:
+            logger.info(
+                f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
+            )
+            AutoTuner.get().print_profiling_cache()
 
         # Clear workspace buffers allocated during the autotuner forward pass.
         # The autotuner runs a context-only forward with max_num_tokens, which
@@ -1471,7 +1522,12 @@ class PyTorchModelEngine(ModelEngine):
                 or self._torch_compile_piecewise_cuda_graph):
             return
 
-        self._capture_generation_cuda_graphs(resource_manager)
+        from ..modules.linear import flashinfer_mxfp8_decode_graph_capture
+
+        # The automatic MiniMax-M3 MXFP8 selection is decode-graph-only.
+        # Keep piecewise context/prefill graph capture on the native backend.
+        with flashinfer_mxfp8_decode_graph_capture():
+            self._capture_generation_cuda_graphs(resource_manager)
         self._capture_piecewise_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self,
