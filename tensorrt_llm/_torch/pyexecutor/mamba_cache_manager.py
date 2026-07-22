@@ -1207,7 +1207,7 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
         """Set reusable Mamba snapshot boundaries before scheduling."""
-        if not self.kv_cache_config.enable_block_reuse:
+        if not self.enable_block_reuse:
             for request in requests:
                 request.expect_snapshot_points = []
             return
@@ -2327,6 +2327,31 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # host_block_offsets: [num_pools, max_batch_size, 2, max_blocks_per_seq]
             values = self.host_block_offsets[self.recurrent_states_pool_index,
                                              rows, 0, bi]
+            invalid_mask = (values < 0) | (values >= max_blocks)
+            # The C++ recurrent-state manager uses null page-table entries for
+            # logical blocks that are not snapshot boundaries.  Usually a
+            # context chunk ends exactly at an allocated snapshot (or at the
+            # final live-state block), but the scheduler may shorten a chunk
+            # further when KV capacity is tight.  In that case the Mamba
+            # kernel must keep accumulating into the next allocated snapshot
+            # or final block, matching copyLinearAttentionBlock(), which also
+            # skips placeholders when it advances the live state.
+            for bad_i in invalid_mask.nonzero(
+                    as_tuple=False).flatten().tolist():
+                req = requests[bad_i]
+                if req.is_context_finished:
+                    continue
+                last_prompt_block = (req.prompt_len -
+                                     1) // self.tokens_per_block
+                row = self.host_block_offsets[self.recurrent_states_pool_index,
+                                              rows[bad_i], 0]
+                candidates = row[block_indices[bad_i]:last_prompt_block + 1]
+                valid_candidates = ((candidates >= 0)
+                                    & (candidates < max_blocks)).nonzero(
+                                        as_tuple=False)
+                if valid_candidates.numel() > 0:
+                    values[bad_i] = candidates[valid_candidates[0, 0]]
+
             invalid_mask = (values < 0) | (values >= max_blocks)
             if invalid_mask.any():
                 bad_i = int(invalid_mask.nonzero(as_tuple=False)[0, 0])

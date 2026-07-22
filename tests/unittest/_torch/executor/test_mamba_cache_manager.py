@@ -319,19 +319,31 @@ def test_hybrid_cache_manager_factory_requires_v2_for_explicit_snapshots(
         )
 
 
-def test_hybrid_cache_manager_factory_requires_snapshot_policy(monkeypatch):
+@pytest.mark.parametrize(
+    ("use_v2", "expected"),
+    [
+        (False, CppMambaHybridCacheManager),
+        ("auto", CppMambaHybridCacheManager),
+        (True, V2MambaHybridCacheManager),
+    ],
+)
+def test_hybrid_cache_manager_factory_allows_reuse_without_snapshot_policy(
+    monkeypatch, use_v2, expected
+):
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
-    with pytest.raises(ValueError, match="at least one snapshot policy"):
+    assert (
         get_kv_cache_manager_cls(
             _hybrid_model_config(),
             KvCacheConfig(
                 enable_block_reuse=True,
                 mamba_state_config=MambaStateConfig(periodic_snapshot_interval=0),
-                use_kv_cache_manager_v2=True,
+                use_kv_cache_manager_v2=use_v2,
             ),
         )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -903,6 +915,7 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
 
 def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(
@@ -928,6 +941,7 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
 
 def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
     mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(
@@ -1312,6 +1326,7 @@ def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
 
 def test_cpp_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
@@ -1330,6 +1345,58 @@ def test_cpp_hybrid_prepare_expect_snapshot_points():
         [64, 128],
         [],
     ]
+
+
+@pytest.mark.parametrize(
+    ("allocated_offsets", "context_current_position", "expected_offset"),
+    [
+        ({9: 25}, 0, 25),
+        ({7: 17, 9: 25}, 0, 17),
+        ({7: 17, 9: 25}, 256, 25),
+    ],
+)
+def test_cpp_hybrid_state_indices_skip_context_placeholders(
+    allocated_offsets, context_current_position, expected_offset
+):
+    """Capacity-limited chunks use the next real snapshot/final block."""
+    null_index = torch.iinfo(torch.int32).max
+    block_offsets = torch.full((1, 1, 2, 10), null_index, dtype=torch.int32)
+    for logical_index, pool_offset in allocated_offsets.items():
+        block_offsets[0, 0, 0, logical_index] = pool_offset
+
+    request = SimpleNamespace(
+        py_request_id=0,
+        prompt_len=314,
+        is_context_finished=False,
+        context_current_position=context_current_position,
+        context_chunk_size=32,
+        prepopulated_prompt_len=0,
+        is_dummy=False,
+    )
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.local_num_mamba_layers = 1
+    mgr.requests = [request]
+    mgr.tokens_per_block = 32
+    mgr.kv_cache_config = SimpleNamespace(enable_block_reuse=True)
+    mgr.impl = SimpleNamespace(
+        copy_batch_block_offsets=lambda *args: None,
+        get_cache_block_ids=lambda *args: [],
+    )
+    mgr.host_block_offsets = block_offsets
+    mgr.recurrent_states_pool_index = 0
+    mgr.blocks_per_window = {LinearCacheType.RECURRENT_STATES.value: (1264, 0)}
+    mgr._host_state_indices = torch.zeros(1, dtype=torch.int32)
+    mgr.cuda_state_indices = torch.zeros(1, dtype=torch.int32)
+    mgr._row_indices = torch.arange(1, dtype=torch.long)
+    mgr._request_id_to_state_index = {}
+    mgr._request_id_to_is_dummy = {}
+    mgr._dummy_request_mask = None
+
+    mgr._setup_state_indices()
+
+    assert mgr._host_state_indices.tolist() == [expected_offset]
+    assert mgr.cuda_state_indices.tolist() == [expected_offset]
+    assert mgr.get_state_indices([request.py_request_id], [False]) == [expected_offset]
 
 
 def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
@@ -1386,6 +1453,7 @@ def test_v2_hybrid_add_dummy_requests_forwards_encoder_output_lens(mocker):
 
 def test_v2_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
     mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.enable_block_reuse = False
     mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[64])
 
@@ -1396,8 +1464,19 @@ def test_v2_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
 
 def test_cpp_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
     mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.enable_block_reuse = False
     mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[64])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == []
+
+
+def test_mixed_hybrid_snapshot_hook_clears_when_reuse_disabled():
+    mgr = object.__new__(MixedMambaHybridCacheManager)
+    mgr.enable_block_reuse = False
+    request = SimpleNamespace(prompt_len=64, expect_snapshot_points=[64])
 
     mgr.prepare_expect_snapshot_points([request])
 
@@ -1407,6 +1486,7 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
 @pytest.mark.parametrize("interval", [0, -64, None])
 def test_cpp_hybrid_prepare_expect_snapshot_points_clears_for_invalid_interval(interval):
     mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.enable_block_reuse = True
     mgr.kv_cache_config = SimpleNamespace(
         enable_block_reuse=True,
         mamba_state_config=SimpleNamespace(periodic_snapshot_interval=interval),

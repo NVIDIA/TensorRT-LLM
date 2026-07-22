@@ -146,8 +146,6 @@ def get_kv_cache_manager_cls(
                 "supported with hybrid Mamba / linear-attention models.")
 
         state_config = kv_cache_config.mamba_state_config
-        interval = state_config.periodic_snapshot_interval
-        has_periodic_snapshots = interval is not None and interval > 0
         has_additional_snapshots = bool(
             state_config.additional_snapshot_offsets_from_start
             or state_config.additional_snapshot_offsets_from_end)
@@ -157,13 +155,6 @@ def get_kv_cache_manager_cls(
             raise ValueError("Mamba additional snapshot offsets require "
                              "use_kv_cache_manager_v2=True; V1 supports only "
                              "periodic_snapshot_interval.")
-        if (kv_cache_config.enable_block_reuse and not has_periodic_snapshots
-                and not has_additional_snapshots):
-            raise ValueError(
-                "Hybrid Mamba block reuse requires at least one snapshot "
-                "policy: set "
-                "mamba_state_config.periodic_snapshot_interval > 0 or "
-                "provide additional snapshot offsets.")
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
         if is_disagg:
