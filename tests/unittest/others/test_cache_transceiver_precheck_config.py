@@ -332,6 +332,56 @@ def test_wireup_timeout_derivation():
     assert plan["wireup_timeout_s"] == 42
 
 
+def _enabled_line(cfg):
+    lines = pcfg.precheck_prefix_lines(cfg, "e2e", "$c", "unset &&", max_world=8)
+    return next(x for x in lines if x.startswith("export ctPrecheckEnabled"))
+
+
+def test_precheck_env_kill_switch_truthy(monkeypatch):
+    """The TRTLLM_DISAGG_CT_PRECHECK global kill switch parses the usual boolean
+    spellings (so a force-enable like =true is not silently read as "off") and
+    rejects anything ambiguous instead of guessing."""
+    cfg = {"cache_transceiver_precheck": {"enabled": True}}
+    monkeypatch.delenv("TRTLLM_DISAGG_CT_PRECHECK", raising=False)
+    assert _enabled_line(cfg).endswith("=1")  # yaml default
+    for v in ("1", "true", "on", "YES", " True "):
+        monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
+        assert _enabled_line(cfg).endswith("=1"), v
+    for v in ("0", "false", "off", "no"):
+        monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", v)
+        assert _enabled_line(cfg).endswith("=0"), v
+    # env overrides yaml either way (kill switch): yaml opt-out but env force-on
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "true")
+    assert _enabled_line({"cache_transceiver_precheck": {"enabled": False}}).endswith("=1")
+    monkeypatch.setenv("TRTLLM_DISAGG_CT_PRECHECK", "maybe")
+    with pytest.raises(ValueError):
+        _enabled_line(cfg)
+
+
+def test_gate_library_content(tmp_path):
+    """The gate library loads from next to the draft, falls back to the in-repo
+    copy for an external draft, strips blank lines, and errors if truly absent."""
+    dd = tmp_path / "disaggregated"
+    dd.mkdir()
+    (dd / "slurm_ct_precheck_gate.sh").write_text(
+        "run_cache_transceiver_precheck() { :; }\n\n\nrun_cache_transceiver_precheck\n"
+    )
+    draft = str(dd / "slurm_launch_draft.sh")
+    got = pcfg.gate_library_content(draft, str(tmp_path))
+    assert "run_cache_transceiver_precheck()" in got
+    assert got.endswith("\n") and "\n\n" not in got  # blank lines stripped
+
+    # external draft -> fall back to <llm_src>/jenkins/.../slurm_ct_precheck_gate.sh
+    repo = tmp_path / "repo"
+    gate2 = repo / "jenkins" / "scripts" / "perf" / "disaggregated" / "slurm_ct_precheck_gate.sh"
+    gate2.parent.mkdir(parents=True)
+    gate2.write_text("echo hi\n")
+    assert pcfg.gate_library_content("/nowhere/draft.sh", str(repo)) == "echo hi\n"
+
+    with pytest.raises(FileNotFoundError):
+        pcfg.gate_library_content("/nowhere/draft.sh", str(tmp_path / "empty"))
+
+
 def test_rid_tags_dense_within_session():
     """The C++ notification tag is rid & 0xFFF: rids must be dense within a
     (ctx, gen) session so tags cannot alias across reps/lengths."""
@@ -419,7 +469,7 @@ class TestMultiPeerOrchestration:
         runner._calls = calls
         return runner
 
-    def _run(self, tmp_path, monkeypatch, fail_ctx1=False):
+    def _run(self, tmp_path, monkeypatch, fail_ctx_idx=None):
         import threading
 
         monkeypatch.setenv("SLURM_JOB_ID", "777")
@@ -443,7 +493,10 @@ class TestMultiPeerOrchestration:
 
         gen = self._mk_runner("gen", 0, plan, work, monkeypatch)
         ctxs = [
-            self._mk_runner("ctx", i, plan, work, monkeypatch, fail_ctx=(fail_ctx1 and i == 1))
+            self._mk_runner(
+                "ctx", i, plan, work, monkeypatch,
+                fail_ctx=(fail_ctx_idx is not None and i == fail_ctx_idx),
+            )
             for i in range(2)
         ]
 
@@ -485,8 +538,10 @@ class TestMultiPeerOrchestration:
             assert c._calls["waves"] == total_waves
             assert [x["status"] for x in c.recorder.cases] == ["PASS"]
 
-    def test_ctx_failure_isolated(self, tmp_path, monkeypatch):
-        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_ctx1=True)
+    def test_ctx_failure_last_peer(self, tmp_path, monkeypatch):
+        # The failing pair is driven LAST: the earlier healthy peer already
+        # completed, so there is nothing left to fail-fast/skip.
+        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_ctx_idx=1)
         # gen side: healthy peer unaffected, failing peer gets a clear verdict
         by_peer = {c["peer"]: c["status"] for c in gen.recorder.cases}
         assert by_peer == {"ctx_0": "PASS", "ctx_1": "TRANSFER_ERROR"}
@@ -494,6 +549,104 @@ class TestMultiPeerOrchestration:
         assert ("gen_0", "_TransferError") in failures
         # ctx_0 served its full schedule and got the deferred done
         assert [c["status"] for c in ctxs[0].recorder.cases] == ["PASS"]
+
+    def test_fail_fast_skips_remaining(self, tmp_path, monkeypatch):
+        # The FIRST-driven pair fails: the remaining pair must be skipped
+        # (not tested against a fabric already known bad), and told to abort
+        # so it tears down promptly instead of waiting out its handshake alarm.
+        plan, gen, ctxs, failures = self._run(tmp_path, monkeypatch, fail_ctx_idx=0)
+        by_peer = {c["peer"]: c["status"] for c in gen.recorder.cases}
+        assert by_peer == {"ctx_0": "TRANSFER_ERROR", "ctx_1": "SKIP"}
+        # ctx_1 never ran a single transfer wave: fail-fast reached it first.
+        assert ctxs[1]._calls["waves"] == 0
+        # ctx_1 recorded a non-failing SKIP (its driver aborted the session).
+        assert [c["status"] for c in ctxs[1].recorder.cases] == ["SKIP"]
+        # the shared, job-stamped abort flag was dropped.
+        assert rp.abort_flag_reason(str(tmp_path)) is not None
+        # SKIP does not count toward the overall verdict; only ctx_0 failed.
+        assert [c["peer"] for c in gen.recorder.failed_cases()] == ["ctx_0"]
+
+    def test_abort_flag_stale_job_ignored(self, tmp_path, monkeypatch):
+        # A flag left by a previous run (different SLURM_JOB_ID) in a reused
+        # work dir must not fail-fast a fresh run -- same staleness rule as
+        # addr files.
+        monkeypatch.setenv("SLURM_JOB_ID", "111")
+        rp.raise_abort_flag(str(tmp_path), "old run failure")
+        assert rp.abort_flag_reason(str(tmp_path)) == "old run failure"
+        monkeypatch.setenv("SLURM_JOB_ID", "222")
+        assert rp.abort_flag_reason(str(tmp_path)) is None
+
+
+def test_ctx_run_wave_missing_params_broadcast(tmp_path, monkeypatch):
+    """#4 regression: the "missing context_phase_params" verdict is computed
+    only on the instance leader (only it holds the gathered params), so it must
+    be broadcast -- otherwise a NON-leader rank keeps reason=None, returns, and
+    enters the next collective while the leader raises, deadlocking the step
+    until the watchdog SIGKILLs it (misreported as TIMEOUT).
+
+    Run the real ctx_run_wave on a non-leader rank: with the leader's verdict
+    delivered via bcast the rank must raise; with a clean (None) broadcast it
+    must return normally.
+    """
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "mpi4py", types.SimpleNamespace(MPI=None))
+    # ctx_run_wave imports tensorrt_llm only for logger.info, never reached with
+    # no owned pairs; a stub keeps the test pure-CPU.
+    monkeypatch.setitem(
+        sys.modules,
+        "tensorrt_llm",
+        types.SimpleNamespace(logger=types.SimpleNamespace(info=lambda *a, **k: None)),
+    )
+
+    class _NonLeaderComm:
+        def __init__(self, bcast_ret):
+            self._bcast_ret = bcast_ret
+
+        def Get_rank(self):
+            return 1  # non-leader (leader is rank 0)
+
+        def Get_size(self):
+            return 2
+
+        def allgather(self, obj):
+            return ["", ""]  # no local send error on any rank
+
+        def gather(self, obj, root=0):
+            return None  # only the leader receives the gathered params
+
+        def bcast(self, obj, root=0):
+            return self._bcast_ret  # the leader's verdict reaching this rank
+
+    plan = pcfg.resolve_plan(
+        _disagg_yaml(
+            cache_transceiver_precheck={
+                "request_lengths": [32],
+                "num_requests": 1,
+                "warmup_requests": 1,
+                "wireup_timeout_s": 0,
+            }
+        )
+    )
+    side = pcfg.side_plan(plan, "ctx")
+    args = types.SimpleNamespace(server_idx=0, work_dir=str(tmp_path))
+
+    def _mk(bcast_ret):
+        r = rp.PrecheckRunner(args, plan, side, _NonLeaderComm(bcast_ret))
+        r.mapping = types.SimpleNamespace(pp_rank=1, tp_rank=1)  # unused non-leader
+        r._owned = lambda wave: []  # skip the GPU send path; verdict arrives via bcast
+        return r
+
+    # leader broadcast a missing-params verdict -> the non-leader raises it too
+    with pytest.raises(rp._TransferError, match="missing context_phase_params"):
+        _mk("missing context_phase_params for pairs [0]").ctx_run_wave(
+            peer_idx=0, li=0, req_len=32, rep=0, wave=[0]
+        )
+
+    # leader broadcast None (all good) -> the non-leader returns cleanly
+    params, reqs = _mk(None).ctx_run_wave(peer_idx=0, li=0, req_len=32, rep=0, wave=[0])
+    assert params == {} and reqs == {}
 
 
 def test_status_env_snapshot_excludes_nixl(tmp_path, monkeypatch):

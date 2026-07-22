@@ -112,12 +112,15 @@ run_cache_transceiver_precheck() {
     precheckDir="$testOutputDir/cache_transceiver_precheck"
     mkdir -p "$precheckDir/logs"
     # A reused work dir (Slurm requeue reruns this batch script with the same
-    # directories) may hold a previous run's rendezvous/status files: stale
-    # addr files would point gen leaders at dead ports, and stale status
-    # files would pollute the verdict aggregation below. The driver also
-    # job-id-stamps addr files as a second line of defense.
+    # directories) may hold a previous run's rendezvous/status/csv files: stale
+    # addr files would point gen leaders at dead ports, stale status files would
+    # pollute the verdict aggregation below, and stale bandwidth CSVs (the
+    # Python transceiver's perf_<uuid>_<rank>.csv are per-run and appended)
+    # would make parse_python_bandwidth_gbps median over two runs' samples. The
+    # driver also job-id-stamps addr files as a second line of defense.
     rm -f "$precheckDir"/rendezvous/*.addr "$precheckDir"/status/*.status \
         "$precheckDir"/status/*.json 2>/dev/null || true
+    rm -rf "$precheckDir"/csv 2>/dev/null || true
     precheckPids=()
     precheckNames=()
     # ct_launch_step <role> <idx> <nodes> <gpusPerNode> <nodeList> <pytestCmd>
@@ -162,6 +165,14 @@ run_cache_transceiver_precheck() {
         ct_write_junit_xml
         cleanup_on_failure "Cache transceiver precheck failed. See summary above and $precheckDir"
     fi
-    echo "Cache transceiver precheck PASSED:"
-    cat "$precheckDir"/status/*.status 2>/dev/null || true
+    # No status files means every step took the skip path (e.g. the yaml has no
+    # cache_transceiver_config.backend): the run wrote no verdicts, so report it
+    # as SKIPPED rather than an empty "PASSED" that reads like real validation.
+    if ls "$precheckDir"/status/*.status >/dev/null 2>&1; then
+        echo "Cache transceiver precheck PASSED:"
+        cat "$precheckDir"/status/*.status 2>/dev/null || true
+    else
+        echo "Cache transceiver precheck SKIPPED: not applicable for this config" \
+            "(no verdicts written; see $precheckDir/logs)"
+    fi
 }

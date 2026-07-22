@@ -514,6 +514,46 @@ def wait_for_addr(path, timeout_s):
     raise _Timeout(f"rendezvous file {path} not published within {timeout_s}s")
 
 
+def abort_flag_path(work_dir):
+    return os.path.join(work_dir, "precheck.abort")
+
+
+def raise_abort_flag(work_dir, reason):
+    """Fail-fast signal, shared across instances through the work dir: the
+    first peer failure (in ANY ctx/gen instance) drops this file so the others
+    stop starting new sessions instead of each re-discovering the dead fabric
+    on its own. Best-effort and write-once. Stamped with the job id so a stale
+    flag in a reused work dir (Slurm requeue) is ignored, like addr files."""
+    path = abort_flag_path(work_dir)
+    if abort_flag_reason(work_dir) is not None:
+        return
+    try:
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(
+                {"reason": (reason or "peer failure").splitlines()[0][:400], "job": run_token()},
+                f,
+            )
+        os.replace(tmp, path)
+    except OSError:
+        pass  # best-effort: a missed flag only costs the usual per-peer timeout
+
+
+def abort_flag_reason(work_dir):
+    """The reason recorded by the first failing peer of THIS run, or None. A
+    flag stamped with another job id is stale (reused work dir) and ignored."""
+    try:
+        with open(abort_flag_path(work_dir)) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    expect_job = run_token()
+    stamped = payload.get("job", "")
+    if expect_job and stamped and stamped != expect_job:
+        return None
+    return payload.get("reason") or "peer failure"
+
+
 # --------------------------------------------------------------------------- #
 # Status recording
 # --------------------------------------------------------------------------- #
@@ -792,12 +832,19 @@ class PrecheckRunner:
         )
         gathered = self.comm.gather(contrib, root=0)
         params_by_pair = {}
-        if self.is_leader and reason is None:
+        if self.is_leader:
             for d in gathered:
                 params_by_pair.update(d or {})
-            missing = [p for p in wave if p not in params_by_pair]
-            if missing:
-                reason = f"missing context_phase_params for pairs {missing}"
+            if reason is None:
+                missing = [p for p in wave if p not in params_by_pair]
+                if missing:
+                    reason = f"missing context_phase_params for pairs {missing}"
+        # The missing-params check runs only on the leader (only it holds the
+        # gathered params). Broadcast the verdict so EVERY rank raises together:
+        # otherwise the leader raises here while the other ranks return and enter
+        # ctx_finish_wave's collective, the collective sequence diverges, and the
+        # step deadlocks until the watchdog SIGKILLs it (misreported as TIMEOUT).
+        reason = self.comm.bcast(reason, root=0)
 
         if reason is not None:
             self._free_all(reqs)
@@ -1011,6 +1058,9 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
         arm(f"gen_{peer_idx} len={req_len} rep={rep}", seconds=wave_timeout_s(plan, li, rep))
         msg = leader_recv()
         if msg[0] == "abort":
+            # Ack so the gen's REQ send/recv completes (fail-fast teardown
+            # sends this in place of the schedule; see gen_abort_peer).
+            leader_reply(("aborted", {}))
             raise _PeerAbort(f"gen_{peer_idx} aborted: {msg[1]}")
         if msg[0] != "go" or (msg[1]["li"], msg[1]["rep"]) != (li, rep):
             raise _TransferError(
@@ -1039,20 +1089,19 @@ def ctx_serve_peer(runner, sock, peer_idx, arm, disarm, key):
     disarm()
 
 
-def gen_run_peer(runner, peer_idx, arm, disarm):
-    """Run the full schedule against ctx server `peer_idx`.
+def _gen_open_session(runner, peer_idx, arm):
+    """Rendezvous with ctx server `peer_idx` and complete the hello/welcome
+    handshake; return (sock, key) on an OPEN REQ socket.
 
-    Returns (sock, key) with the session STILL OPEN on success -- the caller
-    sends the deferred "done" only after every ctx peer's schedule finished,
-    keeping all ctx instances alive for the whole precheck (real-serving
-    lifecycle; see ctx_serve_peer). On failure the socket is closed here.
+    Shared by gen_run_peer (runs the schedule) and gen_abort_peer (sends an
+    early abort for fail-fast). Rendezvous reaches instance-wide consensus via
+    bcast: if only the leader raised, the other ranks would deadlock in the
+    next bcast. The socket is closed here if the handshake itself fails.
     """
     plan = runner.plan
     comm = runner.comm
     hello_s = hello_timeout_s(plan, runner.side["num_peers"])
 
-    # Rendezvous with instance-wide consensus: if only the leader raised here,
-    # the other ranks would deadlock in the next bcast.
     sock, key, err = None, None, None
     arm(f"rendezvous ctx_{peer_idx}", seconds=hello_s)
     if runner.is_leader:
@@ -1086,6 +1135,24 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
         if reply[0] != "welcome":
             raise _TransferError(f"unexpected handshake reply from ctx_{peer_idx}: {reply[:1]}")
+        return sock, key
+    except BaseException:
+        if sock is not None:
+            sock.close(linger=0)
+        raise
+
+
+def gen_run_peer(runner, peer_idx, arm, disarm):
+    """Run the full schedule against ctx server `peer_idx`.
+
+    Returns (sock, key) with the session STILL OPEN on success -- the caller
+    sends the deferred "done" only after every ctx peer's schedule finished,
+    keeping all ctx instances alive for the whole precheck (real-serving
+    lifecycle; see ctx_serve_peer). On failure the socket is closed here.
+    """
+    plan = runner.plan
+    sock, key = _gen_open_session(runner, peer_idx, arm)
+    try:
         # Established sessions are dedicated: wave replies are prompt. The
         # ZMQ timeout is only a backstop under the per-wave alarm, so it
         # includes the first-rep wire-up allowance unconditionally.
@@ -1123,6 +1190,21 @@ def gen_run_peer(runner, peer_idx, arm, disarm):
         if sock is not None:
             sock.close(linger=0)
         raise
+
+
+def gen_abort_peer(runner, peer_idx, reason, arm, disarm):
+    """Fail-fast teardown of a not-yet-run ctx peer: open the session and tell
+    it to abort (it is blocked awaiting our hello), so it stops promptly
+    instead of waiting out the handshake alarm. Best-effort; always closes."""
+    sock = None
+    try:
+        sock, key = _gen_open_session(runner, peer_idx, arm)
+        arm(f"abort ctx_{peer_idx}", seconds=hello_timeout_s(runner.plan, runner.side["num_peers"]))
+        runner._leader_send_recv(sock, ("abort", f"peer fail-fast: {reason}"), key)
+        disarm()
+    finally:
+        if sock is not None:
+            sock.close(linger=0)
 
 
 def gen_release_peer(runner, peer_idx, sock, key, arm, disarm):
@@ -1220,19 +1302,21 @@ def _install_watchdog(runner, plan, rank):
 
 
 def _make_peer_failure_recorder(runner, disarm, current_cell):
-    """Exception -> verdict mapping shared by all per-peer loops (isolation:
-    one bad peer never stops the others)."""
+    """Exception -> verdict mapping shared by all per-peer loops. Recording a
+    failure also drops the fail-fast flag so the remaining peers (here and in
+    the other instances) are skipped instead of tested against a fabric
+    already known bad -- see _drive_ctx_peers / raise_abort_flag."""
 
     def record_peer_failure(peer, exc):
         disarm()
         if isinstance(exc, _Timeout):
-            runner.recorder.record(
-                peer, 0, "TIMEOUT", f"exceeded the budget during {current_cell['what']}"
-            )
+            status, reason = "TIMEOUT", f"exceeded the budget during {current_cell['what']}"
         elif isinstance(exc, _PeerAbort):
-            runner.recorder.record(peer, 0, "TRANSFER_ERROR", str(exc))
+            status, reason = "TRANSFER_ERROR", str(exc)
         else:
-            runner.recorder.record(peer, 0, "TRANSFER_ERROR", repr(exc))
+            status, reason = "TRANSFER_ERROR", repr(exc)
+        runner.recorder.record(peer, 0, status, reason)
+        raise_abort_flag(runner.work_dir, f"{peer} {status}: {reason}")
 
     return record_peer_failure
 
@@ -1263,6 +1347,15 @@ def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
         try:
             ctx_serve_peer(runner, socks.get(gj), gj, arm, disarm, keys.get(gj))
             runner.recorder.record(f"gen_{gj}", 0, "PASS", "served all transfers")
+        except _PeerAbort as e:
+            # A gen driver that failed elsewhere aborts our session as part of
+            # fail-fast: record a (non-failing) SKIP, not our own failure --
+            # the real failure is recorded by whoever hit it. Absent the flag,
+            # a genuine peer abort is still a real failure.
+            if abort_flag_reason(runner.work_dir) is not None:
+                runner.recorder.record(f"gen_{gj}", 0, "SKIP", f"aborted by fail-fast: {e}")
+            else:
+                record_peer_failure(f"gen_{gj}", e)
         except Exception as e:  # noqa: BLE001 - per-peer isolation
             record_peer_failure(f"gen_{gj}", e)
 
@@ -1270,16 +1363,30 @@ def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
 def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
     """gen role: run every ctx peer's schedule, then release all sessions.
 
-    The release ("done") is deferred until EVERY peer's schedule finished, so
-    all ctx instances stay alive for the whole precheck -- matching real
-    serving, where no transceiver ever holds connections to a dead agent
-    while transfers are still running."""
+    Fail-fast: once any pair has failed (this instance or another -- signalled
+    through the work-dir abort flag), the remaining ctx peers are not tested;
+    each is told to abort so it tears down promptly rather than waiting out its
+    handshake alarm. Sessions that already succeeded still get their deferred
+    "done" (below) so those ctx instances shut down cleanly.
+
+    The release ("done") is deferred until EVERY driven peer's schedule
+    finished, so those ctx instances stay alive for the whole precheck --
+    matching real serving, where no transceiver ever holds connections to a
+    dead agent while transfers are still running."""
     open_sessions = []
     for ci in range(runner.side["num_peers"]):
+        reason = abort_flag_reason(runner.work_dir)
+        if reason is not None:
+            try:
+                gen_abort_peer(runner, ci, reason, arm, disarm)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            runner.recorder.record(f"ctx_{ci}", 0, "SKIP", f"fail-fast: {reason}")
+            continue
         try:
             sock, sess_key = gen_run_peer(runner, ci, arm, disarm)
             open_sessions.append((ci, sock, sess_key))
-        except Exception as e:  # noqa: BLE001 - per-peer isolation
+        except Exception as e:  # noqa: BLE001 - failure sets the fail-fast flag
             record_peer_failure(f"ctx_{ci}", e)
     for ci, sock, sess_key in open_sessions:
         try:
