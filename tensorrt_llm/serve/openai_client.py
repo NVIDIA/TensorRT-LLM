@@ -331,8 +331,14 @@ class OpenAIHttpClient(OpenAIClient):
         transient_tcp_budget = 5
         loop_max = max(self._max_retries, transient_tcp_budget) + 1
         for attempt in range(loop_max):
-            # Regenerate disagg_request_id on retry to avoid ID collision on workers
-            if attempt > 0 and self._disagg_id_generator is not None:
+            # Context retries represent a new transfer attempt and need a fresh
+            # ID. A generation retry must keep the ID shared with its existing
+            # context response.
+            if (
+                attempt > 0
+                and self._role != ServerRole.GENERATION
+                and self._disagg_id_generator is not None
+            ):
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = await self._disagg_id_generator()
@@ -426,8 +432,16 @@ class OpenAIHttpClient(OpenAIClient):
                     e,
                     (aiohttp.ServerDisconnectedError, ConnectionResetError),
                 )
+                is_pre_connect_failure = isinstance(e, aiohttp.ClientConnectorError)
                 effective_max = self._max_retries
-                if is_transient_tcp:
+                if self._role == ServerRole.GENERATION and not is_pre_connect_failure:
+                    # A generation POST is not idempotent once it may have been
+                    # accepted. It also cannot regenerate disagg_request_id:
+                    # the context transfer remains registered under the
+                    # original shared ID. Retry only failures which prove that
+                    # the connection was never established.
+                    effective_max = 0
+                elif is_transient_tcp:
                     effective_max = max(self._max_retries, transient_tcp_budget)
                 if attempt >= effective_max:
                     logger.error(

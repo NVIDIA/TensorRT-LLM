@@ -53,6 +53,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <random>
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
@@ -115,6 +116,7 @@ public:
         std::unique_lock lock(mMutex);
         mReadySignal = isReady;
         mReadySignalObserved = true;
+        mReadySignalsSent.push_back(isReady);
         mConditionVariable.notify_all();
         mConditionVariable.wait(lock, [this] { return mReleaseReadySignal; });
     }
@@ -167,6 +169,18 @@ public:
         return mReadySignal;
     }
 
+    bool waitForReadySignalCount(std::size_t count, std::chrono::milliseconds timeout) const
+    {
+        std::unique_lock lock(mMutex);
+        return mConditionVariable.wait_for(lock, timeout, [this, count] { return mReadySignalsSent.size() >= count; });
+    }
+
+    std::deque<bool> getReadySignals() const
+    {
+        std::scoped_lock lock(mMutex);
+        return mReadySignalsSent;
+    }
+
     void releaseReadySignal()
     {
         {
@@ -198,6 +212,7 @@ private:
     mutable bool mReadySignalObserved{false};
     mutable bool mReadySignal{false};
     mutable bool mReleaseReadySignal{false};
+    mutable std::deque<bool> mReadySignalsSent;
     mutable std::size_t mReadySignalReceiveCalls{0};
     mutable std::deque<bool> mReadySignalsToReceive;
 };
@@ -826,6 +841,51 @@ TEST_F(SymmetricalCacheTest, DefaultOffDoesNotCancelPartialAsymmetricHandshake)
     ASSERT_EQ(future.wait_for(std::chrono::seconds{10}), std::future_status::ready);
     EXPECT_NO_THROW(future.get());
     removeRequestFromCache(request);
+}
+
+TEST_F(SymmetricalCacheTest, LateTerminalRequestInfoIsRejectedWithoutBlockingNextRequest)
+{
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+
+    ControlledConnectionManager connectionManager;
+    connectionManager.getConnection().releaseReadySignal();
+    auto sender = makeControlledSender(connectionManager);
+    std::shared_ptr<LlmRequest> firstRequest{makeLlmRequest(17)};
+    addRequestToCache(firstRequest);
+    auto const firstRequestInfo = makeControlledRequestInfo(firstRequest->mRequestId, connectionManager);
+    auto firstFuture = sender->sendAsync(firstRequest);
+    connectionManager.publishRequestInfo(firstRequestInfo);
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(1, std::chrono::seconds{10}));
+    ASSERT_EQ(firstFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(firstFuture.get());
+    removeRequestFromCache(firstRequest);
+
+    // A queued live response wakes the sender. Finalized replay peers are
+    // rejected without consuming that response or poisoning the next transfer.
+    connectionManager.publishRequestInfo(firstRequestInfo);
+    std::shared_ptr<LlmRequest> nextRequest{makeLlmRequest(18)};
+    addRequestToCache(nextRequest);
+    auto nextFuture = sender->sendAsync(nextRequest);
+
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(2, std::chrono::seconds{10}));
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(3, std::chrono::seconds{10}));
+    connectionManager.publishRequestInfo(firstRequestInfo);
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(3, std::chrono::seconds{10}));
+    EXPECT_TRUE(connectionManager.waitForRecvConnectCalls(4, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{true, false, false}));
+
+    connectionManager.publishRequestInfo(makeControlledRequestInfo(nextRequest->mRequestId, connectionManager));
+
+    EXPECT_TRUE(connectionManager.getConnection().waitForReadySignalCount(4, std::chrono::seconds{10}));
+    EXPECT_EQ(connectionManager.getConnection().getReadySignals(), (std::deque<bool>{true, false, false, true}));
+    ASSERT_EQ(nextFuture.wait_for(std::chrono::seconds{10}), std::future_status::ready);
+    EXPECT_NO_THROW(nextFuture.get());
+    removeRequestFromCache(nextRequest);
 }
 
 TEST_F(SymmetricalCacheTest, DefaultOffReceiverDoesNotCancelQueuedRequest)

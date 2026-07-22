@@ -312,6 +312,8 @@ public:
     [[nodiscard]] CommState const& getCommState() const override;
     AgentConnection const* recvConnectionAndRequestInfo(
         batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
+    AgentConnection const* tryRecvConnectionAndRequestInfo(
+        batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] std::vector<batch_manager::BaseTransBufferManager*> const& getCacheTransBufferManagers() const;
     [[nodiscard]] std::vector<uint8_t> const& getBufferKinds() const;
     void updateUnhandledNotifications();
@@ -331,6 +333,8 @@ public:
     [[nodiscard]] bool isRunning() const override;
 
 private:
+    AgentConnection const* recvConnectionAndRequestInfoImpl(
+        batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag, bool waitForRequest);
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
     /// Connection info for dynamically discovered agents that are not listed in mCommState.

@@ -558,10 +558,9 @@ class TestDisaggIdRegenOnRetry:
 class TestSelectiveTransientTcpRetry:
     """Selective retry budget for transient TCP race symptoms.
 
-    ServerDisconnectedError and ConnectionResetError (which include
-    aiohttp.ClientConnectionResetError via MRO) get an extended retry budget
-    of up to 5 attempts; all other client errors keep the original
-    max_retries fail-fast behaviour.
+    Context requests retain the extended retry budget. Generation requests
+    retry only failures which prove the connection was not established, while
+    preserving the transfer ID shared with the one-shot context response.
     """
 
     def _ok_response(self):
@@ -583,7 +582,7 @@ class TestSelectiveTransientTcpRetry:
         response.__aexit__ = AsyncMock()
         return response
 
-    def _make_client(self, session, max_retries=1):
+    def _make_client(self, session, max_retries=1, role=ServerRole.CONTEXT, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -594,22 +593,94 @@ class TestSelectiveTransientTcpRetry:
         router.finish_request = AsyncMock()
         return OpenAIHttpClient(
             router=router,
-            role=ServerRole.CONTEXT,
+            role=role,
             timeout_secs=10,
             max_retries=max_retries,
             retry_interval_sec=0,
             session=session,
+            **kwargs,
         )
 
-    def _make_request(self):
+    def _make_request(self, request_type="context_only"):
+        if request_type == "generation_only":
+            disaggregated_params = DisaggregatedParams(
+                request_type=request_type,
+                first_gen_tokens=[123],
+                ctx_request_id=23,
+                disagg_request_id=23,
+            )
+        else:
+            disaggregated_params = DisaggregatedParams(
+                request_type=request_type, disagg_request_id=1
+            )
         return CompletionRequest(
             model="m",
             prompt="hi",
             stream=False,
-            disaggregated_params=DisaggregatedParams(
-                request_type="context_only", disagg_request_id=1
-            ),
+            disaggregated_params=disaggregated_params,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ServerDisconnectedError(),
+            ConnectionResetError("connection reset"),
+            aiohttp.ClientError("ambiguous client failure"),
+        ],
+        ids=[
+            "server-disconnected",
+            "connection-reset",
+            "generic-client-error",
+        ],
+    )
+    async def test_generation_client_failure_is_not_retried(self, error):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        id_generator = AsyncMock(return_value=24)
+        client = self._make_client(
+            session,
+            max_retries=5,
+            role=ServerRole.GENERATION,
+            disagg_id_generator=id_generator,
+        )
+        request = self._make_request("generation_only")
+        session.post.side_effect = [error, self._mock_http_ok(self._ok_response())]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with pytest.raises(type(error)):
+                await client.send_request(request)
+
+        assert session.post.call_count == 1
+        sleep.assert_not_awaited()
+        id_generator.assert_not_awaited()
+        assert request.disaggregated_params.ctx_request_id == 23
+        assert request.disaggregated_params.disagg_request_id == 23
+
+    @pytest.mark.asyncio
+    async def test_generation_pre_connect_failure_retries_with_original_id(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        id_generator = AsyncMock(return_value=24)
+        client = self._make_client(
+            session,
+            max_retries=5,
+            role=ServerRole.GENERATION,
+            disagg_id_generator=id_generator,
+        )
+        request = self._make_request("generation_only")
+        session.post.side_effect = [
+            aiohttp.ClientConnectorError(MagicMock(), ConnectionRefusedError("connection refused")),
+            self._mock_http_ok(self._ok_response()),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep:
+            response = await client.send_request(request)
+
+        assert isinstance(response, CompletionResponse)
+        assert session.post.call_count == 2
+        sleep.assert_awaited_once()
+        id_generator.assert_not_awaited()
+        assert request.disaggregated_params.ctx_request_id == 23
+        assert request.disaggregated_params.disagg_request_id == 23
 
     @pytest.mark.asyncio
     async def test_server_disconnected_gets_extra_retries(self):
