@@ -167,7 +167,6 @@ def build_google_tests(request, build_type):
         use_ccache=True,
         clean=True,
         generator="Ninja",
-        trt_root="/usr/local/tensorrt",
         nixl_root="/opt/nvidia/nvda_nixl",
         skip_building_wheel=True,
         extra_make_targets=["google-tests"],
