@@ -2276,6 +2276,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Shape: batch_size, beam_width, max_seq_len
            Usage: Per-token log-probs of the CBA path snapshots (the C++
            logProbsCBA analog). Only maintained for early_stopping != 1."""
+        cba_caps: torch.Tensor
+        """Shape: (max_num_sequences,), dtype int32 — per-slot CBA capacity
+           (the request's maximum beam width; C++ nBM)."""
 
     @dataclass(kw_only=True)
     class LogProbsStore:
@@ -2443,6 +2446,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             cba_log_probs = torch.zeros(
                 self.CACHE_INDIRECTION_SHAPE, device="cuda", dtype=torch.float32
             )
+            cba_caps = int_tensor((self.max_num_sequences,))
             beam_search_store = self.BeamSearchStore(
                 cache_indirection=cache_indirection,
                 cache_indirection_buffer=cache_indirection_buffer,
@@ -2461,6 +2465,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 batch_dones=batch_dones,
                 original_log_probs=original_log_probs,
                 cba_log_probs=cba_log_probs,
+                cba_caps=cba_caps,
             )
         # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
         # sampler instances; only slots in self._top_p_decay_slots are ever read.
@@ -3143,20 +3148,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     raise ValueError(
                         "Beam search only supports returning the sampled logprob per token"
                     )
-            early_stopping = _unwrap_singleton(
-                cast(Optional[list[int]], request.sampling_config.early_stopping)
-            )
             # early_stopping == 1 (default) is served by the frozen-slot path
-            # (stopping once all beam slots hold finished beams is equivalent).
-            # The exhaustive modes are served by the candidate-beams-array path
-            # (see beam_search_sampling_batch_cba), which does not support the
-            # combinations rejected below yet.
-            if early_stopping is not None and early_stopping != 1:
-                if request.sampling_config.beam_width_array is not None:
-                    raise ValueError(
-                        "Beam search with early_stopping != 1 does not support "
-                        "variable beam width yet"
-                    )
+            # (stopping once all beam slots hold finished beams is equivalent);
+            # the exhaustive modes by the candidate-beams-array path (see
+            # beam_search_sampling_batch_cba).
 
     @override
     @nvtx_range("setup_sampler_step")
@@ -3199,8 +3194,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_lens = self._finish_reasons_handler.new_max_lens
         end_ids = self._finish_reasons_handler.new_end_ids
         prompt_lens = [request.py_prompt_len for request in new_requests]
+        beam_caps = [request.py_beam_width for request in new_requests]
         # Perform updates to the stores
-        full_list = [seq_slots, max_lens, end_ids, prompt_lens]
+        full_list = [seq_slots, max_lens, end_ids, prompt_lens, beam_caps]
         # perform only a single copy
         full_list_tensor_host = torch.tensor(
             full_list, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
@@ -3211,6 +3207,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_lens_tensor_cuda = full_list_tensor_cuda[1]
         end_ids_tensor_cuda = full_list_tensor_cuda[2]
         prompt_lens_tensor_cuda = full_list_tensor_cuda[3]
+        beam_caps_tensor_cuda = full_list_tensor_cuda[4]
 
         # Cast to int64 once for downstream ``index_copy_`` / ``index_fill_`` calls.
         seq_slots_tensor_cuda_long = seq_slots_tensor_cuda.long()
@@ -3236,6 +3233,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 seq_slots_long=seq_slots_tensor_cuda_long,
                 max_prompt_len=max_prompt_len,
                 prompt_lens_cuda=prompt_lens_tensor_cuda,
+                beam_caps_cuda=beam_caps_tensor_cuda,
             )
 
     def _setup_top_p_decay_for_new_requests(
@@ -3345,6 +3343,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots_long: torch.Tensor,
         max_prompt_len: int,
         prompt_lens_cuda: torch.Tensor,
+        beam_caps_cuda: torch.Tensor,
     ) -> None:
         """Prepare the beam search buffers for the requests
 
@@ -3373,6 +3372,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store.batch_dones.index_fill_(0, seq_slots_long, False)
         beam_search_store.original_log_probs.index_fill_(0, seq_slots_long, 0)
         beam_search_store.cba_log_probs.index_fill_(0, seq_slots_long, 0)
+        beam_search_store.cba_caps.index_copy_(0, seq_slots_long, beam_caps_cuda)
 
     @torch.inference_mode()
     def _process_draft_tokens_rejection_sampling(
@@ -3608,22 +3608,29 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         slot = request.py_seq_slot
         assert slot is not None
 
+        # Active beams currently in the slots: the input width of the current
+        # step (== num_beams except for variable-beam-width requests).
+        active_width = _get_beam_width_in(request)
         cache_indirection = d2h_copier(
-            store.cache_indirection[slot, :num_beams, prompt_length:num_tokens]
+            store.cache_indirection[slot, :active_width, prompt_length:num_tokens]
         )
-        current_path = d2h_copier(store.original_tokens[slot, :num_beams, prompt_length:num_tokens])
-        active_cum = d2h_copier(store.cum_log_probs[slot, :num_beams])
-        cba_tokens = d2h_copier(store.cba_tokens[slot, :num_beams])
-        cba_cum = d2h_copier(store.cba_cum_log_probs[slot, :num_beams])
-        cba_normed = d2h_copier(store.cba_normed_scores[slot, :num_beams])
-        cba_lengths = d2h_copier(store.cba_lengths[slot, :num_beams])
+        current_path = d2h_copier(
+            store.original_tokens[slot, :active_width, prompt_length:num_tokens]
+        )
+        active_cum = d2h_copier(store.cum_log_probs[slot, :active_width])
+        # The CBA pool spans the full store width; per-request capacity keeps
+        # entries beyond it at -inf.
+        cba_tokens = d2h_copier(store.cba_tokens[slot])
+        cba_cum = d2h_copier(store.cba_cum_log_probs[slot])
+        cba_normed = d2h_copier(store.cba_normed_scores[slot])
+        cba_lengths = d2h_copier(store.cba_lengths[slot])
         return_log_probs = request.py_return_log_probs
         cba_log_probs: torch.Tensor | None = None
         current_lp_path: torch.Tensor | None = None
         if return_log_probs:
-            cba_log_probs = d2h_copier(store.cba_log_probs[slot, :num_beams])
+            cba_log_probs = d2h_copier(store.cba_log_probs[slot])
             current_lp_path = d2h_copier(
-                store.original_log_probs[slot, :num_beams, prompt_length:num_tokens]
+                store.original_log_probs[slot, :active_width, prompt_length:num_tokens]
             )
 
         length_penalty = (
@@ -3641,6 +3648,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             active_normed = active_cum
             if length_penalty != 0.0:
                 active_normed = active_cum / float(num_generated_tokens) ** length_penalty
+            pool_width = cba_normed.size(0)
             all_normed = torch.cat([cba_normed, active_normed])
             order = torch.argsort(all_normed, descending=True)[:num_beams]
 
@@ -3653,14 +3661,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             width = max(num_generated_tokens, int(cba_lengths.max().item()))
             tokens = torch.full((num_beams, width), BEAM_SEARCH_PAD_TOKEN, dtype=torch.int32)
-            cum_logprobs = torch.empty((num_beams,), dtype=torch.float32)
+            cum_logprobs = torch.zeros((num_beams,), dtype=torch.float32)
             log_probs: torch.Tensor | None = None
             if return_log_probs:
                 log_probs = torch.zeros((num_beams, width), dtype=torch.float32)
             for out_idx, merged_idx in enumerate(order.tolist()):
-                if merged_idx < num_beams:  # CBA entry (always finite here: the
-                    # actives provide num_beams finite scores, so empty -inf CBA
-                    # entries can never be selected)
+                if not torch.isfinite(all_normed[merged_idx]):
+                    continue  # unreachable unless fewer finite candidates than
+                    # output beams (early termination edge); leaves a padded row
+                if merged_idx < pool_width:  # CBA entry
                     entry_len = int(cba_lengths[merged_idx].item())
                     tokens[out_idx, :entry_len] = cba_tokens[merged_idx, :entry_len]
                     cum_logprobs[out_idx] = cba_cum[merged_idx]
@@ -3668,7 +3677,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         assert cba_log_probs is not None
                         log_probs[out_idx, :entry_len] = cba_log_probs[merged_idx, :entry_len]
                 else:
-                    active_idx = merged_idx - num_beams
+                    active_idx = merged_idx - pool_width
                     tokens[out_idx, :num_generated_tokens] = active_path[active_idx]
                     cum_logprobs[out_idx] = active_cum[active_idx]
                     if log_probs is not None:
@@ -4005,6 +4014,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     stop_past_tokens=self._finish_reasons_handler.store.past_tokens_cuda,
                     original_log_probs=beam_search_store.original_log_probs,
                     cba_log_probs=beam_search_store.cba_log_probs,
+                    cba_caps=beam_search_store.cba_caps,
                     max_seq_len=self.max_seq_len,
                 )
             elif metadata_type is TopPDecayMetadata:

@@ -834,6 +834,26 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
 
+    def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
+        """Beam width of the current (or next) decoding step.
+
+        Overrides the C++ binding for Variable-Beam-Width-Search: the C++
+        implementation clamps the decoding-iteration index with the global
+        kMaxBeamWidthArrayLength constant (it assumes a padded array) and
+        reads past the end of the raw user array once decoding runs longer
+        than the array — returning garbage widths. Same formula, clamped
+        with the actual array length.
+        """
+        beam_width_array = self.sampling_config.beam_width_array
+        if beam_width_array is not None:
+            if beam_width_array and isinstance(beam_width_array[0],
+                                               (list, tuple)):
+                beam_width_array = beam_width_array[0]
+            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            index = max(min(iteration, len(beam_width_array)) - 1, 0)
+            return int(beam_width_array[index])
+        return super().get_beam_width_by_iter(for_next_iteration)
+
     def set_exclude_last_generation_logits(
             self, exclude_last_generation_logits: bool):
         self.py_result.set_exclude_last_generation_logits(

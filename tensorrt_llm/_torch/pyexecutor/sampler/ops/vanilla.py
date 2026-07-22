@@ -89,6 +89,10 @@ class BeamSearchMetadata(StrategyMetadata):
     """[max_num_sequences, max_beam_width] int32, generated lengths."""
     batch_dones: Optional[torch.Tensor] = None
     """[max_num_sequences] bool, per-slot beam-search termination verdict."""
+    cba_caps: Optional[torch.Tensor] = None
+    """[max_num_sequences] int32, per-slot CBA capacity (the request's
+    maximum beam width; C++ nBM). Differs from the step's beam_width_out for
+    variable-beam-width requests."""
     original_log_probs: Optional[torch.Tensor] = None
     """[max_num_sequences, max_beam_width, max_seq_len] float32, uncorrected
     per-slot sampled log-prob per step (log-prob analog of original_tokens;
@@ -192,6 +196,21 @@ def _update_cache_indirection_buffer(
 ) -> None:
     assert cache_indirection_input.device == cache_indirection_output.device
     cache_indirection_input.index_copy_(0, seq_slots, cache_indirection_output[seq_slots])
+
+
+def _pad_next_tokens(next_tokens: torch.Tensor, store_width: int) -> torch.Tensor:
+    """Pad a [batch, beam_width_out] token tensor to the store's beam width.
+
+    The batched sampling buffers are allocated at the maximum beam width; on
+    variable-beam-width steps the op produces fewer columns, and the padding
+    (BEAM_SEARCH_PAD_TOKEN) is never consumed — finalization rewrites all
+    beam tokens from the corrected paths.
+    """
+    if next_tokens.size(1) >= store_width:
+        return next_tokens
+    return torch.nn.functional.pad(
+        next_tokens, (0, store_width - next_tokens.size(1)), value=BEAM_SEARCH_PAD_TOKEN
+    )
 
 
 def beam_candidate_topk(
@@ -399,16 +418,16 @@ def beam_search_sampling_batch(
             )
         )
 
-    max_beam_width = beam_search_args.finished_beams.size(1)
     finished_beams = beam_search_args.finished_beams[beam_search_args.seq_slots].view(-1)
 
     offset_predecessor_beam = predecessor_beam + beam_search_args.seq_offsets[
         : predecessor_beam.size(0)
     ].unsqueeze(1)
     finished_beams = finished_beams[offset_predecessor_beam]
-    beam_search_args.finished_beams[beam_search_args.seq_slots] = finished_beams.view(
-        batch_size, max_beam_width
-    )
+    # Write only the beam_width_out columns produced this step: with variable
+    # beam width it can be smaller than the store width (the stale view() of
+    # the full width crashed on such steps).
+    beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_out] = finished_beams
 
     cache_indirection = beam_search_args.cache_indirection[
         beam_search_args.seq_slots, :beam_width_out
@@ -445,7 +464,7 @@ def beam_search_sampling_batch(
     beam_search_args.cum_log_probs[beam_search_args.seq_slots, :beam_width_out] = sorted_logprobs[
         :, :beam_width_out
     ]
-    return next_tokens, softmax
+    return _pad_next_tokens(next_tokens, beam_search_args.finished_beams.size(1)), softmax
 
 
 def beam_search_sampling_batch_cba(
@@ -503,6 +522,7 @@ def beam_search_sampling_batch_cba(
         and args.batch_dones is not None
         and args.original_log_probs is not None
         and args.cba_log_probs is not None
+        and args.cba_caps is not None
     ), "CBA metadata is required for early_stopping != 1"
     assert logits.dim() == 2, "logits should be 2D: [batch_size * beam_width, vocab_size]"
     batch_size, vocab_size = logits.size()
@@ -540,9 +560,13 @@ def beam_search_sampling_batch_cba(
     topk_fn = topk_fn or _torch_topk
     if not isinstance(diversity_rate, torch.Tensor) and not diversity_rate:
         diversity_rate = None
+    # Each source beam contributes at most one finite end-token candidate, so
+    # beam_width_in extra candidates on top of the slots to fill always leave
+    # >= num_beams active ones — also on narrowing variable-beam-width steps
+    # (beam_width_in > num_beams), where 2 * num_beams would not.
     cand_cum, cand_pred, cand_tok = beam_candidate_topk(
         logprobs,
-        beam_width_out=2 * num_beams,
+        beam_width_out=num_beams + max(num_beams, beam_width_in),
         diversity_rate=diversity_rate,
         source_beam_indices=args.beam_idx_arange,
         topk_fn=topk_fn,
@@ -555,6 +579,7 @@ def beam_search_sampling_batch_cba(
     # beam was harvested at once.
     is_end = (cand_tok == end_ids) & torch.isfinite(cand_cum)
     cand_rank = torch.arange(num_candidates, device=device).view(1, -1)
+    caps = args.cba_caps[slots].view(-1, 1)
 
     # --- Beam slots continue with the first K non-end candidates (>= K of
     # them exist among the 2K selected: at most one finite end-token
@@ -586,7 +611,7 @@ def beam_search_sampling_batch_cba(
     else:
         new_normed = cand_cum
     neg_inf = float("-inf")
-    eligible = is_end & (cand_rank < num_beams)
+    eligible = is_end & (cand_rank < caps)
     new_normed = new_normed.masked_fill(~eligible, neg_inf)
 
     # Snapshot candidate paths (generated tokens) through the cache
@@ -637,8 +662,14 @@ def beam_search_sampling_batch_cba(
         harvest_normed = harvest_cum
     harvest_normed = harvest_normed.masked_fill(~harvest_mask, neg_inf)
 
+    pool_width = args.cba_normed_scores.size(1)
     all_normed = torch.cat([args.cba_normed_scores[slots], new_normed, harvest_normed], dim=1)
-    top_normed, top_i = topk_fn(all_normed, num_beams)
+    top_normed, top_i = topk_fn(all_normed, pool_width)
+    # Enforce the per-request capacity (C++ nBM): entries ranked beyond it are
+    # dropped (kept as -inf so they never win a later merge or finalize).
+    top_normed = top_normed.masked_fill(
+        torch.arange(pool_width, device=device).view(1, -1) >= caps, neg_inf
+    )
     all_cum = torch.cat([args.cba_cum_log_probs[slots], cand_cum, harvest_cum], dim=1)
     all_len = torch.cat(
         [
@@ -662,7 +693,8 @@ def beam_search_sampling_batch_cba(
 
     # --- Done verdict (C++ batchDones): CBA full, and the best candidate's
     # attainable normalized score cannot beat the worst kept entry.
-    cba_full = top_normed[:, num_beams - 1] > neg_inf
+    min_kept = top_normed.gather(1, (caps - 1).long()).view(-1)
+    cba_full = min_kept > neg_inf
     best_cum = cand_cum[:, 0]
     if length_penalty is not None:
         if early_stopping != 0:
@@ -682,15 +714,18 @@ def beam_search_sampling_batch_cba(
         best_attainable = best_cum / bound_len.to(best_cum.dtype).pow(length_penalty)
     else:
         best_attainable = best_cum
-    done = cba_full & (top_normed[:, num_beams - 1] >= best_attainable)
+    done = cba_full & (min_kept >= best_attainable)
     args.batch_dones[slots] = done
     # Publish through the regular stop machinery: a done request has all its
     # beam slots marked finished (the slots themselves only ever carry active
     # beams in CBA mode, so this cannot clash with a real end-token finish).
     # NOT_FINISHED == 0, so the verdict maps directly onto the finish reason.
-    args.finished_beams[slots, :num_beams] = (
+    # Flood the full row: the stop criterion reads the first py_beam_width
+    # (== capacity) entries, which can exceed this step's beam_width_out for
+    # variable-beam-width requests.
+    args.finished_beams[slots] = (
         done.view(-1, 1).to(torch.int32) * FinishReason.END_ID.value
-    ).expand(-1, num_beams)
+    ).expand(-1, args.finished_beams.size(1))
 
     # --- Beam-slot state updates (same contract as beam_search_sampling_batch).
     args.predecessor_beams[slots, :num_beams] = slot_pred
@@ -732,7 +767,7 @@ def beam_search_sampling_batch_cba(
     )
     args.original_log_probs[slots, :num_beams] = olp
     args.cum_log_probs[slots, :num_beams] = slot_cum
-    return slot_tok, softmax
+    return _pad_next_tokens(slot_tok, args.finished_beams.size(1)), softmax
 
 
 def get_rejected_indices(
