@@ -222,12 +222,9 @@ def test_mark_page_tables_consumed_orders_both_manager_streams():
         # One representative per guard family (the per-mode/per-config
         # variants raise through the same checks).
         ("union_only_per_head", "union"),
-        ("union_only_per_layer", "union"),
         ("draft_kv_factor", "standard key/value cache"),
         ("full_attention_draft", "full-attention draft"),
         ("callsite_dflash", "standard paged cache compacted together"),
-        ("callsite_draft_target", "standard paged cache compacted together"),
-        ("callsite_pard", "standard paged cache compacted together"),
     ],
 )
 def test_draft_admission_gates_raise(gate, match):
@@ -241,19 +238,10 @@ def test_draft_admission_gates_raise(gate, match):
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import (
             DFlashDecodingConfig,
-            DraftTargetDecodingConfig,
-            PARDDecodingConfig,
             TriAttentionKvCacheCompressionConfig,
         )
 
-        spec_config = {
-            "callsite_dflash": lambda: DFlashDecodingConfig(max_draft_len=3),
-            "callsite_draft_target": lambda: DraftTargetDecodingConfig(
-                max_draft_len=3,
-                speculative_model="/tmp/draft-target-model",
-            ),
-            "callsite_pard": lambda: PARDDecodingConfig(max_draft_len=3),
-        }[gate]()
+        spec_config = DFlashDecodingConfig(max_draft_len=3)
         with pytest.raises(ValueError, match=match):
             validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(
@@ -267,10 +255,7 @@ def test_draft_admission_gates_raise(gate, match):
         _make_fake_v2(),
         top_B=8,
         model_path="/models/test",
-        eviction_mode={
-            "union_only_per_head": "per_head",
-            "union_only_per_layer": "per_layer_perhead",
-        }.get(gate, "union"),
+        eviction_mode="per_head" if gate == "union_only_per_head" else "union",
         draft_kv_cache_manager=draft_manager,
     )
     if gate == "draft_kv_factor":

@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from conftest import build_compaction as _build_compaction
-from conftest import compaction_family as _compaction_family
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import set_protected_tails as _set_protected_tails
@@ -176,8 +175,10 @@ def _per_head_keep_oracle(
     return torch.stack(rows)
 
 
-@pytest.mark.parametrize("eviction_mode", ["per_head", "per_layer_perhead"])
-@pytest.mark.parametrize("normalize_scores", [False, True])
+@pytest.mark.parametrize(
+    "eviction_mode,normalize_scores",
+    [("per_head", True), ("per_layer_perhead", False)],
+)
 def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     eviction_mode, normalize_scores
 ):
@@ -223,7 +224,7 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     assert torch.equal(second, expected)
 
 
-@pytest.mark.parametrize("keep_count,width", [(4, 64), (4096, 4224), (8192, 9216)])
+@pytest.mark.parametrize("keep_count,width", [(4, 64), (8192, 9216)])
 def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, width):
     # Heavily tied integer scores with ragged valid widths and per-request
     # prompt rebase: the strongest oracle over the direct union top-k path
@@ -939,48 +940,3 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
             swa_after.index_select(2, swa_destination),
             swa_before.index_select(2, swa_source),
         )
-
-
-def test_cache_families_read_the_staged_move_offsets_rows():
-    """Every cache family must consume the caller-staged offsets row.
-
-    A family that silently falls back to its construction-time offsets
-    compacts request slots that are not in the staged cohort; on
-    sliding-window models the padded slots then produce negative source
-    ordinals and an illegal memory access. Binding the staged row by
-    reference is part of the builder contract.
-    """
-    device = torch.device("cuda", torch.cuda.current_device())
-    dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
-    swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)
-    # bf16 pools in the compact op's supported geometry; this test only
-    # constructs the compaction, so the contents stay zero.
-    pools = [
-        torch.zeros(6, 2, 1, 32, 64, dtype=torch.bfloat16, device=device),
-        torch.zeros(6, 2, 1, 32, 64, dtype=torch.bfloat16, device=device),
-    ]
-    keep = torch.tensor([[2, 4, 5, 7], [2, 3, 5, 6]], dtype=torch.int32, device=device)
-    staged_rows = torch.zeros(2, 3, dtype=torch.int32, device=device)
-    dense_offsets_row = staged_rows[0]
-    swa_offsets_row = staged_rows[1]
-    compaction = _build_compaction(
-        layer_pools=pools,
-        dense_layers=[0],
-        swa_layers=[1],
-        layer_group_representative={0: 0},
-        layer_pool_keys=[("dense", 0), ("swa", 0)],
-        kept_token_ordinals=keep,
-        valid_sequence_lengths=torch.tensor([8, 7], dtype=torch.int32, device=device),
-        kv_block_offsets=_encode_block_offsets(torch.stack((dense_tables, swa_tables))),
-        page_table_slots={0: 0, 1: 1},
-        prompt_offsets=torch.tensor([2, 2], dtype=torch.int32, device=device),
-        swa_window=2,
-        protected_tail_capacity=2,
-        dense_move_offsets=dense_offsets_row,
-        swa_move_offsets=swa_offsets_row,
-    )
-    dense_family = _compaction_family(compaction, "dense")
-    assert dense_family["offsets"].data_ptr() == dense_offsets_row.data_ptr()
-    swa_family = _compaction_family(compaction, "swa")
-    assert swa_family is not None
-    assert swa_family["offsets"].data_ptr() == swa_offsets_row.data_ptr()

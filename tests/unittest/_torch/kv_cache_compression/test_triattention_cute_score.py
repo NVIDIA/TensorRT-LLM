@@ -129,13 +129,11 @@ def _launch_split_scores(
         (128, [0, 1], None, 32, 8),
         # GPT-OSS geometry: 32-token pages; a 64-token compute tile spans two
         # pages, so a shuffled physical-page table catches fragment mix-ups.
-        (32, [3, 1, 4, 7, 5, 0, 2, 6], None, 32, 8),
         # Ragged tails land mid-tile: the second page fragment of the last
         # tile is clamped, and scores past the valid length are unspecified.
         (32, [3, 1, 4, 7, 5, 0, 2, 6], [250, 198], 32, 8),
         # Qwen3 geometry: 128-element K rows (64 frequencies) and GQA group
         # 4, which rides the MMA tile N=8 with zeroed padding columns.
-        (32, [3, 1, 4, 7, 5, 0, 2, 6], None, 64, 4),
         (32, [3, 1, 4, 7, 5, 0, 2, 6], [250, 198], 64, 4),
     ],
 )

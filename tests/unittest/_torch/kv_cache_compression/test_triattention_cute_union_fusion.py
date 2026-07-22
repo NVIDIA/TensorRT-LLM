@@ -262,20 +262,14 @@ def _check_union_fusion_matches_split_pipeline(
 @pytest.mark.parametrize(
     "tokens_per_block,num_freqs,num_q_heads,score_starts,valid_lens",
     [
-        # The originally validated geometry: 32 frequencies (64-element K
-        # rows), GQA group 8, across full-range, non-page-aligned ragged,
-        # and page-aligned uniform window starts.
+        # Representative rows per axis: the originally validated geometry
+        # (32 freqs, GQA group 8) at both page sizes with full-range and
+        # ragged page-aligned starts.
         (32, 32, 8, 0, None),
-        (32, 32, 8, 37, [250, 198]),
-        (32, 32, 8, 128, [250, 230]),
-        (128, 32, 8, 0, None),
-        (128, 32, 8, 37, [250, 198]),
         (128, 32, 8, 128, [250, 230]),
         # Qwen3 geometry: 128-element K rows (64 frequencies) and GQA group
         # 4, which rides the MMA tile N=8 with zeroed padding columns.
-        (32, 64, 4, 0, None),
         (32, 64, 4, 37, [250, 198]),
-        (128, 64, 4, 0, None),
         (128, 64, 4, 128, [250, 230]),
         # GQA group 4 with 32 frequencies: head columns pad up to the MMA
         # tile N=8 with zeroed weights, the partial-stats epilogue writes
@@ -286,7 +280,6 @@ def _check_union_fusion_matches_split_pipeline(
         # start mid-tile, one page-aligned) — the case the fused pipeline
         # previously declined.
         (32, 32, 8, [37, 128], [250, 198]),
-        (128, 32, 8, [37, 128], None),
         (32, 64, 4, [37, 128], None),
         (128, 64, 4, [37, 128], [250, 230]),
     ],

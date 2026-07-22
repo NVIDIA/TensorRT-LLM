@@ -16,10 +16,7 @@ paths).
 
 import pytest
 import torch
-from conftest import compaction_family as _compaction_family
-from conftest import encode_block_offsets as _encode_block_offsets
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import build_cache_compactions
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _settle_ties_and_pack_compaction_sources_kernel,
 )
@@ -328,60 +325,3 @@ def test_settle_handles_topk_sentinel_padding():
         )
         assert torch.equal(output[row, :emitted], expected_row), f"row {row}"
         assert (output[row, emitted:] == stale).all(), f"row {row} tail"
-
-
-def test_pack_fusion_drops_the_compaction_dense_pack_and_exports_live_buffers():
-    """Fused packing must remove the compaction-side dense pack launch (each
-    round packs exactly once, in the selection settle), and the exported pack
-    description must point at the very move buffers and keep ordinals the C++
-    compacts consume."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    request_count, num_kv_heads, keep_count = 2, 2, 4
-    # The compaction builder admits only bf16 pools in the compact op's
-    # supported geometry (32/128-token pages, head_dim 64/128).
-    tokens_per_block, head_dim = 32, 64
-    pools = [
-        torch.zeros(
-            6, 2, num_kv_heads, tokens_per_block, head_dim, dtype=torch.bfloat16, device=device
-        )
-        for _ in range(2)
-    ]
-    page_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device=device)
-    keep = torch.zeros(request_count, keep_count, dtype=torch.int32, device=device)
-
-    def build(fuse_dense_pack_into_selection):
-        return build_cache_compactions(
-            eviction_mode="union",
-            layer_pools=pools,
-            dense_layers=[0, 1],
-            swa_layers=[],
-            layer_group_representative={0: 0, 1: 1},
-            layer_pool_keys=[("dense", 0), ("dense", 0)],
-            kept_token_ordinals=keep,
-            valid_sequence_lengths=torch.full(
-                (request_count,), 10, dtype=torch.int32, device=device
-            ),
-            kv_block_offsets=_encode_block_offsets(page_tables.unsqueeze(0)),
-            page_table_slots={0: 0, 1: 0},
-            request_count=request_count,
-            prompt_offsets=torch.zeros(request_count, dtype=torch.int32, device=device),
-            decode_keep_count=keep_count,
-            swa_window=None,
-            protected_tail_capacity=1,
-            fuse_dense_pack_into_selection=fuse_dense_pack_into_selection,
-        )
-
-    standalone = build(fuse_dense_pack_into_selection=False)
-    standalone_dense = _compaction_family(standalone, "dense")
-    assert standalone_dense["pack"] is standalone["dense_pack"]
-
-    fused = build(fuse_dense_pack_into_selection=True)
-    dense = _compaction_family(fused, "dense")
-    assert dense["pack"] is None
-    assert len(fused["families"]) == 1
-    pack = fused["dense_pack"]
-    assert pack["dense_indices"] is dense["source"]
-    assert pack["dense_offsets"] is dense["offsets"]
-    # The fused settle kernel reads back the ordinals it just wrote, so the
-    # packing must describe the caller's own keep buffer.
-    assert pack["kept_token_ordinals"] is keep

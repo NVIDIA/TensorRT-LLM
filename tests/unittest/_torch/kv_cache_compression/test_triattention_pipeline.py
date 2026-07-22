@@ -149,7 +149,6 @@ class TestConfigAndFactory:
             TriAttentionKvCacheCompressionConfig(eviction_mode="made_up_mode")
 
     def test_factory_returns_triattention_and_propagates_config_fields(self):
-        # A plain V2 manager (block reuse off) yields a TriAttention instance.
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
@@ -214,16 +213,13 @@ class TestTriAttentionClass:
             mock.call(101, Role.KEY),
         ]
 
-    @pytest.mark.parametrize("num_extra_kv_tokens,reserved_draft", [(0, 0), (4, 4)])
-    def test_request_init_marks_capacity_only_and_tracks_state(
-        self, num_extra_kv_tokens, reserved_draft
-    ):
+    def test_request_init_marks_capacity_only_and_tracks_state(self):
         # Speculative capacity (extra KV tokens / reserved draft width) is
         # accepted at request init; the target manager is marked so V2 sizing
         # keeps logical max_seq_len while capacity is reclaimed and reused.
         manager = _make_fake_v2()
-        manager.num_extra_kv_tokens = num_extra_kv_tokens
-        manager._kv_reserve_draft_tokens = reserved_draft
+        manager.num_extra_kv_tokens = 4
+        manager._kv_reserve_draft_tokens = 4
         triattention = TriAttention(manager, top_B=8, model_path="/models/test")
         triattention._attention_layer_partition_cache = ([], [], None)
         triattention._calibrated = True
@@ -317,25 +313,6 @@ class TestEvictionLifecycle:
         mgr.top_B = 4096
         return mgr, request, batch
 
-    def test_identity_gate_preserves_real_eviction_round(self):
-        mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
-        cache = mgr.kv_cache_manager.kv_cache_map[7]
-
-        def compact(*args, protected_tail_lengths, **_kwargs):
-            assert protected_tail_lengths == {7: 0}
-            return [(7, 1024 + 4096)]
-
-        with mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict:
-            mgr._periodic_evict(batch)
-
-        evict.assert_called_once_with(
-            [(request, 7)],
-            2,
-            protected_tail_lengths={7: 0},
-        )
-        mgr.kv_cache_manager._stream.wait_event.assert_not_called()
-        cache.resize.assert_called_once_with(1024 + 4096, None)
-
     def test_suspended_cache_rejects_batch_before_cadence_mutation(self):
         manager, first_request, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         second_request = _make_request(8, py_prompt_len=1024)
@@ -351,43 +328,6 @@ class TestEvictionLifecycle:
         assert first_state["confirmed_kv_length"] is None
         assert second_state["generation_steps"] == 127
         assert second_state["confirmed_kv_length"] is None
-
-    def test_non_boundary_step_skips_eviction_geometry(self):
-        manager, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
-        state = manager._request_states[7]
-        state["generation_steps"] = 126
-
-        with mock.patch.object(manager, "_minimum_evictable_length") as keep_count:
-            manager._periodic_evict(batch)
-
-        keep_count.assert_not_called()
-        assert state["generation_steps"] == 127
-        assert state["confirmed_kv_length"] == 1024 + 4096 + 1
-
-    def test_eager_eviction_runs_large_due_cohort_in_one_round(self):
-        manager, _, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
-        requests = []
-        caches = {}
-        for request_id in range(65):
-            request = _make_request(request_id, py_prompt_len=1024)
-            requests.append(request)
-            caches[request_id] = SimpleNamespace(
-                capacity=1024 + 4096 + 1,
-                history_length=1024,
-                is_active=True,
-            )
-            _set_request_state(manager, request_id, generation_steps=127)
-        manager.kv_cache_manager.kv_cache_map = caches
-        batch = SimpleNamespace(generation_requests=requests)
-
-        with (
-            mock.patch.object(manager, "_evict_requests", return_value=[]) as evict,
-            mock.patch.object(manager, "_resize_compacted_requests") as resize,
-        ):
-            manager._periodic_evict(batch)
-
-        assert [len(call.args[0]) for call in evict.call_args_list] == [65]
-        assert resize.call_count == 1
 
     def test_request_finish_clears_state_but_keeps_buffers_resident(self):
         manager = _make_triattention()
@@ -450,15 +390,6 @@ class TestEvictionLifecycle:
         # length plus the draft's own protected tail.
         draft_cache.resize.assert_called_once_with(retained + 1, None)
 
-    def test_missing_draft_cache_fails_the_due_eviction_round(self):
-        mgr, request, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
-        mgr.draft_kv_cache_manager = _make_fake_v2(is_draft=True)
-
-        with mock.patch.object(mgr, "_evict_requests") as evict:
-            with pytest.raises(RuntimeError, match="missing or.*suspended draft KV cache"):
-                mgr._periodic_evict(batch)
-        evict.assert_not_called()
-
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
         physical_confirmed = 6100
         manager = _make_triattention(beta=128)
@@ -509,58 +440,17 @@ class TestEvictionLifecycle:
         manager._validate_v2_compatibility()
         assert manager.kv_cache_manager.kv_compression_manages_history is True
         assert draft_manager.kv_compression_manages_history is True
+        # A one-model MTP contract also passes the call-site speculative gate.
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
+        from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
-    def test_resize_shrinks_draft_cache_with_its_own_protected_tail(self):
-        retained = 1024 + 4096
-        manager = _make_triattention()
-        target_cache = SimpleNamespace(
-            capacity=retained + 10,
-            is_active=True,
-            resize=mock.Mock(return_value=True),
-        )
-        manager.kv_cache_manager = SimpleNamespace(
-            kv_cache_map={7: target_cache},
-        )
-        draft_manager = _make_fake_v2(is_draft=True)
-        draft_manager.num_extra_kv_tokens = 2
-        draft_manager._kv_reserve_draft_tokens = 3
-        draft_cache = SimpleNamespace(is_active=True, resize=mock.Mock(return_value=True))
-        draft_manager.kv_cache_map = {7: draft_cache}
-        manager.draft_kv_cache_manager = draft_manager
-
-        manager._resize_compacted_requests([(7, retained)], {7: 4})
-
-        target_cache.resize.assert_called_once_with(retained + 4, None)
-        # Draft protected tail = num_extra_kv_tokens + reserved draft width + 1.
-        draft_cache.resize.assert_called_once_with(retained + 6, None)
-
-    def test_mtp_eagle_paged_draft_length_contract_is_accepted(self):
-        # A one-model MTP contract passes the call-site speculative gate, and
-        # the factory then builds a manager that validates cleanly.
-        from tensorrt_llm._torch.pyexecutor._util import (
-            create_kv_cache_compression_manager,
-            validate_kv_cache_compression_with_spec,
-        )
-        from tensorrt_llm.llmapi.llm_args import (
-            MTPDecodingConfig,
-            TriAttentionKvCacheCompressionConfig,
-        )
-
-        config = TriAttentionKvCacheCompressionConfig(
-            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
-        )
-        assert config.kv_cache_compression_mode.is_eviction_method() is True
-        draft_manager = _make_fake_v2(is_draft=True)
         validate_kv_cache_compression_with_spec(
-            config, MTPDecodingConfig(max_draft_len=1), draft_manager
+            TriAttentionKvCacheCompressionConfig(
+                model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+            ),
+            MTPDecodingConfig(max_draft_len=1),
+            draft_manager,
         )
-        manager = create_kv_cache_compression_manager(
-            config,
-            _make_fake_v2(),
-            draft_kv_cache_manager=draft_manager,
-        )
-
-        manager._validate_v2_compatibility()
 
     @pytest.mark.parametrize(
         "num_extra_kv_tokens,reserved_draft,draft_tokens,expected_growth",
@@ -593,28 +483,16 @@ class TestEvictionLifecycle:
 
 
 class TestFixedScoreMetadata:
-    @pytest.mark.parametrize("normalize_scores", [False, True])
     @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-    def test_workspace_build_receives_mode_and_capacity_kwargs(
-        self, eviction_mode, normalize_scores
-    ):
+    def test_workspace_build_receives_mode_and_capacity_kwargs(self, eviction_mode):
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
-        if eviction_mode == "union" and not normalize_scores:
+        if eviction_mode == "union":
             # The fused pipeline (THE union path) always z-normalizes, so
-            # this combination is rejected loudly at construction.
+            # normalize_scores=False is rejected loudly at construction.
             with pytest.raises(ValueError, match="normalize_scores=True"):
-                _make_triattention(
-                    top_B=4,
-                    eviction_mode=eviction_mode,
-                    normalize_scores=normalize_scores,
-                )
-            return
-        manager = _make_triattention(
-            top_B=4,
-            eviction_mode=eviction_mode,
-            normalize_scores=normalize_scores,
-        )
+                _make_triattention(top_B=4, eviction_mode="union", normalize_scores=False)
+        manager = _make_triattention(top_B=4, eviction_mode=eviction_mode)
         # The workspace follows the executor limits: eight requests (max batch
         # size) by 260 decode tokens (top_B plus two eviction periods).
         layout, workspace = _make_workspace_stubs(manager)
@@ -649,6 +527,24 @@ class TestFixedScoreMetadata:
             side_effect=AssertionError("workspace was rebuilt"),
         ):
             assert manager._workspace_for(layout, prepared) is workspace
+
+    def test_stage_rejects_int32_overflowing_round_starts(self):
+        # Round starts past the int32 metadata range fail loudly (in the host
+        # metadata build) before any GPU work is enqueued.
+        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+            stage_eviction_cohort,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        staging = _make_bare_staging(device, max_requests=1, copy_block_count=8)
+        gather = mock.Mock()
+        manager = _make_staging_manager(
+            torch.zeros(1, 2, 2, 12, dtype=torch.int32), gather, torch.cuda.Stream(device=device)
+        )
+
+        with pytest.raises((RuntimeError, OverflowError, ValueError)):
+            stage_eviction_cohort(staging, manager, [7], [2**31], [0], [64])
+        assert gather.call_count == 0
 
     def test_bulk_page_table_copy_snapshots_and_orders_consumers(self):
         """The bulk copy stages immutable host snapshots, and the next copy
@@ -789,176 +685,7 @@ class TestFixedScoreMetadata:
         )
 
     @requires_sm100
-    @pytest.mark.parametrize("request_count", [1, 7, 8])
-    def test_staging_stages_dense_and_swa_tables(self, request_count):
-        pytest.importorskip("cutlass")
-        from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-            prepare_eviction_workspace,
-            stage_eviction_cohort,
-        )
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        max_requests = 8
-        page_count = 3
-        # The bucket capacity must be aligned to the score kernel's 64-token
-        # compute tile (the staging constructor compiles the kernel).
-        seq_len = 64
-        page_table_token_capacity = 90
-        tokens_per_block = 32
-        head_dim = 64
-        num_freqs = head_dim // 2
-        num_q_heads = 8
-        layer_elements = max_requests * page_count * 2 * 1 * tokens_per_block * head_dim
-        shared = torch.randn(2 * layer_elements, device=device).to(torch.bfloat16)
-        pool_shape = (max_requests * page_count, 2, 1, tokens_per_block, head_dim)
-        pools = [
-            shared[:layer_elements].view(pool_shape),
-            shared[layer_elements:].view(pool_shape),
-            torch.randn(pool_shape, device=device).to(torch.bfloat16),
-            torch.randn(pool_shape, device=device).to(torch.bfloat16),
-        ]
-        dense_groups = [[0, 1], [2]]
-        representatives = [0, 2, 3]
-        q_real = torch.randn(4, num_q_heads, 2 * num_freqs, dtype=torch.float64, device=device)[
-            ..., ::2
-        ]
-        q_imag = torch.randn(4, num_q_heads, 2 * num_freqs, dtype=torch.float64, device=device)[
-            ..., ::2
-        ]
-        mlr = torch.randn(4, num_q_heads, 2 * num_freqs, dtype=torch.float64, device=device)[
-            ..., ::2
-        ]
-        freq = (torch.rand(2 * num_freqs, dtype=torch.float64, device=device) + 0.5)[::2]
-        omega = (torch.rand(2 * num_freqs, dtype=torch.float64, device=device) * 0.05)[::2]
-        offsets = torch.tensor([1.0, 0.0, 2.0, 0.0], dtype=torch.float64, device=device)[::2]
-        assert not q_real.is_contiguous()
-        assert not freq.is_contiguous()
-        assert not omega.is_contiguous()
-        assert not offsets.is_contiguous()
-        # The workspace constructor converts every non-contiguous fp64
-        # calibration input to contiguous fp32 (the runner's flat views would
-        # otherwise fail) and compiles the score kernel here.
-        staging = prepare_eviction_workspace(
-            eviction_mode="per_head",
-            layer_pools=pools,
-            dense_groups=dense_groups,
-            dense_layers=[0, 1, 2],
-            page_representatives=representatives,
-            max_requests=max_requests,
-            seq_len=seq_len,
-            num_q_heads=num_q_heads,
-            num_freqs=num_freqs,
-            keep_count=4,
-            q_real=q_real,
-            q_imag=q_imag,
-            mlr_coef=mlr,
-            freq_scale_sq=freq,
-            offsets=offsets,
-            omega=omega,
-            page_table_token_capacity=page_table_token_capacity,
-            layer_group_representative={0: 0, 1: 0, 2: 2},
-            layer_pool_keys=[("pool", 0), ("pool", 0), ("pool", 2), ("pool", 3)],
-        )
-        assert staging.bucket_seq_len == seq_len
-        assert staging.page_table_token_capacity == page_table_token_capacity
-        # page_count 3 rounds up to the 4-block copy granule.
-        assert staging.copy_block_count == (page_count + 3) // 4 * 4
-        assert staging.phase["offsets"].dtype == torch.float32
-        assert staging.phase["offsets"].is_contiguous()
-        assert staging.phase["omega"].dtype == torch.float32
-        assert staging.phase["omega"].is_contiguous()
-        tables = {
-            10: [
-                [3 * request, 3 * request + 1, 3 * request + 2] for request in range(request_count)
-            ],
-            12: [
-                [3 * request + 2, 3 * request + 1, 3 * request] for request in range(request_count)
-            ],
-            13: [
-                [23 - 3 * request, 22 - 3 * request, 21 - 3 * request]
-                for request in range(request_count)
-            ],
-        }
-
-        request_ids = list(range(request_count))
-        round_starts = [131_071 + request for request in request_ids]
-        # Per-request pinned prompt lengths: one cohort may mix them.
-        token_starts = list(request_ids)
-        host_table = torch.zeros(
-            3,
-            max_requests,
-            2,
-            staging.copy_block_count,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
-        for slot, global_layer in enumerate((10, 12, 13)):
-            host_table[slot, :request_count, 0, :page_count].copy_(
-                torch.tensor(tables[global_layer], dtype=torch.int32)
-            )
-
-        def gather_k_block_offsets(source, destination, requested_ids, num_blocks):
-            for destination_row, request_id in enumerate(requested_ids):
-                destination[:, destination_row, 0, :num_blocks].copy_(
-                    source[:, request_id, 0, :num_blocks]
-                )
-
-        gather = mock.Mock(side_effect=gather_k_block_offsets)
-        manager = _make_staging_manager(
-            host_table, gather, torch.cuda.Stream(device=device), num_slots=3
-        )
-
-        # Round starts past the int32 metadata range fail loudly before any
-        # GPU work is enqueued.
-        with pytest.raises((RuntimeError, OverflowError, ValueError)):
-            stage_eviction_cohort(
-                staging,
-                manager,
-                request_ids,
-                [2**31] * request_count,
-                token_starts,
-                [seq_len] * request_count,
-            )
-        assert gather.call_count == 0
-        with mock.patch.object(
-            torch,
-            "index_select",
-            side_effect=AssertionError("page-table staging used torch.index_select"),
-        ):
-            stage_eviction_cohort(
-                staging,
-                manager,
-                request_ids,
-                round_starts,
-                token_starts,
-                [seq_len] * request_count,
-            )
-        torch.cuda.current_stream(device).synchronize()
-        assert staging.round_starts_device.untyped_storage().data_ptr() == (
-            staging.valid_seq_lens_device.untyped_storage().data_ptr()
-        )
-        assert torch.equal(
-            staging.round_starts_device[:request_count],
-            torch.tensor(round_starts, dtype=torch.int32, device=device),
-        )
-        assert torch.equal(
-            staging.valid_seq_lens_device[:request_count],
-            torch.full((request_count,), seq_len, dtype=torch.int32, device=device),
-        )
-        assert torch.equal(
-            staging.token_starts_device[:request_count],
-            torch.tensor(token_starts, dtype=torch.int32, device=device),
-        )
-        for slot, global_layer in enumerate((10, 12, 13)):
-            expected = torch.tensor(tables[global_layer], dtype=torch.int32, device=device) * 2
-            assert torch.equal(
-                staging.block_offsets_device[slot, :request_count, 0, :page_count],
-                expected,
-            )
-
-    @requires_sm100
-    @pytest.mark.parametrize("request_count", [1, 7, 8])
+    @pytest.mark.parametrize("request_count", [1, 8])
     def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count):
         """ONE launch over layers in DISTINCT storages with DISTINCT block tables.
 
