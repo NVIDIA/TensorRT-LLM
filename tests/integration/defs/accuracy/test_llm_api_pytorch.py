@@ -7783,11 +7783,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert steps > 0, "no speculative iterations recorded"
             chat_rate = accepted / drafted
             chat_length = 1 + accepted / steps
-            # References from the drafter card; measured bands on this stack
-            # are 0.835-0.845 / 3.50-3.53 without attention DP and
-            # 0.819-0.846 / 3.46-3.54 with it. The floors are consistent
-            # with each other: at draft_len=3, AL ~= 1 + 3*rate, so 3.3
-            # corresponds to a ~0.78 rate.
+            # Published reference (Inferact/MiniMax-M3-EAGLE3 drafter card):
+            # rate 0.839, length 3.518. Our testing thresholds: rate > 0.78,
+            # length > 3.3.
             ref_rate, ref_length = 0.839, 3.518
             print(f"MiniMax-M3 Eagle3 chat-GSM8K acceptance: rate="
                   f"{chat_rate:.3f}, mean acceptance length="
