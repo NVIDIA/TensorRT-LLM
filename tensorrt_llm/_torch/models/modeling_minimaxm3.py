@@ -1489,11 +1489,24 @@ class MiniMaxM3Attention(Attention):
         """
         if self.is_sparse_attention_layer:
             assert idx_q is not None
+            # One launch writes this layer's K/V and, on the bf16 path, index-K,
+            # ahead of the proxy pass that reads the index-K cache. On the FP8
+            # indexer path idx_k is None because the fused producer already
+            # inserted FP8 index-K into the side cache; the fused write then
+            # stores K/V only.
+            attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v, idx_k)
             # Publish the selected blocks so the FMHA runs the sparse path.
-            kv_block_indexes = self.attn.run_indexer(idx_q, idx_k, attn_metadata)
+            # idx_k_prewritten marks that index-K is already in the cache (via
+            # the fused write above on bf16, or the FP8 producer when idx_k is
+            # None), so run_indexer must not write it again.
+            kv_block_indexes = self.attn.run_indexer(
+                idx_q, idx_k, attn_metadata, idx_k_prewritten=True
+            )
             forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
         else:
             assert idx_q is None and idx_k is None
+            # Dense layers get the same fused K/V write.
+            attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)
             # No top-k selection means the FMHA attends the full page table.
             forward_args = AttentionForwardArgs(output=output)
         self.attn.forward(q, k, v, attn_metadata, forward_args=forward_args)
