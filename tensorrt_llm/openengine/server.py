@@ -108,6 +108,10 @@ class OpenEngineServer:
         try:
             await self._server.stop(grace=grace)
         finally:
+            if not await self.servicer.tracker.close_reapers(timeout=grace):
+                logger.warning(
+                    "OpenEngine request cleanup did not finish within %.1f seconds", grace
+                )
             self.servicer.close()
             if self._kv_event_fanout is not None:
                 await self._kv_event_fanout.stop()

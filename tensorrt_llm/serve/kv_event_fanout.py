@@ -6,9 +6,16 @@
 import asyncio
 from collections import deque
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 from tensorrt_llm.logger import logger
+
+
+class KvEventSubscriberOverflow(RuntimeError):
+    """Raised when a subscriber can no longer receive a lossless event stream."""
+
+
+_SUBSCRIBER_OVERFLOW = object()
 
 
 class KvEventFanout:
@@ -19,7 +26,8 @@ class KvEventFanout:
             raise ValueError("buffer_size must be positive")
         self._llm = llm
         self._buffer: deque[dict[str, Any]] = deque(maxlen=buffer_size)
-        self._subscribers: dict[asyncio.Queue[tuple[int, dict[str, Any]]], frozenset[int]] = {}
+        self._subscribers: dict[asyncio.Queue[object], frozenset[int]] = {}
+        self._subscriber_overflow_count = 0
         self._task: asyncio.Task[None] | None = None
         self._sequence_numbers: dict[int, int] = {}
         self._last_engine_event_ids: dict[int, int] = {}
@@ -29,6 +37,10 @@ class KvEventFanout:
     @property
     def buffer_size(self) -> int:
         return self._buffer.maxlen or 0
+
+    @property
+    def subscriber_overflow_count(self) -> int:
+        return self._subscriber_overflow_count
 
     def start(self) -> None:
         if self._task is None:
@@ -53,11 +65,16 @@ class KvEventFanout:
         self, data_parallel_ranks: set[int] | None = None
     ) -> AsyncGenerator[tuple[int, dict[str, Any]], None]:
         self.start()
-        queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue(maxsize=self.buffer_size)
+        queue: asyncio.Queue[object] = asyncio.Queue(maxsize=self.buffer_size)
         self._subscribers[queue] = frozenset(data_parallel_ranks or ())
         try:
             while True:
-                yield await queue.get()
+                item = await queue.get()
+                if item is _SUBSCRIBER_OVERFLOW:
+                    raise KvEventSubscriberOverflow(
+                        "OpenEngine KV event subscriber queue overflowed"
+                    )
+                yield cast(tuple[int, dict[str, Any]], item)
         finally:
             self._subscribers.pop(queue, None)
 
@@ -120,7 +137,15 @@ class KvEventFanout:
             try:
                 queue.put_nowait(sequenced_event)
             except asyncio.QueueFull:
-                logger.warning("Dropping KV event for a slow OpenEngine subscriber")
+                self._subscriber_overflow_count += 1
+                self._subscribers.pop(queue, None)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(_SUBSCRIBER_OVERFLOW)
+                logger.error(
+                    "Closing slow OpenEngine KV subscriber after queue overflow; "
+                    "lossless routing can no longer be guaranteed"
+                )
 
     async def _pump(self) -> None:
         while True:

@@ -58,6 +58,13 @@ async def test_server_stop_cleans_protocol_state_and_stats_on_grpc_failure() -> 
             raise RuntimeError("stop failed")
 
     class _Servicer:
+        class _Tracker:
+            async def close_reapers(self, timeout: float) -> bool:
+                calls.append(("reapers", timeout))
+                return True
+
+        tracker = _Tracker()
+
         def close(self) -> None:
             calls.append(("servicer", None))
 
@@ -80,6 +87,7 @@ async def test_server_stop_cleans_protocol_state_and_stats_on_grpc_failure() -> 
 
     assert calls == [
         ("grpc", 1.5),
+        ("reapers", 1.5),
         ("servicer", None),
         ("kv_events", None),
         ("stats", None),

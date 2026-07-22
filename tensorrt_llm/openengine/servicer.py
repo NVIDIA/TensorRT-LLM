@@ -40,7 +40,7 @@ from tensorrt_llm.runtime.kv_cache_hash import (
     get_effective_kv_cache_event_hash_algo,
 )
 from tensorrt_llm.scheduling_params import SchedulingParams
-from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
+from tensorrt_llm.serve.kv_event_fanout import KvEventFanout, KvEventSubscriberOverflow
 from tensorrt_llm.serve.request_tracker import RequestTracker
 from tensorrt_llm.serve.stats_fanout import StatsFanout
 
@@ -163,6 +163,7 @@ class OpenEngineServicer(
         self.kv_events = kv_event_fanout
         self.stats = stats_fanout
         self._kv_session_requests: dict[str, str] = {}
+        self._kv_session_owners: dict[str, object] = {}
         self._kv_session_timers: dict[str, asyncio.TimerHandle] = {}
         if kv_session_ttl_seconds <= 0:
             raise ValueError("kv_session_ttl_seconds must be positive")
@@ -313,6 +314,7 @@ class OpenEngineServicer(
     ) -> AsyncGenerator[generation_pb2.GenerateResponse, None]:
         result = None
         consumed_session_id = None
+        consumed_session_owner = None
         produced_session = None
         admitted = False
         selected_lora = False
@@ -369,6 +371,11 @@ class OpenEngineServicer(
                 for key, value in metadata.items()
                 if key.lower() in ("traceparent", "tracestate", "baggage")
             }
+            if request.kv.HasField("session") and request.kv.session.session_id:
+                consumed_session_id = request.kv.session.session_id
+                consumed_session_owner = self._track_kv_session(
+                    consumed_session_id, request.request_id, expires=False
+                )
             result = self.llm.generate_async(
                 inputs=inputs,
                 sampling_params=params,
@@ -387,15 +394,20 @@ class OpenEngineServicer(
                 selected_lora = True
             if self.stats is not None:
                 self.stats.wake()
-            if request.kv.HasField("session") and request.kv.session.session_id:
-                consumed_session_id = request.kv.session.session_id
-                self._track_kv_session(consumed_session_id, request.request_id)
+        except asyncio.CancelledError:
+            if consumed_session_owner is not None:
+                self._release_kv_session(consumed_session_id, consumed_session_owner)
+            raise
         except KeyError as error:
+            if consumed_session_owner is not None:
+                self._release_kv_session(consumed_session_id, consumed_session_owner)
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION, f"LoRA is not loaded: {error.args[0]}"
             )
             return
         except (ValueError, TypeError, RuntimeError) as error:
+            if consumed_session_owner is not None:
+                self._release_kv_session(consumed_session_id, consumed_session_owner)
             if (
                 result is not None
                 and self.tracker.active_requests.get(request.request_id) is not result
@@ -420,9 +432,10 @@ class OpenEngineServicer(
         prompt_sent = False
         completed = False
         try:
+            if context.cancelled():
+                return
             async for current in result:
                 if context.cancelled():
-                    await self.tracker.abort(request.request_id)
                     return
                 if selected_lora and not selection_logged:
                     self._log_lora_selection(request, "selected")
@@ -496,7 +509,6 @@ class OpenEngineServicer(
                         yield response
                     completed = True
         except asyncio.CancelledError:
-            await self.tracker.abort(request.request_id)
             raise
         except (RuntimeError, ValueError, TypeError) as error:
             logger.error("OpenEngine request %s failed: %s", request.request_id, error)
@@ -513,25 +525,49 @@ class OpenEngineServicer(
                 self._log_handoff(request, "aborted", produced_session)
                 if selection_logged:
                     self._log_lora_selection(request, "aborted", produced_session)
-            if consumed_session_id is not None:
-                self._release_kv_session(consumed_session_id)
-            if not completed and request.request_id in self.tracker.active_requests:
-                await self.tracker.abort(request.request_id)
-            else:
-                await self.tracker.finish(request.request_id)
+            if admitted:
+                terminal = bool(getattr(result, "finished", False))
+                if not terminal:
+                    await self.tracker.abort(request.request_id)
+                    reaper = self.tracker.reap(request.request_id, result)
+                    if consumed_session_id is not None:
+                        reaper.add_done_callback(
+                            lambda _task,
+                            session_id=consumed_session_id,
+                            owner=consumed_session_owner: (
+                                self._release_kv_session(session_id, owner)
+                            )
+                        )
+                else:
+                    if consumed_session_id is not None:
+                        self._release_kv_session(consumed_session_id, consumed_session_owner)
+                    await self.tracker.finish(request.request_id, result)
             if self.stats is not None:
                 self.stats.wake()
 
-    def _track_kv_session(self, session_id: str, request_id: str) -> None:
-        self._release_kv_session(session_id)
+    def _track_kv_session(
+        self, session_id: str, request_id: str, *, expires: bool = True
+    ) -> object:
+        if session_id in self._kv_session_requests:
+            raise ValueError(f"KV session {session_id!r} is already in use")
+        owner = object()
         self._kv_session_requests[session_id] = request_id
-        loop = asyncio.get_running_loop()
-        self._kv_session_timers[session_id] = loop.call_later(
-            self._kv_session_ttl_seconds, self._release_kv_session, session_id
-        )
+        self._kv_session_owners[session_id] = owner
+        if expires:
+            loop = asyncio.get_running_loop()
+            self._kv_session_timers[session_id] = loop.call_later(
+                self._kv_session_ttl_seconds,
+                self._release_kv_session,
+                session_id,
+                owner,
+            )
+        return owner
 
-    def _release_kv_session(self, session_id: str) -> bool:
+    def _release_kv_session(self, session_id: str, owner: object | None = None) -> bool:
+        if owner is not None and self._kv_session_owners.get(session_id) is not owner:
+            return False
         released = self._kv_session_requests.pop(session_id, None) is not None
+        self._kv_session_owners.pop(session_id, None)
         timer = self._kv_session_timers.pop(session_id, None)
         if timer is not None:
             timer.cancel()
@@ -557,6 +593,7 @@ class OpenEngineServicer(
             timer.cancel()
         self._kv_session_timers.clear()
         self._kv_session_requests.clear()
+        self._kv_session_owners.clear()
 
     def _active_kv_session_count(self) -> int:
         """Count sessions whose owning request is still engine-active.
@@ -967,6 +1004,10 @@ class OpenEngineServicer(
         prefill_batch_size = 0
         decode_batch_size = 0
         attributes = {"source": "shared_stats_fanout" if latest else "shared_request_tracker"}
+        if self.kv_events is not None:
+            attributes["kv_event_subscriber_overflows"] = str(
+                self.kv_events.subscriber_overflow_count
+            )
         tokens_per_block: set[int] = set()
         for rank, stat in sorted(latest.items()):
             kv_stats = stat.get("kvCacheStats") or {}
@@ -1080,7 +1121,8 @@ class OpenEngineServicer(
         if target == "kv_session":
             session_id = request.kv_session.session_id
             request_id = self._kv_session_requests.get(session_id, session_id)
-            released_session = self._release_kv_session(session_id)
+            if request_id not in self.tracker.active_requests:
+                released_session = self._release_kv_session(session_id)
         aborted = await self.tracker.abort(request_id)
         return lifecycle_pb2.AbortResponse(
             status=(
@@ -1277,13 +1319,16 @@ class OpenEngineServicer(
                 f"Unknown data-parallel ranks: {sorted(invalid_ranks)}",
             )
             return
-        async for sequence, raw in self.kv_events.subscribe(selected_ranks):
-            if context.cancelled():
-                return
-            rank = raw.get("attention_dp_rank", 0)
-            if selected_ranks and rank not in selected_ranks:
-                continue
-            yield kv_pb2.SubscribeKvEventsResponse(batch=self._kv_batch(raw, sequence))
+        try:
+            async for sequence, raw in self.kv_events.subscribe(selected_ranks):
+                if context.cancelled():
+                    return
+                rank = raw.get("attention_dp_rank", 0)
+                if selected_ranks and rank not in selected_ranks:
+                    continue
+                yield kv_pb2.SubscribeKvEventsResponse(batch=self._kv_batch(raw, sequence))
+        except KvEventSubscriberOverflow as error:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
 
     def _kv_batch(self, raw: dict[str, Any], sequence: int) -> kv_pb2.KvEventBatch:
         rank = raw.get("attention_dp_rank", 0)

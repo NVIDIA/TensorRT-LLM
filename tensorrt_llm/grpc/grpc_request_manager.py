@@ -134,7 +134,6 @@ class GrpcRequestManager:
 
         except asyncio.CancelledError:
             logger.info(f"Request {request_id} cancelled by client")
-            await self.abort(request_id)
             raise
         except Exception as e:
             logger.error(f"Error in generate for {request_id}: {e}")
@@ -142,7 +141,11 @@ class GrpcRequestManager:
         finally:
             # Cleanup tracking
             if admitted:
-                await self._request_tracker.finish(request_id)
+                if gen_result.finished:
+                    await self._request_tracker.finish(request_id, gen_result)
+                else:
+                    await self._request_tracker.abort(request_id)
+                    self._request_tracker.reap(request_id, gen_result)
 
     async def abort(self, request_id: str) -> bool:
         """Abort a running request.

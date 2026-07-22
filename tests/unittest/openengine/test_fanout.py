@@ -5,28 +5,34 @@ import asyncio
 
 import pytest
 
-from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
+from tensorrt_llm.serve.kv_event_fanout import KvEventFanout, KvEventSubscriberOverflow
 from tensorrt_llm.serve.stats_fanout import StatsFanout
 
 
-def test_kv_fanout_sequence_exposes_subscriber_queue_drops() -> None:
+@pytest.mark.asyncio
+async def test_kv_fanout_closes_subscriber_instead_of_hiding_queue_overflow() -> None:
     fanout = KvEventFanout(object(), buffer_size=1)
-    queue = asyncio.Queue(maxsize=1)
-    fanout._subscribers[queue] = frozenset({0})
+    subscription = fanout.subscribe({0})
+    try:
+        first_item = asyncio.create_task(subscription.__anext__())
+        await asyncio.sleep(0)
 
-    first = {"data": {"type": "stored"}, "event": 1, "attention_dp_rank": 0}
-    second = {"data": {"type": "stored"}, "event": 2, "attention_dp_rank": 0}
-    third = {"data": {"type": "stored"}, "event": 3, "attention_dp_rank": 0}
-    other_rank = {"data": {"type": "stored"}, "event": 20, "attention_dp_rank": 1}
-    fanout._publish(first)
-    fanout._publish(second)
-    assert queue.get_nowait() == (1, first)
+        first = {"data": {"type": "stored"}, "event": 1, "attention_dp_rank": 0}
+        second = {"data": {"type": "stored"}, "event": 2, "attention_dp_rank": 0}
+        third = {"data": {"type": "stored"}, "event": 3, "attention_dp_rank": 0}
+        fanout._publish(first)
+        assert await first_item == (1, first)
+        fanout._publish(second)
+        fanout._publish(third)
+        with pytest.raises(KvEventSubscriberOverflow, match="overflowed"):
+            await subscription.__anext__()
 
-    fanout._publish(other_rank)
-    fanout._publish(third)
-    assert queue.get_nowait() == (3, third)
-    assert fanout.drain_http_buffer() == [third]
-    assert fanout._sequence_numbers == {0: 3, 1: 1}
+        assert fanout.subscriber_overflow_count == 1
+        assert not fanout._subscribers
+        assert fanout.drain_http_buffer() == [third]
+        assert fanout._sequence_numbers == {0: 3}
+    finally:
+        await fanout.stop()
 
 
 def test_kv_fanout_filters_non_global_attention_without_sequence_gaps() -> None:

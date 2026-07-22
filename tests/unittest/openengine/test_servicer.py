@@ -48,7 +48,7 @@ class _Result:
                 disaggregated_params=handoff,
             )
         ]
-        self.finished = True
+        self.finished = False
         self._yielded = False
         self.aborted = False
 
@@ -59,6 +59,7 @@ class _Result:
         if self._yielded:
             raise StopAsyncIteration
         self._yielded = True
+        self.finished = True
         return self
 
     def abort(self) -> None:
@@ -150,7 +151,63 @@ async def test_generate_cancellation_aborts_and_cleans_tracking() -> None:
 
     assert responses == []
     assert llm.result.aborted
+    assert await tracker.wait_empty(0.1)
     assert tracker.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_decode_cancellation_during_media_load_does_not_claim_session(
+    monkeypatch,
+) -> None:
+    entered = asyncio.Event()
+
+    async def blocked_load_media(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("tensorrt_llm.openengine.servicer.load_media", blocked_load_media)
+    llm = _Llm()
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_DECODE, RequestTracker(llm))
+    request = generation_pb2.GenerateRequest(
+        request_id="decode-cancel", model="model", prompt="hello"
+    )
+    request.kv.session.CopyFrom(
+        encode_handoff(
+            DisaggregatedParams(
+                request_type="context_only",
+                disagg_request_id=101,
+                schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+            )
+        )
+    )
+
+    generation = asyncio.create_task(_collect_async(service.Generate(request, _Context())))
+    await entered.wait()
+    assert not service._kv_session_requests
+    generation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await generation
+
+    assert not service._kv_session_requests
+    assert not service._kv_session_owners
+
+
+@pytest.mark.asyncio
+async def test_rejected_duplicate_does_not_finish_original_request() -> None:
+    llm = _Llm()
+    tracker = RequestTracker(llm)
+    original = _Result()
+    tracker.admit("duplicate", original)
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_AGGREGATED, tracker)
+    request = generation_pb2.GenerateRequest(request_id="duplicate", model="model", prompt="hello")
+
+    with pytest.raises(AssertionError, match="already active"):
+        await _collect_async(service.Generate(request, _Context()))
+
+    assert tracker.active_requests["duplicate"] is original
+    assert not await tracker.wait_empty(0)
+    assert await tracker.abort("duplicate")
+    await tracker.finish("duplicate", original)
 
 
 def test_generate_rejects_unsupported_cache_bypass_and_nonzero_dp_placement() -> None:
@@ -437,6 +494,72 @@ async def test_prefill_session_expires_and_close_cancels_timers() -> None:
     service.close()
     assert timer.cancelled()
     assert not service._kv_session_requests
+
+
+@pytest.mark.asyncio
+async def test_active_decode_session_does_not_expire() -> None:
+    llm = _Llm()
+    service = OpenEngineServicer(
+        llm,
+        "model",
+        server_pb2.ENGINE_ROLE_DECODE,
+        RequestTracker(llm),
+        kv_session_ttl_seconds=0.01,
+    )
+    owner = service._track_kv_session("active-decode", "decode", expires=False)
+    await asyncio.sleep(0.02)
+    assert service._kv_session_requests["active-decode"] == "decode"
+    assert "active-decode" not in service._kv_session_timers
+    assert service._release_kv_session("active-decode", owner)
+
+
+@pytest.mark.asyncio
+async def test_late_kv_session_release_cannot_remove_reused_session_id() -> None:
+    llm = _Llm()
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_DECODE, RequestTracker(llm))
+    old_owner = service._track_kv_session("session", "old-request")
+    release_old = asyncio.Event()
+
+    async def late_release() -> bool:
+        await release_old.wait()
+        return service._release_kv_session("session", old_owner)
+
+    late_reaper = asyncio.create_task(late_release())
+    assert service._release_kv_session("session", old_owner)
+    new_owner = service._track_kv_session("session", "new-request")
+    release_old.set()
+
+    assert not await late_reaper
+    assert service._kv_session_requests["session"] == "new-request"
+    assert service._kv_session_owners["session"] is new_owner
+    assert service._release_kv_session("session", new_owner)
+    assert not service._kv_session_timers
+
+
+@pytest.mark.asyncio
+async def test_kv_session_rejects_concurrent_duplicate_consumers() -> None:
+    llm = _Llm()
+    service = OpenEngineServicer(llm, "model", server_pb2.ENGINE_ROLE_DECODE, RequestTracker(llm))
+    session = encode_handoff(
+        DisaggregatedParams(
+            request_type="context_only",
+            disagg_request_id=101,
+            schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+        )
+    )
+    owner = service._track_kv_session(session.session_id, "first-request", expires=False)
+    request = generation_pb2.GenerateRequest(
+        request_id="second-request", model="model", prompt="hello"
+    )
+    request.kv.session.CopyFrom(session)
+
+    with pytest.raises(AssertionError, match="already in use"):
+        await _collect_async(service.Generate(request, _Context()))
+
+    assert llm.result is None
+    assert service._kv_session_requests[session.session_id] == "first-request"
+    assert service._kv_session_owners[session.session_id] is owner
+    assert service._release_kv_session(session.session_id, owner)
 
 
 def test_decode_media_is_required_only_for_marked_handoff(monkeypatch) -> None:

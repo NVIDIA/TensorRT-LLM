@@ -24,6 +24,8 @@ class RequestTracker:
         self._external_requests = 0
         self._draining = False
         self._changed = asyncio.Condition()
+        self._reapers: set[asyncio.Task[None]] = set()
+        self._reaper_owners: dict[asyncio.Task[None], tuple[str, AbortableResult]] = {}
 
     @property
     def draining(self) -> bool:
@@ -45,10 +47,69 @@ class RequestTracker:
             raise ValueError(f"Request {request_id!r} is already active")
         self._requests[request_id] = result
 
-    async def finish(self, request_id: str) -> None:
+    async def finish(self, request_id: str, result: AbortableResult | None = None) -> None:
         async with self._changed:
-            self._requests.pop(request_id, None)
+            current = self._requests.get(request_id)
+            if result is None or current is result:
+                self._requests.pop(request_id, None)
             self._changed.notify_all()
+
+    def reap(self, request_id: str, result: AbortableResult) -> asyncio.Task[None]:
+        """Transfer an abandoned stream to a single terminal-response consumer."""
+
+        async def _reap() -> None:
+            try:
+                aresult = getattr(result, "aresult", None)
+                if callable(aresult):
+                    await aresult()
+                else:
+                    async for _ in result:  # type: ignore[attr-defined]
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("Request %s cleanup ended with: %s", request_id, error)
+            finally:
+                await self.finish(request_id, result)
+
+        task = asyncio.create_task(_reap(), name=f"trtllm-request-reaper-{request_id}")
+        self._reapers.add(task)
+        self._reaper_owners[task] = (request_id, result)
+
+        def _forget(completed: asyncio.Task[None]) -> None:
+            self._reapers.discard(completed)
+            self._reaper_owners.pop(completed, None)
+
+        task.add_done_callback(_forget)
+        return task
+
+    async def wait_reapers(self, timeout: float | None = None) -> bool:
+        """Wait for all currently owned engine-cleanup tasks without cancelling them."""
+        if not self._reapers:
+            return True
+        _, pending = await asyncio.wait(tuple(self._reapers), timeout=timeout)
+        return not pending
+
+    async def close_reapers(self, timeout: float | None = None) -> bool:
+        """Bound cleanup at process shutdown and release every owned task."""
+        completed = await self.wait_reapers(timeout)
+        if completed:
+            return True
+        pending = tuple(self._reapers)
+        owners = tuple(
+            owner for task in pending if (owner := self._reaper_owners.get(task)) is not None
+        )
+        for task in pending:
+            task.cancel()
+        # Give ordinary cancellation-aware result iterators one loop turn to
+        # run their finally blocks without ever waiting on a resistant task.
+        await asyncio.sleep(0)
+        for task in pending:
+            self._reapers.discard(task)
+            self._reaper_owners.pop(task, None)
+        for request_id, result in owners:
+            await self.finish(request_id, result)
+        return False
 
     def begin_external(self) -> None:
         if self._draining:
@@ -69,8 +130,6 @@ class RequestTracker:
         except (RuntimeError, AssertionError) as error:
             logger.warning("Failed to abort request %s: %s", request_id, error)
             return False
-        finally:
-            await self.finish(request_id)
         return True
 
     async def abort_all(self) -> int:
@@ -91,9 +150,6 @@ class RequestTracker:
             else:
                 aborted += 1
 
-        async with self._changed:
-            self._requests.clear()
-            self._changed.notify_all()
         return aborted
 
     async def start_drain(self) -> int:

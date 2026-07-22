@@ -30,6 +30,8 @@ async def test_tracker_abort_drain_and_external_admission() -> None:
     assert await tracker.abort("request")
     assert result.aborted
     assert not await tracker.wait_empty(0)
+    await tracker.finish("request")
+    assert not await tracker.wait_empty(0)
     await tracker.finish_external()
     assert await tracker.wait_empty(0)
 
@@ -71,3 +73,101 @@ async def test_abort_all_reaches_untracked_http_engine_results() -> None:
     assert await tracker.wait_empty()
     await finish_task
     assert result.aborted
+
+
+@pytest.mark.asyncio
+async def test_abort_failure_remains_tracked_until_stream_finishes() -> None:
+    class _FailingResult:
+        def abort(self) -> None:
+            raise RuntimeError("engine still owns request")
+
+    tracker = RequestTracker(object())
+    tracker.admit("request", _FailingResult())
+
+    assert not await tracker.abort("request")
+    assert tracker.active_count == 1
+    assert not await tracker.wait_empty(0)
+
+    await tracker.finish("request")
+    assert await tracker.wait_empty(0)
+
+
+@pytest.mark.asyncio
+async def test_abort_all_waits_for_tracked_stream_termination() -> None:
+    result = _Result()
+    tracker = RequestTracker(object())
+    tracker.admit("request", result)
+
+    assert await tracker.abort_all() == 1
+    assert result.aborted
+    assert not await tracker.wait_empty(0)
+
+    await tracker.finish("request")
+    assert await tracker.wait_empty(0)
+
+
+@pytest.mark.asyncio
+async def test_reaper_keeps_abort_active_until_engine_terminal() -> None:
+    class _DelayedResult(_Result):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal = asyncio.Event()
+
+        async def aresult(self) -> "_DelayedResult":
+            await self.terminal.wait()
+            return self
+
+    tracker = RequestTracker(object())
+    result = _DelayedResult()
+    tracker.admit("request", result)
+
+    assert await tracker.abort("request")
+    reaper = tracker.reap("request", result)
+    assert not await tracker.wait_empty(0)
+
+    result.terminal.set()
+    await reaper
+    assert await tracker.wait_empty(0)
+
+
+@pytest.mark.asyncio
+async def test_late_reaper_cannot_remove_reused_request_id() -> None:
+    class _DelayedResult(_Result):
+        def __init__(self) -> None:
+            super().__init__()
+            self.terminal = asyncio.Event()
+
+        async def aresult(self) -> "_DelayedResult":
+            await self.terminal.wait()
+            return self
+
+    tracker = RequestTracker(object())
+    old = _DelayedResult()
+    tracker.admit("request", old)
+    reaper = tracker.reap("request", old)
+    await tracker.finish("request", old)
+
+    replacement = _Result()
+    tracker.admit("request", replacement)
+    old.terminal.set()
+    await reaper
+
+    assert tracker.active_requests["request"] is replacement
+    await tracker.finish("request", replacement)
+
+
+@pytest.mark.asyncio
+async def test_reaper_shutdown_is_bounded_and_releases_tracking() -> None:
+    class _NeverTerminal(_Result):
+        async def aresult(self) -> "_NeverTerminal":
+            await asyncio.Event().wait()
+            return self
+
+    tracker = RequestTracker(object())
+    result = _NeverTerminal()
+    tracker.admit("request", result)
+    tracker.reap("request", result)
+
+    assert not await tracker.close_reapers(timeout=0)
+    assert await tracker.wait_empty(0)
+    assert not tracker._reapers
