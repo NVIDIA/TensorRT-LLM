@@ -700,6 +700,17 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.attention_dp_events_gather_period_ms == 10
     assert (KvCacheConfig(block_reuse_policy="per_conversation").
             block_reuse_policy == "per_conversation")
+    per_conversation_config = KvCacheConfig(
+        block_reuse_policy="per_conversation",
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=64,
+            additional_snapshot_offsets_from_end=[0],
+        ),
+    )
+    assert (per_conversation_config.mamba_state_config.
+            periodic_snapshot_interval == 0)
+    assert (per_conversation_config.mamba_state_config.
+            additional_snapshot_offsets_from_end == [0])
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
 

@@ -1689,6 +1689,9 @@ def _build_v2_hybrid_with_mamba_layer(
     use_replay_state_update=False,
     enable_block_reuse=False,
     enable_partial_reuse=True,
+    block_reuse_policy="all_reusable",
+    periodic_snapshot_interval=0,
+    additional_snapshot_offsets_from_end=None,
     enable_attention_dp=False,
     enable_swa_scratch_reuse=False,
     dtype=DataType.HALF,
@@ -1709,7 +1712,12 @@ def _build_v2_hybrid_with_mamba_layer(
         max_tokens=512,
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=enable_partial_reuse,
+        block_reuse_policy=block_reuse_policy,
         enable_swa_scratch_reuse=enable_swa_scratch_reuse,
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=periodic_snapshot_interval,
+            additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
+        ),
         dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
     )
     return MambaHybridCacheManagerV2(
@@ -2002,6 +2010,75 @@ def test_v2_hybrid_uses_upstream_min_snapshot_policy():
         assert mgr.kv_cache_manager_py_config.commit_min_snapshot
     finally:
         mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_preserves_per_conversation_and_disables_periodic_snapshots():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        block_reuse_policy="per_conversation",
+        periodic_snapshot_interval=64,
+        additional_snapshot_offsets_from_end=[0],
+    )
+    try:
+        assert mgr.block_reuse_policy is BlockReusePolicy.PER_CONVERSATION
+        assert mgr.conversation_manager is not None
+        assert mgr.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 0
+        assert mgr.kv_cache_manager_py_config.commit_min_snapshot
+        request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[])
+        mgr.prepare_expect_snapshot_points([request])
+        assert request.expect_snapshot_points == [150]
+    finally:
+        mgr.shutdown()
+
+
+def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.enable_block_reuse = True
+    mgr.is_draft = False
+    mgr.block_reuse_policy = BlockReusePolicy.PER_CONVERSATION
+    events = []
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    mgr._mark_context_position_as_history = MagicMock()
+    mgr.conversation_manager = MagicMock()
+    mgr.conversation_manager.save_drop_plan.side_effect = lambda request, kv_cache: events.append(
+        "save"
+    )
+
+    request = SimpleNamespace(
+        py_request_id=7,
+        is_dummy_request=False,
+        context_current_position=128,
+        context_remaining_length=0,
+        expect_snapshot_points=[128],
+        prompt_len=128,
+        is_last_context_chunk=True,
+        get_tokens=lambda beam_idx: list(range(128)),
+    )
+    kv_cache = SimpleNamespace(
+        is_active=True,
+        num_committed_tokens=0,
+        resize=MagicMock(return_value=True),
+        enable_swa_scratch_reuse=True,
+    )
+
+    def commit(tokens):
+        events.append("commit")
+        kv_cache.num_committed_tokens += len(tokens)
+
+    kv_cache.commit = MagicMock(side_effect=commit)
+    kv_cache.stop_committing = MagicMock(side_effect=lambda: events.append("stop"))
+    mgr.kv_cache_map = {request.py_request_id: kv_cache}
+    batch = ScheduledRequests()
+    batch.append_context_request(request)
+
+    mgr.update_context_resources(batch)
+
+    kv_cache.commit.assert_called_once_with(list(range(128)))
+    kv_cache.stop_committing.assert_called_once_with()
+    mgr.conversation_manager.save_drop_plan.assert_called_once_with(request, kv_cache)
+    assert events == ["commit", "stop", "save"]
+    assert not kv_cache.enable_swa_scratch_reuse
 
 
 @skip_no_cuda

@@ -2635,8 +2635,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
-            # SSM reuse is valid only at explicit snapshot boundaries.
-            kv_cache_config.block_reuse_policy = BlockReusePolicy.PER_REQUEST.value
+            block_reuse_policy = BlockReusePolicy(
+                kv_cache_config.block_reuse_policy)
+            if block_reuse_policy == BlockReusePolicy.ALL_REUSABLE:
+                # SSM reuse is valid only at explicit snapshot boundaries.
+                kv_cache_config.block_reuse_policy = (
+                    BlockReusePolicy.PER_REQUEST.value)
         self.kv_cache_config = kv_cache_config
 
         super().__init__(
@@ -3297,6 +3301,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if should_commit:
                 self.try_commit_blocks(request, kv_cache)
             if request.context_remaining_length == 0:
+                if self.conversation_manager is not None:
+                    self.conversation_manager.save_drop_plan(request, kv_cache)
                 kv_cache.enable_swa_scratch_reuse = False
 
     def shutdown(self):

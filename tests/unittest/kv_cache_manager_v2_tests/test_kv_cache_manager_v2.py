@@ -2140,6 +2140,86 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
+    def test_ssm_planned_drop_targets_latest_snapshot_with_shared_plans(self) -> None:
+        """Shared plans drop only their conversation endpoint snapshot."""
+        cfg = self._make_ssm_config(tokens_per_block=32)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(64)]
+
+        kv_cache = self.manager.create_kv_cache()
+        kv_cache.resume(stream)
+        kv_cache.capacity = 32
+        kv_cache.commit(prompt[:32])
+        kv_cache.capacity = 64
+        kv_cache.commit(prompt[32:])
+        kv_cache.stop_committing()
+        first_handle = kv_cache.plan_committed_block_drop()
+        second_handle = kv_cache.plan_committed_block_drop()
+        self.assertIsNotNone(first_handle)
+        self.assertIsNotNone(second_handle)
+        kv_cache.close()
+
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+        assert first_handle is not None
+        first_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 64)
+        assert second_handle is not None
+        second_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 32)
+
+        empty_cache = self.manager.create_kv_cache()
+        empty_cache.resume(stream)
+        empty_cache.stop_committing()
+        self.assertIsNone(empty_cache.plan_committed_block_drop())
+        empty_cache.close()
+
+    def test_ssm_planned_drop_includes_partial_swa_window(self) -> None:
+        """Hybrid plans include SSM and every partial SWA-window page."""
+        cfg = self._make_ssm_config(
+            tokens_per_block=32,
+            num_attn_layers=1,
+            num_ssm_layers=1,
+            window_size=32,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(48)]
+
+        kv_cache = self.manager.create_kv_cache()
+        kv_cache.resume(stream)
+        kv_cache.capacity = len(prompt)
+        kv_cache.commit(prompt)
+        kv_cache.stop_committing()
+        drop_handle = kv_cache.plan_committed_block_drop()
+        self.assertIsNotNone(drop_handle)
+
+        match = self.manager._radix_tree.match(
+            ReuseScope(), prompt, self.manager.enable_partial_match
+        )
+        self.assertEqual(match.num_tokens, len(prompt))
+        attn_lc_id = next(iter(self.manager._life_cycles.attention_life_cycles()))[0]
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        planned_pages = []
+        for block in match.blocks:
+            page_ref = block.storage[attn_lc_id]
+            assert page_ref is not None
+            planned_pages.append(unwrap_rawref(page_ref))
+        ssm_page_ref = match.blocks[-1].storage[ssm_lc_id]
+        assert ssm_page_ref is not None
+        planned_pages.append(unwrap_rawref(ssm_page_ref))
+        self.assertTrue(all(page.planned_drop_count == 1 for page in planned_pages))
+        planned_pages.clear()
+        del page_ref, ssm_page_ref
+
+        kv_cache.close()
+        assert drop_handle is not None
+        drop_handle.drop()
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 0)
+
     def test_ssm_same_block_snapshots_support_monotonic_multi_turn_reuse(self) -> None:
         cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
         self.manager = KVCacheManager(cfg)

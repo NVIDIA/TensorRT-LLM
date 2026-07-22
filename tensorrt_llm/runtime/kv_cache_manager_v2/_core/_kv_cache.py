@@ -1047,22 +1047,37 @@ class _KVCache:
         return self._reuse_scope
 
     def plan_committed_block_drop(self) -> PlannedDropHandle | None:
-        """Plan dropping SWA blocks needed only by the next conversation turn.
+        """Plan dropping pages needed only by the next conversation turn.
 
         The plan covers committed pages in each SWA life cycle's current
-        attention window. Full-attention and attention-sink blocks are excluded
-        because later turns may still need them. SSM state is not yet supported.
-        This must be called after stop_committing(). Returns None without
-        creating a plan if any required SWA page is unavailable.
+        attention window and the exact SSM snapshot for the committed prefix.
+        Full-attention and attention-sink blocks are excluded because later
+        turns may still need them. This must be called after stop_committing().
+        Returns None without creating a plan if any required page is unavailable.
         """
         if self._commit_state != self.CommitState.USER_STOP:
             raise LogicError("plan_committed_block_drop() requires stop_committing()")
 
-        end = self._num_committed_blocks
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        matched_blocks: list[Block] = []
+        if self.num_committed_tokens > 0:
+            # Locate pages through the radix tree rather than
+            # SeqBlock.tree_block: the latter is not guaranteed to identify a
+            # partial snapshot after reuse. Requiring an exact match keeps the
+            # preceding conversation plan intact if this turn no longer has a
+            # complete reusable endpoint. All PP ranks use the same lookup so
+            # attention-only ranks include the final partial SWA block too.
+            match = self.manager._match_reuse(self.reuse_scope, self._committed_tokens)
+            if match.num_tokens != self.num_committed_tokens or not match.blocks:
+                return None
+            matched_blocks = match.blocks
+        elif ssm_lc_id is not None:
+            return None
+
+        end = BlockOrdinal(len(matched_blocks))
         pages_to_drop: list[CommittedPage] = []
         for lc_idx, lc in self.manager._life_cycles.items():
             if isinstance(lc, SsmLifeCycle):
-                # TODO: Support recording reusable SSM state pages.
                 continue
             if lc.window_size is None:
                 continue
@@ -1071,9 +1086,7 @@ class _KVCache:
             )
             window_start = min(stale_range.end, end)
             for ordinal in typed_range(window_start, end):
-                tree_block = self._blocks[ordinal].tree_block
-                if tree_block is None:
-                    return None
+                tree_block = matched_blocks[ordinal]
                 page_ref = tree_block.storage[lc_idx]
                 if page_ref is None:
                     return None
@@ -1081,6 +1094,15 @@ class _KVCache:
                 if page is None:
                     return None
                 pages_to_drop.append(page)
+
+        if ssm_lc_id is not None:
+            page_ref = matched_blocks[-1].storage[ssm_lc_id]
+            if page_ref is None:
+                return None
+            page = page_ref()
+            if not isinstance(page, SsmCommittedPage):
+                return None
+            pages_to_drop.append(page)
         return PlannedDropHandle(pages_to_drop)
 
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens

@@ -88,7 +88,9 @@ configuration files should use the nested field. The prototype
 `additional_snapshot_offsets_from_end` options add fixed boundaries. Start
 offsets count tokens from the beginning of the prompt. End offsets count
 backward from the prompt end, and an end offset of `0` selects the final
-prompt boundary. For example:
+prompt boundary. The `per_conversation` block reuse policy disables periodic
+Mamba snapshots, so configure one or more explicit stable boundaries (usually
+an end offset of `0`) when using it with a hybrid Mamba model. For example:
 
 ```yaml
 kv_cache_config:

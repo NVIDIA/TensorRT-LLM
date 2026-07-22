@@ -3772,8 +3772,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "'all_reusable' commits reusable blocks after every context chunk; "
             "'per_request' commits them only after the final context chunk; "
             "'per_conversation' uses 'per_request' commits and drops the previous "
-            "turn's committed SWA-window blocks after the current turn's final context "
-            "chunk. All reusable blocks remain subject to normal cache eviction. "
+            "turn's committed SWA-window blocks and Mamba stable-boundary state "
+            "after the current turn's final context chunk. Periodic Mamba state "
+            "snapshots are disabled with 'per_conversation'. All reusable blocks "
+            "remain subject to normal cache eviction. "
             "Requests without conversation params use 'per_request' behavior. When "
             "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
             "blocks are committed for reuse.")
@@ -3856,6 +3858,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             update={
                 "periodic_snapshot_interval": self.mamba_state_cache_interval
             })
+        return self
+
+    @model_validator(mode='after')
+    def disable_periodic_mamba_snapshots_for_conversations(
+            self) -> 'KvCacheConfig':
+        """Use only explicit stable boundaries for conversation reuse."""
+        if (self.block_reuse_policy == "per_conversation"
+                and self.mamba_state_config.periodic_snapshot_interval != 0):
+            self.mamba_state_config = self.mamba_state_config.model_copy(
+                update={"periodic_snapshot_interval": 0})
         return self
 
     @model_validator(mode='after')
