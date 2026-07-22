@@ -419,12 +419,11 @@ def test_cancel_request_in_transmission(attention_type):
         assert error_ids == [ctx_request.py_request_id]
         assert sys.getrefcount(ctx_request) == baseline_ctx_refcount
 
-        context_phase_params = ctx_request.context_phase_params
-        del ctx_request
-        gc.collect()
-        assert ctx_ref() is None, (
-            "Terminal context cancellation retained LlmRequest ownership")
-
+        # Construct the generation request before dropping the context request.
+        # The nanobind context_phase_params getter returns a reference into the
+        # context request, while the LlmRequest constructor copies the params.
+        # Keeping the getter result in a Python local would therefore keep the
+        # context request alive and invalidate the ownership check below.
         gen_request = LlmRequest(
             request_id=0,
             max_new_tokens=1,
@@ -433,7 +432,12 @@ def test_cancel_request_in_transmission(attention_type):
                 sampling_params._get_sampling_config()),
             is_streaming=False,
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
-            context_phase_params=context_phase_params)
+            context_phase_params=ctx_request.context_phase_params)
+
+        del ctx_request
+        gc.collect()
+        assert ctx_ref() is None, (
+            "Terminal context cancellation retained LlmRequest ownership")
 
         kv_cache_manager_gen.impl.add_sequence_batch(
             [(gen_request.py_request_id, gen_request.prompt_len, 1)],
