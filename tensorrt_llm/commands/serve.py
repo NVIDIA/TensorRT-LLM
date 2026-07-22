@@ -514,7 +514,7 @@ def launch_server(
                         host=openengine_host,
                         port=openengine_port,
                         tracker=request_tracker,
-                        media_config=multimodal_server_config,
+                        media_config=server.multimodal_server_config,
                         reasoning_parser=getattr(llm.args, "reasoning_parser",
                                                  None),
                         tool_parser=tool_parser,

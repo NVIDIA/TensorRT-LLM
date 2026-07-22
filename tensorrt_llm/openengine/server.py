@@ -3,6 +3,7 @@
 
 """Lifecycle wrapper for the optional OpenEngine sibling gRPC server."""
 
+import importlib
 import ipaddress
 
 import grpc
@@ -31,6 +32,29 @@ def validate_schema_release(schema_release: str) -> str:
     )
 
 
+def validate_runtime_dependencies(llm: object) -> None:
+    """Fail startup when an advertised modality lacks its runtime decoder."""
+    processor = getattr(llm, "input_processor", None)
+    modalities: set[str] = set()
+    for getter_name in (
+        "get_openengine_modalities",
+        "get_openengine_prefill_decode_modalities",
+    ):
+        getter = getattr(processor, getter_name, None)
+        if callable(getter):
+            modalities.update(getter())
+    if "video" in modalities:
+        try:
+            importlib.import_module("cv2")
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorRT-LLM OpenEngine advertises video input for this model, but "
+                "OpenCV is not installed. Install the OpenEngine runtime dependencies "
+                "with `python scripts/install_openengine.py` or "
+                "`pip install 'tensorrt-llm[openengine]'`."
+            ) from exc
+
+
 class OpenEngineServer:
     """An OpenEngine gRPC server which never owns or shuts down the LLM."""
 
@@ -49,6 +73,7 @@ class OpenEngineServer:
         stats_fanout: StatsFanout | None = None,
     ) -> None:
         validate_schema_release(schema_release())
+        validate_runtime_dependencies(llm)
         self.host = host
         self.port = port
         self._kv_event_fanout = kv_event_fanout
@@ -134,4 +159,9 @@ def openengine_role(server_role: object | None) -> int:
     raise ValueError(f"Unknown TRT-LLM server role {name!r}")
 
 
-__all__ = ["OpenEngineServer", "openengine_role", "validate_schema_release"]
+__all__ = [
+    "OpenEngineServer",
+    "openengine_role",
+    "validate_runtime_dependencies",
+    "validate_schema_release",
+]

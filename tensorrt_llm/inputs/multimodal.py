@@ -1026,7 +1026,18 @@ def find_mm_token_lengths(
                     video_metadata = item.metadata
                     video_audio = item.audio
                     item = item.frames
-                assert isinstance(item, list), "Video must be a list of frames"
+                if isinstance(item, np.ndarray):
+                    if item.ndim != 4 or item.shape[-1] != 3:
+                        raise ValueError(
+                            "Video NumPy frames must have shape (N, H, W, 3)"
+                        )
+                    item = list(item)
+                if not isinstance(item, list):
+                    raise TypeError(
+                        "Video must be a list of frames or a 4D NumPy frame array"
+                    )
+                if not item:
+                    raise ValueError("Video frames cannot be empty")
                 call_kwargs = {"video": item}
                 if video_metadata is not None:
                     # Used by per-model overrides that need to account for

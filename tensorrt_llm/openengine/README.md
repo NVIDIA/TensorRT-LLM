@@ -9,12 +9,18 @@ keeps the OpenEngine bindings out of TensorRT-LLM's required dependencies.
 
 The exact schema-revision-3 sibling source revision and `openengine-proto`
 0.3.0 package are recorded in `OPENENGINE_COMMIT`. Verify and install its
-generated Python package with:
+generated Python package and OpenEngine runtime dependencies with:
 
 ```bash
 python scripts/install_openengine.py
 python -m pip install -e .
 ```
+
+The OpenEngine runtime dependencies include the headless OpenCV decoder needed
+to serve the video capability advertised by video-capable input processors. The
+`openengine` extra installs those runtime dependencies, but the sibling
+installer remains required to verify and install the pinned `openengine-proto`
+package.
 
 The installer rejects a different or dirty sibling package/proto checkout. It
 prints the required `OPENENGINE_SCHEMA_RELEASE` export; sibling startup fails

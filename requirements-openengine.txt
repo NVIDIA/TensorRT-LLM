@@ -1,0 +1,3 @@
+# OpenCV 4.12 requires NumPy <2.3, while TensorRT-LLM supports NumPy <2.4 and
+# current serving images use 2.3. Pin the last compatible video decoder line.
+opencv-python-headless==4.11.0.86

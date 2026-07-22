@@ -68,7 +68,16 @@ def main() -> None:
         raise RuntimeError(f"OpenEngine Python package is missing: {package}")
     if not args.verify_only:
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", str(package)],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-e",
+                str(package),
+                "-r",
+                str(root / "requirements-openengine.txt"),
+            ],
             cwd=root,
             check=True,
         )

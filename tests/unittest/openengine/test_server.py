@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from tensorrt_llm.openengine._schema_pin import OPENENGINE_COMMIT
-from tensorrt_llm.openengine.server import OpenEngineServer, validate_schema_release
+from tensorrt_llm.openengine.server import (
+    OpenEngineServer,
+    validate_runtime_dependencies,
+    validate_schema_release,
+)
 from tensorrt_llm.openengine.servicer import schema_release
 
 
@@ -46,6 +50,43 @@ def test_schema_release_reads_launch_environment(monkeypatch) -> None:
     commit = "b0cf2a4826d246192dc65b055dab6d2b38d2d67e"
     monkeypatch.setenv("OPENENGINE_SCHEMA_RELEASE", commit)
     assert schema_release() == commit
+
+
+def test_video_capability_requires_openengine_decoder(monkeypatch) -> None:
+    class _Processor:
+        @staticmethod
+        def get_openengine_modalities() -> tuple[str, ...]:
+            return ("image", "video")
+
+        @staticmethod
+        def get_openengine_prefill_decode_modalities() -> tuple[str, ...]:
+            return ("video",)
+
+    class _Llm:
+        input_processor = _Processor()
+
+    def missing_cv2(_: str) -> None:
+        raise ImportError("cv2 is unavailable")
+
+    monkeypatch.setattr("tensorrt_llm.openengine.server.importlib.import_module", missing_cv2)
+    with pytest.raises(RuntimeError, match="OpenCV is not installed"):
+        validate_runtime_dependencies(_Llm())
+
+
+def test_non_video_capabilities_do_not_require_openengine_decoder(monkeypatch) -> None:
+    class _Processor:
+        @staticmethod
+        def get_openengine_modalities() -> tuple[str, ...]:
+            return ("image", "audio")
+
+    class _Llm:
+        input_processor = _Processor()
+
+    monkeypatch.setattr(
+        "tensorrt_llm.openengine.server.importlib.import_module",
+        lambda _: pytest.fail("cv2 lookup must be capability-gated"),
+    )
+    validate_runtime_dependencies(_Llm())
 
 
 @pytest.mark.asyncio

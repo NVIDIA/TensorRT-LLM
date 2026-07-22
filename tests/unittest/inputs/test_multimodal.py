@@ -4,6 +4,7 @@
 
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,6 +15,7 @@ from tensorrt_llm.inputs.multimodal import (
     _find_mm_embedding_lengths_from_masks,
     find_mm_token_lengths,
 )
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.inputs.registry import (
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
@@ -259,6 +261,45 @@ def test_find_mm_token_lengths_preserves_2d_grid_rows_per_video():
         FakeVideoProcessor(),
         multimodal_data={"video": {"video_grid_thw": torch.tensor([[1, 8, 10], [2, 8, 10]])}},
     ) == {"video": [1, 2]}
+
+
+def test_find_mm_token_lengths_accepts_video_data_numpy_frames():
+    """Qwen3-VL's preferred uint8 HWC frame array remains hashable."""
+    frames = np.zeros((2, 8, 10, 3), dtype=np.uint8)
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(
+            self, *, video, video_grid_thw=None, video_metadata=None
+        ):
+            assert isinstance(video, list)
+            assert len(video) == 2
+            assert all(isinstance(frame, np.ndarray) for frame in video)
+            assert all(frame.shape == (8, 10, 3) for frame in video)
+            assert video_metadata == {}
+            return 16
+
+    assert find_mm_token_lengths(
+        {"video": [VideoData(frames=frames, metadata={})]},
+        FakeVideoProcessor(),
+    ) == {"video": [16]}
+
+
+def test_find_mm_token_lengths_preserves_video_data_tensor_frame_lists():
+    """The existing list-of-tensors decoder contract remains unchanged."""
+    frames = [torch.zeros((3, 8, 10)), torch.ones((3, 8, 10))]
+
+    class FakeVideoProcessor:
+        def get_num_tokens_per_video(
+            self, *, video, video_grid_thw=None, video_metadata=None
+        ):
+            assert video is frames
+            assert video_metadata == {}
+            return 16
+
+    assert find_mm_token_lengths(
+        {"video": [VideoData(frames=frames, metadata={})]},
+        FakeVideoProcessor(),
+    ) == {"video": [16]}
 
 
 def test_disagg_prefill_multimodal_inputs_builds_typed_handoff():
