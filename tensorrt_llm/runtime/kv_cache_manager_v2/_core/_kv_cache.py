@@ -1131,6 +1131,8 @@ class _KVCache:
             # Free scratch slots on suspend since the data is ephemeral
             self._free_scratch_slots()
         self._status = self.Status.SUSPENDED
+        if self._should_record_stats():
+            self.manager.record_suspended_request()
 
     # Resume, migrate buffers to GPU memory.
     def resume(self, cuda_stream: CudaStream | None = None) -> bool:
@@ -1313,6 +1315,8 @@ class _KVCache:
                 self._blocks[last_ordinal].tree_block = None
         self._never_resumed = False
         self._status = self.Status.ACTIVE
+        if self._should_record_stats():
+            self.manager.record_resumed_request()
         return True
 
     def prefetch(self, target: CacheLevel) -> bool:

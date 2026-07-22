@@ -813,3 +813,44 @@ def test_pool_group_stats_are_reported(resource_guard) -> None:
         alloc_new=2,
         missed=2,
     )
+
+
+def _make_active_request(resource_guard) -> tuple[KVCacheManagerV2, _StatsRequest]:
+    """Create a manager + request driven to an active generation state.
+
+    The final _commit_and_get_stats drains the iteration stats (including the
+    resume that prepare_context performs on the freshly-created cache), so the
+    suspend/resume counters are back to 0 when the helper returns.
+    """
+    request = _StatsRequest(1, list(range(8)), context_remaining_length=8)
+    manager = resource_guard(_create_manager(gpu_bytes=8 << 20), request)
+
+    assert manager.prepare_context(request)
+    assert manager.resize_context(request, num_tokens=8)
+    _finish_context(manager, request)
+    _commit_and_get_stats(manager, _context_batch(request))
+    assert manager.try_allocate_generation(request)
+    _commit_and_get_stats(manager, _generation_batch(request))
+    return manager, request
+
+
+def test_suspend_resume_iteration_stats_are_reported(resource_guard) -> None:
+    """A suspend + successful resume increments the manager-level iteration counters.
+
+    This is the black-box signal I-10 asserts on: offload/onboard bytes stay 0 on
+    suspend (pages go LOCKED->HELD, kept on GPU), so they cannot confirm the
+    ACTIVE<->SUSPENDED state machine fired -- these counters can.
+    """
+    manager, request = _make_active_request(resource_guard)
+
+    kv_cache = manager.kv_cache_map[request.py_request_id]
+    assert kv_cache.is_active
+    kv_cache.suspend()
+    assert not kv_cache.is_active
+    assert kv_cache.resume(manager._stream.cuda_stream)
+    assert kv_cache.is_active
+
+    stats_report = manager.get_iteration_stats()
+    assert stats_report is not None
+    assert stats_report.suspended_requests == 1
+    assert stats_report.resumed_requests == 1
