@@ -152,6 +152,17 @@ SLURM_INFRA_RETRY_MAX = 1
 // to avoid nesting with the inner SLURM retry.
 K8S_INFRA_RETRY_MAX = 1
 
+// Per-stage override of the above: set `infraRetryMax` in a stage's opts map (the
+// 3rd element of its parallel-jobs config tuple, alongside singleAttempt) to cap
+// or disable stage-level infra retries for resource-scarce hardware pools --
+// `infraRetryMax: 0` disables retries entirely (1 attempt). It may only reduce the
+// budget: values above the scope global are clamped down to it (resolveInfraRetryMax),
+// so it can never increase retries past these caps. It applies to whichever
+// stage-level retry the stage uses: the SLURM retry (runLLMTestlistOnSlurm) for
+// dispatcher pods, or the K8s pod retry (runKubernetesPodWithInfraRetry) for regular
+// test pods. It does NOT touch the dispatcher-pod launch-retry (relaunching a cheap
+// Blossom pod doesn't tax the scarce hardware). Null/absent = use the globals above.
+
 // Fallback discriminator for SLURM timeouts.
 // If we can't reach the SLURM node for an authoritative reason,
 // we apply a heuristic: if the job needed more than this of its budget
@@ -1938,9 +1949,14 @@ def cbtsResizeSplits(configs) {
     return resized
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false)
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
+
+  // Per-stage override of the SLURM infra-retry budget (from opts.infraRetryMax,
+  // threaded via the dispatcher's retryContext). Lets resource-scarce pools cap
+  // or disable stage-level retries (0 = no retry). Null falls back to the global.
+  int slurmInfraRetryMax = resolveInfraRetryMax(InfraFailure.SLURM, infraRetryMax)
 
   def attempt = 0
   // Avoided SLURM nodes keyed by cluster. The platform can resolve to a
@@ -1958,7 +1974,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     ]
     try {
       if (attempt > 1) {
-        echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
+        echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${slurmInfraRetryMax + 1}"
         if (!avoidedSlurmNodeListsByCluster.isEmpty()) {
           echo "[INFRA-RETRY] ${stageName}: avoiding prior SLURM node list(s): " +
                avoidedSlurmNodeListsByCluster.collect { c, ns -> "${c}: ${ns.join(' ')}" }.join('; ')
@@ -2005,7 +2021,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
       rememberAvoidedSlurmNodeLists(avoidedSlurmNodeListsByCluster, attemptPlacementContext.lastSlurmClusterName, attemptPlacementContext.lastSlurmNodeList, stageName)
 
-      def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : SLURM_INFRA_RETRY_MAX
+      def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? Math.min(1, slurmInfraRetryMax) : slurmInfraRetryMax
 
       if (attempt > effectiveMax) {
         echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
@@ -2188,12 +2204,27 @@ long retrySafetyMarginMs(String scope)
     return scope == InfraFailure.SLURM ? 20L * 60L * 1000L : 15L * 60L * 1000L
 }
 
-int retryMaxForFailure(String scope, InfraFailure failure)
+// Resolve a per-stage infra-retry override (opts.infraRetryMax) against its
+// scope's global budget. The override may only CAP or DISABLE retries, never
+// exceed the global (which bounds CI time / worst-case attempts), so it is
+// clamped to [0, scopeDefault]; e.g. with the default of 1, infraRetryMax=2
+// still yields 1, and infraRetryMax=0 disables. Null falls back to the default.
+int resolveInfraRetryMax(String scope, Integer override)
 {
-    if (failure.severity == InfraFailure.PERSISTENT) {
-        return 1
+    int scopeDefault = (scope == InfraFailure.SLURM) ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX
+    if (override == null) {
+        return scopeDefault
     }
-    return scope == InfraFailure.SLURM ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX
+    return Math.max(0, Math.min(override, scopeDefault))
+}
+
+int retryMaxForFailure(String scope, InfraFailure failure, Integer infraRetryMax=null)
+{
+    // Per-stage override caps the scope default (see resolveInfraRetryMax); a
+    // PERSISTENT failure is still capped to at most one retry, so infraRetryMax=0
+    // disables retries for every severity.
+    int base = resolveInfraRetryMax(scope, infraRetryMax)
+    return (failure.severity == InfraFailure.PERSISTENT) ? Math.min(1, base) : base
 }
 
 boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, InfraFailure failure, int attempt, int effectiveMax, long backoffMs, boolean logDecision)
@@ -2225,7 +2256,7 @@ boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error,
     }
     Long parsedAttempt = trtllm_utils.parseCiBudgetLong(retryContext.attempt)
     int attempt = parsedAttempt != null ? parsedAttempt as int : 1
-    int effectiveMax = retryMaxForFailure(scope, classified)
+    int effectiveMax = retryMaxForFailure(scope, classified, retryContext.infraRetryMax as Integer)
     Long parsedBackoffMs = trtllm_utils.parseCiBudgetLong(retryContext.backoffMs)
     long backoffMs = parsedBackoffMs != null ? parsedBackoffMs : 60L * 1000L
     return hasBudgetForInfraRetry(pipeline, retryContext.stageName ?: "Unknown", scope, classified, attempt, effectiveMax, backoffMs, logDecision)
@@ -4550,6 +4581,12 @@ def runInKubernetes(pipeline, podSpec, containerName)
 def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerName, String stageName, Closure runner)
 {
     boolean singleAttempt = opts.singleAttempt ?: false
+    // Per-stage override of the K8s pod-level infra-retry budget (opts.infraRetryMax,
+    // 0 = no retry) so resource-scarce pools can cap or disable stage retries. Applies
+    // to the outer test-pod retry loop below; the singleAttempt launch-retry keeps the
+    // global (relaunching a dispatcher pod doesn't tax the scarce test hardware). SLURM
+    // dispatchers carry the same opt through to their inner SLURM retry via retryContext.
+    int k8sInfraRetryMax = resolveInfraRetryMax(InfraFailure.K8S, opts.infraRetryMax as Integer)
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
@@ -4627,7 +4664,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
         Map attemptPlacementContext = [:]
         try {
             if (attempt > 1) {
-                echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${K8S_INFRA_RETRY_MAX + 1}"
+                echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${k8sInfraRetryMax + 1}"
                 if (!avoidedKubernetesHostNodes.isEmpty()) {
                     echo "[INFRA-RETRY] ${stageName}: avoiding prior Kubernetes host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
                 }
@@ -4648,13 +4685,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             // cacheErrorAndUploadResult does not suppress synthetic stage-fail
             // XML / junit() on what would otherwise look (to it) like just
             // another intermediate attempt.
-            def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
+            def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             def retryContext = [
                 scope: InfraFailure.K8S,
                 stageName: stageName,
                 attempt: attempt,
                 backoffMs: 60L * 1000L,
+                infraRetryMax: opts.infraRetryMax,
                 excludedKubernetesHostNodes: avoidedKubernetesHostNodes.collect(),
             ]
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
@@ -4680,7 +4718,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
 
             rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
 
-            def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
+            def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
 
             if (attempt > effectiveMax) {
                 echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
@@ -4925,7 +4963,7 @@ def launchTestJobs(pipeline, testFilter)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, false, retryContext?.infraRetryMax)
     }, [singleAttempt: true]]]}
     // SLURM dispatcher pods run their own inner retry loop
     // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
@@ -5215,7 +5253,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -5229,7 +5267,7 @@ def launchTestJobs(pipeline, testFilter)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -5656,7 +5694,15 @@ def launchTestJobs(pipeline, testFilter)
                 // for SLURM dispatcher pods to disable nested pod retry).
                 def opts = (values.size() >= 3 && values[2] instanceof Map) ? values[2] : [:]
                 runKubernetesPodWithInfraRetry(opts, pipeline, values[0], "trt-llm", key, { attemptTag, isFinalAttempt, retryContext = null ->
-                    values[1](attemptTag, isFinalAttempt, retryContext)
+                    // Carry a per-stage infra-retry override (opts.infraRetryMax) to the
+                    // inner runner via retryContext -- the SLURM dispatcher's runner reads
+                    // it and passes it to runLLMTestlistOnSlurm. Preserve the null default
+                    // when no override is set so non-SLURM runners are unaffected.
+                    def innerRetryContext = retryContext
+                    if (opts.infraRetryMax != null) {
+                        innerRetryContext = (retryContext ?: [:]) + [infraRetryMax: opts.infraRetryMax]
+                    }
+                    values[1](attemptTag, isFinalAttempt, innerRetryContext)
                 })
             } else {
                 values()
