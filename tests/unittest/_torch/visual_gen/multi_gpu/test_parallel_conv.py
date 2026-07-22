@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Multi-GPU tests for parallel convolution wrappers.
 
 Tests HaloExchangeConv (stride-1) and HaloExchangeConv2dStride2 (stride-2)
@@ -196,6 +199,42 @@ def _logic_halo_conv2d_stride2(rank, world_size):
         _gather_and_check(local_out, ref, chunk_dim, world_size, rank)
 
 
+def _logic_halo_conv2d_stride2_offset_group(rank, world_size):
+    """Stride-2 halo works when VAE-local ranks differ from global ranks."""
+    assert world_size == 4
+    vae_ranks = [2, 3]
+    vae_group = dist.new_group(vae_ranks)
+    adjacent_group = dist.new_group(vae_ranks)
+    if rank not in vae_ranks:
+        dist.barrier()
+        return
+
+    local_rank = vae_ranks.index(rank)
+    device = f"cuda:{rank}"
+    conv = nn.Conv2d(96, 96, kernel_size=3, stride=2, padding=0).to(device).float()
+    for parameter in conv.parameters():
+        dist.broadcast(parameter.data, src=vae_ranks[0], group=vae_group)
+
+    x = torch.randn((4, 96, 64, 48), dtype=torch.float32, device=device)
+    dist.broadcast(x, src=vae_ranks[0], group=vae_group)
+    reference = conv(nn.ZeroPad2d((0, 1, 0, 1))(x)).detach()
+    local_x = x.chunk(len(vae_ranks), dim=3)[local_rank]
+    parallel = HaloExchangeConv2dStride2(
+        conv,
+        chunk_dim=3,
+        adj_groups=[adjacent_group],
+        rank=local_rank,
+        world_size=len(vae_ranks),
+        pad_before_conv=(0, 1, 0, 1),
+    )
+    local_output = parallel(local_x).contiguous()
+    gathered = [torch.empty_like(local_output) for _ in vae_ranks]
+    dist.all_gather(gathered, local_output, group=vae_group)
+    output = torch.cat(gathered, dim=3)
+    assert torch.max(torch.abs(output - reference)).item() < 0.01
+    dist.barrier()
+
+
 class TestHaloExchangeConv:
     def test_wan_conv3d_with_cache_2gpu(self):
         _run(2, _logic_halo_conv3d)
@@ -207,6 +246,9 @@ class TestHaloExchangeConv:
 class TestHaloExchangeConv2dStride2:
     def test_conv2d_stride2_2gpu(self):
         _run(2, _logic_halo_conv2d_stride2)
+
+    def test_conv2d_stride2_offset_group_4gpu(self):
+        _run(4, _logic_halo_conv2d_stride2_offset_group)
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Required modules not available")

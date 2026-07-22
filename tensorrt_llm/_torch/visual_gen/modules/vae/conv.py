@@ -267,13 +267,27 @@ class HaloExchangeConv2dStride2(nn.Module):
         dim = self.chunk_dim
         send_left = torch.narrow(x, dim, 0, self.halo_left).contiguous()
 
+        right_context = None
         if self.rank != self.world_size - 1:
             right_context = torch.zeros_like(send_left)
-            dist.recv(right_context, src=self.rank + 1)
+            right_group = self.adj_groups[self.rank]
+            if right_group is None:
+                raise RuntimeError(
+                    f"Missing VAE adjacent process group {self.rank} for local rank {self.rank}"
+                )
+            right_global_rank = dist.get_global_rank(right_group, 1)
+            dist.recv(right_context, src=right_global_rank, group=right_group)
         if self.rank != 0:
-            dist.send(send_left, dst=self.rank - 1)
+            left_group = self.adj_groups[self.rank - 1]
+            if left_group is None:
+                raise RuntimeError(
+                    f"Missing VAE adjacent process group {self.rank - 1} for local rank {self.rank}"
+                )
+            left_global_rank = dist.get_global_rank(left_group, 0)
+            dist.send(send_left, dst=left_global_rank, group=left_group)
 
         if self.rank != self.world_size - 1:
+            assert right_context is not None
             # Match the halo slice's layout to ``x`` so the cat preserves
             # channels-last (see ``_spatial_channels_last_format``).
             mf = _spatial_channels_last_format(x)
