@@ -371,6 +371,10 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
                                   save_async):
     model_fn, scheduler, worker = model_with_connector
 
+    # A transceiver-backed executor periodically wakes while idle. Keep the
+    # connector mock's return value valid while both workers are initialized.
+    worker.get_finished.return_value = [], []
+
     prefill_worker = model_fn(
         disable_overlap_scheduler=True,
         cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
