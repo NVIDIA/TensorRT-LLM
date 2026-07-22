@@ -1231,6 +1231,17 @@ void WindowBlockManager::startScheduling()
 
 void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 {
+    // Emit a KV "removed" event before detaching from the reuse trie. This
+    // path (partial-leaf reuse in onboardAndAllocateBlocks) previously dropped
+    // announced blocks from the trie silently: the block's hash had been
+    // published via enqueueStoredEvent when it was stored, but no removed
+    // event ever followed, so KV-event consumers that mirror the cache from
+    // stored/removed events retain the hash forever. Same event contract as
+    // getFreeBlock/releaseSubtree.
+    if (mEventManager && blockInRadixTree(block))
+    {
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
+    }
     // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
     // This is so it can check if the parent should be queued for eviction.
     block->freeLeafBlock();
@@ -1258,11 +1269,7 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
     for (auto it = subtree.rbegin(); it != subtree.rend(); ++it)
     {
         auto const& b = *it;
-        if (mEventManager && blockInRadixTree(b))
-        {
-            mEventManager->enqueueRemovedEvent(b, mWindowSize);
-        }
-        b->freeLeafBlock();
+        freeLeafBlock(b);
         if (!b->hasRefs())
         {
             b->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
@@ -2127,7 +2134,15 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 {
-    return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
+    // Test actual trie membership, not parent-chain validity. getPrevBlock()
+    // walks mLookupNode -> parentNode -> getValue(windowSize) and returns
+    // nullptr whenever the PARENT node's value slot is empty -- which happens
+    // as soon as the parent block is reclaimed. With that check, every
+    // descendant of an evicted ancestor was misreported as not-in-tree at its
+    // own reclaim, so getFreeBlock/releaseSubtree skipped its KV removed event
+    // while silently detaching it, leaking the hash forever in every
+    // kv-event consumer.
+    return !block->getUniqueTokens().empty() && block->getLookupNode() != nullptr;
 }
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)

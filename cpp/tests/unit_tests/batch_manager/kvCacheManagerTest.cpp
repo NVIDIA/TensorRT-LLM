@@ -7512,6 +7512,185 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStoreForDifferentWindowDoesNotFlus
         << "). The wFull store must not prematurely flush pending removes for wSWA.";
 }
 
+// Regression test for silently detached reuse-tree blocks (missing KV removed
+// events). Covers the getFreeBlock/releaseSubtree guard: a block whose
+// ANCESTOR was already reclaimed must still emit a Removed event when it is
+// itself reclaimed. Before blockInRadixTree() tested actual trie membership
+// (getLookupNode), it walked the parent chain (getPrevBlock) and misreported
+// such descendants as not-in-tree, so their reclaim emitted nothing and
+// event-stream consumers retained the hashes forever.
+TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedForBlocksWithEvictedAncestors)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+
+    auto const maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
+    auto const maxAttentionWindow = maxSequenceLength;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dtype, 0, stream, maxSequenceLength,
+        maxSequenceLength, true, CacheType::kSELF, std::nullopt, std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager.allocatePools(false);
+    (void) getEvents(kvCacheManager); // drain the Created event
+
+    // Seed a 2-block chain (head -> leaf) into the reuse tree and release it.
+    // The head gets a LOWER retention priority than the leaf so the eviction
+    // policy reclaims the ANCESTOR first — the exact geometry the old
+    // parent-chain membership test (getPrevBlock) misjudged: once the head's
+    // lookup-node value is cleared, the leaf's later reclaim was misreported
+    // as not-in-tree and emitted no Removed event.
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, false);
+    llmRequest0->setKvCacheRetentionConfig(
+        tle::KvCacheRetentionConfig(std::vector{tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, 5),
+                                        tle::KvCacheRetentionConfig::TokenRangeRetentionConfig(4, std::nullopt, 80)},
+            35));
+    kvCacheManager.addSequenceBatch(
+        {{{0, static_cast<SizeType32>(inputTokens0->size()), beamWidth}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    (void) kvCacheManager.removeSequence(0, llmRequest0);
+
+    // Collect every hash announced via Stored events; consumers now track them.
+    std::vector<size_t> storedHashes;
+    for (auto const& event : getEvents(kvCacheManager))
+    {
+        if (std::holds_alternative<tle::KVCacheStoredData>(event.data))
+        {
+            for (auto const& block : std::get<tle::KVCacheStoredData>(event.data).blocks)
+            {
+                storedHashes.push_back(block.blockHash);
+            }
+        }
+    }
+    ASSERT_GE(storedHashes.size(), 2) << "seed must store a chain of at least head + leaf";
+
+    // Exhaust the pool with an unrelated sequence so every stored block is
+    // reclaimed, ancestors and descendants alike, in whatever order the
+    // eviction policy picks.
+    auto inputTokens1 = std::make_shared<VecTokens>(
+        VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115});
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, false);
+    kvCacheManager.addSequenceBatch(
+        {{{1, static_cast<SizeType32>(inputTokens1->size()), beamWidth}}}, {std::ref(*llmRequest1)});
+
+    std::vector<size_t> removedHashes;
+    for (auto const& event : getEvents(kvCacheManager))
+    {
+        if (std::holds_alternative<tle::KVCacheRemovedData>(event.data))
+        {
+            for (auto const hash : std::get<tle::KVCacheRemovedData>(event.data).blockHashes)
+            {
+                removedHashes.push_back(hash);
+            }
+        }
+    }
+
+    // The stored/removed contract: every announced hash must be un-announced
+    // when its block is reclaimed, including blocks whose ancestors went first.
+    for (auto const storedHash : storedHashes)
+    {
+        EXPECT_THAT(removedHashes, ::testing::Contains(storedHash))
+            << "block announced via Stored was reclaimed without a Removed event";
+    }
+}
+
+// Regression test for the partial-leaf reuse path: onboardAndAllocateBlocks
+// detaches a partially matched leaf from the reuse tree via freeLeafBlock()
+// so the reusing request can re-store it with its own continuation. That
+// detach must emit a Removed event for the leaf's announced hash; previously
+// it detached silently and event-stream consumers leaked the hash.
+TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedOnPartialLeafReuse)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numHeads = 6;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxBlocksPerSeq = 4;
+    auto constexpr maxNumSequences = 8;
+    auto constexpr blocksInPrimaryPool = 8;
+    auto constexpr blocksInSecondaryPool = 0;
+
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+
+    auto const maxSequenceLength = tokensPerBlock * maxBlocksPerSeq;
+    auto const maxAttentionWindow = maxSequenceLength;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dtype, 0, stream, maxSequenceLength,
+        maxSequenceLength, true, CacheType::kSELF, std::nullopt, std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager.allocatePools(false);
+    (void) getEvents(kvCacheManager); // drain the Created event
+
+    // Seed [0,1,2,3,4,5,6]: block0 [0-3] stored full, block1 [4,5] stored as a
+    // partial leaf (the last token is excluded from storage).
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6});
+    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, false);
+    kvCacheManager.addSequenceBatch(
+        {{{0, static_cast<SizeType32>(inputTokens0->size()), beamWidth}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    (void) kvCacheManager.removeSequence(0, llmRequest0);
+
+    // The partial leaf's announced hash is the last stored block hash.
+    std::optional<size_t> leafHash;
+    for (auto const& event : getEvents(kvCacheManager))
+    {
+        if (std::holds_alternative<tle::KVCacheStoredData>(event.data))
+        {
+            auto const& blocks = std::get<tle::KVCacheStoredData>(event.data).blocks;
+            if (!blocks.empty())
+            {
+                leafHash = blocks.back().blockHash;
+            }
+        }
+    }
+    ASSERT_TRUE(leafHash.has_value()) << "seed must store the partial leaf";
+
+    // [0,1,2,3,4,10]: full match on block0, partial match on the leaf [4,5]
+    // (only token 4 matches). This request becomes the sole reuser and
+    // onboardAndAllocateBlocks detaches the leaf via freeLeafBlock().
+    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 10});
+    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, false);
+    kvCacheManager.addSequenceBatch(
+        {{{1, static_cast<SizeType32>(inputTokens1->size()), beamWidth}}}, {std::ref(*llmRequest1)});
+
+    std::vector<size_t> removedHashes;
+    for (auto const& event : getEvents(kvCacheManager))
+    {
+        if (std::holds_alternative<tle::KVCacheRemovedData>(event.data))
+        {
+            for (auto const hash : std::get<tle::KVCacheRemovedData>(event.data).blockHashes)
+            {
+                removedHashes.push_back(hash);
+            }
+        }
+    }
+    EXPECT_THAT(removedHashes, ::testing::Contains(*leafHash))
+        << "partial-leaf reuse must emit a Removed event for the detached leaf";
+}
+
+
 namespace
 {
 void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens)
