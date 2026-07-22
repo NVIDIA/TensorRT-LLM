@@ -64,7 +64,13 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, LayerId
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BatchDesc,
+    GpuCacheTierConfig,
+    KVCacheDesc,
+    KVCacheManagerConfig,
+    LayerId,
+)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1296,16 +1302,20 @@ def test_v2_hybrid_typical_batch_uses_num_ssm_slots():
         enable_partial_reuse=True,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=48),
     )
-
-    config = mgr._build_cache_config(
-        kv_cache_config,
+    mgr.kv_cache_config = kv_cache_config
+    constraints = [BatchDesc([KVCacheDesc(capacity=64, history_length=0)])]
+    base_config = KVCacheManagerConfig(
         tokens_per_block=32,
-        vocab_size=None,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=[],
+        constraints=constraints,
     )
+
+    config = mgr._build_cache_config(base_config)
 
     assert len(config.typical_step.kv_caches) == 2
     assert [kv.num_ssm_slots for kv in config.typical_step.kv_caches] == [3, 2]
+    assert config.constraints is constraints
     assert not hasattr(config.typical_step, "ssm_cache")
     assert not hasattr(config.typical_step, "additional_attention_cache")
     assert not hasattr(config.typical_step.kv_caches[0], "num_extra_attention_slots")
@@ -1329,13 +1339,15 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr._attention_cache_bytes_per_token = lambda: 16
     minimum_quota = mgr._minimum_live_gpu_quota()
 
+    mgr.kv_cache_config = KvCacheConfig(enable_partial_reuse=False)
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=minimum_quota - 1)],
+        layers=[],
+    )
+
     with pytest.raises(ValueError, match="too small for live recurrent states"):
-        mgr._build_cache_config(
-            KvCacheConfig(enable_partial_reuse=False),
-            tokens_per_block=32,
-            vocab_size=None,
-            cache_tiers=[GpuCacheTierConfig(quota=minimum_quota - 1)],
-        )
+        mgr._build_cache_config(base_config)
 
 
 def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
@@ -1577,12 +1589,13 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
             mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
         )
         mgr.kv_cache_config = kv_cache_config
-        config = mgr._build_cache_config(
-            kv_cache_config,
+        base_config = KVCacheManagerConfig(
             tokens_per_block=32,
-            vocab_size=1024,
             cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+            layers=[],
+            initial_pool_ratio=pool_ratio,
         )
+        config = mgr._build_cache_config(base_config)
         runtime_manager = RuntimeKVCacheManager(config)
         try:
             statistics = runtime_manager._storage.get_statistics()
@@ -2156,6 +2169,28 @@ def test_v2_hybrid_intermediate_states_size_by_tokens_per_gen_step():
 
 
 @skip_no_cuda
+def test_v2_hybrid_static_dynamic_tree_capacity():
+    spec_config = MTPDecodingConfig(
+        max_draft_len=6,
+        max_total_draft_tokens=31,
+        use_dynamic_tree=True,
+        dynamic_tree_max_topK=10,
+    )
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        spec_config=spec_config,
+    )
+    try:
+        assert mgr.intermediate_ssm_states.shape[2] == 32
+        assert mgr.intermediate_conv_states.shape[2] == 32
+        assert mgr._kv_reserve_draft_tokens == 31
+        assert mgr._num_cuda_graph_padding_dummy_slots == 1
+        assert not mgr.use_replay_state_update
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
 def test_v2_hybrid_replay_buffers_size_by_tokens_per_gen_step():
     spec_config = _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5)
     mgr = _build_v2_hybrid_with_mamba_layer(
@@ -2258,6 +2293,40 @@ def test_v2_hybrid_replay_update_skips_dummy_and_padding_rows(monkeypatch):
 
     assert mgr.prev_num_accepted_tokens.tolist() == [13, 3, 13, 13]
     assert mgr.cache_buf_idx.tolist() == [1, 0, 1, 1]
+
+
+def test_v2_hybrid_dynamic_tree_promotes_accepted_leaf_state(monkeypatch):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 1
+    mgr._use_replay_state_update = False
+    mgr.intermediate_state_indices = torch.arange(2, dtype=torch.int32)
+    mgr.all_ssm_states = [torch.empty(0)]
+    mgr.all_conv_states = [torch.empty(0)]
+    mgr.intermediate_ssm_states = torch.empty((1, 2, 8))
+    mgr.intermediate_conv_states = torch.empty((1, 2, 8))
+
+    promoted_positions = []
+
+    def capture_promoted_position(_dst, _src, _src_indices, positions, _dst_indices):
+        promoted_positions.append(positions.clone())
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        capture_promoted_position,
+    )
+
+    mgr.update_mamba_states(
+        SimpleNamespace(num_seqs=3, num_contexts=1),
+        torch.tensor([1, 2, 3], dtype=torch.int32),
+        state_indices=torch.tensor([9, 10, 11], dtype=torch.int32),
+        accepted_leaf_positions=torch.tensor([4, 7], dtype=torch.int64),
+    )
+
+    assert len(promoted_positions) == 2
+    assert all(
+        torch.equal(positions, torch.tensor([4, 7], dtype=torch.int32))
+        for positions in promoted_positions
+    )
 
 
 @skip_no_cuda

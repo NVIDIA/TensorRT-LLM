@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import secrets
+import select
 import signal
 import socket
 import subprocess  # nosec B404
@@ -13,7 +14,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Set
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -28,7 +29,7 @@ from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
-from tensorrt_llm.executor.utils import LlmLauncherEnvs
+from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
@@ -39,7 +40,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
-from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
+from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
@@ -199,6 +200,7 @@ def get_llm_args(
         free_gpu_memory_fraction: float = 0.9,
         kv_cache_dtype: str = "auto",
         num_postprocess_workers: int = 0,
+        num_serve_frontends: int = 1,
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
@@ -272,6 +274,8 @@ def get_llm_args(
         max_seq_len,
         "num_postprocess_workers":
         num_postprocess_workers,
+        "num_serve_frontends":
+        num_serve_frontends,
         "enable_chunked_prefill":
         enable_chunked_prefill,
         "enable_attention_dp":
@@ -360,6 +364,156 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+class MultiFrontendMode(NamedTuple):
+    """This process's role under multi-frontend serving (prototype)."""
+    num_frontends: int
+    is_attached_frontend: bool
+
+    @property
+    def is_launcher(self) -> bool:
+        """Owns the engine and spawns/cleans the attached frontends."""
+        return self.num_frontends > 1 and not self.is_attached_frontend
+
+
+def _init_multi_frontend_mode(llm_args: dict,
+                              enabled: bool) -> MultiFrontendMode:
+    """Resolve this process's multi-frontend serving role.
+
+    num_serve_frontends=K runs K HTTP frontend processes against ONE
+    executor: the launcher (frontend 0) owns the engine and spawns K-1
+    attached frontends (classic IPC executor path only). enabled=False
+    entry points (e.g. disaggregated MPI workers) never honor the knob.
+    """
+    if not enabled:
+        if llm_args.pop("num_serve_frontends", 1) > 1:
+            logger.warning("num_serve_frontends is only supported on plain "
+                           "trtllm-serve; ignored on this entry point.")
+        return MultiFrontendMode(1, False)
+
+    mode = MultiFrontendMode(llm_args.get("num_serve_frontends", 1),
+                             os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
+    if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
+        raise ValueError(
+            "num_serve_frontends > 1 requires the default (classic IPC) "
+            "executor path, not orchestrator_type="
+            f"{llm_args.get('orchestrator_type')!r}")
+    return mode
+
+
+def _spawn_attached_frontends(llm, num_frontends: int) -> list:
+    """Spawn num_frontends - 1 attached serving frontend processes.
+
+    Each child re-execs this trtllm-serve command line with env vars
+    carrying the launcher executor's attach endpoints; its executor
+    attaches to the already-running worker instead of launching one (see
+    GenerationExecutor.create / GenerationExecutorFrontendProxy).
+
+    Blocks until every child signals READY over its inherited pipe: a
+    successful Popen only proves the process exists, while the frontend
+    can still fail during executor attach or server setup. Any child
+    failure (or a missed deadline) fails the whole group, terminating
+    the children already started, so num_serve_frontends=K never
+    silently degrades to fewer frontends.
+    """
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+
+    executor = getattr(llm, "_executor", None)
+    if not isinstance(executor, GenerationExecutorProxy) or (
+            attach_info := executor.multi_frontend_attach_info()) is None:
+        raise ValueError(
+            "num_serve_frontends > 1 requires the classic IPC executor "
+            f"proxy in multi-frontend mode, got {type(executor).__name__}")
+    # Carries the executor HMAC keys; the child deletes it from its env
+    # once consumed (GenerationExecutor.create).
+    attach_env = json.dumps(attach_info)
+
+    children, ready_fds = [], []
+    try:
+        for frontend_id in range(1, num_frontends):
+            # Strip MPI/SLURM identity vars: an inherited rank identity would
+            # make the child's mpi4py try to (re-)join the launcher's job.
+            env, _ = split_mpi_env()
+            env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
+            env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
+            env["TLLM_DISABLE_MPI"] = "1"
+            read_fd, write_fd = os.pipe()
+            ready_fds.append(read_fd)
+            env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
+            try:
+                child = subprocess.Popen([sys.executable] + sys.argv,
+                                         env=env,
+                                         pass_fds=(write_fd, ))  # nosec B603
+            finally:
+                # The child now holds the only write end; its exit before
+                # READY surfaces as EOF on read_fd.
+                os.close(write_fd)
+            children.append(child)
+            logger.info(
+                f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
+            )
+        _wait_attached_frontends_ready(children, ready_fds)
+    except BaseException:
+        _terminate_attached_frontends(children)
+        raise
+    finally:
+        for fd in ready_fds:
+            os.close(fd)
+    return children
+
+
+def _wait_attached_frontends_ready(children: list, ready_fds: list) -> None:
+    """Block until every attached frontend writes its READY byte."""
+    timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
+    deadline = time.monotonic() + timeout
+    pending = dict(zip(ready_fds, children))
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"{len(pending)} attached frontend(s) not ready within "
+                f"{timeout:.0f}s (TLLM_FRONTEND_READY_TIMEOUT)")
+        readable, _, _ = select.select(list(pending), [], [],
+                                       min(remaining, 1.0))
+        for fd in readable:
+            child = pending.pop(fd)
+            if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
+                raise RuntimeError(
+                    f"Attached frontend (pid {child.pid}) exited before "
+                    "signaling READY")
+            logger.info(f"Attached frontend (pid {child.pid}) is ready")
+        for fd, child in list(pending.items()):
+            if child.poll() is not None:
+                raise RuntimeError(
+                    f"Attached frontend (pid {child.pid}) exited with code "
+                    f"{child.returncode} before signaling READY")
+
+
+def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
+    """Report READY to the launcher over the inherited pipe.
+
+    Called once everything fallible in an attached frontend's startup
+    (port bind, executor attach, LLM and OpenAIServer construction,
+    middleware registration) has succeeded; the launcher blocks group
+    startup on this byte (see _wait_attached_frontends_ready).
+    """
+    ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
+    if not (multi_frontend.is_attached_frontend and ready_fd):
+        return
+    fd = int(ready_fd)
+    os.write(fd, b"R")
+    os.close(fd)
+
+
+def _terminate_attached_frontends(children: list) -> None:
+    for child in children:
+        child.terminate()
+    for child in children:
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+
+
 def launch_server(
         host: str,
         port: int,
@@ -374,10 +528,25 @@ def launch_server(
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
-        num_media_load_workers: int = 8):
+        num_media_load_workers: int = 8,
+        multi_frontend_enabled: bool = True):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+
+    multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
+        # The Responses API store is per-process in-memory: with several
+        # frontends behind one SO_REUSEPORT port, a follow-up request may
+        # land on a sibling that has no record of the previous response.
+        # Disable storage group-wide (OpenAIServer.enable_store).
+        if not os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE"):
+            logger.warning(
+                "num_serve_frontends > 1: stateful Responses API storage "
+                "(store/previous_response_id) is disabled; the per-frontend "
+                "in-memory store cannot be shared across frontends.")
+        os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
+
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -385,6 +554,10 @@ def launch_server(
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
         assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
+        if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
+            # Every frontend process binds its own listening socket on the
+            # same port; the kernel load-balances accepts across them.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         try:
             s.bind((host, port))
             if port == 0:
@@ -411,25 +584,39 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
-        server = OpenAIServer(
-            generator=llm,
-            model=model,
-            tool_parser=tool_parser,
-            server_role=server_role,
-            metadata_server_cfg=metadata_server_cfg,
-            disagg_cluster_config=disagg_cluster_config,
-            multimodal_server_config=multimodal_server_config,
-            chat_template=chat_template,
-            allow_request_chat_template=allow_request_chat_template,
-            input_processor_workers=num_input_processor_workers,
-            media_load_workers=num_media_load_workers)
-        _apply_fastapi_middlewares(server.app, middleware)
+        # The finally below is the cleanup boundary for the attached
+        # frontends: it must cover everything from their spawn through
+        # server construction, middleware registration, and runtime, or a
+        # failure in between leaks the child processes.
+        frontend_children = []
+        try:
+            if multi_frontend.is_launcher:
+                frontend_children = _spawn_attached_frontends(
+                    llm, multi_frontend.num_frontends)
 
-        # Optionally disable GC (default: not disabled)
-        if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-            gc.disable()
+            server = OpenAIServer(
+                generator=llm,
+                model=model,
+                tool_parser=tool_parser,
+                server_role=server_role,
+                metadata_server_cfg=metadata_server_cfg,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
+                chat_template=chat_template,
+                allow_request_chat_template=allow_request_chat_template,
+                input_processor_workers=num_input_processor_workers,
+                media_load_workers=num_media_load_workers)
+            _apply_fastapi_middlewares(server.app, middleware)
 
-        uvloop.run(server(host, port, sockets=[s]))
+            # Optionally disable GC (default: not disabled)
+            if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                gc.disable()
+
+            _signal_frontend_ready(multi_frontend)
+            uvloop.run(server(host, port, sockets=[s]))
+        finally:
+            if frontend_children:
+                _terminate_attached_frontends(frontend_children)
 
 
 def launch_grpc_server(host: str,
@@ -888,6 +1075,13 @@ def launch_visual_gen_server(
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
                   status="prototype")
+@stability_option("--num_serve_frontends",
+                  type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
+                  default=1,
+                  help="Number of HTTP frontend processes serving one "
+                  "executor; values > 1 share the serving port via "
+                  "SO_REUSEPORT (classic IPC executor path only).",
+                  status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
@@ -1069,29 +1263,30 @@ def launch_visual_gen_server(
     help=
     "Types of agents to schedule. Now Only Support Open Deep Research agent.",
     status="prototype")
-def serve(
-        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        post_processor_hook: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tensor_parallel_size: int,
-        pipeline_parallel_size: int, context_parallel_size: int,
-        moe_expert_parallel_size: Optional[int],
-        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, num_input_processor_workers: int,
-        num_media_load_workers: int, trust_remote_code: bool,
-        revision: Optional[str], extra_llm_api_options: Optional[str],
-        reasoning_parser: Optional[str], tool_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str], agent_percentage: float,
-        agent_types: Optional[str], video_pruning_rate: Optional[float],
-        telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], allow_request_chat_template: bool,
-        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-        served_model_name: Optional[str], visual_gen_args: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
+          post_processor_hook: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tensor_parallel_size: int, pipeline_parallel_size: int,
+          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          moe_cluster_parallel_size: Optional[int],
+          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
+          kv_cache_dtype: str, num_postprocess_workers: int,
+          num_serve_frontends: int, num_input_processor_workers: int,
+          num_media_load_workers: int, trust_remote_code: bool,
+          revision: Optional[str], extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool,
+          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
+          media_io_kwargs: Optional[str], agent_percentage: float,
+          agent_types: Optional[str], video_pruning_rate: Optional[float],
+          telemetry: bool, custom_module_dirs: list[Path],
+          chat_template: Optional[str], allow_request_chat_template: bool,
+          middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
+          served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1173,6 +1368,7 @@ def serve(
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             kv_cache_dtype=kv_cache_dtype,
             num_postprocess_workers=num_postprocess_workers,
+            num_serve_frontends=num_serve_frontends,
             trust_remote_code=trust_remote_code,
             revision=revision,
             reasoning_parser=reasoning_parser,
@@ -2151,7 +2347,9 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
         host=server_cfg.hostname,
         port=server_cfg.port,
         llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template)
+        allow_request_chat_template=disagg_config.allow_request_chat_template,
+        # Disagg ctx/gen MPI workers must not enter multi-frontend mode.
+        multi_frontend_enabled=False)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

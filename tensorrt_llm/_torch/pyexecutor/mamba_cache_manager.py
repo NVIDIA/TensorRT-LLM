@@ -16,7 +16,7 @@
 import math
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, NamedTuple,
                     Optional, Tuple, Union)
 
@@ -47,13 +47,11 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
                                                       AttentionLayerConfig,
                                                       BatchDesc, BufferConfig,
-                                                      CacheTierConfig, DataRole,
-                                                      KVCacheDesc)
+                                                      DataRole, KVCacheDesc)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, PageIndexMode,
-                                                      SsmLayerConfig,
-                                                      SwaScratchReuseConfig)
+                                                      SsmLayerConfig)
 
 GB = 1 << 30
 
@@ -882,14 +880,20 @@ class PythonMambaCacheManager(BaseResourceManager):
         torch.cuda.empty_cache()
 
     @torch.compile(options={"max-autotune": True})
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: torch.Tensor):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: torch.Tensor,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         num_accepted_draft_tokens = num_accepted_tokens[
             num_contexts:num_contexts + num_gens] - 1
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
+        accepted_positions = (accepted_leaf_positions if accepted_leaf_positions
+                              is not None else num_accepted_draft_tokens)
         state_indices_d = state_indices[num_contexts:num_contexts + num_gens]
         src_state_indices = self.intermediate_state_indices[:num_gens]
 
@@ -909,7 +913,7 @@ class PythonMambaCacheManager(BaseResourceManager):
             ssm_states = self.mamba_cache.temporal
             intermediate_ssm_cache = self.mamba_cache.intermediate_ssm
             accepted_ssm_state = intermediate_ssm_cache[:, src_state_indices,
-                                                        num_accepted_draft_tokens]
+                                                        accepted_positions]
             ssm_states[:, state_indices_d, :] = accepted_ssm_state
 
         # Conv: both paths save all intermediate conv windows, carry over the accepted one.
@@ -917,7 +921,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
-                                                             num_accepted_draft_tokens]
+                                                             accepted_positions]
         conv_states[:, state_indices_d, :] = accepted_conv_state
 
 
@@ -1061,15 +1065,18 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     def shutdown(self):
         self._impl.shutdown()
 
-    def update_mamba_states(self, attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: torch.Tensor):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: torch.Tensor,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         # Non-speculative configs don't allocate intermediate state; the
         # promotion is a clean no-op.
         if not self._impl.is_speculative():
             return
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
-                                       state_indices)
+                                       state_indices, accepted_leaf_positions)
 
 
 class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
@@ -2207,10 +2214,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self._pending_state_transfers = False
 
     @nvtx_range("hybrid_update_mamba_states")
-    def update_mamba_states(self,
-                            attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: Optional[torch.Tensor] = None):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: Optional[torch.Tensor] = None,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
         batch_size = attn_metadata.num_seqs
@@ -2219,6 +2228,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         num_accepted_draft_tokens = (
             num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
                 torch.int32)
+        # Dynamic tree passes tree-node leaf positions; linear MTP uses depth.
+        accepted_positions = (accepted_leaf_positions.to(torch.int32)
+                              if accepted_leaf_positions is not None else
+                              num_accepted_draft_tokens)
         # Match the API of MambaCacheManager.update_mamba_states: callers
         # may pass per-request state slot indices explicitly (e.g. MTP via
         # attn_metadata.mamba_metadata.state_indices). Fall back to this
@@ -2256,16 +2269,15 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             # Legacy: copy the accepted SSM state from the intermediate buffer.
             _promote_mamba_state_triton(self.all_ssm_states,
                                         self.intermediate_ssm_states,
-                                        src_state_indices,
-                                        num_accepted_draft_tokens,
+                                        src_state_indices, accepted_positions,
                                         state_indices_d)
 
         # Conv: both paths save all intermediate conv windows, carry over the
         # accepted one.
         _promote_mamba_state_triton(self.all_conv_states,
                                     self.intermediate_conv_states,
-                                    src_state_indices,
-                                    num_accepted_draft_tokens, state_indices_d)
+                                    src_state_indices, accepted_positions,
+                                    state_indices_d)
 
     def get_num_available_tokens(self,
                                  token_num_upper_bound: int,
@@ -2844,16 +2856,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return state_quota + attention_quota
 
     def _build_cache_config(
-        self,
-        kv_cache_config: KvCacheConfig,
-        *,
-        tokens_per_block: int,
-        vocab_size: Optional[int],
-        cache_tiers: List[CacheTierConfig],
-    ):
-        # Kept in the virtual method contract for cache-manager subclasses.
-        # The generic V2 config no longer stores the vocabulary size.
-        del vocab_size
+            self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        kv_cache_config = self.kv_cache_config
+        tokens_per_block = config.tokens_per_block
+        cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
         if minimum_live_quota > gpu_quota:
@@ -2874,11 +2880,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             buffer_type.append(Role.KEY_BLOCK_SCALE)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 buffer_type.append(Role.VALUE_BLOCK_SCALE)
-
-        scratch_reuse_config = None
-        if self.enable_swa_scratch_reuse:
-            scratch_reuse_config = SwaScratchReuseConfig(
-                max_rewind_len=self.num_extra_kv_tokens)
 
         layers = []
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
@@ -2920,28 +2921,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         typical_ssm_slots = self._ssm_slots_per_request_for_typical_batch(
             planned_capacity, kv_cache_config)
 
-        return KVCacheManagerConfigPy(
-            tokens_per_block=tokens_per_block,
-            cache_tiers=cache_tiers,
-            max_util_for_resume=kv_cache_config.max_util_for_resume,
-            initial_pool_ratio=kv_cache_config.pool_ratio,
+        typical_step = BatchDesc([
+            KVCacheDesc(
+                capacity=capacity_per_request + int(i < capacity_remainder),
+                history_length=max(
+                    0, capacity_per_request + int(i < capacity_remainder) - 1),
+                num_ssm_slots=typical_ssm_slots[i],
+            ) for i in range(num_sequences)
+        ])
+        return replace(
+            config,
             layers=layers,
-            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
-            typical_step=BatchDesc([
-                KVCacheDesc(
-                    capacity=capacity_per_request + int(i < capacity_remainder),
-                    history_length=max(
-                        0,
-                        capacity_per_request + int(i < capacity_remainder) - 1),
-                    num_ssm_slots=typical_ssm_slots[i],
-                ) for i in range(num_sequences)
-            ]),
-            swa_scratch_reuse=scratch_reuse_config,
+            typical_step=typical_step,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
             # attempted, while the runtime config still needs the invariant.
             commit_min_snapshot=True,
-            enable_stats=self.enable_stats,
         )
 
     def _get_state_buffer(self, local_layer_idx: int, role, dtype: torch.dtype,
@@ -3175,10 +3170,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def get_max_resource_count(self) -> int:
         return self.max_batch_size
 
-    def update_mamba_states(self,
-                            attn_metadata: "AttentionMetadata",
-                            num_accepted_tokens: torch.Tensor,
-                            state_indices: Optional[torch.Tensor] = None):
+    def update_mamba_states(
+            self,
+            attn_metadata: "AttentionMetadata",
+            num_accepted_tokens: torch.Tensor,
+            state_indices: Optional[torch.Tensor] = None,
+            accepted_leaf_positions: Optional[torch.Tensor] = None):
         if self.local_num_mamba_layers == 0:
             return
         batch_size = attn_metadata.num_seqs
@@ -3187,6 +3184,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         num_accepted_draft_tokens = (
             num_accepted_tokens[num_contexts:num_contexts + num_gens] - 1).to(
                 torch.int32)
+        # Dynamic tree selects a tree node rather than a linear draft depth.
+        accepted_positions = (accepted_leaf_positions.to(torch.int32)
+                              if accepted_leaf_positions is not None else
+                              num_accepted_draft_tokens)
         if state_indices is None:
             state_indices = self.get_state_indices()
         state_indices_d = state_indices[num_contexts:num_contexts +
@@ -3211,7 +3212,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     dst.unsqueeze(0),
                     self.intermediate_ssm_states[layer_offset:layer_offset + 1],
                     src_state_indices,
-                    num_accepted_draft_tokens,
+                    accepted_positions,
                     state_indices_d,
                 )
 
@@ -3220,7 +3221,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 dst.unsqueeze(0),
                 self.intermediate_conv_states[layer_offset:layer_offset + 1],
                 src_state_indices,
-                num_accepted_draft_tokens,
+                accepted_positions,
                 state_indices_d,
             )
 

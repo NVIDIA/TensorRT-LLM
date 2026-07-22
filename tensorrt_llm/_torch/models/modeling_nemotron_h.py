@@ -1282,6 +1282,8 @@ class NemotronHMTP(nn.Module):
                 residual=residual,
                 attn_metadata=attn_metadata,
                 all_rank_num_tokens=all_rank_num_tokens,
+                spec_metadata=spec_metadata,
+                mamba_metadata=attn_metadata.mamba_metadata,
                 lora_params=lora_params,
             )
         return hidden_states
