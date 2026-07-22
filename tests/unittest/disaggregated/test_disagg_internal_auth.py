@@ -80,6 +80,29 @@ def test_protected_fields_accept_valid_internal_auth_header(completion_request):
     validate_internal_disagg_request("secret", completion_request, headers)
 
 
+def test_protected_fields_accept_valid_header_after_wire_roundtrip():
+    request = _make_request(
+        encoded_opaque_state="b3BhcXVl",
+        ctx_info_endpoint="tcp://10.0.0.1:5000",
+    )
+    request.disaggregated_params.conversation_id = "conversation-1"
+    headers = build_internal_disagg_auth_headers("secret", request)
+
+    wire_request = CompletionRequest.model_validate_json(
+        request.model_dump_json(exclude_unset=True)
+    )
+
+    validate_internal_disagg_request("secret", wire_request, headers)
+
+
+def test_unprotected_disagg_fields_do_not_invalidate_internal_auth_header():
+    request = _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000")
+    headers = build_internal_disagg_auth_headers("secret", request)
+    request.disaggregated_params.conversation_id = "conversation-1"
+
+    validate_internal_disagg_request("secret", request, headers)
+
+
 def test_opaque_state_rejects_tampered_payload():
     request = _make_request(encoded_opaque_state="b3BhcXVl")
     headers = build_internal_disagg_auth_headers("secret", request)
