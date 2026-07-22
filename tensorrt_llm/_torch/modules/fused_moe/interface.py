@@ -868,6 +868,13 @@ class MoE(nn.Module):
         self.transform_weights()
         self.cache_derived_state()
 
+    @property
+    def supports_partial_weight_loading(self) -> bool:
+        """Whether this backend can defer processing across partial loads."""
+        quant_method = getattr(self, 'quant_method', None)
+        return bool(
+            getattr(quant_method, 'supports_partial_weight_loading', False))
+
     def process_weights_after_loading(self):
         """
         Apply quantization processing to loaded weights.

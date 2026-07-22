@@ -28,11 +28,60 @@ __all__ = [
     "madvise_range",
     "pageout_file_backed_regions",
     "advise_tensor_pageout",
+    "is_reloadable_file_backed_tensor",
 ]
 
 _MADV_DONTNEED = 4
 _MADV_PAGEOUT = 21
 _MADV_ADVICE_BY_MODE = {"dontneed": _MADV_DONTNEED, "pageout": _MADV_PAGEOUT}
+
+
+def is_reloadable_file_backed_tensor(tensor) -> bool:
+    """Return whether a CPU tensor is wholly inside a reloadable file mapping.
+
+    ``MADV_DONTNEED`` is only safe for checkpoint tensors whose pages can be
+    faulted back from an ordinary file.  Anonymous allocations and node-shared
+    transports (including common ``/dev/shm`` MPI mappings) must not be
+    discarded: later consumers could otherwise observe zero-filled pages.
+
+    This Linux-only check intentionally fails closed when ``/proc/self/maps``
+    cannot be inspected or the mapping disappears concurrently.
+    """
+    if tensor.device.type != "cpu" or not tensor.is_contiguous():
+        return False
+
+    start = tensor.data_ptr()
+    end = start + tensor.numel() * tensor.element_size()
+    if end <= start:
+        return False
+
+    try:
+        maps = open("/proc/self/maps")
+    except OSError:
+        return False
+    with maps:
+        for line in maps:
+            fields = line.rstrip("\n").split(maxsplit=5)
+            if len(fields) < 6:
+                continue
+            try:
+                start_hex, end_hex = fields[0].split("-", maxsplit=1)
+                mapping_start = int(start_hex, 16)
+                mapping_end = int(end_hex, 16)
+            except ValueError:
+                continue
+            if not (mapping_start <= start and end <= mapping_end):
+                continue
+
+            path = fields[5]
+            if (
+                not path.startswith("/")
+                or path.endswith(" (deleted)")
+                or path.startswith(("/dev/shm/", "/run/shm/"))
+            ):
+                return False
+            return True
+    return False
 
 
 def madvise_range(addr: int, size: int, mode: str = "dontneed") -> None:
@@ -126,12 +175,14 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
     - This call only gives a *hint* to the kernel: the OS may decide to ignore it.
     - Safe to call on file-backed mmap tensors (data will be reloaded on next
       access).
-    - Do not call this on malloc-based tensors. ``MADV_DONTNEED`` may discard
-      anonymous pages, and later accesses can observe zero-filled memory.
+    - Anonymous and node-shared tensors are rejected defensively.
     """
 
     if not tensor.device.type == "cpu":
         raise ValueError("Only CPU tensors are supported.")
+
+    if not is_reloadable_file_backed_tensor(tensor):
+        return
 
     # Get raw pointer and size in bytes
     ptr = tensor.data_ptr()

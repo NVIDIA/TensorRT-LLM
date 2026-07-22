@@ -19,7 +19,18 @@ from tensorrt_llm._torch.models.checkpoints import (
     MistralLarge3CheckpointLoader,
     WeightLoadPolicy,
 )
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    BaseWeightLoader,
+    BorrowedWeightStorageRetentionError,
+    WeightBatch,
+    WeightBatchLease,
+    WeightBatchStream,
+    WeightGroup,
+    WeightSegment,
+)
+from tensorrt_llm._torch.models.checkpoints.hf import (
+    shared_host_stream as shared_host_stream_module,
+)
 from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as weight_loader_module
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -39,6 +50,21 @@ def single_process(monkeypatch):
     monkeypatch.delenv("TLLM_OVERRIDE_LAYER_NUM", raising=False)
 
 
+def _enable_single_rank_mpi(monkeypatch):
+    node_communicator = mock.Mock()
+    node_communicator.Get_rank.return_value = 0
+    node_communicator.Get_size.return_value = 1
+    world_communicator = mock.Mock()
+    world_communicator.Get_rank.return_value = 0
+    world_communicator.Get_size.return_value = 1
+    world_communicator.allgather.side_effect = lambda value: [value]
+    world_communicator.Split_type.return_value = node_communicator
+    monkeypatch.setattr(weight_loader_module, "ENABLE_MULTI_DEVICE", True)
+    monkeypatch.setattr(weight_loader_module, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(weight_loader_module, "mpi_comm", lambda: world_communicator)
+    return world_communicator, node_communicator
+
+
 def _model(
     model_type: str = "LlamaForCausalLM",
     *,
@@ -48,6 +74,8 @@ def _model(
     spec_config=None,
     lora_config=None,
     force_dynamic_quantization=False,
+    moe_load_balancer=None,
+    enable_min_latency=False,
 ):
     model_cls = type(
         model_type, (), {"__module__": module_name or _MODEL_MODULES.get(model_type, __name__)}
@@ -59,8 +87,563 @@ def _model(
         spec_config=spec_config,
         lora_config=lora_config,
         force_dynamic_quantization=force_dynamic_quantization,
+        moe_load_balancer=moe_load_balancer,
+        enable_min_latency=enable_min_latency,
     )
     return model
+
+
+class _TestWeightLease(WeightBatchLease):
+    def __init__(self, batch, payload, *, direct_buffer_enabled=False):
+        self._batch = batch
+        self._payload = payload
+        self._direct_buffer_enabled = direct_buffer_enabled
+        self.released = False
+
+    @property
+    def batch(self):
+        return self._batch
+
+    def view(self, segment):
+        assert not self.released
+        start = segment.payload_offset
+        return memoryview(self._payload)[start : start + segment.nbytes]
+
+    def borrow_direct_buffer(self, segment):
+        if not self._direct_buffer_enabled:
+            return None
+        assert not self.released
+        start = segment.payload_offset
+        return memoryview(self._payload)[start : start + segment.nbytes]
+
+    def release(self):
+        self.released = True
+
+
+class _TestWeightStream(WeightBatchStream):
+    def __init__(self, groups, batches_and_payloads, *, direct_buffer_enabled=False):
+        self._groups = tuple(groups)
+        self._leases = [
+            _TestWeightLease(batch, payload, direct_buffer_enabled=direct_buffer_enabled)
+            for batch, payload in batches_and_payloads
+        ]
+        self.all_leases = tuple(self._leases)
+        self.completed = []
+        self.started = []
+        self.aborted = []
+        self.materializations = []
+        self.finalized = False
+
+    @property
+    def groups(self):
+        return self._groups
+
+    def begin_next(self):
+        if not self._leases:
+            return None
+        return self._leases.pop(0)
+
+    def start(self, error=None):
+        self.started.append(error)
+        if error is not None:
+            raise RuntimeError(f"start consensus: {type(error).__name__}: {error}")
+
+    def complete(self, lease, error=None):
+        assert lease.released
+        self.completed.append((lease.batch.sequence, error))
+        if error is not None:
+            if isinstance(error, BorrowedWeightStorageRetentionError):
+                raise error
+            raise RuntimeError(f"consensus: {type(error).__name__}: {error}")
+
+    def record_materialization(self, *, direct, nbytes):
+        self.materializations.append((direct, nbytes))
+
+    def abort(self, error):
+        self.aborted.append(error)
+
+    def finalize(self):
+        self.finalized = True
+
+
+class _TestIncrementalMapper:
+    borrowed_source_tensors_safe = False
+
+    def __init__(self):
+        self.events = []
+
+    def begin_incremental_load(self, groups):
+        self.events.append(("begin", tuple(groups)))
+
+    def record_incremental_group_loaded(self, group_id):
+        self.events.append(("record", group_id))
+
+    def finalize_incremental_load(self):
+        self.events.append(("finalize",))
+
+    def abort_incremental_load(self):
+        self.events.append(("abort",))
+
+
+def _stream_batch(
+    sequence,
+    tensor_offset,
+    payload_nbytes,
+    *,
+    complete,
+    group_id="model",
+    key="model.weight",
+):
+    segment = WeightSegment(
+        key=key,
+        dtype="F32",
+        shape=(4,),
+        tensor_nbytes=16,
+        tensor_offset=tensor_offset,
+        payload_offset=0,
+        nbytes=payload_nbytes,
+    )
+    return WeightBatch(
+        sequence=sequence,
+        slot=sequence % 2,
+        group_id=group_id,
+        group_keys=(key,),
+        group_complete=complete,
+        segments=(segment,),
+        payload_nbytes=payload_nbytes,
+    )
+
+
+def test_model_loader_materializes_only_complete_stream_groups():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    reference = torch.arange(4, dtype=torch.float32)
+    payload = reference.numpy().tobytes()
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [
+            (_stream_batch(0, 0, 8, complete=False), payload[:8]),
+            (_stream_batch(1, 8, 8, complete=True), payload[8:]),
+        ],
+        direct_buffer_enabled=True,
+    )
+    mapper = _TestIncrementalMapper()
+    mapper.borrowed_source_tensors_safe = True
+    loaded = []
+
+    def load_weights(weights, weight_mapper, allow_partial_loading=False):
+        assert weight_mapper is mapper
+        assert allow_partial_loading
+        loaded.append(weights["model.weight"].clone())
+
+    loader = object.__new__(ModelLoader)
+    loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    assert len(loaded) == 1
+    torch.testing.assert_close(loaded[0], reference)
+    assert stream.completed == [(0, None), (1, None)]
+    assert mapper.events == [
+        ("begin", stream.groups),
+        ("record", "model"),
+        ("finalize",),
+    ]
+    assert stream.materializations == [(False, 16)]
+
+
+def test_model_loader_borrows_complete_registered_group_through_h2d_sync():
+    from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class BorrowSafeMapper(_TestIncrementalMapper):
+        borrowed_source_tensors_safe = True
+
+    reference = torch.arange(4, dtype=torch.float32)
+    payload = bytearray(reference.numpy().tobytes())
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), payload)],
+        direct_buffer_enabled=True,
+    )
+    lease = stream.all_leases[0]
+    mapper = BorrowSafeMapper()
+    source_ptr = torch.frombuffer(payload, dtype=torch.float32).data_ptr()
+    loaded = []
+
+    def load_weights(weights, allow_partial_loading=False):
+        assert allow_partial_loading
+        assert weights["model.weight"].data_ptr() == source_ptr
+        loaded.append(weights["model.weight"].clone())
+
+    def synchronize():
+        assert not lease.released
+
+    loader = object.__new__(ModelLoader)
+    with (
+        mock.patch.object(
+            model_loader_module._StagedStreamTensor,
+            "allocate",
+            side_effect=AssertionError("unexpected staging"),
+        ),
+        mock.patch.object(torch.cuda, "is_available", return_value=True),
+        mock.patch.object(torch.cuda, "current_stream") as current_stream,
+    ):
+        current_stream.return_value.synchronize.side_effect = synchronize
+        loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    assert lease.released
+    assert len(loaded) == 1
+    torch.testing.assert_close(loaded[0], reference)
+    assert stream.materializations == [(True, 16)]
+    current_stream.return_value.synchronize.assert_called_once_with()
+
+
+def test_model_loader_stages_when_direct_buffer_is_unavailable():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class BorrowSafeMapper(_TestIncrementalMapper):
+        borrowed_source_tensors_safe = True
+
+    reference = torch.arange(4, dtype=torch.float32)
+    payload = bytearray(reference.numpy().tobytes())
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), payload)],
+        direct_buffer_enabled=False,
+    )
+    mapper = BorrowSafeMapper()
+    source_ptr = torch.frombuffer(payload, dtype=torch.float32).data_ptr()
+    loaded_ptrs = []
+
+    def load_weights(weights, allow_partial_loading=False):
+        assert allow_partial_loading
+        loaded_ptrs.append(weights["model.weight"].data_ptr())
+
+    loader = object.__new__(ModelLoader)
+    loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    assert loaded_ptrs != [source_ptr]
+    assert stream.materializations == [(False, 16)]
+
+
+def test_model_loader_rejects_direct_source_mutation():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class BorrowSafeMapper(_TestIncrementalMapper):
+        borrowed_source_tensors_safe = True
+
+    reference = torch.arange(4, dtype=torch.float32)
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), bytearray(reference.numpy().tobytes()))],
+        direct_buffer_enabled=True,
+    )
+    mapper = BorrowSafeMapper()
+
+    def load_weights(weights, allow_partial_loading=False):
+        assert allow_partial_loading
+        weights["model.weight"].add_(1)
+
+    loader = object.__new__(ModelLoader)
+    with pytest.raises(RuntimeError, match="borrowed checkpoint tensor.*immutable"):
+        loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    assert isinstance(stream.completed[0][1], RuntimeError)
+    assert mapper.events[-1] == ("abort",)
+
+
+def test_model_loader_rejects_retained_direct_source_tensor():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class BorrowSafeMapper(_TestIncrementalMapper):
+        borrowed_source_tensors_safe = True
+
+    reference = torch.arange(4, dtype=torch.float32)
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), bytearray(reference.numpy().tobytes()))],
+        direct_buffer_enabled=True,
+    )
+    mapper = BorrowSafeMapper()
+    retained = []
+
+    def load_weights(weights, allow_partial_loading=False):
+        assert allow_partial_loading
+        retained.append(weights["model.weight"])
+
+    loader = object.__new__(ModelLoader)
+    with pytest.raises(
+        BorrowedWeightStorageRetentionError, match="retained borrowed checkpoint tensor"
+    ):
+        loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    retained.clear()
+    assert isinstance(stream.completed[0][1], BorrowedWeightStorageRetentionError)
+    assert mapper.events[-1] == ("abort",)
+
+
+def test_model_loader_reports_materialization_error_through_batch_consensus():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    reference = torch.arange(4, dtype=torch.float32)
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), reference.numpy().tobytes())],
+    )
+    mapper = _TestIncrementalMapper()
+
+    def load_weights(_weights, allow_partial_loading=False):
+        assert allow_partial_loading
+        raise ValueError("materialization failed")
+
+    loader = object.__new__(ModelLoader)
+    with pytest.raises(RuntimeError, match="consensus: ValueError"):
+        loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    assert len(stream.completed) == 1
+    assert isinstance(stream.completed[0][1], ValueError)
+    assert mapper.events[-1] == ("abort",)
+
+
+def test_model_loader_reports_final_validation_through_final_batch_consensus():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class FinalizeFailingMapper(_TestIncrementalMapper):
+        def finalize_incremental_load(self):
+            super().finalize_incremental_load()
+            raise ValueError("manifest validation failed")
+
+    reference = torch.arange(4, dtype=torch.float32)
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), reference.numpy().tobytes())],
+    )
+    mapper = FinalizeFailingMapper()
+
+    def load_weights(_weights, allow_partial_loading=False):
+        assert allow_partial_loading
+
+    loader = object.__new__(ModelLoader)
+    with pytest.raises(RuntimeError, match="consensus: ValueError"):
+        loader._load_weight_stream(load_weights, stream, mapper, model=torch.nn.Module())
+
+    assert isinstance(stream.completed[0][1], ValueError)
+    assert mapper.events[-1] == ("abort",)
+
+
+def test_model_loader_finalizes_partial_modules_once_before_post_load():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    events = []
+
+    class RecordingMapper(_TestIncrementalMapper):
+        def finalize_incremental_load(self):
+            super().finalize_incremental_load()
+            events.append("mapper_finalize")
+
+    class Backend(torch.nn.Module):
+        def process_weights_after_loading(self):
+            events.append("backend_process")
+
+        def post_load_weights(self):
+            events.append("backend_post_load")
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backend = Backend()
+
+        def process_weights_after_loading(self):
+            events.append("wrapper_process")
+            self.backend.process_weights_after_loading()
+
+    class Leaf(torch.nn.Module):
+        def process_weights_after_loading(self):
+            events.append("leaf_process")
+
+        def post_load_weights(self):
+            events.append("leaf_post_load")
+
+    model = torch.nn.Module()
+    model.wrapper = Wrapper()
+    model.leaf = Leaf()
+    reference = torch.arange(4, dtype=torch.float32)
+    stream = _TestWeightStream(
+        [
+            WeightGroup("model.0", ("model.0.weight",)),
+            WeightGroup("model.1", ("model.1.weight",)),
+        ],
+        [
+            (
+                _stream_batch(
+                    0,
+                    0,
+                    16,
+                    complete=True,
+                    group_id="model.0",
+                    key="model.0.weight",
+                ),
+                reference.numpy().tobytes(),
+            ),
+            (
+                _stream_batch(
+                    1,
+                    0,
+                    16,
+                    complete=True,
+                    group_id="model.1",
+                    key="model.1.weight",
+                ),
+                reference.numpy().tobytes(),
+            ),
+        ],
+    )
+    mapper = RecordingMapper()
+
+    def load_weights(_weights, allow_partial_loading=False):
+        assert allow_partial_loading
+        events.append("load")
+
+    loader = object.__new__(ModelLoader)
+    loader._load_weight_stream(load_weights, stream, mapper, model=model)
+    loader._walk_full_post_load(model)
+
+    assert events[:6] == [
+        "load",
+        "load",
+        "mapper_finalize",
+        "wrapper_process",
+        "backend_process",
+        "leaf_process",
+    ]
+    assert events.count("backend_process") == 1
+    assert events.index("leaf_process") < events.index("leaf_post_load")
+    assert mapper.events == [
+        ("begin", stream.groups),
+        ("record", "model.0"),
+        ("record", "model.1"),
+        ("finalize",),
+    ]
+
+
+def test_model_loader_reports_processing_error_through_final_batch_consensus():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class FailingModule(torch.nn.Module):
+        def process_weights_after_loading(self):
+            raise ValueError("deferred weight processing failed")
+
+    model = torch.nn.Module()
+    model.failing = FailingModule()
+    reference = torch.arange(4, dtype=torch.float32)
+    stream = _TestWeightStream(
+        [WeightGroup("model", ("model.weight",))],
+        [(_stream_batch(0, 0, 16, complete=True), reference.numpy().tobytes())],
+    )
+    mapper = _TestIncrementalMapper()
+
+    def load_weights(_weights, allow_partial_loading=False):
+        assert allow_partial_loading
+
+    loader = object.__new__(ModelLoader)
+    with pytest.raises(RuntimeError, match="consensus: ValueError"):
+        loader._load_weight_stream(load_weights, stream, mapper, model=model)
+
+    assert isinstance(stream.completed[0][1], ValueError)
+    assert mapper.events[-2:] == [("finalize",), ("abort",)]
+
+
+def test_model_loader_reports_mapper_begin_error_through_start_consensus():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    class BeginFailingMapper(_TestIncrementalMapper):
+        def begin_incremental_load(self, groups):
+            super().begin_incremental_load(groups)
+            raise ValueError("mapper initialization failed")
+
+    stream = _TestWeightStream([WeightGroup("model", ("model.weight",))], [])
+    mapper = BeginFailingMapper()
+    loader = object.__new__(ModelLoader)
+
+    with pytest.raises(RuntimeError, match="start consensus: ValueError"):
+        loader._load_weight_stream(lambda _weights: None, stream, mapper, model=torch.nn.Module())
+
+    assert isinstance(stream.started[0], ValueError)
+    assert mapper.events[-1] == ("abort",)
+
+
+def test_partial_loading_capability_accepts_keyword_only_argument():
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    def load_weights(_weights, *, allow_partial_loading=False):
+        del allow_partial_loading
+
+    assert ModelLoader._supports_partial_weight_loading(load_weights)
+
+
+@pytest.mark.parametrize(
+    "method_name, expected",
+    [
+        ("UnquantizedLinearMethod", True),
+        ("FP8QDQLinearMethod", True),
+        ("FP8BlockScalesLinearMethod", True),
+        ("NVFP4LinearMethod", True),
+        ("WeightOnlyQuantLinearMethod", False),
+    ],
+)
+def test_linear_partial_weight_loading_capability_matches_runtime_guard(method_name, expected):
+    from tensorrt_llm._torch.modules import linear as linear_module
+
+    linear = linear_module.Linear.__new__(linear_module.Linear)
+    torch.nn.Module.__init__(linear)
+    linear._weights_created = True
+    linear.quant_method = getattr(linear_module, method_name)()
+
+    assert linear.supports_partial_weight_loading is expected
+
+
+def test_fused_moe_partial_weight_loading_capability_matrix():
+    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+        DeepSeekFP8BlockScalesFusedMoEMethod,
+        FP8QDQFusedMoEMethod,
+        FusedMoEMethodBase,
+        NVFP4FusedMoEMethod,
+        UnquantizedFusedMoEMethod,
+        W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    )
+
+    assert UnquantizedFusedMoEMethod.supports_partial_weight_loading
+    assert FP8QDQFusedMoEMethod.supports_partial_weight_loading
+    assert DeepSeekFP8BlockScalesFusedMoEMethod.supports_partial_weight_loading
+    assert NVFP4FusedMoEMethod.supports_partial_weight_loading
+    assert not FusedMoEMethodBase.supports_partial_weight_loading
+    assert not W4A8MXFP4MXFP8MegaMoEDeepGemmMethod.supports_partial_weight_loading
+
+
+def test_moe_modules_publish_or_delegate_partial_weight_loading_capability():
+    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonFusedMoE
+    from tensorrt_llm._torch.modules.fused_moe.fused_moe_vanilla import VanillaMoE
+    from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
+    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+        W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+    )
+
+    backend = torch.nn.Module()
+    backend.supports_partial_weight_loading = True
+    configurable_moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(configurable_moe)
+    configurable_moe.backend = backend
+
+    assert configurable_moe.supports_partial_weight_loading
+    backend.supports_partial_weight_loading = False
+    assert not configurable_moe.supports_partial_weight_loading
+    assert not VanillaMoE.__new__(VanillaMoE).supports_partial_weight_loading
+    assert not TritonFusedMoE.__new__(TritonFusedMoE).supports_partial_weight_loading
+
+    mega_deep_gemm = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    torch.nn.Module.__init__(mega_deep_gemm)
+    mega_deep_gemm.quant_method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
+    assert not mega_deep_gemm.supports_partial_weight_loading
 
 
 def test_direct_rank_read_uses_mmap_path_without_full_prefetch(tmp_path):
@@ -232,18 +815,25 @@ def test_direct_rank_prefetch_reads_only_assigned_chunks(tmp_path):
     ]
 
 
-def test_shared_host_producer_assigns_all_chunks_to_local_rank_zero(tmp_path):
+def test_single_producer_page_cache_prefetch_assigns_chunks_to_rank_zero(
+    tmp_path,
+):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"x" * 10)
-    loader = HfWeightLoader(weight_load_plan="shared_host_producer", prefetch_chunk_size=4)
+    loader = HfWeightLoader(
+        weight_load_plan="single_producer_page_cache_prefetch",
+        prefetch_chunk_size=4,
+    )
 
     with mock.patch.object(loader, "_get_local_rank_and_size", return_value=(0, 3)):
         producer_chunks = loader._local_prefetch_chunks(
-            [str(checkpoint)], WeightLoadPolicy.SHARED_HOST_PRODUCER
+            [str(checkpoint)],
+            WeightLoadPolicy.SINGLE_PRODUCER_PAGE_CACHE_PREFETCH,
         )
     with mock.patch.object(loader, "_get_local_rank_and_size", return_value=(1, 3)):
         consumer_chunks = loader._local_prefetch_chunks(
-            [str(checkpoint)], WeightLoadPolicy.SHARED_HOST_PRODUCER
+            [str(checkpoint)],
+            WeightLoadPolicy.SINGLE_PRODUCER_PAGE_CACHE_PREFETCH,
         )
 
     assert producer_chunks == [
@@ -254,19 +844,257 @@ def test_shared_host_producer_assigns_all_chunks_to_local_rank_zero(tmp_path):
     assert consumer_chunks == []
 
 
-def test_shared_host_producer_uses_page_cache_then_mmap(tmp_path):
+def test_single_producer_page_cache_prefetch_then_mmaps(tmp_path):
     checkpoint = tmp_path / "model.safetensors"
     reference = {"model.norm.weight": torch.arange(4)}
     save_file(reference, str(checkpoint))
-    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    loader = HfWeightLoader(weight_load_plan="single_producer_page_cache_prefetch")
 
     with mock.patch.object(
         loader, "prefetch_file_chunks", wraps=loader.prefetch_file_chunks
     ) as prefetch:
         weights = loader.load_weights(str(tmp_path), mapping=Mapping(), model=_model())
 
-    prefetch.assert_called_once_with([str(checkpoint)], WeightLoadPolicy.SHARED_HOST_PRODUCER, None)
+    prefetch.assert_called_once_with(
+        [str(checkpoint)],
+        WeightLoadPolicy.SINGLE_PRODUCER_PAGE_CACHE_PREFETCH,
+        None,
+    )
     torch.testing.assert_close(weights["model.norm.weight"], reference["model.norm.weight"])
+
+
+def test_strict_shared_host_fails_preflight_without_safe_mapper_manifest(tmp_path, monkeypatch):
+    _enable_single_rank_mpi(monkeypatch)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+
+    class UnsupportedMapper:
+        single_tensor_groups_safe = False
+
+        @staticmethod
+        def get_weight_groups(_keys):
+            return None
+
+    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    with (
+        mock.patch.object(
+            shared_host_stream_module, "open_shared_host_weight_stream"
+        ) as open_stream,
+        pytest.raises(RuntimeError, match="did not declare a safe incremental"),
+    ):
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=_model(),
+            _weight_mapper=UnsupportedMapper(),
+            _model_supports_partial_loading=True,
+        ):
+            pytest.fail("strict preflight must fail before session entry")
+
+    open_stream.assert_not_called()
+
+
+def test_strict_shared_host_requires_mpi_before_header_preflight(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+
+    with (
+        mock.patch.object(
+            shared_host_stream_module, "prepare_shared_host_weight_stream"
+        ) as prepare_stream,
+        pytest.raises(RuntimeError, match="requires active MPI"),
+    ):
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=_model(),
+            _weight_mapper=mock.Mock(),
+            _model_supports_partial_loading=True,
+        ):
+            pytest.fail("strict preflight must fail before session entry")
+
+    prepare_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "model, expected_reason",
+    [
+        (
+            _model(
+                "Qwen3_5MoeForCausalLM",
+                moe_load_balancer=SimpleNamespace(layer_updates_per_iter=1),
+            ),
+            "does not support dynamic MoE load balancing",
+        ),
+        (
+            _model("Llama4ForConditionalGeneration", enable_min_latency=True),
+            "does not support min-latency model loading",
+        ),
+    ],
+)
+def test_strict_shared_host_rejects_unbounded_or_eager_partial_profiles(
+    tmp_path, monkeypatch, model, expected_reason
+):
+    _enable_single_rank_mpi(monkeypatch)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+
+    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    with (
+        mock.patch.object(
+            shared_host_stream_module, "prepare_shared_host_weight_stream"
+        ) as prepare_stream,
+        pytest.raises(RuntimeError, match=expected_reason),
+    ):
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=model,
+            _weight_mapper=mock.Mock(),
+            _model_supports_partial_loading=True,
+        ):
+            pytest.fail("unsafe partial-load profile must fail before preflight")
+
+    prepare_stream.assert_not_called()
+
+
+def test_nested_partial_load_capability_ignores_unknown_modules():
+    model = torch.nn.Module()
+    model.unknown = torch.nn.Module()
+
+    assert HfWeightLoader._nested_partial_load_ineligibility_reason(model) is None
+
+
+def test_nested_partial_load_capability_failure_returns_ineligibility_reason():
+    class BrokenCapabilityModule(torch.nn.Module):
+        @property
+        def supports_partial_weight_loading(self):
+            raise RuntimeError("capability unavailable")
+
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Module()
+    model.decoder.broken_projection = BrokenCapabilityModule()
+
+    reason = HfWeightLoader._nested_partial_load_ineligibility_reason(model)
+
+    assert "decoder.broken_projection" in reason
+    assert "RuntimeError: capability unavailable" in reason
+
+
+@pytest.mark.parametrize("getter_raises", [False, True], ids=["unsupported", "check-failed"])
+def test_ordered_shared_host_plan_falls_back_before_nested_module_preflight_io(
+    tmp_path, monkeypatch, getter_raises
+):
+    class UnsupportedModule(torch.nn.Module):
+        @property
+        def supports_partial_weight_loading(self):
+            if getter_raises:
+                raise RuntimeError("capability unavailable")
+            return False
+
+    _enable_single_rank_mpi(monkeypatch)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Module()
+    model.decoder.unsupported_projection = UnsupportedModule()
+    expected_weights = {"model.norm.weight": object()}
+    loader = HfWeightLoader(weight_load_plan=("shared_host_producer", "legacy_fallback"))
+
+    with (
+        mock.patch.object(
+            shared_host_stream_module, "prepare_shared_host_weight_stream"
+        ) as prepare_stream,
+        mock.patch.object(
+            shared_host_stream_module, "open_shared_host_weight_stream"
+        ) as open_stream,
+        mock.patch.object(loader, "_load_legacy_safetensors", return_value=expected_weights),
+    ):
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=model,
+            _weight_mapper=mock.Mock(),
+            _model_supports_partial_loading=True,
+        ) as weights:
+            assert weights is expected_weights
+
+    reason = HfWeightLoader._nested_partial_load_ineligibility_reason(model)
+    assert "decoder.unsupported_projection" in reason
+    if getter_raises:
+        assert "RuntimeError: capability unavailable" in reason
+    prepare_stream.assert_not_called()
+    open_stream.assert_not_called()
+
+
+def test_ordered_shared_host_plan_falls_back_before_transport_allocation(tmp_path, monkeypatch):
+    _enable_single_rank_mpi(monkeypatch)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+
+    class UnsupportedMapper:
+        single_tensor_groups_safe = False
+
+        @staticmethod
+        def get_weight_groups(_keys):
+            return None
+
+    expected_weights = {"model.norm.weight": object()}
+    loader = HfWeightLoader(weight_load_plan=("shared_host_producer", "legacy_fallback"))
+    with (
+        mock.patch.object(
+            loader, "_load_legacy_safetensors", return_value=expected_weights
+        ) as legacy_load,
+        mock.patch.object(
+            shared_host_stream_module, "open_shared_host_weight_stream"
+        ) as open_stream,
+    ):
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=_model(),
+            _weight_mapper=UnsupportedMapper(),
+            _model_supports_partial_loading=True,
+        ) as weights:
+            assert weights is expected_weights
+
+    open_stream.assert_not_called()
+    legacy_load.assert_called_once()
+
+
+def test_shared_host_session_returns_preflighted_stream(tmp_path, monkeypatch):
+    _enable_single_rank_mpi(monkeypatch)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"model.norm.weight": torch.arange(4)}, str(checkpoint))
+
+    class ManifestMapper:
+        single_tensor_groups_safe = False
+
+        @staticmethod
+        def get_weight_groups(keys):
+            assert tuple(keys) == ("model.norm.weight",)
+            return [WeightGroup("model.norm", ("model.norm.weight",))]
+
+    expected_stream = _TestWeightStream([WeightGroup("model.norm", ("model.norm.weight",))], [])
+    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    with mock.patch.object(
+        shared_host_stream_module,
+        "open_shared_host_weight_stream",
+        return_value=expected_stream,
+    ) as open_stream:
+        with loader.open_weight_session(
+            str(tmp_path),
+            Mapping(),
+            model=_model(),
+            _weight_mapper=ManifestMapper(),
+            _model_supports_partial_loading=True,
+        ) as weights:
+            assert weights is expected_stream
+
+    assert expected_stream.finalized
+    assert open_stream.call_args.kwargs["group_manifest"] == expected_stream.groups
+    assert open_stream.call_args.kwargs["buffer_budget_bytes"] == 64 * 1024 * 1024 * 1024
 
 
 def test_direct_session_yields_before_read_ahead_finishes_and_exit_joins(tmp_path):
@@ -368,10 +1196,10 @@ def test_direct_session_has_no_pre_consumption_node_barrier(tmp_path):
     node_communicator.Free.assert_called_once_with()
 
 
-def test_shared_host_producer_session_stays_synchronous(tmp_path):
+def test_single_producer_page_cache_session_stays_synchronous(tmp_path):
     checkpoint = tmp_path / "model.safetensors"
     checkpoint.write_bytes(b"x")
-    loader = HfWeightLoader(weight_load_plan="shared_host_producer")
+    loader = HfWeightLoader(weight_load_plan="single_producer_page_cache_prefetch")
     prefetch_started = threading.Event()
     release = threading.Event()
     body_entered = threading.Event()
@@ -534,6 +1362,21 @@ def test_default_weight_load_plan_matches_policy_order(monkeypatch):
     assert HfWeightLoader()._get_weight_load_plan() == DEFAULT_WEIGHT_LOAD_PLAN
 
 
+@pytest.mark.parametrize(
+    "plan,expected",
+    [
+        ("direct_rank_read", False),
+        ("legacy_fallback", False),
+        ("shared_host_producer", True),
+        (("gpu_broadcast", "shared_host_producer", "legacy_fallback"), True),
+    ],
+)
+def test_only_shared_first_plan_requires_mapper_before_session(plan, expected):
+    checkpoint_loader = HfCheckpointLoader(weight_loader=HfWeightLoader(weight_load_plan=plan))
+
+    assert checkpoint_loader.requires_initialized_mapper_for_session() is expected
+
+
 def test_implicit_plan_preserves_explicit_raw_weight_cache(monkeypatch):
     monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "1")
 
@@ -572,6 +1415,15 @@ def test_weight_load_plan_can_be_selected_from_environment(monkeypatch):
         WeightLoadPolicy.SHARED_HOST_PRODUCER,
         WeightLoadPolicy.LEGACY_FALLBACK,
     )
+
+
+def test_shared_host_buffer_budget_can_be_selected_from_environment(monkeypatch):
+    monkeypatch.setenv(
+        "TRTLLM_HF_SHARED_HOST_BUFFER_BUDGET_BYTES",
+        str(2 * 1024 * 1024 * 1024),
+    )
+
+    assert HfWeightLoader()._get_shared_host_buffer_budget() == 2 * 1024 * 1024 * 1024
 
 
 def test_gpu_broadcast_is_explicitly_unavailable(tmp_path):
@@ -1052,6 +1904,20 @@ def test_hf_session_preserves_hf_weight_loader_subclass_override():
                 "prefetch_workers_per_rank": 0,
             },
             "workers_per_rank must be positive",
+        ),
+        (
+            {
+                "weight_load_plan": "shared_host_producer",
+                "shared_host_buffer_budget": 0,
+            },
+            "shared_host_buffer_budget must be positive",
+        ),
+        (
+            {
+                "weight_load_plan": "shared_host_producer",
+                "shared_host_buffer_budget": 256 * 1024 * 1024,
+            },
+            "must hold two prefetch chunks",
         ),
     ],
 )

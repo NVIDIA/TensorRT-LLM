@@ -106,13 +106,14 @@ legacy_fallback
 ```
 
 The first eligible and implemented policy is selected. Qualification and
-fallback happen before policy-specific I/O begins; the loader does not switch
-policies after a collective read or transfer has started. In this first
-version, the two host policies share source and communicator qualification
-rules and `gpu_broadcast` is unavailable. The implicit plan therefore selects
-`direct_rank_read` for HF/AUTO SafeTensors and otherwise reaches
-`legacy_fallback`; select `shared_host_producer` explicitly to compare it.
-An explicitly selected single policy is strict.
+fallback happen before checkpoint payload I/O or shared-window allocation; the
+loader does not switch policies after a collective read or transfer has
+started. The implicit plan selects `direct_rank_read` for HF/AUTO SafeTensors
+and otherwise reaches `legacy_fallback`; select `shared_host_producer`
+explicitly to compare the producer/consumer design. An explicitly selected
+single policy is strict. Shared-host preflight parses only SafeTensors headers
+and requires both partial model loading and a mapper-provided atomic dependency
+manifest before it can be selected.
 The ordered plan is an eligibility/fallback mechanism, not a runtime
 performance-adaptive selector: one policy handles the whole checkpoint, and
 policies are not mixed per tensor.
@@ -145,7 +146,8 @@ checkpoint_loader = HfCheckpointLoader(
 | Policy | Status | Current behavior |
 | --- | --- | --- |
 | `direct_rank_read` | Implemented; default primary policy | Node-local ranks own disjoint file extents and issue parallel background reads into the shared OS page cache while ModelLoader materializes tensors. |
-| `shared_host_producer` | Implemented page-cache staging v0 | Node-local rank 0 reads all extents with a bounded thread pool; peer ranks wait and then mmap the shared cached pages. |
+| `shared_host_producer` | Implemented for qualified model mappers | One producer per node fills an adaptively sized, bounded shared-memory double buffer and attempts CUDA host registration. All local ranks incrementally materialize complete dependency groups while the producer fills the next slot. |
+| `single_producer_page_cache_prefetch` | Implemented comparison policy | Node-local rank 0 reads all extents into the Linux page cache; peers wait at a node barrier and then use the unchanged mmap path. This preserves the earlier policy that was temporarily named `shared_host_producer`. |
 | `gpu_broadcast` | Recognized future policy | Preflight reports it unavailable until rank-aware final tensor placement and a topology-aware GPU transport exist. |
 | `legacy_fallback` | Implemented compatibility policy | Uses the pre-existing whole-file prefetch and SafeTensors loading path. |
 
@@ -159,12 +161,13 @@ encoding those sources as more policy modes.
 `.bin` and `.pth` checkpoints support only `legacy_fallback`. A strict plan
 that omits that policy fails instead of silently measuring the legacy path.
 
-Both implemented cooperative policies retain the existing 90%-of-available-
-host-memory guard. When full prefetch is safe, they divide selected files into
-256 MiB extents and read each extent through bounded 8 MiB temporary buffers.
-`shared_host_producer` completes those reads and a node-local barrier before
-every rank uses the unchanged mmap-backed SafeTensors and model-loading paths.
-For `direct_rank_read`, ModelLoader starts a background read-ahead session,
+`direct_rank_read` and `single_producer_page_cache_prefetch` retain the existing
+90%-of-available-host-memory guard. When full prefetch is safe, they divide
+selected files into 256 MiB extents and read each extent through bounded 8 MiB
+temporary buffers. The single-producer page-cache policy completes those reads
+and a node-local barrier before every rank uses the unchanged mmap-backed
+SafeTensors and model-loading paths. For `direct_rank_read`, ModelLoader starts
+a background read-ahead session,
 maps the full raw weight dictionary immediately, and keeps the session open
 through mapper initialization and model weight materialization. Session exit
 joins the reads, coordinates errors, and performs the node barrier. This is
@@ -183,11 +186,91 @@ not partition storage traffic across nodes. "Direct" means that ranks own
 regular buffered `pread` responsibilities; it does not mean Linux `O_DIRECT`,
 GPUDirect Storage, or direct placement into final GPU tensors.
 
-`shared_host_producer` currently uses the Linux page cache as shared host
-storage. It is a useful single-producer comparison policy, but it is not the
-complete pinned shared-memory producer/consumer design. That later design
-requires partial model loading, a bounded pinned buffer, per-rank consumption
-tracking, NUMA placement, cancellation, and crash-safe reclamation.
+`shared_host_producer` is the producer/consumer implementation. SafeTensors
+headers and an atomic mapper manifest are validated first. Each node then
+allocates an MPI shared-memory double buffer, and node-local rank 0 reads the
+next ordered batch with a bounded worker pool while all local ranks consume the
+current batch. The configured 256 MiB slot size is a baseline: planning grows
+each slot to the packed size of the largest atomic group, subject to a 64 GiB
+total two-slot budget. This keeps the allocation bounded by one dependency
+group rather than the full checkpoint while allowing groups larger than 256
+MiB to remain in one published lease.
+
+The producer uses ordinary buffered `pread` operations. Source data therefore
+still traverses the Linux page cache before the kernel copies it into the
+shared arena; this policy is bounded streaming, not `O_DIRECT` or GDS. The
+initial protocol publishes one atomic dependency group per batch (or multiple
+batches when one group exceeds a slot) and does not yet pack independent small
+groups together, so benchmark group/batch counts and acknowledgement overhead.
+
+After collective shared-window allocation, every node-local rank opens one
+MPI passive-target epoch with `Win.Lock_all`; all producer/consumer
+`Win.Sync` calls occur inside that epoch. Normal teardown closes the epoch
+with `Win.Unlock_all` on every rank, coordinates the result node-locally, and
+only then enters collective `Win.Free`. A rank-local lock or unlock failure is
+coordinated before any collective free. Unsafe windows are quarantined rather
+than freed; a known lifetime quarantine intentionally leaves its epoch open so
+escaped storage cannot outlive the MPI window.
+
+When every rank on a node successfully registers that node's shared arena with
+CUDA, a group fits in one slot, and the mapper declares the runtime profile's
+source-tensor lifetime safe, consumers borrow immutable tensor views directly
+from that single shared copy. The existing model-specific transformations and
+H2D copies consume those views, and each rank synchronizes its current CUDA
+stream before acknowledging the lease. No per-rank full-group host copy is
+made on this path. A registration failure disables direct views only on the
+affected node, not on independently registered nodes.
+
+If CUDA host registration is unavailable, an atomic group exceeds the
+configured buffer budget, or the source-lifetime contract is not qualified,
+the correctness fallback assembles that group in rank-local pinned host
+storage (with a logged pageable fallback). Quantized profiles currently take
+this staging path because some Linear and MoE methods retain temporary source
+views until final checkpoint processing; integrated-GPU profiles stage as well
+to keep node-shared bytes outside mmap page-eviction hooks. Unquantized,
+static-loading Qwen 3.5 and Llama 4 profiles on discrete GPUs may use direct
+views. An all-rank completion or error consensus gates slot reuse in both
+cases. Telemetry reports the configured and effective slot sizes, largest
+group, single-slot coverage, node-local all-ranks registration result, and
+direct-versus-staged group and byte counts; benchmark runs should retain these
+fields with their timing results.
+
+Direct views have a strict lifetime contract: model loading must neither mutate
+nor retain source storage after the incremental load call returns. If a loader
+or its exception traceback retains borrowed storage, the loader raises a
+dedicated retention error and the completion consensus propagates a quarantine
+decision to every rank. All ranks then intentionally retain the CUDA
+registration, MPI window, and bounded two-slot arena for the rest of the
+process lifetime. Startup still fails, but no rank reuses or frees memory that
+an escaped tensor may reference. This bounded leak occurs only on the failed
+contract-violation path; normal completion and other coordinated failures keep
+their usual collective teardown.
+
+After the last dependency group is loaded and mapper coverage is validated,
+the stream runs each eligible module's deferred
+`process_weights_after_loading` hook exactly once before the final batch
+consensus. Wrapper-owned MoE backends are de-duplicated. Any deferred
+quantization, fusion, or CUDA synchronization failure is therefore reported to
+all ranks before the final slot can be reused. The ordinary
+`post_load_weights` walk still runs afterward through the common model-loader
+lifecycle.
+
+For this policy, `HfWeightLoader.prefetch_chunk_size` sets the baseline slot
+size, `shared_host_buffer_budget` caps the total double buffer, and
+`prefetch_workers_per_rank` sets the single node producer's I/O worker count.
+The producer defaults to the existing 64-worker node budget. The buffer budget
+can also be set in bytes with
+`TRTLLM_HF_SHARED_HOST_BUFFER_BUDGET_BYTES`; the constructor value takes
+precedence. Increase the default only after confirming host-memory headroom.
+
+This shared window contains immutable raw checkpoint bytes. It is not a
+transformed-weight cache, does not require the producer to retain a full model,
+and provides no restart reuse after the load session closes. On a multi-node
+job, every node has its own producer and shared window; checkpoint payload I/O
+is deduplicated within a node, not across nodes. The stream and placement
+interfaces remain source-neutral so a future MX, GMS, snapshot, or Model
+Streamer source can reuse the incremental materialization lifecycle without
+being implemented as another policy mode.
 
 `gpu_broadcast` is shorthand for topology-aware GPU fan-out rather than a
 literal full-model broadcast. Replicated weights could use NCCL broadcast, but
@@ -199,20 +282,58 @@ parameter buffers. The current HF loader returns raw CPU tensors before
 model-specific slicing and placement, so implementing this policy efficiently
 requires a new rank-aware materialization interface.
 
-Because the cooperative policies stage immutable raw file extents and return
-the same complete tensor dictionary as the legacy mmap path, eligibility is
-not tied to a model class, mapper, quantization mode, or TP/PP/CP/EP layout.
-That includes Qwen 3.5, DeepSeek V4, and Llama 4 checkpoint paths, including
-MTP/speculative configurations, provided the underlying checkpoint is HF
-SafeTensors with `LoadFormat.AUTO`. This removes a loader-specific model
-onboarding step; model-specific mapping and quantization correctness remains
-the responsibility of the unchanged downstream model loader. Eligibility is
-not end-to-end qualification: each flagship model, quantization, and
-parallelism configuration still requires correctness and cold-start benchmark
-coverage before it is claimed as production-qualified. Distributed
-cooperative loading requires MPI-launched ranks. `.bin`/`.pth`, MX, GMS, and
-format-specific loaders retain their existing paths. Every participating rank
-must use the same plan, load format, and world size.
+The two page-cache policies return the same complete raw tensor dictionary as
+the legacy mmap path, so their eligibility is not tied to a model class,
+mapper, quantization mode, or TP/PP/CP/EP layout. Shared-host streaming is more
+selective: `model.load_weights` must explicitly accept
+`allow_partial_loading`, and the initialized mapper must partition every
+checkpoint source key exactly once into dependency-safe groups. This prevents
+half of a fused QKV projection, quantization scale family, MoE layer, vision
+tower, or MTP dependency from reaching model code. Unsupported models fail
+before parameter mutation in a strict plan or explicitly advance to the next
+policy in an ordered plan.
+
+Falling back to the exact generic `HfWeightMapper` is not qualification by
+itself. After an end-to-end audit, a model class can explicitly declare
+`_supports_generic_hf_incremental_loading = True`; the marker is intentionally
+not inherited by derived architectures. Without that model-level opt-in, the
+generic mapper publishes no manifest, does not borrow transport-owned tensors,
+and does not use incremental subtree dispatch.
+
+Qualified mappers use the smallest audited dependency: a fused QKV or gate/up
+family, a Qwen linear-attention qkvz/ba family, or an ordinary parameter
+family. Routed-MoE tensors remain atomic at the complete MLP/MoE module, and
+multimodal vision plus projector loaders that require a complete state dict
+remain one group. Incremental dispatch walks only those destination subtrees
+and avoids creating a full-model thread pool for each group.
+Loads that require a separately opened speculative-draft checkpoint are also
+conservatively ineligible until target and draft streams share one preflight
+and failure transaction; integrated MTP groups remain mapper-qualified.
+
+An atomic manifest is necessary but is not end-to-end qualification. Every
+model, quantization backend, and parallelism configuration still requires
+correctness and cold-start benchmark coverage. Distributed cooperative loading
+requires MPI-launched ranks. `.bin`/`.pth`, MX, GMS, and format-specific
+loaders retain their existing paths. Every participating rank must use the
+same plan, load format, checkpoint metadata, group manifest, and world size.
+Before header parsing or shared-window allocation, the loader also walks nested
+Linear and MoE modules and requires their concrete quantization/backend methods
+to advertise partial-load support. Unsupported backends fail a strict shared
+plan or advance an ordered plan before model mutation. Dynamic EPLB is
+currently ineligible because it deliberately retains complete raw expert
+tensors beyond a bounded batch. Llama 4 min-latency loading is also ineligible
+because it eagerly derives FP8 layouts before deferred partial-load
+finalization. Static EPLB does not have the raw-source retention behavior and
+remains eligible when its selected backend passes the nested capability check.
+
+The initial model-specific manifests cover Qwen 3.5 text/VLM and Llama 4.
+Architectures that use the unmodified generic HF mapper remain ineligible until
+their model class explicitly opts into the audited contract above. DeepSeek V4
+is deliberately not enabled for `shared_host_producer` yet: its bespoke loader
+performs whole-checkpoint remapping, synthesized defaults, direct key lookups,
+and MTP/shared-layer finalization without a partial-load contract. It continues
+to use `direct_rank_read` or an explicit fallback until that loader is
+refactored and qualified across BF16/FP8/NVFP4, TP/EP, and MTP configurations.
 
 Flagship qualification should exercise the real downstream loaders rather
 than add model-name checks to the byte reader:
@@ -224,8 +345,10 @@ than add model-name checks to the byte reader:
 | Llama 4 | Scout and Maverick; text and multimodal construction; FP8; TP/EP and a PP configuration that verifies layer ownership. |
 
 For each configuration, run strict `direct_rank_read`, strict
-`shared_host_producer`, the default ordered plan, and `legacy_fallback`. A
-strict optimized run fails qualification if it falls back. Validate
+`shared_host_producer`, the default ordered plan, and `legacy_fallback`. The
+single-producer page-cache policy can be retained as an additional diagnostic,
+but it is not the shared-memory producer/consumer result. A strict optimized
+run fails qualification if it falls back. Validate
 deterministic inference parity, clean worker and communicator teardown, and
 peak host memory, then measure cold-cache model initialization and first-
 inference latency. Performance claims require a system trace showing storage

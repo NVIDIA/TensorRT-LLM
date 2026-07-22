@@ -662,6 +662,11 @@ class ConfigurableMoE(MoE):
             self._weights_transformed = False
         return result
 
+    @property
+    def supports_partial_weight_loading(self) -> bool:
+        """Delegate partial-load capability to the selected backend."""
+        return bool(getattr(self.backend, "supports_partial_weight_loading", False))
+
     def transform_weights(self) -> None:
         """
         Transform weights - delegated to backend

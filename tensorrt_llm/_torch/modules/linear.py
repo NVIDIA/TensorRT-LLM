@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import enum
@@ -3315,6 +3318,16 @@ class Linear(nn.Module):
             exclude_kv_cache=True)
 
     @property
+    def supports_partial_weight_loading(self) -> bool:
+        """Whether this linear's quantization method supports partial loads."""
+        assert self._weights_created
+        return isinstance(
+            self.quant_method,
+            (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
+             NVFP4LinearMethod),
+        )
+
+    @property
     def has_fp8_qdq(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq(
@@ -3468,9 +3481,7 @@ class Linear(nn.Module):
         assert self._weights_created
 
         weight_mode = self.weights_loading_config.weight_mode
-        if not isinstance(self.quant_method,
-                          (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
-                           NVFP4LinearMethod)):
+        if not self.supports_partial_weight_loading:
             assert allow_partial_loading is False, (
                 f"{type(self.quant_method).__name__} does not support "
                 "allow_partial_loading")

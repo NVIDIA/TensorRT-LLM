@@ -3,10 +3,14 @@
 
 import copy
 import inspect
+import math
 import os
+import time
 import traceback
 import warnings
+import weakref
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -36,6 +40,9 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+from ..models.checkpoints.base_weight_loader import (
+    BorrowedWeightStorageRetentionError, WeightBatchLease, WeightBatchStream,
+    WeightSegment)
 from ..models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
                                      DecoderModelForCausalLM, MetaInitMode,
@@ -62,6 +69,269 @@ def _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir: str,
         return nullcontext(
             checkpoint_loader.load_weights(checkpoint_dir, **kwargs))
     return checkpoint_loader.open_weight_session(checkpoint_dir, **kwargs)
+
+
+_SAFETENSORS_TORCH_DTYPE_NAMES = {
+    "BOOL": "bool",
+    "U8": "uint8",
+    "I8": "int8",
+    "I16": "int16",
+    "U16": "uint16",
+    "I32": "int32",
+    "U32": "uint32",
+    "I64": "int64",
+    "U64": "uint64",
+    "F8_E4M3": "float8_e4m3fn",
+    "F8_E4M3FN": "float8_e4m3fn",
+    "F8_E5M2": "float8_e5m2",
+    "F16": "float16",
+    "BF16": "bfloat16",
+    "F32": "float32",
+    "F64": "float64",
+    "C64": "complex64",
+    "C128": "complex128",
+}
+
+
+def _stream_tensor_dtype(dtype_token: str) -> torch.dtype:
+    dtype_name = _SAFETENSORS_TORCH_DTYPE_NAMES.get(dtype_token)
+    dtype = getattr(torch, dtype_name, None) if dtype_name is not None else None
+    if dtype is None:
+        raise ValueError(
+            f"Unsupported SafeTensors stream dtype {dtype_token!r}")
+    return dtype
+
+
+def _validate_stream_tensor_layout(
+        dtype_token: str, shape: tuple[int, ...],
+        tensor_nbytes: int) -> tuple[torch.dtype, int]:
+    dtype = _stream_tensor_dtype(dtype_token)
+    expected_elements = math.prod(shape)
+    element_size = torch.empty((), dtype=dtype).element_size()
+    if expected_elements * element_size != tensor_nbytes:
+        raise ValueError(f"Streamed tensor shape/dtype do not match its "
+                         f"{tensor_nbytes}-byte payload")
+    return dtype, expected_elements
+
+
+@dataclass
+class _StagedStreamTensor:
+    """Pinned rank-local assembly storage for one streamed source tensor."""
+
+    key: str
+    dtype_token: str
+    shape: tuple[int, ...]
+    tensor_nbytes: int
+    storage: torch.Tensor
+    covered_ranges: list[tuple[int, int]] = field(default_factory=list)
+
+    @classmethod
+    def allocate(cls, segment: WeightSegment) -> "_StagedStreamTensor":
+        pin_memory = torch.cuda.is_available()
+        try:
+            storage = torch.empty(segment.tensor_nbytes,
+                                  dtype=torch.uint8,
+                                  pin_memory=pin_memory)
+        except RuntimeError:
+            if not pin_memory:
+                raise
+            logger.warning_once(
+                f"Pinned staging allocation failed for {segment.key}; "
+                "falling back to pageable host memory.",
+                key="shared-host-pageable-staging-fallback")
+            storage = torch.empty(segment.tensor_nbytes, dtype=torch.uint8)
+        return cls(segment.key, segment.dtype, segment.shape,
+                   segment.tensor_nbytes, storage)
+
+    def copy_segment(self, segment: WeightSegment, source: memoryview) -> None:
+        if (segment.key != self.key or segment.dtype != self.dtype_token
+                or segment.shape != self.shape
+                or segment.tensor_nbytes != self.tensor_nbytes):
+            raise ValueError(
+                f"Inconsistent streamed metadata for tensor {segment.key}")
+        start = segment.tensor_offset
+        end = start + segment.nbytes
+        if any(start < covered_end and covered_start < end
+               for covered_start, covered_end in self.covered_ranges):
+            raise ValueError(
+                f"Overlapping streamed byte ranges for tensor {self.key}")
+        source_bytes = source.cast("B")
+        try:
+            if len(source_bytes) != segment.nbytes:
+                raise ValueError(
+                    f"Streamed byte count for {self.key} is "
+                    f"{len(source_bytes)}, expected {segment.nbytes}")
+            destination = memoryview(self.storage.numpy())
+            try:
+                destination[start:end] = source_bytes
+            finally:
+                destination.release()
+        finally:
+            source_bytes.release()
+        self.covered_ranges.append((start, end))
+
+    def as_tensor(self) -> torch.Tensor:
+        cursor = 0
+        for start, end in sorted(self.covered_ranges):
+            if start != cursor:
+                raise ValueError(
+                    f"Streamed tensor {self.key} has a byte-range gap at "
+                    f"offset {cursor}")
+            cursor = end
+        if cursor != self.tensor_nbytes:
+            raise ValueError(
+                f"Streamed tensor {self.key} is incomplete: received "
+                f"{cursor} of {self.tensor_nbytes} bytes")
+
+        dtype, _ = _validate_stream_tensor_layout(self.dtype_token, self.shape,
+                                                  self.tensor_nbytes)
+        return self.storage.view(dtype).reshape(self.shape)
+
+
+@dataclass
+class _BorrowedStreamTensor:
+    """Immutable tensor view whose lifetime is bounded by one batch lease."""
+
+    key: str
+    buffer: memoryview | None
+    base_tensor: torch.Tensor | None
+    tensor: torch.Tensor | None
+    initial_version: int
+
+    @classmethod
+    def borrow(cls, lease: WeightBatchLease,
+               segment: WeightSegment) -> "_BorrowedStreamTensor | None":
+        buffer = lease.borrow_direct_buffer(segment)
+        if buffer is None:
+            return None
+        try:
+            if (segment.tensor_offset != 0
+                    or segment.nbytes != segment.tensor_nbytes):
+                raise ValueError(
+                    f"Direct stream tensor {segment.key} is not complete")
+            if buffer.nbytes != segment.tensor_nbytes:
+                raise ValueError(
+                    f"Direct stream tensor {segment.key} has "
+                    f"{buffer.nbytes} bytes, expected {segment.tensor_nbytes}")
+            dtype, expected_elements = _validate_stream_tensor_layout(
+                segment.dtype, segment.shape, segment.tensor_nbytes)
+            if expected_elements == 0:
+                base_tensor = torch.empty(0, dtype=dtype)
+            else:
+                try:
+                    base_tensor = torch.frombuffer(buffer,
+                                                   dtype=dtype,
+                                                   count=expected_elements)
+                except (RuntimeError, TypeError, ValueError):
+                    # Some dtype/alignment combinations may not support a
+                    # borrowed PyTorch view. The caller can safely use its
+                    # rank-local staging path instead.
+                    buffer.release()
+                    return None
+            tensor = base_tensor.reshape(segment.shape)
+            return cls(segment.key, buffer, base_tensor, tensor,
+                       tensor._version)
+        except BaseException:
+            buffer.release()
+            raise
+
+    def validate_immutable(self) -> None:
+        tensor = self.tensor
+        if tensor is not None and tensor._version != self.initial_version:
+            raise RuntimeError(
+                f"Model loading mutated borrowed checkpoint tensor "
+                f"{self.key!r}; direct shared-buffer views are immutable")
+
+    def detach_lifetime(self) -> tuple[weakref.ReferenceType, ...]:
+        """Drop owned tensor references and return retention sentinels."""
+        references = []
+        for tensor in (self.tensor, self.base_tensor):
+            if tensor is not None:
+                references.append(weakref.ref(tensor))
+        self.tensor = None
+        self.base_tensor = None
+        return tuple(references)
+
+    def release_buffer(self) -> weakref.ReferenceType | None:
+        """Drop the exported view and return a storage-retention sentinel."""
+        if self.buffer is not None:
+            buffer = self.buffer
+            reference = weakref.ref(buffer)
+            buffer.release()
+            self.buffer = None
+            return reference
+        return None
+
+
+def _try_borrow_direct_group(
+    lease: WeightBatchLease,
+    segments: tuple[WeightSegment, ...],
+    group_keys: tuple[str, ...],
+) -> list[_BorrowedStreamTensor] | None:
+    """Borrow a complete one-batch group, or select the staging fallback."""
+    if len(segments) != len(group_keys):
+        return None
+    segments_by_key = {segment.key: segment for segment in segments}
+    if len(segments_by_key) != len(segments) or set(segments_by_key) != set(
+            group_keys):
+        return None
+    if any(segment.tensor_offset != 0 or segment.nbytes != segment.tensor_nbytes
+           for segment in segments):
+        return None
+
+    borrowed = []
+    try:
+        for key in group_keys:
+            tensor = _BorrowedStreamTensor.borrow(lease, segments_by_key[key])
+            if tensor is None:
+                for prior in borrowed:
+                    prior.detach_lifetime()
+                    prior.release_buffer()
+                return None
+            borrowed.append(tensor)
+    except BaseException:
+        for prior in borrowed:
+            prior.detach_lifetime()
+            prior.release_buffer()
+        raise
+    return borrowed
+
+
+def _release_borrowed_group(
+    borrowed: list[_BorrowedStreamTensor],
+    weights: dict[str, torch.Tensor],
+    *,
+    check_retention: bool,
+) -> None:
+    """Release direct views and reject source tensors retained by a loader."""
+    references = []
+    release_failures = []
+    weights.clear()
+    for tensor in borrowed:
+        references.extend(
+            (tensor.key, reference) for reference in tensor.detach_lifetime())
+    for tensor in borrowed:
+        try:
+            reference = tensor.release_buffer()
+        except BaseException as error:
+            release_failures.append((tensor.key, error))
+        else:
+            if reference is not None:
+                references.append((tensor.key, reference))
+    retained = (
+        {key
+         for key, reference in references
+         if reference() is not None} if check_retention else set())
+    retained.update(key for key, _ in release_failures)
+    if retained:
+        retained = sorted(retained)
+        error = BorrowedWeightStorageRetentionError(
+            "Model loading retained borrowed checkpoint tensor storage for "
+            f"{retained[:5]}; direct shared-buffer views must not escape the "
+            "load call")
+        if release_failures:
+            raise error from release_failures[0][1]
+        raise error
 
 
 def validate_and_set_mamba_ssm_cache_dtype(
@@ -591,6 +861,30 @@ class ModelLoader:
                     # Generic loaders ignore it; MXCheckpointLoader pops it.
                     "source_identity": self._source_identity,
                 }
+                initialized_weight_mapper = None
+                requires_mapper_preflight = getattr(
+                    checkpoint_loader,
+                    "requires_initialized_mapper_for_session", lambda: False)()
+                if (checkpoint_loader.checkpoint_format == "HF"
+                        and requires_mapper_preflight):
+                    # Streaming policy selection needs the actual initialized
+                    # mapper manifest and model capability before any shared
+                    # window is allocated or model parameter is mutated.
+                    initialized_weight_mapper = (
+                        checkpoint_loader.get_initialized_weight_mapper(
+                            model, config))
+                    self.weight_mapper = initialized_weight_mapper
+                    # A separately loaded speculative draft does not yet have
+                    # a composite incremental transaction. Reject strict S1
+                    # before target-model mutation instead of failing after
+                    # the target stream has already completed.
+                    load_weights_kwargs.update({
+                        "_weight_mapper":
+                        initialized_weight_mapper,
+                        "_model_supports_partial_loading":
+                        self._supports_partial_weight_loading(
+                            model.load_weights) and not loads_draft_weights,
+                    })
                 if checkpoint_loader.checkpoint_format == "MX":
                     # If a separate draft model still needs a raw disk load,
                     # do not accept post-transform bytes for only the target
@@ -615,12 +909,20 @@ class ModelLoader:
                     # A non-empty dict contains size-mismatched tensors that
                     # should be merged via the standard disk pipeline.
                     weights_preloaded = checkpoint_loader.is_weights_preloaded()
-                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                        model, config)
+                    if initialized_weight_mapper is None:
+                        initialized_weight_mapper = (
+                            checkpoint_loader.get_initialized_weight_mapper(
+                                model, config))
+                        self.weight_mapper = initialized_weight_mapper
 
-                    if weights:
+                    if isinstance(weights, WeightBatchStream):
+                        self._load_weight_stream(model.load_weights,
+                                                 weights,
+                                                 initialized_weight_mapper,
+                                                 model=model)
+                    elif weights:
                         self._call_load_weights(model.load_weights, weights,
-                                                self.weight_mapper)
+                                                initialized_weight_mapper)
 
                 if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
                 ):
@@ -1204,6 +1506,43 @@ class ModelLoader:
                 post_load_weights()
 
     @staticmethod
+    def _walk_process_weights_after_loading(
+            model: DecoderModelForCausalLM) -> bool:
+        """Finalize modules loaded through partial checkpoint groups once.
+
+        ``ConfigurableMoE`` owns its backend's weight lifecycle and delegates
+        this hook to that backend. Since the backend is also an ``nn.Module``
+        child, a plain module walk would process it twice. Prefer the wrapper
+        lifecycle entrypoint and omit its delegated backend from the walk.
+
+        Args:
+            model: Root decoder model whose partial loads are complete.
+
+        Returns:
+            Whether at least one module processing hook ran.
+        """
+        modules = tuple(model.modules())
+        delegated_backend_ids = {
+            id(backend)
+            for module in modules
+            if callable(getattr(module, 'process_weights_after_loading', None))
+            for backend in (getattr(module, 'backend', None), )
+            if backend is not None and callable(
+                getattr(backend, 'process_weights_after_loading', None))
+        }
+        processed_weights = False
+        for module in modules:
+            if id(module) in delegated_backend_ids or getattr(
+                    module, '_weights_removed', False):
+                continue
+            process_weights: Optional[Callable[[], None]] = getattr(
+                module, 'process_weights_after_loading', None)
+            if process_weights is not None:
+                process_weights()
+                processed_weights = True
+        return processed_weights
+
+    @staticmethod
     def _reset_weights_transformed(model: DecoderModelForCausalLM) -> None:
         """Mark transformed modules as needing a new transform pass.
 
@@ -1289,6 +1628,8 @@ class ModelLoader:
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
+            kv_cache_compression_config=(
+                self.llm_args.kv_cache_compression_config),
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,
@@ -1409,17 +1750,298 @@ class ModelLoader:
                     f"checkpoint weights via mod-indexing.")
         return config
 
+    @staticmethod
+    def _supports_partial_weight_loading(load_method: Callable) -> bool:
+        """Whether ``load_method`` explicitly accepts incremental groups."""
+        args = inspect.getfullargspec(load_method)
+        return ("allow_partial_loading" in args.args
+                or "allow_partial_loading" in args.kwonlyargs)
+
+    def _load_weight_stream(self, load_method: Callable,
+                            stream: WeightBatchStream, weight_mapper, *,
+                            model: DecoderModelForCausalLM) -> None:
+        """Materialize complete dependency groups from a bounded host stream."""
+        groups = stream.groups
+        start_error = None
+        try:
+            weight_mapper.begin_incremental_load(groups)
+        except BaseException as error:
+            start_error = error
+        try:
+            stream.start(start_error)
+        except BaseException:
+            weight_mapper.abort_incremental_load()
+            raise
+        if start_error is not None:
+            # Defensive for test/source implementations that violate the
+            # start(error) contract and return successfully.
+            weight_mapper.abort_incremental_load()
+            raise start_error
+        active_group_id = None
+        active_group_keys: tuple[str, ...] = ()
+        staged_tensors: dict[str, _StagedStreamTensor] = {}
+        expected_sequence = 0
+        stream_started = time.perf_counter()
+        staging_seconds = 0.0
+        materialization_seconds = 0.0
+        h2d_sync_seconds = 0.0
+        payload_nbytes = 0
+        completed_groups = 0
+        direct_groups = 0
+        direct_nbytes = 0
+        staged_groups = 0
+        staged_nbytes = 0
+        incremental_load_finalized = False
+        try:
+            while True:
+                lease = stream.begin_next()
+                if lease is None:
+                    break
+
+                completed_group_id = None
+                completed_group_direct = False
+                completed_group_nbytes = 0
+                local_error = None
+                borrowed_tensors = None
+                borrowed_weights = None
+                try:
+                    batch = lease.batch
+                    if batch.sequence != expected_sequence:
+                        raise ValueError(
+                            "Out-of-order shared-host weight batch: expected "
+                            f"{expected_sequence}, received {batch.sequence}")
+                    expected_sequence += 1
+                    payload_nbytes += batch.payload_nbytes
+
+                    if active_group_id is None:
+                        expected_group = groups[completed_groups]
+                        if (batch.group_id != expected_group.group_id
+                                or batch.group_keys != expected_group.keys):
+                            raise ValueError(
+                                "Streamed dependency groups do not follow the "
+                                "validated mapper manifest")
+                        active_group_id = batch.group_id
+                        active_group_keys = batch.group_keys
+                    elif (batch.group_id != active_group_id
+                          or batch.group_keys != active_group_keys):
+                        raise ValueError(
+                            "A streamed weight dependency group changed before "
+                            "group_complete=True")
+
+                    if (batch.group_complete and not staged_tensors
+                            and getattr(weight_mapper,
+                                        "borrowed_source_tensors_safe", False)):
+                        borrowed_tensors = _try_borrow_direct_group(
+                            lease, batch.segments, active_group_keys)
+
+                    if borrowed_tensors is None:
+                        staging_started = time.perf_counter()
+                        try:
+                            for segment in batch.segments:
+                                staged = staged_tensors.get(segment.key)
+                                if staged is None:
+                                    staged = _StagedStreamTensor.allocate(
+                                        segment)
+                                    staged_tensors[segment.key] = staged
+                                source = lease.view(segment)
+                                try:
+                                    staged.copy_segment(segment, source)
+                                finally:
+                                    source.release()
+                            del staged
+                        finally:
+                            staging_seconds += (time.perf_counter() -
+                                                staging_started)
+
+                    if batch.group_complete:
+                        using_direct_buffers = borrowed_tensors is not None
+                        if using_direct_buffers:
+                            weights = {
+                                tensor.key: tensor.tensor
+                                for tensor in borrowed_tensors
+                            }
+                            borrowed_weights = weights
+                            completed_group_nbytes = sum(
+                                segment.tensor_nbytes
+                                for segment in batch.segments)
+                        else:
+                            if set(staged_tensors) != set(active_group_keys):
+                                missing = sorted(
+                                    set(active_group_keys) -
+                                    set(staged_tensors))
+                                unexpected = sorted(
+                                    set(staged_tensors) -
+                                    set(active_group_keys))
+                                raise ValueError(
+                                    "A completed streamed weight group does "
+                                    "not match its manifest "
+                                    f"(missing={missing[:5]}, "
+                                    f"unexpected={unexpected[:5]})")
+                            weights = {
+                                key: staged_tensors[key].as_tensor()
+                                for key in active_group_keys
+                            }
+                            completed_group_nbytes = sum(
+                                tensor.tensor_nbytes
+                                for tensor in staged_tensors.values())
+                        materialization_started = time.perf_counter()
+                        materialization_error = None
+                        try:
+                            self._call_load_weights(load_method,
+                                                    weights,
+                                                    weight_mapper,
+                                                    allow_partial_loading=True)
+                        except BaseException as error:
+                            materialization_error = error
+                        finally:
+                            materialization_seconds += (time.perf_counter() -
+                                                        materialization_started)
+                        # The shared slot may be reused only after every H2D
+                        # read from rank-local staging or the borrowed arena
+                        # has completed, including a partially launched load.
+                        if torch.cuda.is_available():
+                            sync_started = time.perf_counter()
+                            try:
+                                torch.cuda.current_stream().synchronize()
+                            except BaseException as error:
+                                if materialization_error is None:
+                                    materialization_error = error
+                            finally:
+                                h2d_sync_seconds += (time.perf_counter() -
+                                                     sync_started)
+                        if borrowed_tensors is not None:
+                            if materialization_error is None:
+                                try:
+                                    for tensor in borrowed_tensors:
+                                        tensor.validate_immutable()
+                                except BaseException as error:
+                                    materialization_error = error
+                            try:
+                                _release_borrowed_group(
+                                    borrowed_tensors,
+                                    weights,
+                                    check_retention=True,
+                                )
+                            except BaseException as error:
+                                if isinstance(
+                                        error,
+                                        BorrowedWeightStorageRetentionError):
+                                    if materialization_error is not None:
+                                        error.__cause__ = materialization_error
+                                    materialization_error = error
+                                elif materialization_error is None:
+                                    materialization_error = error
+                        if materialization_error is not None:
+                            raise materialization_error
+                        completed_group_id = active_group_id
+                        completed_group_direct = using_direct_buffers
+                        completed_groups += 1
+                        active_group_id = None
+                        active_group_keys = ()
+                        staged_tensors.clear()
+                        del weights
+                except BaseException as error:
+                    local_error = error
+                if borrowed_tensors is not None:
+                    try:
+                        _release_borrowed_group(
+                            borrowed_tensors,
+                            borrowed_weights
+                            if borrowed_weights is not None else {},
+                            check_retention=True,
+                        )
+                    except BaseException as error:
+                        if isinstance(error,
+                                      BorrowedWeightStorageRetentionError):
+                            if local_error is not None:
+                                error.__cause__ = local_error
+                            local_error = error
+                        elif local_error is None:
+                            local_error = error
+                if completed_group_id is not None and local_error is None:
+                    try:
+                        weight_mapper.record_incremental_group_loaded(
+                            completed_group_id)
+                        if completed_groups == len(groups):
+                            weight_mapper.finalize_incremental_load()
+                            incremental_load_finalized = True
+                            processed_weights = self._walk_process_weights_after_loading(
+                                model)
+                            # Deferred quantization/fusion may enqueue GPU
+                            # work. Surface failures through the final batch
+                            # consensus before any rank exits the stream.
+                            if processed_weights and torch.cuda.is_available():
+                                sync_started = time.perf_counter()
+                                torch.cuda.current_stream().synchronize()
+                                h2d_sync_seconds += (time.perf_counter() -
+                                                     sync_started)
+                        stream.record_materialization(
+                            direct=completed_group_direct,
+                            nbytes=completed_group_nbytes)
+                        if completed_group_direct:
+                            direct_groups += 1
+                            direct_nbytes += completed_group_nbytes
+                        else:
+                            staged_groups += 1
+                            staged_nbytes += completed_group_nbytes
+                    except BaseException as error:
+                        local_error = error
+                try:
+                    lease.release()
+                except BaseException as error:
+                    if local_error is None:
+                        local_error = error
+
+                # Every rank enters the same per-batch collective even when
+                # only one consumer failed. The transport selects and raises
+                # one deterministic rank error before allowing slot reuse.
+                stream.complete(lease, local_error)
+                if local_error is not None:
+                    # Defensive for test/source implementations that violate
+                    # the complete(error) contract and return successfully.
+                    raise local_error
+
+            # The transport's validated plan publishes EOF only after the
+            # final manifest group. Mapper finalization already participated
+            # in that group's complete(error) consensus above.
+            if active_group_id is not None:
+                raise RuntimeError(
+                    "Shared-host weight stream ended before dependency group "
+                    f"{active_group_id!r} was complete")
+            if not incremental_load_finalized:
+                raise RuntimeError(
+                    "Shared-host weight stream ended before the incremental "
+                    "mapper lifecycle was finalized")
+            stream_elapsed = time.perf_counter() - stream_started
+            logger.info(
+                "shared_host_producer materialized "
+                f"{payload_nbytes / (1024**3):.2f}GB in {expected_sequence} "
+                f"batches and {completed_groups} atomic groups over "
+                f"{stream_elapsed:.2f}s; direct shared-buffer="
+                f"{direct_nbytes / (1024**3):.2f}GB/{direct_groups} groups, "
+                f"rank-local staged={staged_nbytes / (1024**3):.2f}GB/"
+                f"{staged_groups} groups, staging="
+                f"{staging_seconds:.2f}s, model materialization="
+                f"{materialization_seconds:.2f}s, exposed H2D sync tail="
+                f"{h2d_sync_seconds:.2f}s.")
+        except BaseException:
+            weight_mapper.abort_incremental_load()
+            raise
+
     def _call_load_weights(self,
                            load_method: Callable,
                            weights,
                            weight_mapper,
                            allow_partial_loading: bool = False):
         """Calls the model's weight loading method with the correct arguments."""
-        args = inspect.getfullargspec(load_method).args
+        signature = inspect.getfullargspec(load_method)
+        args = signature.args
+        kwonlyargs = signature.kwonlyargs
         kargs = {}
         if "weight_mapper" in args:
             kargs["weight_mapper"] = weight_mapper
-        if "allow_partial_loading" in args:
+        if ("allow_partial_loading" in args
+                or "allow_partial_loading" in kwonlyargs):
             kargs["allow_partial_loading"] = allow_partial_loading
         else:
             assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"

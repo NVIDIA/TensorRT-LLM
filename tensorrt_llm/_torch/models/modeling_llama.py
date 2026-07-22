@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1205,6 +1208,8 @@ def _load_checkpoint_into_module(module: nn.Module,
 
 class Llama4VisionEncoder(nn.Module):
 
+    _WEIGHT_PREFIXES = ("vision_model.", "multi_modal_projector.")
+
     def __init__(self, model_config: ModelConfig[Llama4Config], *args,
                  **kwargs):
         super().__init__()
@@ -1214,7 +1219,17 @@ class Llama4VisionEncoder(nn.Module):
 
         self.dtype = self.pretrained_config.text_config.torch_dtype
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, allow_partial_loading: bool = False):
+        has_vision_weights = any(
+            name.startswith(self._WEIGHT_PREFIXES) for name in weights)
+        if allow_partial_loading and not has_vision_weights:
+            # A text dependency group must not reopen the checkpoint through
+            # the legacy fallback path.
+            return
+        if allow_partial_loading and getattr(self, "_vision_weights_loaded",
+                                             False):
+            raise RuntimeError("Llama4 vision weights were already loaded")
+
         module_dict = nn.ModuleDict({
             "vision_model":
             Llama4VisionModel(self.pretrained_config.vision_config),
@@ -1233,12 +1248,23 @@ class Llama4VisionEncoder(nn.Module):
 
         # Otherwise, load the weights from the checkpoint.
         else:
+            if allow_partial_loading:
+                missing_params = [
+                    name for name in param_names if name not in weights
+                ]
+                missing_sample = ", ".join(missing_params[:8])
+                if len(missing_params) > 8:
+                    missing_sample += ", ..."
+                raise ValueError(
+                    "Incomplete Llama4 vision dependency group; missing "
+                    f"{len(missing_params)} parameters: {missing_sample}")
             _load_checkpoint_into_module(module_dict,
                                          self.pretrained_config._name_or_path,
                                          strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)
+        self._vision_weights_loaded = True
 
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
@@ -1578,9 +1604,13 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
         return super().infer_max_seq_len()
 
-    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: BaseWeightMapper,
+                     allow_partial_loading: bool = False):
         if not DISAGG:
-            self.mm_encoder.load_weights(weights)
+            self.mm_encoder.load_weights(
+                weights, allow_partial_loading=allow_partial_loading)
 
         # Temporarily detach mm_encoder so the TRT-LLM loader doesn't try to load it
         had_mm_encoder = hasattr(self, "mm_encoder")
@@ -1588,7 +1618,9 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         if had_mm_encoder:
             delattr(self, "mm_encoder")
         try:
-            super().load_weights(weights, weight_mapper)
+            super().load_weights(weights,
+                                 weight_mapper,
+                                 allow_partial_loading=allow_partial_loading)
         finally:
             if had_mm_encoder:
                 self.mm_encoder = saved_mm_encoder

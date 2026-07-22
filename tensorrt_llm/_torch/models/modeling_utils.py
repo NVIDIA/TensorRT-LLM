@@ -1215,6 +1215,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             if weight_mapper.does_require_special_handling(module_name):
                 module_weights = weight_mapper.apply_callbacks(
                     module, module_name, module_names_breakdown, weights)
+                # An incremental dependency group usually contains only one
+                # layer. Do not invoke fused module loaders for every absent
+                # layer: some loaders perform post-load work even when all
+                # source dictionaries are empty.
+                if allow_partial_loading and not any(module_weights):
+                    return
                 module.load_weights(weights=module_weights,
                                     allow_partial_loading=allow_partial_loading)
 
@@ -1258,15 +1264,73 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     if hasattr(weights, 'mark_consumed'):
                         weights.mark_consumed(name)
 
+    def get_load_modules() -> tuple[list[tuple[str, nn.Module]], bool]:
+        """Select only destination subtrees for an audited partial mapper."""
+        if not allow_partial_loading:
+            return list(model.named_modules(remove_duplicate=False)), False
+
+        roots = weight_mapper.get_incremental_load_roots(weights.keys())
+        if roots is None:
+            return list(model.named_modules(remove_duplicate=False)), False
+        if not roots and weights:
+            logger.debug(
+                "Incremental mapper returned no destination roots; falling "
+                "back to full model traversal")
+            return list(model.named_modules(remove_duplicate=False)), False
+
+        selected_modules: dict[str, nn.Module] = {}
+        for root in roots:
+            try:
+                root_module = model.get_submodule(root) if root else model
+            except AttributeError:
+                # A model wrapper may consume a dependency (for example an
+                # atomic vision group) before the decoder loader runs. Retain
+                # the legacy traversal for such groups so an incorrect mapper
+                # root can never silently skip source weights.
+                logger.debug(
+                    f"Incremental destination root {root!r} is not present; "
+                    "falling back to full model traversal")
+                return list(model.named_modules(remove_duplicate=False)), False
+
+            for relative_name, module in root_module.named_modules(
+                    remove_duplicate=False):
+                name = (root if not relative_name else
+                        f"{root}.{relative_name}" if root else relative_name)
+                selected_modules.setdefault(name, module)
+
+        logger.debug(
+            f"Incremental weight dispatch selected {len(selected_modules)} "
+            f"modules from {len(roots)} destination roots")
+        return list(selected_modules.items()), True
+
+    load_modules, incremental_dispatch = get_load_modules()
+
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
-                      "False") in ["True", "true", "1", "yes", "y"]:
-        for name, module in tqdm(list(
-                model.named_modules(remove_duplicate=False)),
-                                 desc="Loading weights"):
+                      "False") in ["True", "true", "1", "yes", "y"] or \
+            incremental_dispatch:
+        # Dependency groups usually contain only one or a few destination
+        # modules. Direct dispatch avoids creating a broad executor and one
+        # future per module for every streamed group.
+        all_modules = dict(load_modules)
+        ordered_module_names = []
+        if preload_weight_modules is not None:
+            for preload_module in preload_weight_modules:
+                ordered_module_names.extend([
+                    name for name in all_modules
+                    if name.endswith(preload_module)
+                    and name not in ordered_module_names
+                ])
+        ordered_module_names.extend(
+            [name for name in all_modules if name not in ordered_module_names])
+        module_iterator = ordered_module_names
+        if not incremental_dispatch:
+            module_iterator = tqdm(module_iterator, desc="Loading weights")
+        for name in module_iterator:
+            module = all_modules[name]
             load_single_module(name, module)
     else:
         # remove_duplicate=False ensures original modules sharing weights with next_layer_layernorm are not skipped
-        all_modules = dict(model.named_modules(remove_duplicate=False))
+        all_modules = dict(load_modules)
         serial_load_modules = []
         if preload_weight_modules is not None:
             for module in preload_weight_modules:
@@ -1282,11 +1346,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                 del all_modules[module]
             pbar.close()
 
-        pbar = tqdm(list(model.named_modules(remove_duplicate=False)),
-                    desc="Loading weights concurrently")
-        args_list = [
-            (name, module)
-            for name, module in model.named_modules(remove_duplicate=False)
-            if name not in serial_load_modules
-        ]
+        args_list = [(name, module) for name, module in load_modules
+                     if name not in serial_load_modules]
+        pbar = tqdm(total=len(args_list), desc="Loading weights concurrently")
         run_concurrently(load_single_module, args_list, pbar=pbar)

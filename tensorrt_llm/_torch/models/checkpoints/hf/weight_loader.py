@@ -30,7 +30,7 @@ import tqdm
 from mpi4py import MPI as _MPI
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
-    BaseWeightLoader, ConsumableWeightsDict)
+    BaseWeightLoader, ConsumableWeightsDict, WeightBatchStream, WeightGroup)
 from tensorrt_llm._torch.models.checkpoints.weight_load_plan import (
     WeightLoadPlan, WeightLoadPolicy, normalize_weight_load_plan)
 from tensorrt_llm._torch.models.modeling_utils import (
@@ -44,7 +44,9 @@ from tensorrt_llm.mapping import Mapping
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 _WEIGHT_LOAD_PLAN_ENV = "TRTLLM_HF_WEIGHT_LOAD_PLAN"
+_SHARED_HOST_BUFFER_BUDGET_ENV = "TRTLLM_HF_SHARED_HOST_BUFFER_BUDGET_BYTES"
 _DEFAULT_PREFETCH_CHUNK_SIZE = 256 * 1024 * 1024
+_DEFAULT_SHARED_HOST_BUFFER_BUDGET = 64 * 1024 * 1024 * 1024
 _PREFETCH_READ_SIZE = 8 * 1024 * 1024
 _DEFAULT_PREFETCH_WORKERS_PER_RANK = 16
 _DEFAULT_PREFETCH_WORKERS_PER_NODE = 64
@@ -189,6 +191,94 @@ class _DirectReadAheadSession:
             raise communicator_error
 
 
+class _SharedHostStreamSession:
+    """Own transport cleanup and the caller-created node communicator."""
+
+    def __init__(self, stream: WeightBatchStream, node_communicator) -> None:
+        self._stream = stream
+        self._node_communicator = node_communicator
+        self._finished = False
+        self._started_at = time.perf_counter()
+
+    def finish(self, body_error: BaseException | None = None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        cleanup_error = None
+        communicator_error = None
+        telemetry = None
+        try:
+            if body_error is not None:
+                try:
+                    self._stream.abort(body_error)
+                except Exception:
+                    logger.exception(
+                        "Suppressing shared_host_producer abort failure to "
+                        "preserve the model-load exception.")
+            try:
+                telemetry = getattr(self._stream, "telemetry", None)
+            except Exception:
+                logger.exception(
+                    "Unable to snapshot shared_host_producer telemetry.")
+            try:
+                self._stream.finalize()
+            except Exception as error:
+                cleanup_error = error
+        finally:
+            if self._node_communicator is not None:
+                try:
+                    self._node_communicator.Free()
+                except Exception as error:
+                    communicator_error = error
+
+        if body_error is not None:
+            return
+        if cleanup_error is not None:
+            raise cleanup_error
+        if communicator_error is not None:
+            raise communicator_error
+        if telemetry is not None:
+            materialized_bytes = (telemetry.direct_view_bytes +
+                                  telemetry.staged_bytes)
+            direct_fraction = (telemetry.direct_view_bytes / materialized_bytes
+                               if materialized_bytes else 0.0)
+            logger.info("shared_host_producer rank materialization: "
+                        f"world_rank={telemetry.world_rank}, "
+                        f"node_rank={telemetry.node_rank}, "
+                        "all_ranks_host_registered="
+                        f"{telemetry.all_ranks_host_registered}, direct_groups="
+                        f"{telemetry.direct_view_groups}, manifest_groups="
+                        f"{telemetry.group_count}, direct_bytes="
+                        f"{telemetry.direct_view_bytes}, staged_groups="
+                        f"{telemetry.staged_groups}, staged_bytes="
+                        f"{telemetry.staged_bytes}, direct_byte_fraction="
+                        f"{direct_fraction:.6f}.")
+        if telemetry is not None and telemetry.is_node_producer:
+            elapsed = time.perf_counter() - self._started_at
+            throughput = telemetry.bytes_published / max(elapsed, 1e-9) / (1024
+                                                                           **3)
+            logger.info(
+                "shared_host_producer node stream published "
+                f"{telemetry.bytes_published / (1024**3):.2f}GB in "
+                f"{telemetry.batches_published} batches over {elapsed:.2f}s "
+                f"({throughput:.2f}GB/s logical rate); shared double buffer="
+                f"{telemetry.slot_count} x "
+                f"{telemetry.slot_bytes / (1024**2):.0f}MiB "
+                f"(configured={telemetry.configured_slot_bytes / (1024**2):.0f}MiB, "
+                f"budget={telemetry.buffer_budget_bytes / (1024**3):.1f}GiB, "
+                f"largest group={telemetry.largest_group_nbytes / (1024**2):.0f}MiB, "
+                f"single-slot groups={telemetry.groups_fitting_single_slot}/"
+                f"{telemetry.group_count}), "
+                f"I/O workers={telemetry.io_workers}, host registration="
+                f"{telemetry.host_registered} "
+                f"({telemetry.host_registration_detail}), all-rank registration="
+                f"{telemetry.all_ranks_host_registered}; direct materialization="
+                f"{telemetry.direct_view_groups} groups/"
+                f"{telemetry.direct_view_bytes / (1024**3):.2f}GB, staged="
+                f"{telemetry.staged_groups} groups/"
+                f"{telemetry.staged_bytes / (1024**3):.2f}GB.")
+
+
 @register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
 @register_checkpoint_weight_loader("mistral_large_3")
@@ -205,19 +295,26 @@ class HfWeightLoader(BaseWeightLoader):
                            | Sequence[WeightLoadPolicy | str] | None) = None,
         prefetch_chunk_size: int = _DEFAULT_PREFETCH_CHUNK_SIZE,
         prefetch_workers_per_rank: int | None = None,
+        shared_host_buffer_budget: int | None = None,
     ) -> None:
         self._configured_weight_load_plan = weight_load_plan
         self._prefetch_chunk_size = prefetch_chunk_size
         self._prefetch_workers_per_rank = prefetch_workers_per_rank
+        self._configured_shared_host_buffer_budget = (shared_host_buffer_budget)
         self._validate_weight_load_options()
 
     def _validate_weight_load_options(self) -> None:
-        self._get_weight_load_plan()
+        weight_load_plan = self._get_weight_load_plan()
         if self._prefetch_chunk_size <= 0:
             raise ValueError("prefetch_chunk_size must be positive")
         if (self._prefetch_workers_per_rank is not None
                 and self._prefetch_workers_per_rank <= 0):
             raise ValueError("prefetch_workers_per_rank must be positive")
+        if (WeightLoadPolicy.SHARED_HOST_PRODUCER in weight_load_plan
+                and self._get_shared_host_buffer_budget()
+                < 2 * self._prefetch_chunk_size):
+            raise ValueError(
+                "shared_host_buffer_budget must hold two prefetch chunks")
 
     def _get_weight_load_plan(self) -> WeightLoadPlan:
         value = self._configured_weight_load_plan
@@ -226,6 +323,30 @@ class HfWeightLoader(BaseWeightLoader):
         if value is None and self._is_weight_cache_enabled():
             return (WeightLoadPolicy.LEGACY_FALLBACK, )
         return normalize_weight_load_plan(value)
+
+    def _get_shared_host_buffer_budget(self) -> int:
+        value = self._configured_shared_host_buffer_budget
+        if value is None:
+            raw_value = os.environ.get(_SHARED_HOST_BUFFER_BUDGET_ENV)
+            if raw_value is not None:
+                try:
+                    value = int(raw_value)
+                except ValueError as error:
+                    raise ValueError(
+                        f"{_SHARED_HOST_BUFFER_BUDGET_ENV} must be an integer"
+                    ) from error
+        if value is None:
+            value = _DEFAULT_SHARED_HOST_BUFFER_BUDGET
+        if value <= 0:
+            raise ValueError("shared_host_buffer_budget must be positive")
+        return value
+
+    def requires_initialized_mapper_for_session(self) -> bool:
+        """Whether shared-host preflight can be reached by this plan."""
+        first_non_gpu_policy = next(
+            (policy for policy in self._get_weight_load_plan()
+             if policy != WeightLoadPolicy.GPU_BROADCAST), None)
+        return first_non_gpu_policy == WeightLoadPolicy.SHARED_HOST_PRODUCER
 
     def _get_coordinated_weight_load_plan(
             self,
@@ -308,6 +429,95 @@ class HfWeightLoader(BaseWeightLoader):
                 return f"rank {rank}: {rank_reason}"
         return None
 
+    @staticmethod
+    def _nested_partial_load_ineligibility_reason(model: Any) -> str | None:
+        """Return the first destination module that rejects partial loading."""
+        named_modules = getattr(model, "named_modules", None)
+        if not callable(named_modules):
+            return None
+
+        for module_name, module in named_modules():
+            display_name = module_name or "<root>"
+            try:
+                capability = getattr(module, "supports_partial_weight_loading",
+                                     None)
+            except Exception as error:
+                return (f"destination module {display_name!r} "
+                        f"({type(module).__name__}) failed its partial-load "
+                        f"capability check: {type(error).__name__}: {error}")
+            # Only modules that explicitly publish this contract participate.
+            # Unknown module types remain eligible for their existing loading
+            # path rather than being rejected by absence of an opt-in marker.
+            if capability is not False:
+                continue
+            quant_method = getattr(module, "quant_method", None)
+            quant_details = (f", quant_method={type(quant_method).__name__}"
+                             if quant_method is not None else "")
+            return (
+                f"destination module {display_name!r} "
+                f"({type(module).__name__}{quant_details}) does not support "
+                "allow_partial_loading")
+        return None
+
+    @classmethod
+    def _shared_host_ineligibility_reason(
+        cls,
+        model: Any,
+        mapping: Mapping,
+        *,
+        checkpoint_format: str,
+        uses_custom_weight_mapper: bool,
+        load_format: Any,
+        supports_weight_stream: bool,
+        model_supports_partial_loading: bool,
+        weight_mapper: Any,
+        weight_groups: Sequence[Any] | None,
+        preflight_error: str | None,
+    ) -> str | None:
+        """Preflight model-side requirements for incremental materialization."""
+        reason = cls._cooperative_ineligibility_reason(
+            model,
+            mapping,
+            checkpoint_format=checkpoint_format,
+            uses_custom_weight_mapper=uses_custom_weight_mapper,
+            load_format=load_format)
+        if reason is not None:
+            return reason
+        if not ENABLE_MULTI_DEVICE or mpi_disabled():
+            return ("shared_host_producer requires active MPI world and "
+                    "node-local communicators")
+        if not supports_weight_stream:
+            return ("shared_host_producer requires an open weight session; "
+                    "synchronous load_weights callers cannot consume a stream")
+        if not model_supports_partial_loading:
+            return ("the model load_weights method does not support "
+                    "allow_partial_loading")
+        nested_reason = cls._nested_partial_load_ineligibility_reason(model)
+        if nested_reason is not None:
+            return nested_reason
+        model_config = getattr(model, "model_config", None)
+        load_balancer = getattr(model_config, "moe_load_balancer", None)
+        if (load_balancer is not None
+                and getattr(load_balancer, "layer_updates_per_iter", 0) > 0):
+            return ("shared_host_producer does not support dynamic MoE load "
+                    "balancing because it retains raw checkpoint tensors "
+                    "beyond a bounded stream batch")
+        if getattr(model_config, "enable_min_latency", False):
+            return ("shared_host_producer does not support min-latency model "
+                    "loading because its eager weight derivation is not "
+                    "compatible with deferred partial-load finalization")
+        if weight_mapper is None:
+            return "an initialized weight mapper is required"
+        if not callable(getattr(weight_mapper, "get_weight_groups", None)):
+            return ("the initialized weight mapper does not provide an "
+                    "incremental weight-group manifest")
+        if preflight_error is not None:
+            return preflight_error
+        if weight_groups is None:
+            return ("the initialized weight mapper did not declare a safe "
+                    "incremental weight-group manifest")
+        return None
+
     def _resolve_weight_load_policy(
         self,
         plan: WeightLoadPlan,
@@ -318,14 +528,18 @@ class HfWeightLoader(BaseWeightLoader):
         uses_custom_weight_mapper: bool,
         load_format: Any,
         coordination_error: str | None,
+        supports_weight_stream: bool = False,
+        model_supports_partial_loading: bool = False,
+        weight_mapper: Any = None,
+        shared_host_weight_groups: Sequence[Any] | None = None,
+        shared_host_preflight_error: str | None = None,
     ) -> tuple[WeightLoadPolicy, list[tuple[WeightLoadPolicy, str]]]:
         """Resolve an ordered policy list before strategy collectives begin."""
         if coordination_error is not None:
             raise RuntimeError("Weight loading cannot coordinate ranks: "
                                f"{coordination_error}")
         skipped = []
-        cooperative_reason = None
-        cooperative_reason_resolved = False
+        policy_reasons: dict[WeightLoadPolicy, str | None] = {}
         for policy in plan:
             if policy == WeightLoadPolicy.LEGACY_FALLBACK:
                 return policy, skipped
@@ -333,21 +547,35 @@ class HfWeightLoader(BaseWeightLoader):
                 skipped.append((policy, _GPU_BROADCAST_UNAVAILABLE_REASON))
                 continue
 
-            if not cooperative_reason_resolved:
-                cooperative_reason = self._cooperative_ineligibility_reason(
-                    model,
-                    mapping,
-                    checkpoint_format=checkpoint_format,
-                    uses_custom_weight_mapper=uses_custom_weight_mapper,
-                    load_format=load_format)
+            if policy not in policy_reasons:
+                if policy == WeightLoadPolicy.SHARED_HOST_PRODUCER:
+                    reason = self._shared_host_ineligibility_reason(
+                        model,
+                        mapping,
+                        checkpoint_format=checkpoint_format,
+                        uses_custom_weight_mapper=uses_custom_weight_mapper,
+                        load_format=load_format,
+                        supports_weight_stream=supports_weight_stream,
+                        model_supports_partial_loading=(
+                            model_supports_partial_loading),
+                        weight_mapper=weight_mapper,
+                        weight_groups=shared_host_weight_groups,
+                        preflight_error=shared_host_preflight_error)
+                else:
+                    reason = self._cooperative_ineligibility_reason(
+                        model,
+                        mapping,
+                        checkpoint_format=checkpoint_format,
+                        uses_custom_weight_mapper=uses_custom_weight_mapper,
+                        load_format=load_format)
                 if getattr(load_format, "name", load_format) == "AUTO":
-                    cooperative_reason = (
-                        self._coordinate_cooperative_ineligibility_reason(
-                            cooperative_reason))
-                cooperative_reason_resolved = True
-            if cooperative_reason is None:
+                    reason = self._coordinate_cooperative_ineligibility_reason(
+                        reason)
+                policy_reasons[policy] = reason
+            reason = policy_reasons[policy]
+            if reason is None:
                 return policy, skipped
-            skipped.append((policy, cooperative_reason))
+            skipped.append((policy, reason))
 
         details = "; ".join(f"{policy.value}: {reason}"
                             for policy, reason in skipped)
@@ -387,6 +615,47 @@ class HfWeightLoader(BaseWeightLoader):
         if signature[0] == "error":
             raise RuntimeError("Checkpoint file discovery failed: "
                                f"{signature[1]}: {signature[2]}")
+
+    @staticmethod
+    def _get_shared_host_weight_groups(
+            keys: Sequence[str], weight_mapper: Any) -> tuple[WeightGroup, ...]:
+        """Build and validate an atomic manifest without starting transport."""
+        if len(set(keys)) != len(keys):
+            raise ValueError(
+                "SafeTensors checkpoint contains duplicate tensor names")
+
+        groups = weight_mapper.get_weight_groups(keys)
+        if groups is None:
+            if not getattr(weight_mapper, "single_tensor_groups_safe", False):
+                raise ValueError(
+                    "the initialized weight mapper did not declare a safe "
+                    "incremental weight-group manifest")
+            groups = [WeightGroup(group_id=key, keys=(key, )) for key in keys]
+        groups = tuple(groups)
+        if not groups:
+            raise ValueError("the incremental weight-group manifest is empty")
+
+        group_ids = [group.group_id for group in groups]
+        if len(set(group_ids)) != len(group_ids):
+            raise ValueError("incremental weight-group IDs must be unique")
+        grouped_keys = [key for group in groups for key in group.keys]
+        grouped_key_set = set(grouped_keys)
+        checkpoint_key_set = set(keys)
+        if len(grouped_keys) != len(grouped_key_set):
+            raise ValueError(
+                "incremental weight groups contain duplicate tensor names")
+        if grouped_key_set != checkpoint_key_set:
+            missing = sorted(checkpoint_key_set - grouped_key_set)
+            unexpected = sorted(grouped_key_set - checkpoint_key_set)
+            details = []
+            if missing:
+                details.append(f"missing {missing[:5]}")
+            if unexpected:
+                details.append(f"unexpected {unexpected[:5]}")
+            raise ValueError(
+                "incremental weight groups must partition checkpoint keys "
+                "exactly (" + "; ".join(details) + ")")
+        return groups
 
     @staticmethod
     def _is_weight_cache_enabled() -> bool:
@@ -576,12 +845,14 @@ class HfWeightLoader(BaseWeightLoader):
         return weights
 
     @contextmanager
-    def open_weight_session(self,
-                            checkpoint_dir: str,
-                            mapping: Mapping,
-                            use_consolidated: bool = False,
-                            **kwargs) -> Iterator[dict[str, Any]]:
-        """Load weights while allowing direct-rank read-ahead to overlap use."""
+    def open_weight_session(
+            self,
+            checkpoint_dir: str,
+            mapping: Mapping,
+            use_consolidated: bool = False,
+            **kwargs) -> Iterator[dict[str, Any]
+                                  | WeightBatchStream]:
+        """Keep policy-owned I/O resources alive during materialization."""
         weights, pending_session = self._load_weights_impl(
             checkpoint_dir,
             mapping,
@@ -602,8 +873,8 @@ class HfWeightLoader(BaseWeightLoader):
                     if body_error is None:
                         raise
                     logger.exception(
-                        "Suppressing a direct_rank_read cleanup failure to "
-                        "preserve the model-load exception.")
+                        "Suppressing weight-session cleanup failure to preserve "
+                        "the model-load exception.")
 
     def _load_weights_impl(
         self,
@@ -613,7 +884,8 @@ class HfWeightLoader(BaseWeightLoader):
         *,
         defer_direct_read_ahead: bool,
         **kwargs,
-    ) -> tuple[dict[str, Any], _DirectReadAheadSession | None]:
+    ) -> tuple[dict[str, Any] | WeightBatchStream, _DirectReadAheadSession
+               | _SharedHostStreamSession | None]:
         load_format = kwargs.get("_load_format")
         checkpoint_format = kwargs.get("_checkpoint_format", "HF")
         weight_files = sorted(glob.glob(f"{checkpoint_dir}/*.safetensors"))
@@ -644,15 +916,151 @@ class HfWeightLoader(BaseWeightLoader):
                 self._get_coordinated_weight_load_plan(mapping,
                                                        checkpoint_format,
                                                        load_format))
-            policy, skipped = self._resolve_weight_load_policy(
-                weight_load_plan,
-                kwargs.get("model"),
-                mapping,
-                checkpoint_format=checkpoint_format,
-                uses_custom_weight_mapper=kwargs.get(
-                    "_uses_custom_weight_mapper", False),
-                load_format=load_format,
-                coordination_error=coordination_error)
+            model = kwargs.get("model")
+            weight_mapper = kwargs.get("_weight_mapper")
+            model_supports_partial_loading = kwargs.get(
+                "_model_supports_partial_loading", False)
+            shared_host_preflight = None
+            shared_host_weight_groups = None
+            shared_host_preflight_error = None
+
+            # Avoid even SafeTensors header parsing unless shared-host
+            # streaming is the first potentially executable policy. Direct
+            # read-ahead and page-cache prefetch have the same distributed
+            # eligibility requirements, so a shared policy after either one
+            # cannot become the selected policy on its own.
+            first_non_gpu_policy = next(
+                (candidate for candidate in weight_load_plan
+                 if candidate != WeightLoadPolicy.GPU_BROADCAST), None)
+            if (coordination_error is None and first_non_gpu_policy
+                    == WeightLoadPolicy.SHARED_HOST_PRODUCER):
+                cheap_reason = self._shared_host_ineligibility_reason(
+                    model,
+                    mapping,
+                    checkpoint_format=checkpoint_format,
+                    uses_custom_weight_mapper=kwargs.get(
+                        "_uses_custom_weight_mapper", False),
+                    load_format=load_format,
+                    supports_weight_stream=defer_direct_read_ahead,
+                    model_supports_partial_loading=(
+                        model_supports_partial_loading),
+                    weight_mapper=weight_mapper,
+                    weight_groups=(),
+                    preflight_error=None)
+                if getattr(load_format, "name", load_format) == "AUTO":
+                    cheap_reason = (
+                        self._coordinate_cooperative_ineligibility_reason(
+                            cheap_reason))
+                if cheap_reason is None:
+                    try:
+                        from tensorrt_llm._torch.models.checkpoints.hf.shared_host_stream import \
+                            prepare_shared_host_weight_stream
+
+                        shared_host_preflight = (
+                            prepare_shared_host_weight_stream(weight_files))
+                        shared_host_weight_groups = (
+                            self._get_shared_host_weight_groups(
+                                shared_host_preflight.keys, weight_mapper))
+                    except Exception as error:
+                        shared_host_preflight_error = (
+                            "shared-host stream preflight failed: "
+                            f"{type(error).__name__}: {error}")
+
+                    if getattr(load_format, "name", load_format) == "AUTO":
+                        shared_host_preflight_error = (
+                            self._coordinate_cooperative_ineligibility_reason(
+                                shared_host_preflight_error))
+                    if shared_host_preflight_error is None:
+                        assert shared_host_weight_groups is not None
+                        if ENABLE_MULTI_DEVICE and not mpi_disabled():
+                            manifest_signature = tuple(
+                                (group.group_id, group.keys)
+                                for group in shared_host_weight_groups)
+                            manifest_signatures = mpi_comm().allgather(
+                                manifest_signature)
+                            if any(signature != manifest_signatures[0]
+                                   for signature in manifest_signatures[1:]):
+                                shared_host_preflight_error = (
+                                    "incremental weight-group manifests must "
+                                    "match across all MPI ranks")
+
+            def resolve_policy(plan: WeightLoadPlan):
+                return self._resolve_weight_load_policy(
+                    plan,
+                    model,
+                    mapping,
+                    checkpoint_format=checkpoint_format,
+                    uses_custom_weight_mapper=kwargs.get(
+                        "_uses_custom_weight_mapper", False),
+                    load_format=load_format,
+                    coordination_error=coordination_error,
+                    supports_weight_stream=defer_direct_read_ahead,
+                    model_supports_partial_loading=(
+                        model_supports_partial_loading),
+                    weight_mapper=weight_mapper,
+                    shared_host_weight_groups=shared_host_weight_groups,
+                    shared_host_preflight_error=(shared_host_preflight_error))
+
+            policy, skipped = resolve_policy(weight_load_plan)
+            if policy == WeightLoadPolicy.SHARED_HOST_PRODUCER:
+                assert shared_host_preflight is not None
+                assert shared_host_weight_groups is not None
+                node_communicator = self._get_active_node_communicator()
+                try:
+                    from tensorrt_llm._torch.models.checkpoints.hf.shared_host_stream import \
+                        open_shared_host_weight_stream
+
+                    world_communicator = (mpi_comm() if ENABLE_MULTI_DEVICE
+                                          and not mpi_disabled() else None)
+                    stream = open_shared_host_weight_stream(
+                        shared_host_preflight,
+                        node_communicator,
+                        world_communicator,
+                        group_manifest=shared_host_weight_groups,
+                        slot_bytes=self._prefetch_chunk_size,
+                        buffer_budget_bytes=(
+                            self._get_shared_host_buffer_budget()),
+                        io_workers=(self._prefetch_workers_per_rank
+                                    or _DEFAULT_PREFETCH_WORKERS_PER_NODE),
+                        strict=len(weight_load_plan) == 1)
+                except BaseException:
+                    if node_communicator is not None:
+                        node_communicator.Free()
+                    raise
+                if stream is not None:
+                    telemetry = stream.telemetry
+                    if self._is_weight_cache_enabled():
+                        logger.warning(
+                            "The HF raw-weight cache is ignored by "
+                            "shared_host_producer because it cannot mirror "
+                            "the incremental collective sequence.")
+                    logger.info(
+                        "Using shared_host_producer bounded SafeTensors "
+                        f"streaming for {type(model).__name__} "
+                        f"(TP={mapping.tp_size}, PP={mapping.pp_size}); slots="
+                        f"{telemetry.slot_count} x "
+                        f"{telemetry.slot_bytes / (1024**2):.0f}MiB "
+                        f"(configured {telemetry.configured_slot_bytes / (1024**2):.0f}MiB), "
+                        f"single-slot atomic groups="
+                        f"{telemetry.groups_fitting_single_slot}/"
+                        f"{telemetry.group_count}, largest group="
+                        f"{telemetry.largest_group_nbytes / (1024**2):.0f}MiB, "
+                        f"all-rank CUDA host registration="
+                        f"{telemetry.all_ranks_host_registered}.")
+                    return stream, _SharedHostStreamSession(
+                        stream, node_communicator)
+
+                if node_communicator is not None:
+                    node_communicator.Free()
+                skipped.append(
+                    (WeightLoadPolicy.SHARED_HOST_PRODUCER,
+                     "the shared-host transport is unavailable on this host"))
+                shared_index = weight_load_plan.index(
+                    WeightLoadPolicy.SHARED_HOST_PRODUCER)
+                remaining_plan = weight_load_plan[shared_index + 1:]
+                policy, additionally_skipped = resolve_policy(remaining_plan)
+                skipped.extend(additionally_skipped)
+
             if skipped and checkpoint_format == "HF":
                 skipped_details = "; ".join(
                     f"{skipped_policy.value}: {reason}"
@@ -661,13 +1069,13 @@ class HfWeightLoader(BaseWeightLoader):
                     f"Resolved weight-load policy to {policy.value}; skipped "
                     f"{skipped_details}.")
             if policy in (WeightLoadPolicy.DIRECT_RANK_READ,
-                          WeightLoadPolicy.SHARED_HOST_PRODUCER):
+                          WeightLoadPolicy.SINGLE_PRODUCER_PAGE_CACHE_PREFETCH):
                 if self._is_weight_cache_enabled():
                     logger.warning(
                         "The HF raw-weight cache is ignored by cooperative "
                         "SafeTensors policies because it does not yet mirror "
                         "their collective sequence.")
-                model_type = type(kwargs.get("model")).__name__
+                model_type = type(model).__name__
                 logger.info(f"Using {policy.value} SafeTensors loading for "
                             f"{model_type} (TP={mapping.tp_size}, "
                             f"PP={mapping.pp_size}).")
@@ -763,7 +1171,7 @@ class HfWeightLoader(BaseWeightLoader):
             policy: WeightLoadPolicy) -> ConsumableWeightsDict:
         """Prefetch SafeTensors with one selected host I/O assignment."""
         if policy not in (WeightLoadPolicy.DIRECT_RANK_READ,
-                          WeightLoadPolicy.SHARED_HOST_PRODUCER):
+                          WeightLoadPolicy.SINGLE_PRODUCER_PAGE_CACHE_PREFETCH):
             raise ValueError(
                 f"Policy {policy.value} is not a cooperative host policy")
         node_communicator = self._get_active_node_communicator()
@@ -1141,7 +1549,7 @@ class HfWeightLoader(BaseWeightLoader):
             node_communicator)
         if policy == WeightLoadPolicy.DIRECT_RANK_READ:
             return chunks[local_rank::local_size]
-        if policy == WeightLoadPolicy.SHARED_HOST_PRODUCER:
+        if policy == WeightLoadPolicy.SINGLE_PRODUCER_PAGE_CACHE_PREFETCH:
             return chunks if local_rank == 0 else []
         raise ValueError(f"Policy {policy.value} does not assign host reads")
 

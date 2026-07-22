@@ -1462,6 +1462,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
 class TritonFusedMoE(MoE):
 
+    @property
+    def supports_partial_weight_loading(self) -> bool:
+        """Triton MoE currently requires one complete load."""
+        return False
+
     @classmethod
     def can_implement(
         cls,

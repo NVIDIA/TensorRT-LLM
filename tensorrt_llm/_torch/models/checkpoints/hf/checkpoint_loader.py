@@ -9,8 +9,8 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
     BaseConfigLoader
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    BaseWeightLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    BaseWeightLoader, WeightBatchStream)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.config_loader import \
@@ -61,6 +61,8 @@ class HfCheckpointLoader(BaseCheckpointLoader):
             kwargs.pop("_checkpoint_format", None)
             kwargs.pop("_uses_custom_weight_mapper", None)
             kwargs.pop("_load_format", None)
+            kwargs.pop("_weight_mapper", None)
+            kwargs.pop("_model_supports_partial_loading", None)
         return kwargs
 
     def load_weights(self, checkpoint_dir: str, mapping: Mapping,
@@ -70,8 +72,10 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         return super().load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 
     @contextmanager
-    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
-                            **kwargs) -> Iterator[dict[str, Any]]:
+    def open_weight_session(
+            self, checkpoint_dir: str, mapping: Mapping,
+            **kwargs) -> Iterator[dict[str, Any]
+                                  | WeightBatchStream]:
         """Keep native HF read-ahead active during model materialization."""
         if (self.checkpoint_format != "HF"
                 or not isinstance(self.weight_loader, HfWeightLoader) or
@@ -101,6 +105,15 @@ class HfCheckpointLoader(BaseCheckpointLoader):
             # our property setter. It is a supported default, not user input.
             self._uses_custom_weight_mapper = False
         return weight_mapper
+
+    def requires_initialized_mapper_for_session(self) -> bool:
+        """Whether native HF policy preflight needs an initialized mapper."""
+        return (self.checkpoint_format == "HF"
+                and isinstance(self.weight_loader, HfWeightLoader)
+                and type(self).load_weights is HfCheckpointLoader.load_weights
+                and type(self.weight_loader).load_weights
+                is HfWeightLoader.load_weights and
+                self.weight_loader.requires_initialized_mapper_for_session())
 
     def cleanup(self) -> None:
         # Clean up weight mapper first as it may hold model references
