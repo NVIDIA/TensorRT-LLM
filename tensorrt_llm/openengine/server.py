@@ -3,6 +3,8 @@
 
 """Lifecycle wrapper for the optional OpenEngine sibling gRPC server."""
 
+import ipaddress
+
 import grpc
 from openengine.v1 import openengine_pb2_grpc, server_pb2
 
@@ -16,6 +18,7 @@ from ._schema_pin import OPENENGINE_COMMIT
 from .servicer import OpenEngineServicer, schema_release
 
 _MAX_MESSAGE_LENGTH = 256 * 1024 * 1024
+_IPV4_UNSPECIFIED = str(ipaddress.IPv4Address(0))
 
 
 def validate_schema_release(schema_release: str) -> str:
@@ -78,7 +81,7 @@ class OpenEngineServer:
             raise RuntimeError(f"Failed to bind OpenEngine server to {host}:{port}")
         self.port = bound if port == 0 else port
         advertised_host = {
-            "0.0.0.0": "127.0.0.1",
+            _IPV4_UNSPECIFIED: "127.0.0.1",
             "::": "::1",
             "[::]": "::1",
         }.get(host, host)
