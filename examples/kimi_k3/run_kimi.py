@@ -26,7 +26,6 @@ Resolution order for each input:
     input          env var               config key    workspace default
     ------------   -------------------   -----------   -----------------------------------
     checkpoint     KIMI_K3_MODEL_DIR     model_dir     <ws>/goldenprairie-final-weights_vv1
-    opt work       KIMI_K3_OPT_WORK_DIR  opt_work_dir  <ws>/exisiting_optimization_work
     container      IMAGE                 image         sole *.sqsh in <ws>
     JIT/HF cache   KIMI_K3_CACHE_DIR     cache_dir     <repo>/.kimi_k3_cache
 """
@@ -53,9 +52,9 @@ Set up the config file (one-time):
     $EDITOR {CONFIG_PATH}    # point `workspace` at your directory
 
 The workspace directory must contain the HF checkpoint
-(goldenprairie-final-weights_vv1/), the exisiting_optimization_work checkout,
-and the container image (*.sqsh); see the example file for per-input
-overrides and run_kimi.py --help for the full resolution rules."""
+(goldenprairie-final-weights_vv1/) and the container image (*.sqsh); see the
+example file for per-input overrides and run_kimi.py --help for the full
+resolution rules."""
 
 MODES = {
     "sanity": {
@@ -122,9 +121,6 @@ def resolve_inputs() -> dict:
         "KIMI_K3_MODEL_DIR": pick(
             "KIMI_K3_MODEL_DIR", "model_dir",
             lambda w: w / "goldenprairie-final-weights_vv1"),
-        "KIMI_K3_OPT_WORK_DIR": pick(
-            "KIMI_K3_OPT_WORK_DIR", "opt_work_dir",
-            lambda w: w / "exisiting_optimization_work"),
         "IMAGE": pick("IMAGE", "image", infer_image),
         "KIMI_K3_CACHE_DIR": pick(
             "KIMI_K3_CACHE_DIR", "cache_dir", lambda w: None)
@@ -162,17 +158,11 @@ def main() -> int:
 
     # Preflight: every input path must exist before we burn queue time.
     ok = True
-    for key in ("KIMI_K3_OPT_WORK_DIR", "KIMI_K3_MODEL_DIR", "IMAGE"):
+    for key in ("KIMI_K3_MODEL_DIR", "IMAGE"):
         if not Path(env[key]).exists():
             print(f"error: {key}={env[key]} does not exist", file=sys.stderr)
             ok = False
     if not ok:
-        return 1
-    snapshot_data = Path(env["KIMI_K3_OPT_WORK_DIR"]) / "trtllmgen_MOE/flashinfer/data/csrc"
-    if not snapshot_data.exists():
-        print(f"error: {snapshot_data} missing — set up the flashinfer snapshot "
-              "per trtllmgen_MOE/SNAPSHOT_SETUP.md (3rdparty clones + "
-              "flashinfer/data symlinks)", file=sys.stderr)
         return 1
     Path(env["KIMI_K3_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
 

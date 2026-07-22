@@ -24,9 +24,7 @@ Environment (the sbatch launcher sets everything up):
   KIMI_K3_FUSED_MOE            native (default) = in-tree TRTLLM-Gen SiTU
                                fused MoE (mxe4m3_mxe2m1_block_scale_moe_runner,
                                no external cubin env needed);
-                               1 = legacy private flashinfer SiTU MXFP4 fused
-                               MoE (snapshot env + FLASHINFER_PRIVATE_CUBIN_DIR
-                               required); 0 = slow reference dequant loop
+                               0 = slow reference dequant loop
   KIMI_K3_NUM_LAYERS_OVERRIDE  truncate to first N layers (debug; skips
                                output-quality assertions)
 Exit code 0 = PASS, 1 = FAIL.

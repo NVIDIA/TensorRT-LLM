@@ -20,7 +20,6 @@ workspace = /path/to/your/goldenprairie
 # Explicit per-input overrides — uncomment any that deviate from the
 # workspace layout above. Environment variable equivalents in parentheses.
 #model_dir = /path/to/goldenprairie-final-weights_vv1        (KIMI_K3_MODEL_DIR)
-#opt_work_dir = /path/to/exisiting_optimization_work         (KIMI_K3_OPT_WORK_DIR)
 #image = /path/to/trtllm-pytorch-26.05-...sbsa...sqsh        (IMAGE)
 
 # FlashInfer JIT / HF cache location; created if missing.

@@ -115,13 +115,57 @@ def _is_mla_layer(cfg, layer_idx: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
+"""Set to ``1`` to route attn_res through the in-tree fused Torch op
+``trtllm::attn_res_fwd`` (Blackwell only). Default: pure-torch fp32 path."""
+
+_FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "0") == "1"
+
+
+def _apply_attn_res_fused(prefix_sum: torch.Tensor,
+                          block_residual: torch.Tensor, proj: nn.Linear,
+                          norm: KimiK3RMSNorm) -> Optional[torch.Tensor]:
+    """Fused attn_res via the in-tree ``trtllm::attn_res_fwd`` op.
+
+    Returns ``None`` when the call falls outside the fused kernel's
+    contract (dtype/shape/arch) so the caller can use the exact fp32
+    reference instead. Candidate order matches the reference: snapshots
+    first, the running prefix sum last.
+    """
+    if prefix_sum.dtype is not torch.bfloat16:
+        return None
+    M, H = prefix_sum.shape
+    K = int(block_residual.shape[1])
+    if K + 1 > 12 or M > 16384 or not (4096 <= H <= 8192 and H % 1024 == 0):
+        return None
+    try:
+        attn_res_op = torch.ops.trtllm.attn_res_fwd
+    except (AttributeError, RuntimeError):
+        return None
+    layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
+    block_kernel = block_residual.transpose(0, 1).reshape(K, M, 1,
+                                                          H).contiguous()
+    output, _rsigma, _probs, _logits = attn_res_op(
+        layer_kernel, block_kernel,
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(), float(norm.eps))
+    return output.reshape(M, H)
+
+
 def _apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor,
                     proj: nn.Linear, norm: KimiK3RMSNorm) -> torch.Tensor:
     """Exact port of HF ``modeling_kimi._apply_attn_res`` (fp32 math).
 
     prefix_sum:     ``[num_tokens, hidden_size]``
     block_residual: ``[num_tokens, num_snapshots, hidden_size]``
+
+    When ``KIMI_K3_FUSED_ATTN_RES=1`` and the inputs fit the fused kernel's
+    contract, dispatches to the in-tree ``trtllm::attn_res_fwd`` op instead.
     """
+    if _FUSED_ATTN_RES_ENABLED:
+        fused = _apply_attn_res_fused(prefix_sum, block_residual, proj, norm)
+        if fused is not None:
+            return fused
     v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     v_float = v.float()
     variance = v_float.pow(2).mean(-1, keepdim=True)
@@ -242,24 +286,19 @@ class KimiK3MoERuntime(nn.Module):
 
         # Fused SiTU MoE paths. KIMI_K3_FUSED_MOE selects the backend:
         #   "0" (default) — Python per-expert fallback;
-        #   "1"           — private flashinfer MXFP4 cubins (W4A16, requires the
-        #                   snapshot flashinfer env, see
-        #                   kimi_k3_moe/_fused_situ_backend.py);
         #   "native"      — in-tree TRTLLM-Gen SiTU op (W4A8 MXFP4xMXFP8,
         #                   torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner;
         #                   no external cubin env needed, SM100/SM103 only).
-        # In both fused modes the kernel-layout weights are prepared lazily on
+        # In the fused mode the kernel-layout weights are prepared lazily on
         # the first forward (after load_weights has populated the bank); the
         # bank's packed buffers are freed afterwards to avoid holding the
         # expert slice twice.
         import os as _os
         _fused_mode = _os.environ.get("KIMI_K3_FUSED_MOE", "0")
-        self.use_fused_moe = _fused_mode == "1"
         self.use_native_fused_moe = _fused_mode == "native"
         self._situ_alpha = float(situ_beta)
         self._situ_linear_beta = float(situ_linear_beta
                                        if situ_linear_beta is not None else 1.0)
-        self._fused_weights = None
         self._native_fused_weights = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -279,27 +318,6 @@ class KimiK3MoERuntime(nn.Module):
         # Shared experts are replicated: computed once per rank, added after
         # the allreduce so they are not double counted.
         return y + self.shared_experts(identity)
-
-    def _ensure_fused_weights(self) -> None:
-        """Lazily shuffle the bank's MXFP4 buffers into kernel layout."""
-        if self._fused_weights is not None:
-            return
-        from ..modules.kimi_k3_moe._fused_situ_backend import \
-            prepare_fused_situ_weights
-        bank = self.expert_bank
-        self._fused_weights = prepare_fused_situ_weights(
-            bank.w1_packed, bank.w1_scales, bank.w3_packed, bank.w3_scales,
-            bank.w2_packed, bank.w2_scales)
-        logger.info(
-            f"[KimiK3MoERuntime] layer {self.layer_idx}: prepared fused SiTU "
-            f"weights for {self._fused_weights.num_local_experts} local "
-            f"experts (offset {self.expert_lo})")
-        # Free the (now redundant) bank copies of the expert slice.
-        empty = torch.empty(0, dtype=torch.uint8,
-                            device=bank.w1_packed.device)
-        for name in ("w1_packed", "w1_scales", "w3_packed", "w3_scales",
-                     "w2_packed", "w2_scales"):
-            bank.register_buffer(name, empty.clone())
 
     def _ensure_native_fused_weights(self) -> None:
         """Lazily pack the bank's MXFP4 buffers for the in-tree SiTU op."""
@@ -370,23 +388,6 @@ class KimiK3MoERuntime(nn.Module):
                 valid_intermediate_size=self.expert_bank.intermediate_size,
                 local_expert_offset=self.expert_lo,
                 local_num_experts=self.experts_per_rank,
-            )
-        if self.use_fused_moe:
-            if x.shape[0] == 0:
-                return torch.zeros_like(x)
-            from ..modules.kimi_k3_moe._fused_situ_backend import \
-                fused_situ_moe_forward
-            self._ensure_fused_weights()
-            return fused_situ_moe_forward(
-                x,
-                topk_ids.to(torch.int32),
-                topk_weight,
-                self._fused_weights,
-                num_experts=self.num_experts,
-                top_k=self.top_k,
-                local_expert_offset=self.expert_lo,
-                situ_alpha=self._situ_alpha,
-                situ_linear_beta=self._situ_linear_beta,
             )
         cnts = topk_ids.new_zeros((topk_ids.shape[0], self.num_experts))
         cnts.scatter_(1, topk_ids, 1)

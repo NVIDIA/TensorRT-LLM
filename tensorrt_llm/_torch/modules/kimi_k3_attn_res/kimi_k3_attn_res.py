@@ -50,13 +50,9 @@ import torch
 from torch import nn
 
 from ._attn_res_kernels import (
-    KIMI_K3_ATTN_RES_CUTLASS_ENV,
-    KIMI_K3_ATTN_RES_EXT_SO_ENV,
-    KIMI_K3_ATTN_RES_OPTIMIZED_KERNEL_ENV,
+    intree_attn_res_fwd,
     is_attn_res_optimized_supported,
-    load_extension,
-    optimized_extension_source,
-    resolve_optimization_root,
+    is_intree_attn_res_available,
 )
 
 
@@ -220,8 +216,11 @@ class KimiK3AttnResidualOp(nn.Module):
         self.rms_weight = nn.Parameter(torch.ones(self.hidden_size))
         self.proj_weight = nn.Parameter(torch.zeros(1, self.hidden_size))
 
-        root = resolve_optimization_root()
-        if force_use_fallback_kernel or root is None or not is_attn_res_optimized_supported():
+        if (
+            force_use_fallback_kernel
+            or not is_attn_res_optimized_supported()
+            or not is_intree_attn_res_available()
+        ):
             self.kernel_path = KimiK3AttnResidualKernelPath.REFERENCE
         else:
             self.kernel_path = KimiK3AttnResidualKernelPath.OPTIMIZED
@@ -298,24 +297,13 @@ class KimiK3AttnResidualOp(nn.Module):
     def _attn_res_fwd_optimized(
         self, inputs: _AttnResFwdInputs
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        T, B, H, K = self._validate_inputs(inputs)
-        if self._optimized_extension is None:
-            self._optimized_extension = load_extension(verbose=False)
-        N = K + 1
-        output = torch.empty_like(inputs.layer_residual)
-        rsigma = torch.empty((N, T, B), device=inputs.layer_residual.device, dtype=torch.float32)
-        probs = torch.empty_like(rsigma)
-        logits = torch.empty_like(rsigma)
-        self._optimized_extension.attn_res_fwd_cuda(
+        self._validate_inputs(inputs)
+        output, rsigma, probs, _logits = intree_attn_res_fwd(
             inputs.layer_residual,
             inputs.block_residual,
-            inputs.res_weight.contiguous(),
-            inputs.rms_weight.contiguous(),
-            output,
-            rsigma,
-            probs,
-            logits,
-            float(self.variance_epsilon),
+            inputs.res_weight,
+            inputs.rms_weight,
+            self.variance_epsilon,
         )
         return output, rsigma, probs
 
@@ -407,21 +395,10 @@ class KimiK3AttnResidualOp(nn.Module):
     def kernel_source(self) -> str:
         """Return a stable string describing the kernel path in use."""
         if self.kernel_path == KimiK3AttnResidualKernelPath.OPTIMIZED:
-            if self._optimized_extension is None:
-                self._optimized_extension = load_extension(verbose=False)
-            return optimized_extension_source() or "<attn_res_fwd_ext>"
+            return "<trtllm::attn_res_fwd>"
         return "<reference:attn_res_fwd_chunked_reference>"
 
     def precompile(self, verbose: bool = False) -> None:
-        """Warm the JIT extension so the first parity call is not dominated by build time."""
-        if self.kernel_path == KimiK3AttnResidualKernelPath.OPTIMIZED:
-            self._optimized_extension = load_extension(verbose=verbose)
+        """No-op: the in-tree ``trtllm::attn_res_fwd`` op is pre-compiled."""
+        del verbose
 
-    @staticmethod
-    def env_variables() -> dict:
-        """Return the env variables this module honours (for logging)."""
-        return {
-            "KIMI_K3_ATTN_RES_OPTIMIZED_KERNEL_DIR": KIMI_K3_ATTN_RES_OPTIMIZED_KERNEL_ENV,
-            "KIMI_K3_ATTN_RES_CUTLASS_DIR": KIMI_K3_ATTN_RES_CUTLASS_ENV,
-            "KIMI_K3_ATTN_RES_EXT_SO": KIMI_K3_ATTN_RES_EXT_SO_ENV,
-        }
