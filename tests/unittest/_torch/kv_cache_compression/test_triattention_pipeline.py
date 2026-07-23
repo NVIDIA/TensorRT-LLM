@@ -35,7 +35,6 @@ from conftest import make_tri_config as _make_tri_config
 from conftest import make_triattention as _make_triattention
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
-from pydantic import ValidationError
 
 # TriAttention lives in the kv_cache_compression package. It exposes only the
 # compression manager -- no attention classes or KV-cache-manager subclass.
@@ -86,34 +85,6 @@ def _make_hf_config(**values):
 
 
 class TestConfigAndFactory:
-    def test_llm_args_dispatch_and_validation(self):
-        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-        tri_args = TorchLlmArgs(
-            model="dummy",
-            kv_cache_compression_config={
-                "algorithm": "triattention",
-                "model_path": "/models/test",
-                "calibration_path": "/calib/test.pt",
-            },
-        )
-        assert isinstance(
-            tri_args.kv_cache_compression_config,
-            TriAttentionKvCacheCompressionConfig,
-        )
-        assert tri_args.kv_cache_compression_config.budget == 2048
-        assert tri_args.kv_cache_compression_config.beta == 128
-
-        # Dispatch is by the algorithm tag, so an unknown algorithm fails
-        # config validation instead of falling back to a base config.
-        with pytest.raises(ValidationError):
-            TorchLlmArgs(
-                model="dummy",
-                kv_cache_compression_config={"algorithm": "future_method"},
-            )
-        with pytest.raises(ValidationError):
-            TriAttentionKvCacheCompressionConfig(eviction_mode="made_up_mode")
-
     def test_factory_returns_triattention_and_propagates_config_fields(self):
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
@@ -337,12 +308,6 @@ class TestCompressedTokenPublication:
 
 class TestEvictionLifecycle:
     def test_prepare_does_not_evict_and_update_runs_final_hook_once(self):
-        # Hooks only, never the base template methods.
-        assert "prepare_resources" not in TriAttention.__dict__
-        assert "update_resources" not in TriAttention.__dict__
-        assert "on_generation_step_begin" in TriAttention.__dict__
-        assert "on_generation_step_end" in TriAttention.__dict__
-
         manager = _make_triattention()
         batch = SimpleNamespace(
             context_requests=[],

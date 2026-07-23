@@ -204,8 +204,8 @@ def test_unsupported_geometry_raises_at_buffer_construction():
         for _ in range(num_layers)
     ]
     calib = torch.randn(num_layers, 2, num_freqs, device=device)
-    # No rewrap: the runner's own contract error surfaces directly (the
-    # fp32 pools trip the BF16 gate first, at TMA descriptor encoding).
+    # No rewrap: the buffer build's own contract error surfaces directly
+    # (the fp32 pools trip the BF16 gate first, at TMA descriptor encoding).
     with pytest.raises(TypeError, match="BF16"):
         _make_cute_buffers(
             eviction_mode="per_head",
