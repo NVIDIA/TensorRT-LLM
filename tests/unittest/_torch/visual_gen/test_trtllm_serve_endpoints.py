@@ -77,10 +77,10 @@ def _make_dummy_audio_tensor(length: int = 16000) -> torch.Tensor:
     return torch.randn(1, length, dtype=torch.float32)
 
 
-def _b64_white_png_1x1() -> str:
-    """Return a base64-encoded 1x1 white PNG for image edit tests."""
+def _b64_white_png(width: int = 64, height: int = 64) -> str:
+    """Return a base64-encoded white PNG for image edit tests."""
     buf = BytesIO()
-    Image.new("RGB", (1, 1), (255, 255, 255)).save(buf, format="PNG")
+    Image.new("RGB", (width, height), (255, 255, 255)).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
@@ -130,6 +130,7 @@ class MockVisualGen:
         should_fail: bool = False,
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
+        supports_image_edit: bool = True,
     ):
         from types import SimpleNamespace
 
@@ -168,6 +169,7 @@ class MockVisualGen:
             extra_param_specs={
                 "stg_scale": ExtraParamSchema(type="float", default=1.0),
             },
+            supports_image_edit=supports_image_edit,
         )
 
     def _maybe_batch(self, tensor, n):
@@ -457,7 +459,7 @@ class TestImageGeneration:
             "/v1/images/generations",
             json={
                 "prompt": "Reference-conditioned request",
-                "input_reference": _b64_white_png_1x1(),
+                "input_reference": _b64_white_png(),
             },
         )
         assert resp.status_code == 422
@@ -696,7 +698,7 @@ class TestImageEdit:
     """Multipart reference images are forwarded through the edits endpoint."""
 
     def test_image_edit_forwards_single_image(self, image_client):
-        reference = base64.b64decode(_b64_white_png_1x1())
+        reference = base64.b64decode(_b64_white_png())
         resp = image_client.post(
             "/v1/images/edits",
             files={"image": ("reference.png", reference, "image/png")},
@@ -714,8 +716,8 @@ class TestImageEdit:
     @pytest.mark.parametrize("field_name", ["image", "image[]"])
     def test_image_edit_forwards_multiple_images(self, image_client, field_name):
         references = [
-            base64.b64decode(_b64_white_png_1x1()),
-            base64.b64decode(_b64_white_png_1x1()),
+            base64.b64decode(_b64_white_png()),
+            base64.b64decode(_b64_white_png()),
         ]
         resp = image_client.post(
             "/v1/images/edits",
@@ -746,7 +748,7 @@ class TestImageEdit:
         _assert_llm_envelope(resp.json(), code=422, message_contains="Field 'image'")
 
     def test_image_edit_rejects_too_many_images(self, image_client):
-        reference = base64.b64decode(_b64_white_png_1x1())
+        reference = base64.b64decode(_b64_white_png())
         resp = image_client.post(
             "/v1/images/edits",
             files=[
@@ -756,6 +758,88 @@ class TestImageEdit:
         )
         assert resp.status_code == 422
         _assert_llm_envelope(resp.json(), code=422, message_contains="At most 10")
+
+    def test_image_edit_rejects_unsupported_pipeline(self, tmp_path):
+        gen = MockVisualGen(
+            image_output=_make_dummy_image_tensor(),
+            supports_image_edit=False,
+        )
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/images/edits",
+                files={
+                    "image": (
+                        "reference.png",
+                        base64.b64decode(_b64_white_png()),
+                        "image/png",
+                    )
+                },
+                data={"prompt": "Edit this"},
+            )
+            assert resp.status_code == 501
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    @pytest.mark.parametrize(
+        ("reference", "message"),
+        [
+            (b"not an image", "valid encoded image"),
+            (base64.b64decode(_b64_white_png(32, 64)), "too small"),
+            (base64.b64decode(_b64_white_png(576, 64)), "aspect ratio"),
+        ],
+    )
+    def test_image_edit_rejects_invalid_reference(
+        self,
+        image_client,
+        reference,
+        message,
+    ):
+        resp = image_client.post(
+            "/v1/images/edits",
+            files={"image": ("reference.png", reference, "image/png")},
+            data={"prompt": "Edit this"},
+        )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains=message)
+
+    def test_image_edit_rejects_decompression_bomb(self, image_client):
+        with patch(
+            "tensorrt_llm.serve.openai_server.PIL.Image.open",
+            side_effect=Image.DecompressionBombError("too many pixels"),
+        ):
+            resp = image_client.post(
+                "/v1/images/edits",
+                files={
+                    "image": (
+                        "reference.png",
+                        base64.b64decode(_b64_white_png()),
+                        "image/png",
+                    )
+                },
+                data={"prompt": "Edit this"},
+            )
+        assert resp.status_code == 422
+        _assert_llm_envelope(resp.json(), code=422, message_contains="valid encoded image")
+
+    def test_image_edit_auto_size_uses_reference_dimensions(self, tmp_path):
+        reference = base64.b64decode(_b64_white_png(80, 64))
+        gen = MockVisualGen(image_output=_make_dummy_image_tensor(64, 80))
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        try:
+            client = _create_server(gen)
+            resp = client.post(
+                "/v1/images/edits",
+                files={"image": ("reference.png", reference, "image/png")},
+                data={"prompt": "Edit this"},
+            )
+            assert resp.status_code == 200
+            assert gen.last_params.width is None
+            assert gen.last_params.height is None
+            assert resp.json()["size"] == "80x64"
+        finally:
+            os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
 
 # =========================================================================
