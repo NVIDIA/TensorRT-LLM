@@ -1,7 +1,7 @@
-max_batch_size: 32
+max_batch_size: 64
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 32
+  max_batch_size: 64
 enable_attention_dp: true
 print_iter_log: true
 kv_cache_config:
@@ -17,8 +17,8 @@ attention_dp_config:
 speculative_config:
   decoding_type: MTP
   max_draft_len: 1
-tensor_parallel_size: 8
-moe_expert_parallel_size: 8
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
 trust_remote_code: true
-max_num_tokens: 8320
+max_num_tokens: 8384
 max_seq_len: 9472
