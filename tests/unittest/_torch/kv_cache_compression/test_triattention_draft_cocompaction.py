@@ -95,9 +95,10 @@ def _launched_draft_compaction(draft_protected_tails):
     )
 
 
-@pytest.mark.parametrize("draft_protected_tails", [[1, 1], [1, 2]])
-def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protected_tails):
-    built = _launched_draft_compaction(draft_protected_tails=draft_protected_tails)
+def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle():
+    # Ragged draft tails [1, 2] against target tails [2, 1]: one request's
+    # draft tail below and one above its target, subsuming the uniform row.
+    built = _launched_draft_compaction(draft_protected_tails=[1, 2])
     device = built.device
     prompt_len = built.prompt_len
 

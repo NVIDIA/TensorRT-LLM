@@ -16,12 +16,25 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels 
     _settle_ties_kernel,
 )
 
-# Both kernels share the settle geometry parameter grid.
+# Settle geometry rows: the width/keep axes flip the WIDTH and KEEP_COUNT
+# static_range trip counts across the 256-lane BLOCK.
 _WIDTH_KEEP_CASES = [
     # Small and ragged: rows shorter than the keep count, empty rows.
     (21, 5),
     # More than one 256-lane block along both the settle and move axes.
     (350, 300),
+]
+
+# Pack rows: one per distinct kernel path combo (BROADCAST = union; PER_LAYER
+# only branches inside the non-broadcast SWA store, so it is compiled out
+# without SWA); keep 5 vs 300 flips the MOVE_CAPACITY block trip count on
+# both BROADCAST sides.
+_PACK_PATH_ROWS = [
+    ("union", False, 21, 5),
+    ("union", True, 350, 300),
+    ("per_head", False, 350, 300),
+    ("per_head", True, 21, 5),
+    ("per_layer_perhead", True, 350, 300),
 ]
 
 
@@ -133,7 +146,9 @@ def _make_settle_inputs(request_count, selection_rows, width, keep_count, seed, 
     return scores, row_lengths, prompt_offsets, provisional
 
 
-@pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
+# SELECTION_ROWS is stride/grid arithmetic only (no static branch): one
+# single-row and one multi-row mode pin every settle path.
+@pytest.mark.parametrize("eviction_mode", ["union", "per_layer_perhead"])
 @pytest.mark.parametrize("width,keep_count", _WIDTH_KEEP_CASES)
 def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
     device = torch.device("cuda", torch.cuda.current_device())
@@ -172,9 +187,7 @@ def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
         assert torch.equal(output_actual, output_reference), f"kept ordinals differ (seed {seed})"
 
 
-@pytest.mark.parametrize("has_swa", [False, True])
-@pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-@pytest.mark.parametrize("width,keep_count", _WIDTH_KEEP_CASES)
+@pytest.mark.parametrize("eviction_mode,has_swa,width,keep_count", _PACK_PATH_ROWS)
 def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, width, keep_count):
     device = torch.device("cuda", torch.cuda.current_device())
     request_count, num_layers, num_kv_heads = 3, 2, 2

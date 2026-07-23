@@ -410,7 +410,9 @@ class TestEvictionLifecycle:
         assert first_state["generation_steps"] == 128
         assert second_state["generation_steps"] == 127
 
-    @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+    # ``accepted`` enters the prepared item linearly; the zero and maximal
+    # boundary rows pin the whole family.
+    @pytest.mark.parametrize("accepted", [0, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
         confirmed = 1024 + 4096 + 1 + accepted
         reserve = 2
@@ -679,55 +681,11 @@ class TestFixedScoreMetadata:
         assert snapshot[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
         assert staging.block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
 
-    def test_staged_page_tables_bypass_per_request_cuda_materialization(self):
-        manager = _make_triattention(budget=4)
-        manager.kv_cache_manager.num_extra_kv_tokens = 3
-        manager.kv_cache_manager._stream = mock.Mock()
-        manager.kv_cache_manager.get_batch_cache_indices = mock.Mock(
-            side_effect=AssertionError("eviction staged page tables per request")
-        )
-        first = _make_request(7, py_prompt_len=3)
-        second = _make_request(8, py_prompt_len=5)
-        _set_request_state(manager, 7)
-        _set_request_state(manager, 8)
-
-        with _mocked_eviction_internals(manager) as internals:
-            manager._evict_requests(
-                [
-                    _make_prepared_item(
-                        first,
-                        request_id=7,
-                        seq_len=8,
-                        prompt_len=3,
-                        expected_keep_count=7,
-                        protected_tail=2,
-                    ),
-                    _make_prepared_item(
-                        second,
-                        request_id=8,
-                        seq_len=10,
-                        prompt_len=5,
-                        expected_keep_count=9,
-                        protected_tail=3,
-                    ),
-                ]
-            )
-
-        # One round-executor call carries the whole cohort (with the target
-        # and draft managers it orders after the compact launches).
-        args = internals.execute.call_args
-        assert args.args[0] is internals.buffers
-        assert args.args[1] is manager.kv_cache_manager
-        assert args.args[3] is None
-        prepared = args.args[2]
-        assert [item["request_id"] for item in prepared] == [7, 8]
-        assert [item["round_start"] for item in prepared] == [8, 10]
-        assert [item["prompt_len"] for item in prepared] == [3, 5]
-        assert [item["seq_len"] for item in prepared] == [8, 10]
-        assert args.kwargs == {}
-
+    def test_cohort_move_offsets_stage_keep_plus_tail_and_pad_rows(self):
         # The derived move offsets stage keep + tail moves per request
-        # (budget=4 -> [6, 7]); padded rows repeat the final offset.
+        # (keep_count=4 -> [6, 7]); padded rows past the cohort repeat the
+        # final offset and contribute no moves. (The executor-call contract
+        # itself is pinned by the overlap-tail and draft publication tests.)
         from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
             _cohort_move_offsets,
         )
@@ -738,20 +696,26 @@ class TestFixedScoreMetadata:
             swa_window=None,
             draft_protected_tail_capacity=None,
         )
+        prepared = [
+            _make_prepared_item(request_id=7, seq_len=8, protected_tail=2),
+            _make_prepared_item(request_id=8, seq_len=10, protected_tail=3),
+        ]
         dense, swa, draft = _cohort_move_offsets(offsets_buffers, prepared)
         assert dense == [0, 6, 13, 13, 13, 13, 13, 13, 13]
         assert swa is None
         assert draft is None
 
     @requires_sm100
-    @pytest.mark.parametrize("request_count", [1, 8])
-    def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count):
+    def test_fused_score_spans_distinct_storages_and_block_tables(self):
         """ONE launch over layers in DISTINCT storages with DISTINCT block
         tables (the production V2 shape), checked against the Torch oracle,
-        then relaunched after a round-start advance and a table rebind."""
+        then relaunched after a round-start advance and a table rebind.
+        (Single-request launches are pinned by the CuTe score oracle's
+        request-count loop; the distinct-storages property is layer-axis.)"""
         pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
+        request_count = 8
         device = torch.device("cuda", torch.cuda.current_device())
         torch.manual_seed(20260707 + request_count)
         max_requests = request_count

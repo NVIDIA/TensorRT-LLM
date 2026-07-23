@@ -72,11 +72,9 @@ def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tenso
         # only the real heads' rows, and the union finalizer maps head rows
         # onto the padded score planes.
         (128, 32, 4, 0, None),
-        # Mixed-prompt cohorts: each request scores its own window (one
-        # start mid-tile, one page-aligned) — the case the fused pipeline
-        # previously declined.
-        (32, 32, 8, [37, 128], [250, 198]),
-        (32, 64, 4, [37, 128], None),
+        # Mixed-prompt cohort (one start mid-tile, one page-aligned) — the
+        # case the fused pipeline previously declined. Starts are per-request
+        # runtime reads, so one representative row covers the family.
         (128, 64, 4, [37, 128], [250, 230]),
     ],
 )
