@@ -18,6 +18,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
@@ -180,6 +181,11 @@ def prepare_sparse_attn_outputs(
         num_contexts = attn_metadata.num_contexts
         num_generations = attn_metadata.num_generations
         if self._disable_dsv4_epilogue_fusion:
+            return False
+        # BCG eager breaks replay with dynamic, unpadded attention metadata,
+        # while captured segment tensors use static bucket shapes. The fused
+        # epilogue buffers cannot safely bridge that shape boundary.
+        if is_in_breakable_cuda_graph():
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
