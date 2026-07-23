@@ -1921,7 +1921,8 @@ class TriAttention(BaseKVCacheCompressionManager):
         ``calibration_path``; we only run inference. Both the official R-KV layout
         (``{metadata, stats{"layerLL_headHH": {q_mean_real, q_mean_imag,
         q_abs_mean}}}``) and our already-converted flat layout are accepted -- the
-        official one is converted here."""
+        official one is converted here. Calibration resolves lazily on the
+        first request (``on_request_init``), not at manager construction."""
         if self.calibration_path is None:
             raise ValueError(
                 "TriAttention requires `calibration_path`: a calibration .pt from "
