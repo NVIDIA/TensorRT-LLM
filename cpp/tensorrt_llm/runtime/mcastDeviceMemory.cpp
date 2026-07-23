@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime_api.h>
+#include <exception>
 
 namespace tensorrt_llm::runtime
 {
@@ -35,6 +36,37 @@ namespace
 inline size_t roundUp(size_t val, size_t gran)
 {
     return (val + gran - 1) & ~(gran - 1);
+}
+
+template <typename Cleanup>
+void cleanupNoThrow(char const* resource, Cleanup cleanup) noexcept
+{
+    try
+    {
+        cleanup();
+    }
+    catch (std::exception const& error)
+    {
+        try
+        {
+            TLLM_LOG_WARNING("Failed to release %s during McastDeviceMemory destruction: %s", resource, error.what());
+        }
+        catch (...)
+        {
+            // Logging must not make destruction terminate during static teardown.
+        }
+    }
+    catch (...)
+    {
+        try
+        {
+            TLLM_LOG_WARNING("Failed to release %s during McastDeviceMemory destruction", resource);
+        }
+        catch (...)
+        {
+            // Logging must not make destruction terminate during static teardown.
+        }
+    }
 }
 } // namespace
 
@@ -124,37 +156,40 @@ void McastDeviceMemory::initializePointerTables()
     TLLM_CUDA_CHECK(cudaMemcpy(mUcPtrsDev, mUcPtrs.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
 }
 
-McastDeviceMemory::~McastDeviceMemory()
+McastDeviceMemory::~McastDeviceMemory() noexcept
 {
-    tensorrt_llm::common::unregisterMcastDevMemBuffer(this);
+    cleanupNoThrow(
+        "multicast buffer registration", [this]() { tensorrt_llm::common::unregisterMcastDevMemBuffer(this); });
     if (mIsMNNvlink)
     {
         if (mMapped)
         {
-            releaseMnMcastMem();
+            cleanupNoThrow("MNNVL mappings", [this]() { releaseMnMcastMem(); });
         }
         if (mUcBasePtr != 0)
         {
-            TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mUcBasePtr, mAllocationSize * mGroupSize));
+            cleanupNoThrow("unicast virtual address reservation",
+                [this]() { TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mUcBasePtr, mAllocationSize * mGroupSize)); });
         }
         if (mMcPtr != 0)
         {
-            TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mMcPtr, mAllocationSize));
+            cleanupNoThrow("multicast virtual address reservation",
+                [this]() { TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(mMcPtr, mAllocationSize)); });
         }
     }
     else
     {
         // The nvlsfree function will free the handle pointer as well
-        tensorrt_llm::runtime::ipcNvlsFree(mNvlsHandle);
+        cleanupNoThrow("NVLS multicast memory", [this]() { tensorrt_llm::runtime::ipcNvlsFree(mNvlsHandle); });
     }
 
     if (mSignalPadsDev != nullptr)
     {
-        TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev));
+        cleanupNoThrow("signal-pad pointer table", [this]() { TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev)); });
     }
     if (mUcPtrsDev != nullptr)
     {
-        TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev));
+        cleanupNoThrow("unicast pointer table", [this]() { TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev)); });
     }
 }
 

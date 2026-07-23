@@ -53,6 +53,7 @@ class _FakeMcastBuffer:
 
 def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None:
     mapping = object()
+    stale_comm = _FakeComm()
     comm = _FakeComm()
     handle = _FakeMcastBuffer()
     with torch.inference_mode():
@@ -63,7 +64,7 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
         "uc_buffer": uc_buffer,
         "buffer_flags": buffer_flags,
         "buffer_size_bytes": 1024,
-        "mpi_comm": comm,
+        "mpi_comm": stale_comm,
     }
     allreduce = object.__new__(MNNVLAllReduce)
     torch.nn.Module.__init__(allreduce)
@@ -79,6 +80,8 @@ def test_checkpoint_restore_resets_inference_protocol_state(monkeypatch) -> None
     allreduce.checkpoint_restore(comm)
     allreduce.checkpoint_restore(comm)
 
+    assert workspace["mpi_comm"] is comm
+    assert stale_comm.barrier_count == 0
     assert handle.prepare_count == 1
     assert handle.restore_count == 1
     assert comm.barrier_count == 1

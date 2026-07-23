@@ -16,7 +16,7 @@ import math
 import os
 import platform
 import threading
-from typing import Dict, List, Optional, Protocol, Tuple, Union
+from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
@@ -58,6 +58,14 @@ class _MpiCommProtocol(Protocol):
         ...
 
 
+class _MnnvlWorkspace(TypedDict):
+    handle: McastGPUBuffer
+    uc_buffer: torch.Tensor
+    buffer_flags: torch.Tensor
+    buffer_size_bytes: int
+    mpi_comm: _MpiCommProtocol
+
+
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
         setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
@@ -90,7 +98,7 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
-def _initialize_allreduce_mnnvl_protocol(workspace: Dict) -> None:
+def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace) -> None:
     """Reset Lamport buffers and control flags after allocation or restore."""
     buffer_size_bytes = workspace["buffer_size_bytes"]
     num_bytes_to_clear = [0] * 4
@@ -109,10 +117,9 @@ def _initialize_allreduce_mnnvl_protocol(workspace: Dict) -> None:
 
 
 def get_or_scale_allreduce_mnnvl_workspace(
-    mapping: Mapping,
-    dtype: torch.dtype,
-    buffer_size_bytes: Optional[int] = None
-) -> Tuple[McastGPUBuffer, torch.Tensor, torch.Tensor, int]:
+        mapping: Mapping,
+        dtype: torch.dtype,
+        buffer_size_bytes: Optional[int] = None) -> _MnnvlWorkspace:
     """
     WORKSPACE is a entire memory allocation used for allreduce, while BUFFER refers to single lamport buffer.
     Each WORKSPACE contains NUM_LAMPORT_BUFFERS buffers.
@@ -573,7 +580,7 @@ class MNNVLAllReduce(nn.Module):
     fast path that keeps the local value in registers and volatile-loads only peers
     from the Lamport buffer. Larger world sizes use a compact deterministic fallback.
     """
-    allreduce_mnnvl_workspaces: Dict[Mapping, Dict] = {}
+    allreduce_mnnvl_workspaces: dict[Mapping, _MnnvlWorkspace] = {}
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -642,6 +649,9 @@ class MNNVLAllReduce(nn.Module):
 
         This follows FlashInfer #3745 and requires a communicator created
         after process restore for the fresh handle exchange.
+
+        Args:
+            comm: Communicator newly created after process restore.
         """
         workspace = self.allreduce_mnnvl_workspaces[self.mapping]
         if workspace["handle"].is_mapped():

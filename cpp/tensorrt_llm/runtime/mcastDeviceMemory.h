@@ -97,7 +97,7 @@ public:
         return mMapped;
     }
 
-    ~McastDeviceMemory();
+    ~McastDeviceMemory() noexcept;
 
 private:
     bool mIsMNNvlink;
