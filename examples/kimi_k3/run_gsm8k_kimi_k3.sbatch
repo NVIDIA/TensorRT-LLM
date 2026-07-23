@@ -105,11 +105,8 @@ case "$MODE" in
         ;;
 esac
 
-# Mount every input at its host path so the paths are valid inside too.
 MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro"
-# Optional extra container mounts (srun --container-mounts syntax). Needed
-# e.g. when $REPO is a git worktree whose build artifacts (.venv-3.12,
-# bindings *.so) are symlinks into the main checkout.
+# Optional extra container mounts (srun --container-mounts syntax).
 if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi
@@ -136,11 +133,8 @@ srun --mpi=pmix \
 
         # Run trtllm-eval from the in-place installation created in the
         # README Prerequisites section (build_wheel.py creates .venv-3.12).
-        # Invoke it through python3 explicitly: the console script's shebang
-        # records the build-time venv path, so a PATH lookup alone breaks
-        # with an obscure 'bad interpreter' if the repo is mounted anywhere
-        # other than its build-time location.
         export PATH=\"$REPO/.venv-3.12/bin:\$PATH\"
+        
         # Log a running partial score every N completed responses (0 = off).
         export TLLM_EVAL_PARTIAL_SCORES_EVERY=\"\${TLLM_EVAL_PARTIAL_SCORES_EVERY:-100}\"
 
@@ -152,7 +146,6 @@ srun --mpi=pmix \
             --max_batch_size $MAX_BATCH_SIZE \
             --max_seq_len 8192 \
             --max_num_tokens 8192 \
-            --kv_cache_free_gpu_memory_fraction 0.25 \
             $KV_REUSE_ARG \
             --trust_remote_code \
             --config '$EVAL_CONFIG' \

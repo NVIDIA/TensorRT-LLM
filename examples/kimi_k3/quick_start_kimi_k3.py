@@ -30,9 +30,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         required=True,
-        help="Path to a Kimi K3 checkpoint (the Slurm launcher validates "
-        "and bind-mounts it, so remote Hugging Face IDs are not supported "
-        "through that flow).",
+        help="Path to a local Kimi K3 checkpoint",
     )
     parser.add_argument(
         "--tp-size",
@@ -54,8 +52,6 @@ def main() -> None:
     args = parse_arguments()
     llm = LLM(
         model=args.model,
-        # DEP deployment: attention runs data-parallel and the experts
-        # shard across the expert-parallel group (EP width == tp).
         tensor_parallel_size=args.tp_size,
         enable_attention_dp=True,
         moe_expert_parallel_size=args.tp_size,
@@ -64,16 +60,10 @@ def main() -> None:
         max_seq_len=4096,
         max_num_tokens=4096,
         enable_chunked_prefill=True,
-        disable_overlap_scheduler=False,
-        # CUDA graphs require the graph-safe MLA latent-cache append (write
-        # positions derived from device tensors, attention_backend/utils.py);
-        # verified at GSM8K parity with the eager path.
-        cuda_graph_config=CudaGraphConfig(enable_padding=True,
-                                          max_batch_size=8),
+        cuda_graph_config=CudaGraphConfig(max_batch_size=8),
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=args.enable_block_reuse,
-            free_gpu_memory_fraction=0.25,
-            tokens_per_block=64,
+            free_gpu_memory_fraction=0.7,
         ),
     )
 

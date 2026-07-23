@@ -73,9 +73,7 @@ done
 REPO=${REPO:-$SLURM_SUBMIT_DIR}
 
 MOUNTS="$REPO:$REPO:rw,$MODEL:$MODEL:ro"
-# Optional extra container mounts (srun --container-mounts syntax). Needed
-# e.g. when $REPO is a git worktree whose build artifacts (.venv-3.12,
-# bindings *.so) are symlinks into the main checkout.
+# Optional extra container mounts (srun --container-mounts syntax) 
 if [ -n "${EXTRA_MOUNTS:-}" ]; then
     MOUNTS+=",$EXTRA_MOUNTS"
 fi

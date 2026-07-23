@@ -8,26 +8,22 @@ start and configuration for GSM8K evaluation.
 Only NVIDIA Blackwell GPUs are currently supported and tested. Support for
 other GPU architectures may be added in a future release.
 
-The full-model example uses 16 GPUs in the DEP16 deployment: attention runs
-data-parallel and the 896 experts shard across the expert-parallel group
-(`enable_attention_dp=true`, `moe_expert_parallel_size=16`).
-
 ## Prerequisites
 
-- TensorRT-LLM built from this repository and installed in place. Inside
+- TensorRT-LLM built from this repository and installed. Inside
   the TensorRT-LLM container, from the repository root:
 
   ```bash
-  python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
+  python3 scripts/build_wheel.py --cuda_architectures 103-real
   .venv-3.12/bin/python -m pip install --no-deps -e .
   ```
+  You can also build the wheel and then pip install the generated wheel.
+  Using editable mode is recommended for development and testing, see [build-from-source](./docs/source/installation/build-from-source.md) for details.
 
   `build_wheel.py` creates the `.venv-3.12` virtual environment at the
   repository root (named after the container's Python version). Adjust
   `--cuda_architectures` to the target GPUs (`100-real` for GB200,
-  `103-real` for GB300). The Slurm scripts below run TensorRT-LLM from this
-  in-place environment, so build and install with the repository at the
-  same path the jobs use.
+  `103-real` for GB300). 
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer.
 - A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
   image.
@@ -163,16 +159,8 @@ decoding requires the default cache manager, which cannot reuse blocks.
 
 ## Current limitations
 
-Pipeline parallelism and disaggregated serving are not supported. CUDA
-graphs and the overlap scheduler are supported and enabled by default: the
-generation-phase MLA latent-cache append derives its write positions from
-device tensors, making it CUDA-graph-safe, verified at GSM8K parity with
-the eager path.
+Pipeline parallelism and disaggregated serving are not supported.
 
 Suffix-automaton (SA) speculative decoding is supported as an opt-in for
 evaluation (see `eval_extra_llm_options_sa.yaml`). SA runs keep CUDA graphs
-and the overlap scheduler off, need `max_batch_size` ≤ 8, and use the same
-DEP16 deployment as the non-SA config (SA with attention DP is
-parity-certified; DEP16 is also the only deployment with the memory
-headroom for larger draft lengths — plain EP replicates attention weights
-and only fits the minimal `max_draft_len=2` eager configuration).
+and the overlap scheduler off, need `max_batch_size` ≤ 8.
