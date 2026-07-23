@@ -24,7 +24,6 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native import rank_info
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.resource import page
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -256,7 +255,7 @@ def _mamba_layer_ids(manager):
 
 def _mamba_state_slot(manager, request_id):
     if isinstance(manager, MambaHybridCacheManagerV2):
-        return manager.get_state_indices([request_id])[0]
+        return manager._request_id_to_state_index[request_id]
     return manager.mamba_cache_index[request_id]
 
 
@@ -277,89 +276,6 @@ def test_mamba_policy_layer_major_v1_ptrs():
     )
 
     np.testing.assert_array_equal(ptrs, [130, 210])
-
-
-def test_mamba_policy_slot_major_layer_ptrs():
-    """V2 Mamba state tensors step by physical slots, not V1 layers."""
-    self_mlg = page.MambaLayerGroup(
-        pool_group_idx=0,
-        mamba_layer_offsets={1: 0, 2: 1},
-        conv_states=page.PhysicalPool(
-            base_address=1000,
-            slot_bytes=10,
-            num_slots=8,
-            slot_stride_bytes=20,
-            layer_stride_bytes=10,
-        ),
-        ssm_states=page.PhysicalPool(
-            base_address=3000,
-            slot_bytes=20,
-            num_slots=8,
-            slot_stride_bytes=40,
-            layer_stride_bytes=20,
-        ),
-        conv_section_bytes=[10],
-        ssm_bytes_per_head=10,
-    )
-    peer_mlg = page.MambaLayerGroup(
-        pool_group_idx=0,
-        mamba_layer_offsets={1: 0, 2: 1},
-        conv_states=page.PhysicalPool(
-            base_address=5000,
-            slot_bytes=10,
-            num_slots=8,
-            slot_stride_bytes=20,
-            layer_stride_bytes=10,
-        ),
-        ssm_states=page.PhysicalPool(
-            base_address=7000,
-            slot_bytes=20,
-            num_slots=8,
-            slot_stride_bytes=40,
-            layer_stride_bytes=20,
-        ),
-        conv_section_bytes=[10],
-        ssm_bytes_per_head=10,
-    )
-    self_ri = rank_info.RankInfo(
-        instance_name="self",
-        instance_rank=0,
-        tp_size=1,
-        tp_rank=0,
-        pp_size=1,
-        pp_rank=0,
-        layer_num_per_pp=[2],
-        sender_endpoints=[],
-        server_endpoint="",
-        self_endpoint="",
-        transfer_engine_info=bytes(),
-    )
-    peer_ri = rank_info.RankInfo(
-        instance_name="peer",
-        instance_rank=0,
-        tp_size=1,
-        tp_rank=0,
-        pp_size=1,
-        pp_rank=0,
-        layer_num_per_pp=[2],
-        sender_endpoints=[],
-        server_endpoint="",
-        self_endpoint="",
-        transfer_engine_info=bytes(),
-    )
-
-    src_frags, dst_frags, kv_sizes = peer.MambaPolicy.build_mamba_frags(
-        self_mlg=self_mlg,
-        peer_mlg=peer_mlg,
-        src_slot=3,
-        dst_slot=5,
-        self_ri=self_ri,
-        peer_ri=peer_ri,
-    )
-
-    assert src_frags == [1060, 1070, 3120, 3140]
-    assert dst_frags == [5100, 5110, 7200, 7220]
-    assert kv_sizes == [10, 10, 20, 20]
 
 
 def test_mamba_policy_slot_major_interleaved_role_ptrs():

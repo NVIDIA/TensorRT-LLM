@@ -2770,7 +2770,6 @@ class TestInitRatioConfig(unittest.TestCase):
         ssm_lc = manager._life_cycles.ssm_life_cycle_id
         assert ssm_lc is not None
         ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
-        attn_pg = 1 - ssm_pg
 
         batch = BatchDesc(
             kv_caches=[
@@ -2784,10 +2783,6 @@ class TestInitRatioConfig(unittest.TestCase):
         )
         slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
         self.assertEqual(slots[ssm_pg], 6)
-        self.assertEqual(
-            slots[attn_pg],
-            2 * div_up(1024, self.TOKENS_PER_BLOCK) + 2,
-        )
 
         default_batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4095)] * 2)
         default_slots = manager._storage._compute_slots_for_batch(

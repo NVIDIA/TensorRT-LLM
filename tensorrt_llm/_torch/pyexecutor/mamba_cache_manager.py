@@ -45,7 +45,6 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (DEFAULT_BEAM_INDEX,
-                                                      AttentionLayerConfig,
                                                       BatchDesc, BufferConfig,
                                                       DataRole, KVCacheDesc)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
@@ -1658,7 +1657,6 @@ def _estimate_mamba_hybrid_cache_cost(
     *,
     max_batch_size: int,
     kv_cache_config: KvCacheConfig,
-    num_layers: Optional[int],
     tokens_per_block: int,
     max_seq_len: Optional[int],
     num_reserved_dummy_slots: int,
@@ -1668,7 +1666,6 @@ def _estimate_mamba_hybrid_cache_cost(
     use_separate_draft_kv_cache: bool = False,
     **kwargs,
 ) -> Tuple[int, int]:
-    del num_layers
     spec_config = kwargs.get("spec_config")
     params, local_mamba_layers, local_attention_layers = (
         _get_local_mamba_cache_layout(
@@ -1896,10 +1893,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         # Section dims are derived from mHiddenSize and mNGroups*mDState in C++;
         # we just need to tell C++ which ordering to use.
         self._rnn_conv_section_layout = model_type  # "nemotron_hybrid" or "qwen3_next"
-        self.ssm_count = math.prod(self.ssm_state_shape)
-        self.conv_count = math.prod(self.conv_state_shape)
-        self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
-        self.conv_bytes = self.conv_count * self.conv_state_dtype.itemsize
+        self.ssm_bytes = (math.prod(self.ssm_state_shape) *
+                          self.ssm_state_dtype.itemsize)
+        self.conv_bytes = (math.prod(self.conv_state_shape) *
+                           self.conv_state_dtype.itemsize)
 
         total_bytes = self.ssm_bytes + self.conv_bytes
         if total_bytes % self.ssm_state_dtype.itemsize != 0:
@@ -2023,10 +2020,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                          device="cpu")
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
-        # Batch-order mask aligned with state_indices; duplicate dummy request
-        # IDs mark every batch row even when they share one cache slot.
-        self._dummy_request_mask = None
-        self._dummy_request_mask_host = None
         self.kv_cache_config = kv_cache_config
         self.is_estimating_kv_cache = is_estimating_kv_cache
 
@@ -2068,7 +2061,6 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             mapping,
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
-            num_layers=num_layers,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=1,
@@ -2549,13 +2541,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
         self._seed_rank_offset = _mamba_rank_offset(mapping)
         self._seed_request_counter = 0
-        self._num_cuda_graph_padding_dummy_slots = (
+        num_cuda_graph_padding_dummy_slots = (
             _get_num_cuda_graph_padding_dummy_slots(spec_config,
                                                     max_batch_size))
-        self._num_attention_dp_dummy_slots = int(mapping.enable_attention_dp)
-        self._num_reserved_dummy_slots = (
-            self._num_cuda_graph_padding_dummy_slots +
-            self._num_attention_dp_dummy_slots)
+        self._num_reserved_dummy_slots = (num_cuda_graph_padding_dummy_slots +
+                                          int(mapping.enable_attention_dp))
         self.ssm_state_dtype = (mamba_ssm_cache_dtype if mamba_ssm_cache_dtype
                                 is not None else mamba_cache_dtype)
         self.conv_state_dtype = mamba_cache_dtype
@@ -2611,10 +2601,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     grouped_state_dim_local,
                     d_inner_local,
                 ]
-            self.ssm_count = math.prod(self.ssm_state_shape)
-            self.conv_count = math.prod(self.conv_state_shape)
-            self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
-            self.conv_bytes = self.conv_count * self.conv_state_dtype.itemsize
+            self.ssm_bytes = (math.prod(self.ssm_state_shape) *
+                              self.ssm_state_dtype.itemsize)
+            self.conv_bytes = (math.prod(self.conv_state_shape) *
+                               self.conv_state_dtype.itemsize)
         else:
             logger.info(
                 "No local mamba layers for this rank, skipping mamba state views"
@@ -2623,8 +2613,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.conv_state_shape = []
             self.ssm_state_shape = []
             self.conv_section_dims = []
-            self.ssm_count = 0
-            self.conv_count = 0
             self.ssm_bytes = 0
             self.conv_bytes = 0
 
@@ -2675,9 +2663,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layer_id: offset
             for offset, layer_id in enumerate(self.mamba_pp_layers)
         }
-        self.mamba_local_layer_ids = [
-            self.layer_offsets[layer_id] for layer_id in self.mamba_pp_layers
-        ]
         self._request_id_to_state_index = {}
         self._request_id_to_is_dummy = {}
 
@@ -2691,7 +2676,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                                pin_memory=prefer_pinned())
 
         if self.local_num_mamba_layers > 0:
-            first_mamba_local_layer = self.mamba_local_layer_ids[0]
+            first_mamba_local_layer = self.layer_offsets[
+                self.mamba_pp_layers[0]]
             self.ssm_layer_group_id = self.impl.get_layer_group_id(
                 LayerId(first_mamba_local_layer))
             self._ssm_page_index_scale = self.impl.get_page_index_scale(
@@ -2736,7 +2722,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             mapping,
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
-            num_layers=num_layers,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=num_reserved_dummy_slots,
@@ -2838,10 +2823,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         gpu_quota: int,
     ) -> int:
         capacity = self._get_max_tokens_from_quota(gpu_quota)
-        if math.isinf(capacity):
-            capacity = (kv_cache_config.max_tokens if kv_cache_config.max_tokens
-                        is not None else self.max_seq_len *
-                        self._max_resident_sequences())
         capacity = min(
             capacity,
             self.max_seq_len * self._max_resident_sequences(),
@@ -2852,26 +2833,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states and one attention page."""
-        num_sequences = self._max_resident_sequences()
-        state_slots = num_sequences + self._num_reserved_dummy_slots
-        state_quota = state_slots * self._mamba_state_bytes_per_slot()
         attention_block_quota = (self._attention_cache_bytes_per_token() *
                                  self.tokens_per_block)
-        # At zero token capacity, any reserved dummy state makes non-live SSM
-        # capacity possible. Match the normal estimator by reserving one
-        # partial attention page per request lineage in that case.
-        extra_attention_quota = (num_sequences * attention_block_quota
-                                 if state_slots > num_sequences else 0)
-        attention_quota = max(
-            super()._get_quota_from_max_tokens(0) + extra_attention_quota,
-            attention_block_quota,
+        num_state_slots = (self._max_resident_sequences() +
+                           self._num_reserved_dummy_slots)
+        state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
+        return max(
+            self._get_quota_from_max_tokens(0),
+            state_quota + attention_block_quota,
         )
-        return state_quota + attention_quota
 
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         kv_cache_config = self.kv_cache_config
-        tokens_per_block = config.tokens_per_block
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
         minimum_live_quota = self._minimum_live_gpu_quota()
@@ -2880,51 +2854,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 "The V2 Mamba GPU cache quota is too small for live recurrent "
                 f"states and attention pages: got {gpu_quota} bytes, need at "
                 f"least {minimum_live_quota} bytes.")
-        buffer_type = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            buffer_type.append(Role.VALUE)
-        if kv_cache_config.dtype == "nvfp4":
-            for layer_idx, hd in enumerate(self.head_dim_per_layer):
-                if self._is_local_mamba_layer(layer_idx):
-                    continue
-                assert hd % 2 == 0, (
-                    f"head_dim must be divisible by 2 for nvfp4 kv cache, "
-                    f"but layer {layer_idx} has head_dim={hd}")
-            buffer_type.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                buffer_type.append(Role.VALUE_BLOCK_SCALE)
-
-        layers = []
+        # _build_base_config already constructed every attention layer,
+        # including dtype-specific scale and subclass-provided side buffers.
+        # Preserve those configs and replace only the local Mamba layers.
+        layers = list(config.layers)
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
-            layer_id = LayerId(local_layer_idx)
             if self._mamba_layer_mask[global_layer_idx]:
-                layers.append(
-                    SsmLayerConfig(
-                        layer_id=layer_id,
-                        buffers=[
-                            BufferConfig(role=MambaRole.SSM_STATE,
-                                         size=self.ssm_bytes),
-                            BufferConfig(role=MambaRole.CONV_STATE,
-                                         size=self.conv_bytes),
-                        ],
-                    ))
-            else:
-                layers.append(
-                    AttentionLayerConfig(
-                        layer_id=layer_id,
-                        buffers=[
-                            BufferConfig(
-                                role=role,
-                                size=self.get_layer_bytes_per_token(
-                                    local_layer_idx=layer_id, data_role=role) *
-                                tokens_per_block,
-                            ) for role in buffer_type
-                        ],
-                        sliding_window_size=self.max_attention_window_vec[
-                            global_layer_idx %
-                            len(self.max_attention_window_vec)],
-                        num_sink_tokens=None,
-                    ))
+                layer_id = LayerId(local_layer_idx)
+                layers[local_layer_idx] = SsmLayerConfig(
+                    layer_id=layer_id,
+                    buffers=[
+                        BufferConfig(role=MambaRole.SSM_STATE,
+                                     size=self.ssm_bytes),
+                        BufferConfig(role=MambaRole.CONV_STATE,
+                                     size=self.conv_bytes),
+                    ],
+                )
 
         num_sequences = self._max_resident_sequences()
         planned_capacity = self._planned_token_capacity(kv_cache_config,
@@ -2972,15 +2917,18 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         )
 
     def _setup_states(self) -> None:
+        local_layer_ids = [
+            self.layer_offsets[layer_id] for layer_id in self.mamba_pp_layers
+        ]
         self.all_ssm_states = [
             self._get_state_buffer(local_layer_idx, MambaRole.SSM_STATE,
                                    self.ssm_state_dtype, self.ssm_state_shape)
-            for local_layer_idx in self.mamba_local_layer_ids
+            for local_layer_idx in local_layer_ids
         ]
         self.all_conv_states = [
             self._get_state_buffer(local_layer_idx, MambaRole.CONV_STATE,
                                    self.conv_state_dtype, self.conv_state_shape)
-            for local_layer_idx in self.mamba_local_layer_ids
+            for local_layer_idx in local_layer_ids
         ]
 
     def _setup_replay_buffers(self, spec_config) -> None:
@@ -3016,13 +2964,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self.kv_cache_config.mamba_state_config.periodic_snapshot_interval)
         if (self.kv_cache_config.enable_block_reuse and interval is not None
                 and interval > 0):
-            cache_bytes += (self.local_num_mamba_layers *
-                            (self.ssm_bytes + self.conv_bytes) // interval)
+            cache_bytes += self._mamba_state_bytes_per_slot() // interval
         if cache_bytes == 0 and self.local_num_mamba_layers > 0:
-            return max(
-                1,
-                self.local_num_mamba_layers *
-                (self.ssm_bytes + self.conv_bytes))
+            cache_bytes = self._mamba_state_bytes_per_slot()
         return max(1, cache_bytes)
 
     def get_num_free_blocks(self) -> int:

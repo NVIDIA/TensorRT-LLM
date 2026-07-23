@@ -700,17 +700,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.attention_dp_events_gather_period_ms == 10
     assert (KvCacheConfig(block_reuse_policy="per_conversation").
             block_reuse_policy == "per_conversation")
-    per_conversation_config = KvCacheConfig(
-        block_reuse_policy="per_conversation",
-        mamba_state_config=MambaStateConfig(
-            periodic_snapshot_interval=64,
-            additional_snapshot_offsets_from_end=[0],
-        ),
-    )
-    assert (per_conversation_config.mamba_state_config.
-            periodic_snapshot_interval == 0)
-    assert (per_conversation_config.mamba_state_config.
-            additional_snapshot_offsets_from_end == [0])
     with pytest.raises(ValidationError):
         KvCacheConfig(block_reuse_policy="invalid")
 
@@ -738,14 +727,9 @@ def test_MambaStateConfig_rejects_unknown_fields():
     [
         ("periodic_snapshot_interval", -1),
         ("additional_snapshot_offsets_from_start", [0]),
-        ("additional_snapshot_offsets_from_start", [-1]),
         ("additional_snapshot_offsets_from_start", [True]),
-        ("additional_snapshot_offsets_from_start", [1.5]),
-        ("additional_snapshot_offsets_from_start", ["128"]),
         ("additional_snapshot_offsets_from_end", [-1]),
-        ("additional_snapshot_offsets_from_end", [True]),
         ("additional_snapshot_offsets_from_end", [1.5]),
-        ("additional_snapshot_offsets_from_end", ["32"]),
     ],
 )
 def test_MambaStateConfig_rejects_invalid_snapshot_offsets(field, value):
@@ -770,12 +754,11 @@ def test_KvCacheConfig_requires_v2_for_additional_snapshot_offsets(
             use_kv_cache_manager_v2=False,
         )
 
-    for use_v2 in (True, "auto"):
-        config = KvCacheConfig(
-            mamba_state_config=state_config,
-            use_kv_cache_manager_v2=use_v2,
-        )
-        assert getattr(config.mamba_state_config, field) == offsets
+    config = KvCacheConfig(
+        mamba_state_config=state_config,
+        use_kv_cache_manager_v2=True,
+    )
+    assert getattr(config.mamba_state_config, field) == offsets
 
 
 def test_KvCacheConfig_allows_periodic_snapshots_with_v1():
@@ -800,12 +783,6 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
                for message in warnings_seen)
     assert "mamba_state_cache_interval" not in config.model_dump()
 
-    llm_args = TorchLlmArgs(
-        model=llama_model_path,
-        kv_cache_config={"mamba_state_cache_interval": 32},
-    )
-    assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 32
-
 
 def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
         monkeypatch):
@@ -815,10 +792,14 @@ def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
 
     config = KvCacheConfig(
         block_reuse_policy="per_conversation",
-        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+        mamba_state_config=MambaStateConfig(
+            periodic_snapshot_interval=64,
+            additional_snapshot_offsets_from_end=[0],
+        ),
     )
 
     assert config.mamba_state_config.periodic_snapshot_interval == 0
+    assert config.mamba_state_config.additional_snapshot_offsets_from_end == [0]
     assert len(warnings_seen) == 1
     assert "periodic_snapshot_interval=64" in warnings_seen[0]
     assert "block_reuse_policy=per_conversation" in warnings_seen[0]

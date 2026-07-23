@@ -120,8 +120,13 @@ def test_capacity_only_is_scoped_to_target_manager() -> None:
     target_cache.resize.assert_called_once_with(253, None)
 
 
-def test_dynamic_tree_draft_reclaims_reserved_capacity() -> None:
-    manager = _manager(is_draft=True, kv_reserve_draft_tokens=60)
+@pytest.mark.parametrize(
+    ("is_draft", "expected_capacity"),
+    [(True, 201), (False, 230)],
+    ids=["draft-reclaims-reserve", "target-has-no-reserve"],
+)
+def test_dynamic_tree_reserved_capacity(is_draft: bool, expected_capacity: int) -> None:
+    manager = _manager(is_draft=is_draft, kv_reserve_draft_tokens=60)
     # The runtime tree used 31 draft positions: 26 rejected and 5 accepted.
     request = _request(1, rewind=26, accepted_draft_tokens=5)
     cache = _cache()
@@ -129,19 +134,7 @@ def test_dynamic_tree_draft_reclaims_reserved_capacity() -> None:
 
     manager.update_resources(SimpleNamespace(generation_requests=[request]))
 
-    # Rewind 26 rejected positions plus the 60 - 31 reserve slack.
-    cache.resize.assert_called_once_with(201, 200)
-
-
-def test_dynamic_tree_target_does_not_reclaim_unallocated_reserve() -> None:
-    manager = _manager(is_draft=False, kv_reserve_draft_tokens=60)
-    request = _request(1, rewind=26, accepted_draft_tokens=5)
-    cache = _cache()
-    manager.kv_cache_map[request.py_request_id] = cache
-
-    manager.update_resources(SimpleNamespace(generation_requests=[request]))
-
-    cache.resize.assert_called_once_with(230, 200)
+    cache.resize.assert_called_once_with(expected_capacity, 200)
 
 
 def test_capacity_only_completion_preserves_history() -> None:

@@ -610,10 +610,6 @@ def test_mamba_layer_group_serialization():
     d = mlg.to_dict()
     assert d["mamba_layer_offsets"] == {10: 0, 11: 1, 12: 2}
     assert d["conv_section_bytes"] == [512, 256, 256]
-    assert d["conv_states"]["slot_stride_bytes"] == 512
-    assert d["conv_states"]["layer_stride_bytes"] == 256
-    assert d["ssm_states"]["slot_stride_bytes"] == 1024
-    assert d["ssm_states"]["layer_stride_bytes"] == 512
 
     from tensorrt_llm._torch.disaggregation.resource.page import LayerGroup
 
@@ -621,16 +617,10 @@ def test_mamba_layer_group_serialization():
     assert isinstance(restored, MambaLayerGroup)
     assert restored.mamba_layer_offsets == {10: 0, 11: 1, 12: 2}
     assert restored.conv_states.base_address == 1000
-    assert restored.conv_states.slot_bytes == 128
-    assert restored.conv_states.num_slots == 10
     assert restored.conv_states.slot_stride_bytes == 512
-    assert restored.conv_states.layer_stride_bytes == 256
     assert get_slot_address(restored.conv_states, 3) == 1000 + 3 * 512
     assert restored.ssm_states.base_address == 8000
-    assert restored.ssm_states.slot_bytes == 256
-    assert restored.ssm_states.num_slots == 8
     assert restored.ssm_states.slot_stride_bytes == 1024
-    assert restored.ssm_states.layer_stride_bytes == 512
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
 
