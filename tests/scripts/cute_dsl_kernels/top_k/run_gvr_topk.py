@@ -151,9 +151,16 @@ def _compile(
         if use_ext_counts
         else None
     )
-    cand_fake = (
+    cand_vals_fake = (
         cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (n_rows, cand_cap * 2), stride_order=(1, 0), assumed_align=8
+            cutlass.Float32, (n_rows, cand_cap), stride_order=(1, 0), assumed_align=4
+        )
+        if use_ext_cand
+        else None
+    )
+    cand_idx_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_rows, cand_cap), stride_order=(1, 0), assumed_align=4
         )
         if use_ext_cand
         else None
@@ -213,7 +220,8 @@ def _compile(
         seed_thr=seed_thr_fake,
         seed_counts=seed_counts_fake,
         xstate=xstate_fake,
-        cand=cand_fake,
+        cand_vals=cand_vals_fake,
+        cand_idx=cand_idx_fake,
         cand_ctl=cand_ctl_fake,
         options="--enable-tvm-ffi",
     )
@@ -351,6 +359,7 @@ def derive_seed_rungs(
     prev_counts: "torch.Tensor | None" = None,
     count_octaves: float = 2.0,
     fallback_spread: float = 0.5,
+    top_k: "int | None" = None,
 ) -> torch.Tensor:
     """Host-side slope-adaptive seed rung derivation (waterfall closed loop).
 
@@ -370,6 +379,7 @@ def derive_seed_rungs(
     """
     if prev_sthr is None or prev_counts is None:
         d = torch.full_like(prev_thr, fallback_spread)
+        d_lo = d
     else:
         c_lo = prev_counts[:, 0].float().clamp(min=1.0)
         c_hi = prev_counts[:, 2].float().clamp(min=1.0)
@@ -380,7 +390,19 @@ def derive_seed_rungs(
             count_octaves / slope.clamp(min=0.05),
             torch.full_like(slope, fallback_spread),
         ).clamp(0.1, 4.0)
-    return torch.stack([prev_thr - d, prev_thr, prev_thr + d], dim=1).contiguous()
+        # undershoot hysteresis: a row whose PREVIOUS loose rung caught
+        # fewer than K cannot use its list (fallback ~26us); widen only
+        # that row's next down-guard by +2 octaves. Rows in band keep the
+        # tight spread (a fat list taxes every step's walk).
+        oct_lo = torch.full_like(slope, count_octaves)
+        if top_k is not None:
+            oct_lo = torch.where(prev_counts[:, 0].float() < float(top_k), oct_lo + 2.0, oct_lo)
+        d_lo = torch.where(
+            slope > 0.05,
+            oct_lo / slope.clamp(min=0.05),
+            torch.full_like(slope, fallback_spread),
+        ).clamp(0.1, 6.0)
+    return torch.stack([prev_thr - d_lo, prev_thr, prev_thr + d], dim=1).contiguous()
 
 
 def emu_seed_counts(
@@ -414,8 +436,8 @@ def emu_cand(
     next_n: int = 1,
     compress_ratio: int = 1,
     sentinel_pad: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """L2 emu: unordered candidate pre-collect.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """L2 emu: unordered candidate pre-collect (SoA).
 
     Unordered (value fp32-bits, index) pairs of all valid positions
     >= t_0 = seed_thr[:, 0]; ctl = {claimed, void}. claimed may
@@ -428,9 +450,9 @@ def emu_cand(
     dev = logits.device
     n_eff = _row_n_eff(seq_lens, R, next_n, compress_ratio)
     lf = logits.to(torch.float32)
-    cand = torch.full((R, cap * 2), -1, dtype=torch.int32, device=dev)
+    cand_vals = torch.full((R, cap), float("-inf"), dtype=torch.float32, device=dev)
+    cand_idx = torch.full((R, cap), -1, dtype=torch.int32, device=dev)
     ctl = torch.zeros((R, 2), dtype=torch.int32, device=dev)
-    pairs = cand.view(R, cap, 2)
     for r in range(R):
         ne = int(n_eff[r])
         hits = torch.nonzero(lf[r, :ne] >= seed_thr[r, 0], as_tuple=False).flatten()
@@ -447,11 +469,11 @@ def emu_cand(
         claimed = int(ent.numel())
         nwr = min(claimed, cap)
         live = ent[:nwr] >= 0
-        pairs[r, :nwr, 1] = ent[:nwr].to(torch.int32)
-        pairs[r, :nwr, 0][live] = lf[r, ent[:nwr][live]].view(torch.int32)
+        cand_idx[r, :nwr] = ent[:nwr].to(torch.int32)
+        cand_vals[r, :nwr][live] = lf[r, ent[:nwr][live]]
         ctl[r, 0] = claimed
         ctl[r, 1] = 1 if claimed > cap else 0
-    return cand, ctl
+    return cand_vals, cand_idx, ctl
 
 
 def enc_ordered_f32(t: torch.Tensor) -> torch.Tensor:
@@ -508,7 +530,8 @@ def gvr_topk_decode(
     seed_thr: Optional[torch.Tensor] = None,
     seed_counts: Optional[torch.Tensor] = None,
     xstate: Optional[torch.Tensor] = None,
-    cand: Optional[torch.Tensor] = None,
+    cand_vals: Optional[torch.Tensor] = None,
+    cand_idx: Optional[torch.Tensor] = None,
     cand_ctl: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL GVR Top-K wrapper with every tuning knob exposed.
@@ -606,24 +629,29 @@ def gvr_topk_decode(
             and seed_counts.is_contiguous()
             and seed_counts.shape == (num_rows, 3)
         ), "seed_counts must be contiguous CUDA int32 [num_rows, 3]"
-    use_ext_cand = cand is not None and cand_ctl is not None
+    use_ext_cand = cand_vals is not None and cand_idx is not None and cand_ctl is not None
     cand_cap = 5120
     if use_ext_cand:
         assert (
-            cand.dtype == torch.int32
-            and cand.is_cuda
-            and cand.is_contiguous()
-            and cand.dim() == 2
-            and cand.shape[0] == num_rows
-            and cand.shape[1] % 2 == 0
-        ), "cand must be contiguous CUDA int32 [num_rows, CAP*2]"
+            cand_vals.dtype == torch.float32
+            and cand_vals.is_cuda
+            and cand_vals.is_contiguous()
+            and cand_vals.dim() == 2
+            and cand_vals.shape[0] == num_rows
+        ), "cand_vals must be contiguous CUDA fp32 [num_rows, CAP]"
+        assert (
+            cand_idx.dtype == torch.int32
+            and cand_idx.is_cuda
+            and cand_idx.is_contiguous()
+            and cand_idx.shape == cand_vals.shape
+        ), "cand_idx must be contiguous CUDA int32 [num_rows, CAP]"
         assert (
             cand_ctl.dtype == torch.int32
             and cand_ctl.is_cuda
             and cand_ctl.is_contiguous()
             and cand_ctl.shape == (num_rows, 2)
         ), "cand_ctl must be contiguous CUDA int32 [num_rows, 2]"
-        cand_cap = cand.shape[1] // 2
+        cand_cap = cand_vals.shape[1]
     emit_xstate = xstate is not None
     if emit_xstate:
         assert (
@@ -730,7 +758,8 @@ def gvr_topk_decode(
         seed_thr if use_ext_counts else None,
         seed_counts if use_ext_counts else None,
         xstate if emit_xstate else None,
-        cand if use_ext_cand else None,
+        cand_vals if use_ext_cand else None,
+        cand_idx if use_ext_cand else None,
         cand_ctl if use_ext_cand else None,
     )
     if return_output_values:
