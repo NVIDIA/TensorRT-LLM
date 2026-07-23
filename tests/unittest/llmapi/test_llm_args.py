@@ -54,7 +54,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           StrictBaseModel, TorchCompileConfig,
                                           TorchLlmArgs,
                                           UserProvidedDecodingConfig,
-                                          update_llm_args_with_extra_dict)
+                                          update_llm_args_with_extra_dict,
+                                          update_llm_args_with_extra_options)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -198,12 +199,11 @@ kv_cache_config:
 
         assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 64
 
-    def test_from_yaml_rejects_empty_file(self, tmp_path):
+    def test_from_yaml_empty_file_reports_missing_model(self, tmp_path):
         yaml_path = tmp_path / "empty.yaml"
         yaml_path.write_text("", encoding="utf-8")
 
-        with pytest.raises(ValueError,
-                           match="Configuration file root must be a mapping"):
+        with pytest.raises(ValidationError, match="model"):
             TorchLlmArgs.from_yaml(yaml_path)
 
     def test_from_yaml_rejects_non_mapping_root(self, tmp_path):
@@ -805,6 +805,37 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
         kv_cache_config={"mamba_state_cache_interval": 32},
     )
     assert llm_args.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 32
+
+
+def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
+        monkeypatch):
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
+
+    config = KvCacheConfig(
+        block_reuse_policy="per_conversation",
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
+    )
+
+    assert config.mamba_state_config.periodic_snapshot_interval == 0
+    assert len(warnings_seen) == 1
+    assert "periodic_snapshot_interval=64" in warnings_seen[0]
+    assert "block_reuse_policy=per_conversation" in warnings_seen[0]
+    assert "setting it to 0" in warnings_seen[0]
+
+    warnings_seen.clear()
+    KvCacheConfig(block_reuse_policy="per_conversation")
+    assert warnings_seen == []
+
+
+def test_update_llm_args_with_empty_options_file(tmp_path):
+    yaml_path = tmp_path / "empty.yaml"
+    yaml_path.write_text("", encoding="utf-8")
+    llm_args = {"model": "dummy"}
+
+    assert update_llm_args_with_extra_options(llm_args,
+                                              str(yaml_path)) == llm_args
 
 
 def test_config_file_merge_migrates_legacy_mamba_interval_without_mutating_input(

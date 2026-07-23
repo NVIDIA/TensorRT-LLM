@@ -3939,6 +3939,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         """Use only explicit stable boundaries for conversation reuse."""
         if (self.block_reuse_policy == "per_conversation"
                 and self.mamba_state_config.periodic_snapshot_interval != 0):
+            interval = self.mamba_state_config.periodic_snapshot_interval
+            logger.warning(
+                f"'kv_cache_config.mamba_state_config.periodic_snapshot_interval={interval}' "
+                "is ignored because "
+                "'kv_cache_config.block_reuse_policy=per_conversation' disables "
+                "periodic Mamba snapshots; setting it to 0.")
             self.mamba_state_config = self.mamba_state_config.model_copy(
                 update={"periodic_snapshot_interval": 0})
         return self
@@ -4539,7 +4545,9 @@ class BaseLlmArgs(StrictBaseModel):
     def from_yaml(cls, yaml_path: Union[str, Path]):
         with open(yaml_path, "r") as f:
             config_dict = yaml.safe_load(f)
-        if not isinstance(config_dict, dict):
+        if config_dict is None:
+            config_dict = {}
+        elif not isinstance(config_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
         return cls(**config_dict)
 
@@ -6084,7 +6092,9 @@ def update_llm_args_with_extra_options(
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-        if not isinstance(llm_args_dict, dict):
+        if llm_args_dict is None:
+            llm_args_dict = {}
+        elif not isinstance(llm_args_dict, dict):
             raise ValueError("Configuration file root must be a mapping.")
         llm_args = update_llm_args_with_extra_dict(
             llm_args,

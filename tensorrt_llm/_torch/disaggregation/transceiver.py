@@ -237,7 +237,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         mamba_state_index = None
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
-                mamba_state_index = self._kv_cache_manager.get_state_indices([req.py_request_id])[0]
+                mamba_state_index = self._kv_cache_manager._request_id_to_state_index[
+                    req.py_request_id
+                ]
         elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
