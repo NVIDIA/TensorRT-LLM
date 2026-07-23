@@ -487,7 +487,7 @@ TEST_PARAMS += generate_element_wise_test_params()
 # that pads a non-aligned per-partition intermediate is otherwise uncovered.
 # 200 is a multiple of neither 16 nor 64 and rounds up to 256.
 W8A16_NON_ALIGNED_MOE_MODEL_CONFIGS = [
-    MoeModelConfig(4, 2, 256, 200),
+    MoeModelConfig(4, 2, 512, 200),
 ]
 
 
