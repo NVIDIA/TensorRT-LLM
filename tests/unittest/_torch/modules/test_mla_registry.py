@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.mla import MLA
+from tensorrt_llm._torch.modules.mla import MLA, create_mla_outputs_impl
 from tensorrt_llm.functional import PositionEmbeddingType
 
 
@@ -80,3 +81,27 @@ def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:
     assert registry["0"]() is target_mla
     assert registry["0_0"]() is draft_mla
     assert registry["0_1"]() is next_mla
+
+
+def test_dsv4_epilogue_fusion_is_disabled_inside_breakable_graph() -> None:
+    metadata = SimpleNamespace(num_contexts=1, num_generations=0, num_tokens=5)
+    mla_layer = Mock(spec=MLA)
+    mla_layer._should_use_dsv4_epilogue_fusion.return_value = True
+    mla_layer.create_output.return_value = torch.empty(8, 8)
+    hidden_states = torch.empty(8, 8)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.modules.mla._extract_mla_extra_attrs",
+            return_value=(metadata, mla_layer),
+        ),
+        patch(
+            "tensorrt_llm._torch.modules.mla.is_in_breakable_cuda_graph",
+            return_value=True,
+        ),
+    ):
+        outputs = create_mla_outputs_impl(hidden_states, "0")
+
+    assert outputs == [mla_layer.create_output.return_value]
+    mla_layer.create_output.assert_called_once_with(hidden_states, 1)
+    mla_layer._create_dsv4_epilogue_buffers.assert_not_called()

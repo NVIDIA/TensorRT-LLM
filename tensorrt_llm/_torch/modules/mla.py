@@ -137,8 +137,14 @@ def _extract_mla_extra_attrs(layer_idx: str):
 
 def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> List[torch.Tensor]:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    enable_dsv4_epilogue_fusion = mla_layer._should_use_dsv4_epilogue_fusion(
-        metadata.num_contexts, metadata.num_generations
+    # BCG eager breaks replay with dynamic, unpadded attention metadata, while
+    # tensors produced inside the captured segment have static bucket shapes.
+    # DSv4 fused epilogue buffers cannot safely bridge that shape boundary.
+    enable_dsv4_epilogue_fusion = (
+        not is_in_breakable_cuda_graph()
+        and mla_layer._should_use_dsv4_epilogue_fusion(
+            metadata.num_contexts, metadata.num_generations
+        )
     )
     output_input = hidden_states[:0] if enable_dsv4_epilogue_fusion else hidden_states
     attn_output = mla_layer.create_output(output_input, metadata.num_contexts)
