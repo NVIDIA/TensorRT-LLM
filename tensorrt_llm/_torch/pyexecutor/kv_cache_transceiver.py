@@ -116,7 +116,8 @@ def create_kv_cache_transceiver(
         kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+        publish_disaggregated_params: bool = True):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
@@ -172,7 +173,8 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+                                    cache_transceiver_config,
+                                    publish_disaggregated_params)
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
@@ -209,6 +211,36 @@ class KvCacheTransceiver(ABC):
     @abstractmethod
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
+
+    def owns_request(self, req: LlmRequest) -> bool:
+        """Return whether the transceiver still owns request-scoped state.
+
+        Implementations should include requests that are waiting or prepared,
+        not only requests with an active data transfer. The executor uses this
+        signal to route cancellation through the owning transceiver before it
+        frees request resources.
+        """
+        return False
+
+    def activate_context_requests_for_schedule(
+            self, requests: List[LlmRequest]) -> None:
+        """Activate generation-first requests selected by the PP schedule.
+
+        The Python transceiver's asynchronous readiness protocol overrides
+        this hook. Other transceivers have no separate readiness lease, so the
+        authoritative schedule requires no additional action.
+        """
+        return
+
+    def take_context_cancelled_request_ids(self) -> List[int]:
+        """Return newly quiescent CTX cancellations owned by the executor.
+
+        Implementations that coordinate cancellation across ranks use this
+        handoff to distinguish peer-initiated cancellation from a local user
+        cancellation. The default implementation preserves the existing
+        two-list context-status API for transceivers without that signal.
+        """
+        return []
 
     def supports_inflight_request_cancellation(self) -> bool:
         return False
