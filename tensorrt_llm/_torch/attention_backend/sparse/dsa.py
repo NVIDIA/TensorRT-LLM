@@ -2585,12 +2585,22 @@ class Indexer(nn.Module):
                 num_contexts].copy_(topk_indices_buffer[last_ctx_idx, :])
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
-            # Get decode lengths per request (from seq_lens) for validation
-            gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
-                                             num_generations]
-            max_decode_len = gen_seq_lens.max().item()
-            min_decode_len = gen_seq_lens.min().item()
-            assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
+            # Equal decode length across all gen requests is a required
+            # invariant: next_n is derived as num_gen_tokens // num_generations
+            # below, and the q_decode.view(num_generations, -1, ...) reshape
+            # assumes every gen request contributes the same number of tokens.
+            # This check is opt-in (TRTLLM_DSA_DEBUG_DECODE_LEN) because the
+            # max()/min()/.item() reductions run once per layer per decode step
+            # solely to feed this assert. seq_lens is a pinned host tensor, so
+            # this is host-side (CPU) tensor-op overhead rather than a device
+            # sync; skipping it trims that per-layer overhead from the decode
+            # hot path (adds up across all layers). It stays off in production.
+            if os.environ.get("TRTLLM_DSA_DEBUG_DECODE_LEN"):
+                gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
+                                                 num_generations]
+                max_decode_len = gen_seq_lens.max().item()
+                min_decode_len = gen_seq_lens.min().item()
+                assert max_decode_len == min_decode_len, "max_decode_len != min_decode_len, we need padding"
 
             # Reshape q for decode phase: [num_gen_tokens, ...] -> [batch_size, next_n, ...]
             q_decode = q_fp8[num_ctx_tokens:num_ctx_tokens + num_gen_tokens,
