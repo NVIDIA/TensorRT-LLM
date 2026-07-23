@@ -1,9 +1,11 @@
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
+from ...modules.multi_stream_utils import (do_multi_stream,
+                                           maybe_execute_in_parallel)
 from .cuda_graph_lora_params import CudaGraphLoraParams
 
 
@@ -159,6 +161,8 @@ MOE_LORA_MODULE_TO_KERNEL_SLOT = {
 
 class LoraLayer(torch.nn.Module):
 
+    _aux_streams: Dict[int, torch.cuda.Stream] = {}
+
     def __init__(self, lora_module_types: List[LoraModuleType],
                  output_hidden_sizes: List[int]):
         super().__init__()
@@ -166,6 +170,50 @@ class LoraLayer(torch.nn.Module):
         self.lora_module_types = lora_module_types
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
+
+        self._aux_stream: Optional[torch.cuda.Stream] = None
+        self._parallel_events: Optional[List[torch.cuda.Event]] = None
+
+    def execute_with_base(
+        self,
+        base_forward: Callable[[], Any],
+        lora_forward: Callable[[], Any],
+        lora_params: Dict,
+        layer_idx: Optional[int],
+        additional_lora_layers: tuple["LoraLayer", ...] = (),
+    ) -> tuple[Any, Any]:
+        """Run the base and LoRA branches concurrently during graph capture."""
+        use_cuda_graph_mode = bool(lora_params) and lora_params.get(
+            'use_cuda_graph_mode', False)
+        cuda_graph_params = lora_params.get('cuda_graph_params')
+        lora_layers = (self, ) + additional_lora_layers
+        has_lora_layer = bool(cuda_graph_params) and any(
+            CudaGraphLoraParams.LoraLayerKey(
+                layer_idx=layer_idx,
+                module_ids=tuple(layer.lora_module_types),
+            ) in cuda_graph_params.layer_info for layer in lora_layers)
+        execute_in_parallel = (use_cuda_graph_mode and has_lora_layer
+                               and do_multi_stream()
+                               and not torch.compiler.is_compiling())
+        if execute_in_parallel and self._aux_stream is None:
+            device = torch.cuda.current_device()
+            if device not in self._aux_streams:
+                self._aux_streams[device] = torch.cuda.Stream(device=device)
+            self._aux_stream = self._aux_streams[device]
+            self._parallel_events = [torch.cuda.Event(), torch.cuda.Event()]
+
+        if execute_in_parallel:
+            assert self._parallel_events is not None
+            return maybe_execute_in_parallel(
+                base_forward,
+                lora_forward,
+                self._parallel_events[0],
+                self._parallel_events[1],
+                self._aux_stream,
+                disable_on_compile=True,
+            )
+
+        return base_forward(), lora_forward()
 
     def forward(
         self,

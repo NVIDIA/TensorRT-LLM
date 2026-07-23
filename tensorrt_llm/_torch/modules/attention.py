@@ -1048,18 +1048,29 @@ class Attention(nn.Module):
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
 
-        qkv = self.qkv_proj(hidden_states)
-
         if bool(lora_params):
-            qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
-                                              self.layer_idx)
-            if qkv_lora is not None:
-                qkv = qkv + qkv_lora
 
-            qkv_lora = self.fused_qkv_lora(hidden_states, lora_params,
-                                           self.layer_idx)
-            if qkv_lora is not None:
-                qkv = qkv + qkv_lora
+            def qkv_lora():
+                return (
+                    self.splitted_qkv_lora(hidden_states, lora_params,
+                                           self.layer_idx),
+                    self.fused_qkv_lora(hidden_states, lora_params,
+                                        self.layer_idx),
+                )
+
+            qkv, qkv_lora_results = (
+                self.splitted_qkv_lora.execute_with_base(
+                    lambda: self.qkv_proj(hidden_states),
+                    qkv_lora,
+                    lora_params,
+                    self.layer_idx,
+                    (self.fused_qkv_lora, ),
+                ))
+            for qkv_lora_result in qkv_lora_results:
+                if qkv_lora_result is not None:
+                    qkv = qkv + qkv_lora_result
+        else:
+            qkv = self.qkv_proj(hidden_states)
 
         # For dynamic tree spec decoding with Python RoPE, adjust position_ids
         # to use tree offsets (same as C++ kernel: past_seq_len + offset).
