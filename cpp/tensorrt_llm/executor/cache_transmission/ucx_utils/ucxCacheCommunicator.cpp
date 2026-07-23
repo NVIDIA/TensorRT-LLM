@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -618,11 +618,29 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
 
     std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(
         buffer.data(), buffer.size(), ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
+    bool cancellationRequested = false;
     if (!req->isCompleted())
     {
+        constexpr auto kCancellationCheckPeriod = std::chrono::milliseconds{10};
+        while (future.wait_for(kCancellationCheckPeriod) != std::future_status::ready)
+        {
+            if (!cancellationRequested && ctx.getTransferTerminate().load(std::memory_order_relaxed))
+            {
+                req->cancel();
+                cancellationRequested = true;
+            }
+        }
         future.get();
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv SendConnectionId should be completed");
+    if (cancellationRequested)
+    {
+        if (req->getStatus() != UCS_ERR_CANCELED)
+        {
+            req->checkError();
+        }
+        return nullptr;
+    }
     req->checkError();
 
     memcpy(data, buffer.data(), size);
