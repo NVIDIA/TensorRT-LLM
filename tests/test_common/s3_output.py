@@ -69,6 +69,13 @@ class PendingUpload:
     filename: str
 
 
+@dataclass(frozen=True)
+class CapturedSection:
+    content: str
+    message: str
+    force_output: bool = False
+
+
 def _create_s3_client(
     endpoint_url: str,
     aws_access_key_id: str,
@@ -243,6 +250,9 @@ class UploadLogPlugin:
         self._spool_config_path = os.path.join(self._spool_dir, _SPOOL_CONFIG_NAME)
         self._test_names: dict[str, str] = {}
         self._used_test_names: set[str] = set()
+        self._captured_sections: dict[str, dict[tuple[str, str, int], CapturedSection]] = {}
+        self._capture_filename_counts: dict[str, dict[tuple[int, str, str], int]] = {}
+        self._pending_reruns: set[str] = set()
         self._upload_failed = False
         self._executor = None
         self._pending_uploads: dict[Future, PendingUpload] = {}
@@ -413,25 +423,41 @@ class UploadLogPlugin:
 
     def _format_report_content(self, message: str, content: str, failed: bool) -> str:
         if not failed:
-            return message
-        return f"{message}\n\nLast {_FAILED_OUTPUT_MAX_LINES} lines:\n{self._tail(content)}"
+            return f"{message}\n"
+        formatted = f"{message}\n\nLast {_FAILED_OUTPUT_MAX_LINES} lines:\n{self._tail(content)}"
+        if not formatted.endswith("\n"):
+            formatted += "\n"
+        return formatted
 
-    def _transform_section(
+    def _next_filename(
         self,
-        section_name: str,
-        content: str,
+        nodeid: str,
         stream_name: str,
         phase: str,
-        test_name: str,
-        failed: bool,
-        duplicate_index: int,
-    ) -> tuple[str, str]:
-        if self._should_inline(stream_name, content):
-            return section_name, content
+        attempt: int,
+    ) -> str:
+        counts = self._capture_filename_counts.setdefault(nodeid, {})
+        count_key = (attempt, stream_name, phase)
+        duplicate_index = counts.get(count_key, 0)
+        counts[count_key] = duplicate_index + 1
 
-        filename = f"{_STREAM_FILENAMES[stream_name]}-{phase}.log"
+        suffixes = []
+        if attempt > 1:
+            suffixes.append(f"attempt-{attempt}")
         if duplicate_index:
-            filename = f"{_STREAM_FILENAMES[stream_name]}-{phase}-{duplicate_index}.log"
+            suffixes.append(str(duplicate_index))
+
+        filename = f"{_STREAM_FILENAMES[stream_name]}-{phase}"
+        if suffixes:
+            filename += f"-{'-'.join(suffixes)}"
+        return f"{filename}.log"
+
+    def _upload_section(
+        self,
+        content: str,
+        test_name: str,
+        filename: str,
+    ) -> CapturedSection:
         source_path = self._write_spool_file(test_name, filename, content)
         filesize = os.path.getsize(source_path)
         object_key = self._object_key(test_name, filename)
@@ -439,12 +465,12 @@ class UploadLogPlugin:
 
         if self.skip_upload:
             message = f"{filesize} bytes (upload skipped, would upload to {file_url})"
-            return section_name, self._format_report_content(message, content, failed)
+            return CapturedSection(content, message)
 
         if self.upload_mode == "deferred":
             self._schedule_upload(source_path, object_key, test_name, filename)
             message = f"{filesize} bytes scheduled for upload to {file_url}"
-            return section_name, self._format_report_content(message, content, failed)
+            return CapturedSection(content, message)
 
         try:
             self._upload_source(source_path, object_key)
@@ -457,16 +483,25 @@ class UploadLogPlugin:
                 exc,
             )
             message = f"upload failed: {exc}\nsize: {filesize} bytes"
-            return section_name, self._format_report_content(message, content, True)
+            return CapturedSection(content, message, force_output=True)
 
         self._remove_source(source_path)
         message = f"{filesize} bytes uploaded to {file_url}"
-        return section_name, self._format_report_content(message, content, failed)
+        return CapturedSection(content, message)
+
+    @staticmethod
+    def _attempt(report) -> int:
+        rerun = getattr(report, "rerun", 0)
+        return rerun + 1 if isinstance(rerun, int) and rerun >= 0 else 1
 
     def _process_report(self, report, default_phase: str) -> None:
         nodeid = getattr(report, "nodeid", "unknown")
         test_name = self._test_name(nodeid)
         failed = getattr(report, "outcome", None) == "failed"
+        if getattr(report, "outcome", None) == "rerun":
+            self._pending_reruns.add(nodeid)
+        attempt = self._attempt(report)
+        captured_sections = self._captured_sections.setdefault(nodeid, {})
         duplicate_counts: dict[tuple[str, str], int] = {}
         transformed_sections = []
         for section_name, content in report.sections:
@@ -479,15 +514,34 @@ class UploadLogPlugin:
             duplicate_key = (stream_name, phase)
             duplicate_index = duplicate_counts.get(duplicate_key, 0)
             duplicate_counts[duplicate_key] = duplicate_index + 1
-            transformed_sections.append(
-                self._transform_section(
-                    section_name,
-                    content,
+            if self._should_inline(stream_name, content):
+                transformed_sections.append((section_name, content))
+                continue
+
+            section_key = (stream_name, phase, duplicate_index)
+            captured_section = captured_sections.get(section_key)
+            if captured_section is None or captured_section.content != content:
+                filename = self._next_filename(
+                    nodeid,
                     stream_name,
                     phase,
+                    attempt,
+                )
+                captured_section = self._upload_section(
+                    content,
                     test_name,
-                    failed,
-                    duplicate_index,
+                    filename,
+                )
+                captured_sections[section_key] = captured_section
+
+            transformed_sections.append(
+                (
+                    section_name,
+                    self._format_report_content(
+                        captured_section.message,
+                        content,
+                        failed or captured_section.force_output,
+                    ),
                 )
             )
         report.sections[:] = transformed_sections
@@ -503,10 +557,19 @@ class UploadLogPlugin:
     @pytest.hookimpl(tryfirst=True)
     def pytest_collectreport(self, report) -> None:
         self._process_report(report, "collect")
-        self._test_names.pop(getattr(report, "nodeid", "unknown"), None)
+        nodeid = getattr(report, "nodeid", "unknown")
+        self._test_names.pop(nodeid, None)
+        self._captured_sections.pop(nodeid, None)
+        self._capture_filename_counts.pop(nodeid, None)
+        self._pending_reruns.discard(nodeid)
 
     def pytest_runtest_logfinish(self, nodeid: str, location) -> None:
         self._test_names.pop(nodeid, None)
+        if nodeid in self._pending_reruns:
+            self._pending_reruns.remove(nodeid)
+            return
+        self._captured_sections.pop(nodeid, None)
+        self._capture_filename_counts.pop(nodeid, None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionfinish(self, session, exitstatus) -> None:
@@ -521,6 +584,9 @@ class UploadLogPlugin:
                 Path(self._spool_dir).parent.rmdir()
             except OSError:
                 pass
+        self._captured_sections.clear()
+        self._capture_filename_counts.clear()
+        self._pending_reruns.clear()
 
 
 def add_options(parser) -> None:
