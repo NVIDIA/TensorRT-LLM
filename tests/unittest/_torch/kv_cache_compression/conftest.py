@@ -449,7 +449,7 @@ def torch_tri_score_oracle(
 def make_phase_table(offsets, omega, initial_rows):
     """Build the mean-phase table dict exactly like the product's inlined
     form and grow it to cover positions ``[0, initial_rows)``."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         grow_mean_phase_table,
     )
 

@@ -43,7 +43,6 @@ from ..compaction import compact, init_compaction_buffers
 from .triattention_kernels import (
     _gather_mean_phase_kernel,
     _settle_ties_kernel,
-    grow_mean_phase_table,
     prepare_per_head_scores,
 )
 
@@ -82,6 +81,35 @@ def _allocate_block_offset_staging(
     host = torch.empty(shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned())
     device_table = torch.empty(shape, dtype=torch.int32, device=anchor_pool.device)
     return host, device_table
+
+
+_MEAN_PHASE_MAX_ROWS = 1 << 24
+
+
+def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
+    """Cover positions ``[0, rows)``, rebuilding the table if it must grow."""
+    rows = int(rows)
+    if rows <= phase["rows"]:
+        return
+    if rows > _MEAN_PHASE_MAX_ROWS:
+        raise ValueError(f"a {rows}-row mean-phase table exceeds the exact-FP32 position range")
+    target = 1
+    while target < rows:
+        target *= 2
+    target = min(max(target, 2 * phase["rows"]), _MEAN_PHASE_MAX_ROWS)
+    omega = phase["omega"]
+    positions = torch.arange(target, device=omega.device, dtype=torch.float32)
+    cos_table = torch.zeros((target, omega.numel()), dtype=torch.float32, device=omega.device)
+    sin_table = torch.zeros_like(cos_table)
+    # Fixed summation order keeps the table bit-stable across rebuilds.
+    for offset in phase["offset_values"]:
+        angle = torch.outer(positions + offset, omega)
+        cos_table += torch.cos(angle)
+        sin_table += torch.sin(angle)
+    scale = 1.0 / len(phase["offset_values"])
+    phase["cos"] = cos_table.mul_(scale)
+    phase["sin"] = sin_table.mul_(scale)
+    phase["rows"] = target
 
 
 def init_eviction_buffers(

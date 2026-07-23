@@ -5,17 +5,14 @@
 
 from __future__ import annotations
 
-from typing import Dict
-
 import torch
 import triton
 import triton.language as tl
 
-# ---- Mean-phase table: RoPE-style position table of mean trig phases ----
+# ---- Mean-phase gather: per-request phase-row fetch + width derivation ----
 
 
 # Positions past this row count are not exactly representable in fp32.
-_MEAN_PHASE_MAX_ROWS = 1 << 24
 
 # Score z-normalization epsilon; must stay a plain float (the CuTe DSL traces it).
 STD_EPSILON = 1e-6
@@ -55,32 +52,6 @@ def _gather_mean_phase_kernel(
     tl.store(valid_widths + request, tl.load(valid_seq_lens + request) - token_start)
     if HAS_SWA:
         tl.store(swa_destination_bases + request, token_start + swa_rebase_delta)
-
-
-def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
-    """Cover positions ``[0, rows)``, rebuilding the table if it must grow."""
-    rows = int(rows)
-    if rows <= phase["rows"]:
-        return
-    if rows > _MEAN_PHASE_MAX_ROWS:
-        raise ValueError(f"a {rows}-row mean-phase table exceeds the exact-FP32 position range")
-    target = 1
-    while target < rows:
-        target *= 2
-    target = min(max(target, 2 * phase["rows"]), _MEAN_PHASE_MAX_ROWS)
-    omega = phase["omega"]
-    positions = torch.arange(target, device=omega.device, dtype=torch.float32)
-    cos_table = torch.zeros((target, omega.numel()), dtype=torch.float32, device=omega.device)
-    sin_table = torch.zeros_like(cos_table)
-    # Fixed summation order keeps the table bit-stable across rebuilds.
-    for offset in phase["offset_values"]:
-        angle = torch.outer(positions + offset, omega)
-        cos_table += torch.cos(angle)
-        sin_table += torch.sin(angle)
-    scale = 1.0 / len(phase["offset_values"])
-    phase["cos"] = cos_table.mul_(scale)
-    phase["sin"] = sin_table.mul_(scale)
-    phase["rows"] = target
 
 
 # ---- Selection: combine scores per mode, then finalize the top-k set ----
