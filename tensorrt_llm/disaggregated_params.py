@@ -4,11 +4,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-# isort: off
-# needed before trying to import bindings to load tensorrt_libs
-import tensorrt as trt  # noqa
-# isort: on
-
 from tensorrt_llm.bindings import executor as tllme
 
 

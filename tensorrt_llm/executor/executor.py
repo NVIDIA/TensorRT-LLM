@@ -1,6 +1,8 @@
 import atexit
 import faulthandler
+import json
 import multiprocessing
+import os
 import platform
 import signal
 import traceback
@@ -20,7 +22,6 @@ from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -529,7 +530,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
@@ -560,6 +561,35 @@ class GenerationExecutor(ABC):
             logger_debug(
                 f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
                 "green")
+
+        # Multi-frontend serving: attach to an already-running executor
+        # instead of launching one (set by trtllm-serve for attached
+        # frontend processes).
+        attach_env = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
+        if attach_env:
+            attach_info = json.loads(attach_env)
+            # Consumed: it carries the HMAC keys and must not leak into
+            # descendant processes.
+            os.environ.pop("TLLM_EXECUTOR_ATTACH_INFO", None)
+            if attach_info.get("mode") != "classic":
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO only supports the classic IPC "
+                    f"executor path, got mode={attach_info.get('mode')!r}")
+            from .proxy import GenerationExecutorFrontendProxy
+            frontend_id_env = os.getenv("TLLM_EXECUTOR_FRONTEND_ID")
+            if frontend_id_env is None:
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO is set but "
+                    "TLLM_EXECUTOR_FRONTEND_ID is not; both are set together "
+                    "by trtllm-serve when spawning attached frontends.")
+            frontend_id = int(frontend_id_env)
+            logger.info(f"Attaching executor frontend {frontend_id} to the "
+                        "running classic IPC worker")
+            return GenerationExecutorFrontendProxy(
+                attach_info,
+                frontend_id=frontend_id,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
 
         worker_kwargs = {
             "engine": engine,
@@ -652,7 +682,7 @@ class GenerationExecutor(ABC):
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
-                mpi_session=None,  # use mpi4py
+                mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
@@ -662,13 +692,17 @@ class GenerationExecutor(ABC):
             mpi_session = ProcessPoolExecutorSession(n_workers=1,
                                                      mp_context=ctx)
             # TODO: add rpc worker here
-            return GenerationExecutor._create_ipc_executor(
+            executor = GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
+            # The session was created right here with no outer owner, so the
+            # proxy must shut it down despite it arriving as "external".
+            executor._owns_mpi_session = True
+            return executor
 
     def wait_first_completed(
         self, futures: List[GenerationResult]

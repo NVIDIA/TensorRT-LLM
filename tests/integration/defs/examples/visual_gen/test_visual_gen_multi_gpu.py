@@ -14,7 +14,9 @@
 # limitations under the License.
 """Multi-GPU integration tests for VisualGen LPIPS quality checks."""
 
+import glob
 import os
+import sys
 from typing import Callable
 
 import pytest
@@ -39,16 +41,21 @@ from defs.examples.visual_gen.test_visual_gen import (
     _save_lpips_video_mp4,
 )
 
-try:
-    from tensorrt_llm._utils import get_free_port
+
+def _parallel_config(**kwargs):
+    # Imported lazily so that mp.spawn child processes resolve tensorrt_llm only after
+    # _distributed_worker has prepended the installed-wheel location to sys.path. A
+    # module-level tensorrt_llm import would run during the child's module re-import
+    # (before sys.path is fixed) and resolve to the bindings-less source tree.
     from tensorrt_llm.visual_gen.args import ParallelConfig
 
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+    return ParallelConfig(**kwargs)
+
 
 # Keep it as 0.25 as the worst case scenario at NVL72 scale
 WAN_MULTI_GPU_LPIPS_THRESHOLD = 0.25
+WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
+WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
 WAN22_LPIPS_MULTI_GPU_VARIANTS = [
     ("ulysses4", {"ulysses_size": 4}),
     ("cfg2_ulysses2", {"cfg_size": 2, "ulysses_size": 2}),
@@ -59,6 +66,7 @@ WAN22_LPIPS_MULTI_GPU_VARIANTS = [
 
 WAN22_LPIPS_TP_VARIANTS = [
     ("tp2", {"tp_size": 2}),
+    ("tp3", {"tp_size": 3}),
     ("cfg2_tp2", {"cfg_size": 2, "tp_size": 2}),
     ("tp2_ulysses2", {"tp_size": 2, "ulysses_size": 2}),
 ]
@@ -90,7 +98,37 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
+def _validated_tllm_site(site_dir):
+    """Return the realpath of ``site_dir`` after verifying it holds the installed wheel.
+
+    The spawn workers rely on this directory to import tensorrt_llm with compiled
+    bindings; accepting an arbitrary path would let the import silently fall through
+    to the bindings-less source tree, so reject anything that does not contain the
+    package plus its compiled bindings extension.
+    """
+    resolved = os.path.realpath(site_dir) if site_dir else ""
+    package_init = os.path.join(resolved, "tensorrt_llm", "__init__.py")
+    bindings = glob.glob(os.path.join(resolved, "tensorrt_llm", "bindings*.so")) + glob.glob(
+        os.path.join(resolved, "tensorrt_llm", "bindings", "*.so")
+    )
+    if not (resolved and os.path.isfile(package_init) and bindings):
+        raise RuntimeError(
+            f"tllm_site={site_dir!r} does not contain an installed tensorrt_llm package "
+            "with compiled bindings; spawn workers would import the bindings-less "
+            "source tree instead of the wheel."
+        )
+    return resolved
+
+
+def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs, tllm_site):
+    # mp.spawn starts a fresh interpreter whose sys.path (set up by the integration
+    # `defs` harness) puts the source checkout ahead of the installed wheel, so a bare
+    # `import tensorrt_llm` would resolve to the bindings-less source tree and crash the
+    # worker. Prepend the parent's installed-package location so the child imports
+    # tensorrt_llm (with compiled bindings) from the wheel before any such import.
+    tllm_site = _validated_tllm_site(tllm_site)
+    sys.path[:] = [path for path in sys.path if os.path.realpath(path) != tllm_site]
+    sys.path.insert(0, tllm_site)
     try:
         init_distributed_worker(rank, world_size, backend, port)
         test_fn(rank, world_size, **kwargs)
@@ -102,22 +140,32 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, kwargs):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True, **kwargs):
-    if not MODULES_AVAILABLE:
+    try:
+        import tensorrt_llm.bindings as tllm_bindings
+        from tensorrt_llm._utils import get_free_port
+    except ImportError:
         pytest.skip("Required modules not available")
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     backend = "nccl" if use_cuda else "gloo"
     port = get_free_port()
+    # Directory containing the installed tensorrt_llm package (i.e. site-packages),
+    # passed to spawn workers so they prepend it to sys.path and import the wheel with
+    # compiled bindings instead of the source-tree package. Validated here as well so a
+    # bad environment fails before any worker is spawned.
+    tllm_site = _validated_tllm_site(
+        os.path.dirname(os.path.dirname(os.path.abspath(tllm_bindings.__file__)))
+    )
     mp.spawn(
         _distributed_worker,
-        args=(world_size, backend, test_fn, port, kwargs),
+        args=(world_size, backend, test_fn, port, kwargs, tllm_site),
         nprocs=world_size,
         join=True,
     )
 
 
 def _skip_if_insufficient_gpus_for_parallel(parallel):
-    parallel_cfg = ParallelConfig(**parallel)
+    parallel_cfg = _parallel_config(**parallel)
     required = parallel_cfg.n_workers
     available = torch.cuda.device_count()
     if available < required:
@@ -128,7 +176,7 @@ def _skip_if_insufficient_gpus_for_parallel(parallel):
 
 def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> None:
     parallel = kwargs["parallel"]
-    ParallelConfig(**parallel).validate_world_size(world_size)
+    _parallel_config(**parallel).validate_world_size(world_size)
 
     generated_video = _run_wan_lpips_pipeline(
         kwargs["model_path"],
@@ -140,8 +188,9 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
         kwargs["num_inference_steps"],
         kwargs["guidance_scale"],
         kwargs["seed"],
-        attention_backend="FA4",
+        attention_backend=WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND,
         parallel=parallel,
+        fully_eager=True,
     )
 
     if rank == 0:
@@ -160,10 +209,12 @@ def _wan22_lpips_distributed_worker(rank: int, world_size: int, **kwargs) -> Non
 
 def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     _skip_if_insufficient_gpus_for_parallel(parallel)
-    parallel_cfg = ParallelConfig(**parallel)
+    parallel_cfg = _parallel_config(**parallel)
     generated_path = tmp_path / f"wan22_t2v_generated_{variant_name}.mp4"
     golden_path = _golden_media_path(
-        tmp_path, "wan22_t2v_lpips_golden_video.mp4", "Wan 2.2 LPIPS golden video"
+        tmp_path,
+        WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO,
+        "Wan 2.2 FA4 fully-eager LPIPS golden video",
     )
 
     run_test_in_distributed(
@@ -200,7 +251,9 @@ def _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel):
     WAN22_LPIPS_MULTI_GPU_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_MULTI_GPU_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parallel):
+def test_wan22_t2v_lpips_against_golden_multi_gpu(
+    _visual_gen_deps, tmp_path, variant_name, parallel
+):
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)
 
 
@@ -209,5 +262,5 @@ def test_wan22_t2v_lpips_against_golden_multi_gpu(tmp_path, variant_name, parall
     WAN22_LPIPS_TP_VARIANTS,
     ids=[name for name, _ in WAN22_LPIPS_TP_VARIANTS],
 )
-def test_wan22_t2v_lpips_against_golden_tp(tmp_path, variant_name, parallel):
+def test_wan22_t2v_lpips_against_golden_tp(_visual_gen_deps, tmp_path, variant_name, parallel):
     _run_wan22_t2v_lpips_case(tmp_path, variant_name, parallel)

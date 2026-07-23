@@ -15,8 +15,15 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
+    _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
+    _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.quantization import QuantAlgo
 
 
@@ -112,21 +119,30 @@ class _DummyKvCacheCreator:
 class _DummyModelEngine:
     """Mock model engine that exposes attention runtime features and model configuration."""
 
-    def __init__(self, *, attn_runtime_features, kv_cache_quant_algo):
+    def __init__(
+        self,
+        *,
+        attn_runtime_features,
+        kv_cache_quant_algo,
+        enable_flash_mla=False,
+        max_seq_len=128,
+    ):
         """Initialize with runtime features and quantization algorithm.
 
         Args:
             attn_runtime_features: AttentionRuntimeFeatures instance.
             kv_cache_quant_algo: Quantization algorithm for KV cache.
+            enable_flash_mla: Whether to emulate the FlashMLA block-size override.
+            max_seq_len: Effective sequence length reported by the model engine.
         """
         self.attn_runtime_features = attn_runtime_features
-        self.max_seq_len = 128
+        self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
         self.sparse_attention_config = None
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
-                enable_flash_mla=False,
+                enable_flash_mla=enable_flash_mla,
                 is_generation=True,
                 pretrained_config=SimpleNamespace(),
                 quant_config=SimpleNamespace(kv_cache_quant_algo=kv_cache_quant_algo),
@@ -166,6 +182,7 @@ def _make_llm_args():
         trust_remote_code=False,
         mm_encoder_only=False,
         enable_chunked_prefill=False,
+        sparse_attention_config=None,
         attn_backend="TRTLLM",
         speculative_config=None,
         disable_overlap_scheduler=True,
@@ -178,15 +195,23 @@ def _make_llm_args():
             calibration_layer_indices=None,
         ),
         sampler_type=None,
-        disable_flashinfer_sampling=False,
         cuda_graph_config=None,
         parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
         get_runtime_sizes=lambda: (1, 128, 128, 4),
     )
 
 
-def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
-    """Execute create_py_executor with mocked dependencies and return cache reuse flags.
+def _run_create_py_executor(
+    monkeypatch,
+    *,
+    sm_version,
+    kv_cache_quant_algo,
+    cache_transceiver_config=None,
+    enable_flash_mla=False,
+    model_max_seq_len=128,
+    enable_chunked_prefill=False,
+):
+    """Execute create_py_executor with mocked dependencies and return MLA runtime flags.
 
     Mocks all external dependencies (model engine, resource managers, etc.) to isolate
     executor creation logic and verify that KV cache reuse configuration is synchronized
@@ -196,11 +221,18 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         monkeypatch: pytest fixture for mocking.
         sm_version: CUDA SM version to simulate (e.g., 89, 90).
         kv_cache_quant_algo: Quantization algorithm to use (e.g., NO_QUANT, INT8).
+        cache_transceiver_config: Optional transceiver configuration to mutate.
+        enable_flash_mla: Whether to emulate the FlashMLA block-size override.
+        model_max_seq_len: Effective sequence length reported by the model engine.
+        enable_chunked_prefill: Whether to request MLA chunked prefill support.
 
     Returns:
-        Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag) from created executor.
+        Tuple of (kv_cache_reuse_flag, runtime_cache_reuse_flag,
+        runtime_chunked_prefill_flag) from created executor.
     """
     llm_args = _make_llm_args()
+    llm_args.cache_transceiver_config = cache_transceiver_config
+    llm_args.enable_chunked_prefill = enable_chunked_prefill
     fake_mapping = SimpleNamespace(
         rank=0,
         tp_size=1,
@@ -249,6 +281,8 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
         return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"],
             kv_cache_quant_algo=kv_cache_quant_algo,
+            enable_flash_mla=enable_flash_mla,
+            max_seq_len=model_max_seq_len,
         )
 
     monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
@@ -276,6 +310,7 @@ def _run_create_py_executor(monkeypatch, *, sm_version, kv_cache_quant_algo):
     return (
         kv_cache_manager.enable_block_reuse,
         py_executor.model_engine.attn_runtime_features.cache_reuse,
+        py_executor.model_engine.attn_runtime_features.chunked_prefill,
     )
 
 
@@ -288,7 +323,7 @@ def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
 
     This test ensures invariant synchronization is maintained across the fallback.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=89,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
@@ -308,7 +343,7 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
 
     This test ensures invariant synchronization is maintained across the fallback.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
         sm_version=90,
         kv_cache_quant_algo=QuantAlgo.INT8,
@@ -318,21 +353,93 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
     assert runtime_cache_reuse is False
 
 
-def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch):
-    """Verify MLA supported configuration preserves cache reuse in both config and runtime.
+@pytest.mark.parametrize("sm_version", _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
+def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch, sm_version):
+    """Verify every supported MLA SM preserves cache reuse in both config and runtime.
 
-    When both SM version (90) and KV quantization (NO_QUANT) are supported for MLA,
-    no fallback occurs and:
+    When the SM version is in the MLA allowlist and KV quantization is
+    NO_QUANT, no unsupported-SM fallback should occur and:
     - kv_cache_config.enable_block_reuse remains True
     - model_engine.attn_runtime_features.cache_reuse remains True
-
-    This positive test ensures the default path does not regress.
     """
-    kv_cache_reuse, runtime_cache_reuse = _run_create_py_executor(
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
         monkeypatch,
-        sm_version=90,
+        sm_version=sm_version,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
     )
 
     assert kv_cache_reuse is True
     assert runtime_cache_reuse is True
+
+
+def test_default_transceiver_buffer_rounds_up_to_tokens_per_block(monkeypatch):
+    config = CacheTransceiverConfig()
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        cache_transceiver_config=config,
+        model_max_seq_len=130,
+    )
+
+    assert config.max_tokens_in_buffer == 160
+
+
+def test_default_transceiver_buffer_uses_flash_mla_block_size(monkeypatch):
+    config = CacheTransceiverConfig()
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        cache_transceiver_config=config,
+        enable_flash_mla=True,
+        model_max_seq_len=130,
+    )
+
+    assert config.max_tokens_in_buffer == 192
+
+
+def test_explicit_transceiver_buffer_size_is_preserved(monkeypatch):
+    config = CacheTransceiverConfig(max_tokens_in_buffer=256)
+
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=90,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        cache_transceiver_config=config,
+        enable_flash_mla=True,
+        model_max_seq_len=130,
+    )
+
+    assert config.max_tokens_in_buffer == 256
+
+
+@pytest.mark.parametrize("sm_version", _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
+def test_mla_supported_configuration_preserves_chunked_prefill(monkeypatch, sm_version):
+    """Verify every supported MLA SM preserves chunked prefill when requested."""
+    _, _, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=sm_version,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        enable_chunked_prefill=True,
+    )
+
+    assert runtime_chunked_prefill is True
+
+
+def test_mla_sm121_fallback_preserves_cache_reuse_and_disables_chunked_prefill(
+    monkeypatch,
+):
+    """Verify SM121 keeps cache reuse while disabling unsupported chunked prefill."""
+    kv_cache_reuse, runtime_cache_reuse, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=121,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        enable_chunked_prefill=True,
+    )
+
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
+    assert runtime_chunked_prefill is False

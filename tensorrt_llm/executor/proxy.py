@@ -16,6 +16,8 @@ import atexit
 import concurrent.futures
 import json
 import os
+import shutil
+import tempfile
 import threading
 import weakref
 from queue import Empty
@@ -29,7 +31,8 @@ from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
-                                  RemoteMpiCommSessionClient)
+                                  RemoteMpiCommSessionClient,
+                                  validate_session_world_size)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
@@ -40,13 +43,17 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+from .utils import (EngineDeadError, ErrorResponse, RequestError,
+                    WorkerCommIpcAddrs, create_mpi_comm_session,
+                    get_spawn_proxy_process_env, is_llm_response,
+                    multi_frontend_request_addr, multi_frontend_result_addr,
+                    namespace_client_id, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
+from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
 __all__ = [
     "GenerationExecutorProxy",
+    "GenerationExecutorFrontendProxy",
 ]
 
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
@@ -116,6 +123,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+        self._owns_mpi_session = mpi_session is None
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
@@ -125,6 +133,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            # submit() launches one worker task per pool worker, so an
+            # external session must match the model's world size exactly;
+            # fail loudly instead of starting the wrong number of executors.
+            validate_session_world_size(mpi_session, model_world_size)
             logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
@@ -139,6 +151,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
+        # Sticky engine-dead flag: once a worker death is recorded, pending and
+        # new requests fail fast with EngineDeadError instead of blocking on a
+        # response queue whose producer is gone.
+        self._engine_dead = False
 
         self.model_world_size = model_world_size
 
@@ -148,6 +164,24 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
+
+        # Multi-frontend serving: this launcher proxy owns the shared ipc
+        # dir + HMAC key for the per-frontend endpoints (_setup_queues);
+        # trtllm-serve hands them to the attached frontends via
+        # multi_frontend_attach_info().
+        self._num_frontends = (_llm_args.num_serve_frontends
+                               if _llm_args is not None else 1)
+        self._multi_frontend_ipc_dir: Optional[str] = None
+        self._multi_frontend_hmac: Optional[bytes] = None
+        if self._num_frontends > 1:
+            if self._enable_resource_governor:
+                raise ValueError(
+                    "Multi-frontend serving does not support "
+                    "enable_resource_governor: the resource-governor signal "
+                    "only reaches the launcher frontend.")
+            self._multi_frontend_ipc_dir = tempfile.mkdtemp(
+                prefix="trtllm_frontends_")
+            self._multi_frontend_hmac = os.urandom(32)
 
         # Generate RPC address and key for stats RPC
         self.rpc_addr = get_unique_ipc_addr()
@@ -165,6 +199,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
+        self._worker_process_monitor = WorkerProcessMonitor()
         self._start_executor_workers(worker_kwargs)
 
         # Create RPC client after workers are started (worker starts RPC server)
@@ -213,6 +248,19 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return True
         return False
 
+    def _check_mpi_workers(self) -> bool:
+        """Check OS process handles and MPI futures for worker death."""
+        dead_worker = self._worker_process_monitor.find_dead_worker()
+        if dead_worker is not None:
+            self._set_fatal_error(
+                RuntimeError("MPI worker rank "
+                             f"{dead_worker.rank} (pid {dead_worker.pid}) "
+                             "exited unexpectedly"))
+            if not self.doing_shutdown:
+                self.pre_shutdown()
+            return True
+        return self._check_mpi_futures()
+
     def _drain_error_queue(self) -> bool:
         """Drain all queued errors, skipping per-request errors.
 
@@ -255,26 +303,117 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._drain_error_queue():
             return self._fatal_error is None and not self.doing_shutdown
 
-        if self._check_mpi_futures():
+        if self._check_mpi_workers():
             return False
 
         return True
 
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Record the fatal error, then unblock every pending request.
+
+        Extends the base behavior so that the instant a worker death is
+        recorded (from the error monitor, a health check, or a crashed future),
+        all pending GenerationResults fail fast with EngineDeadError rather than
+        blocking forever on a response queue whose producer is gone.
+        """
+        super()._set_fatal_error(error)
+        self._mark_engine_dead(error)
+
+    def _mark_engine_dead(self, error: Optional[BaseException] = None) -> None:
+        """Set the sticky flag and push EngineDeadError onto pending results."""
+        if self._engine_dead:
+            return
+        self._engine_dead = True
+        dead_error = EngineDeadError(error)
+        # Snapshot to avoid mutation-during-iteration; best-effort per result.
+        # Use put() (not put_nowait()) so the async _SyncQueue path also wakes
+        # the awaiting event loop, not just the sync Queue path.
+        for result in list(self._results.values()):
+            try:
+                result.queue.put(dead_error)
+            except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
+                pass
+        # Release the session's exit joins here, not at teardown: interpreter
+        # exit joins non-daemon threads before any teardown code runs, so a
+        # wedged pool manager thread must be deregistered while user code is
+        # still alive. Non-destructive, hence safe for unowned sessions.
+        release = getattr(getattr(self, 'mpi_session', None),
+                          'release_exit_joins', None)
+        if release is not None:
+            try:
+                release()
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(
+                    f"MPI session exit-join release failed (ignored): {e!r}")
+
+    def _handle_worker_death(self, error: BaseException) -> None:
+        """Event-driven worker-death handler.
+
+        Runs from the MPI future's done-callback thread the instant a worker
+        process exits. Enqueues the error for the monitor loop to record (which
+        drives pre_shutdown) and immediately broadcasts EngineDeadError to
+        pending requests, so they fail fast without waiting for the next poll
+        tick. Propagation is therefore no longer gated by the poll interval.
+        """
+        self._error_queue.put_nowait(error)
+        self._mark_engine_dead(error)
+
+    def _check_remote_worker_death(self) -> bool:
+        """Poll a remote (pre-spawned) MPI session for forwarded worker deaths.
+
+        Under ``TLLM_SPAWN_PROXY_PROCESS=1`` / ``trtllm-llmapi-launch`` the
+        session is a ``RemoteMpiCommSessionClient`` whose ``submit()`` returns
+        no futures, so the ``mpi_done_callback`` path never fires and
+        ``_check_mpi_futures()`` has nothing to watch. The remote server
+        forwards worker exceptions over its control socket instead
+        (``RemoteWorkerDeath``); surface them here into the same fast-death
+        path so this deployment mode gets identical EngineDeadError behavior.
+
+        Returns:
+            True if a dead worker was detected.
+        """
+        check = getattr(self.mpi_session, "check_worker_error", None)
+        if check is None:
+            return False
+        try:
+            error = check()
+        except Exception as exc:  # noqa: BLE001 - monitor must not die
+            logger.debug(f"check_worker_error failed (ignored): {exc!r}")
+            return False
+        if error is None:
+            return False
+        logger.error(f"Remote MPI worker death reported: {error!r}")
+        self._handle_worker_death(error)
+        self._set_fatal_error(error)
+        if not self.doing_shutdown:
+            self.pre_shutdown()
+        return True
+
     def _error_monitor_loop(self) -> None:
-        """Background thread that polls for fatal errors every ~5 seconds.
+        """Background thread that reaps a dead engine and drives pre_shutdown.
 
-        Checks MPI worker futures and drains the error queue using
-        the shared ``_check_mpi_futures()`` and ``_drain_error_queue()``
-        helpers.
+        Checks local MPI worker process handles and futures, remote-session
+        worker-death notifications, and the error queue using the shared
+        ``_check_mpi_workers()``, ``_check_remote_worker_death()`` and
+        ``_drain_error_queue()`` helpers.
 
-        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop,
-        so shutdown is immediate rather than waiting up to 5 seconds.
+        Propagation to pending requests is event-driven via
+        ``_handle_worker_death`` (the MPI future done-callback) where futures
+        exist; for remote sessions it is bounded by this loop's poll interval.
+        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop, so
+        shutdown is immediate.
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
-                if self._check_mpi_futures():
+                if self._check_mpi_workers():
                     logger.error("Error monitor: MPI worker crash detected, "
                                  "shutting down")
+                    return
+
+                if self._check_remote_worker_death():
+                    logger.error(
+                        "Error monitor: remote MPI worker death detected, "
+                        "shutting down")
                     return
 
                 self._drain_error_queue()
@@ -284,48 +423,107 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger.debug(f"Error monitor: unexpected exception (ignored): "
                              f"{exc!r}")
 
-            # Wait up to 5s, but wake immediately if _shutdown_event is set
+            # Backstop poll only; the latency-sensitive propagation path is
+            # event-driven (see _handle_worker_death), so a coarse interval is
+            # fine. Wakes immediately if _shutdown_event is set.
             self._shutdown_event.wait(timeout=5.0)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
-
-        self.request_queue = IpcQueue(is_server=True,
-                                      name="proxy_request_queue")
+        frontend_result_addrs = None
+        if self._num_frontends > 1:
+            # The rank0 worker BINDS the request ingress (PULL) so every
+            # frontend can PUSH-connect; each frontend (incl. this launcher,
+            # frontend 0) binds its own result lane (PULL).
+            ipc_dir = self._multi_frontend_ipc_dir
+            hmac_key = self._multi_frontend_hmac
+            request_addr = (multi_frontend_request_addr(ipc_dir), hmac_key)
+            frontend_result_addrs = [(multi_frontend_result_addr(ipc_dir,
+                                                                 i), hmac_key)
+                                     for i in range(self._num_frontends)]
+            self.request_queue = IpcQueue(request_addr,
+                                          is_server=False,
+                                          socket_type=zmq.PUSH,
+                                          name="proxy_request_queue")
+            self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
+                                              is_server=True,
+                                              fuse_message=False,
+                                              socket_type=zmq.PULL,
+                                              name="proxy_result_queue")
+        else:
+            request_addr = None
+            self.request_queue = IpcQueue(is_server=True,
+                                          name="proxy_request_queue")
+            # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
+            # Use PULL mode when enable_postprocess_parallel as there are
+            # multiple senders from multiple processes.
+            self.result_queue = FusedIpcQueue(
+                is_server=True,
+                fuse_message=False,
+                socket_type=zmq.PULL
+                if self.enable_postprocess_parallel else zmq.PAIR,
+                name="proxy_result_queue")
         self.worker_init_status_queue = IpcQueue(
             is_server=True,
             socket_type=zmq.ROUTER,
             name="worker_init_status_queue")
-        # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
-        # Use PULL mode when enable_postprocess_parallel as there are
-        # multiple senders from multiple processes.
-        self.result_queue = FusedIpcQueue(
-            is_server=True,
-            fuse_message=False,
-            socket_type=zmq.PULL
-            if self.enable_postprocess_parallel else zmq.PAIR,
-            name="proxy_result_queue")
         self._resource_governor_queue = IpcQueue(
             is_server=True, name="proxy_resource_governor_queue"
         ) if self._enable_resource_governor else None
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
-            request_queue_addr=self.request_queue.address,
+            # A connect-mode queue has no bound .address; use the preset one.
+            request_queue_addr=request_addr
+            if request_addr is not None else self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
             resource_governor_queue_addr=self._resource_governor_queue.address
             if self._resource_governor_queue is not None else None,
+            frontend_result_queue_addrs=frontend_result_addrs,
         )
+
+    def multi_frontend_attach_info(self) -> Optional[dict]:
+        """The attach payload consumed by attached serving frontends.
+
+        See GenerationExecutorFrontendProxy and commands/serve.py. Returns
+        None unless multi-frontend mode is active.
+        """
+        if self._num_frontends <= 1:
+            return None
+        ipc_dir = self._multi_frontend_ipc_dir
+        hmac_key = self._multi_frontend_hmac
+        return {
+            "mode":
+            "classic",
+            "request_addr":
+            multi_frontend_request_addr(ipc_dir),
+            "result_addrs": [
+                multi_frontend_result_addr(ipc_dir, i)
+                for i in range(self._num_frontends)
+            ],
+            "hmac_key":
+            hmac_key.hex(),
+            # Attached frontends must apply the same collective_rpc guard
+            # as the launcher (see _check_collective_rpc_guard).
+            "model_world_size":
+            self.model_world_size,
+            # Stats / KV events / disagg params RPC endpoint on the rank0
+            # worker (ROUTER socket, natively multi-client).
+            "rpc_addr":
+            self.rpc_addr,
+            "rpc_hmac_key":
+            self.hmac_key.hex(),
+        }
 
     @property
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
     def abort_request(self, request_id: int) -> None:
-        ''' Abort a request by sending a cancelling request to the request queue.
+        """Abort a request by sending a cancelling request to the request queue.
 
         Args:
             request_id (int): The id of the request to abort.
-        '''
+        """
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
@@ -414,7 +612,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             # will not block.
             if future.exception() is not None:
                 if self_ := self_ref():
-                    self_._error_queue.put_nowait(future.exception())
+                    self_._handle_worker_death(future.exception())
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
@@ -446,7 +644,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         while True:
             if self.worker_init_status_queue.poll(1):
-                ready_signal, error_trace = self.worker_init_status_queue.get()
+                status = self.worker_init_status_queue.get()
                 # Send ACK to the worker
                 self.worker_init_status_queue.put("ACK")
                 logger.info("get signal from executor worker")
@@ -456,11 +654,30 @@ class GenerationExecutorProxy(GenerationExecutor):
                 raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
+        ready_signal, error_trace = status[:2]
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
-            self.mpi_session.shutdown_abort(reason=ready_signal)
+            # Only abort a session this proxy created; an externally owned
+            # (shared) session must stay alive for its owner to tear down.
+            if self._owns_mpi_session:
+                self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
+
+        self._register_worker_processes(status)
+
+    def _register_worker_processes(self, status: tuple) -> None:
+        """Register identities returned by locally spawned MPI workers.
+
+        Test session reuse replaces this module's ``MpiPoolSession`` class
+        reference with a factory, so identify pool-backed sessions by excluding
+        the external communication session types.
+        """
+        if not isinstance(
+                self.mpi_session,
+            (MpiCommSession, RemoteMpiCommSessionClient)) and len(status) == 3:
+            worker_process_identities: List[WorkerProcessIdentity] = status[2]
+            self._worker_process_monitor.register(worker_process_identities)
 
     def _abort_all_requests(self):
         # The results can be finished during this loop, so self._results may be changed.
@@ -476,6 +693,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         else:
             self.doing_shutdown = True
+
+        self._worker_process_monitor.close()
 
         # Wake the error monitor thread immediately so it exits cleanly
         if hasattr(self, '_shutdown_event'):
@@ -502,8 +721,28 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
 
+    def _get_next_client_id(self) -> int:
+        client_id = super()._get_next_client_id()
+        if self._num_frontends > 1:
+            # Lane 0 follows the same namespace rule as attached frontends
+            # so a long-lived counter can never bleed into the frontend-id
+            # bits (a no-op re-encode until the counter wraps).
+            client_id = namespace_client_id(0, client_id)
+        return client_id
+
+    def _cleanup_multi_frontend_ipc_dir(self):
+        """Remove the launcher-owned multi-frontend ipc directory.
+
+        Unlinking ipc socket paths does not disturb established zmq
+        connections; it only prevents new connects.
+        """
+        if self._multi_frontend_ipc_dir is not None:
+            shutil.rmtree(self._multi_frontend_ipc_dir, ignore_errors=True)
+            self._multi_frontend_ipc_dir = None
+
     def shutdown(self):
         if not self.workers_started:
+            self._cleanup_multi_frontend_ipc_dir()
             return
 
         if not self.doing_shutdown:
@@ -511,7 +750,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
+        # An abruptly-killed worker world (MPI_Abort, SIGKILL, OOM) never
+        # completes its mpi4py futures: give them one short collective grace
+        # instead of blocking on each, and skip the ones still pending.
+        if self._engine_dead:
+            concurrent.futures.wait(self.mpi_futures, timeout=5.0)
+
         for f in self.mpi_futures:
+            if self._engine_dead and not f.done():
+                continue
             try:
                 f.result()
             except:
@@ -528,7 +775,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
         ):
             self.dispatch_result_thread.stop()
-            self.dispatch_result_thread.join()
+            # With the engine dead, the shutdown sentinel will never arrive
+            # and the dispatcher may be blocked in a ZMQ recv forever: bound
+            # the join and leak the daemon thread.
+            self.dispatch_result_thread.join(
+                timeout=5.0 if self._engine_dead else None)
 
         # step3: finish all remaining work
 
@@ -543,9 +794,15 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.result_queue.close()
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
+        self._cleanup_multi_frontend_ipc_dir()
 
         self.workers_started = False
-        self.mpi_session.shutdown()
+        if self._owns_mpi_session:
+            if self._engine_dead:
+                # Anything joining a dead worker world blocks forever.
+                self.mpi_session.abandon()
+            else:
+                self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
@@ -560,6 +817,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             Forwards the request to the workers through the request queue.
         """
 
+        # Sticky fast-fail: don't accept new work once the engine is known dead.
+        if self._engine_dead or self._fatal_error is not None:
+            raise EngineDeadError(self._fatal_error)
+
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
@@ -572,6 +833,15 @@ class GenerationExecutorProxy(GenerationExecutor):
             disaggregated_params=request.disaggregated_params,
             logprob_params=logprob_params)
         self._results[request.id] = result
+
+        # Close the submit-vs-death race: _mark_engine_dead() runs on the
+        # error-monitor thread and its one-shot sweep snapshots _results, so a
+        # result registered just after that snapshot would never be unblocked
+        # and would hang forever on a dead worker. Re-check after registering
+        # and fail fast if the engine died in that window.
+        if self._engine_dead or self._fatal_error is not None:
+            self._results.pop(request.id, None)
+            raise EngineDeadError(self._fatal_error)
 
         with nvtx_range_debug("request_queue.put"):
             self.request_queue.put(request)
@@ -769,3 +1039,126 @@ class GenerationExecutorProxy(GenerationExecutor):
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
         return False  # propagate the exception
+
+
+class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
+    """An attached serving frontend for the classic IPC executor path.
+
+    Used for multi-frontend serving (num_serve_frontends > 1).
+    PUSH-connects to the request ingress bound by the rank0 worker and binds
+    its own per-frontend result lane (PULL); the worker routes responses to
+    this lane by the frontend id embedded in the top bits of client_id (see
+    utils.namespace_client_id). It never owns the engine: no MPI
+    session, no worker launch, and shutdown never emits the worker's None
+    shutdown sentinel -- that right is the launcher frontend's alone.
+    """
+
+    def __init__(
+        self,
+        attach_info: dict,
+        *,
+        frontend_id: int,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
+    ) -> None:
+        num_lanes = len(attach_info["result_addrs"])
+        if not 0 < frontend_id < num_lanes:
+            raise ValueError(
+                f"frontend_id {frontend_id} out of range: attached frontends "
+                f"use ids 1..{num_lanes - 1} (id 0 is the launcher)")
+        postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
+        )
+        # Deliberately skip GenerationExecutorProxy.__init__: it creates an
+        # MPI session, launches workers, and registers the pre_shutdown
+        # atexit hook that emits the engine shutdown sentinel.
+        GenerationExecutor.__init__(
+            self,
+            num_postprocess_workers=postproc_worker_config.
+            num_postprocess_workers,
+            postprocess_tokenizer_dir=postproc_worker_config.
+            postprocess_tokenizer_dir,
+            is_llm_executor=is_llm_executor)
+
+        # State consumed by methods inherited from GenerationExecutorProxy
+        # (submit / check_health / collective_rpc). The engine lives with
+        # the launcher: there are no local MPI workers, so the monitor
+        # stays empty and worker death reaches this frontend through its
+        # result lane / error queue instead.
+        self._engine_dead = False
+        self.model_world_size = attach_info.get("model_world_size", 1)
+        self._worker_process_monitor = WorkerProcessMonitor()
+
+        self._frontend_id = frontend_id
+        self._num_frontends = num_lanes
+        self._results: Dict[int, GenerationResult] = {}
+        self.garbage_collection_gen0_threshold = None
+        self.workers_started = False
+        self.dispatch_result_thread: Optional[ManagedThread] = None
+        # Must be None: OpenAIServer reads the resource_governor_queue
+        # property at init; the governor lives with the launcher only.
+        self._resource_governor_queue = None
+
+        hmac_key = bytes.fromhex(attach_info["hmac_key"])
+        self.request_queue = IpcQueue(
+            (attach_info["request_addr"], hmac_key),
+            is_server=False,
+            socket_type=zmq.PUSH,
+            name=f"frontend_{frontend_id}_request_queue")
+        self.result_queue = FusedIpcQueue(
+            (attach_info["result_addrs"][frontend_id], hmac_key),
+            is_server=True,
+            fuse_message=False,
+            socket_type=zmq.PULL,
+            name=f"frontend_{frontend_id}_result_queue")
+
+        # Stats / KV events / disagg params share the rank0 worker's stats
+        # RPC server with the launcher (ROUTER socket, multi-client).
+        self.rpc_client: Optional[RPCClient] = None
+        if attach_info.get("rpc_addr"):
+            self.rpc_client = RPCClient(attach_info["rpc_addr"],
+                                        hmac_key=bytes.fromhex(
+                                            attach_info["rpc_hmac_key"]))
+
+    def _get_next_client_id(self) -> int:
+        # Embed the frontend id in the top bits so the worker routes the
+        # responses back to this frontend's result lane.
+        return namespace_client_id(self._frontend_id,
+                                   super()._get_next_client_id())
+
+    def check_health(self) -> bool:
+        """Health contract of an attached frontend.
+
+        An attached frontend owns no workers, so there is no process or
+        MPI-future liveness to poll: it is healthy while no fatal error
+        has been recorded and shutdown has not begun. Engine death
+        reaches it through the per-lane result socket / dispatch-thread
+        error path, which records the fatal error checked here.
+        """
+        if self.doing_shutdown or self._fatal_error is not None:
+            return False
+
+        if self._drain_error_queue():
+            return self._fatal_error is None and not self.doing_shutdown
+
+        return True
+
+    def pre_shutdown(self):
+        if self.doing_shutdown:
+            return
+        self.doing_shutdown = True
+        # Abort this frontend's in-flight requests so the engine frees their
+        # slots. Never send the None engine-shutdown sentinel: the launcher
+        # frontend owns the engine lifecycle (see the class docstring).
+        self._abort_all_requests()
+
+    def shutdown(self):
+        self.pre_shutdown()
+        if self.rpc_client is not None:
+            self.rpc_client.close()
+            self.rpc_client = None
+        self._worker_process_monitor.close()
+        # The dispatch thread blocks on result_queue.get(); it is a daemon
+        # ManagedThread that exits with the process or on the worker's
+        # per-lane None sentinel at engine teardown. Closing its socket from
+        # another thread is not ZMQ-safe, so leave the queues to process
+        # teardown.

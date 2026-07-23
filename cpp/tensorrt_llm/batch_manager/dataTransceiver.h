@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,12 +22,14 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
@@ -128,6 +130,20 @@ public:
 
     void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
+    /// @brief Transfer ownership of pre-assigned receive buffers to this session.
+    void setReservedRecvBuffers(std::vector<BufferIndexHolder> holders);
+
+    [[nodiscard]] bool hasReservedRecvBuffer(BaseTransBufferManager const& manager) const noexcept;
+
+    /// @brief Release one formatter's pre-assigned buffer after its receive and postprocessing complete.
+    bool releaseReservedRecvBuffer(BaseTransBufferManager const& manager) noexcept;
+
+    /// @brief Release all pre-assigned receive buffers after the full receive pipeline completes.
+    void releaseReservedRecvBuffers() noexcept;
+
+    /// @brief Fail closed when receive-buffer quiescence cannot be established.
+    void poisonReservedRecvBuffers() noexcept;
+
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
@@ -160,6 +176,7 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
+    std::vector<BufferIndexHolder> mReservedRecvBuffers;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
@@ -290,8 +307,8 @@ public:
     /// @brief Update the RNN config on the internal CacheState copies.
     /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
     void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
-        nvinfer1::DataType ssmStateDataType);
+        std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
+        tensorrt_llm::DataType ssmStateDataType);
 
     /// @brief Destructor.
     virtual ~CacheSender();
@@ -341,8 +358,8 @@ public:
     /// @brief Update the RNN config on the internal CacheState copies.
     /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
     void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
-        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
-        nvinfer1::DataType ssmStateDataType);
+        std::vector<SizeType32> rnnLayerNumPerPP, tensorrt_llm::DataType convStateDataType,
+        tensorrt_llm::DataType ssmStateDataType);
 
     /// @brief Destructor.
     virtual ~CacheReceiver();
