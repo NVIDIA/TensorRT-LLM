@@ -78,6 +78,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 from ..compaction import init_compaction_buffers
 from .triattention_kernels import (
+    SETTLE_PACK_BLOCK,
+    SETTLE_PACK_NUM_WARPS,
     _settle_ties_and_pack_compaction_sources_kernel,
     build_mean_phase_table,
     gather_mean_phases,
@@ -210,6 +212,7 @@ def init_eviction_buffers(
     layer pool: the compiled kernels encode immutable TMA descriptors from
     their raw device addresses, so the pools must stay alive and stay put.
     """
+    from .triattention_cute_score_fused import N as PADDED_HEAD_COLUMNS
     from .triattention_cute_score_fused import TriAttentionCuteScoreRunner
 
     device = layer_pools[page_representatives[0]].device
@@ -353,15 +356,19 @@ def init_eviction_buffers(
     # every downstream i32 offset (including the seg_out_offset cast below)
     # is bounded by it. Wraparound would be a silent wild read, not a clean
     # error, hence the loud audit.
-    if (8 - 1) * max_segments * seq_len >= 2**31:
+    if (PADDED_HEAD_COLUMNS - 1) * max_segments * seq_len >= 2**31:
         raise ValueError(
-            f"score bucket overflows the 32-bit score plane: {(8 - 1) * max_segments * seq_len}"
+            "score bucket overflows the 32-bit score plane: "
+            f"{(PADDED_HEAD_COLUMNS - 1) * max_segments * seq_len}"
         )
     # The kernel scores each request's window into a head-major scratch;
     # all buffers below are persistent because the compiled kernels capture
     # their device pointers.
+    bufs.padded_head_columns = PADDED_HEAD_COLUMNS
     bufs.cute_scratch = torch.empty(
-        bufs.num_kv_heads * 8 * max_segments * seq_len, dtype=torch.float32, device=device
+        bufs.num_kv_heads * PADDED_HEAD_COLUMNS * max_segments * seq_len,
+        dtype=torch.float32,
+        device=device,
     )
     # int32 is safe here: covered by the 2^31 score-plane audit above.
     seg_out_offset = (torch.arange(max_segments, dtype=torch.int64, device=device) * seq_len).to(
@@ -730,8 +737,8 @@ def settle_top_tokens(bufs: SimpleNamespace) -> None:
         SELECTION_ROWS=bufs.selection_rows_per_request,
         **bufs.settle_pack_shape,
         HAS_SETTLE=True,
-        BLOCK=256,
-        num_warps=4,
+        BLOCK=SETTLE_PACK_BLOCK,
+        num_warps=SETTLE_PACK_NUM_WARPS,
     )
 
 
@@ -780,9 +787,10 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
             # scratch data masked by ``valid_widths``.
             group_size = bufs.num_q_heads // bufs.num_kv_heads
             num_segments = request_count * bufs.num_layers
+            pad = bufs.padded_head_columns
             source = (
-                bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
-                .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
+                bufs.cute_scratch[: bufs.num_kv_heads * pad * num_segments * bufs.bucket_seq_len]
+                .view(bufs.num_kv_heads, pad, request_count, bufs.num_layers, bufs.bucket_seq_len)[
                     :, :group_size
                 ]
                 .permute(2, 3, 0, 1, 4)
@@ -827,19 +835,20 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
                 # One more pack launch broadcasts the target keep set over
                 # the draft KV heads and appends the draft's own tail
                 # ordinals. HAS_SETTLE=False compiles the settle half away
-                # (the ordinals arrive pre-settled), so any well-formed
-                # tensor stands in for the settle-side pointer arguments.
+                # (the ordinals arrive pre-settled), so the settle-side
+                # pointer arguments are None; the pack half reads the
+                # settled ordinals through output_indices.
                 _settle_ties_and_pack_compaction_sources_kernel[(bufs.max_requests, 1)](
-                    bufs.keep,
-                    bufs.valid_seq_lens_device,
-                    bufs.draft_pack["offsets"],
-                    bufs.keep,
+                    None,
+                    None,
+                    None,
+                    None,
                     bufs.keep,
                     bufs.valid_seq_lens_device,
                     bufs.draft_pack["offsets"],
                     bufs.draft_pack["indices"],
-                    bufs.draft_pack["offsets"],
-                    bufs.draft_pack["indices"],
+                    None,
+                    None,
                     WIDTH=bufs.keep_count,
                     KEEP_COUNT=bufs.keep_count,
                     SELECTION_ROWS=1,
@@ -852,8 +861,8 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
                     PER_LAYER=False,
                     HAS_SWA=False,
                     HAS_SETTLE=False,
-                    BLOCK=256,
-                    num_warps=4,
+                    BLOCK=SETTLE_PACK_BLOCK,
+                    num_warps=SETTLE_PACK_NUM_WARPS,
                 )
             for group in family["groups"]:
                 torch.ops.trtllm.sparse_kv_cache_compact_layers(

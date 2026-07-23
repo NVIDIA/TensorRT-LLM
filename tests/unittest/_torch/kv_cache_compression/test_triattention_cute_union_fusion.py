@@ -32,11 +32,13 @@ def _make_union_buffers(
     omega,
     offsets,
     decode_width=None,
+    eviction_mode="union",
 ):
-    """Union-mode buffers over one shared page-table slot.
+    """Buffers over one shared page-table slot (union mode by default).
 
-    The union runner also compiles the score-only entries, so one buffer
-    namespace serves both the fused pipeline and the split reference leg.
+    Union runners compile only the fused pipeline, so the split reference
+    leg builds its own score-only buffers with ``eviction_mode="per_head"``
+    over the same pools.
     """
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         init_eviction_buffers,
@@ -44,7 +46,7 @@ def _make_union_buffers(
 
     num_layers = len(layer_pools)
     return init_eviction_buffers(
-        eviction_mode="union",
+        eviction_mode=eviction_mode,
         layer_pools=layer_pools,
         dense_groups=[list(range(num_layers))],
         dense_layers=list(range(num_layers)),
@@ -214,12 +216,26 @@ def _check_union_fusion_matches_split_pipeline(
         omega=omega,
         offsets=offsets,
     )
+    ref_bufs = _make_union_buffers(
+        layer_pools=[pool],
+        max_requests=2,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        omega=omega,
+        offsets=offsets,
+        eviction_mode="per_head",
+    )
     k_plane = [2 * page for page in page_permutation]
     v_plane = [2 * page + 1 for page in page_permutation]
-    _write_block_offsets(
-        bufs,
-        torch.tensor([[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device),
+    encoded = torch.tensor(
+        [[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device
     )
+    _write_block_offsets(bufs, encoded)
+    _write_block_offsets(ref_bufs, encoded)
     if valid_lens is None:
         valid_lens = [seq_len, seq_len]
     valid_seq_lens = torch.tensor(valid_lens, dtype=torch.int32, device=device)
@@ -233,7 +249,7 @@ def _check_union_fusion_matches_split_pipeline(
     split_widths = torch.empty(request_count, dtype=torch.int32, device=device)
     token_starts = torch.tensor(score_starts, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
-        bufs,
+        ref_bufs,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -416,10 +432,27 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         decode_width=decode_window,
     )
     assert (bufs.cute_scratch.numel() > 2**31) == (max_requests == 64)
+    # The split reference leg only scores the two live requests; its own
+    # small per_head buffers keep the giant scratch on the union side.
+    ref_bufs = _make_union_buffers(
+        layer_pools=layer_pools,
+        max_requests=request_count,
+        seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        q_real=q_real,
+        q_imag=q_imag,
+        mlr_coef=mlr_coef,
+        freq_scale_sq=freq_scale_sq,
+        omega=omega,
+        offsets=offsets,
+        decode_width=decode_window,
+        eviction_mode="per_head",
+    )
     page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
-    bufs.block_offsets_device.zero_()
-    bufs.block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
-    bufs.block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
+    for staged in (bufs, ref_bufs):
+        staged.block_offsets_device.zero_()
+        staged.block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
+        staged.block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
 
     valid_seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
     token_starts = torch.zeros(max_requests, dtype=torch.int32, device=device)
@@ -430,7 +463,7 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     # the pure-torch union oracle.
     split_widths = torch.zeros(max_requests, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
-        bufs,
+        ref_bufs,
         request_count,
         valid_seq_lens,
         split_widths,

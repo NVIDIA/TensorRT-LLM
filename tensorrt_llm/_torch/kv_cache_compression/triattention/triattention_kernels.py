@@ -36,6 +36,13 @@ import triton.language as tl
 # so a larger table would silently degrade every downstream phase.
 _MEAN_PHASE_MAX_ROWS = 1 << 24
 
+# Score z-normalization epsilon, shared with the CuTe union pipeline
+# (triattention_cute_selection.py imports it): both kernels bake the same
+# literal, keeping the eviction modes' normalization consistent. Plain float
+# (the CuTe DSL traces it directly); the Triton stats kernel receives it as
+# an explicit constexpr parameter.
+STD_EPSILON = 1e-6
+
 
 @triton.jit
 def _gather_mean_phase_kernel(
@@ -172,6 +179,7 @@ def _score_row_stats_kernel(
     ROWS: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    EPSILON: tl.constexpr,
 ):
     """Compute one valid-prefix mean and inverse standard deviation per score row."""
     flat_row = tl.program_id(0)
@@ -195,7 +203,7 @@ def _score_row_stats_kernel(
         square_sum += tl.sum(centered * centered, axis=0)
     std = tl.sqrt(square_sum / valid_width)
     tl.store(row_mean + flat_row, mean)
-    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, 1e-6))
+    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, EPSILON))
 
 
 @triton.jit
@@ -295,6 +303,8 @@ def prepare_per_head_scores(
     num_kv_heads = int(num_kv_heads)
     _, num_layers, num_query_heads, width = scores.shape
     selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
+    # 256 lanes / 4 warps: one program spans the row in a few static loop
+    # trips without starving occupancy; matches the settle/pack shape.
     stats_block = 256
     rows = num_layers * num_query_heads
     if normalize_scores:
@@ -306,6 +316,7 @@ def prepare_per_head_scores(
             ROWS=rows,
             WIDTH=width,
             BLOCK=stats_block,
+            EPSILON=STD_EPSILON,
             num_warps=4,
         )
     reduction_block = 256
@@ -334,6 +345,14 @@ def prepare_per_head_scores(
 # --------------------------------------------------------------------------- #
 # Compaction: pack the kept ordinals into per-request move indices.           #
 # --------------------------------------------------------------------------- #
+
+
+# Launch shape of the settle/pack kernel: tokens per program along the
+# width/move axis, and its warp count. One pair for every launch site (the
+# fused settle, the draft pack, and the standalone test packs) so a retune
+# cannot diverge silently.
+SETTLE_PACK_BLOCK = 256
+SETTLE_PACK_NUM_WARPS = 4
 
 
 @triton.jit
@@ -386,10 +405,10 @@ def _settle_ties_and_pack_compaction_sources_kernel(
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
     row = request * SELECTION_ROWS + selection_domain
-    row_scores = scores + row * WIDTH
-    row_selected = provisional_indices + row * KEEP_COUNT
     row_output = output_indices + row * KEEP_COUNT
     if HAS_SETTLE:
+        row_scores = scores + row * WIDTH
+        row_selected = provisional_indices + row * KEEP_COUNT
         # Scores are decode-relative; this row's pinned prompt length rebases
         # the emitted ordinals to absolute positions (per row, so one launch
         # may mix prompt lengths).
@@ -486,8 +505,9 @@ def _settle_ties_and_pack_compaction_sources_kernel(
                     mask=move < dense_count,
                 )
         else:
-            domain = tl.program_id(1)
-            dense_output = domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
+            dense_output = (
+                selection_domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
+            )
             tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
         if HAS_SWA:
             swa_source = valid_len - SWA_WINDOW + move
@@ -499,18 +519,16 @@ def _settle_ties_and_pack_compaction_sources_kernel(
                         mask=move < swa_count,
                     )
             else:
-                domain = tl.program_id(1)
-                # Per-layer selection has one dense domain per (layer,
-                # head). SWA uses one shared source row per head, so only
-                # the first layer writes it.
+                swa_mask = move < swa_count
                 if PER_LAYER:
-                    write_swa = domain < NUM_KV_HEADS
-                else:
-                    write_swa = move >= 0
-                head = domain % NUM_KV_HEADS
+                    # Per-layer selection has one dense domain per (layer,
+                    # head). SWA uses one shared source row per head, so
+                    # only the first layer's domains write it.
+                    swa_mask = swa_mask & (selection_domain < NUM_KV_HEADS)
+                head = selection_domain % NUM_KV_HEADS
                 swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
                 tl.store(
                     swa_indices + swa_output,
                     swa_source,
-                    mask=write_swa & (move < swa_count),
+                    mask=swa_mask,
                 )

@@ -25,6 +25,15 @@ from cutlass.cute.typing import Int32 as CuteInt32
 from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .triattention_cute_score_fused import STATS_FIELDS as _STATS_FIELDS
+from .triattention_cute_score_fused import STATS_M2, STATS_MEAN
+
+# Single-sourced constants: the fused score file owns the padded-head tile
+# (N) and the partial-stats record layout it writes; the Triton kernels
+# module owns the z-normalization epsilon shared by both selection paths.
+from .triattention_cute_score_fused import N as _PADDED_HEAD_COLUMNS
+from .triattention_kernels import STD_EPSILON as _STD_EPSILON
+
 _REDUCE_THREADS = 256
 _WARP_SIZE = 32
 _REDUCE_WARPS = _REDUCE_THREADS // _WARP_SIZE
@@ -34,11 +43,6 @@ _SMALL_TOKENS_PER_LANE = 2
 _SMALL_TOKEN_SUBTILES = 1
 _MAX_ROW_CLUSTER_CTAS = 4
 _SMALL_TILE_RESIDENT_CTAS_PER_SM = 6
-_STATS_FIELDS = 3
-_STD_EPSILON = 1.0e-6
-# The fused score kernel pads each KV head's group of score planes up to the
-# minimum tcgen05 MMA tile (GQA groups below 8 ride zero-padded columns).
-_PADDED_HEAD_COLUMNS = 8
 
 
 def _select_normalize_union_config(
@@ -116,6 +120,25 @@ def _ld_shared_cluster_f32(
 @cute.jit
 def _ld_cluster_f32(mapped_addr):
     return _ld_shared_cluster_f32(mapped_addr)
+
+
+def _gmem_lane_tile(iterator, flat_index, tokens_per_lane, assumed_align):
+    """One lane's gmem tile of ``tokens_per_lane`` fp32 values.
+
+    Folds the (possibly 64-bit) flat index into the pointer BEFORE any
+    element access, so nothing routes through the DSL's 32-bit dynamic
+    coordinate; ``assumed_align`` is the only per-site difference between
+    the vectorized and fallback arms.
+    """
+    return cute.make_tensor(
+        cute.make_ptr(
+            cutlass.Float32,
+            (iterator + flat_index).toint(),
+            AddressSpace.gmem,
+            assumed_align=assumed_align,
+        ),
+        cute.make_layout(tokens_per_lane),
+    )
 
 
 class _TriAttentionNormalizeUnionKernel:
@@ -198,6 +221,81 @@ class _TriAttentionNormalizeUnionKernel:
                 cluster=(self.row_cluster_ctas, 1, 1),
                 stream=stream,
             )
+
+    @cute.jit
+    def _reduce_and_store_union_rows(
+        self,
+        union_scores: cute.Tensor,
+        union_values: cute.Tensor,
+        warp_max: cute.Tensor,
+        warp_max_ptr,
+        score_copy_atom,
+        request_idx: cutlass.Int32,
+        valid_width: cutlass.Int32,
+        first_token: cutlass.Int32,
+        lane_idx: cutlass.Int32,
+        from_cluster_peers: cutlass.Constexpr,
+    ):
+        """Final peer reduce + union-row store, shared by both arms.
+
+        The peer-reduction source is the ONLY difference between the
+        single-CTA and cluster arms (other warps' smem rows vs DSM cluster
+        peers), selected at trace time by ``from_cluster_peers``.
+        """
+        for token_subtile in cutlass.range_constexpr(self.token_subtiles):
+            reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
+            for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                if cutlass.const_expr(from_cluster_peers):
+                    union_value = warp_max[(0, token_subtile, token_slot, lane_idx)]
+                    # Offset derived from the SAME layout object the smem
+                    # tensor was built with (no hand-derived strides).
+                    shared_offset = cute.crd2idx(
+                        (0, token_subtile, token_slot, lane_idx), warp_max.layout
+                    )
+                    for peer_rank in cutlass.range_constexpr(1, self.row_cluster_ctas):
+                        remote_addr = _mapa_cluster(warp_max_ptr, cutlass.Int32(peer_rank))
+                        union_value = cute.arch.fmax(
+                            union_value,
+                            _ld_cluster_f32(
+                                remote_addr + shared_offset * (cutlass.Float32.width // 8)
+                            ),
+                        )
+                else:
+                    union_value = union_values[(token_subtile, token_slot)]
+                    for other_warp in cutlass.range_constexpr(1, self.reduce_warps):
+                        union_value = cute.arch.fmax(
+                            union_value,
+                            warp_max[(other_warp, token_subtile, token_slot, lane_idx)],
+                        )
+                reduced_values[token_slot] = union_value
+            subtile_first_token = first_token + token_subtile * self.subtile_token_tile
+            # The output row covers this request's own window,
+            # [0, valid - start); the straddling subtile falls back to the
+            # per-token stores. union_scores spans request_count * width
+            # < 2^31 by the host score-plane audit
+            # (triattention.init_eviction_buffers), so the i32 union_index
+            # cannot wrap here -- unlike the scratch, whose offsets fold
+            # through Int64.
+            if cutlass.const_expr(self.width % self.tokens_per_lane == 0) and cutlass.dynamic_expr(
+                subtile_first_token + self.tokens_per_lane <= valid_width
+            ):
+                union_index = request_idx * self.width + subtile_first_token
+                union_tile = _gmem_lane_tile(
+                    union_scores.iterator,
+                    union_index,
+                    self.tokens_per_lane,
+                    self.tokens_per_lane * 4,
+                )
+                cute.copy(
+                    score_copy_atom,
+                    cute.coalesce(reduced_values),
+                    cute.coalesce(union_tile),
+                )
+            else:
+                for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
+                    token = subtile_first_token + token_slot
+                    if cutlass.dynamic_expr(token < valid_width):
+                        union_scores[request_idx * self.width + token] = reduced_values[token_slot]
 
     @cute.kernel
     def kernel(
@@ -320,10 +418,10 @@ class _TriAttentionNormalizeUnionKernel:
             delta = cutlass.Float32(0.0)
             if cutlass.const_expr(self.page_shards == 2):
                 stats_base = stats_row * 2 * _STATS_FIELDS
-                mean_0 = partial_stats[stats_base + 1]
-                m2_0 = partial_stats[stats_base + 2]
-                mean_1 = partial_stats[stats_base + 4]
-                m2_1 = partial_stats[stats_base + 5]
+                mean_0 = partial_stats[stats_base + STATS_MEAN]
+                m2_0 = partial_stats[stats_base + STATS_M2]
+                mean_1 = partial_stats[stats_base + _STATS_FIELDS + STATS_MEAN]
+                m2_1 = partial_stats[stats_base + _STATS_FIELDS + STATS_M2]
                 delta = mean_1 - mean_0
                 count = common_count
                 mean = mean_0 + delta * mean_weight_1
@@ -332,8 +430,8 @@ class _TriAttentionNormalizeUnionKernel:
                 count = common_count
                 for page_shard in cutlass.range_constexpr(self.page_shards):
                     stats_base = (stats_row * self.page_shards + page_shard) * _STATS_FIELDS
-                    shard_mean = partial_stats[stats_base + 1]
-                    shard_m2 = partial_stats[stats_base + 2]
+                    shard_mean = partial_stats[stats_base + STATS_MEAN]
+                    shard_m2 = partial_stats[stats_base + STATS_M2]
                     delta = shard_mean - mean
                     mean = mean + delta * shard_mean_weights[page_shard]
                     m2 = m2 + shard_m2 + delta * delta * shard_m2_cross_weights[page_shard]
@@ -362,14 +460,11 @@ class _TriAttentionNormalizeUnionKernel:
                     score_start % self.tokens_per_lane == 0
                     and subtile_first_token + self.tokens_per_lane <= valid_width
                 ):
-                    score_tile = cute.make_tensor(
-                        cute.make_ptr(
-                            cutlass.Float32,
-                            (scores.iterator + score_index).toint(),
-                            AddressSpace.gmem,
-                            assumed_align=self.tokens_per_lane * 4,
-                        ),
-                        cute.make_layout(self.tokens_per_lane),
+                    score_tile = _gmem_lane_tile(
+                        scores.iterator,
+                        score_index,
+                        self.tokens_per_lane,
+                        self.tokens_per_lane * 4,
                     )
                     cute.copy(
                         score_copy_atom,
@@ -386,14 +481,8 @@ class _TriAttentionNormalizeUnionKernel:
                     # window start is not lane-aligned (any pinned prompt
                     # length not divisible by ``tokens_per_lane``), so real
                     # serve cohorts hit it on every eviction round.
-                    score_tail = cute.make_tensor(
-                        cute.make_ptr(
-                            cutlass.Float32,
-                            (scores.iterator + score_index).toint(),
-                            AddressSpace.gmem,
-                            assumed_align=4,
-                        ),
-                        cute.make_layout(self.tokens_per_lane),
+                    score_tail = _gmem_lane_tile(
+                        scores.iterator, score_index, self.tokens_per_lane, 4
                     )
                     for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
                         token = subtile_first_token + token_slot
@@ -449,51 +538,18 @@ class _TriAttentionNormalizeUnionKernel:
         cute.arch.sync_threads()
         if cutlass.const_expr(self.row_cluster_ctas == 1):
             if warp_idx == 0:
-                for token_subtile in cutlass.range_constexpr(self.token_subtiles):
-                    reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
-                    for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
-                        union_value = union_values[(token_subtile, token_slot)]
-                        for other_warp in cutlass.range_constexpr(1, self.reduce_warps):
-                            union_value = cute.arch.fmax(
-                                union_value,
-                                warp_max[(other_warp, token_subtile, token_slot, lane_idx)],
-                            )
-                        reduced_values[token_slot] = union_value
-                    subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-                    # The output row covers this request's own window,
-                    # [0, valid - start); the straddling subtile falls back
-                    # to the per-token stores. union_scores spans
-                    # request_count * width < 2^31 by the host score-plane
-                    # audit (triattention.init_eviction_buffers), so the i32
-                    # union_index cannot wrap here -- unlike the scratch,
-                    # whose offsets fold through Int64.
-                    if cutlass.const_expr(
-                        self.width % self.tokens_per_lane == 0
-                    ) and cutlass.dynamic_expr(
-                        subtile_first_token + self.tokens_per_lane <= valid_width
-                    ):
-                        union_index = request_idx * self.width + subtile_first_token
-                        union_tile = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float32,
-                                (union_scores.iterator + union_index).toint(),
-                                AddressSpace.gmem,
-                                assumed_align=self.tokens_per_lane * 4,
-                            ),
-                            cute.make_layout(self.tokens_per_lane),
-                        )
-                        cute.copy(
-                            score_copy_atom,
-                            cute.coalesce(reduced_values),
-                            cute.coalesce(union_tile),
-                        )
-                    else:
-                        for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
-                            token = subtile_first_token + token_slot
-                            if cutlass.dynamic_expr(token < valid_width):
-                                union_scores[request_idx * self.width + token] = reduced_values[
-                                    token_slot
-                                ]
+                self._reduce_and_store_union_rows(
+                    union_scores,
+                    union_values,
+                    warp_max,
+                    warp_max_ptr,
+                    score_copy_atom,
+                    request_idx,
+                    valid_width,
+                    first_token,
+                    lane_idx,
+                    False,
+                )
         else:
             # Warp 0 reduces its CTA's row partition, then CTA 0 combines the
             # cluster's partial maxima through distributed shared memory.
@@ -511,54 +567,17 @@ class _TriAttentionNormalizeUnionKernel:
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
             if cta_rank == 0 and warp_idx == 0:
-                for token_subtile in cutlass.range_constexpr(self.token_subtiles):
-                    reduced_values = cute.make_rmem_tensor((self.tokens_per_lane,), cutlass.Float32)
-                    for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
-                        union_value = warp_max[(0, token_subtile, token_slot, lane_idx)]
-                        shared_offset = (
-                            token_subtile * self.tokens_per_lane * _WARP_SIZE
-                            + token_slot * _WARP_SIZE
-                            + lane_idx
-                        )
-                        for peer_rank in cutlass.range_constexpr(1, self.row_cluster_ctas):
-                            remote_addr = _mapa_cluster(
-                                warp_max_ptr,
-                                cutlass.Int32(peer_rank),
-                            )
-                            union_value = cute.arch.fmax(
-                                union_value,
-                                _ld_cluster_f32(remote_addr + shared_offset * 4),
-                            )
-                        reduced_values[token_slot] = union_value
-                    subtile_first_token = first_token + token_subtile * self.subtile_token_tile
-                    # Same per-request output domain (and the same host-audit
-                    # bound on the i32 union_index) as the single-CTA path.
-                    if cutlass.const_expr(
-                        self.width % self.tokens_per_lane == 0
-                    ) and cutlass.dynamic_expr(
-                        subtile_first_token + self.tokens_per_lane <= valid_width
-                    ):
-                        union_index = request_idx * self.width + subtile_first_token
-                        union_tile = cute.make_tensor(
-                            cute.make_ptr(
-                                cutlass.Float32,
-                                (union_scores.iterator + union_index).toint(),
-                                AddressSpace.gmem,
-                                assumed_align=self.tokens_per_lane * 4,
-                            ),
-                            cute.make_layout(self.tokens_per_lane),
-                        )
-                        cute.copy(
-                            score_copy_atom,
-                            cute.coalesce(reduced_values),
-                            cute.coalesce(union_tile),
-                        )
-                    else:
-                        for token_slot in cutlass.range_constexpr(self.tokens_per_lane):
-                            token = subtile_first_token + token_slot
-                            if cutlass.dynamic_expr(token < valid_width):
-                                union_scores[request_idx * self.width + token] = reduced_values[
-                                    token_slot
-                                ]
+                self._reduce_and_store_union_rows(
+                    union_scores,
+                    union_values,
+                    warp_max,
+                    warp_max_ptr,
+                    score_copy_atom,
+                    request_idx,
+                    valid_width,
+                    first_token,
+                    lane_idx,
+                    True,
+                )
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()

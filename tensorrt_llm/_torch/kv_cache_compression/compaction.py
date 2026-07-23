@@ -244,8 +244,8 @@ def init_compaction_buffers(
         selection_rows = num_kv_heads
     # Selection rows carry decode-only kept ordinals (already absolute), so
     # the rectangle is prompt-length independent. HAS_SWA specializes the SWA
-    # loads and stores away, so without SWA layers the dense buffers stand in
-    # for the compiled-away SWA pointer arguments.
+    # loads and stores away, so without SWA layers the SWA pointer arguments
+    # are None (the Triton optional-pointer convention).
     has_swa = swa_move_indices is not None
     swa_total = int(swa_move_indices.shape[-1]) if has_swa else 0
     # Widest per-request move count any staged offsets may express; the
@@ -257,8 +257,8 @@ def init_compaction_buffers(
         valid_sequence_lengths,
         dense_move_offsets,
         dense_move_indices,
-        swa_move_offsets if has_swa else dense_move_offsets,
-        swa_move_indices if has_swa else dense_move_indices,
+        swa_move_offsets if has_swa else None,
+        swa_move_indices if has_swa else None,
     )
     settle_pack_shape = dict(
         DENSE_TOTAL=int(dense_move_indices.shape[-1]),

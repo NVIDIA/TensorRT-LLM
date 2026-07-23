@@ -18,11 +18,14 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    SETTLE_PACK_BLOCK as _BLOCK,
+)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+    SETTLE_PACK_NUM_WARPS as _NUM_WARPS,
+)
+from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _settle_ties_and_pack_compaction_sources_kernel,
 )
-
-_BLOCK = 256
-_NUM_WARPS = 4
 
 
 def _settle_oracle(scores, row_lengths, row_prompt_offsets, provisional, output, keep_count):

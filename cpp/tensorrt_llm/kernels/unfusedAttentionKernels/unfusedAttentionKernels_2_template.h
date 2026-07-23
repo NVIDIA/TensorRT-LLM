@@ -1848,7 +1848,7 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     static_assert(std::is_same_v<T, __nv_bfloat16>);
     static_assert(HeadDim == 64 || HeadDim == 128);
     // 128-token pages are the geometry the kernel was written for; 32-token
-    // pages cover this tree's production configuration (one tile == one page).
+    // pages cover the supported production configuration (one tile == one page).
     static_assert(TokensPerBlock == 32 || TokensPerBlock == 128);
     // 16B vectors per head: Dh64 -> 8 lanes (block 8x32 = 256 threads),
     // Dh128 -> 16 lanes (block 16x32 = 512 threads).
@@ -1989,161 +1989,9 @@ __global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
     }
 }
 
-//! Variant of the pipeline kernel that stages the destination page index in
-//! shared memory once per tile instead of having every thread look it up.
-//! Only valid when each request's destination base is 32-token tile aligned,
-//! so a whole tile lands in one destination page (both supported page sizes
-//! are multiples of the tile). Compiled but not yet dispatched: the bases
-//! live on device, so the host cannot prove alignment (see the dispatch
-//! helper below).
-template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
-__global__ __launch_bounds__(HeadDim * sizeof(T) / sizeof(uint4)
-    * kSparseKvCompactTokensPerTile) void sparseKvCacheCompactV2Bf16DestinationPagePipelineKernel(SparseKvCacheCompactBf16Params
-        params)
-{
-    static_assert(std::is_same_v<T, __nv_bfloat16>);
-    static_assert(HeadDim == 64 || HeadDim == 128);
-    static_assert(TokensPerBlock == 32 || TokensPerBlock == 128);
-    constexpr int32_t kBufferCount = 2;
-    constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
-    constexpr int32_t kTokensPerTile = kSparseKvCompactTokensPerTile;
-    constexpr int32_t kVectorsPerTile = kTokensPerTile * kVectorsPerHead;
-    constexpr int32_t kVectorsPerBuffer = 2 * kVectorsPerTile;
-
-    int32_t const layerIdx = static_cast<int32_t>(blockIdx.x);
-    int32_t const kvHeadIdx = static_cast<int32_t>(blockIdx.y);
-    int32_t const batchIdx = static_cast<int32_t>(blockIdx.z);
-    int32_t const moveBegin = params.sourceOffsets[batchIdx];
-    int32_t const moveEnd = params.sourceOffsets[batchIdx + 1];
-    int32_t const moveCount = moveEnd - moveBegin;
-    if (moveCount <= 0)
-    {
-        return;
-    }
-
-    int32_t const sourceLayer = params.sourceLayerIndices == nullptr ? layerIdx : params.sourceLayerIndices[layerIdx];
-    int64_t const sourceMoveBase = static_cast<int64_t>(sourceLayer) * params.sourceLayerStride
-        + static_cast<int64_t>(kvHeadIdx) * params.sourceHeadStride + moveBegin;
-    int32_t const destinationBase = params.destinationBases[batchIdx];
-    auto* const pool = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(params.poolPointers[layerIdx]));
-    int32_t const* const pageTable = params.pageTable + static_cast<int64_t>(batchIdx) * params.pageTableRequestStride;
-
-    extern __shared__ uint4 sharedVectors[];
-    auto* const sharedDestinationPages = reinterpret_cast<int32_t*>(sharedVectors + kBufferCount * kVectorsPerBuffer);
-    int32_t const sharedVector
-        = static_cast<int32_t>(threadIdx.y) * kVectorsPerHead + static_cast<int32_t>(threadIdx.x);
-    int32_t currentBuffer = 0;
-    int32_t currentRequestMove = static_cast<int32_t>(threadIdx.y);
-    bool currentValid = currentRequestMove < moveCount;
-    int32_t currentSourceToken = currentValid ? params.sourceIndices[sourceMoveBase + currentRequestMove] : -1;
-    uint4* currentSharedK = sharedVectors;
-    uint4* currentSharedV = currentSharedK + kVectorsPerTile;
-
-    // The dispatch guard tile-aligns the destination base, so every 32-token
-    // tile lies within one destination page. One producer stages the decoded
-    // page beside buffer 0; the existing prologue barrier publishes both
-    // products.
-    if (threadIdx.x == 0 && threadIdx.y == 0)
-    {
-        sharedDestinationPages[currentBuffer] = pageTable[destinationBase / TokensPerBlock] >> 1;
-    }
-    uint4 const* currentSourceKVector = nullptr;
-    uint4 const* currentSourceVVector = nullptr;
-    if (currentValid)
-    {
-        int32_t const sourcePage = pageTable[currentSourceToken / TokensPerBlock] >> 1;
-        auto* const sourcePageBase = pool + static_cast<size_t>(sourcePage) * params.bytesPerPage;
-        auto const* const sourceK = reinterpret_cast<uint4 const*>(sourcePageBase);
-        auto const* const sourceV = reinterpret_cast<uint4 const*>(sourcePageBase + params.bytesPerKvHalf);
-        int32_t const localVector = (kvHeadIdx * TokensPerBlock + currentSourceToken % TokensPerBlock) * kVectorsPerHead
-            + static_cast<int32_t>(threadIdx.x);
-        currentSourceKVector = &sourceK[localVector];
-        currentSourceVVector = &sourceV[localVector];
-    }
-    uint32_t const currentSourceBytes = currentValid ? sizeof(uint4) : 0U;
-    compact_detail::copyAsync<sizeof(uint4)>(&currentSharedK[sharedVector], currentSourceKVector, currentSourceBytes);
-    compact_detail::copyAsync<sizeof(uint4)>(&currentSharedV[sharedVector], currentSourceVVector, currentSourceBytes);
-    compact_detail::commitGroup();
-    compact_detail::waitGroup<0>();
-    __syncthreads();
-
-    for (int32_t nextTileBegin = kTokensPerTile; nextTileBegin < moveCount; nextTileBegin += kTokensPerTile)
-    {
-        int32_t const nextRequestMove = nextTileBegin + static_cast<int32_t>(threadIdx.y);
-        bool const nextValid = nextRequestMove < moveCount;
-        int32_t const nextSourceToken = nextValid ? params.sourceIndices[sourceMoveBase + nextRequestMove] : -1;
-        int32_t const nextBuffer = (nextTileBegin / kTokensPerTile) & 1;
-        uint4* const nextSharedK = sharedVectors + nextBuffer * kVectorsPerBuffer;
-        uint4* const nextSharedV = nextSharedK + kVectorsPerTile;
-
-        // Produce the page paired with the next ping-pong buffer. The loop's existing final barrier publishes it
-        // before the buffer becomes current, so destination staging does not add a CTA synchronization.
-        if (threadIdx.x == 0 && threadIdx.y == 0)
-        {
-            int32_t const nextDestinationToken = destinationBase + nextTileBegin;
-            sharedDestinationPages[nextBuffer] = pageTable[nextDestinationToken / TokensPerBlock] >> 1;
-        }
-        uint4 const* nextSourceKVector = nullptr;
-        uint4 const* nextSourceVVector = nullptr;
-        if (nextValid)
-        {
-            int32_t const sourcePage = pageTable[nextSourceToken / TokensPerBlock] >> 1;
-            auto* const sourcePageBase = pool + static_cast<size_t>(sourcePage) * params.bytesPerPage;
-            auto const* const sourceK = reinterpret_cast<uint4 const*>(sourcePageBase);
-            auto const* const sourceV = reinterpret_cast<uint4 const*>(sourcePageBase + params.bytesPerKvHalf);
-            int32_t const localVector
-                = (kvHeadIdx * TokensPerBlock + nextSourceToken % TokensPerBlock) * kVectorsPerHead
-                + static_cast<int32_t>(threadIdx.x);
-            nextSourceKVector = &sourceK[localVector];
-            nextSourceVVector = &sourceV[localVector];
-        }
-        uint32_t const nextSourceBytes = nextValid ? sizeof(uint4) : 0U;
-        compact_detail::copyAsync<sizeof(uint4)>(&nextSharedK[sharedVector], nextSourceKVector, nextSourceBytes);
-        compact_detail::copyAsync<sizeof(uint4)>(&nextSharedV[sharedVector], nextSourceVVector, nextSourceBytes);
-        compact_detail::commitGroup();
-
-        // The compaction contract provides strictly increasing sources per request/head and
-        // dst(i) = destinationBase + i <= src(i). For current i and future j, i < j implies
-        // dst(i) < destinationBase + j <= src(j), so current stores cannot alias future prefetch sources.
-        int32_t const destinationToken = destinationBase + currentRequestMove;
-        if (currentValid && currentSourceToken != destinationToken)
-        {
-            int32_t const destinationPage = sharedDestinationPages[currentBuffer];
-            auto* const destinationPageBase = pool + static_cast<size_t>(destinationPage) * params.bytesPerPage;
-            auto* const destinationK = reinterpret_cast<uint4*>(destinationPageBase);
-            auto* const destinationV = reinterpret_cast<uint4*>(destinationPageBase + params.bytesPerKvHalf);
-            int32_t const localVector
-                = (kvHeadIdx * TokensPerBlock + destinationToken % TokensPerBlock) * kVectorsPerHead
-                + static_cast<int32_t>(threadIdx.x);
-            destinationK[localVector] = currentSharedK[sharedVector];
-            destinationV[localVector] = currentSharedV[sharedVector];
-        }
-
-        compact_detail::waitGroup<0>();
-        __syncthreads();
-        currentBuffer = nextBuffer;
-        currentRequestMove = nextRequestMove;
-        currentValid = nextValid;
-        currentSourceToken = nextSourceToken;
-        currentSharedK = nextSharedK;
-        currentSharedV = nextSharedV;
-    }
-
-    // The final tile and its destination page scalar already completed the existing wait and CTA barrier.
-    int32_t const destinationToken = destinationBase + currentRequestMove;
-    if (currentValid && currentSourceToken != destinationToken)
-    {
-        int32_t const destinationPage = sharedDestinationPages[currentBuffer];
-        auto* const destinationPageBase = pool + static_cast<size_t>(destinationPage) * params.bytesPerPage;
-        auto* const destinationK = reinterpret_cast<uint4*>(destinationPageBase);
-        auto* const destinationV = reinterpret_cast<uint4*>(destinationPageBase + params.bytesPerKvHalf);
-        int32_t const localVector = (kvHeadIdx * TokensPerBlock + destinationToken % TokensPerBlock) * kVectorsPerHead
-            + static_cast<int32_t>(threadIdx.x);
-        destinationK[localVector] = currentSharedK[sharedVector];
-        destinationV[localVector] = currentSharedV[sharedVector];
-    }
-}
-
+// A destination-page-staging variant (needs a host-side proof that every
+// destination base is tile-aligned) is parked on branch
+// tr-parked-destination-page-kernel pending compaction.py alignment-flag plumbing.
 template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
 void launchSparseKvCacheCompactV2Bf16Pipeline(SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
 {
@@ -2160,60 +2008,22 @@ void launchSparseKvCacheCompactV2Bf16Pipeline(SparseKvCacheCompactBf16Params con
     sparseKvCacheCompactV2Bf16PipelineKernel<T, HeadDim, TokensPerBlock><<<grid, block, sharedBytes, stream>>>(params);
 }
 
-template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
-void launchSparseKvCacheCompactV2Bf16DestinationPagePipeline(
-    SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
-{
-    constexpr int32_t kDestinationPageBuffers = 2;
-    constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / sizeof(uint4);
-    dim3 const block(kVectorsPerHead, kSparseKvCompactTokensPerTile);
-    dim3 const grid(params.numLayers, params.numKvHeads, params.batchSize);
-    // Same 16/32 KiB tile buffers as the plain pipeline plus two staged
-    // destination page indices; still far below the 48 KiB default.
-    size_t const sharedBytes = 4 * kSparseKvCompactTokensPerTile * kVectorsPerHead * sizeof(uint4)
-        + kDestinationPageBuffers * sizeof(int32_t);
-    sparseKvCacheCompactV2Bf16DestinationPagePipelineKernel<T, HeadDim, TokensPerBlock>
-        <<<grid, block, sharedBytes, stream>>>(params);
-}
-
-template <typename T, int32_t HeadDim, int32_t TokensPerBlock>
-void dispatchSparseKvCacheCompactGeometry(SparseKvCacheCompactBf16Params const& params, cudaStream_t stream)
-{
-    // The destination-page variant requires every request's destination base
-    // to be 32-token tile aligned so each tile lands in one page, but the
-    // bases live on device where the host cannot check them. Until a host-side
-    // alignment flag is plumbed through compaction.py, always launch the plain
-    // pipeline. A plain `if` (not `if constexpr`) keeps the destination-page
-    // kernel instantiated and compiling.
-    constexpr bool kDestinationPageVariantEnabled = false;
-    if (kDestinationPageVariantEnabled)
-    {
-        launchSparseKvCacheCompactV2Bf16DestinationPagePipeline<T, HeadDim, TokensPerBlock>(params, stream);
-        return;
-    }
-    launchSparseKvCacheCompactV2Bf16Pipeline<T, HeadDim, TokensPerBlock>(params, stream);
-}
 
 #endif // ENABLE_BF16
 
-template <typename T, typename TCache, int BLOCK_SIZE, int Dh, typename KVCacheBuffer, bool Layered = false>
+template <typename T, typename TCache, int BLOCK_SIZE, int Dh, typename KVCacheBuffer>
 __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
     QKVPreprocessingParams<T, KVCacheBuffer> params)
 {
     // The number of 16B vectors per head size in the kv cache.
     constexpr int VECS_PER_HEAD = Dh * sizeof(TCache) / 16;
     static_assert(BLOCK_SIZE % VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
-    // D64 and D128 map one complete K/V vector to each x lane, so registers can
-    // preserve the read-before-write value across the in-place ordering barrier.
-    constexpr bool use_register_staging = Layered && (Dh == 64 || Dh == 128) && sizeof(TCache) == 2;
 
     int const batch_idx = blockIdx.z;
     int const kv_head_idx = blockIdx.y;
 
-    // Head-plane stride of the packed indices for the non-layered layout; the
-    // layered layout carries its stride on the buffer (its index buffers may
-    // be wider than one round's move count).
-    [[maybe_unused]] int const total_num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
+    // Head-row stride of the packed indices.
+    int const total_num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
 
     int const sparse_start_idx = params.sparse_kv_offsets[batch_idx];
     int const sparse_end_idx = params.sparse_kv_offsets[batch_idx + 1];
@@ -2228,51 +2038,27 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
 
     for (int token_block_offset = 0; token_block_offset < num_sparse_tokens; token_block_offset += tokens_per_block)
     {
-        uint4 key_vector;
-        uint4 value_vector;
         int const sparse_token_offset = token_block_offset + threadIdx.y;
 
         if (sparse_token_offset < num_sparse_tokens)
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
-            int src_token_idx;
-            if constexpr (Layered)
-            {
-                src_token_idx = params.kv_cache_buffer.getSparseKvSourceToken(
-                    params.sparse_kv_indices, kv_head_idx, global_sparse_idx);
-            }
-            else
-            {
-                int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
-                src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
-            }
+            int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
+            int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
 
             void* src_k_ptr = params.kv_cache_buffer.getKBlockPtr(batch_idx, src_token_idx);
             void* src_v_ptr = params.kv_cache_buffer.getVBlockPtr(batch_idx, src_token_idx);
             auto const src_k_block_ptr = reinterpret_cast<uint4*>(src_k_ptr);
             auto const src_v_block_ptr = reinterpret_cast<uint4*>(src_v_ptr);
 
-            if constexpr (use_register_staging)
+            for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
             {
-                int const head_vec_idx = threadIdx.x;
                 auto const src_k_vec_idx
                     = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
                 auto const src_v_vec_idx
                     = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                key_vector = src_k_block_ptr[src_k_vec_idx];
-                value_vector = src_v_block_ptr[src_v_vec_idx];
-            }
-            else
-            {
-                for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
-                {
-                    auto const src_k_vec_idx
-                        = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                    auto const src_v_vec_idx
-                        = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                    k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_k_block_ptr[src_k_vec_idx];
-                    v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_v_block_ptr[src_v_vec_idx];
-                }
+                k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_k_block_ptr[src_k_vec_idx];
+                v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_v_block_ptr[src_v_vec_idx];
             }
         }
         __syncthreads();
@@ -2280,20 +2066,9 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
         if (sparse_token_offset < num_sparse_tokens)
         {
             int const global_sparse_idx = sparse_start_idx + sparse_token_offset;
-            int src_token_idx;
-            int dst_token_idx;
-            if constexpr (Layered)
-            {
-                src_token_idx = params.kv_cache_buffer.getSparseKvSourceToken(
-                    params.sparse_kv_indices, kv_head_idx, global_sparse_idx);
-                dst_token_idx = params.kv_cache_buffer.getSparseKvDestinationToken(batch_idx, sparse_token_offset);
-            }
-            else
-            {
-                int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
-                src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
-                dst_token_idx = sparse_token_offset;
-            }
+            int const sparse_idx_offset = kv_head_idx * total_num_sparse_kv_tokens + global_sparse_idx;
+            int const src_token_idx = params.sparse_kv_indices[sparse_idx_offset];
+            int const dst_token_idx = sparse_token_offset;
 
             if (src_token_idx != dst_token_idx)
             {
@@ -2302,27 +2077,14 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
                 auto const dst_k_block_ptr = reinterpret_cast<uint4*>(dst_k_ptr);
                 auto const dst_v_block_ptr = reinterpret_cast<uint4*>(dst_v_ptr);
 
-                if constexpr (use_register_staging)
+                for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
                 {
-                    int const head_vec_idx = threadIdx.x;
-                    auto const dst_k_vec_idx
-                        = params.kv_cache_buffer.getKVLocalIdx(dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                    auto const dst_v_vec_idx
-                        = params.kv_cache_buffer.getKVLocalIdx(dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                    dst_k_block_ptr[dst_k_vec_idx] = key_vector;
-                    dst_v_block_ptr[dst_v_vec_idx] = value_vector;
-                }
-                else
-                {
-                    for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
-                    {
-                        auto const dst_k_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
-                            dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                        auto const dst_v_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
-                            dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                        dst_k_block_ptr[dst_k_vec_idx] = k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
-                        dst_v_block_ptr[dst_v_vec_idx] = v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
-                    }
+                    auto const dst_k_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
+                        dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                    auto const dst_v_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
+                        dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                    dst_k_block_ptr[dst_k_vec_idx] = k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
+                    dst_v_block_ptr[dst_v_vec_idx] = v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
                 }
             }
         }
@@ -2344,7 +2106,7 @@ void kernelSparseDispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> param
     // grid.x is always 1 to avoid data races
     dim3 grid(1, params.kv_head_num, params.batch_size);
 
-    updateSparseKvCacheAfterFmha<T, TCache, BLOCK_SIZE, Dh, KVCacheBuffer, false>
+    updateSparseKvCacheAfterFmha<T, TCache, BLOCK_SIZE, Dh, KVCacheBuffer>
         <<<grid, block, smem_size, stream>>>(params);
 }
 
@@ -2404,19 +2166,19 @@ void invokeSparseKvCacheCompactLayers(int64_t const* poolPointers, int32_t const
             fastParams.bytesPerPage = 2 * fastParams.bytesPerKvHalf;
             if (headDim == 64 && tokensPerBlock == 32)
             {
-                dispatchSparseKvCacheCompactGeometry<T, 64, 32>(fastParams, stream);
+                launchSparseKvCacheCompactV2Bf16Pipeline<T, 64, 32>(fastParams, stream);
             }
             else if (headDim == 64 && tokensPerBlock == 128)
             {
-                dispatchSparseKvCacheCompactGeometry<T, 64, 128>(fastParams, stream);
+                launchSparseKvCacheCompactV2Bf16Pipeline<T, 64, 128>(fastParams, stream);
             }
             else if (headDim == 128 && tokensPerBlock == 32)
             {
-                dispatchSparseKvCacheCompactGeometry<T, 128, 32>(fastParams, stream);
+                launchSparseKvCacheCompactV2Bf16Pipeline<T, 128, 32>(fastParams, stream);
             }
             else
             {
-                dispatchSparseKvCacheCompactGeometry<T, 128, 128>(fastParams, stream);
+                launchSparseKvCacheCompactV2Bf16Pipeline<T, 128, 128>(fastParams, stream);
             }
             return;
         }

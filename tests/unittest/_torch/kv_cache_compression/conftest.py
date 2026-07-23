@@ -164,6 +164,8 @@ def launch_family_pack(compaction, name):
     (any well-formed tensor stands in).
     """
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        SETTLE_PACK_BLOCK,
+        SETTLE_PACK_NUM_WARPS,
         _settle_ties_and_pack_compaction_sources_kernel,
     )
 
@@ -184,18 +186,18 @@ def launch_family_pack(compaction, name):
             PER_LAYER=False,
             HAS_SWA=False,
         )
-        swa_offsets, swa_indices = family["offsets"], family["source"]
+        swa_offsets, swa_indices = None, None
     else:
         rows = compaction["selection_rows"]
         shape = compaction["settle_pack_shape"]
         swa_family = compaction_family(compaction, "swa")
-        swa_offsets = swa_family["offsets"] if swa_family else family["offsets"]
-        swa_indices = swa_family["source"] if swa_family else family["source"]
+        swa_offsets = swa_family["offsets"] if swa_family else None
+        swa_indices = swa_family["source"] if swa_family else None
     _settle_ties_and_pack_compaction_sources_kernel[(compaction["request_count"], rows)](
-        kept,
-        valid,
-        family["offsets"],
-        kept,
+        None,
+        None,
+        None,
+        None,
         kept,
         valid,
         family["offsets"],
@@ -207,8 +209,8 @@ def launch_family_pack(compaction, name):
         SELECTION_ROWS=rows,
         **shape,
         HAS_SETTLE=False,
-        BLOCK=256,
-        num_warps=4,
+        BLOCK=SETTLE_PACK_BLOCK,
+        num_warps=SETTLE_PACK_NUM_WARPS,
     )
 
 

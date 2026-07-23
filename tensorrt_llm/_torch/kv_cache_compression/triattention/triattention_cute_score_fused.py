@@ -26,35 +26,14 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
-def _cute_sqrt_keyword_mode() -> str:
-    """Probe which fast-sqrt spelling this CuTe DSL's ``cute.math.sqrt`` takes.
-
-    The approximate-sqrt control was renamed across DSL releases: some expose
-    ``approx``/``ftz`` keywords, cutlass 4.5 exposes a single ``fastmath``
-    flag, and older releases expose a plain one-argument ``sqrt``. Passing an
-    unknown keyword raises TypeError at trace time (inside ``cute.compile``,
-    where it cannot be caught), so the capability is probed once at import
-    time via signature inspection and folded into a trace-time constant.
-    """
-    import inspect
-
-    try:
-        parameters = inspect.signature(cute.math.sqrt).parameters
-    except (TypeError, ValueError):
-        return "plain"
-    if "approx" in parameters and "ftz" in parameters:
-        return "approx_ftz"
-    if "fastmath" in parameters:
-        return "fastmath"
-    return "plain"
-
-
-_CUTE_SQRT_KWARG_MODE = _cute_sqrt_keyword_mode()
-
-
 @dsl_user_op
 def _sqrt_approx_ftz(value: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
-    """Emit the approximate FTZ square root missing from CuTe DSL 4.5."""
+    """Emit the approximate FTZ square root as inline PTX.
+
+    ``cute.math.sqrt``'s fast-sqrt keyword spelling varies across CuTe DSL
+    releases; the inline-asm form is release-independent and matches the
+    ``sqrt.approx.ftz.f32`` the fused score path has always used.
+    """
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
@@ -77,6 +56,19 @@ N = 8
 THREADS = 256
 EPILOGUE_THREADS = 128
 RAW_PAGE_BUFFERS = 2
+# partial_stats is a flat [stats_row, page_shard, {count, mean, m2}] record
+# array (stats_row = segment * num_q_heads + q_head); the selection finalizer
+# imports these field constants.
+STATS_FIELDS = 3
+STATS_MEAN = 1
+STATS_M2 = 2
+# Stats smem scratch: N first-tile score origins, then one (sum, square-sum)
+# pair per (epilogue warp, padded head column).
+STATS_ORIGIN_SLOTS = N
+STATS_SCRATCH_ELEMENTS = STATS_ORIGIN_SLOTS + (EPILOGUE_THREADS // 32) * N * 2
+# HND K pools interleave K/V planes: staged block-offset entries encode
+# physical_page * K_PLANES_PER_POOL_PAGE + plane.
+K_PLANES_PER_POOL_PAGE = 2
 
 RAW_K_VECTOR_ELEMENTS = 8
 TMA_DESCRIPTOR_QWORDS = 16
@@ -177,6 +169,11 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             )
         if tokens_per_block not in (32, 128):
             raise ValueError("TriAttention CuTe score requires 32- or 128-token pages")
+        if tokens_per_block > CTA_M:
+            # The schedule assumes one page never spans multiple compute
+            # tiles (the retired page_half loop generalized this; both
+            # supported page sizes make it a single iteration).
+            raise ValueError("TriAttention CuTe score requires pages within one compute tile")
         if num_q_heads % num_kv_heads or num_q_heads // num_kv_heads not in (4, 8):
             raise ValueError("TriAttention CuTe score requires GQA group 4 or 8")
         if page_shards not in _SUPPORTED_PAGE_SHARDS:
@@ -200,8 +197,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         self.box_tokens = min(CTA_M, tokens_per_block)
         self.fragments_per_phase = CTA_M // self.box_tokens
         self.pages_per_tile = self.fragments_per_phase
-        self.halves_per_page = max(1, tokens_per_block // CTA_M)
-        self.tile_tokens = self.halves_per_page * CTA_M
+        self.tile_tokens = CTA_M
         self.max_tiles = (seq_len + self.tile_tokens - 1) // self.tile_tokens
 
         # Producer staging constants baked into the generated code.
@@ -352,7 +348,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         raw_bf16_b_elements = cute.cosize(raw_bf16_b_smem_layout.outer)
         magnitude_fp16_a_elements = cute.cosize(magnitude_fp16_a_smem_layout.outer)
         magnitude_fp16_b_elements = cute.cosize(magnitude_fp16_b_smem_layout.outer)
-        stats_scratch_elements = 72 * int(self.write_partial_stats)
+        stats_scratch_elements = STATS_SCRATCH_ELEMENTS * int(self.write_partial_stats)
 
         @cute.struct
         class SharedStorage:
@@ -506,7 +502,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             swizzle=magnitude_fp16_b_smem_layout.inner,
         )
         if cutlass.const_expr(self.write_partial_stats):
-            sStats = storage.sStats.get_tensor(cute.make_layout(72))
+            sStats = storage.sStats.get_tensor(cute.make_layout(STATS_SCRATCH_ELEMENTS))
         raw_k_storage = storage.sRawK
         cpasync_raw_k_0 = raw_k_storage.get_tensor(
             raw_bf16_direct_a_smem_layout.outer,
@@ -632,7 +628,8 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     # The staged K-plane entries encode physical_page *
                     # kv_factor (2); decode to the pool page index here.
                     producer_prefetched_page_id_lane0 = (
-                        cutlass.Int32(page_ids[page_off + tile_index * self.pages_per_tile]) // 2
+                        cutlass.Int32(page_ids[page_off + tile_index * self.pages_per_tile])
+                        // K_PLANES_PER_POOL_PAGE
                     )
                     if cutlass.const_expr(self.fragments_per_phase > 1):
                         for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
@@ -649,7 +646,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                                             page_off + tile_index * self.pages_per_tile + fragment
                                         ]
                                     )
-                                    // 2
+                                    // K_PLANES_PER_POOL_PAGE
                                 )
                             producer_prefetched_page_ids_lane0[fragment] = fragment_page_id
         tCrRawBf16ASplit = raw_bf16_tiled_mma.make_fragment_A(cpasync_raw_k_0)
@@ -855,512 +852,476 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             producer_prefetched_page_ids_lane0[fragment],
                             0,
                         )
-            for page_half in cutlass.range_constexpr(self.halves_per_page):
-                raw_page_buffer = cutlass.Int32(0)
-                if cutlass.const_expr(self.write_partial_stats):
-                    raw_page_buffer = tiles_processed % RAW_PAGE_BUFFERS
-                raw_real_stage = raw_page_buffer * 2
-                raw_imag_stage = raw_real_stage + 1
-                if cutlass.const_expr(not self.write_partial_stats):
-                    if warp_idx == self.producer_warp_id:
-                        # Phase 0 fills the packed real-band stage view
-                        # (CTA_M x num_freqs bf16, raw_tma_copy_bytes).
-                        # Every producer-warp lane participates in the
-                        # PipelineTmaAsync barrier election.
-                        raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                        for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                            fragment_page = physical_page
-                            if cutlass.const_expr(fragment > 0):
-                                fragment_page = physical_page_fragments[fragment]
-                            cute.copy(
-                                raw_tma_atom,
-                                raw_tma_global_partition[
-                                    (
-                                        None,
-                                        0,
-                                        page_half,
-                                        (kv_head, fragment_page),
-                                    )
-                                ],
-                                raw_tma_shared_partition_real[fragment],
-                                tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                    raw_tma_producer_state
-                                ),
-                                tma_desc_ptr=raw_tma_descriptor_ptr,
+            raw_page_buffer = cutlass.Int32(0)
+            if cutlass.const_expr(self.write_partial_stats):
+                raw_page_buffer = tiles_processed % RAW_PAGE_BUFFERS
+            raw_real_stage = raw_page_buffer * 2
+            raw_imag_stage = raw_real_stage + 1
+            if cutlass.const_expr(not self.write_partial_stats):
+                if warp_idx == self.producer_warp_id:
+                    # Phase 0 fills the packed real-band stage view
+                    # (CTA_M x num_freqs bf16, raw_tma_copy_bytes).
+                    # Every producer-warp lane participates in the
+                    # PipelineTmaAsync barrier election.
+                    raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
+                    for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+                        fragment_page = physical_page
+                        if cutlass.const_expr(fragment > 0):
+                            fragment_page = physical_page_fragments[fragment]
+                        cute.copy(
+                            raw_tma_atom,
+                            raw_tma_global_partition[
+                                (
+                                    None,
+                                    0,
+                                    0,
+                                    (kv_head, fragment_page),
+                                )
+                            ],
+                            raw_tma_shared_partition_real[fragment],
+                            tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
+                                raw_tma_producer_state
+                            ),
+                            tma_desc_ptr=raw_tma_descriptor_ptr,
+                        )
+                    raw_tma_producer_state.advance()
+            raw_tma_pipeline.consumer_wait(raw_tma_consumer_state)
+            raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
+            raw_tma_consumer_state.advance()
+            if cutlass.const_expr(not self.write_partial_stats):
+                if warp_idx == self.producer_warp_id:
+                    raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
+                    for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+                        fragment_page = physical_page
+                        if cutlass.const_expr(fragment > 0):
+                            fragment_page = physical_page_fragments[fragment]
+                        cute.copy(
+                            raw_tma_atom,
+                            raw_tma_global_partition[
+                                (
+                                    None,
+                                    1,
+                                    0,
+                                    (kv_head, fragment_page),
+                                )
+                            ],
+                            raw_tma_shared_partition_imag[fragment],
+                            tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
+                                raw_tma_producer_state
+                            ),
+                            tma_desc_ptr=raw_tma_descriptor_ptr,
+                        )
+                    raw_tma_producer_state.advance()
+
+            next_page_id_lane0 = cutlass.Int32(0)
+            if warp_idx == self.producer_warp_id:
+                if lane_idx == 0:
+                    next_tile_start_token = tile_start_token + self.tile_tokens * self.page_shards
+                    next_pages_processed = tiles_processed + 1
+                    if (
+                        next_tile_start_token < valid_seq_len
+                        and next_pages_processed < self.max_tiles
+                    ):
+                        next_page_id_lane0 = (
+                            cutlass.Int32(
+                                page_ids[
+                                    page_off + (tile_index + self.page_shards) * self.pages_per_tile
+                                ]
                             )
+                            // K_PLANES_PER_POOL_PAGE
+                        )
+                        if cutlass.const_expr(self.fragments_per_phase > 1):
+                            for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
+                                # Same tail-tile clamp as the initial
+                                # prefetch: fall back to the first
+                                # fragment's page.
+                                next_fragment_page_id = next_page_id_lane0
+                                if (
+                                    next_tile_start_token + fragment * self.box_tokens
+                                    < valid_seq_len
+                                ):
+                                    next_fragment_page_id = (
+                                        cutlass.Int32(
+                                            page_ids[
+                                                page_off
+                                                + (tile_index + self.page_shards)
+                                                * self.pages_per_tile
+                                                + fragment
+                                            ]
+                                        )
+                                        // K_PLANES_PER_POOL_PAGE
+                                    )
+                                producer_prefetched_page_ids_lane0[fragment] = next_fragment_page_id
+            producer_prefetched_page_id_lane0 = next_page_id_lane0
+
+            # Submit B0-real while the imaginary TMA is in flight.
+            tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+            if warp_idx == self.producer_warp_id:
+                acc_pipeline.producer_acquire(acc_producer_state)
+                raw_bf16_tiled_mma.set(
+                    tcgen05.Field.ACCUMULATE,
+                    False,
+                )
+                for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    cute.gemm(
+                        raw_bf16_tiled_mma,
+                        tCtAcc,
+                        tCrRawBf16ASplit[(None, None, raw_k_block, raw_real_stage)],
+                        tCrRawBf16B0[(None, None, raw_k_block, 0)],
+                        tCtAcc,
+                    )
+                    raw_bf16_tiled_mma.set(
+                        tcgen05.Field.ACCUMULATE,
+                        True,
+                    )
+            raw_tma_pipeline.consumer_wait(raw_tma_consumer_state)
+            if cutlass.const_expr(self.write_partial_stats):
+                if warp_idx == self.producer_warp_id:
+                    next_tile_start_token = tile_start_token + self.tile_tokens * self.page_shards
+                    next_pages_processed = tiles_processed + 1
+                    prefetch_next_raw = (
+                        next_tile_start_token < valid_seq_len
+                        and next_pages_processed < self.max_tiles
+                    )
+                    prefetched_physical_page = cute.arch.shuffle_sync(
+                        producer_prefetched_page_id_lane0,
+                        0,
+                    )
+                    if cutlass.const_expr(self.fragments_per_phase > 1):
+                        for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
+                            prefetched_page_fragments[fragment] = cute.arch.shuffle_sync(
+                                producer_prefetched_page_ids_lane0[fragment],
+                                0,
+                            )
+                    if cutlass.dynamic_expr(prefetch_next_raw):
+                        next_raw_page_buffer = (raw_page_buffer + 1) % RAW_PAGE_BUFFERS
+                        raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
+                        if cutlass.dynamic_expr(next_raw_page_buffer == 0):
+                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+                                fragment_page = prefetched_physical_page
+                                if cutlass.const_expr(fragment > 0):
+                                    fragment_page = prefetched_page_fragments[fragment]
+                                cute.copy(
+                                    raw_tma_atom,
+                                    raw_tma_global_partition[
+                                        (
+                                            None,
+                                            0,
+                                            0,
+                                            (kv_head, fragment_page),
+                                        )
+                                    ],
+                                    raw_tma_shared_partition_real[fragment],
+                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
+                                        raw_tma_producer_state
+                                    ),
+                                    tma_desc_ptr=raw_tma_descriptor_ptr,
+                                )
+                        else:
+                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+                                fragment_page = prefetched_physical_page
+                                if cutlass.const_expr(fragment > 0):
+                                    fragment_page = prefetched_page_fragments[fragment]
+                                cute.copy(
+                                    raw_tma_atom,
+                                    raw_tma_global_partition[
+                                        (
+                                            None,
+                                            0,
+                                            0,
+                                            (kv_head, fragment_page),
+                                        )
+                                    ],
+                                    raw_tma_shared_partition_real_next[fragment],
+                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
+                                        raw_tma_producer_state
+                                    ),
+                                    tma_desc_ptr=raw_tma_descriptor_ptr,
+                                )
                         raw_tma_producer_state.advance()
-                raw_tma_pipeline.consumer_wait(raw_tma_consumer_state)
+                        raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
+                        if cutlass.dynamic_expr(next_raw_page_buffer == 0):
+                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+                                fragment_page = prefetched_physical_page
+                                if cutlass.const_expr(fragment > 0):
+                                    fragment_page = prefetched_page_fragments[fragment]
+                                cute.copy(
+                                    raw_tma_atom,
+                                    raw_tma_global_partition[
+                                        (
+                                            None,
+                                            1,
+                                            0,
+                                            (kv_head, fragment_page),
+                                        )
+                                    ],
+                                    raw_tma_shared_partition_imag[fragment],
+                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
+                                        raw_tma_producer_state
+                                    ),
+                                    tma_desc_ptr=raw_tma_descriptor_ptr,
+                                )
+                        else:
+                            for fragment in cutlass.range_constexpr(self.fragments_per_phase):
+                                fragment_page = prefetched_physical_page
+                                if cutlass.const_expr(fragment > 0):
+                                    fragment_page = prefetched_page_fragments[fragment]
+                                cute.copy(
+                                    raw_tma_atom,
+                                    raw_tma_global_partition[
+                                        (
+                                            None,
+                                            1,
+                                            0,
+                                            (kv_head, fragment_page),
+                                        )
+                                    ],
+                                    raw_tma_shared_partition_imag_next[fragment],
+                                    tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
+                                        raw_tma_producer_state
+                                    ),
+                                    tma_desc_ptr=raw_tma_descriptor_ptr,
+                                )
+                        raw_tma_producer_state.advance()
+            # Each of the 32 lanes stages one frequency per pass; 64-
+            # frequency heads take two passes.
+            for freq_rep in cutlass.range_constexpr(self.num_freqs // 32):
+                frequency = lane_idx + 32 * freq_rep
+                # Stage prefetch_depth independent token loads from the
+                # raw-K shared buffer before consuming any of them.
+                for token_base in cutlass.range(
+                    0,
+                    CTA_M // (THREADS // 32),
+                    self.prefetch_depth,
+                    unroll_full=False,
+                ):
+                    staged_real = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
+                    staged_imag = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
+                    for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
+                        token_round = token_base + prefetch_index
+                        token = warp_idx + token_round * (THREADS // 32)
+                        staged_real[prefetch_index] = cutlass.Float32(
+                            cpasync_raw_k_0[
+                                (
+                                    (token, frequency % 16),
+                                    0,
+                                    frequency // 16,
+                                    raw_real_stage,
+                                )
+                            ]
+                        )
+                        staged_imag[prefetch_index] = cutlass.Float32(
+                            cpasync_raw_k_0[
+                                (
+                                    (token, frequency % 16),
+                                    0,
+                                    frequency // 16,
+                                    raw_imag_stage,
+                                )
+                            ]
+                        )
+
+                    for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
+                        token_round = token_base + prefetch_index
+                        token = warp_idx + token_round * (THREADS // 32)
+                        real = staged_real[prefetch_index]
+                        imag = staged_imag[prefetch_index]
+                        norm2 = real * real + imag * imag
+                        magnitude = _sqrt_approx_ftz(norm2)
+                        magnitude_fp16_0 = cutlass.Float16(magnitude)
+                        magnitude_fp16_1 = cutlass.Float16(
+                            magnitude - cutlass.Float32(magnitude_fp16_0)
+                        )
+                        magnitude_k_block_fp16 = frequency // 16
+                        magnitude_coord_fp16 = (
+                            (token, frequency % 16),
+                            0,
+                            magnitude_k_block_fp16,
+                            0,
+                        )
+                        sMagnitudeFp16A0[magnitude_coord_fp16] = magnitude_fp16_0
+                        sMagnitudeFp16A1[magnitude_coord_fp16] = magnitude_fp16_1
+
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.barrier()
+
+            tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+
+            if warp_idx == self.producer_warp_id:
+                # Finish B0-imag, then issue B1-real and B1-imag.
+                raw_bf16_tiled_mma.set(
+                    tcgen05.Field.ACCUMULATE,
+                    True,
+                )
+                for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    imag_b_block = self.num_freqs // 16 + raw_k_block
+                    cute.gemm(
+                        raw_bf16_tiled_mma,
+                        tCtAcc,
+                        tCrRawBf16ASplit[(None, None, raw_k_block, raw_imag_stage)],
+                        tCrRawBf16B0[(None, None, imag_b_block, 0)],
+                        tCtAcc,
+                    )
+                for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    cute.gemm(
+                        raw_bf16_tiled_mma,
+                        tCtAcc,
+                        tCrRawBf16ASplit[(None, None, raw_k_block, raw_real_stage)],
+                        tCrRawBf16B1[(None, None, raw_k_block, 0)],
+                        tCtAcc,
+                    )
+                for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    imag_b_block = self.num_freqs // 16 + raw_k_block
+                    cute.gemm(
+                        raw_bf16_tiled_mma,
+                        tCtAcc,
+                        tCrRawBf16ASplit[(None, None, raw_k_block, raw_imag_stage)],
+                        tCrRawBf16B1[(None, None, imag_b_block, 0)],
+                        tCtAcc,
+                    )
+                # Compensated FP16 magnitude accumulation:
+                # |K|*coeff = A0*B0 + A0*B1 + A1*B0 (the A1*B1 term is
+                # below fp32 accumulation resolution and dropped).
+                magnitude_lo_tiled_mma.set(
+                    tcgen05.Field.ACCUMULATE,
+                    True,
+                )
+                for magnitude_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    cute.gemm(
+                        magnitude_lo_tiled_mma,
+                        tCtAcc,
+                        tCrMagnitudeFp16A0[(None, None, magnitude_k_block, 0)],
+                        tCrMagnitudeFp16B0[(None, None, magnitude_k_block, 0)],
+                        tCtAcc,
+                    )
+                for magnitude_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    cute.gemm(
+                        magnitude_lo_tiled_mma,
+                        tCtAcc,
+                        tCrMagnitudeFp16A0[(None, None, magnitude_k_block, 0)],
+                        tCrMagnitudeFp16B1[(None, None, magnitude_k_block, 0)],
+                        tCtAcc,
+                    )
+                for magnitude_k_block in cutlass.range_constexpr(self.num_freqs // 16):
+                    cute.gemm(
+                        magnitude_lo_tiled_mma,
+                        tCtAcc,
+                        tCrMagnitudeFp16A1[(None, None, magnitude_k_block, 0)],
+                        tCrMagnitudeFp16B0[(None, None, magnitude_k_block, 0)],
+                        tCtAcc,
+                    )
+                acc_pipeline.producer_commit(acc_producer_state)
+                acc_producer_state.advance()
+                if tiles_processed == 0:
+                    cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
+            acc_pipeline.consumer_wait(acc_consumer_state)
+            if cutlass.const_expr(self.write_partial_stats):
+                # The alternate raw-page buffer was filled while this
+                # page's UMMA completed. Release only the current imag
+                # phase after all of its asynchronous consumers finish.
                 raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
                 raw_tma_consumer_state.advance()
-                if cutlass.const_expr(not self.write_partial_stats):
-                    if warp_idx == self.producer_warp_id:
-                        raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                        for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                            fragment_page = physical_page
-                            if cutlass.const_expr(fragment > 0):
-                                fragment_page = physical_page_fragments[fragment]
-                            cute.copy(
-                                raw_tma_atom,
-                                raw_tma_global_partition[
-                                    (
-                                        None,
-                                        1,
-                                        page_half,
-                                        (kv_head, fragment_page),
-                                    )
-                                ],
-                                raw_tma_shared_partition_imag[fragment],
-                                tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                    raw_tma_producer_state
-                                ),
-                                tma_desc_ptr=raw_tma_descriptor_ptr,
-                            )
-                        raw_tma_producer_state.advance()
-
-                if cutlass.const_expr(page_half == self.halves_per_page - 1):
-                    next_page_id_lane0 = cutlass.Int32(0)
-                    if warp_idx == self.producer_warp_id:
-                        if lane_idx == 0:
-                            next_tile_start_token = (
-                                tile_start_token + self.tile_tokens * self.page_shards
-                            )
-                            next_pages_processed = tiles_processed + 1
-                            if (
-                                next_tile_start_token < valid_seq_len
-                                and next_pages_processed < self.max_tiles
-                            ):
-                                next_page_id_lane0 = (
-                                    cutlass.Int32(
-                                        page_ids[
-                                            page_off
-                                            + (tile_index + self.page_shards) * self.pages_per_tile
-                                        ]
-                                    )
-                                    // 2
-                                )
-                                if cutlass.const_expr(self.fragments_per_phase > 1):
-                                    for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
-                                        # Same tail-tile clamp as the initial
-                                        # prefetch: fall back to the first
-                                        # fragment's page.
-                                        next_fragment_page_id = next_page_id_lane0
-                                        if (
-                                            next_tile_start_token + fragment * self.box_tokens
-                                            < valid_seq_len
-                                        ):
-                                            next_fragment_page_id = (
-                                                cutlass.Int32(
-                                                    page_ids[
-                                                        page_off
-                                                        + (tile_index + self.page_shards)
-                                                        * self.pages_per_tile
-                                                        + fragment
-                                                    ]
-                                                )
-                                                // 2
-                                            )
-                                        producer_prefetched_page_ids_lane0[fragment] = (
-                                            next_fragment_page_id
-                                        )
-                    producer_prefetched_page_id_lane0 = next_page_id_lane0
-
-                # Submit B0-real while the imaginary TMA is in flight.
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
-                if warp_idx == self.producer_warp_id:
-                    acc_pipeline.producer_acquire(acc_producer_state)
-                    raw_bf16_tiled_mma.set(
-                        tcgen05.Field.ACCUMULATE,
-                        False,
-                    )
-                    for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        cute.gemm(
-                            raw_bf16_tiled_mma,
-                            tCtAcc,
-                            tCrRawBf16ASplit[(None, None, raw_k_block, raw_real_stage)],
-                            tCrRawBf16B0[(None, None, raw_k_block, 0)],
-                            tCtAcc,
-                        )
-                        raw_bf16_tiled_mma.set(
-                            tcgen05.Field.ACCUMULATE,
-                            True,
-                        )
-                raw_tma_pipeline.consumer_wait(raw_tma_consumer_state)
-                if cutlass.const_expr(self.write_partial_stats):
-                    if warp_idx == self.producer_warp_id:
-                        if cutlass.const_expr(page_half + 1 < self.halves_per_page):
-                            prefetched_physical_page = physical_page
-                            prefetch_next_raw = True
-                            prefetched_page_half = page_half + 1
-                        else:
-                            next_tile_start_token = (
-                                tile_start_token + self.tile_tokens * self.page_shards
-                            )
-                            next_pages_processed = tiles_processed + 1
-                            prefetch_next_raw = (
-                                next_tile_start_token < valid_seq_len
-                                and next_pages_processed < self.max_tiles
-                            )
-                            prefetched_physical_page = cute.arch.shuffle_sync(
-                                producer_prefetched_page_id_lane0,
-                                0,
-                            )
-                            if cutlass.const_expr(self.fragments_per_phase > 1):
-                                for fragment in cutlass.range_constexpr(1, self.pages_per_tile):
-                                    prefetched_page_fragments[fragment] = cute.arch.shuffle_sync(
-                                        producer_prefetched_page_ids_lane0[fragment],
-                                        0,
-                                    )
-                            prefetched_page_half = 0
-                        if cutlass.dynamic_expr(prefetch_next_raw):
-                            next_raw_page_buffer = (raw_page_buffer + 1) % RAW_PAGE_BUFFERS
-                            raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                            if cutlass.dynamic_expr(next_raw_page_buffer == 0):
-                                for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                    fragment_page = prefetched_physical_page
-                                    if cutlass.const_expr(fragment > 0):
-                                        fragment_page = prefetched_page_fragments[fragment]
-                                    cute.copy(
-                                        raw_tma_atom,
-                                        raw_tma_global_partition[
-                                            (
-                                                None,
-                                                0,
-                                                prefetched_page_half,
-                                                (kv_head, fragment_page),
-                                            )
-                                        ],
-                                        raw_tma_shared_partition_real[fragment],
-                                        tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                            raw_tma_producer_state
-                                        ),
-                                        tma_desc_ptr=raw_tma_descriptor_ptr,
-                                    )
-                            else:
-                                for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                    fragment_page = prefetched_physical_page
-                                    if cutlass.const_expr(fragment > 0):
-                                        fragment_page = prefetched_page_fragments[fragment]
-                                    cute.copy(
-                                        raw_tma_atom,
-                                        raw_tma_global_partition[
-                                            (
-                                                None,
-                                                0,
-                                                prefetched_page_half,
-                                                (kv_head, fragment_page),
-                                            )
-                                        ],
-                                        raw_tma_shared_partition_real_next[fragment],
-                                        tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                            raw_tma_producer_state
-                                        ),
-                                        tma_desc_ptr=raw_tma_descriptor_ptr,
-                                    )
-                            raw_tma_producer_state.advance()
-                            raw_tma_pipeline.producer_acquire(raw_tma_producer_state)
-                            if cutlass.dynamic_expr(next_raw_page_buffer == 0):
-                                for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                    fragment_page = prefetched_physical_page
-                                    if cutlass.const_expr(fragment > 0):
-                                        fragment_page = prefetched_page_fragments[fragment]
-                                    cute.copy(
-                                        raw_tma_atom,
-                                        raw_tma_global_partition[
-                                            (
-                                                None,
-                                                1,
-                                                prefetched_page_half,
-                                                (kv_head, fragment_page),
-                                            )
-                                        ],
-                                        raw_tma_shared_partition_imag[fragment],
-                                        tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                            raw_tma_producer_state
-                                        ),
-                                        tma_desc_ptr=raw_tma_descriptor_ptr,
-                                    )
-                            else:
-                                for fragment in cutlass.range_constexpr(self.fragments_per_phase):
-                                    fragment_page = prefetched_physical_page
-                                    if cutlass.const_expr(fragment > 0):
-                                        fragment_page = prefetched_page_fragments[fragment]
-                                    cute.copy(
-                                        raw_tma_atom,
-                                        raw_tma_global_partition[
-                                            (
-                                                None,
-                                                1,
-                                                prefetched_page_half,
-                                                (kv_head, fragment_page),
-                                            )
-                                        ],
-                                        raw_tma_shared_partition_imag_next[fragment],
-                                        tma_bar_ptr=raw_tma_pipeline.producer_get_barrier(
-                                            raw_tma_producer_state
-                                        ),
-                                        tma_desc_ptr=raw_tma_descriptor_ptr,
-                                    )
-                            raw_tma_producer_state.advance()
-                # Each of the 32 lanes stages one frequency per pass; 64-
-                # frequency heads take two passes.
-                for freq_rep in cutlass.range_constexpr(self.num_freqs // 32):
-                    frequency = lane_idx + 32 * freq_rep
-                    # Stage prefetch_depth independent token loads from the
-                    # raw-K shared buffer before consuming any of them.
-                    for token_base in cutlass.range(
-                        0,
-                        CTA_M // (THREADS // 32),
-                        self.prefetch_depth,
-                        unroll_full=False,
-                    ):
-                        staged_real = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
-                        staged_imag = cute.make_rmem_tensor((self.prefetch_depth,), cutlass.Float32)
-                        for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
-                            token_round = token_base + prefetch_index
-                            token = warp_idx + token_round * (THREADS // 32)
-                            staged_real[prefetch_index] = cutlass.Float32(
-                                cpasync_raw_k_0[
-                                    (
-                                        (token, frequency % 16),
-                                        0,
-                                        frequency // 16,
-                                        raw_real_stage,
-                                    )
-                                ]
-                            )
-                            staged_imag[prefetch_index] = cutlass.Float32(
-                                cpasync_raw_k_0[
-                                    (
-                                        (token, frequency % 16),
-                                        0,
-                                        frequency // 16,
-                                        raw_imag_stage,
-                                    )
-                                ]
-                            )
-
-                        for prefetch_index in cutlass.range_constexpr(self.prefetch_depth):
-                            token_round = token_base + prefetch_index
-                            token = warp_idx + token_round * (THREADS // 32)
-                            real = staged_real[prefetch_index]
-                            imag = staged_imag[prefetch_index]
-                            norm2 = real * real + imag * imag
-                            if cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "approx_ftz"):
-                                magnitude = cute.math.sqrt(norm2, approx=True, ftz=True)
-                            elif cutlass.const_expr(_CUTE_SQRT_KWARG_MODE == "fastmath"):
-                                magnitude = _sqrt_approx_ftz(norm2)
-                            else:
-                                # Plain IEEE sqrt (more accurate than approx);
-                                # the equivalence tolerance covers the difference.
-                                magnitude = cute.math.sqrt(norm2)
-                            magnitude_fp16_0 = cutlass.Float16(magnitude)
-                            magnitude_fp16_1 = cutlass.Float16(
-                                magnitude - cutlass.Float32(magnitude_fp16_0)
-                            )
-                            magnitude_k_block_fp16 = frequency // 16
-                            magnitude_coord_fp16 = (
-                                (token, frequency % 16),
-                                0,
-                                magnitude_k_block_fp16,
-                                0,
-                            )
-                            sMagnitudeFp16A0[magnitude_coord_fp16] = magnitude_fp16_0
-                            sMagnitudeFp16A1[magnitude_coord_fp16] = magnitude_fp16_1
-
-                cute.arch.fence_proxy("async.shared", space="cta")
-                cute.arch.barrier()
-
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
-
-                if warp_idx == self.producer_warp_id:
-                    # Finish B0-imag, then issue B1-real and B1-imag.
-                    raw_bf16_tiled_mma.set(
-                        tcgen05.Field.ACCUMULATE,
-                        True,
-                    )
-                    for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        imag_b_block = self.num_freqs // 16 + raw_k_block
-                        cute.gemm(
-                            raw_bf16_tiled_mma,
-                            tCtAcc,
-                            tCrRawBf16ASplit[(None, None, raw_k_block, raw_imag_stage)],
-                            tCrRawBf16B0[(None, None, imag_b_block, 0)],
-                            tCtAcc,
-                        )
-                    for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        cute.gemm(
-                            raw_bf16_tiled_mma,
-                            tCtAcc,
-                            tCrRawBf16ASplit[(None, None, raw_k_block, raw_real_stage)],
-                            tCrRawBf16B1[(None, None, raw_k_block, 0)],
-                            tCtAcc,
-                        )
-                    for raw_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        imag_b_block = self.num_freqs // 16 + raw_k_block
-                        cute.gemm(
-                            raw_bf16_tiled_mma,
-                            tCtAcc,
-                            tCrRawBf16ASplit[(None, None, raw_k_block, raw_imag_stage)],
-                            tCrRawBf16B1[(None, None, imag_b_block, 0)],
-                            tCtAcc,
-                        )
-                    # Compensated FP16 magnitude accumulation:
-                    # |K|*coeff = A0*B0 + A0*B1 + A1*B0 (the A1*B1 term is
-                    # below fp32 accumulation resolution and dropped).
-                    magnitude_lo_tiled_mma.set(
-                        tcgen05.Field.ACCUMULATE,
-                        True,
-                    )
-                    for magnitude_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        cute.gemm(
-                            magnitude_lo_tiled_mma,
-                            tCtAcc,
-                            tCrMagnitudeFp16A0[(None, None, magnitude_k_block, 0)],
-                            tCrMagnitudeFp16B0[(None, None, magnitude_k_block, 0)],
-                            tCtAcc,
-                        )
-                    for magnitude_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        cute.gemm(
-                            magnitude_lo_tiled_mma,
-                            tCtAcc,
-                            tCrMagnitudeFp16A0[(None, None, magnitude_k_block, 0)],
-                            tCrMagnitudeFp16B1[(None, None, magnitude_k_block, 0)],
-                            tCtAcc,
-                        )
-                    for magnitude_k_block in cutlass.range_constexpr(self.num_freqs // 16):
-                        cute.gemm(
-                            magnitude_lo_tiled_mma,
-                            tCtAcc,
-                            tCrMagnitudeFp16A1[(None, None, magnitude_k_block, 0)],
-                            tCrMagnitudeFp16B0[(None, None, magnitude_k_block, 0)],
-                            tCtAcc,
-                        )
-                    acc_pipeline.producer_commit(acc_producer_state)
-                    acc_producer_state.advance()
-                    if tiles_processed == 0:
-                        if cutlass.const_expr(page_half == 0):
-                            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
-                acc_pipeline.consumer_wait(acc_consumer_state)
-                if cutlass.const_expr(self.write_partial_stats):
-                    # The alternate raw-page buffer was filled while this
-                    # page's UMMA completed. Release only the current imag
-                    # phase after all of its asynchronous consumers finish.
-                    raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
-                    raw_tma_consumer_state.advance()
-                # Every term multiplying sum_seq must stay 64-bit: with
-                # request*layer segments of seq_len columns the score-plane
-                # stride alone can exceed 2^31. The scratch head axis is
-                # padded to the MMA tile N=8 per KV head (group-4 columns
-                # 4..7 land in padded score planes holding zero scores). The
-                # host audit in triattention.init_eviction_buffers bounds the
-                # 32-bit head-axis fold (kv_head * N <= 7 planes) here.
-                output_offset = (
-                    cutlass.Int64(kv_head * N) * sum_seq
-                    + out_base
-                    + tile_start_token
-                    + page_half * CTA_M
-                )
-                page_output = cute.make_tensor(
-                    output.iterator + output_offset,
-                    cute.make_layout(
-                        (CTA_M, N, 1),
-                        stride=(
-                            1,
-                            sum_seq,
-                            N * sum_seq,
-                        ),
+            # Every term multiplying sum_seq must stay 64-bit: with
+            # request*layer segments of seq_len columns the score-plane
+            # stride alone can exceed 2^31. The scratch head axis is
+            # padded to the MMA tile N=8 per KV head (group-4 columns
+            # 4..7 land in padded score planes holding zero scores). The
+            # host audit in triattention.init_eviction_buffers bounds the
+            # 32-bit head-axis fold (kv_head * N <= 7 planes) here.
+            output_offset = cutlass.Int64(kv_head * N) * sum_seq + out_base + tile_start_token
+            page_output = cute.make_tensor(
+                output.iterator + output_offset,
+                cute.make_layout(
+                    (CTA_M, N, 1),
+                    stride=(
+                        1,
+                        sum_seq,
+                        N * sum_seq,
                     ),
-                )
-                gC_mnl = cute.local_tile(page_output, self.epi_tile, (None, None, None))
-                tCgC = thr_mma.partition_C(gC_mnl)
-                epilogue_tidx = tidx % EPILOGUE_THREADS
-                tiled_copy_t2r, tTR_tAcc, tTR_rAcc = self.epilog_tmem_copy_and_partition(
-                    epilogue_tidx, tCtAcc, tCgC, self.epi_tile, False
-                )
-                simt_atom, tTR_rC, tTR_gC = self.epilog_gmem_copy_and_partition(
-                    epilogue_tidx, tiled_copy_t2r, tCgC, self.epi_tile
-                )
-                tTR_gC = tTR_gC[(None, None, None, None, None, 0, 0, 0)]
-                tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
-                if tidx < EPILOGUE_THREADS:
-                    for subtile_idx in cutlass.range_constexpr(cute.size(tTR_tAcc.shape, mode=[3])):
+                ),
+            )
+            gC_mnl = cute.local_tile(page_output, self.epi_tile, (None, None, None))
+            tCgC = thr_mma.partition_C(gC_mnl)
+            epilogue_tidx = tidx % EPILOGUE_THREADS
+            tiled_copy_t2r, tTR_tAcc, tTR_rAcc = self.epilog_tmem_copy_and_partition(
+                epilogue_tidx, tCtAcc, tCgC, self.epi_tile, False
+            )
+            simt_atom, tTR_rC, tTR_gC = self.epilog_gmem_copy_and_partition(
+                epilogue_tidx, tiled_copy_t2r, tCgC, self.epi_tile
+            )
+            tTR_gC = tTR_gC[(None, None, None, None, None, 0, 0, 0)]
+            tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+            tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+            if tidx < EPILOGUE_THREADS:
+                for subtile_idx in cutlass.range_constexpr(cute.size(tTR_tAcc.shape, mode=[3])):
+                    cute.copy(
+                        tiled_copy_t2r,
+                        tTR_tAcc[(None, None, None, subtile_idx)],
+                        tTR_rAcc,
+                    )
+                    tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
+                    # The window start is a per-request runtime value, so
+                    # the tile-interior fast path is a dynamic predicate;
+                    # only the straddling first tile takes the per-token
+                    # branch.
+                    if cutlass.dynamic_expr(
+                        tile_start_token >= score_start and tile_start_token + CTA_M <= self.seq_len
+                    ):
                         cute.copy(
-                            tiled_copy_t2r,
-                            tTR_tAcc[(None, None, None, subtile_idx)],
-                            tTR_rAcc,
+                            simt_atom,
+                            tTR_rC,
+                            tTR_gC[(None, None, None, subtile_idx)],
                         )
-                        tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
-                        # The window start is a per-request runtime value, so
-                        # the tile-interior fast path is a dynamic predicate;
-                        # only the straddling first tile takes the per-token
-                        # branch.
+                    else:
+                        output_token = tile_start_token + epilogue_tidx
                         if cutlass.dynamic_expr(
-                            tile_start_token >= score_start
-                            and tile_start_token + CTA_M <= self.seq_len
+                            output_token >= score_start and output_token < self.seq_len
                         ):
                             cute.copy(
                                 simt_atom,
                                 tTR_rC,
                                 tTR_gC[(None, None, None, subtile_idx)],
                             )
-                        else:
-                            output_token = tile_start_token + epilogue_tidx
-                            if cutlass.dynamic_expr(
-                                output_token >= score_start and output_token < self.seq_len
-                            ):
-                                cute.copy(
-                                    simt_atom,
-                                    tTR_rC,
-                                    tTR_gC[(None, None, None, subtile_idx)],
-                                )
-                        if cutlass.const_expr(self.write_partial_stats):
-                            stats_output = cute.coalesce(tTR_rC)
-                            stats_head_base = subtile_idx * cute.size(stats_output)
-                            for stats_value in cutlass.range_constexpr(cute.size(stats_output)):
-                                stats_head = stats_head_base + stats_value
-                                stats_page_scores_m128[stats_head] = cutlass.Float32(
-                                    stats_output[stats_value]
-                                )
-                                if tiles_processed == 0:
-                                    if cutlass.const_expr(page_half == 0):
-                                        if tidx == 0:
-                                            sStats[stats_head] = cutlass.Float32(
-                                                stats_output[stats_value]
-                                            )
-                cute.arch.fence_view_async_tmem_load()
-                with cute.arch.elect_one():
-                    acc_pipeline.consumer_release(acc_consumer_state)
-                acc_consumer_state.advance()
-                if cutlass.const_expr(self.write_partial_stats):
-                    if tidx < EPILOGUE_THREADS:
-                        stats_epilogue_barrier.wait_unaligned()
-                else:
-                    cute.arch.barrier()
-                if cutlass.const_expr(not self.write_partial_stats):
-                    raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
-                    raw_tma_consumer_state.advance()
-                if cutlass.const_expr(self.write_partial_stats):
-                    if tiles_processed == 0:
-                        if cutlass.const_expr(page_half == 0):
-                            for stats_head in cutlass.range_constexpr(N):
-                                stats_origins_m128[stats_head] = sStats[stats_head]
-                    stats_token = tile_start_token + tidx
-                    if tidx < EPILOGUE_THREADS:
-                        if cutlass.dynamic_expr(
-                            stats_token >= score_start and stats_token < valid_seq_len
-                        ):
-                            for stats_head in cutlass.range_constexpr(N):
-                                stats_delta = (
-                                    stats_page_scores_m128[stats_head]
-                                    - stats_origins_m128[stats_head]
-                                )
-                                stats_sums_m128[stats_head] = (
-                                    stats_sums_m128[stats_head] + stats_delta
-                                )
-                                stats_square_sums_m128[stats_head] = (
-                                    stats_square_sums_m128[stats_head] + stats_delta * stats_delta
-                                )
+                    if cutlass.const_expr(self.write_partial_stats):
+                        stats_output = cute.coalesce(tTR_rC)
+                        stats_head_base = subtile_idx * cute.size(stats_output)
+                        for stats_value in cutlass.range_constexpr(cute.size(stats_output)):
+                            stats_head = stats_head_base + stats_value
+                            stats_page_scores_m128[stats_head] = cutlass.Float32(
+                                stats_output[stats_value]
+                            )
+                            if tiles_processed == 0:
+                                if tidx == 0:
+                                    sStats[stats_head] = cutlass.Float32(stats_output[stats_value])
+            cute.arch.fence_view_async_tmem_load()
+            with cute.arch.elect_one():
+                acc_pipeline.consumer_release(acc_consumer_state)
+            acc_consumer_state.advance()
+            if cutlass.const_expr(self.write_partial_stats):
+                if tidx < EPILOGUE_THREADS:
+                    stats_epilogue_barrier.wait_unaligned()
+            else:
+                cute.arch.barrier()
+            if cutlass.const_expr(not self.write_partial_stats):
+                raw_tma_pipeline.consumer_release(raw_tma_consumer_state)
+                raw_tma_consumer_state.advance()
+            if cutlass.const_expr(self.write_partial_stats):
+                if tiles_processed == 0:
+                    for stats_head in cutlass.range_constexpr(N):
+                        stats_origins_m128[stats_head] = sStats[stats_head]
+                stats_token = tile_start_token + tidx
+                if tidx < EPILOGUE_THREADS:
+                    if cutlass.dynamic_expr(
+                        stats_token >= score_start and stats_token < valid_seq_len
+                    ):
+                        for stats_head in cutlass.range_constexpr(N):
+                            stats_delta = (
+                                stats_page_scores_m128[stats_head] - stats_origins_m128[stats_head]
+                            )
+                            stats_sums_m128[stats_head] = stats_sums_m128[stats_head] + stats_delta
+                            stats_square_sums_m128[stats_head] = (
+                                stats_square_sums_m128[stats_head] + stats_delta * stats_delta
+                            )
             tile_index += self.page_shards
             tile_start_token += self.tile_tokens * self.page_shards
             tiles_processed += 1
@@ -1377,7 +1338,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                         stats_square_sum, stats_offset
                     )
                 if lane_idx == 0 and warp_idx < EPILOGUE_THREADS // 32:
-                    stats_scratch_base = 8 + (warp_idx * N + stats_head) * 2
+                    stats_scratch_base = STATS_ORIGIN_SLOTS + (warp_idx * N + stats_head) * 2
                     sStats[stats_scratch_base] = stats_sum
                     sStats[stats_scratch_base + 1] = stats_square_sum
             cute.arch.barrier()
@@ -1390,7 +1351,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                     stats_sum = cutlass.Float32(0.0)
                     stats_square_sum = cutlass.Float32(0.0)
                     for stats_warp in cutlass.range_constexpr(EPILOGUE_THREADS // 32):
-                        stats_scratch_base = 8 + (stats_warp * N + lane_idx) * 2
+                        stats_scratch_base = STATS_ORIGIN_SLOTS + (stats_warp * N + lane_idx) * 2
                         stats_sum = stats_sum + sStats[stats_scratch_base]
                         stats_square_sum = stats_square_sum + sStats[stats_scratch_base + 1]
                     stats_count_i32 = tiles_processed * self.tile_tokens
@@ -1418,10 +1379,10 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
                             cutlass.Float32(0.0),
                         )
                     stats_row = task * self.group_size + lane_idx
-                    stats_base = (stats_row * self.page_shards + page_shard) * 3
+                    stats_base = (stats_row * self.page_shards + page_shard) * STATS_FIELDS
                     partial_stats[stats_base] = stats_count
-                    partial_stats[stats_base + 1] = stats_mean
-                    partial_stats[stats_base + 2] = stats_m2
+                    partial_stats[stats_base + STATS_MEAN] = stats_mean
+                    partial_stats[stats_base + STATS_M2] = stats_m2
         cute.arch.barrier()
         if warp_idx == 0:
             cute.arch.dealloc_tmem(tmem_ptr, self.num_tmem_alloc_cols, is_two_cta=False)
@@ -1450,7 +1411,11 @@ def _encode_tma_descriptors(
         if tuple(pool.shape[1:]) != tuple(anchor.shape[1:]):
             raise ValueError("TriAttention CuTe score requires uniform scored-layer pool geometry")
         _, kv_factor, num_kv_heads, pool_tokens, head_dim = pool.shape
-        if (kv_factor, pool_tokens, head_dim) != (2, tokens_per_block, 2 * num_freqs):
+        if (kv_factor, pool_tokens, head_dim) != (
+            K_PLANES_PER_POOL_PAGE,
+            tokens_per_block,
+            2 * num_freqs,
+        ):
             raise ValueError(
                 f"TriAttention CuTe score requires [page, 2, Hkv, {tokens_per_block}, "
                 f"{2 * num_freqs}] pools"
@@ -1567,8 +1532,10 @@ class TriAttentionCuteScoreRunner:
         self.num_kv_heads = int(num_kv_heads)
         self.sm_count = int(torch.cuda.get_device_properties(output.device).multi_processor_count)
         self.enable_partial_stats = bool(enable_partial_stats)
+        # One [stats_row, page_shard, {count, mean, m2}] record array (see the
+        # STATS_FIELDS constants above).
         partial_stats_elements = (
-            max_requests * num_layers * num_q_heads * SMALL_WORKLOAD_PAGE_SHARDS * 3
+            max_requests * num_layers * num_q_heads * SMALL_WORKLOAD_PAGE_SHARDS * STATS_FIELDS
             if self.enable_partial_stats
             else 1
         )
@@ -1654,44 +1621,47 @@ class TriAttentionCuteScoreRunner:
         if max_requests > 1:
             variants.append((max_requests, 2))
         for request_count, page_shards in variants:
-            cache_key = (
-                "triattention_cute_score",
-                static_geometry,
-                tensor_specs,
-                request_count,
-                page_shards,
-            )
-            with _COMPILE_LOCK:
-                compiled = _COMPILED_KERNELS.get(cache_key)
-                if compiled is None:
-                    kernel = _TriAttentionScoreKernel(
-                        num_layers=num_layers,
-                        seq_len=seq_len,
-                        num_q_heads=num_q_heads,
-                        num_kv_heads=num_kv_heads,
-                        num_freqs=num_freqs,
-                        tokens_per_block=tokens_per_block,
-                        pool_shape=tuple(
-                            int(value) for value in layer_pools[layer_indices[0]].shape
-                        ),
-                        pool_strides=tuple(
-                            int(value) for value in layer_pools[layer_indices[0]].stride()
-                        ),
-                        pool_dtype=cutlass.BFloat16,
-                        page_shards=page_shards,
-                    )
-                    stream = cuda.CUstream(torch.cuda.current_stream(output.device).cuda_stream)
-                    compiled = cute.compile(
-                        kernel,
-                        *self._cute_prefix,
-                        _to_cute(mean_cos.view(-1)),
-                        _to_cute(mean_sin.view(-1)),
-                        *self._cute_tail,
-                        cutlass.Int32(1),
-                        stream,
-                    )
-                    _COMPILED_KERNELS[cache_key] = compiled
-            self._compiled[request_count] = compiled
+            if not self.enable_partial_stats:
+                # Per-head modes launch the score-only entry; the union
+                # runner compiles ONLY its fused stats+union pipeline below.
+                cache_key = (
+                    "triattention_cute_score",
+                    static_geometry,
+                    tensor_specs,
+                    request_count,
+                    page_shards,
+                )
+                with _COMPILE_LOCK:
+                    compiled = _COMPILED_KERNELS.get(cache_key)
+                    if compiled is None:
+                        kernel = _TriAttentionScoreKernel(
+                            num_layers=num_layers,
+                            seq_len=seq_len,
+                            num_q_heads=num_q_heads,
+                            num_kv_heads=num_kv_heads,
+                            num_freqs=num_freqs,
+                            tokens_per_block=tokens_per_block,
+                            pool_shape=tuple(
+                                int(value) for value in layer_pools[layer_indices[0]].shape
+                            ),
+                            pool_strides=tuple(
+                                int(value) for value in layer_pools[layer_indices[0]].stride()
+                            ),
+                            pool_dtype=cutlass.BFloat16,
+                            page_shards=page_shards,
+                        )
+                        stream = cuda.CUstream(torch.cuda.current_stream(output.device).cuda_stream)
+                        compiled = cute.compile(
+                            kernel,
+                            *self._cute_prefix,
+                            _to_cute(mean_cos.view(-1)),
+                            _to_cute(mean_sin.view(-1)),
+                            *self._cute_tail,
+                            cutlass.Int32(1),
+                            stream,
+                        )
+                        _COMPILED_KERNELS[cache_key] = compiled
+                self._compiled[request_count] = compiled
             self._page_shards[request_count] = page_shards
             if self.enable_partial_stats:
                 stats_cache_key = (
@@ -1735,8 +1705,8 @@ class TriAttentionCuteScoreRunner:
                 self._compiled_stats[request_count] = compiled_stats
 
         if max_requests > 1:
-            small_score = self._compiled[1]
-            large_score = self._compiled[max_requests]
+            small_score = self._compiled.get(1)
+            large_score = self._compiled.get(max_requests)
             small_stats = self._compiled_stats.get(1)
             large_stats = self._compiled_stats.get(max_requests)
             for request_count in range(1, max_requests + 1):
@@ -1745,9 +1715,10 @@ class TriAttentionCuteScoreRunner:
                 # (2 * sm_count CTAs); larger cohorts already fill the GPU.
                 two_shard_ctas = request_count * num_layers * num_kv_heads * 2
                 use_extra_score_shard = two_shard_ctas < 2 * self.sm_count
-                self._compiled[request_count] = (
-                    small_score if use_extra_score_shard else large_score
-                )
+                if not self.enable_partial_stats:
+                    self._compiled[request_count] = (
+                        small_score if use_extra_score_shard else large_score
+                    )
                 self._page_shards[request_count] = (
                     SMALL_WORKLOAD_PAGE_SHARDS if use_extra_score_shard else 2
                 )
