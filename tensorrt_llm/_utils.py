@@ -13,17 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import ctypes
 import gc
 import inspect
 import json
 import linecache
 import math
 import os
+import signal
 import socket
 import struct
 import sys
 import tempfile
 import threading
+import time
 import trace
 import traceback
 import weakref
@@ -31,11 +34,11 @@ from contextlib import contextmanager
 from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
+import psutil
 from mpi4py import MPI
 from mpi4py.util import pkl5
 from typing_extensions import ParamSpec
@@ -64,7 +67,7 @@ except ImportError:
     has_nvml = False
 # isort: on
 
-from tensorrt_llm.bindings import DataType, GptJsonConfig, LayerType
+from tensorrt_llm.bindings import DataType, LayerType
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
 
@@ -427,12 +430,10 @@ def set_parent_death_signal(sig=None,
     only covers the direct parent. Deeper / forked trees are handled by
     ``kill_process_tree``.
     """
-    import signal
     if sig is None:
         sig = signal.SIGKILL
     if sys.platform != "linux":
         return
-    import ctypes
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     if libc.prctl(_PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
         errno = ctypes.get_errno()
@@ -453,9 +454,6 @@ def kill_process_tree(pid: int,
     (raw PR_SET_PDEATHSIG only covers the direct parent-child link). Mirrors the
     anti-zombie cleanup used by SGLang / vLLM.
     """
-    import time
-
-    import psutil
     try:
         parent = psutil.Process(pid)
     except psutil.NoSuchProcess:
@@ -851,13 +849,6 @@ class BaseEnumMeta(EnumMeta):
         except ValueError:
             return False
         return True
-
-
-def supports_inflight_batching(engine_dir):
-    config_path = Path(engine_dir) / "config.json"
-    json_config = GptJsonConfig.parse_file(config_path)
-    model_config = json_config.model_config
-    return model_config.supports_inflight_batching
 
 
 class QuantModeWrapper:
