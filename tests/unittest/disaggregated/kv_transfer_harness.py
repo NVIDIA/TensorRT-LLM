@@ -38,9 +38,16 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestTyp
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
-# Reduce NIXL threads for unit test: default 8 threads per agent causes heavy
-# contention when creating multiple agents on a single GPU in the same process.
-os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
+# This harness builds real NIXL transfer agents, so force a known-good
+# transport config *unconditionally* rather than deferring to inherited env:
+# a poisoned developer/CI environment must not be able to destabilize the
+# transport or oversubscribe CPUs.
+#   - One NIXL worker thread per agent: the default (8) causes heavy contention
+#     when many agents are created on a single GPU in the same process.
+#   - ``^ib,gdr_copy`` disables InfiniBand and GDR copy, which are unavailable
+#     (and flaky) in the single-process threaded harness.
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
 
 
 # ---------------------------------------------------------------------------
