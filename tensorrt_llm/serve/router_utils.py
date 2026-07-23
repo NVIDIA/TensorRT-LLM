@@ -206,6 +206,8 @@ class BlockHashMixin:
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
             model_path = self._tokenizer_dir or model
+            # Only an operator-configured tokenizer directory may run remote
+            # tokenizer code; request model values are client-controlled.
             trust_remote_code = self._tokenizer_dir is not None
             if self._custom_tokenizer:
                 from tensorrt_llm.tokenizer import load_custom_tokenizer
