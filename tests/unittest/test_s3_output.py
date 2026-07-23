@@ -140,6 +140,7 @@ def test_small_stdout_remains_inline(tmp_path):
     report = Report([("Captured stdout call", "ok\n")])
 
     process_report(plugin, report)
+    plugin.pytest_runtest_logfinish(report.nodeid, None)
 
     assert report.sections == [("Captured stdout call", "ok\n")]
     assert not s3_output._spool_root(str(tmp_path)).exists()
@@ -152,10 +153,30 @@ def test_stdout_at_threshold_is_replaced_with_url(tmp_path):
     process_report(plugin, report)
 
     section_name, section_content = report.sections[0]
-    assert section_name == "Captured stdout call"
+    assert section_name == "Captured stdout"
     assert "4 bytes (upload skipped" in section_content
-    assert "/stdout-call.log" in section_content
+    assert "/stdout.log" in section_content
     assert "four" not in section_content
+
+
+def test_inline_threshold_applies_to_combined_stream(tmp_path):
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=8)
+    setup_section = ("Captured stdout setup", "abc")
+    call_section = ("Captured stdout call", "defgh")
+    setup_report = Report([setup_section], when="setup")
+    call_report = Report([setup_section, call_section])
+    teardown_report = Report([setup_section, call_section], when="teardown")
+
+    process_report(plugin, setup_report)
+    process_report(plugin, call_report)
+    process_report(plugin, teardown_report)
+
+    assert setup_report.sections == [setup_section]
+    assert len(call_report.sections) == 1
+    assert "/stdout.log" in call_report.sections[0][1]
+    assert len(teardown_report.sections) == 1
+    stdout_file = next(s3_output._spool_root(str(tmp_path)).rglob("stdout.log"))
+    assert stdout_file.read_text(encoding="utf-8") == "abcdefgh"
 
 
 def test_logging_section_is_uploaded_even_when_small(tmp_path):
@@ -165,7 +186,7 @@ def test_logging_section_is_uploaded_even_when_small(tmp_path):
     process_report(plugin, report)
 
     assert "upload skipped" in report.sections[0][1]
-    assert "/logging-call.log" in report.sections[0][1]
+    assert "/logging.log" in report.sections[0][1]
 
 
 def test_sync_upload_transforms_native_sections(tmp_path, monkeypatch):
@@ -181,7 +202,8 @@ def test_sync_upload_transforms_native_sections(tmp_path, monkeypatch):
             ("Captured stdout setup", "setup output\n"),
             ("custom", "keep me"),
             ("Captured stderr call", "call error\n"),
-        ]
+        ],
+        when="teardown",
     )
 
     process_report(plugin, report)
@@ -191,14 +213,14 @@ def test_sync_upload_transforms_native_sections(tmp_path, monkeypatch):
         b"setup output\n",
         b"call error\n",
     ]
-    assert client.uploads[0][2].endswith("/stdout-setup.log")
-    assert client.uploads[1][2].endswith("/stderr-call.log")
+    assert client.uploads[0][2].endswith("/stdout.log")
+    assert client.uploads[1][2].endswith("/stderr.log")
     assert report.sections[1] == ("custom", "keep me")
     assert all("uploaded to" in report.sections[index][1] for index in (0, 2))
     assert not s3_output._spool_root(str(tmp_path)).exists()
 
 
-def test_duplicate_capture_sections_get_distinct_objects(tmp_path):
+def test_duplicate_capture_sections_share_one_object(tmp_path):
     plugin = make_plugin(tmp_path, inline_output_max_bytes=0)
     report = Report(
         [
@@ -209,9 +231,10 @@ def test_duplicate_capture_sections_get_distinct_objects(tmp_path):
 
     process_report(plugin, report)
 
-    assert "/stdout-call.log" in report.sections[0][1]
-    assert "/stdout-call-1.log" in report.sections[1][1]
-    assert all(content.endswith("\n") for _, content in report.sections)
+    assert len(report.sections) == 1
+    assert "/stdout.log" in report.sections[0][1]
+    stdout_file = next(s3_output._spool_root(str(tmp_path)).rglob("stdout.log"))
+    assert stdout_file.read_text(encoding="utf-8") == "firstsecond"
 
 
 def test_cumulative_capture_sections_are_uploaded_once(tmp_path, monkeypatch):
@@ -239,26 +262,26 @@ def test_cumulative_capture_sections_are_uploaded_once(tmp_path, monkeypatch):
 
     process_report(plugin, setup_report)
     process_report(plugin, call_report)
+    assert client.uploads == []
     process_report(plugin, teardown_report)
     plugin.pytest_runtest_logfinish(setup_report.nodeid, None)
     plugin.pytest_sessionfinish(None, 0)
 
     assert [upload[0] for upload in client.uploads] == [
-        b"setup output\n",
-        b"call output\n",
+        b"setup output\ncall output\n",
         b"teardown error\n",
     ]
     assert [upload[2].rsplit("/", 1)[-1] for upload in client.uploads] == [
-        "stdout-setup.log",
-        "stdout-call.log",
-        "stderr-teardown.log",
+        "stdout.log",
+        "stderr.log",
     ]
     assert "Last 200 lines:" in call_report.sections[0][1]
+    assert "setup output" in call_report.sections[0][1]
+    assert "call output" in call_report.sections[0][1]
     assert "Last 200 lines:" not in teardown_report.sections[0][1]
-    assert (
-        setup_report.sections[0][1].splitlines()[0]
-        == (teardown_report.sections[0][1].splitlines()[0])
-    )
+    assert sum("/stdout.log" in content for _, content in teardown_report.sections) == 1
+    assert sum("/stderr.log" in content for _, content in teardown_report.sections) == 1
+    assert len(teardown_report.sections) == 2
     assert all(content.endswith("\n") for _, content in teardown_report.sections)
 
 
@@ -315,6 +338,7 @@ def test_deferred_upload_starts_before_session_finish(tmp_path, monkeypatch):
     report = Report([("Captured stdout call", "background output")])
 
     process_report(plugin, report)
+    plugin.pytest_runtest_logfinish(report.nodeid, None)
 
     assert client.started.wait(timeout=5)
     assert "scheduled for upload" in report.sections[0][1]
@@ -339,9 +363,9 @@ def test_deferred_upload_reuses_cumulative_section(tmp_path, monkeypatch):
     teardown_report = Report([section], when="teardown")
 
     process_report(plugin, call_report)
-    assert client.started.wait(timeout=5)
     process_report(plugin, teardown_report)
 
+    assert client.started.wait(timeout=5)
     assert len(plugin._pending_uploads) == 1
     assert (
         call_report.sections[0][1].splitlines()[0]
@@ -406,10 +430,10 @@ def test_rerun_keeps_one_url_per_attempt(tmp_path, monkeypatch):
         b"second stderr\n",
     ]
     object_keys = [upload[2] for upload in client.uploads]
-    assert object_keys[0].endswith("/stdout-call.log")
-    assert object_keys[1].endswith("/stderr-call.log")
-    assert object_keys[2].endswith("/stdout-call-attempt-2.log")
-    assert object_keys[3].endswith("/stderr-call-attempt-2.log")
+    assert object_keys[0].endswith("/stdout.log")
+    assert object_keys[1].endswith("/stderr.log")
+    assert object_keys[2].endswith("/stdout-attempt-2.log")
+    assert object_keys[3].endswith("/stderr-attempt-2.log")
     assert object_keys[0].rsplit("/", 1)[0] != object_keys[2].rsplit("/", 1)[0]
     assert all(content.endswith("\n") for _, content in teardown_report.sections)
     assert "Last 200 lines:" not in teardown_report.sections[0][1]
@@ -422,7 +446,7 @@ def test_parent_drain_retries_upload_left_by_failed_process(tmp_path, monkeypatc
         FailingS3Client(),
         inline_output_max_bytes=0,
     )
-    report = Report([("Captured stdout call", "recover me")])
+    report = Report([("Captured stdout call", "recover me")], when="teardown")
     process_report(plugin, report)
     assert "upload failed" in report.sections[0][1]
 
@@ -435,7 +459,7 @@ def test_parent_drain_retries_upload_left_by_failed_process(tmp_path, monkeypatc
     monkeypatch.setattr(s3_output, "_create_s3_client", lambda *args: client)
     assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
     assert client.uploads[0][0] == b"recover me"
-    assert client.uploads[0][2].endswith("/stdout-call.log")
+    assert client.uploads[0][2].endswith("/stdout.log")
     assert not s3_output._spool_root(str(tmp_path)).exists()
 
 
@@ -548,11 +572,20 @@ def test_native_capture_is_replaced_before_junit_consumes_report(tmp_path):
         "import os\n"
         "import subprocess\n"
         "import sys\n"
-        "def test_output():\n"
+        "import pytest\n"
+        "@pytest.fixture\n"
+        "def output_fixture():\n"
+        "    os.write(1, b'setup stdout\\n')\n"
+        "    os.write(2, b'setup stderr ' + b'y' * 300 + b'\\n')\n"
+        "    yield\n"
+        "    os.write(1, b'teardown stdout\\n')\n"
+        "    os.write(2, b'teardown stderr ' + b'y' * 300 + b'\\n')\n"
+        "def test_output(output_fixture):\n"
         "    os.write(1, b'parent before\\n')\n"
         "    subprocess.run([sys.executable, '-c', "
         "\"import os; os.write(1, b'child capture ' + b'x' * 300 + b'\\\\n')\"], check=True)\n"
-        "    os.write(1, b'parent after\\n')\n",
+        "    os.write(1, b'parent after\\n')\n"
+        "    os.write(2, b'call stderr ' + b'y' * 300 + b'\\n')\n",
         encoding="utf-8",
     )
     output_dir = tmp_path / "output"
@@ -583,11 +616,28 @@ def test_native_capture_is_replaced_before_junit_consumes_report(tmp_path):
     xml = xml_path.read_text(encoding="utf-8")
     assert "upload skipped" in xml
     assert "child capture xxxxx" not in xml
-    assert "stdout-call.log" in xml
-    stdout_files = list(s3_output._spool_root(str(output_dir)).rglob("stdout-call.log"))
+    assert xml.count("stdout.log") == 1
+    assert xml.count("stderr.log") == 1
+    stdout_files = list(s3_output._spool_root(str(output_dir)).rglob("stdout.log"))
     assert len(stdout_files) == 1
     assert stdout_files[0].read_bytes() == (
-        b"parent before\n" + b"child capture " + b"x" * 300 + b"\nparent after\n"
+        b"setup stdout\n"
+        + b"parent before\n"
+        + b"child capture "
+        + b"x" * 300
+        + b"\nparent after\n"
+        + b"teardown stdout\n"
+    )
+    stderr_files = list(s3_output._spool_root(str(output_dir)).rglob("stderr.log"))
+    assert len(stderr_files) == 1
+    assert stderr_files[0].read_bytes() == (
+        b"setup stderr "
+        + b"y" * 300
+        + b"\ncall stderr "
+        + b"y" * 300
+        + b"\nteardown stderr "
+        + b"y" * 300
+        + b"\n"
     )
 
 
@@ -633,22 +683,20 @@ def test_rerun_urls_are_distinct_and_line_delimited_in_junit(tmp_path):
         element.text or "" for element in ET.parse(xml_path).findall(".//system-out")
     )
     url_lines = [
-        line
-        for line in system_output.splitlines()
-        if "upload skipped" in line and "stdout-call" in line
+        line for line in system_output.splitlines() if "upload skipped" in line and "stdout" in line
     ]
     assert len(url_lines) == 2, system_output
-    assert any("/stdout-call.log)" in line for line in url_lines)
-    assert any("/stdout-call-attempt-2.log)" in line for line in url_lines)
+    assert any("/stdout.log)" in line for line in url_lines)
+    assert any("/stdout-attempt-2.log)" in line for line in url_lines)
 
-    stdout_files = list(s3_output._spool_root(str(output_dir)).rglob("stdout-call*.log"))
+    stdout_files = list(s3_output._spool_root(str(output_dir)).rglob("stdout*.log"))
     assert {path.name for path in stdout_files} == {
-        "stdout-call.log",
-        "stdout-call-attempt-2.log",
+        "stdout.log",
+        "stdout-attempt-2.log",
     }
     contents = {path.name: path.read_bytes() for path in stdout_files}
-    assert contents["stdout-call.log"].startswith(b"attempt 1 ")
-    assert contents["stdout-call-attempt-2.log"].startswith(b"attempt 2 ")
+    assert contents["stdout.log"].startswith(b"attempt 1 ")
+    assert contents["stdout-attempt-2.log"].startswith(b"attempt 2 ")
 
 
 def test_xdist_worker_transforms_report_before_controller_junit(tmp_path):
@@ -689,7 +737,7 @@ def test_xdist_worker_transforms_report_before_controller_junit(tmp_path):
     xml = xml_path.read_text(encoding="utf-8")
     assert "upload skipped" in xml
     assert "xdist capture xxxxx" not in xml
-    assert "stdout-call.log" in xml
+    assert "stdout.log" in xml
 
 
 def test_native_capture_restores_timeout_output_to_console(tmp_path):
