@@ -2590,11 +2590,8 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE),
                               dtype=dtype).cuda()
 
-        # triton 3.7.0: the fast downcast_to_mxfp/upcast_from_mxfp kernels
-        # require the quantization axis to be a multiple of 32 (pre-3.7.0
-        # they padded internally and returned unpadded results). Pad and
-        # slice around them here to keep the old behavior for the unaligned
-        # intermediate sizes exercised by this test.
+        # The fast conversion kernels require a 32-aligned quantization axis.
+        # Pad and slice to cover unaligned intermediate sizes.
         from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp,
                                                           upcast_from_mxfp)
 

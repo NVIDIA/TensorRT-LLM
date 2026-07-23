@@ -156,10 +156,8 @@ def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn, cutoff,
 class TritonRoutingData:
     """Routing information consumed by the Triton MoE matmul calls.
 
-    Replaces ``triton_kernels.matmul_ogs.RoutingData`` (plus ``GatherIndx`` /
-    ``ScatterIndx``), which were removed in triton 3.7.0. The new
-    ``triton_kernels.matmul.matmul`` takes the ragged-tensor metadata and plain
-    ``torch.Tensor`` gather/scatter indices directly.
+    Replaces the removed ``matmul_ogs`` routing wrappers. ``matmul`` now takes
+    ragged-tensor metadata and plain gather/scatter tensors directly.
     """
     # Per-expert ragged metadata, passed as `a_ragged_metadata` to matmul.
     ragged_metadata: RaggedTensorMetadata
@@ -177,11 +175,9 @@ def combine_expert_outputs(gemm2_output: torch.Tensor,
                            rdata: Optional[TritonRoutingData]) -> torch.Tensor:
     """Sum the per-expert rows of the scattered gemm2 output over top-k.
 
-    triton 3.7.0 removed the fused finalize from ``matmul`` (formerly
-    ``matmul_ogs``): with ``scatter_indx`` the kernel only permutes rows into
-    token-major expanded order (skipping ``-1`` destinations, whose rows stay
-    uninitialized), so the masked reduction over the top-k expert outputs must
-    be performed explicitly.
+    With ``scatter_indx``, ``matmul`` only permutes rows into token-major
+    expanded order. Rows for ``-1`` destinations remain uninitialized, so the
+    top-k reduction must mask them explicitly.
 
     Args:
         gemm2_output: ``[n_tokens * n_expts_act, hidden]`` gemm2 output in
@@ -294,8 +290,7 @@ class TritonEPRouter():
         # expanded (token-major) row `token * n_expts_act + k`. The gather
         # index must address rows of the activations, hence the division; the
         # scatter index addresses rows of the expanded output. This matches
-        # what `matmul_ogs` used to derive from GatherIndx/ScatterIndx
-        # internally before triton 3.7.0.
+        # what `matmul_ogs` derived from its gather/scatter wrappers.
         gather_indx = torch.div(metadata.col_sorted_indx,
                                 n_expts_act,
                                 rounding_mode='trunc')
@@ -772,10 +767,8 @@ def is_swizzling_supported() -> bool:
     The swizzled layouts produced by ``make_default_matmul_mxfp4_w_layout`` /
     ``make_default_matmul_mxfp4_w_scale_layout`` are broken on the H20 family
     (e.g. ``NVIDIA H20``, ``NVIDIA H20-3e``), so callers must keep the natural
-    strided layout there (wrap without a layout conversion; pre-3.7.0 this was
-    an identity ``StridedLayout`` conversion). H200 uses substring exclusion
-    because its device name also contains ``H20``. This is a WAR. For proper
-    fix, see nvbugs/6026676.
+    strided layout there. H200 uses substring exclusion because its device name
+    also contains ``H20``. This is a WAR. For proper fix, see nvbugs/6026676.
     """
     name = torch.cuda.get_device_name()
     is_h20_family = "H20" in name and "H200" not in name
@@ -803,8 +796,7 @@ def convert_layout_expert_chunked(
     for 3D ``(num_experts, K, N)`` tensors and layouts that treat the leading
     dim as a batch dim (Hopper MXFP4 value/scale layouts).
 
-    ``new_layout`` is a ``Layout`` instance carrying its own parameters
-    (triton 3.7.0 API).
+    ``new_layout`` carries the conversion parameters.
     """
     assert t.dim() == 3
     # wrap_torch_tensor infers the dtype from the tensor when dtype is None.
@@ -859,17 +851,12 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
         f"TRITON_MOE_MXFP4_NUM_WARPS should be 4 or 8, got {num_warps}"
-    # triton 3.7.0: the layout factories return Layout instances (the mx axis
-    # must be given relative to the trailing dims, i.e. -2 for the K dim of
-    # (num_experts, K, N) weights).
+    # The mx axis is -2: the K dim in the factory's trailing-dims convention.
     value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=-2)
     scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=-2, num_warps=num_warps)
     if not is_swizzling_supported():
-        # Keep the natural strided layout of the data. Pre-3.7.0 this used a
-        # StridedLayout whose swizzle was an identity operation; in 3.7.0
-        # converting to StridedLayout repacks (and requires row-major input),
-        # so skip the conversion entirely instead.
+        # Keep the natural strided layout; conversion would repack the data.
         value_layout = None
         scale_layout = None
     # Same reasoning when the factories themselves fall back to StridedLayout

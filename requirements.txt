@@ -22,7 +22,6 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# Torch 2.12.1 is the first release paired with Triton 3.7.1.
 torch>=2.12.1,<=2.13.0a0
 torchvision
 nvidia-modelopt[torch]~=0.37.0
@@ -66,7 +65,7 @@ meson
 ninja
 blake3
 soundfile
-# 3.7.1 fixes missing async-read proxy fences on Blackwell in 3.7.0.
+# Keep the Blackwell async-read proxy fence fix from Triton 3.7.1.
 triton==3.7.1 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
 xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeploy
 tiktoken

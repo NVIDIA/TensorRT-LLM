@@ -319,8 +319,7 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
             0)  # (1, in_features//32, out_features)
         fused_weight, fused_scale = swizzle_weight_and_scale(
             fused_weight, fused_scale)
-        # triton 3.7.0: Tensor.dtype is a triton DataType, so compare against
-        # the underlying torch storage dtype.
+        # Tensor.dtype is a Triton type; compare the underlying torch dtype.
         assert module.weight_scale.dtype == fused_scale.storage.data.dtype
         # We need to use Triton tensor wrapper instead of Torch tensor to maintain the correct swizzling layout
         module._parameters.pop('weight', None)

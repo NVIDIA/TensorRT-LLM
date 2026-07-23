@@ -30,8 +30,7 @@ def test_mxfp4_value_layout_skips_conversion_for_strided_fallback(monkeypatch):
 
     value_layout = mxfp4_moe._mxfp4_value_layout(mx_axis=-2)
 
-    # The pre-Hopper StridedLayout fallback must not be converted either: in
-    # triton 3.7.0 a StridedLayout conversion repacks instead of aliasing.
+    # The StridedLayout fallback must not be converted because it repacks.
     assert value_layout is None
 
 

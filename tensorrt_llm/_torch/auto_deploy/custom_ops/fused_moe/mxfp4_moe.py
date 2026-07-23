@@ -58,17 +58,11 @@ _MXFP4_WEIGHT_CACHE: OrderedDict[WeightCacheKey, tuple[PreparedWeights, list[wea
 def _mxfp4_value_layout(mx_axis: int):
     # Blackwell's default value layout is only supported by the persistent TMA
     # kernel. GPT-OSS MoE can select the non-persistent kernel for small shapes,
-    # where unswizzled values use the native MXFP4 dot_scaled path. Returning
-    # ``None`` keeps the natural strided layout of the data (pre-3.7.0 this
-    # used a StridedLayout whose swizzle was an identity operation; in 3.7.0
-    # converting to StridedLayout repacks, so the conversion is skipped).
+    # where unswizzled values use the native MXFP4 dot_scaled path.
     if cuda_capability_geq(10):
         return None
-    # triton 3.7.0: the layout factory returns a Layout instance. When the
-    # factory falls back to StridedLayout (pre-Hopper GPUs), skip the
-    # conversion as well: the data already is in its natural strided layout,
-    # and a 3.7.0 StridedLayout conversion repacks (two full copies) instead
-    # of aliasing like the 3.6 identity swizzle did.
+    # The data is already strided when the factory falls back to
+    # StridedLayout; converting it would only repack it.
     value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
     if isinstance(value_layout, layout.StridedLayout):
         return None
@@ -90,8 +84,7 @@ def _mxfp4_scale_layout(mx_axis: int, num_warps: int = 4):
 
 
 def _swizzle_mxfp4(w, w_scale):
-    # The mx axis is the K dim of the (num_experts, K, N) weights, i.e. -2 in
-    # the trailing-dims convention required by triton 3.7.0.
+    # The mx axis is the K dim in the layout factory's trailing-dims convention.
     value_layout = _mxfp4_value_layout(mx_axis=-2)
     scale_layout = _mxfp4_scale_layout(mx_axis=-2)
     w = wrap_torch_tensor(w, dtype=FP4)
@@ -303,8 +296,7 @@ def _run_mxfp4_mlp_core(
         fused_activation=act,
     )
 
-    # down (matmul scatters into token-major order; the top-k combine is
-    # done explicitly below since triton 3.7.0 removed the fused finalize)
+    # down (matmul scatters into token-major order; combine top-k explicitly)
     y = matmul(
         inter,
         triton_down_w,
