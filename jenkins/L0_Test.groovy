@@ -869,7 +869,29 @@ bash "${scriptPrepareBodyPathNode}"
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)
+
+                // Use fat sqsh as the agent container image if it was pre-built by Prepare Container,
+                // so the Jenkins agent runs inside the fat sqsh (TRT-LLM + pip deps pre-baked).
+                def containerImageForAgent = LLM_DOCKER_IMAGE
+                if (cluster.fatBuilderArgs != null) {
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def fatCheckResult = Utils.exec(
+                        pipeline,
+                        returnStdout: true,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            "\"fatHash=\$(printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}' | sha256sum | cut -d' ' -f1 | head -c 16); fatSqshPath=${fatSqshDir}/fat-\${fatHash}.sqsh; test -f \"\$fatSqshPath\" && echo \"\$fatSqshPath\" || echo MISSING\""
+                        )
+                    ).trim()
+                    if (fatCheckResult != "MISSING" && fatCheckResult) {
+                        echo "Fat sqsh ready; using it as agent container image: ${fatCheckResult}"
+                        containerImageForAgent = fatCheckResult
+                    } else {
+                        echo "Fat sqsh not ready; falling back to base image."
+                    }
+                }
+
+                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, containerImageForAgent, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
