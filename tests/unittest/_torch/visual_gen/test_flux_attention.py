@@ -16,6 +16,7 @@ Note: With random weights, attention can produce NaN due to numerical instabilit
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -57,6 +58,32 @@ class TestFluxAttentionBackend(unittest.TestCase):
                     config=self._create_config("VANILLA", tp_size=tp_size),
                 )
                 self.assertEqual(attn.fuse_qk_norm_rope, expected)
+
+    def test_async_ulysses_enabled_only_for_validated_sizes(self) -> None:
+        """Test FLUX async Ulysses is limited to the validated size range."""
+        from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+        from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+
+        for ulysses_size, expected in ((1, False), (2, True), (4, True), (8, False)):
+            with self.subTest(ulysses_size=ulysses_size):
+                config = self._create_config("VANILLA")
+                config.visual_gen_mapping = SimpleNamespace(ulysses_size=ulysses_size)
+                config.parallel = SimpleNamespace(async_ulysses=True)
+
+                with patch.object(Attention, "__init__", return_value=None) as init:
+                    attn = FluxJointAttention(
+                        hidden_size=128,
+                        num_attention_heads=2,
+                        head_dim=64,
+                        config=config,
+                    )
+
+                self.assertEqual(attn._use_async_ulysses, expected)
+                self.assertEqual(
+                    init.call_args.kwargs["qkv_mode"],
+                    QKVMode.SEPARATE_QKV if expected else QKVMode.FUSE_QKV,
+                )
+                self.assertEqual(init.call_args.kwargs["async_ulysses"], expected)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_vanilla_backend_sanity(self):
