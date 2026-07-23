@@ -13,12 +13,42 @@ from tensorrt_llm._torch.modules.fla.utils import input_guard
 from tensorrt_llm._utils import get_sm_version
 
 _SMALL_GRID_HEAD_TILES = 512
+_BV16_MAX_HEAD_TILES = 64
+_BV32_MAX_HEAD_TILES = 128
+_RATIO2_FINE_MAPPING_MAX_HEAD_TILES = 256
 _EIGHT_WARP_COMMIT_HEAD_TILES = 1024
 _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
+
+
+def _default_cached_replay_block_v(
+    use_tuned_bf16_mapping: bool,
+    head_tiles: int,
+    value_dim: int,
+) -> int:
+    """Select the replay value tile without changing its cache layout."""
+    if use_tuned_bf16_mapping:
+        if head_tiles <= _BV16_MAX_HEAD_TILES:
+            return 16
+        if head_tiles <= _BV32_MAX_HEAD_TILES:
+            return 32
+        if head_tiles <= _SMALL_GRID_HEAD_TILES:
+            return 64
+    return triton.next_power_of_2(value_dim)
+
+
+def _supports_fine_grained_replay_tiling(
+    num_key_heads: int,
+    num_value_heads: int,
+    head_tiles: int,
+) -> bool:
+    """Return whether the measured fine-grained value tiling applies."""
+    return num_value_heads == 4 * num_key_heads or (
+        num_value_heads == 2 * num_key_heads and head_tiles <= _RATIO2_FINE_MAPPING_MAX_HEAD_TILES
+    )
 
 
 @triton.jit
@@ -669,25 +699,26 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
         v = v.contiguous()
         packed_qkv = q
     BK = triton.next_power_of_2(K)
-    # GB200 dispatch for the production Qwen3.5 MTP per-CTA shape. Balanced
-    # DEP and TEP runs at the same global batch have the same N * HV head-tile
-    # count, so use that workload measure instead of topology-specific H/HV
-    # values or the per-rank batch alone.
-    use_tuned_bf16_mapping = (
+    # The complete workload mapping is retained for the 4:1 shape; the
+    # 2:1 fine tiling is enabled only through the measured low-batch range.
+    use_production_bf16_shape = (
         T == 4
         and history_size <= 16
-        and HV == 4 * H
         and K == 128
         and V == 128
         and ssm_states.dtype == torch.bfloat16
     )
     head_tiles = N * HV
-    use_small_grid_mapping = use_tuned_bf16_mapping and head_tiles <= _SMALL_GRID_HEAD_TILES
+    use_tuned_bf16_mapping = use_production_bf16_shape and HV == 4 * H
+    use_fine_grained_mapping = use_production_bf16_shape and _supports_fine_grained_replay_tiling(
+        H, HV, head_tiles
+    )
+    use_small_grid_mapping = use_fine_grained_mapping and head_tiles <= _SMALL_GRID_HEAD_TILES
     if block_v is None:
-        block_v = 64 if use_small_grid_mapping else triton.next_power_of_2(V)
+        block_v = _default_cached_replay_block_v(use_fine_grained_mapping, head_tiles, V)
     if num_warps is None:
         num_warps = (
-            2 if use_tuned_bf16_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
+            2 if use_fine_grained_mapping and (use_small_grid_mapping or launch_with_pdl) else 4
         )
     BV = block_v
     use_large_workload_mapping = (
