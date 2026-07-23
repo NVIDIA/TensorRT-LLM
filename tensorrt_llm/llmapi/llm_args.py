@@ -3423,10 +3423,12 @@ class KvCacheCompressionConfig(StrictBaseModel):
 
 
 class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
-    """TriAttention KV-cache compression: periodic decode-time eviction scored by
-    offline calibration (github.com/WeianMao/triattention; supply the official
-    .pt via ``calibration_path``). Pure compression — decode runs the model's
-    standard attention over the compacted cache."""
+    """TriAttention KV-cache compression: periodic decode-time eviction.
+
+    Scored by offline calibration (github.com/WeianMao/triattention; supply
+    the official .pt via ``calibration_path``). Pure compression — decode
+    runs the model's standard attention over the compacted cache.
+    """
     algorithm: Literal["triattention"] = "triattention"
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
         default="union",
