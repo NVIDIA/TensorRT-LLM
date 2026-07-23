@@ -560,9 +560,8 @@ class CUDAGraphRunner:
                 dummy_encoder_output_len = self._get_padding_dummy_encoder_output_len(
                     cross_kv_cache_manager)
 
-            # Get draft KV cache manager only for one-model speculative decoding.
-            # In two-model mode, each model has its own KV cache manager, so
-            # draft_kv_cache_manager should be None.
+            # Get draft KV cache manager for one-model speculative decoding with
+            # a separate draft KV cache pool.
             draft_kv_cache_manager = get_draft_kv_cache_manager(
                 self.spec_config, resource_manager)
 

@@ -440,7 +440,6 @@ class AttentionMetadata:
             is_spec_dec_dynamic_tree,
             max_draft_len,
             max_total_draft_tokens,
-            model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
             spec_tree_manager: Optional['SpecTreeManager'] = None,
             num_contexts: int = 0):

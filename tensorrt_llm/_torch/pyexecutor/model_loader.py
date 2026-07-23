@@ -548,17 +548,10 @@ class ModelLoader:
                         if t.device != torch.device('meta') and (
                                 need_initialized_weights or is_meta_init):
                             if t.is_cuda:
-                                memory_type_map = {
-                                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
-                                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
-                                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT:
-                                    ExecutorMemoryType.MODEL_ENGINE_DRAFT,
-                                }
-
                                 warnings.warn(
                                     f"A weight tensor of shape {t.shape} is already allocated on CUDA device before "
                                     f"the weight allocation stage. This will cause extra CUDA memory usage in the "
-                                    f"'{memory_type_map[self.model_weights_memory_tag]}' scope."
+                                    f"'{ExecutorMemoryType.MODEL_ENGINE_MAIN}' scope."
                                 )
                             cuda_t.copy_(t)
                         memo[t] = cuda_t

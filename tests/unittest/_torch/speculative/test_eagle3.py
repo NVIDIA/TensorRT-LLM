@@ -1038,7 +1038,6 @@ def test_nemotron_super_mtp_dynamic_tree_dl6_k10_dt31(
         max_seq_len=8192,
     )
     spec_config = MTPDecodingConfig(max_draft_len=max_draft_len,
-                                    mtp_eagle_one_model=True,
                                     use_dynamic_tree=True,
                                     dynamic_tree_max_topK=10,
                                     max_total_draft_tokens=31)

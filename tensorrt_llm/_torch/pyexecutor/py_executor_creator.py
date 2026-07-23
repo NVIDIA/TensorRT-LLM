@@ -94,8 +94,6 @@ class _ExecutorMemoryMonitor:
         "KV cache",
         ExecutorMemoryType.MODEL_ENGINE_MAIN:
         "Model",
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
-        "Draft model for speculative decoding",
     }
 
     # Suggestion to reduce component memory usage
@@ -111,9 +109,6 @@ class _ExecutorMemoryMonitor:
         ExecutorMemoryType.INIT_KV_CACHE:
         "reduce max_num_tokens",
         ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
-         "pipeline and/or tensor parallelism"),
-        ExecutorMemoryType.MODEL_ENGINE_DRAFT:
         ("reduce max_num_tokens and/or shard the model weights across GPUs by enabling "
          "pipeline and/or tensor parallelism"),
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:

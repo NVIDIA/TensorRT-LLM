@@ -1390,13 +1390,14 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
 
-    # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
-    # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
-    # calls `load_draft_weights` on the *outer* model it resolved, but the
-    # spec-decoding wrapper (`SpecDecOneEngineForCausalLM`) is applied to the
-    # inner `self.llm` when this VLM composes it. Composite checkpoints
-    # (e.g. Qwen3.5-4B publishes text_config + vision_config) route text-only
-    # spec tests through this wrapper, so surface the inner LM's draft state.
+    # Draft-model delegation for same-engine speculative decoding (e.g. Eagle3 /
+    # DFlash draft weights loaded into the target engine). `ModelLoader.load`
+    # reads `draft_config` / `draft_model` and calls `load_draft_weights` on the
+    # *outer* model it resolved, but the spec-decoding wrapper
+    # (`SpecDecOneEngineForCausalLM`) is applied to the inner `self.llm` when
+    # this VLM composes it. Composite checkpoints (e.g. Qwen3.5-4B publishes
+    # text_config + vision_config) route text-only spec tests through this
+    # wrapper, so surface the inner LM's draft state.
     # Note: `load_draft_weights` must keep an explicit signature — the loader
     # dispatches kwargs via `inspect.getfullargspec`.
     @property

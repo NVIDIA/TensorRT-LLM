@@ -1546,12 +1546,6 @@ class PyTorchModelEngine(ModelEngine):
                                 batch, num_tokens_i)
                             if batch is None:
                                 continue
-                            spec_resource_manager = resource_manager.get_resource_manager(
-                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                            if self.is_draft_model and isinstance(
-                                    spec_resource_manager,
-                                    Eagle3ResourceManager):
-                                spec_resource_manager.is_first_draft = True
 
                             self.forward(batch,
                                          new_tensors_device=None,

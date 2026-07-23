@@ -1237,7 +1237,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False,
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
@@ -1259,9 +1258,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.is_p2p_supported = can_access_peer(mapping)
 
         layer_idx_for_attention = layer_idx
-        if is_separate_draft_engine:
-            #KVCacheManager only support 1 layer for separate draft engine
-            layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
         # When enable_attention_dp is True, TP reduction is skipped since each DP rank
         # works on different batch elements. However, with CP > 1, attention is split
@@ -1670,10 +1666,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
     def __init__(self,
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
-                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False):
-        super().__init__(model_config, layer_idx, aux_stream_dict,
-                         is_separate_draft_engine)
+                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream]):
+        super().__init__(model_config, layer_idx, aux_stream_dict)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1808,7 +1802,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
-        # It's for 2-model path, capture the hidden states
+        # It's for Eagle3 / speculative capture of hidden states.
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
 

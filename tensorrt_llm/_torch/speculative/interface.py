@@ -224,10 +224,9 @@ def get_force_num_accepted_tokens() -> int:
     variable as an integer.
 
     Used by speculative decoding paths that operate on Python lists/slices and
-    therefore require an integer count (e.g. the two-model path in
-    ``TorchSampler``). For the one-model path, see
-    :func:`get_force_num_accepted_tokens_float`, which supports fractional
-    synthetic acceptance rates.
+    therefore require an integer count (e.g. drafter-based paths in
+    ``TorchSampler``). For fractional synthetic acceptance rates, see
+    :func:`get_force_num_accepted_tokens_float`.
 
     Returns:
         int: The forced number of accepted tokens, or 0 if not set or invalid.
