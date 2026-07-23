@@ -138,13 +138,16 @@ def create_venv(project_dir: Path):
 def setup_venv(project_dir: Path,
                requirements_file: Path,
                no_venv: bool,
-               yes: bool = False) -> tuple[Path, Path]:
+               yes: bool = False,
+               skip_requirements: bool = False) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
         project_dir: The root directory of the project.
         requirements_file: Path to the requirements file.
         no_venv: Use current Python environment as is.
+        skip_requirements: Do not pip-install requirements (or conan) into
+            the environment; use its installed packages as they are.
 
     Returns:
         Tuple[Path, Path]: Paths to the python and conan executables in the venv.
@@ -209,18 +212,28 @@ def setup_venv(project_dir: Path,
                 )
 
     # Install/update requirements
-    print(
-        f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
-    )
-    build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
+    if skip_requirements:
+        print(
+            f"-- Skipping requirements installation from {requirements_file} "
+            "as requested; the environment is used as is.")
+    else:
+        print(
+            f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
+        )
+        build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
-    venv_conan = setup_conan(scripts_dir, venv_python)
+    venv_conan = setup_conan(scripts_dir, venv_python,
+                             skip_install=skip_requirements)
 
     return venv_python, venv_conan
 
 
-def setup_conan(scripts_dir, venv_python):
-    build_run(f'"{venv_python}" -m pip install conan==2.14.0')
+def setup_conan(scripts_dir, venv_python, skip_install: bool = False):
+    if skip_install:
+        print("-- Skipping conan installation as requested; "
+              "expecting conan to be present in the environment.")
+    else:
+        build_run(f'"{venv_python}" -m pip install conan==2.14.0')
     # Determine the path to the conan executable within the venv
     venv_conan = scripts_dir / "conan"
     if not venv_conan.exists():
@@ -509,6 +522,7 @@ def main(*,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
          no_venv: bool = False,
+         skip_requirements: bool = False,
          nvrtc_dynamic_linking: bool = False,
          mypyc: bool = False,
          require_dynamic_attributions: bool = False,
@@ -538,7 +552,8 @@ def main(*,
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
                                          no_venv,
-                                         yes=yes)
+                                         yes=yes,
+                                         skip_requirements=skip_requirements)
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
@@ -1280,6 +1295,14 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Use the current Python interpreter without creating a virtual environment"
     )
+    parser.add_argument(
+        "--skip_requirements",
+        action="store_true",
+        help="Do not pip-install the dev requirements (or conan) into the "
+        "environment; use its installed packages as they are. Typically "
+        "combined with --no-venv when the environment is managed externally "
+        "(conda, pixi, uv) and pip resolving the requirement pins would "
+        "downgrade or replace externally managed packages.")
     parser.add_argument(
         "--nvrtc_dynamic_linking",
         action="store_true",
