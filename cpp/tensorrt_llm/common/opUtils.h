@@ -104,83 +104,6 @@ public:
     }
 };
 
-namespace
-{
-
-template <typename T>
-struct hash_helper;
-
-// Base case: use std::hash for basic types
-template <typename T>
-struct hash_helper
-{
-    size_t operator()(T const& v) const
-    {
-        return std::hash<T>{}(v);
-    }
-};
-
-// Specialization for std::set
-template <typename T>
-struct hash_helper<std::set<T>>
-{
-    size_t operator()(std::set<T> const& s) const
-    {
-        size_t hash_value = 0;
-        for (auto const& item : s)
-        {
-            // Recursively hash each element
-            hash_value ^= hash_helper<T>{}(item) + 0x9e3779b9 + (hash_value << 6) + (hash_value >> 2);
-        }
-        return hash_value;
-    }
-};
-
-// Helper for tuple hashing
-template <typename Tuple, size_t Index = std::tuple_size<Tuple>::value - 1>
-struct tuple_hash_helper
-{
-    static size_t hash(Tuple const& tuple)
-    {
-        size_t hash_value = tuple_hash_helper<Tuple, Index - 1>::hash(tuple);
-        return hash_value
-            ^ (hash_helper<typename std::tuple_element<Index, Tuple>::type>{}(std::get<Index>(tuple)) + 0x9e3779b9
-                + (hash_value << 6) + (hash_value >> 2));
-    }
-};
-
-// Base case for tuple hashing
-template <typename Tuple>
-struct tuple_hash_helper<Tuple, 0>
-{
-    static size_t hash(Tuple const& tuple)
-    {
-        return hash_helper<typename std::tuple_element<0, Tuple>::type>{}(std::get<0>(tuple));
-    }
-};
-
-// Specialization for std::tuple
-template <typename... Args>
-struct hash_helper<std::tuple<Args...>>
-{
-    size_t operator()(std::tuple<Args...> const& t) const
-    {
-        return tuple_hash_helper<std::tuple<Args...>>::hash(t);
-    }
-};
-
-} // namespace
-
-// Main hash struct to be used
-template <typename T>
-struct hash
-{
-    size_t operator()(T const& v) const
-    {
-        return hash_helper<T>{}(v);
-    }
-};
-
 // for testing only
 void const* getCommSessionHandle();
 } // namespace common::op
@@ -218,7 +141,50 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
 
+namespace
+{
+template <class T>
+inline size_t hash_combine(size_t hash, T const& value)
+{
+    static constexpr size_t seed = 0x9e3779b9ULL;
+    return std::hash<std::remove_cv_t<std::remove_reference_t<T>>>{}(value) + seed + (hash << 6) + (hash >> 2);
+}
+} // namespace
+
 TRTLLM_NAMESPACE_END
+
+// Specialization for iterable containers.
+template <typename T>
+struct std::hash<std::set<T>>
+{
+    size_t operator()(std::set<T> const& s) const
+    {
+        size_t hash_value = 0;
+        for (auto const& item : s)
+        {
+            // Recursively hash each element
+            hash_value ^= tensorrt_llm::hash_combine(hash_value, item);
+        }
+        return hash_value;
+    }
+};
+
+// Specialization for tuple-like containers.
+template <class... Args>
+struct std::hash<std::tuple<Args...>>
+{
+    template <std::size_t... Idx>
+    static size_t hash_impl(std::tuple<Args...> const& t, std::integer_sequence<std::size_t, Idx...>)
+    {
+        size_t value = 0;
+        return ((value ^= tensorrt_llm::hash_combine(value, std::get<Idx>(t))), ...);
+    }
+
+    size_t operator()(std::tuple<Args...> const& t) const
+    {
+        return hash_impl(t, std::make_index_sequence<sizeof...(Args)>{});
+    }
+};
 
 #ifndef DEBUG
 

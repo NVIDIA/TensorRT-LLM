@@ -194,7 +194,6 @@ void const* tensorrt_llm::common::op::getCommSessionHandle()
 
 namespace
 {
-using tensorrt_llm::common::op::hash;
 
 // Get current cuda context, a default context will be created if there is no context.
 inline CUcontext getCurrentCudaCtx()
@@ -229,7 +228,7 @@ public:
     PerCudaCtxPerThreadSingletonCreator(CreatorFunc creator, DeleterFunc deleter)
         : mCreator{std::move(creator)}
         , mDeleter{std::move(deleter)}
-        , mObservers{new std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>>()}
+        , mObservers{new std::unordered_map<CacheKey, std::weak_ptr<T>>()}
     {
     }
 
@@ -299,7 +298,7 @@ private:
     mutable std::mutex mMutex;
     // CUDA resources are per-context and per-thread.
     using CacheKey = std::tuple<CUcontext, std::thread::id>;
-    std::unordered_map<CacheKey, std::weak_ptr<T>, hash<CacheKey>>* mObservers;
+    std::unordered_map<CacheKey, std::weak_ptr<T>>* mObservers;
 };
 
 // Structure to hold memory information
