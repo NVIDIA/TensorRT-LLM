@@ -827,7 +827,7 @@ class TriAttention(BaseKVCacheCompressionManager):
     def __init__(
         self,
         kv_cache_manager: KVCacheManagerV2,
-        top_B: int,
+        budget: int,
         draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
         beta: int = 128,
         model_path: Optional[str] = None,
@@ -838,10 +838,10 @@ class TriAttention(BaseKVCacheCompressionManager):
         count_prompt_tokens: bool = False,
     ):
         super().__init__(kv_cache_manager, draft_kv_cache_manager)
-        self.top_B = top_B
+        self.budget = budget
         self.beta = beta
-        if self.top_B <= 0 or self.beta <= 0:
-            raise ValueError("TriAttention top_B and beta must both be positive")
+        if self.budget <= 0 or self.beta <= 0:
+            raise ValueError("TriAttention budget and beta must both be positive")
         # Which token set each eviction round keeps. The user-facing meaning of
         # each mode is documented on TriAttentionKvCacheCompressionConfig
         # (llm_args); implementation notes live above the selection helpers.
@@ -939,7 +939,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         # V2 mirrors the resolved speculative draft length (0 without spec).
         speculative_overshoot = int(manager.max_draft_len)
         first_eviction_decode_length = (
-            self.top_B // self.beta + 1
+            self.budget // self.beta + 1
         ) * self.beta + speculative_overshoot
         decode_capacity = min(int(request.py_max_new_tokens), first_eviction_decode_length)
         confirmed_capacity = int(request.py_prompt_len) + decode_capacity
@@ -954,7 +954,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             raise ValueError(
                 "TriAttention target KV capacity is too small to reach its first "
                 f"eviction: request requires {required_capacity} tokens "
-                f"(prompt={request.py_prompt_len}, budget={self.top_B}, "
+                f"(prompt={request.py_prompt_len}, budget={self.budget}, "
                 f"beta={self.beta}, decode before eviction or completion="
                 f"{decode_capacity}, speculative overshoot="
                 f"{speculative_overshoot}, protected tail="
@@ -979,7 +979,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             raise ValueError(
                 "TriAttention draft KV capacity is too small to reach the first "
                 f"co-compression: request requires {draft_required_capacity} "
-                f"tokens (prompt={request.py_prompt_len}, budget={self.top_B}, "
+                f"tokens (prompt={request.py_prompt_len}, budget={self.budget}, "
                 f"beta={self.beta}, decode before eviction or completion="
                 f"{decode_capacity}, draft protected tail={draft_protected_tail}), "
                 f"but the draft V2 pool covers "
@@ -1279,13 +1279,13 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
         """Return the largest cache length for which selection is an identity.
 
-        With a decode-only budget, pinned prompt tokens do not consume ``top_B``.
+        With a decode-only budget, pinned prompt tokens do not consume ``budget``.
         Selection therefore keeps every token until the cache exceeds
-        ``prompt_len + top_B``. The constructor guarantees the decode-only
+        ``prompt_len + budget``. The constructor guarantees the decode-only
         budget (``pin_prefill=True``, ``count_prompt_tokens=False``).
         """
         prompt_len = min(int(request.py_prompt_len), seq_len)
-        return prompt_len + self.top_B
+        return prompt_len + self.budget
 
     def _local_score_calibration(
         self,
@@ -1437,9 +1437,9 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "TriAttention requires a positive integer model sliding_window "
                     "when layer_types contains sliding attention"
                 )
-            if self.top_B < raw_window:
+            if self.budget < raw_window:
                 raise ValueError(
-                    f"TriAttention decode budget top_B={self.top_B} must be at least "
+                    f"TriAttention budget={self.budget} must be at least "
                     f"the kernel-masked SWA window size {raw_window}"
                 )
             window_size = raw_window
@@ -1634,7 +1634,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         The request capacity follows the executor's max batch size (memory
         scales linearly with it) and the decode-width capacity follows the
         eviction bound (compaction keeps the scored decode region near
-        ``top_B`` plus one period of growth), so one workspace serves every
+        ``budget`` plus one period of growth), so one workspace serves every
         round. It is rebuilt only when the pool views change or a round
         outgrows it.
         """
@@ -1652,7 +1652,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         fingerprint = (
             self.eviction_mode,
-            self.top_B,
+            self.budget,
             tuple(layout["dense_layers"]),
             layout["pool_view_fingerprint"],
             draft_fingerprint,
@@ -1674,7 +1674,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         request_capacity = max(needed_requests, int(mgr.max_batch_size))
         decode_width = max(
             needed_width,
-            self.top_B + 2 * self.beta + int(mgr.max_total_draft_tokens or 0),
+            self.budget + 2 * self.beta + int(mgr.max_total_draft_tokens or 0),
         )
         # Bucket the score scratch by what cohorts actually present instead of
         # pinning it to max_seq_len: with pinned prompts the post-compaction
@@ -1755,7 +1755,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             seq_len=seq_capacity,
             num_q_heads=int(self._H),
             num_freqs=int(self._F),
-            keep_count=self.top_B,
+            keep_count=self.budget,
             q_real=q_real,
             q_imag=q_imag,
             mlr_coef=mlr_coef,
@@ -1794,14 +1794,14 @@ class TriAttention(BaseKVCacheCompressionManager):
             return offsets
 
         tails = [item["protected_tail"] for item in prepared]
-        dense = padded_offsets([self.top_B + tail for tail in tails])
+        dense = padded_offsets([self.budget + tail for tail in tails])
         swa = None
         if layout["swa_layers"] and layout["swa_window"]:
             swa = padded_offsets([int(layout["swa_window"]) + tail for tail in tails])
         draft = None
         if self.draft_kv_cache_manager is not None:
             draft_tail = self._draft_protected_tail_capacity()
-            draft = padded_offsets([self.top_B + draft_tail] * len(prepared))
+            draft = padded_offsets([self.budget + draft_tail] * len(prepared))
         return dense, swa, draft
 
     def _page_table_pool_keys(
@@ -1858,10 +1858,10 @@ class TriAttention(BaseKVCacheCompressionManager):
                 # SWA landing positions are prompt-dependent; reject a request
                 # whose retained span cannot cover the model window this round.
                 for item in prepared:
-                    if item["prompt_len"] + self.top_B < int(layout["swa_window"]):
+                    if item["prompt_len"] + self.budget < int(layout["swa_window"]):
                         raise ValueError(
                             f"Request {item['request_id']} retains "
-                            f"{item['prompt_len'] + self.top_B} tokens, below the "
+                            f"{item['prompt_len'] + self.budget} tokens, below the "
                             f"sliding window {layout['swa_window']}"
                         )
         with nvtx_range_debug("triattention.page_table_stage", color="orange"):

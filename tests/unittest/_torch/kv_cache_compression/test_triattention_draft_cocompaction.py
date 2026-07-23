@@ -245,7 +245,7 @@ def test_draft_admission_gates_raise(gate, match):
         with pytest.raises(ValueError, match=match):
             validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(
-                    model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+                    model_path="/models/test", calibration_path="/calib/test.pt", budget=8
                 ),
                 spec_config,
                 draft_manager,
@@ -253,7 +253,7 @@ def test_draft_admission_gates_raise(gate, match):
         return
     manager = TriAttention(
         _make_fake_v2(),
-        top_B=8,
+        budget=8,
         model_path="/models/test",
         eviction_mode="per_head" if gate == "union_only_per_head" else "union",
         draft_kv_cache_manager=draft_manager,
@@ -268,7 +268,7 @@ def test_draft_admission_gates_raise(gate, match):
 
 
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
-    manager = _make_triattention(top_B=4, beta=4)
+    manager = _make_triattention(budget=4, beta=4)
     manager._calibrated = True
     manager._attention_layer_partition_cache = ([0, 1], [], None)
     target = manager.kv_cache_manager
@@ -337,7 +337,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
 def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
-    manager = _make_triattention(top_B=4)
+    manager = _make_triattention(budget=4)
     layout, workspace = _make_workspace_stubs(manager)
     # The one-time host block-offset table shape gate reads the real manager
     # tables (int32 [pools, slots, K/V, blocks]).
@@ -390,7 +390,7 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
         assert prepare.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
         # Migrated from the pipeline workspace-kwargs test: the budget, the
         # shared phase-table dict, and the pool keys thread through unchanged.
-        assert prepare.call_args.kwargs["keep_count"] == manager.top_B
+        assert prepare.call_args.kwargs["keep_count"] == manager.budget
         assert prepare.call_args.kwargs["phase"] is manager._phase
         assert prepare.call_args.kwargs["layer_pool_keys"] == list(layout["layer_pool_keys"])
 

@@ -3456,11 +3456,11 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
         default=True,
         description="Always preserve the prompt (prefill) tokens; only decode "
         "tokens compete for the budget (upstream behaviour).")
-    top_B: int = Field(
+    budget: int = Field(
         default=2048,
         gt=0,
-        description="Tokens kept at each periodic eviction (upstream `budget`; "
-        "prompt tokens are always preserved on top).")
+        description="Tokens kept at each periodic eviction; prompt tokens are "
+        "always preserved on top.")
     beta: int = Field(
         default=128,
         gt=0,
@@ -3499,7 +3499,7 @@ class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
     def to_manager_kwargs(self) -> dict:
         """Constructor kwargs for the TriAttention manager."""
         return {
-            "top_B": self.top_B,
+            "budget": self.budget,
             "beta": self.beta,
             "model_path": self.model_path,
             "calibration_path": self.calibration_path,

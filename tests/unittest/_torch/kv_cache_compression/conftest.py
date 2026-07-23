@@ -269,7 +269,7 @@ def make_triattention(**overrides):
     """Construct a fully initialized manager for method-level unit tests."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import TriAttention
 
-    options = {"top_B": 8, "model_path": "/models/test"}
+    options = {"budget": 8, "model_path": "/models/test"}
     options.update(overrides)
     return TriAttention(make_fake_v2(), **options)
 

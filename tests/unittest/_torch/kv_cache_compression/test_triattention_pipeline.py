@@ -135,7 +135,7 @@ class TestConfigAndFactory:
             tri_args.kv_cache_compression_config,
             TriAttentionKvCacheCompressionConfig,
         )
-        assert tri_args.kv_cache_compression_config.top_B == 2048
+        assert tri_args.kv_cache_compression_config.budget == 2048
         assert tri_args.kv_cache_compression_config.beta == 128
 
         # The union dispatches on the algorithm tag, so an unknown algorithm
@@ -153,7 +153,7 @@ class TestConfigAndFactory:
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
         cfg = TriAttentionKvCacheCompressionConfig(
-            top_B=32,
+            budget=32,
             beta=16,
             eviction_mode="per_head",
             model_path="/models/test",
@@ -161,7 +161,7 @@ class TestConfigAndFactory:
         )
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
-        assert mgr.top_B == 32
+        assert mgr.budget == 32
         assert mgr.beta == 16
         assert mgr.eviction_mode == "per_head"
         assert mgr.kv_cache_manager is fake_v2
@@ -220,7 +220,7 @@ class TestTriAttentionClass:
         manager = _make_fake_v2()
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
-        triattention = TriAttention(manager, top_B=8, model_path="/models/test")
+        triattention = TriAttention(manager, budget=8, model_path="/models/test")
         triattention._attention_layer_partition_cache = ([], [], None)
         triattention._calibrated = True
 
@@ -247,7 +247,7 @@ class TestCompressedTokenPublication:
     # test_compressed_count_is_monotone_and_tracks_confirmed_length.
 
     def test_identity_compaction_is_rejected_instead_of_published(self):
-        manager = _make_triattention(top_B=4)
+        manager = _make_triattention(budget=4)
         manager.kv_cache_manager._stream = mock.Mock()
         request = _make_request(7, py_prompt_len=2)
         # Selection keeps every token at seq_len == prompt + budget: the due
@@ -350,7 +350,7 @@ class TestEvictionLifecycle:
         mgr._request_states = {}
         _set_request_state(mgr, 7, generation_steps=127)
         mgr.beta = 128
-        mgr.top_B = 4096
+        mgr.budget = 4096
         return mgr, request, batch
 
     def test_suspended_cache_rejects_batch_before_cadence_mutation(self):
@@ -486,7 +486,7 @@ class TestEvictionLifecycle:
         draft_manager.max_seq_len = 8192
         manager = TriAttention(
             _make_fake_v2(),
-            top_B=8,
+            budget=8,
             model_path="/models/test",
             draft_kv_cache_manager=draft_manager,
         )
@@ -500,7 +500,7 @@ class TestEvictionLifecycle:
 
         validate_kv_cache_compression_with_spec(
             TriAttentionKvCacheCompressionConfig(
-                model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+                model_path="/models/test", calibration_path="/calib/test.pt", budget=8
             ),
             MTPDecodingConfig(max_draft_len=1),
             draft_manager,
@@ -524,7 +524,7 @@ class TestEvictionLifecycle:
         manager.kv_cache_map = {
             7: SimpleNamespace(capacity=106, is_active=True),
         }
-        triattention = TriAttention(manager, top_B=8, model_path="/models/test")
+        triattention = TriAttention(manager, budget=8, model_path="/models/test")
         batch = SimpleNamespace(
             context_requests=[],
             generation_requests=[_make_request(7, py_draft_tokens=draft_tokens)],
@@ -541,7 +541,7 @@ class TestFixedScoreMetadata:
         # The fused pipeline (THE union path) always z-normalizes, so
         # normalize_scores=False is rejected loudly at construction.
         with pytest.raises(ValueError, match="normalize_scores=True"):
-            _make_triattention(top_B=4, eviction_mode="union", normalize_scores=False)
+            _make_triattention(budget=4, eviction_mode="union", normalize_scores=False)
 
     def test_workspace_build_receives_mode_and_capacity_kwargs(self):
         # Mode/phase/pool-key threading and cached reuse are covered by the
@@ -549,9 +549,9 @@ class TestFixedScoreMetadata:
         # test_triattention_draft_cocompaction.py.
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
-        manager = _make_triattention(top_B=4)
+        manager = _make_triattention(budget=4)
         # The workspace follows the executor limits: eight requests (max batch
-        # size) by 260 decode tokens (top_B plus two eviction periods).
+        # size) by 260 decode tokens (budget plus two eviction periods).
         layout, workspace = _make_workspace_stubs(manager)
         prepared = [
             _prepared_eviction(
@@ -697,7 +697,7 @@ class TestFixedScoreMetadata:
         assert staging.block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
 
     def test_staged_page_tables_bypass_per_request_cuda_materialization(self):
-        manager = _make_triattention(top_B=4)
+        manager = _make_triattention(budget=4)
         manager.kv_cache_manager.num_extra_kv_tokens = 3
         manager.kv_cache_manager._stream = mock.Mock()
         manager.kv_cache_manager.get_batch_cache_indices = mock.Mock(
@@ -732,7 +732,7 @@ class TestFixedScoreMetadata:
             )
 
         # One batched staging call carries the whole cohort: request ids,
-        # round starts, pinned prompt lengths, and valid lengths. top_B=4:
+        # round starts, pinned prompt lengths, and valid lengths. budget=4:
         # per-request moves are keep + tail = [6, 7]; padded rows repeat the
         # final offset out to the request capacity.
         args = internals.stage.call_args
@@ -891,11 +891,11 @@ class TestFixedScoreMetadata:
 
 
 class TestKernelMaskedSwa:
-    @pytest.mark.parametrize("top_B,fits_window", [(128, True), (127, False)])
-    def test_layer_partition_uses_local_config_and_validates_window(self, top_B, fits_window):
+    @pytest.mark.parametrize("budget,fits_window", [(128, True), (127, False)])
+    def test_layer_partition_uses_local_config_and_validates_window(self, budget, fits_window):
         mgr = _make_triattention()
         mgr.model_path = "/models/gpt-oss"
-        mgr.top_B = top_B
+        mgr.budget = budget
         mgr.kv_cache_manager = SimpleNamespace(pp_layers=[0, 1, 2, 3])
         config = _make_hf_config(
             layer_types=[
@@ -910,7 +910,7 @@ class TestKernelMaskedSwa:
         with mock.patch("transformers.AutoConfig.from_pretrained", return_value=config) as load:
             if not fits_window:
                 # The decode budget must cover the kernel-masked SWA window.
-                with pytest.raises(ValueError, match="decode budget top_B=127"):
+                with pytest.raises(ValueError, match="budget=127"):
                     mgr._attention_layer_partition(4)
                 return
             dense, sliding, window = mgr._attention_layer_partition(4)

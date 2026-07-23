@@ -2,7 +2,7 @@
 
 This document describes enabling TriAttention KV-cache compression in TensorRT LLM.
 
-TriAttention is a training-free, decode-time KV-cache eviction method for long-context LLM inference. During generation it periodically scores the cached tokens by a trigonometric importance measure derived from offline per-head query statistics (calibration), keeps the most important `top_B` tokens, and physically compacts the cache — reducing KV-cache memory so more sequences fit on a GPU at once.
+TriAttention is a training-free, decode-time KV-cache eviction method for long-context LLM inference. During generation it periodically scores the cached tokens by a trigonometric importance measure derived from offline per-head query statistics (calibration), keeps the most important `budget` tokens, and physically compacts the cache — reducing KV-cache memory so more sequences fit on a GPU at once.
 
 For technical details see the paper [TriAttention](https://arxiv.org/abs/2604.04921) and the official implementation [github.com/WeianMao/triattention](https://github.com/WeianMao/triattention).
 
@@ -11,7 +11,7 @@ For technical details see the paper [TriAttention](https://arxiv.org/abs/2604.04
 TriAttention runs entirely in the generation phase and reuses the standard dense attention kernel over the compacted cache:
 
 1. **Calibration (offline, one-time per model).** The importance score needs each attention head's mean and magnitude of the pre-RoPE query, gathered over a small calibration corpus. **TensorRT LLM does not compute calibration** — you produce it once with the official tool and pass the resulting `.pt` file. TensorRT LLM loads it and converts it to its runtime schema at the first request.
-2. **Periodic eviction (Stage during generation).** Every `beta` confirmed generation tokens, once a sequence is over budget, TriAttention scores the whole cache, selects `top_B` tokens to keep (the prompt tokens are preserved on top of the budget), and physically compacts the KV cache down to the kept set. A speculative iteration may confirm multiple tokens; crossing multiple periods in one update is coalesced into one eviction.
+2. **Periodic eviction (Stage during generation).** Every `beta` confirmed generation tokens, once a sequence is over budget, TriAttention scores the whole cache, selects `budget` tokens to keep (the prompt tokens are preserved on top of the budget), and physically compacts the KV cache down to the kept set. A speculative iteration may confirm multiple tokens; crossing multiple periods in one update is coalesced into one eviction.
 
 TriAttention is integrated into TensorRT LLM as a KV-cache compression manager on top of the `KVCacheManagerV2`. The scoring and compaction kernels are implemented in **Triton**.
 
@@ -65,7 +65,7 @@ from tensorrt_llm.llmapi import (KvCacheConfig,
 
 # 1. Configure the eviction manager + point it at the calibration file.
 compression_config = TriAttentionKvCacheCompressionConfig(
-    top_B=2048,            # tokens kept at each eviction (prompt is kept on top)
+    budget=2048,            # tokens kept at each eviction (prompt is kept on top)
     beta=64,               # eviction period, in confirmed generation tokens
     eviction_mode="union",
     calibration_path="/path/to/qwen3-8b-calibration.pt",  # official tool's output
@@ -96,7 +96,7 @@ Pass the configs via `--config config.yaml`. The field names match the Python co
 backend: pytorch
 kv_cache_compression_config:
   algorithm: triattention
-  top_B: 2048
+  budget: 2048
   beta: 64
   eviction_mode: union
   calibration_path: /path/to/qwen3-8b-calibration.pt
@@ -114,7 +114,7 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
 
 `TriAttentionKvCacheCompressionConfig` controls the compression ratio and the eviction algorithm:
 
-* **`top_B`** (int, default=2048): Tokens kept at each eviction (the upstream `budget`). Prompt tokens are always preserved on top of this. Smaller `top_B` → more compression.
+* **`budget`** (int, default=2048): Tokens kept at each eviction. Prompt tokens are always preserved on top of this. Smaller `budget` → more compression.
 * **`beta`** (int, default=128): Eviction period, in confirmed generation tokens (the upstream `divide_length`). Speculative acceptance advances the counter by `1 + accepted_draft_tokens`; at most one eviction is coalesced per final update.
 * **`eviction_mode`** (str, default=`union`): Which token set each eviction keeps.
     * `union`: union of each KV head's top-B, re-ranked by the per-token max score. Matches the official base setting.
