@@ -56,7 +56,7 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "tests/integration/defs/.test_durations",
     "tests/integration/defs/agg_unit_mem_df.csv",
     "tests/microbenchmarks/",
-    "jenkins/scripts/cbts/",
+    "jenkins/",
 )
 
 # Path suffixes (extensions) with no test-execution impact, anywhere in

@@ -103,6 +103,7 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
+# [cbts-test] no-op touch to validate coverage-based selection
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 
 # Environment variable to enable PyTorch profiler tracing.
