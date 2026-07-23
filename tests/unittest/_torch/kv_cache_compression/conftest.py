@@ -153,7 +153,12 @@ def build_compaction(**overrides):
         swa_window=None,
     )
     args.update(overrides)
-    return build_cache_compactions(**args)
+    compaction = build_cache_compactions(**args)
+    # Production fuses the dense pack into the settle launch; standalone
+    # compaction tests re-attach it so run_cache_compactions packs the dense
+    # move buffers before the C++ moves (firing the pack twice is idempotent).
+    compaction_family(compaction, "dense")["pack"] = compaction["dense_pack"]
+    return compaction
 
 
 def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None):

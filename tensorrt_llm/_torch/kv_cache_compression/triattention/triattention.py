@@ -514,7 +514,6 @@ def prepare_eviction_workspace(
         # ONE launch settles the kept ordinals and packs the dense/SWA
         # move sources; ``run_cache_compactions`` then only runs the C++
         # moves (plus the draft's own pack).
-        fuse_dense_pack_into_selection=True,
         **draft_kwargs,
     )
     pack = ws.compaction["dense_pack"]

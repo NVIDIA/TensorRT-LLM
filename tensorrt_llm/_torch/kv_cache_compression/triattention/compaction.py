@@ -22,10 +22,10 @@ SWA families; a co-compressed draft adds a second) and then moves the
 surviving KV in place with batched C++ compact launches. Everything is plain
 tensors and dicts: ``build_cache_compactions`` allocates the launch data once
 per geometry (called by ``triattention.prepare_eviction_workspace``) and
-``run_cache_compactions`` fires the kernels directly each round. A driver
-that finalizes the keep set in its own GPU launch takes the target's
-dense/SWA packing over into that launch (``fuse_dense_pack_into_selection``);
-the draft always packs here.
+``run_cache_compactions`` fires the kernels directly each round. The
+target's dense/SWA packing always rides the driver's fused settle launch
+(the returned ``dense_pack`` dict describes it); the draft always packs
+here with its own launch.
 """
 
 from collections import OrderedDict
@@ -259,7 +259,6 @@ def build_cache_compactions(
     swa_window: Optional[int],
     layer_pool_keys: List[object],
     protected_tail_capacity: int = 0,
-    fuse_dense_pack_into_selection: bool = False,
     draft_layer_pools: Optional[List[torch.Tensor]] = None,
     draft_layers: Optional[List[int]] = None,
     draft_layer_group_representative: Optional[Dict[int, int]] = None,
@@ -287,10 +286,9 @@ def build_cache_compactions(
     ``[slot, request, K/V, block]`` (offset = ``2*page + plane``);
     ``protected_tail_capacity`` is the widest per-request tail this geometry
     must support -- actual per-round lengths arrive through the staged
-    move-offset rows. With ``fuse_dense_pack_into_selection`` the target's
-    dense/SWA packing is left to the caller's fused settle launch (the
-    returned ``dense_pack`` dict describes it) and only the C++ moves run
-    here; the draft always keeps its own pack launch.
+    move-offset rows. The target's dense/SWA packing is left to the caller's
+    fused settle launch (the returned ``dense_pack`` dict describes it) and
+    only the C++ moves run here; the draft always keeps its own pack launch.
 
     Returns ``{"families": [...], "dense_pack": ..., "num_kv_heads": ...,
     "swa_window": ..., "swa_destination_bases": ...}`` where each family is
@@ -365,10 +363,10 @@ def build_cache_compactions(
     families = [
         dict(
             name="dense",
-            # A fused selection-side settle launch packs the dense/SWA move
+            # The fused selection-side settle launch packs the dense/SWA move
             # sources when it finalizes the kept ordinals; only the C++ moves
             # stay here. Each round then packs exactly once.
-            pack=None if fuse_dense_pack_into_selection else dense_pack,
+            pack=None,
             groups=_compact_groups(dense_entries, layer_pool_keys, device, dense_slots),
             source=dense_move_indices,
             offsets=dense_move_offsets,

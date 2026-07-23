@@ -1788,10 +1788,6 @@ class TriAttentionCuteScoreRunner:
                     compiled_configs[config_key] = compiled_selection
                 self._compiled_normalize_union[request_count] = compiled_selection
 
-    def supports(self, request_count: int) -> bool:
-        """Return whether the dynamic specialization covers this request count."""
-        return request_count in self._compiled
-
     def launch(
         self,
         request_count: int,
@@ -1807,13 +1803,6 @@ class TriAttentionCuteScoreRunner:
             *self._cute_tail,
             request_count,
             stream,
-        )
-
-    def supports_union_fusion(self, request_count: int) -> bool:
-        """Return whether the score/stats/union pipeline was precompiled."""
-        return (
-            request_count in self._compiled_stats
-            and request_count in self._compiled_normalize_union
         )
 
     def launch_union_fusion(

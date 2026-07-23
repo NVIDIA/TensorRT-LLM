@@ -11,7 +11,10 @@ from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import run_cache_compactions
+from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
+    launch_move_pack,
+    run_cache_compactions,
+)
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import settle_top_tokens
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     prepare_per_head_scores,
@@ -396,6 +399,9 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(compaction, protected_tails)
+    # Production packs these buffers inside the fused settle launch; with
+    # pre-settled ordinals the standalone pack call is its exact analog.
+    launch_move_pack(compaction["dense_pack"])
     run_cache_compactions(compaction)
     torch.cuda.synchronize(device)
 
@@ -484,6 +490,7 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(cohort_compaction, protected_tails)
+    launch_move_pack(cohort_compaction["dense_pack"])
     run_cache_compactions(cohort_compaction)
 
     expected_pools = [pool.clone() for pool in initial_pools]
@@ -499,6 +506,7 @@ def test_union_mixed_prompt_lengths_cohort_matches_single_request_compactions():
             protected_tail_capacity=protected_tails[request],
         )
         _set_protected_tails(single_compaction, [protected_tails[request]])
+        launch_move_pack(single_compaction["dense_pack"])
         run_cache_compactions(single_compaction)
     torch.cuda.synchronize(device)
 
@@ -593,8 +601,10 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     ws.valid_seq_lens_device.fill_(seq_len)
     ws.token_starts_device.fill_(0)
 
-    # This compaction packs its own move indices; the workspace's fused pack
-    # stays masked off (its staged move-offsets row is all zeros).
+    # This compaction packs its own move indices (the ordinals settle
+    # mid-round, so the pack rides the family slot exactly like the draft's
+    # own pack does in production); the workspace's fused pack stays masked
+    # off (its staged move-offsets row is all zeros).
     ws.compaction = _build_compaction(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
@@ -611,6 +621,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         protected_tail_capacity=0,
     )
     _set_protected_tails(ws.compaction, [0])
+    ws.compaction["families"][0]["pack"] = ws.compaction["dense_pack"]
     run_eviction_round(ws, normalize_scores=False)
     assert torch.equal(ws.keep, expected_keep)
     torch.cuda.synchronize(device)
@@ -901,6 +912,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(compaction, protected_tails)
+    launch_move_pack(compaction["dense_pack"])
     run_cache_compactions(compaction)
     torch.cuda.synchronize(device)
 

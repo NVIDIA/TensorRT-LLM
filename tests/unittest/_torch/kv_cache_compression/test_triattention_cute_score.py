@@ -94,7 +94,7 @@ def _launch_split_scores(
         valid_seq_lens, 0, ws.seg_req[:num_segments], out=ws.seg_seq_len[:num_segments]
     )
     ws.cute_token_starts[:request_count].copy_(token_starts[:request_count])
-    assert ws.runner.supports(request_count)
+    assert request_count in ws.runner._compiled
     ws.runner.launch(request_count, mean_cos, mean_sin)
     group_size = ws.num_q_heads // ws.num_kv_heads
     source = (
@@ -377,7 +377,7 @@ def test_cute_kernel_matches_torch_oracle(case):
     # The compiled runner serves every request count up to the workspace
     # capacity and nothing beyond it; cover one, an intermediate count, and
     # the capacity.
-    assert not ws.runner.supports(max_requests + 1)
+    assert max_requests + 1 not in ws.runner._compiled
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
         valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
         scores = _launch_split_scores(

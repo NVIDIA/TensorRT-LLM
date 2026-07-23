@@ -91,7 +91,7 @@ def _launch_split_scores(
 ):
     """The production score-only leg plus the decode-window gather."""
     _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts)
-    assert ws.runner.supports(request_count)
+    assert request_count in ws.runner._compiled
     ws.runner.launch(request_count, mean_cos, mean_sin)
     num_segments = request_count * ws.num_layers
     group_size = ws.num_q_heads // ws.num_kv_heads
@@ -124,7 +124,10 @@ def _launch_union_fusion(
 ):
     """The fused score+stats+normalized-union pipeline (THE union path)."""
     _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts)
-    assert ws.runner.supports_union_fusion(request_count)
+    assert (
+        request_count in ws.runner._compiled_stats
+        and request_count in ws.runner._compiled_normalize_union
+    )
     ws.runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_out[:request_count])
 
 
