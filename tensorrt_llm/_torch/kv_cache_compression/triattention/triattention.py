@@ -1142,9 +1142,11 @@ class TriAttention(BaseKVCacheCompressionManager):
                     "the final update hook"
                 )
             if request_id not in self._request_states:
-                self.on_request_init(request)
+                raise RuntimeError(
+                    f"request {request_id} reached generation without on_request_init"
+                )
             resolved_requests.append((request, request_id, kv_cache))
-        if not resolved_requests or not self._calibrated:
+        if not resolved_requests:
             return
         protected_tails: Dict[int, int] = {}
         due_requests = []

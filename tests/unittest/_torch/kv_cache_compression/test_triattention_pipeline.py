@@ -283,6 +283,18 @@ class TestEvictionLifecycle:
 
         periodic_evict.assert_called_once_with(batch)
 
+    def test_unregistered_generation_request_is_rejected(self):
+        # A generation request whose on_request_init never ran is a framework
+        # ordering bug: it fails loudly instead of late-initializing here.
+        manager = _make_triattention()
+        manager._calibrated = True
+        cache = SimpleNamespace(capacity=8, history_length=0, is_active=True)
+        manager.kv_cache_manager.kv_cache_map = {7: cache}
+        request = _make_request(7, py_prompt_len=2)
+
+        with pytest.raises(RuntimeError, match="without on_request_init"):
+            manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
+
     @staticmethod
     def _make_due_decode_request(seq_len):
         request = _make_request(
