@@ -1517,6 +1517,9 @@ class TriAttentionCuteScoreRunner:
             _to_cute(seg_out_offset),
             _to_cute(token_starts, assumed_align=4),
         )
+        self._cute_partial_stats = _to_cute(self.partial_stats)
+        # Launch-path from_dlpack wraps, cached per persistent buffer identity.
+        self._cute_launch_cache: dict[str, tuple[torch.Tensor, cute.Tensor]] = {}
         static_geometry = (
             max_requests,
             num_layers,
@@ -1659,6 +1662,15 @@ class TriAttentionCuteScoreRunner:
                     compiled_configs[config_key] = compiled_selection
                 self._compiled_normalize_union[request_count] = compiled_selection
 
+    def _cute_cached(self, key: str, tensor: torch.Tensor) -> cute.Tensor:
+        """One from_dlpack per persistent buffer; rewrap only on identity change."""
+        cached = self._cute_launch_cache.get(key)
+        if cached is not None and cached[0] is tensor:
+            return cached[1]
+        wrapped = _to_cute(tensor.view(-1))
+        self._cute_launch_cache[key] = (tensor, wrapped)
+        return wrapped
+
     def launch(
         self,
         request_count: int,
@@ -1669,8 +1681,8 @@ class TriAttentionCuteScoreRunner:
         stream = cuda.CUstream(torch.cuda.current_stream(mean_cos.device).cuda_stream)
         self._compiled[request_count](
             *self._cute_prefix,
-            _to_cute(mean_cos.view(-1)),
-            _to_cute(mean_sin.view(-1)),
+            self._cute_cached("mean_cos", mean_cos),
+            self._cute_cached("mean_sin", mean_sin),
             *self._cute_tail,
             request_count,
             stream,
@@ -1687,16 +1699,16 @@ class TriAttentionCuteScoreRunner:
         stream = cuda.CUstream(torch.cuda.current_stream(mean_cos.device).cuda_stream)
         self._compiled_stats[request_count](
             *self._cute_prefix,
-            _to_cute(mean_cos.view(-1)),
-            _to_cute(mean_sin.view(-1)),
+            self._cute_cached("mean_cos", mean_cos),
+            self._cute_cached("mean_sin", mean_sin),
             *self._cute_tail,
             request_count,
             stream,
         )
         self._compiled_normalize_union[request_count](
-            _to_cute(self.partial_stats),
+            self._cute_partial_stats,
             *self._cute_selection_prefix,
-            _to_cute(union_scores.view(-1)),
+            self._cute_cached("union_scores", union_scores),
             request_count,
             stream,
         )
