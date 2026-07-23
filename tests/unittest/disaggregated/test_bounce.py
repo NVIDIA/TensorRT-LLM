@@ -1181,7 +1181,7 @@ class TestReceiveReserve:
     def test_destination_intervals_factory_canonicalizes_without_retaining_input(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[8])
         req = _recv_req([1])
-        raw_intervals = {(0x2080, 0x80), (0x2000, 0x80)}
+        raw_intervals = {(0x2004, 4), (0x2000, 4)}
         calls = []
 
         def build_intervals():
@@ -1196,10 +1196,10 @@ class TestReceiveReserve:
         ctx = t._reserved_map[(req.unique_rid, req.slice_id)]
         assert calls == [1]
         assert "destination_intervals" not in ctx.__dict__
-        assert ctx._destination_intervals == ((0x2000, 0x2100),)
+        assert ctx._destination_intervals == ((0x2000, 0x2008),)
 
         raw_intervals.add((0x3000, 8))
-        assert ctx._destination_intervals == ((0x2000, 0x2100),)
+        assert ctx._destination_intervals == ((0x2000, 0x2008),)
 
     def test_invalid_lazy_destination_intervals_release_reserved_slot(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[8])
@@ -1383,7 +1383,7 @@ class TestReceiveReserve:
 
     def test_settlement_retry_replays_registry_update_until_session_ack(self, monkeypatch):
         tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
-        from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice
+        from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionArgsBase
         from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])
@@ -1420,6 +1420,7 @@ class TestReceiveReserve:
         session = object.__new__(tfr.RxSession)
         session._closed = True
         session.request_id = key[0]
+        session._base_args = SessionArgsBase(params)
         session.lock = threading.Lock()
         session._kv_tasks = [task]
         session._receiver = receiver

@@ -4069,7 +4069,10 @@ class RxSession(RxSessionBase):
             self._aux_exposed_writer_ranks: set[int] = set()
             self._aux_publication_closed = not self._need_aux
             self._aux_result_conflict = False
-            self._aux_drained = not self._need_aux
+            # Allocating the session-scoped AUX slot does not create a remote
+            # accessor. It becomes an active ownership lease only when its
+            # address is actually published to a writer.
+            self._aux_drained = True
             self._aux_status: TaskStatus = TaskStatus.INIT
             self._sender_endpoints: set[str] = set()
             self._selected_writer_cohort: Optional[frozenset[int]] = None
@@ -4245,12 +4248,19 @@ class RxSession(RxSessionBase):
         """Whether another publication may carry the session AUX address."""
         return not (self._need_aux and self.aux_slot is not None and self._aux_publication_closed)
 
+    def _retain_aux_writer_exposure_locked(self, peer_rank: int) -> None:
+        """Retain one possible AUX accessor until terminal drain evidence."""
+        if not self._need_aux:
+            return
+        self._aux_exposed_writer_ranks.add(int(peer_rank))
+        self._aux_drained = False
+
     def _mark_aux_writer_exposed_locked(self, peer_rank: int) -> bool:
         """Record one possible AUX accessor, rejecting exposure after closure."""
         if not self._aux_writer_exposure_allowed_locked():
             return False
         if self._need_aux and self.aux_slot is not None:
-            self._aux_exposed_writer_ranks.add(int(peer_rank))
+            self._retain_aux_writer_exposure_locked(peer_rank)
         return True
 
     def _close_aux_publication_locked(self) -> None:
@@ -4259,7 +4269,11 @@ class RxSession(RxSessionBase):
             return
         self._aux_publication_closed = True
         if not self._kv_tasks:
-            self._aux_drained = True
+            # With no remote evidence, closing before the first KV task proves
+            # that the slot was never exposed. A protocol-conflict frame may
+            # itself be evidence of an accessor, however, and only a terminal
+            # result or backend-wide fence can retire that ledger entry.
+            self._aux_drained = not self._aux_exposed_writer_ranks
             self._aux_status = TaskStatus.ERROR
             return
         cohort_task = self._kv_tasks[0]
@@ -4283,21 +4297,31 @@ class RxSession(RxSessionBase):
                 self._select_adp_cohort_locked(cohort_task, self._aux_results, channel="aux")
                 self._advance_aux_locked(cohort_task)
 
+    def _validate_receive_admission_locked(self) -> None:
+        """Reject receive work that cannot enter the serialized dispatch."""
+        if not self._accepting_receives:
+            raise RuntimeError(
+                f"RxSession {self.disagg_request_id} is closing; "
+                "new receive slices are not accepted"
+            )
+        if self._last_slice_admitted:
+            raise RuntimeError(
+                f"RxSession {self.disagg_request_id} already admitted its last slice"
+            )
+
     def receive(self, slice: KVSlice) -> None:
         # Serializing through dispatch is required because AUX storage and its
         # publication ledger are session-wide.  A later last slice must not
         # close/free the slot while an earlier slice can still expose it.
+        # Check the admission gate before waiting for the dispatch lock so a
+        # receive started after shutdown is sealed cannot block behind an
+        # already admitted dispatch. Repeat the check after serialization to
+        # close the race with cancellation or close.
+        with self.lock:
+            self._validate_receive_admission_locked()
         with self._receive_lock:
             with self.lock:
-                if not self._accepting_receives:
-                    raise RuntimeError(
-                        f"RxSession {self.disagg_request_id} is closing; "
-                        "new receive slices are not accepted"
-                    )
-                if self._last_slice_admitted:
-                    raise RuntimeError(
-                        f"RxSession {self.disagg_request_id} already admitted its last slice"
-                    )
+                self._validate_receive_admission_locked()
                 params = self._base_args.params
                 slice_id = len(self._kv_tasks)
                 task = KVRecvTask(
@@ -4427,7 +4451,7 @@ class RxSession(RxSessionBase):
             # Preserve the possible accessor even if the publication gate has
             # already closed so AUX drain remains fail-closed.
             if self._need_aux and self.aux_slot is not None:
-                self._aux_exposed_writer_ranks.add(int(peer_rank))
+                self._retain_aux_writer_exposure_locked(peer_rank)
             self._close_aux_publication_locked()
             logger.error(detail)
 
@@ -4517,7 +4541,7 @@ class RxSession(RxSessionBase):
                 # The frame itself is evidence that this identity participated
                 # in some publication generation. Retain it in the physical
                 # ledger even while latching the protocol conflict.
-                self._aux_exposed_writer_ranks.add(peer_rank)
+                self._retain_aux_writer_exposure_locked(peer_rank)
             self._aux_results[peer_rank] = status
             if not identity_valid:
                 self._aux_result_conflict = True
@@ -4544,7 +4568,7 @@ class RxSession(RxSessionBase):
     def process_aux_protocol_conflict(self, peer_rank: int, reason: str) -> None:
         """Latch an AUX protocol failure without treating it as quiescence."""
         with self.lock:
-            self._aux_exposed_writer_ranks.add(peer_rank)
+            self._retain_aux_writer_exposure_locked(peer_rank)
             self._aux_result_conflict = True
             self._aux_status = TaskStatus.ERROR
             self._exception = RuntimeError(

@@ -520,6 +520,47 @@ def test_aux_protocol_conflict_requires_full_exposed_ledger_or_backend_fence() -
     assert session._aux_status is TaskStatus.ERROR
 
 
+def test_aux_protocol_conflict_reopens_initially_drained_exposure_ledger() -> None:
+    session, _task = _make_legacy_session(((1, 2),))
+    session._aux_exposed_writer_ranks.clear()
+    session._aux_drained = True
+
+    session.process_aux_protocol_conflict(9, "unknown result status")
+
+    assert session._aux_exposed_writer_ranks == {9}
+    assert not session._aux_drained
+
+    session.mark_backend_quiesced()
+    assert session._aux_drained
+
+
+def test_aux_protocol_conflict_before_first_receive_requires_backend_fence() -> None:
+    receiver = _make_receiver()
+    aux_buffer = SimpleNamespace(
+        alloc_slot=Mock(return_value=SimpleNamespace(id=7)),
+        free_slot=Mock(),
+    )
+    session = RxSession(
+        REQUEST_ID,
+        _params(schedule_style=DisaggScheduleStyle.GENERATION_FIRST),
+        receiver,
+        aux_buffer=aux_buffer,
+    )
+
+    assert session._aux_drained
+
+    session.process_aux_protocol_conflict(9, "unknown result status")
+
+    assert session._aux_exposed_writer_ranks == {9}
+    assert not session._aux_drained
+    assert session.has_untracked_receive_activity()
+
+    session.mark_backend_quiesced()
+    assert session._aux_drained
+    session.close()
+    aux_buffer.free_slot.assert_called_once_with(7)
+
+
 def test_adp_cross_channel_cohort_conflict_reopens_aux_and_retains_kv() -> None:
     session, task = _make_legacy_session(((1, 2), (3, 4)))
 

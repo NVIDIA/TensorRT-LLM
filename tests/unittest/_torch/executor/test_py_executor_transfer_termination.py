@@ -1068,6 +1068,7 @@ def _make_connector_completion_executor(request):
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.has_pending_admission.return_value = False
     executor.async_transfer_manager.has_any_transfer_owner.return_value = False
+    executor.async_transfer_manager.is_final_transfer_owner.return_value = True
     executor.async_transfer_manager.requests_in_transfer.return_value = {}
     executor.force_terminate_ctx_for_partial_reuse = False
     executor._terminate_request = Mock()
@@ -1380,6 +1381,8 @@ def test_connector_owned_cancel_waits_for_connector_completion(transceiver_kind)
     assert executor.active_requests == [request]
     request.create_response.assert_not_called()
     executor._terminate_request.assert_not_called()
+    executor._enqueue_responses.assert_called_once_with([])
+    executor._enqueue_responses.reset_mock()
 
     executor._kv_connector_terminate_requests()
 
@@ -1416,6 +1419,8 @@ def test_capability_false_cancel_keeps_anonymous_status_owner_after_connector():
     assert executor.active_requests == [request]
     executor.async_transfer_manager.end_transfer.assert_not_called()
     executor._terminate_request.assert_not_called()
+    executor._enqueue_responses.assert_called_once_with([])
+    executor._enqueue_responses.reset_mock()
 
     executor._kv_connector_terminate_requests()
 
@@ -1585,6 +1590,8 @@ def test_cancelled_context_connector_owner_terminates_exactly_once(force_partial
     finished_requests = executor._handle_responses()
     assert executor.active_requests == []
     assert finished_requests == [request]
+    request.create_response.assert_called_once_with(False, 0)
+    executor._enqueue_responses.assert_called_once_with([(7, response)])
     if force_partial_reuse:
         executor._terminate_request.assert_called_once_with(request)
     else:
@@ -1749,6 +1756,7 @@ def test_shutdown_discards_post_loop_native_response_without_collective(monkeypa
     request = _make_native_completion_request()
     request.is_dummy_request = False
     executor = _make_shutdown_executor(events, request)
+    events.terminate_request.side_effect = executor._mark_transfer_terminal_teardown_complete
     executor.active_requests = [request]
     executor._deferred_transfer_terminations = {}
     executor.async_transfer_manager = _ExactTransferManager(request, transceiver=True)
@@ -1832,6 +1840,7 @@ def test_shutdown_waits_for_final_connector_owner_after_native_cancel(monkeypatc
     request.cached_tokens = 0
     request.create_response.return_value = Mock(result=SimpleNamespace())
     executor = _make_shutdown_executor(events, request)
+    events.terminate_request.side_effect = executor._mark_transfer_terminal_teardown_complete
     executor.dist = SimpleNamespace(pp_size=1, rank=0, world_size=1)
     executor._deferred_transfer_terminations = {}
     executor.active_requests = [request]
@@ -2177,7 +2186,7 @@ def test_shutdown_discards_ownerless_unbuffered_terminal_before_teardown(
     request = SimpleNamespace(py_request_id=7, is_dummy_request=False)
     executor = _make_shutdown_executor(events, request)
     executor._deferred_transfer_terminations = {}
-    executor.kv_cache_transceiver.requires_physical_drain_before_request_release = False
+    events.transceiver_shutdown.return_value = True
     executor.async_transfer_manager = _ExactTransferManager(request)
     executor.active_requests = [request]
     executor._claim_transfer_terminal(
@@ -2248,7 +2257,7 @@ def test_shutdown_local_cleanup_failure_still_enters_connector_consensus(monkeyp
     request = Mock(py_request_id=7, is_dummy_request=False)
     executor = _make_shutdown_executor(events, request)
     executor._deferred_transfer_terminations = {}
-    executor.kv_cache_transceiver.requires_physical_drain_before_request_release = False
+    events.transceiver_shutdown.return_value = True
     executor.async_transfer_manager = _ExactTransferManager(request)
     executor.kv_connector_manager = Mock()
     executor.kv_connector_manager.get_finished.return_value = []

@@ -1079,6 +1079,7 @@ def test_gen_status_poll_retains_owner_and_blocks_replacement() -> None:
     transceiver._wait_reqs = {}
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._dist = Mock(rank=0)
     transceiver.kv_transfer_poll_interval_ms = 1000
     transceiver._gen_consensus = lambda local_ids: list(local_ids)
     transceiver._gen_consensus_outcome = (

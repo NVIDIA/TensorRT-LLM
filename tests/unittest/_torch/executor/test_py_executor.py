@@ -362,13 +362,12 @@ class TestDisaggTerminationGuard:
         _end_transfer_and_maybe_terminate must then terminate it exactly once
         when the transfer completes (force_terminate_ctx_for_partial_reuse=False)."""
         req = Mock()
-        executor = types.SimpleNamespace(
-            kv_cache_transceiver=Mock(),
-            active_requests=[],  # already removed by _handle_responses
-            async_transfer_manager=Mock(),
-            force_terminate_ctx_for_partial_reuse=False,
-            _terminate_request=Mock(),
-        )
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.active_requests = []  # already removed by _handle_responses
+        executor.async_transfer_manager = Mock()
+        executor.force_terminate_ctx_for_partial_reuse = False
+        executor._terminate_request = Mock()
         executor.async_transfer_manager.end_transfer.return_value = True
 
         PyExecutor._end_transfer_and_maybe_terminate(executor, req)
@@ -381,13 +380,12 @@ class TestDisaggTerminationGuard:
         skip re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
         avoid a double free_resources (nvbug/5961736)."""
         req = Mock()
-        executor = types.SimpleNamespace(
-            kv_cache_transceiver=Mock(),
-            active_requests=[],  # already removed + terminated by early path
-            async_transfer_manager=Mock(),
-            force_terminate_ctx_for_partial_reuse=True,
-            _terminate_request=Mock(),
-        )
+        executor = object.__new__(PyExecutor)
+        executor.kv_cache_transceiver = Mock()
+        executor.active_requests = []  # already removed + terminated by early path
+        executor.async_transfer_manager = Mock()
+        executor.force_terminate_ctx_for_partial_reuse = True
+        executor._terminate_request = Mock()
         executor.async_transfer_manager.end_transfer.return_value = True
 
         PyExecutor._end_transfer_and_maybe_terminate(executor, req)

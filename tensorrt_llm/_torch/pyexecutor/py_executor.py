@@ -9000,11 +9000,16 @@ class PyExecutor:
                 continue
 
             terminal = self._get_transfer_terminal(request)
-            if (terminal is not None
-                    and self._has_async_transfer_owner(request)):
-                # A provider already owns the exact logical response, but a
-                # sibling lease still prevents final teardown. Do not let the
-                # ordinary response pass create a second terminal result.
+            native_cancel_can_publish = (
+                terminal is not None
+                and terminal.outcome == _TransferTerminalOutcome.CANCELLED
+                and self._requires_physical_transfer_drain())
+            if (terminal is not None and self._has_async_transfer_owner(request)
+                    and not native_cancel_can_publish):
+                # Legacy providers retain response creation until their final
+                # completion callback. For native cancellation, the logical
+                # result is already final, and the exact terminal/manager root
+                # can keep physical teardown gated after response publication.
                 new_active_requests.append(request)
                 continue
 
