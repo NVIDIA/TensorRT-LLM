@@ -91,6 +91,35 @@ def test_resolve_plan_adp_asymmetric():
     assert plan["ctx_cache_transceiver_config"]["backend"] == "NIXL"
 
 
+def test_spec_nextn_max_draft_len_fallback():
+    # Checked-in yamls spell the MTP depth either way (num_nextn_predict_layers
+    # is MTPDecodingConfig's deprecated alias of max_draft_len); both must
+    # resolve to the same spec-layer count.
+    cfg = _disagg_yaml(
+        ctx_extra={"speculative_config": {"decoding_type": "MTP", "max_draft_len": 3}},
+        gen_extra={
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "num_nextn_predict_layers": 3,
+                "max_draft_len": 3,
+            }
+        },
+    )
+    plan = pcfg.resolve_plan(cfg)
+    assert plan["ctx_num_nextn_predict_layers"] == 3
+    assert plan["gen_num_nextn_predict_layers"] == 3
+
+    # Non-MTP speculation never contributes MTP KV layers, even with a
+    # max_draft_len present.
+    cfg = _disagg_yaml(
+        ctx_extra={"speculative_config": {"decoding_type": "Eagle", "max_draft_len": 3}},
+        gen_extra={"speculative_config": {"decoding_type": "Eagle", "max_draft_len": 3}},
+    )
+    plan = pcfg.resolve_plan(cfg)
+    assert plan["ctx_num_nextn_predict_layers"] == 0
+    assert plan["gen_num_nextn_predict_layers"] == 0
+
+
 def test_request_lengths_clamped_by_buffer_and_cap():
     cfg = _disagg_yaml(benchmark={"mode": "e2e", "input_length": 131072})
     cfg["worker_config"]["ctx"]["cache_transceiver_config"]["max_tokens_in_buffer"] = 131104

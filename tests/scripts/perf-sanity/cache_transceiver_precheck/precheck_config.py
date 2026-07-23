@@ -101,10 +101,15 @@ def _parallel(side):
 
 def _spec_nextn(side):
     spec = side.get("speculative_config") or {}
-    decoding_type = str(spec.get("decoding_type", "")).upper()
-    if decoding_type == "MTP":
-        return int(spec.get("num_nextn_predict_layers", 0) or 0)
-    return 0
+    if str(spec.get("decoding_type", "")).upper() != "MTP":
+        return 0
+    # Test yamls spell the MTP depth either way: num_nextn_predict_layers is
+    # the deprecated alias MTPDecodingConfig remaps to max_draft_len, so both
+    # must resolve to the same KV-pool spec-layer count here.
+    n = spec.get("num_nextn_predict_layers")
+    if n is None:
+        n = spec.get("max_draft_len", 0)
+    return int(n or 0)
 
 
 def wireup_timeout_s(max_world):

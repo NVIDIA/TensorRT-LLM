@@ -112,14 +112,16 @@ run_cache_transceiver_precheck() {
     precheckDir="$testOutputDir/cache_transceiver_precheck"
     mkdir -p "$precheckDir/logs"
     # A reused work dir (Slurm requeue reruns this batch script with the same
-    # directories) may hold a previous run's rendezvous/status/csv files: stale
-    # addr files would point gen leaders at dead ports, stale status files would
-    # pollute the verdict aggregation below, and stale bandwidth CSVs (the
-    # Python transceiver's perf_<uuid>_<rank>.csv are per-run and appended)
+    # directories) may hold a previous run's rendezvous/status/csv/abort files:
+    # stale addr files would point gen leaders at dead ports, stale status files
+    # would pollute the verdict aggregation below, a stale precheck.abort would
+    # fail-fast-skip the whole rerun (a requeued job keeps its SLURM_JOB_ID, so
+    # the driver's job-id stamp cannot tell it apart), and stale bandwidth CSVs
+    # (the Python transceiver's perf_<uuid>_<rank>.csv are per-run and appended)
     # would make parse_python_bandwidth_gbps median over two runs' samples. The
     # driver also job-id-stamps addr files as a second line of defense.
     rm -f "$precheckDir"/rendezvous/*.addr "$precheckDir"/status/*.status \
-        "$precheckDir"/status/*.json 2>/dev/null || true
+        "$precheckDir"/status/*.json "$precheckDir"/precheck.abort 2>/dev/null || true
     rm -rf "$precheckDir"/csv 2>/dev/null || true
     precheckPids=()
     precheckNames=()
