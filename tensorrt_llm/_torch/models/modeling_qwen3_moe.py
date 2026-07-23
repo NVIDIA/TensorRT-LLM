@@ -82,6 +82,24 @@ class Qwen3Gate(nn.Module):
                 f"Unsupported routing method: {self.routing_method_type}")
 
 
+def _get_experts_quant_config(model_config, layer_idx):
+    """Per-layer routed-experts quant config for MIXED_PRECISION checkpoints. ModelOpt exports
+    per-expert keys (".../experts.0.gate_proj"); the fused MoE uses one format for the whole experts
+    block, so derive it from a representative routed expert. Falls back to the global config."""
+    qcd = getattr(model_config, "quant_config_dict", None)
+    if qcd is None:
+        return model_config.quant_config
+    base = f"model.layers.{layer_idx}.mlp.experts"
+    if base in qcd:
+        return qcd[base]
+    prefix = base + "."
+    for name, cfg in qcd.items():
+        if name.startswith(prefix) and name.endswith(
+            (".gate_proj", ".up_proj", ".down_proj")):
+            return cfg
+    return model_config.quant_config
+
+
 class Qwen3MoE(nn.Module):
 
     def __init__(
@@ -124,6 +142,7 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=_get_experts_quant_config(model_config, layer_idx),
             layer_idx=layer_idx,
             weight_loading_mode=self.weight_loading_mode,
         )
