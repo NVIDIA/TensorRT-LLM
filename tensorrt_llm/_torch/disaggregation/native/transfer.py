@@ -556,6 +556,10 @@ class Sender(SenderBase):
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
+        # Generation-first CTX requests may wait for peer metadata longer
+        # than the orphan TTL before a TxSession exists. A lease retains only
+        # their small RecvReqInfo map; no model, KV, or slot resource is held.
+        self._peer_request_leases: set[int] = set()
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._control = _ControlPlane("native-sender")
         self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
@@ -565,6 +569,11 @@ class Sender(SenderBase):
         # history: evicting it can let a delayed session write into memory the
         # receiver reclaimed after our ACK.
         self._pre_cancelled_rids: dict[int, None] = {}
+        # Authoritatively-aborted metadata-only requests cannot create a later
+        # local TxSession. Retain only bounded history to reject in-flight
+        # setup/REQUEST_DATA races; after eviction, orphan metadata remains
+        # harmless and is reclaimed by sweep_stale_req_infos().
+        self._metadata_cancelled_rids: OrderedDict[int, None] = OrderedDict()
         self._pre_cancelled_operations: dict[tuple[int, str, int], None] = {}
         self._cancelled_operation_tombstones: OrderedDict[tuple[int, str, int], None] = (
             OrderedDict()
@@ -641,6 +650,21 @@ class Sender(SenderBase):
         with self._peer_requests_lock:
             self._peer_requests.pop(unique_rid, None)
             self._peer_requests_timestamps.pop(unique_rid, None)
+            getattr(self, "_peer_request_leases", set()).discard(unique_rid)
+
+    def pin_peer_req_infos(self, unique_rid: int) -> None:
+        """Prevent metadata for a known local request from orphan eviction."""
+        with self._peer_requests_lock:
+            if (
+                unique_rid not in self._peer_request_leases
+                and len(self._peer_request_leases) >= _LIVE_PROTOCOL_STATE_LIMIT
+            ):
+                self._protocol_error = RuntimeError(
+                    "Sender metadata leases reached their safety limit; "
+                    "refusing to evict live generation-first requests"
+                )
+                raise self._protocol_error
+            self._peer_request_leases.add(unique_rid)
 
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
@@ -655,12 +679,17 @@ class Sender(SenderBase):
                 rid
                 for rid, ts in self._peer_requests_timestamps.items()
                 if now - ts > self._STALE_REQ_INFO_TTL_S
+                and rid not in getattr(self, "_peer_request_leases", set())
             ]
         if not stale_rids:
             return
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
-                if rid not in self._sessions and rid in self._peer_requests:
+                if (
+                    rid not in self._sessions
+                    and rid in self._peer_requests
+                    and rid not in getattr(self, "_peer_request_leases", set())
+                ):
                     self._peer_requests.pop(rid, None)
                     self._peer_requests_timestamps.pop(rid, None)
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
@@ -677,9 +706,13 @@ class Sender(SenderBase):
                 ) from self._protocol_error
             with self._sessions_lock:
                 self._sessions[unique_rid] = weakref.ref(tx_session)
-                if unique_rid in self._pre_cancelled_rids:
+                with self._peer_requests_lock:
+                    getattr(self, "_peer_request_leases", set()).discard(unique_rid)
+                metadata_cancelled_rids = getattr(self, "_metadata_cancelled_rids", OrderedDict())
+                if unique_rid in self._pre_cancelled_rids or unique_rid in metadata_cancelled_rids:
                     pre_cancel = True
                     self._pre_cancelled_rids.pop(unique_rid, None)
+                    metadata_cancelled_rids.pop(unique_rid, None)
                 self._closed_rids.pop(unique_rid, None)
         if pre_cancel:
             tx_session.cancel()
@@ -1728,6 +1761,7 @@ class Sender(SenderBase):
                     cancelled_before_request
                     or info.unique_rid in self._closed_rids
                     or info.unique_rid in self._pre_cancelled_rids
+                    or info.unique_rid in getattr(self, "_metadata_cancelled_rids", OrderedDict())
                 ):
                     cancelled_before_request = True
                 else:
@@ -1886,6 +1920,9 @@ class Sender(SenderBase):
         with self._peer_requests_lock:
             req_info_map = self._peer_requests.get(unique_rid)
             req_infos = list(req_info_map.values()) if req_info_map else []
+        self._send_cancel_to_req_infos(unique_rid, req_infos)
+
+    def _send_cancel_to_req_infos(self, unique_rid: int, req_infos: list[RecvReqInfo]) -> None:
         for req_info in req_infos:
             try:
                 peer_ri = self._registrar.get_peer_rank_info(
@@ -1908,6 +1945,35 @@ class Sender(SenderBase):
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
+
+    def cancel_peer_req_infos(self, unique_rid: int) -> bool:
+        """Retire a metadata-only send request before TxSession creation.
+
+        The caller may use this only after an authoritative readiness abort
+        guarantees that no later local TxSession can be created for the
+        process-unique request ID. A bounded tombstone makes in-flight
+        setup/REQUEST_DATA races fail closed. After that history expires, late
+        ingress can create only orphan metadata, which the stale sweep reclaims.
+        Returns False if a live TxSession has already assumed ownership.
+        """
+        with self._ingress_lock, self._sessions_lock:
+            session_ref = self._sessions.get(unique_rid)
+            if session_ref is not None and session_ref() is not None:
+                return False
+            self._sessions.pop(unique_rid, None)
+            metadata_cancelled_rids = getattr(self, "_metadata_cancelled_rids", None)
+            if metadata_cancelled_rids is None:
+                metadata_cancelled_rids = OrderedDict()
+                self._metadata_cancelled_rids = metadata_cancelled_rids
+            self._remember_tombstone(metadata_cancelled_rids, unique_rid)
+            self._remember_closed_unlocked(unique_rid)
+            with self._peer_requests_lock:
+                req_info_map = self._peer_requests.pop(unique_rid, None)
+                req_infos = list(req_info_map.values()) if req_info_map else []
+                self._peer_requests_timestamps.pop(unique_rid, None)
+                self._peer_request_leases.discard(unique_rid)
+        self._send_cancel_to_req_infos(unique_rid, req_infos)
+        return True
 
     def send_cancel_ack(
         self,
@@ -4422,6 +4488,12 @@ class TransferWorker:
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
         return self._sender.has_all_peer_req_infos(unique_rid)
+
+    def pin_peer_req_infos_for_send(self, unique_rid: int) -> None:
+        self._sender.pin_peer_req_infos(unique_rid)
+
+    def cancel_peer_req_infos_for_send(self, unique_rid: int) -> bool:
+        return self._sender.cancel_peer_req_infos(unique_rid)
 
     def sweep_stale_req_infos(self):
         """Forward to Sender to evict orphaned RecvReqInfo from ADP broadcast."""

@@ -125,6 +125,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._legacy_failed_sessions: set[int] = set()
         self._shutdown = False
         self._shutdown_complete = False
+        self._shutdown_metadata_leases_complete = False
         self._shutdown_sessions_complete = False
         self._shutdown_consensus_complete = False
         self._shutdown_worker_complete = False
@@ -211,6 +212,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._async_ready_prepared: Dict[tuple[int, int], LlmRequest] = {}
         self._async_ready_released: set[tuple[int, int]] = set()
         self._async_ready_activated: Dict[tuple[int, int], LlmRequest] = {}
+        self._async_ready_metadata_leases: set[int] = set()
         self._async_ready_acknowledged: set[tuple[int, int]] = set()
         self._async_ready_withdrawn: set[tuple[int, int]] = set()
         # READY_ABORT is intentionally broadcast to every participant, even
@@ -438,6 +440,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 logger.error(f"Python transceiver shutdown step {name!r} failed: {error}")
                 shutdown_errors.append((name, error))
 
+        def cancel_metadata_leases() -> None:
+            for rid in list(self._async_ready_metadata_leases):
+                run_shutdown_step(
+                    f"cancel metadata-only request {rid}",
+                    lambda rid=rid: self._cancel_async_ready_metadata_lease(rid),
+                )
+            self._shutdown_metadata_leases_complete = not bool(self._async_ready_metadata_leases)
+
+        if not getattr(self, "_shutdown_metadata_leases_complete", False):
+            cancel_metadata_leases()
+
         if not getattr(self, "_shutdown_sessions_complete", False):
             for rid, session in list(self._send_sessions.items()):
                 run_shutdown_step(f"close TxSession {rid}", session.close)
@@ -452,6 +465,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # final drain, so session close must not be retried after the
             # worker may already have stopped.
             self._shutdown_sessions_complete = True
+
+        # A stale transceiver-side metadata lease can race native TxSession
+        # creation. Closing sessions above transfers ownership back to the
+        # metadata-only cancellation path, so retry once synchronously before
+        # deciding that teardown is incomplete.
+        if not getattr(self, "_shutdown_metadata_leases_complete", False):
+            cancel_metadata_leases()
+            if not self._shutdown_metadata_leases_complete:
+                shutdown_errors.append(
+                    (
+                        "metadata-only requests",
+                        RuntimeError(
+                            "Python transceiver metadata-only request teardown is incomplete"
+                        ),
+                    )
+                )
 
         if not getattr(self, "_shutdown_consensus_complete", False):
             if self._async_consensus is None:
@@ -471,7 +500,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 if len(shutdown_errors) == errors_before_consensus:
                     self._shutdown_consensus_complete = True
 
-        if not getattr(self, "_shutdown_worker_complete", False):
+        if getattr(self, "_shutdown_metadata_leases_complete", False) and not getattr(
+            self, "_shutdown_worker_complete", False
+        ):
             try:
                 worker_result = self._transfer_worker.shutdown()
             except Exception as error:
@@ -499,7 +530,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     )
 
         self._shutdown_complete = (
-            getattr(self, "_shutdown_sessions_complete", False)
+            getattr(self, "_shutdown_metadata_leases_complete", False)
+            and getattr(self, "_shutdown_sessions_complete", False)
             and getattr(self, "_shutdown_consensus_complete", False)
             and getattr(self, "_shutdown_worker_complete", False)
         )
@@ -968,6 +1000,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 len(self._async_ready_finalized_without_request) > _MAX_RETIRED_CONSENSUS_REQUESTS
             ):
                 self._async_ready_finalized_without_request.popitem(last=False)
+        if not self._cancel_async_ready_metadata_lease(event.request_id):
+            raise RuntimeError(
+                "READY_ABORT_FINALIZE could not retire metadata-only "
+                f"ownership: request_id={event.request_id}, "
+                f"epoch={event.epoch}"
+            )
         self._finish_async_ready_epoch(event.request_id, event.epoch)
         self._record_async_transition("ready_abort_finalize", event.request_id, event.epoch)
 
@@ -1294,6 +1332,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             )
         if rid not in self._send_sessions:
             self._send_sessions[rid] = self._transfer_worker.create_tx_session(req)
+        self._async_ready_metadata_leases.discard(rid)
         # Publish request ownership before any native dispatch. A pre-cancelled
         # session, or a cancellation racing send/send_aux, must never leave a
         # session without its matching request bookkeeping.
@@ -1687,6 +1726,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             or any(key[0] == rid for key in self._async_ready_prepared)
             or any(key[0] == rid for key in self._async_ready_activated)
             or any(key[0] == rid for key in self._async_ready_aborted)
+            or rid in self._async_ready_metadata_leases
         )
 
     def cancel_request(self, req: LlmRequest) -> bool:
@@ -1822,7 +1862,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         if has_transferring:
             return False
-        return True
+        return self._cancel_async_ready_metadata_lease(rid)
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         # Keep this aligned with fields populated in respond_and_send_async().
@@ -1858,6 +1898,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Withdraw known-cancelled requests before readiness progression."""
         for req in requests:
             rid = get_unique_rid(req)
+            if (
+                getattr(self, "_async_peer_ready_consensus_enabled", False)
+                and rid not in self._send_sessions
+                and rid not in self._async_ready_metadata_leases
+            ):
+                # A request and its cancellation can materialize in the same
+                # executor fetch. Establish native metadata ownership without
+                # publishing READY so already-arrived or delayed REQUEST_DATA
+                # is retired by the normal metadata-only cancellation path.
+                self._transfer_worker.pin_peer_req_infos_for_send(rid)
+                self._async_ready_metadata_leases.add(rid)
             epoch = self._async_ready_published.get(rid, self._async_ready_epoch.get(rid, 0))
             setattr(req, _ASYNC_READY_CANCELLED_EPOCH_ATTR, epoch)
 
@@ -1924,6 +1975,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not getattr(self, "_async_peer_ready_consensus_enabled", False):
             return
         coordinator = cast(AsyncConsensusCoordinator, self._async_consensus)
+        activations = []
         for req in requests:
             rid = get_unique_rid(req)
             epoch = self._async_ready_published.get(rid)
@@ -1946,11 +1998,45 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     "scheduling rank selected readiness before READY_RELEASE: "
                     f"request_id={rid}, epoch={epoch}"
                 )
+            if prepared_req is not req:
+                raise RuntimeError(
+                    "readiness activation request object does not match "
+                    f"PREPARE ownership: request_id={rid}, epoch={epoch}"
+                )
+            activations.append((rid, epoch, key, prepared_req))
+        for rid, epoch, key, prepared_req in activations:
             prepared_req.state = LlmRequestState.CONTEXT_INIT
             del self._async_ready_prepared[key]
             self._async_ready_activated[key] = prepared_req
             coordinator.acknowledge_ready_activation(rid, epoch)
             self._record_async_transition("ready_activate", rid, epoch)
+
+    def supports_pre_active_context_requests(self) -> bool:
+        return bool(getattr(self, "_async_peer_ready_consensus_enabled", False))
+
+    def is_context_request_ready_for_activation(self, request: LlmRequest) -> bool:
+        if not self.supports_pre_active_context_requests():
+            return False
+        rid = get_unique_rid(request)
+        epoch = self._async_ready_published.get(rid)
+        if epoch is None:
+            return False
+        key = (rid, epoch)
+        if self._async_ready_prepared.get(key) is not request:
+            return False
+        # READY_RELEASE is delivered only to the scheduling rank. Followers
+        # receive the authoritative activation IDs on the existing PP
+        # schedule, but must still prove that the same request and epoch were
+        # prepared locally before materializing those IDs.
+        return self._dist.rank != 0 or key in self._async_ready_released
+
+    def _cancel_async_ready_metadata_lease(self, rid: int) -> bool:
+        if rid not in self._async_ready_metadata_leases:
+            return True
+        cancelled = self._transfer_worker.cancel_peer_req_infos_for_send(rid)
+        if cancelled:
+            self._async_ready_metadata_leases.discard(rid)
+        return cancelled
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
@@ -1965,6 +2051,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 if getattr(req, _ASYNC_READY_CANCELLED_EPOCH_ATTR, None) is not None:
                     self._wait_reqs.pop(rid, None)
                     continue
+                if getattr(self, "_async_peer_ready_consensus_enabled", False):
+                    self._transfer_worker.pin_peer_req_infos_for_send(rid)
+                    self._async_ready_metadata_leases.add(rid)
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
 

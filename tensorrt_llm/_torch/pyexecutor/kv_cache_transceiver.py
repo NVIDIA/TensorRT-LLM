@@ -232,6 +232,15 @@ class KvCacheTransceiver(ABC):
         """
         return
 
+    def supports_pre_active_context_requests(self) -> bool:
+        """Return whether generation-first CTX requests may wait outside active capacity."""
+        return False
+
+    def is_context_request_ready_for_activation(self,
+                                                request: LlmRequest) -> bool:
+        """Return whether rank zero may promote a pre-active CTX request."""
+        return False
+
     def take_context_cancelled_request_ids(self) -> List[int]:
         """Return newly quiescent CTX cancellations owned by the executor.
 

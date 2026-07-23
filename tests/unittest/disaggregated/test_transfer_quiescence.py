@@ -950,6 +950,168 @@ def test_sender_acknowledged_pre_cancel_is_not_count_evicted() -> None:
     assert 0 not in sender._pre_cancelled_rids
 
 
+def test_sender_metadata_lease_survives_stale_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender = object.__new__(Sender)
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    sender._peer_requests = {1: {0: object()}, 2: {0: object()}}
+    sender._peer_requests_timestamps = {1: 1.0, 2: 1.0}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_request_leases = {1}
+    monkeypatch.setattr(transfer_module.time, "monotonic", lambda: 1000.0)
+
+    sender.sweep_stale_req_infos()
+
+    assert 1 in sender._peer_requests
+    assert 1 in sender._peer_requests_timestamps
+    assert 2 not in sender._peer_requests
+    assert 2 not in sender._peer_requests_timestamps
+
+
+def test_sender_stale_sweep_rechecks_lease_before_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _GateLock:
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def __enter__(self):
+            self.entered.set()
+            assert self.release.wait(timeout=1)
+            return self
+
+        def __exit__(self, *_args) -> None:
+            pass
+
+    sender = object.__new__(Sender)
+    sessions_lock = _GateLock()
+    sender._sessions = {}
+    sender._sessions_lock = sessions_lock
+    sender._peer_requests = {3: {0: object()}}
+    sender._peer_requests_timestamps = {3: 1.0}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_request_leases = set()
+    sender._protocol_error = None
+    monkeypatch.setattr(transfer_module.time, "monotonic", lambda: 1000.0)
+
+    sweep = threading.Thread(target=sender.sweep_stale_req_infos)
+    sweep.start()
+    assert sessions_lock.entered.wait(timeout=1)
+    sender.pin_peer_req_infos(3)
+    sessions_lock.release.set()
+    sweep.join(timeout=1)
+
+    assert not sweep.is_alive()
+    assert 3 in sender._peer_requests
+    assert 3 in sender._peer_request_leases
+
+
+def test_sender_metadata_only_cancel_tombstones_and_notifies() -> None:
+    sender = object.__new__(Sender)
+    sender._ingress_lock = threading.Lock()
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    metadata = object()
+    sender._peer_requests = {4: {0: metadata}}
+    sender._peer_requests_timestamps = {4: 1.0}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_request_leases = {4}
+    sender._pre_cancelled_rids = {}
+    sender._metadata_cancelled_rids = OrderedDict()
+    sender._protocol_error = None
+    sender._closed_rids = OrderedDict()
+    notified = []
+    sender._send_cancel_to_req_infos = lambda request_id, req_infos: notified.append(
+        (request_id, req_infos)
+    )
+
+    assert sender.cancel_peer_req_infos(4)
+
+    assert list(sender._closed_rids) == [4]
+    assert 4 not in sender._pre_cancelled_rids
+    assert list(sender._metadata_cancelled_rids) == [4]
+    assert 4 not in sender._peer_requests
+    assert 4 not in sender._peer_requests_timestamps
+    assert 4 not in sender._peer_request_leases
+    assert notified == [(4, [metadata])]
+
+
+def test_sender_metadata_only_cancel_history_is_bounded_and_cancels_delayed_session() -> None:
+    sender = object.__new__(Sender)
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    sender._ingress_lock = threading.Lock()
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_request_leases = set()
+    sender._pre_cancelled_rids = {}
+    sender._metadata_cancelled_rids = OrderedDict()
+    sender._closed_rids = OrderedDict()
+    sender._protocol_error = None
+    sender._send_cancel_to_req_infos = lambda _request_id, _req_infos: None
+
+    original_limit = Sender._TOMBSTONE_LIMIT
+    Sender._TOMBSTONE_LIMIT = 3
+    try:
+        for request_id in range(5):
+            assert sender.cancel_peer_req_infos(request_id)
+    finally:
+        Sender._TOMBSTONE_LIMIT = original_limit
+
+    assert not sender._pre_cancelled_rids
+    assert list(sender._metadata_cancelled_rids) == [2, 3, 4]
+    assert sender._protocol_error is None
+
+    class _DelayedSession:
+        disagg_request_id = 4
+
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    session = _DelayedSession()
+    sender._shutdown = False
+    sender.setup_session(session)
+
+    assert session.cancelled
+    assert 4 not in sender._metadata_cancelled_rids
+
+
+def test_sender_session_creation_assumes_metadata_lease() -> None:
+    class _Session:
+        disagg_request_id = 5
+
+        def cancel(self) -> None:
+            raise AssertionError("session must not be pre-cancelled")
+
+    sender = object.__new__(Sender)
+    sender._ingress_lock = threading.Lock()
+    sender._shutdown = False
+    sender._protocol_error = None
+    sender._sessions = {}
+    sender._sessions_lock = threading.Lock()
+    sender._peer_requests = {}
+    sender._peer_requests_timestamps = {}
+    sender._peer_requests_lock = threading.Lock()
+    sender._peer_request_leases = {5}
+    sender._pre_cancelled_rids = {}
+    sender._pre_cancelled_operations = {}
+    sender._cancelled_operation_tombstones = OrderedDict()
+    sender._closed_rids = OrderedDict()
+    session = _Session()
+
+    sender.setup_session(session)
+
+    assert sender._sessions[5]() is session
+    assert 5 not in sender._peer_request_leases
+
+
 def test_sender_shutdown_gate_rejects_enqueue_after_worker_sentinels() -> None:
     sender = object.__new__(Sender)
     sender._shutdown = True

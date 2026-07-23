@@ -54,6 +54,9 @@ class _FakeTransferWorker:
     def __init__(self) -> None:
         self.sweep_count = 0
         self.ready_request_ids: set[int] = set()
+        self.pinned_request_ids: set[int] = set()
+        self.cancelled_peer_request_ids: set[int] = set()
+        self.cancel_peer_result = True
         self.tx_session = None
         self.rx_session = None
 
@@ -62,6 +65,15 @@ class _FakeTransferWorker:
 
     def has_all_peer_req_infos_for_send(self, rid: int) -> bool:
         return rid in self.ready_request_ids
+
+    def pin_peer_req_infos_for_send(self, rid: int) -> None:
+        self.pinned_request_ids.add(rid)
+
+    def cancel_peer_req_infos_for_send(self, rid: int) -> bool:
+        if self.cancel_peer_result:
+            self.pinned_request_ids.discard(rid)
+            self.cancelled_peer_request_ids.add(rid)
+        return self.cancel_peer_result
 
     def create_tx_session(self, _req):
         assert self.tx_session is not None
@@ -200,11 +212,13 @@ def _make_transceiver(
     transceiver._async_ready_published = {}
     transceiver._shutdown = False
     transceiver._shutdown_complete = False
+    transceiver._shutdown_metadata_leases_complete = False
     transceiver._shutdown_sessions_complete = False
     transceiver._shutdown_consensus_complete = False
     transceiver._shutdown_worker_complete = False
     transceiver._shutdown_worker_event = None
     transceiver._shutdown_deferred_errors = []
+    transceiver._async_ready_metadata_leases = set()
     transceiver._async_ready_idle_wakeup = threading.Event()
     transceiver._sender_future_timeout_ms = 123
     transceiver.kv_transfer_poll_interval_ms = 10
@@ -257,6 +271,7 @@ def _enable_fake_async_consensus(
     transceiver._async_ready_withdrawn = set()
     transceiver._async_ready_aborted = {}
     transceiver._async_ready_finalized_without_request = OrderedDict()
+    transceiver._async_ready_metadata_leases = set()
     transceiver._async_consensus_counters = defaultdict(int)
     transceiver._wait_reqs = {}
     transceiver._recv_sessions = {}
@@ -598,6 +613,26 @@ def test_shutdown_retries_only_incomplete_consensus_teardown() -> None:
 
     transceiver.shutdown()
     assert transceiver._async_consensus.shutdown.call_count == 2
+
+
+def test_shutdown_retries_metadata_lease_before_stopping_worker() -> None:
+    transceiver = _make_transceiver({})
+    transceiver._async_consensus = None
+    transceiver._async_ready_metadata_leases.add(46)
+    transceiver._transfer_worker.cancel_peer_result = False
+    transceiver._transfer_worker.shutdown = Mock(return_value=None)
+
+    with pytest.raises(RuntimeError, match="metadata-only request teardown"):
+        transceiver.shutdown()
+    assert not transceiver._shutdown_metadata_leases_complete
+    assert not transceiver._shutdown_complete
+    transceiver._transfer_worker.shutdown.assert_not_called()
+
+    transceiver._transfer_worker.cancel_peer_result = True
+    assert transceiver.shutdown() is None
+    assert transceiver._shutdown_metadata_leases_complete
+    assert transceiver._shutdown_complete
+    transceiver._transfer_worker.shutdown.assert_called_once_with()
 
 
 def test_shutdown_propagates_deferred_worker_completion_before_marking_complete() -> None:
@@ -1454,6 +1489,19 @@ def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None
     transceiver._ctx_consensus.assert_not_called()
 
 
+def test_async_peer_ready_pins_metadata_while_request_is_pre_active() -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=30)
+
+    transceiver.prepare_context_requests([req])
+
+    assert transceiver.supports_pre_active_context_requests()
+    assert transceiver._transfer_worker.pinned_request_ids == {30}
+    assert transceiver._async_ready_metadata_leases == {30}
+    assert transceiver.owns_request(req)
+
+
 def test_async_peer_ready_activates_only_from_authoritative_schedule() -> None:
     transceiver = _make_transceiver({})
     coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
@@ -1477,6 +1525,7 @@ def test_async_peer_ready_activates_only_from_authoritative_schedule() -> None:
     assert req.state is None
     assert 31 not in transceiver._wait_reqs
     assert coordinator.ready_acks == [(31, 0)]
+    assert not transceiver.is_context_request_ready_for_activation(req)
 
     # Omitting the request from rank zero's schedule leaves the lease hidden.
     transceiver.activate_context_requests_for_schedule([])
@@ -1494,6 +1543,7 @@ def test_async_peer_ready_activates_only_from_authoritative_schedule() -> None:
     transceiver._progress_async_consensus()
     assert req.state == LlmRequestState.CONTEXT_INIT
     assert (31, 0) in transceiver._async_ready_prepared
+    assert transceiver.is_context_request_ready_for_activation(req)
 
     transceiver.activate_context_requests_for_schedule([req])
     assert coordinator.ready_activation_acks == [(31, 0)]
@@ -1512,6 +1562,82 @@ def test_async_peer_ready_activates_only_from_authoritative_schedule() -> None:
     transceiver._progress_async_consensus()
     assert not transceiver._async_ready_activated
     assert 31 not in transceiver._async_ready_published
+
+
+def test_async_peer_ready_activation_validates_batch_atomically() -> None:
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    first = _FakeRequest(request_id=41)
+    second = _FakeRequest(request_id=42)
+    wrong_second = _FakeRequest(request_id=42)
+    transceiver._async_ready_published.update({41: 0, 42: 0})
+    transceiver._async_ready_prepared.update(
+        {
+            (41, 0): first,
+            (42, 0): second,
+        }
+    )
+    transceiver._async_ready_released.update({(41, 0), (42, 0)})
+
+    with pytest.raises(RuntimeError, match="does not match PREPARE"):
+        transceiver.activate_context_requests_for_schedule([first, wrong_second])
+
+    assert transceiver._async_ready_prepared == {
+        (41, 0): first,
+        (42, 0): second,
+    }
+    assert transceiver._async_ready_activated == {}
+    assert coordinator.ready_activation_acks == []
+
+
+def test_async_peer_ready_completion_retains_metadata_ownership_until_session() -> None:
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=43)
+    transceiver._transfer_worker.ready_request_ids.add(43)
+    transceiver.prepare_context_requests([req])
+    coordinator.events.extend(
+        [
+            ConsensusEvent(ConsensusEventKind.READY_PREPARE, 43, 0, ConsensusOutcome.READY),
+            ConsensusEvent(ConsensusEventKind.READY_RELEASE, 43, 0, ConsensusOutcome.READY),
+        ]
+    )
+    transceiver._progress_async_consensus()
+    transceiver.activate_context_requests_for_schedule([req])
+    coordinator.events.append(
+        ConsensusEvent(ConsensusEventKind.READY_COMPLETE, 43, 0, ConsensusOutcome.READY)
+    )
+    transceiver._progress_async_consensus()
+
+    assert transceiver.owns_request(req)
+    assert transceiver.cancel_request(req)
+    assert not transceiver.owns_request(req)
+    assert 43 in transceiver._transfer_worker.cancelled_peer_request_ids
+
+
+def test_async_peer_ready_metadata_ownership_transfers_to_tx_session() -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=44)
+    session = Mock()
+    transceiver._transfer_worker.tx_session = session
+    transceiver._async_ready_metadata_leases.add(44)
+
+    assert transceiver._get_or_create_send_session(req) is session
+    assert 44 not in transceiver._async_ready_metadata_leases
+    assert transceiver._send_sessions[44] is session
+
+
+def test_async_peer_ready_cancel_retains_ownership_if_native_handoff_won() -> None:
+    transceiver = _make_transceiver({})
+    _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=45)
+    transceiver._async_ready_metadata_leases.add(45)
+    transceiver._transfer_worker.cancel_peer_result = False
+
+    assert not transceiver.cancel_request(req)
+    assert transceiver.owns_request(req)
+    assert 45 in transceiver._async_ready_metadata_leases
 
 
 def test_async_peer_ready_wait_uses_bounded_interruptible_backoff(monkeypatch) -> None:
@@ -1607,6 +1733,8 @@ def test_async_peer_ready_follower_stays_hidden_until_schedule_arrives() -> None
     transceiver._progress_async_consensus()
 
     assert req.state is None
+    assert transceiver.is_context_request_ready_for_activation(req)
+    assert not transceiver.is_context_request_ready_for_activation(_FakeRequest(request_id=99))
     transceiver.activate_context_requests_for_schedule([])
     assert req.state is None
 
@@ -1647,6 +1775,8 @@ def test_async_peer_ready_cancel_withdraws_and_tombstones_request() -> None:
     )
     transceiver._progress_async_consensus()
     assert transceiver.cancel_request(req)
+    assert 32 in transceiver._transfer_worker.cancelled_peer_request_ids
+    assert 32 not in transceiver._async_ready_metadata_leases
 
     transceiver.prepare_context_requests([req])
     assert coordinator.ready_votes == [(32, 0)]
@@ -1786,6 +1916,24 @@ def test_known_cancel_withdraws_before_readiness_poll_or_vote() -> None:
     # cancellation marker and cannot publish a contradictory READY vote.
     transceiver.prepare_context_requests([req])
     assert coordinator.ready_votes == []
+
+
+def test_cancel_before_readiness_tracks_and_retires_native_metadata() -> None:
+    transceiver = _make_transceiver({})
+    coordinator = _enable_fake_async_consensus(transceiver, peer_ready=True)
+    req = _FakeRequest(request_id=42)
+
+    transceiver.exclude_context_requests_from_readiness([req])
+
+    assert coordinator.ready_votes == []
+    assert coordinator.ready_withdrawals == []
+    assert 42 in transceiver._transfer_worker.pinned_request_ids
+    assert 42 in transceiver._async_ready_metadata_leases
+    assert transceiver.owns_request(req)
+
+    assert transceiver.cancel_request(req)
+    assert 42 in transceiver._transfer_worker.cancelled_peer_request_ids
+    assert 42 not in transceiver._async_ready_metadata_leases
 
 
 def test_default_off_cancel_removes_existing_legacy_readiness_waiter() -> None:

@@ -939,6 +939,10 @@ class PyExecutor:
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
             waiting_queue_policy)
+        self._waiting_queue_policy = waiting_queue_policy
+        self._gen_first_pre_active_requests: Dict[int, LlmRequest] = {}
+        self._gen_first_pre_active_order: Dict[int, int] = {}
+        self._next_gen_first_pre_active_order = 0
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -1735,7 +1739,8 @@ class PyExecutor:
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0
+            len(self.waiting_queue) == 0 and \
+            len(getattr(self, "_gen_first_pre_active_requests", {})) == 0
 
     @contextmanager
     def _profiler(self):
@@ -2565,6 +2570,8 @@ class PyExecutor:
         is_dp_broadcast = self.dist.tp_size > 1 and self.enable_attention_dp
         if self.dist.rank == 0 or (self.dist.is_first_pp_rank
                                    and is_dp_broadcast):
+            activated_context_request_ids = (
+                self._activate_ready_pre_active_context_requests())
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
             if self.kv_cache_transceiver:
@@ -2572,8 +2579,11 @@ class PyExecutor:
                     self._apply_disagg_transfer_admission(
                         fitting_disagg_gen_init_requests))
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
-                scheduled_batch, fitting_disagg_gen_init_requests,
-                num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
+                scheduled_batch,
+                fitting_disagg_gen_init_requests,
+                num_fitting_reqs,
+                wait_for_disagg_gen_transfer_progress,
+                activated_context_request_ids=activated_context_request_ids)
 
         # Broadcast within first tp+cp group before send/recv chain to other tp+cp groups
         if self.dist.is_first_pp_rank:
@@ -2601,6 +2611,10 @@ class PyExecutor:
                     microbatch_id] = self.dist.isend_object(
                         serializable_schedule, self.dist.next_pp_rank,
                         PPCommTag.SCHEDULE_RESULT)
+
+        if scheduled_batch is None:
+            self._activate_pre_active_context_requests(
+                serializable_schedule.activated_context_request_ids)
 
         if scheduled_batch is None:
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
@@ -2687,6 +2701,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_disagg_gen_transfer_status()
+                    self._handle_pre_active_canceled_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
@@ -4408,15 +4423,20 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
-        if pending.control_requires_drain and (len(self.active_requests) != 0
-                                               or len(self.waiting_queue) != 0):
+        if pending.control_requires_drain and (
+                len(self.active_requests) != 0
+                or len(self.waiting_queue) != 0 or len(
+                    getattr(self, "_gen_first_pre_active_requests", {})) != 0):
             # drain=True: keep the sentinel parked until the engine drains.
             return
 
-        logger.debug(f"[control_action] firing control request "
-                     f"drain={pending.control_requires_drain} "
-                     f"active_requests={len(self.active_requests)} "
-                     f"waiting_queue={len(self.waiting_queue)}")
+        logger.debug(
+            f"[control_action] firing control request "
+            f"drain={pending.control_requires_drain} "
+            f"active_requests={len(self.active_requests)} "
+            f"waiting_queue={len(self.waiting_queue)} "
+            "pre_active_context_requests="
+            f"{len(getattr(self, '_gen_first_pre_active_requests', {}))}")
         # Quiesce the device before the action mutates GPU state. Under the
         # overlap scheduler a previous batch's forward/sample kernels may still
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
@@ -5062,7 +5082,8 @@ class PyExecutor:
             return
 
         # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        idle = ((total_num_active_requests == 0) and len(waiting_queue) == 0
+                and not getattr(self, "_gen_first_pre_active_requests", {}))
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -5133,8 +5154,8 @@ class PyExecutor:
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
-            self, waiting_queue: WaitingQueue,
-            active_requests: List[LlmRequest]) -> List[LlmRequest]:
+        self, waiting_queue: WaitingQueue, active_requests: List[LlmRequest]
+    ) -> Tuple[List[LlmRequest], List[LlmRequest]]:
         """Fetch new requests and return LlmRequests ready for execution."""
         # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
@@ -5178,6 +5199,8 @@ class PyExecutor:
         self._fetch_and_enqueue_requests(waiting_queue,
                                          total_num_active_requests)
 
+        pre_active_items = self._take_pre_active_context_items(waiting_queue)
+
         # 3. Pop requests from waiting queue
         new_requests = self._pop_from_waiting_queue(
             waiting_queue, total_num_active_requests,
@@ -5185,10 +5208,11 @@ class PyExecutor:
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
-            self._update_new_active_requests_queue_latency(new_requests)
+            self._update_new_active_requests_queue_latency(new_requests +
+                                                           pre_active_items)
 
         # 5. Update total fetch counter (used by benchmark disagg gating)
-        self.num_fetch_requests += len(new_requests)
+        self.num_fetch_requests += len(new_requests) + len(pre_active_items)
 
         # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
@@ -5213,12 +5237,110 @@ class PyExecutor:
             new_requests = new_requests_cur_rank
 
         # 7. Merge requests
-        return merge_requests(new_requests,
-                              cp_config=self.dist.cp_config,
-                              cp_rank=self.dist.cp_rank,
-                              cp_size=self.dist.cp_size,
-                              exclude_last_generation_logits=self.
-                              _should_exclude_last_generation_logits())
+        merge_kwargs = dict(cp_config=self.dist.cp_config,
+                            cp_rank=self.dist.cp_rank,
+                            cp_size=self.dist.cp_size,
+                            exclude_last_generation_logits=self.
+                            _should_exclude_last_generation_logits())
+        return (merge_requests(new_requests, **merge_kwargs),
+                merge_requests(pre_active_items, **merge_kwargs))
+
+    def _supports_pre_active_context_requests(self) -> bool:
+        return (
+            self.kv_cache_transceiver is not None and
+            self.kv_cache_transceiver.supports_pre_active_context_requests()
+            is True)
+
+    @staticmethod
+    def _is_pre_active_context_item(item: RequestQueueItem) -> bool:
+        request = item.request
+        params = getattr(request, "py_disaggregated_params", None)
+        # One queue item can materialize several child requests that do not
+        # have independent peer-metadata identities. Keep that uncommon path
+        # on the legacy capacity-accounted fallback until child activation can
+        # be represented atomically by the PP schedule.
+        return (
+            item.is_normal_request and request is not None
+            and not item.child_req_ids
+            and request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST)
+
+    def _take_pre_active_context_items(
+            self, waiting_queue: WaitingQueue) -> List[RequestQueueItem]:
+        """Move qualified metadata waiters out of compute-active accounting."""
+        if not self._supports_pre_active_context_requests():
+            return []
+        items = [
+            item for item in waiting_queue
+            if self._is_pre_active_context_item(item)
+        ]
+        waiting_queue.remove_by_ids({item.id for item in items})
+        return items
+
+    def _pre_active_context_order_key(self, request: LlmRequest) -> Tuple:
+        request_id = request.request_id
+        insertion_order = self._gen_first_pre_active_order[request_id]
+        if self._waiting_queue_policy == WaitingQueuePolicy.PRIORITY:
+            return (-request.priority, insertion_order)
+        return (insertion_order, )
+
+    def _select_ready_pre_active_context_request_ids(self) -> List[int]:
+        if not self._supports_pre_active_context_requests():
+            return []
+        free_capacity = self.max_num_active_requests - len(self.active_requests)
+        if free_capacity <= 0:
+            return []
+        ordered_requests = sorted(self._gen_first_pre_active_requests.values(),
+                                  key=self._pre_active_context_order_key)
+        return [
+            request.request_id for request in ordered_requests
+            if self.kv_cache_transceiver.
+            is_context_request_ready_for_activation(request)
+        ][:free_capacity]
+
+    def _activate_pre_active_context_requests(self,
+                                              request_ids: List[int]) -> None:
+        if not request_ids:
+            return
+        if len(set(request_ids)) != len(request_ids):
+            raise RuntimeError("duplicate pre-active context activation ID")
+        if len(self.active_requests) + len(
+                request_ids) > self.max_num_active_requests:
+            raise RuntimeError("pre-active context activation exceeds capacity")
+        missing_ids = [
+            request_id for request_id in request_ids
+            if request_id not in self._gen_first_pre_active_requests
+        ]
+        if missing_ids:
+            raise RuntimeError(
+                "PP activation selected unknown pre-active context requests: "
+                f"{missing_ids}")
+        requests = [
+            self._gen_first_pre_active_requests[request_id]
+            for request_id in request_ids
+        ]
+        unprepared_ids = [
+            request.request_id for request in requests
+            if not self.kv_cache_transceiver.
+            is_context_request_ready_for_activation(request)
+        ]
+        if unprepared_ids:
+            raise RuntimeError(
+                "PP activation selected context requests without matching "
+                f"readiness state: {unprepared_ids}")
+        self.kv_cache_transceiver.activate_context_requests_for_schedule(
+            requests)
+        for request in requests:
+            request_id = request.request_id
+            del self._gen_first_pre_active_requests[request_id]
+            del self._gen_first_pre_active_order[request_id]
+            self.active_requests.append(request)
+
+    def _activate_ready_pre_active_context_requests(self) -> List[int]:
+        request_ids = self._select_ready_pre_active_context_request_ids()
+        self._activate_pre_active_context_requests(request_ids)
+        return request_ids
 
     def _handle_special_queue_items(
             self,
@@ -5257,7 +5379,9 @@ class PyExecutor:
 
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
-        def _respond_if_invalid(request: LlmRequest) -> bool:
+        def _respond_if_invalid(request: LlmRequest,
+                                *,
+                                pre_active: bool = False) -> bool:
             """Immediately fail invalid request.
 
             Return True if invalid request was encountered and
@@ -5267,21 +5391,61 @@ class PyExecutor:
                 self._validate_request(request)
                 return False
             except Exception as e:
-                self._handle_errors(str(e),
-                                    requests=[request],
-                                    charge_budget=False)
+                if pre_active:
+                    self._handle_pre_active_request_error(request, str(e))
+                else:
+                    self._handle_errors(str(e),
+                                        requests=[request],
+                                        charge_budget=False)
                 return True
 
-        new_requests_cur_rank = self._fetch_new_requests(
+        new_requests_cur_rank, new_pre_active_requests = self._fetch_new_requests(
             self.waiting_queue, self.active_requests)
 
         validated_requests = [
             request for request in new_requests_cur_rank
             if not _respond_if_invalid(request)
         ]
+        validated_pre_active_requests = [
+            request for request in new_pre_active_requests
+            if not _respond_if_invalid(request, pre_active=True)
+        ]
 
         self.active_requests.extend(validated_requests)
-        return validated_requests
+        for request in validated_pre_active_requests:
+            request_id = request.request_id
+            if request_id in self._gen_first_pre_active_requests:
+                raise RuntimeError(
+                    "duplicate generation-first pre-active request: "
+                    f"{request_id}")
+            self._gen_first_pre_active_requests[request_id] = request
+            self._gen_first_pre_active_order[
+                request_id] = self._next_gen_first_pre_active_order
+            self._next_gen_first_pre_active_order += 1
+        canceled_request_ids = set(self.canceled_req_ids)
+        canceled_pre_active_requests = [
+            request for request in validated_pre_active_requests
+            if self._request_vote_id(request) in canceled_request_ids
+        ]
+        if canceled_pre_active_requests:
+            # Request and cancellation queue items can arrive in one fetch.
+            # Keep those requests on the no-resource lane, but establish the
+            # cancellation marker before readiness can publish a vote.
+            self.kv_cache_transceiver.exclude_context_requests_from_readiness(
+                canceled_pre_active_requests)
+        pending_pre_active_requests = [
+            request for request in validated_pre_active_requests
+            if self._request_vote_id(request) not in canceled_request_ids
+        ]
+        if pending_pre_active_requests:
+            self.kv_cache_transceiver.prepare_context_requests(
+                pending_pre_active_requests)
+        # Preserve the established per-iteration admission accounting: before
+        # this lane existed, generation-first metadata waiters entered
+        # active_requests and were counted as newly admitted here. They no
+        # longer consume compute capacity, but they have left the request queue
+        # and their queue-latency start time was consumed above.
+        return validated_requests + validated_pre_active_requests
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -5785,7 +5949,9 @@ class PyExecutor:
             return
         canceled_request_ids = set(self.canceled_req_ids)
         canceled_gen_first_ctx_requests = [
-            req for req in self.active_requests
+            req for req in (
+                *self.active_requests,
+                *getattr(self, "_gen_first_pre_active_requests", {}).values())
             if req.is_context_only_request and req.py_disaggregated_params.
             schedule_style == DisaggScheduleStyle.GENERATION_FIRST
             and self._request_vote_id(req) in canceled_request_ids
@@ -6785,8 +6951,12 @@ class PyExecutor:
                         f"Drained {len(waiting_responses)} queued requests "
                         "on fatal error")
 
-        failed_requests = (list(self.active_requests)
-                           if requests is None else requests)
+        pre_active_request_ids = set(
+            getattr(self, "_gen_first_pre_active_requests", {}))
+        failed_requests = (
+            (list(self.active_requests) +
+             list(getattr(self, "_gen_first_pre_active_requests", {}).values()))
+            if requests is None else requests)
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -6796,14 +6966,25 @@ class PyExecutor:
                 client_id=request.py_client_id)
         if requests is None:
             self.active_requests.clear()
+            getattr(self, "_gen_first_pre_active_requests", {}).clear()
+            getattr(self, "_gen_first_pre_active_order", {}).clear()
         else:
             self.active_requests = [
                 request for request in self.active_requests
                 if request not in requests
             ]
+            for request in requests:
+                request_id = request.request_id
+                getattr(self, "_gen_first_pre_active_requests",
+                        {}).pop(request_id, None)
+                getattr(self, "_gen_first_pre_active_order",
+                        {}).pop(request_id, None)
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
-            self._terminate_request(request)
+            if request.request_id in pre_active_request_ids:
+                self._release_pre_active_request_bookkeeping(request)
+            else:
+                self._terminate_request(request)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
@@ -6831,6 +7012,33 @@ class PyExecutor:
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+
+    def _release_pre_active_request_bookkeeping(self,
+                                                request: LlmRequest) -> None:
+        """Release bookkeeping for a request that never owned model resources."""
+        getattr(self, "_gen_first_pre_active_requests",
+                {}).pop(request.request_id, None)
+        getattr(self, "_gen_first_pre_active_order",
+                {}).pop(request.request_id, None)
+        self._prefetched_request_ids.discard(request.py_request_id)
+        self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
+        self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
+        getattr(self, "_disagg_acknowledged_ctx_cancel_legs",
+                set()).discard(request.py_request_id)
+        getattr(self, "_disagg_peer_cancelled_ctx_ids",
+                set()).discard(request.py_request_id)
+        if self.gather_all_responses or self.dist.rank == 0:
+            self.result_wait_queues.pop(request.py_request_id, None)
+
+    def _handle_pre_active_request_error(self, request: LlmRequest,
+                                         error_msg: str) -> None:
+        """Fail a request that was validated before resource activation."""
+        request.state = LlmRequestState.GENERATION_COMPLETE
+        response = LlmResponse(request_id=request.py_request_id,
+                               error_msg=error_msg,
+                               client_id=request.py_client_id)
+        self._enqueue_responses([(request.py_request_id, response)])
+        self._release_pre_active_request_bookkeeping(request)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -6922,7 +7130,19 @@ class PyExecutor:
         # Remove canceled requests from the waiting queue
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
-        still_pending_canceled_ids = []
+        pre_active_vote_ids = {
+            request.py_request_id
+            if not request.is_child else request.parent_request_id
+            for request in getattr(self, "_gen_first_pre_active_requests",
+                                   {}).values()
+        }
+        still_pending_canceled_ids = [
+            request_id for request_id in self.canceled_req_ids
+            if request_id in pre_active_vote_ids
+        ]
+        # Metadata-only pre-active requests are drained by
+        # _handle_pre_active_canceled_requests without touching model resource
+        # managers. Never route them through this active-request cleanup path.
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
@@ -6936,11 +7156,67 @@ class PyExecutor:
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
             else:
-                still_pending_canceled_ids.append(req_id)
+                if req_id not in still_pending_canceled_ids:
+                    still_pending_canceled_ids.append(req_id)
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
+
+    def _handle_pre_active_canceled_requests(self) -> None:
+        """Drain metadata-only CTX cancellation without an executed batch.
+
+        PP normally processes cancellation while retiring an executed batch.
+        A generation-first metadata waiter intentionally owns no executable
+        batch or model resource, so that callback may never run. Retire only
+        pre-active requests here; ordinary active cancellation keeps its
+        existing batch-synchronized lifecycle.
+        """
+        pre_active_requests = getattr(self, "_gen_first_pre_active_requests",
+                                      {})
+        if not pre_active_requests:
+            return
+        if self.is_shutdown:
+            queued_cancellations = set(self.canceled_req_ids)
+            for request in pre_active_requests.values():
+                request_id = (request.py_request_id if not request.is_child else
+                              request.parent_request_id)
+                if request_id not in queued_cancellations:
+                    self.canceled_req_ids.append(request_id)
+                    queued_cancellations.add(request_id)
+        if not self.canceled_req_ids:
+            return
+        canceled_ids = set(self.canceled_req_ids)
+        completed_ids = set()
+        responses = []
+        for request in list(pre_active_requests.values()):
+            request_id = (request.py_request_id if not request.is_child else
+                          request.parent_request_id)
+            if request_id not in canceled_ids:
+                continue
+            if not self._try_cancel_request(request):
+                continue
+
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            request.draft_tokens = request.py_draft_tokens or []
+            response = request.create_response(False, self.dist.rank)
+            if response is not None:
+                response.result.cached_tokens = request.cached_tokens
+                self._maybe_attach_ctx_usage(request, response)
+                responses.append((request.py_request_id, response))
+
+            self._release_pre_active_request_bookkeeping(request)
+            completed_ids.add(request_id)
+
+        if responses:
+            self._enqueue_responses(responses)
+        if completed_ids:
+            self.canceled_req_ids[:] = [
+                request_id for request_id in self.canceled_req_ids
+                if request_id not in completed_ids
+            ]
 
     @nvtx_range("_enqueue_responses")
     def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
