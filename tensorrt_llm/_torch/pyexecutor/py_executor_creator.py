@@ -47,6 +47,8 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .trace_log_utils import (log_mem_history, log_mem_snapshot,
+                              reset_mem_history)
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
@@ -56,6 +58,8 @@ _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
+_STARTUP_FREE_MEMORY_WARN_RATIO = 0.9
+_STARTUP_USED_MEMORY_WARN_BYTES = 2 * (1 << 30)
 
 
 class _ExecutorMemoryMonitor:
@@ -68,12 +72,37 @@ class _ExecutorMemoryMonitor:
         free_gpu_memory_bytes_post: int
 
     def __init__(self):
-        self._total_gpu_memory_bytes = torch.cuda.mem_get_info()[1]
+        reset_mem_history()
+        free_gpu_memory_bytes, self._total_gpu_memory_bytes = torch.cuda.mem_get_info(
+        )
         self._samples: list["_ExecutorMemoryMonitor._GpuMemoryUsageSample"] = []
+        self._warn_if_gpu_not_empty(free_gpu_memory_bytes)
+        log_mem_snapshot("startup/baseline")
 
     @staticmethod
     def _bytes_to_gib(bytes: int) -> float:
         return bytes / (1024)**3
+
+    def _warn_if_gpu_not_empty(self, free_gpu_memory_bytes: int) -> None:
+        total = self._total_gpu_memory_bytes
+        if total <= 0:
+            return
+        used = total - free_gpu_memory_bytes
+        if (free_gpu_memory_bytes / total >= _STARTUP_FREE_MEMORY_WARN_RATIO
+                or used < _STARTUP_USED_MEMORY_WARN_BYTES):
+            return
+
+        try:
+            process_info = " ".join(
+                torch.cuda.list_gpu_processes().splitlines())
+        except Exception as error:
+            process_info = f"unavailable ({type(error).__name__})"
+        logger.warning(
+            "GPU is not empty at executor startup: "
+            f"{self._bytes_to_gib(free_gpu_memory_bytes):.2f} GiB free of "
+            f"{self._bytes_to_gib(total):.2f} GiB total "
+            f"({self._bytes_to_gib(used):.2f} GiB already used). "
+            f"Visible GPU processes: {process_info}")
 
     memory_type_friendly_names = {
         ExecutorMemoryType.SAMPLER:
@@ -176,9 +205,12 @@ class _ExecutorMemoryMonitor:
                 free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre)
             if explanation is None:
                 raise  # not an OOM
+            log_mem_snapshot(f"oom/{current_stage.value}", force=True)
+            log_mem_history(f"oom/{current_stage.value}")
             raise RuntimeError(explanation) from e
         else:
             free_gpu_memory_bytes_post = torch.cuda.mem_get_info()[0]
+            log_mem_snapshot(f"stage/{current_stage.value}")
             self._samples.append(
                 self._GpuMemoryUsageSample(
                     creation_stage=current_stage,
