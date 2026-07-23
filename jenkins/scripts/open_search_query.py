@@ -31,9 +31,24 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 from open_search_db import OpenSearchDB
+
+# Lucene/OpenSearch regexp metacharacters to escape when embedding a literal.
+_REGEXP_SPECIAL = re.compile(r'([.?+*|{}\[\]()"\\#@&<>~])')
+
+
+def buildStageNameCondition(stageName):
+    """Match a stage and all its shards: "<base>", "<base>-<n>", "<base>-<n>-cbts".
+
+    Any trailing shard suffix on the input is stripped first, so passing any
+    single shard (e.g. "xxx-3") returns all sibling shards for the base "xxx".
+    """
+    base = re.sub(r"-[0-9]+(-cbts)?$", "", stageName)
+    escaped = _REGEXP_SPECIAL.sub(r"\\\1", base)
+    return {"regexp": {"s_stage_name": f"{escaped}(-[0-9]+(-cbts)?)?"}}
 
 
 def queryJobEvents(commitID="", stageName="", onlySuccess=True):
@@ -51,7 +66,7 @@ def queryJobEvents(commitID="", stageName="", onlySuccess=True):
     if commitID:
         mustConditions.append({"term": {"s_trigger_mr_commit": commitID}})
     if stageName:
-        mustConditions.append({"term": {"s_stage_name": stageName}})
+        mustConditions.append(buildStageNameCondition(stageName))
     if onlySuccess:
         mustConditions.append({"term": {"s_status": "PASSED"}})
 
