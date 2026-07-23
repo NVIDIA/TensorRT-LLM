@@ -29,11 +29,7 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionBackend,
-    AttentionForwardArgs,
-    SparsePrediction,
-)
+from tensorrt_llm._torch.attention_backend.interface import AttentionBackend, AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
 )
@@ -42,10 +38,10 @@ from tensorrt_llm._torch.attention_backend.sparse.hooks import (
     SparseAttnHooks,
     _get_sparse_attn_hooks_for_algorithm,
     get_sparse_attn_hooks,
+    prepare_sparse_runtime_params,
 )
 from tensorrt_llm._torch.attention_backend.sparse.hooks import __all__ as SPARSE_ATTN_HOOK_API
-from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams
-from tensorrt_llm._torch.attention_backend.sparse.prediction import prepare_sparse_prediction
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams, SparseRuntimeParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.attention import Attention
@@ -183,7 +179,7 @@ class TestSparseAttention(TrtllmAttention):
         return self._sparse_attn_indices, self._sparse_attn_offsets
 
 
-def test_prepare_sparse_prediction_uses_optional_hooks() -> None:
+def test_prepare_sparse_runtime_params_uses_backend_hooks() -> None:
     attention = TestSparseAttention.__new__(TestSparseAttention)
     attention.sparse_params = MockSparseParams()
     attention._sparse_kv_indices = torch.tensor([1], dtype=torch.int32)
@@ -191,17 +187,22 @@ def test_prepare_sparse_prediction_uses_optional_hooks() -> None:
     attention._sparse_attn_indices = torch.tensor([2], dtype=torch.int32)
     attention._sparse_attn_offsets = None
     forward_args = AttentionForwardArgs(
-        sparse_prediction=SparsePrediction(sparse_mla_topk_lens=torch.tensor([3]))
+        sparse_runtime_params=SparseRuntimeParams(sparse_mla_topk_lens=torch.tensor([3]))
     )
 
-    prediction = prepare_sparse_prediction(attention, torch.empty(0), None, None, forward_args)
+    runtime_params = prepare_sparse_runtime_params(
+        attention, torch.empty(0), None, None, forward_args
+    )
 
-    assert prediction.sparse_kv_indices is attention._sparse_kv_indices
-    assert prediction.sparse_kv_offsets is attention._sparse_kv_offsets
-    assert prediction.sparse_attn_indices is attention._sparse_attn_indices
-    assert prediction.sparse_attn_offsets is None
-    assert prediction.sparse_attn_indices_block_size == 1
-    assert prediction.sparse_mla_topk_lens is forward_args.sparse_prediction.sparse_mla_topk_lens
+    assert runtime_params.sparse_kv_indices is attention._sparse_kv_indices
+    assert runtime_params.sparse_kv_offsets is attention._sparse_kv_offsets
+    assert runtime_params.sparse_attn_indices is attention._sparse_attn_indices
+    assert runtime_params.sparse_attn_offsets is None
+    assert runtime_params.sparse_attn_indices_block_size == 1
+    assert (
+        runtime_params.sparse_mla_topk_lens
+        is forward_args.sparse_runtime_params.sparse_mla_topk_lens
+    )
 
 
 def test_mla_forward_uses_sparse_hook_facade() -> None:
@@ -291,7 +292,11 @@ def test_mla_forward_uses_sparse_hook_facade() -> None:
         "transform_sparse_attn_weights"
     ) < transform_weights_source.index("self.resmooth_parameters")
     assert "project_sparse_attn_output" in project_output_source
-    assert set(SPARSE_ATTN_HOOK_API) == {"SparseAttnHooks", "get_sparse_attn_hooks"}
+    assert set(SPARSE_ATTN_HOOK_API) == {
+        "SparseAttnHooks",
+        "get_sparse_attn_hooks",
+        "prepare_sparse_runtime_params",
+    }
     assert set(_SPARSE_ATTN_HOOK_MODULE_PATHS) == {"rocket", "dsa", "deepseek_v4"}
     assert _get_sparse_attn_hooks_for_algorithm("dsa").algorithm == "dsa"
     assert _get_sparse_attn_hooks_for_algorithm("deepseek_v4").algorithm == "deepseek_v4"
@@ -394,6 +399,7 @@ def test_sparse_attn_hook_contract_allows_optional_hooks() -> None:
         relative_attention_bias,
         relative_attention_max_distance,
         has_lora,
+        **kwargs,
     ):
         return None
 
@@ -414,15 +420,15 @@ def test_sparse_attn_hook_contract_allows_optional_hooks() -> None:
     assert attention_hooks.project_sparse_attn_output is project_attention_sparse_attn_output
 
 
-def test_prepare_sparse_prediction_allows_backend_without_prediction() -> None:
+def test_prepare_sparse_runtime_params_allows_backend_without_prediction() -> None:
     attention = TrtllmAttention.__new__(TrtllmAttention)
     attention.sparse_params = MockSparseParams()
 
-    prediction = prepare_sparse_prediction(
+    runtime_params = prepare_sparse_runtime_params(
         attention, torch.empty(0), None, None, AttentionForwardArgs()
     )
 
-    assert prediction == SparsePrediction()
+    assert runtime_params == SparseRuntimeParams()
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

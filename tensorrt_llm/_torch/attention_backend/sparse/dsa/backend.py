@@ -94,18 +94,39 @@ class DSATrtllmAttention(TrtllmAttention):
         metadata: DSAtrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Transform local TopK indices to global paged KV cache indices."""
-        # Transform the local topk indices to global topk indices in paged kv cache
+        """Run the DSA indexer and convert its local TopK to paged indices."""
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
-        topk_indices = getattr(metadata, "runtime_topk_indices", None)
-        if topk_indices is None:
-            topk_indices = forward_args.topk_indices
+        sparse_backend_args = forward_args.sparse_backend_args
+        if self.indexer is None:
+            shared_topk_indices = metadata.shared_topk_indices
+            assert shared_topk_indices is not None, (
+                "DSA shared layer has no top-k from a preceding full "
+                "indexer layer; check the index_topk_pattern/freq schedule.")
+            if is_generation:
+                topk_indices = shared_topk_indices[metadata.num_ctx_tokens:]
+            else:
+                topk_indices = shared_topk_indices[:metadata.num_ctx_tokens]
+        else:
+            indexer_intermediates = sparse_backend_args.indexer_intermediates
+            topk_indices = self.indexer.forward_from_projected(
+                metadata,
+                q,
+                indexer_intermediates,
+                is_generation=is_generation,
+            )
+            buffer = metadata.shared_topk_indices_buffer
+            if buffer is not None:
+                shared_topk_indices = buffer[:metadata.
+                                             num_tokens, :topk_indices.shape[1]]
+                metadata.shared_topk_indices = shared_topk_indices
+                start = metadata.num_ctx_tokens if is_generation else 0
+                shared_topk_indices[start:start +
+                                    topk_indices.shape[0]].copy_(topk_indices)
+
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
             topk_indices, metadata, self.get_local_layer_idx(metadata),
             is_generation)
 
-        # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
-        # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
         return topk_indices_global, None
 
     def sparse_kv_predict(

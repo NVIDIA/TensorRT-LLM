@@ -5,7 +5,6 @@
 
 from .params import (
     SkipSoftmaxFormula,
-    SkipSoftmaxKernelParams,
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
     skip_softmax_config_from_ckpt_sparse_attention_config,
@@ -18,7 +17,6 @@ from .params import (
 
 __all__ = [
     "SkipSoftmaxFormula",
-    "SkipSoftmaxKernelParams",
     "SkipSoftmaxParams",
     "SkipSoftmaxScheduler",
     "skip_softmax_config_from_ckpt_sparse_attention_config",

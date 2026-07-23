@@ -45,17 +45,76 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 
-from .backend import (
+from .compressor import KVCacheDtype
+from .params import (
     DEEPSEEK_V4_NON_SLIDING_ATTENTION,
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DEEPSEEK_V4_SPARSE_RATIO,
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
-    get_attn_dim,
-    get_token_bytes,
     is_overlap_compressor,
 )
-from .compressor import KVCacheDtype
+
+
+def get_attn_dim(
+    head_dim: int, index_head_dim: int, compress_ratio: int, attn_type: DeepseekV4AttentionType
+) -> int:
+    state_factor = 2 if is_overlap_compressor(compress_ratio) else 1
+    if attn_type == DeepseekV4AttentionType.SWA:
+        return head_dim
+    if attn_type == DeepseekV4AttentionType.COMPRESS:
+        return head_dim
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_KV:
+        return state_factor * head_dim
+    if attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
+        return state_factor * head_dim
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+        return index_head_dim
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV:
+        return state_factor * index_head_dim
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
+        return state_factor * index_head_dim
+    raise ValueError(f"Unsupported DeepSeek-V4 attention type: {attn_type}")
+
+
+def get_token_bytes(
+    head_dim: int,
+    index_head_dim: int,
+    compress_ratio: int,
+    attn_type: DeepseekV4AttentionType,
+    has_fp8_kv_cache: bool,
+    indexer_k_dtype: str = "fp8",
+) -> int:
+    if not compress_ratio_has_attention(compress_ratio, attn_type):
+        raise ValueError(
+            f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
+        )
+
+    attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
+
+    dtype_bytes = 1 if has_fp8_kv_cache else 2
+    # (indexer) compressor kv and score always use float32
+    if attn_type in [
+        DeepseekV4AttentionType.COMPRESSOR_KV,
+        DeepseekV4AttentionType.COMPRESSOR_SCORE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
+    ]:
+        dtype_bytes = 4  # (indexer) compressor kv and score use float32
+    # Indexer cache always packs data + per-block scales into one row.  Only
+    # the two indexer presets ("fp8" blockwise / "fp4" mxfp4) are valid
+    # here — bf16 / fp8_pertensor are reserved for the main-attention
+    # compressor.
+    if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
+        if indexer_k_dtype == "fp8":
+            return attn_dim + index_head_dim // 128 * 4
+        if indexer_k_dtype == "fp4":
+            return index_head_dim // 2 + index_head_dim // 32
+        raise ValueError(
+            f"Unsupported indexer_k_dtype {indexer_k_dtype!r}; expected 'fp8' or 'fp4'."
+        )
+
+    return attn_dim * dtype_bytes
 
 
 def _estimate_non_sliding_attn_size_per_token(

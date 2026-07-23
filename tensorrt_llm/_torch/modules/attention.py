@@ -827,6 +827,7 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        **kwargs,
     ):
         num_tokens = attn_metadata.num_tokens
 
@@ -866,6 +867,7 @@ class Attention(nn.Module):
                     relative_attention_bias=relative_attention_bias,
                     relative_attention_max_distance=
                     relative_attention_max_distance,
+                    **kwargs,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -915,6 +917,7 @@ class Attention(nn.Module):
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
+                **kwargs,
             ))
         if isinstance(attn_output, tuple):
             assert len(
@@ -937,6 +940,7 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        **kwargs,
     ):
         if forward_sparse_attn := self.sparse_attn_hooks.forward_sparse_attn:
             return forward_sparse_attn(
@@ -953,6 +957,7 @@ class Attention(nn.Module):
                 relative_attention_bias,
                 relative_attention_max_distance,
                 has_lora,
+                **kwargs,
             )
 
         mrope_rotary_cos_sin = None
@@ -969,7 +974,7 @@ class Attention(nn.Module):
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
                                  and is_torch_compiling()
-                                 and not self.is_marlin_enabled)
+                                 and not self.is_marlin_enabled and not kwargs)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
@@ -1007,6 +1012,7 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
+                **kwargs,
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
@@ -1097,6 +1103,7 @@ class Attention(nn.Module):
             relative_attention_bias=relative_attention_bias,
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
+            **kwargs,
         )
 
         if self.attn_output_gate:

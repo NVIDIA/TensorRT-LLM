@@ -7,14 +7,18 @@ from typing import List, Optional
 
 import torch
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionForwardArgs,
+    AttentionInputType,
+    AttentionMetadata,
+)
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_torch_compiling
 from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
-from .indexer import transform_local_topk_and_prepare_pool_view
 from .metadata import DSAtrtllmAttentionMetadata
+from .params import DSABackendForwardArgs
 
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
@@ -62,16 +66,15 @@ def forward_context_sparse_attn(
     attn_metadata: AttentionMetadata,
     output: torch.Tensor,
     latent_cache: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
+    indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     if should_use_short_mha(self, attn_metadata, position_ids):
         return self.forward_context(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
         )
     if get_sm_version() >= 100:
-        attn_metadata.runtime_topk_indices = topk_indices
-        result = self.forward_absorption_context(
+        return self.forward_absorption_context(
             q,
             compressed_kv,
             k_pe,
@@ -79,11 +82,16 @@ def forward_context_sparse_attn(
             output,
             position_ids=position_ids,
             latent_cache=latent_cache,
+            sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
         )
-        attn_metadata.runtime_topk_indices = None
-        return result
     return forward_sparse_mla_kvcache_bf16(
-        self, q, latent_cache, attn_metadata, output, topk_indices, is_generation=False
+        self,
+        q,
+        latent_cache,
+        attn_metadata,
+        output,
+        indexer_intermediates,
+        is_generation=False,
     )
 
 
@@ -96,11 +104,10 @@ def forward_generation_sparse_attn(
     output: torch.Tensor,
     position_ids: Optional[torch.Tensor] = None,
     latent_cache: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
+    indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     if get_sm_version() >= 100:
-        attn_metadata.runtime_topk_indices = topk_indices
-        result = self.forward_absorption_generation(
+        return self.forward_absorption_generation(
             q,
             compressed_kv,
             k_pe,
@@ -108,11 +115,16 @@ def forward_generation_sparse_attn(
             output,
             position_ids=position_ids,
             latent_cache=latent_cache,
+            sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
         )
-        attn_metadata.runtime_topk_indices = None
-        return result
     return forward_sparse_mla_kvcache_bf16(
-        self, q, latent_cache, attn_metadata, output, topk_indices, is_generation=True
+        self,
+        q,
+        latent_cache,
+        attn_metadata,
+        output,
+        indexer_intermediates,
+        is_generation=True,
     )
 
 
@@ -239,8 +251,8 @@ def forward_dsa_proj(
     if use_short_mha_for_ctx and attn_metadata.num_generations == 0:
         return [q, compressed_kv, k_pe, latent_cache]
 
-    # DSA "shared" layer: no indexer; reuses the previous full layer's
-    # top-k (in _forward_dsa_attn), so skip the projection.
+    # DSA "shared" layer: no indexer projection; the backend predictor
+    # reuses the preceding full layer's top-k.
     if self.mqa.indexer is None:
         return [q, compressed_kv, k_pe, latent_cache]
 
@@ -304,18 +316,7 @@ def _forward_dsa_attn(
         self, attn_metadata, position_ids
     )
 
-    if use_short_mha_for_ctx and num_generations == 0:
-        topk_indices = None
-    elif self.mqa.indexer is None:
-        # DSA "shared" layer: reuse the previous full layer's top-k. These
-        # are local token positions, so they are layer-agnostic; each layer
-        # applies its own paged-KV transform downstream.
-        topk_indices = getattr(attn_metadata, "shared_topk_indices", None)
-        assert topk_indices is not None, (
-            "DSA shared layer has no top-k from a preceding full indexer "
-            "layer; check the index_topk_pattern/freq schedule."
-        )
-    else:
+    if not (use_short_mha_for_ctx and num_generations == 0) and self.mqa.indexer is not None:
         q_fp8, k_fp8, k_scale, weights, q_scale = indexer_intermediates
         # Slice indexer intermediates to actual num_tokens (they were
         # computed on the full padded tensor in Op 1).
@@ -324,18 +325,12 @@ def _forward_dsa_attn(
         k_scale = k_scale[:num_tokens, ...]
         weights = weights[:num_tokens, ...]
         q_scale = q_scale[:num_tokens, ...]
-        topk_indices = self.mqa.indexer.sparse_attn_indexer(
-            attn_metadata,
-            q,  # only used for shape/device in buffer allocation
-            q_fp8,
-            k_fp8,
-            k_scale,
-            weights,
-            q_scale=q_scale,
-        )
-        # Stash for subsequent DSA "shared" layers (full -> shared reuse);
-        # unused by a dense per-layer indexer.
-        attn_metadata.shared_topk_indices = topk_indices
+        indexer_intermediates = [q_fp8, k_fp8, k_scale, weights, q_scale]
+        # Update the full mixed batch once before context/generation prediction
+        # splits. Context chunk gathers must observe the newly appended keys.
+        self.mqa.indexer._update_k_cache(k_fp8, k_scale, attn_metadata)
+    else:
+        indexer_intermediates = None
 
     assert output is not None, "output must be provided"
 
@@ -357,8 +352,8 @@ def _forward_dsa_attn(
             attn_metadata,
             output[:num_ctx_tokens, :],
             latent_cache_ctx,
-            topk_indices=(topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None),
             position_ids=ctx_position_ids,
+            indexer_intermediates=indexer_intermediates,
         )
 
     if num_generations > 0:
@@ -381,8 +376,8 @@ def _forward_dsa_attn(
             attn_metadata,
             output[num_ctx_tokens:num_tokens, :],
             latent_cache=latent_cache_gen,
-            topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
             position_ids=gen_position_ids,
+            indexer_intermediates=indexer_intermediates,
         )
 
 
@@ -421,7 +416,7 @@ def forward_sparse_mla_kvcache_bf16(
     latent_cache: torch.Tensor,
     attn_metadata: DSAtrtllmAttentionMetadata,
     output: torch.Tensor,
-    topk_indices: torch.Tensor,
+    indexer_intermediates: Optional[List[torch.Tensor]],
     is_generation: bool = False,
 ) -> torch.Tensor:
     """
@@ -435,6 +430,23 @@ def forward_sparse_mla_kvcache_bf16(
     assert isinstance(attn_metadata, DSAtrtllmAttentionMetadata), (
         "DSA requires DSAtrtllmAttentionMetadata"
     )
+    attention_input_type = (
+        AttentionInputType.generation_only if is_generation else AttentionInputType.context_only
+    )
+    topk_indices_pool, _ = self.mqa.sparse_attn_predict(
+        q,
+        None,
+        attn_metadata,
+        AttentionForwardArgs(
+            attention_input_type=attention_input_type,
+            sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=indexer_intermediates),
+        ),
+    )
+    assert topk_indices_pool is not None
+    attn_metadata._ensure_pool_view_cached()
+    kv_cache_pool = attn_metadata._cached_pool_view
+    assert kv_cache_pool is not None
+
     # Append current tokens to paged cache and apply RoPE to q
     # This writes latent_cache to paged KV and modifies q in-place
     trtllm_attention = self.mqa
@@ -511,15 +523,6 @@ def forward_sparse_mla_kvcache_bf16(
         q_padded[:, : self.num_heads_tp, :] = q_concat
         q_concat = q_padded
 
-    # Convert indices and return all-layer KV pool
-    # The pool is layer-interleaved. Return the all-layer view and adjust
-    # top-k indices by num_layers * tokens_per_block to avoid a per-layer copy.
-    topk_indices_pool, kv_cache_pool = transform_local_topk_and_prepare_pool_view(
-        topk_indices,
-        attn_metadata,
-        layer_idx=self.layer_idx,
-        is_generation=is_generation,
-    )
     topk_indices_pool = topk_indices_pool.view(num_tokens, 1, -1)
     if flash_mla_sparse_fwd is not None:
         attn_out_latent = flash_mla_sparse_fwd(

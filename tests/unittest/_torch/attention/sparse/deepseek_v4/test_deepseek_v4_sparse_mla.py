@@ -37,11 +37,10 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4AttentionType,
     DeepseekV4CacheManager,
     DeepseekV4TrtllmAttention,
-)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
     DeepseekV4TrtllmAttentionMetadata,
-    get_token_bytes,
 )
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
+from tensorrt_llm._torch.attention_backend.sparse.params import SparseBackendForwardArgs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -781,7 +780,6 @@ def test_deepseek_v4_sparse_mla_single_token_tp4_local_heads_repro():
         attention_input_type=AttentionInputType.context_only,
         latent_cache=latent_cache,
         q_pe=q_pe,
-        topk_indices=None,
         softmax_stats_tensor=softmax_stats_tensor,
     )
 
@@ -1087,7 +1085,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
             attention_input_type=AttentionInputType.context_only,
             latent_cache=latent_cache,
             q_pe=q_pe,
-            topk_indices=topk_indices,
+            sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
         )
 
         # Reference computation
@@ -1237,7 +1235,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], num_generation_steps
                 cu_q_seqlens=cu_q_seqlens,
                 cu_kv_seqlens=cu_kv_seqlens,
                 fmha_scheduler_counter=fmha_scheduler_counter,
-                topk_indices=topk_indices,
+                sparse_backend_args=SparseBackendForwardArgs(topk_indices=topk_indices),
             )
 
             # Reference: apply RoPE separately, then compute attention
@@ -1432,7 +1430,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             attention_input_type=AttentionInputType.context_only,
             latent_cache=prefill_latent,
             q_pe=prefill_q_pe,
-            topk_indices=prefill_topk,
+            sparse_backend_args=SparseBackendForwardArgs(topk_indices=prefill_topk),
         )
 
     gen_requests = requests[1:]
@@ -1557,7 +1555,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             output=output[:total_ctx_tokens],
             latent_cache=ctx_latent,
             q_pe=ctx_q_pe,
-            topk_indices=ctx_topk,
+            sparse_backend_args=SparseBackendForwardArgs(topk_indices=ctx_topk),
         )
 
         # Generation forward → output[total_ctx_tokens:]
@@ -1589,7 +1587,7 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
             cu_q_seqlens=cu_q,
             cu_kv_seqlens=cu_kv,
             fmha_scheduler_counter=counter,
-            topk_indices=gen_topk,
+            sparse_backend_args=SparseBackendForwardArgs(topk_indices=gen_topk),
         )
 
         # Context reference

@@ -16,13 +16,11 @@ from transformers import PretrainedConfig
 # from utils.util import default_dtype
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+    DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
     DeepseekV4TrtllmAttentionMetadata,
-)
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager,
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention

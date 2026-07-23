@@ -27,10 +27,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.backend import (
-    DeepseekV4AttentionType,
-    get_token_bytes,
-)
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import get_token_bytes
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import DeepseekV4AttentionType
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
     DeepSeekV4SparseAttentionConfig,
