@@ -202,6 +202,37 @@ def test_runner_warmup_capture_execute_and_shared_output():
     assert body.forward == original_forward
 
 
+def test_runner_first_bucket_segments_share_one_memory_pool():
+    class BreakableBody(nn.Module):
+        @eager_on_graph(True)
+        def eager_add_one(self, value):
+            return value + 1
+
+        @eager_on_graph(True)
+        def eager_double(self, value):
+            return value * 2
+
+        def forward(self, value):
+            value = self.eager_add_one(value + 1)
+            return self.eager_double(value + 1)
+
+    body = BreakableBody().cuda()
+    runner = BreakableCUDAGraphRunner(body)
+    inputs = {"value": torch.zeros((8, 4), device="cuda")}
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(inputs["value"]))
+        return body(inputs["value"])
+
+    runner.capture(8, engine_forward)
+
+    graph = runner._graphs[8]
+    assert graph.num_segments == 3
+    assert runner._memory_pool is not None
+    assert all(segment.pool() == runner._memory_pool for segment in graph._segments)
+
+
 def test_runner_graph_miss_nested_execute_and_exception_recovery():
     body = _Body().cuda()
     runner = BreakableCUDAGraphRunner(body)

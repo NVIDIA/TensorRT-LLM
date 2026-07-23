@@ -164,7 +164,7 @@ def eager_on_graph(enable: bool) -> Callable[[Callable], Callable]:
 
             # 看下attn的参数
             def make_weak_ref_with_str_none(x):
-                if isinstance(x, (str, None)):
+                if isinstance(x, (str, type(None))):
                     return x
                 return make_weak_ref(x)
 
