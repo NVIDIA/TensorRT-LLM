@@ -15,3 +15,4 @@ l0_cpu_x86:
   tests:
   - unittest/executor/test_rpc.py
   - unittest/_utils/test_anti_zombie.py
+  - unittest/executor/test_multi_frontend_routing.py

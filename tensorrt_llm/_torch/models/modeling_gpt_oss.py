@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 import torch
 from torch import nn
@@ -551,6 +551,13 @@ class Transformer(DecoderModel):
 
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        return "PYTHON"
 
     params_map = {
         # TRTLLM module name : GptOss module name
