@@ -6,11 +6,8 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    KimiK3RMSNorm,
-    _apply_attn_res,
-    _apply_attn_res_fused,
-)
+from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3RMSNorm, _apply_attn_res_fused
+from tensorrt_llm._torch.modules.kimi_k3_attn_res import apply_attn_res_reference
 
 HIDDEN_SIZE = 7168
 RMS_EPS = 1e-6
@@ -70,7 +67,13 @@ def test_fused_attn_res_matches_torch_reference(num_tokens: int, num_snapshots: 
         * 0.05
     )
 
-    expected = _apply_attn_res(prefix_sum, block_residual, projection, norm)
+    expected = apply_attn_res_reference(
+        prefix_sum,
+        block_residual,
+        projection.weight,
+        norm.weight,
+        RMS_EPS,
+    )
     actual = _apply_attn_res_fused(prefix_sum, block_residual, projection, norm)
 
     assert actual is not None

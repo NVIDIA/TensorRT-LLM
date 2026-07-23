@@ -130,10 +130,10 @@ def _is_mla_layer(cfg, layer_idx: int) -> bool:
 
 
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
-"""Set to ``1`` to route attn_res through the in-tree fused Torch op
-``trtllm::attn_res_fwd`` (Blackwell only). Default: pure-torch fp32 path."""
+"""Set to ``0`` to disable the in-tree fused Torch op
+``trtllm::attn_res_fwd`` (Blackwell only). Default: fused with fallback."""
 
-_FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "0") == "1"
+_FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
 
 def _apply_attn_res_fused(prefix_sum: torch.Tensor,
@@ -173,8 +173,8 @@ def _apply_attn_res(prefix_sum: torch.Tensor, block_residual: torch.Tensor,
     prefix_sum:     ``[num_tokens, hidden_size]``
     block_residual: ``[num_tokens, num_snapshots, hidden_size]``
 
-    When ``KIMI_K3_FUSED_ATTN_RES=1`` and the inputs fit the fused kernel's
-    contract, dispatches to the in-tree ``trtllm::attn_res_fwd`` op instead.
+    Unless ``KIMI_K3_FUSED_ATTN_RES=0``, inputs fitting the fused kernel's
+    contract dispatch to the in-tree ``trtllm::attn_res_fwd`` op.
     """
     if _FUSED_ATTN_RES_ENABLED:
         fused = _apply_attn_res_fused(prefix_sum, block_residual, proj, norm)
