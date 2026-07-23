@@ -388,3 +388,58 @@ tried first but broke DeepSeek-V3 due to lost shape/export metadata.
 reconstructed `GraphModule` must preserve not just the graph and parameters
 but also any callable methods that downstream code relies on. Test with
 multimodal models that have extra methods on their graph modules.
+
+______________________________________________________________________
+
+## 15. Porting fusion plumbing to xDSL's PatternRewriteWalker (keep discovery custom)
+
+**Context:** PR #12427 review (comment r3019035416) flagged that the pipeline
+was half-idiomatic: `decompose.py` used xDSL's `PatternRewriteWalker` +
+`GreedyRewritePatternApplier` + `RewritePattern`, but `subgraph_discovery.py` +
+`subgraph_replace.py` hand-rolled IR traversal, mutation, and cleanup —
+including `block.erase_op(..., safe_erase=False)`, which suppresses use-def
+validation.
+
+**What was done:**
+
+- Removed `safe_erase=False`. Because `subgraph.ops` is topologically sorted
+  and we erase in **reverse** order (consumers before producers), and every
+  external use was already redirected by `replace_by`, each op has no remaining
+  uses at erase time — so the default `safe_erase=True` check passes. The old
+  flag was defensive, not load-bearing.
+- Added `mlir/fusion/fuse.py`: `run_fusion(module, metadata, log_warning)` +
+  `FusionStats`, mirroring `run_decomposition`. A `_FuseSubgraphPattern`
+  (`RewritePattern`) matches each subgraph's anchor (`sg.ops[0]`) and is driven
+  by `PatternRewriteWalker(apply_recursively=False)`. The transform `_apply`
+  now just calls `run_fusion`.
+- `replace_subgraph_with_fused_op` gained an optional `rewriter: PatternRewriter`
+  param: walker path uses `rewriter.insert_op`/`erase_op`; standalone callers
+  (unit tests call it directly) keep using block ops. The param **must** stay
+  optional — `test_elementwise_fusion_e2e.py` invokes it without a walker.
+
+**Decision — discovery stays union-find, NOT a root-anchored walk.** The review
+sketched a `discover_subgraph_rooted_at` backward walk. That is *not* a faithful
+substitute: a single-root backward cone (1) fragments maximal **multi-output**
+connected components (two fusible results feeding different external consumers
+land in separate fusions → different hashes, more kernels), and (2) cannot
+express the 64-input **dependent** partitioning from issues #9/#11 (a single
+`match_and_rewrite` emitting one `AdOpaque` per root can't chain partitions).
+So only **iteration + mutation** went xDSL-native; the domain logic
+(union-find, placement-conflict detection `_has_placement_conflict`, the
+64-input `_split_subgraph`, Kahn topo-sort for hash stability) stays custom —
+matching the reviewer's own "what stays custom" carve-out.
+
+**Subtlety:** A **forward** walk visits partition anchors in dependency order
+(partition 1 before partition 2), so `refresh_inputs()` (issue #10) still picks
+up redirected operands exactly as the old ahead-of-time loop did. Don't switch
+to `walk_reverse=True` — it would break partition input refresh.
+
+**API gotcha:** xDSL 0.66 `Block` has **no** `insert_op_at_location`. Use
+`block.insert_op_before/after` (standalone) or
+`rewriter.insert_op(op, InsertPoint.before/after(anchor))` (walker).
+
+**Lesson:** When making a hand-rolled pass xDSL-idiomatic, port the *plumbing*
+(walker-driven iteration, rewriter-tracked mutation, safe erase) but keep the
+codegen-constraint-specific *discovery algorithm* custom. Reverse-topological
+erase + prior `replace_by` is sufficient for safe erase — no need to bypass the
+use-def check.

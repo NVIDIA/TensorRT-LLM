@@ -21,9 +21,10 @@ that the MLIR-to-FX converter uses to reconstruct a call to the generated
 Triton kernel.
 """
 
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from xdsl.dialects.builtin import StringAttr
+from xdsl.pattern_rewriter import InsertPoint, PatternRewriter
 
 from ..dialect import AdOpaque
 from .subgraph_discovery import FusibleSubgraph
@@ -34,6 +35,7 @@ def replace_subgraph_with_fused_op(
     kernel_fn: Callable,
     sg_hash: str,
     metadata: Dict[str, Dict[str, Any]],
+    rewriter: Optional[PatternRewriter] = None,
 ) -> None:
     """Replace a subgraph's ops in the MLIR block with a single fused AdOpaque.
 
@@ -44,6 +46,12 @@ def replace_subgraph_with_fused_op(
         sg_hash: The subgraph hash used in the torch.ops registration name.
         metadata: The FXToMLIRConverter metadata side-table. A new entry is
             added for the fused op so MLIR-to-FX can reconstruct it.
+        rewriter: Optional xDSL ``PatternRewriter``.  When provided (the
+            walker-driven :func:`run_fusion` path), op insertion and erasure go
+            through the rewriter so SSA rewiring is tracked and validated by
+            xDSL's pass infrastructure.  When ``None`` (standalone callers,
+            e.g. unit tests), the same mutations are applied directly on the
+            block with the default safe-erase use-def check.
     """
     import torch
     from xdsl.dialects.builtin import TensorType
@@ -111,17 +119,29 @@ def replace_subgraph_with_fused_op(
         # An external input is produced AFTER the first subgraph op.
         # Insert the fused op just after that input producer.
         anchor_op = list(block.ops)[latest_input_pos]
-        block.insert_op_after(fused_op, anchor_op)
+        if rewriter is not None:
+            rewriter.insert_op(fused_op, InsertPoint.after(anchor_op))
+        else:
+            block.insert_op_after(fused_op, anchor_op)
     else:
         # Normal case: all inputs are available before the subgraph.
-        block.insert_op_before(fused_op, subgraph.ops[0])
+        if rewriter is not None:
+            rewriter.insert_op(fused_op, InsertPoint.before(subgraph.ops[0]))
+        else:
+            block.insert_op_before(fused_op, subgraph.ops[0])
 
     # Replace each subgraph output's uses with the corresponding fused op output
     for i, out_val in enumerate(subgraph.outputs):
         out_val.replace_by(fused_op.outputs[i])
 
-    # Erase the original subgraph ops in reverse order.
-    # safe_erase=False skips the use-check, which is needed because internal
-    # operand references between subgraph ops may still exist at erase time.
+    # Erase the original subgraph ops in reverse topological order.
+    # ``subgraph.ops`` is topologically sorted (producers before consumers), so
+    # iterating in reverse erases consumers first.  Combined with the
+    # ``replace_by`` above (which redirects every external use of a subgraph
+    # output), each op has no remaining uses by the time it is erased, so the
+    # default ``safe_erase=True`` use-def check passes.
     for op in reversed(subgraph.ops):
-        block.erase_op(op, safe_erase=False)
+        if rewriter is not None:
+            rewriter.erase_op(op)
+        else:
+            block.erase_op(op)

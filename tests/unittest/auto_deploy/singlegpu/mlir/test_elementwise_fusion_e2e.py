@@ -497,6 +497,134 @@ def test_moe_ep_mask_fusion_discovery():
     assert len(subgraphs[0].ops) == 3, f"Expected 3 ops, got {len(subgraphs[0].ops)}"
 
 
+# ---------------------------------------------------------------------------
+# Walker-driven run_fusion (PatternRewriteWalker) — parity with the manual
+# discover-then-replace loop.
+# ---------------------------------------------------------------------------
+
+
+def test_run_fusion_replaces_subgraph_and_records_metadata():
+    """run_fusion discovers + replaces a subgraph via the walker, no CUDA needed.
+
+    Exercises the xDSL PatternRewriteWalker path: the AdAdd+AdMul subgraph is
+    fused into a single AdOpaque, the original primitives are erased, and a
+    fused-op metadata entry is recorded with the tuple "val" contract.
+    """
+    from tensorrt_llm._torch.auto_deploy.mlir.dialect import AdOpaque
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.fuse import run_fusion
+
+    hidden = 128
+    mlir_mod = _build_single_output_add_mul_module(hidden)
+
+    metadata = {}
+    stats = run_fusion(mlir_mod, metadata)
+
+    assert stats.num_subgraphs == 1
+    assert stats.num_replaced == 1
+    assert stats.num_skipped_low_rank == 0
+
+    block = mlir_mod.body.block
+    # The fused AdOpaque replaced the AdAdd/AdMul primitives.
+    assert sum(isinstance(op, AdOpaque) for op in block.ops) == 1
+    assert not any(isinstance(op, (AdAdd, AdMul)) for op in block.ops)
+
+    # Exactly one fused-op metadata entry, with the tuple "val" contract.
+    assert len(metadata) == 1
+    (val_meta,) = (m["val"] for m in metadata.values())
+    assert isinstance(val_meta, tuple) and len(val_meta) == 1
+    assert tuple(val_meta[0].shape) == (2, hidden)
+
+
+def test_run_fusion_skips_low_rank_subgraph():
+    """run_fusion reports low-rank subgraphs as skipped, not replaced."""
+    from xdsl.dialects.builtin import Region as _Region
+
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.fuse import run_fusion
+
+    # Two chained ops on 1D (weight-space) tensors → discovered but low-rank.
+    tw = TensorType(BFloat16Type(), [128])
+    block = Block()
+    a = block.insert_arg(tw, 0)
+    b = block.insert_arg(tw, 1)
+    add_op = AdAdd.build(operands=[a, b], result_types=[tw])
+    block.add_op(add_op)
+    mul_op = AdMul.build(operands=[add_op.output, b], result_types=[tw])
+    block.add_op(mul_op)
+    block.add_op(AdGraphOutput.build(operands=[[mul_op.output]]))
+    mlir_mod = ModuleOp(_Region([block]))
+
+    metadata = {}
+    stats = run_fusion(mlir_mod, metadata)
+
+    assert stats.num_subgraphs == 1
+    assert stats.num_replaced == 0
+    assert stats.num_skipped_low_rank == 1
+    assert metadata == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_run_fusion_full_fx_roundtrip():
+    """FX → MLIR → decompose → run_fusion (walker) → MLIR → FX matches eager.
+
+    Walker-path counterpart of ``test_full_fx_roundtrip_with_replacement``,
+    which drives the same model through the manual discover-then-replace loop.
+    """
+    import tensorrt_llm._torch.auto_deploy.custom_ops.normalization.rms_norm  # noqa: F401
+    import tensorrt_llm._torch.auto_deploy.mlir  # noqa: F401
+    from tensorrt_llm._torch.auto_deploy.mlir.fusion.fuse import run_fusion
+    from tensorrt_llm._torch.auto_deploy.mlir.fx_to_mlir import FXToMLIRConverter
+    from tensorrt_llm._torch.auto_deploy.mlir.mlir_to_fx import MLIRToFXConverter
+
+    hidden = 128
+
+    class AddNormModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+            )
+            self.eps = 1e-5
+
+        def forward(self, x, residual):
+            added = x + residual
+            norm = torch.ops.auto_deploy.torch_rmsnorm(added, self.weight, self.eps)
+            return norm, added
+
+    model = AddNormModel()
+    x = torch.randn(2, 8, hidden, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn_like(x)
+
+    from torch.export import Dim
+
+    from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+
+    gm = torch_export_to_gm(
+        model,
+        args=(x, res),
+        dynamic_shapes=({0: Dim.DYNAMIC}, {0: Dim.DYNAMIC}),
+        clone=True,
+    )
+
+    converter = FXToMLIRConverter(gm)
+    mlir_module = converter.convert()
+
+    num_decomposed = run_decomposition(mlir_module)
+    assert num_decomposed >= 1
+
+    stats = run_fusion(mlir_module, converter.metadata)
+    assert stats.num_replaced >= 1
+
+    back_converter = MLIRToFXConverter(gm)
+    new_gm = back_converter.convert(mlir_module, converter.metadata)
+
+    result = new_gm(x.clone(), res.clone())
+    ref = model(x.clone(), res.clone())
+
+    assert len(result) == len(ref)
+    torch.testing.assert_close(result[0], ref[0], atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(result[1], ref[1], atol=1e-2, rtol=1e-2)
+
+
 def test_moe_ep_mask_kernel_generation():
     """Triton kernel can be generated for the mixed-type floordiv+eq+mul pattern."""
     mlir_mod = _build_moe_ep_mask_module()
