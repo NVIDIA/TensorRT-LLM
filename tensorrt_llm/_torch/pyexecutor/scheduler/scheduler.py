@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import inspect
 from abc import ABC, abstractmethod
@@ -257,6 +260,7 @@ class SerializableSchedulerOutput:
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
     wait_for_disagg_gen_transfer_progress: bool = False
+    activated_context_request_ids: list[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_scheduler_result(
@@ -265,6 +269,7 @@ class SerializableSchedulerOutput:
         fitting_disagg_gen_init_requests: RequestList,
         num_fitting_requests: int,
         wait_for_disagg_gen_transfer_progress: bool = False,
+        activated_context_request_ids: Optional[list[int]] = None,
     ) -> "SerializableSchedulerOutput":
         return cls(
             encoder_requests=[req.request_id for req in scheduled_requests.encoder_requests],
@@ -281,6 +286,7 @@ class SerializableSchedulerOutput:
             ],
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
+            activated_context_request_ids=activated_context_request_ids or [],
         )
 
     def to_scheduler_result(
