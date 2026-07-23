@@ -181,7 +181,6 @@ def test_execute_eviction_round_orders_both_manager_streams():
 
     event = mock.Mock()
     host = torch.zeros(6, 9, dtype=torch.int32)
-    prompt_offsets = object()
     buffers = SimpleNamespace(
         device=torch.device("cuda", torch.cuda.current_device()),
         max_requests=8,
@@ -197,7 +196,6 @@ def test_execute_eviction_round_orders_both_manager_streams():
         phase={"cos": None, "sin": None, "rows": 8},
         phase_num_freqs=1,
         phase_f_block=1,
-        prompt_offsets=prompt_offsets,
         round_starts_device=None,
         valid_seq_lens_device=None,
         token_starts_device=None,
@@ -207,10 +205,10 @@ def test_execute_eviction_round_orders_both_manager_streams():
         swa_destination_bases=None,
         swa_rebase_delta=0,
         copy_block_count=0,
-        _bulk_offsets_src=None,
+        _block_offsets_host=None,
         block_offsets_device=None,
         draft_copy_block_count=0,
-        _draft_bulk_offsets_src=None,
+        _draft_block_offsets_host=None,
         draft_block_offsets_device=None,
     )
     target_stream = mock.Mock()
@@ -236,7 +234,7 @@ def test_execute_eviction_round_orders_both_manager_streams():
     ):
         with pytest.raises(Boom):
             module.execute_eviction_round(
-                buffers, manager, draft_manager, prepared, normalize_scores=True
+                buffers, manager, prepared, draft_manager, normalize_scores=True
             )
 
     # Both page-table planes were snapshotted before the round body fired.
@@ -360,7 +358,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
                 # The staged logical position restores the uncompressed
                 # length: physical confirmed plus everything evicted so far
                 # (the prepared item's round_start).
-                prepared = internals.execute.call_args.args[3]
+                prepared = internals.execute.call_args.args[2]
                 assert prepared[0]["round_start"] == uncompressed
             # The published count equals the uncompressed confirmed logical
             # length minus the physical confirmed length, and never decreases.
@@ -378,7 +376,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     for call in internals.execute.call_args_list:
         assert call.args[0] is internals.buffers
         assert call.args[1] is target
-        assert call.args[2] is draft_manager
+        assert call.args[3] is draft_manager
         assert call.kwargs == {"normalize_scores": True}
 
 

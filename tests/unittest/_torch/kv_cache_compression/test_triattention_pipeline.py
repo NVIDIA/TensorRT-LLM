@@ -343,8 +343,7 @@ class TestCompressedTokenPublication:
                             expected_keep_count=6,
                             prompt_len=2,
                         )
-                    ],
-                    2,
+                    ]
                 )
         assert request.py_num_compressed_tokens == 0
 
@@ -455,7 +454,7 @@ class TestEvictionLifecycle:
         draft_manager._stream = mock.Mock()
         mgr.draft_kv_cache_manager = draft_manager
 
-        def compact(prepared, _num_layers):
+        def compact(prepared):
             # Publish and resize consume the same prepared cohort.
             return prepared
 
@@ -476,8 +475,7 @@ class TestEvictionLifecycle:
                     "expected_keep_count": retained,
                     "protected_tail": tail,
                 }
-            ],
-            2,
+            ]
         )
         cache.resize.assert_called_once_with(retained + tail, None)
         draft_cache.resize.assert_called_once_with(retained + 1, None)
@@ -594,7 +592,7 @@ class TestFixedScoreMetadata:
         prepared = [_make_prepared_item(request_id=7, seq_len=64, round_start=2**31)]
 
         with pytest.raises((RuntimeError, OverflowError, ValueError)):
-            execute_eviction_round(staging, manager, None, prepared, normalize_scores=True)
+            execute_eviction_round(staging, manager, prepared, normalize_scores=True)
         assert gather.call_count == 0
 
     def test_bulk_page_table_copy_snapshots_and_orders_consumers(self):
@@ -645,8 +643,7 @@ class TestFixedScoreMetadata:
                 staging,
                 manager,
                 [7],
-                current_stream,
-                staging._bulk_offsets_src,
+                staging._block_offsets_host,
                 staging.block_offsets_device,
                 staging.copy_block_count,
             )
@@ -662,7 +659,7 @@ class TestFixedScoreMetadata:
             side_effect=AssertionError("page-table staging used torch.index_select"),
         ):
             stage_once()
-        assert staging._bulk_offsets_src.shape == (1, 1, 2, 8)
+        assert staging._block_offsets_host.shape == (1, 1, 2, 8)
         host_table[0, 0, 0, :5] = torch.tensor([13, 14, 15, 16, 17], dtype=torch.int32)
         selected_slot[0] = 1
         current_stream.synchronize()
@@ -733,8 +730,7 @@ class TestFixedScoreMetadata:
                         expected_keep_count=9,
                         protected_tail=3,
                     ),
-                ],
-                2,
+                ]
             )
 
         # One round-executor call carries the whole cohort (with the target
@@ -742,8 +738,8 @@ class TestFixedScoreMetadata:
         args = internals.execute.call_args
         assert args.args[0] is internals.buffers
         assert args.args[1] is manager.kv_cache_manager
-        assert args.args[2] is None
-        prepared = args.args[3]
+        assert args.args[3] is None
+        prepared = args.args[2]
         assert [item["request_id"] for item in prepared] == [7, 8]
         assert [item["round_start"] for item in prepared] == [8, 10]
         assert [item["prompt_len"] for item in prepared] == [3, 5]
@@ -867,9 +863,7 @@ class TestFixedScoreMetadata:
         # The compact stage is stubbed to a no-op: this test owns the score
         # buffers only, never a staged move decision.
         with mock.patch.object(module, "compact"):
-            module.execute_eviction_round(
-                bufs, manager, None, prepared_cohort(), normalize_scores=False
-            )
+            module.execute_eviction_round(bufs, manager, prepared_cohort(), normalize_scores=False)
         fixed = bufs.score_output.clone()
         assert bufs.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
@@ -908,9 +902,7 @@ class TestFixedScoreMetadata:
         bufs.score_output.fill_(score_sentinel)
         bufs.valid_widths.fill_(-1)
         with mock.patch.object(module, "compact"):
-            module.execute_eviction_round(
-                bufs, manager, None, prepared_cohort(), normalize_scores=False
-            )
+            module.execute_eviction_round(bufs, manager, prepared_cohort(), normalize_scores=False)
         second_launch = bufs.score_output.clone()
         assert torch.equal(bufs.valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)

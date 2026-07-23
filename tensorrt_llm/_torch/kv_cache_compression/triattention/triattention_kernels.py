@@ -24,16 +24,16 @@ STD_EPSILON = 1e-6
 @triton.jit
 def _gather_mean_phase_kernel(
     round_starts,
-    table_cos,
-    table_sin,
-    mean_cos,
-    mean_sin,
+    phase_cos,
+    phase_sin,
+    phase_rows,
     valid_seq_lens,
     token_starts,
+    mean_cos,
+    mean_sin,
     valid_widths,
     swa_destination_bases,
-    table_rows,
-    rebase_delta,
+    swa_rebase_delta,
     NUM_FREQS: tl.constexpr,
     F_BLOCK: tl.constexpr,
     HAS_SWA: tl.constexpr,
@@ -44,17 +44,17 @@ def _gather_mean_phase_kernel(
     frequency_mask = frequency < NUM_FREQS
     table_row = tl.load(round_starts + request).to(tl.int64)
     # Clamp stale or padded round starts instead of faulting.
-    table_row = tl.minimum(tl.maximum(table_row, 0), table_rows - 1)
+    table_row = tl.minimum(tl.maximum(table_row, 0), phase_rows - 1)
     source_offset = table_row * NUM_FREQS + frequency
     output_offset = request * NUM_FREQS + frequency
-    row_cos = tl.load(table_cos + source_offset, mask=frequency_mask, other=0.0)
-    row_sin = tl.load(table_sin + source_offset, mask=frequency_mask, other=0.0)
+    row_cos = tl.load(phase_cos + source_offset, mask=frequency_mask, other=0.0)
+    row_sin = tl.load(phase_sin + source_offset, mask=frequency_mask, other=0.0)
     tl.store(mean_cos + output_offset, row_cos, mask=frequency_mask)
     tl.store(mean_sin + output_offset, row_sin, mask=frequency_mask)
     token_start = tl.load(token_starts + request)
     tl.store(valid_widths + request, tl.load(valid_seq_lens + request) - token_start)
     if HAS_SWA:
-        tl.store(swa_destination_bases + request, token_start + rebase_delta)
+        tl.store(swa_destination_bases + request, token_start + swa_rebase_delta)
 
 
 def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
@@ -94,8 +94,7 @@ def _score_row_stats_kernel(
     row_inv_std,
     ROWS: tl.constexpr,
     WIDTH: tl.constexpr,
-    BLOCK: tl.constexpr,
-    EPSILON: tl.constexpr,
+    BLOCK: tl.constexpr = 256,
 ):
     """Compute one valid-prefix mean and inverse standard deviation per score row."""
     flat_row = tl.program_id(0)
@@ -119,7 +118,7 @@ def _score_row_stats_kernel(
         square_sum += tl.sum(centered * centered, axis=0)
     std = tl.sqrt(square_sum / valid_width)
     tl.store(row_mean + flat_row, mean)
-    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, EPSILON))
+    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, STD_EPSILON))
 
 
 @triton.jit
@@ -131,16 +130,16 @@ def _score_per_head_reduce_kernel(
     selection_scores,
     selection_seq_lens,
     NUM_LAYERS: tl.constexpr,
-    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
-    QUERY_GROUP_SIZE: tl.constexpr,
-    SELECTION_ROWS: tl.constexpr,
     WIDTH: tl.constexpr,
     PER_LAYER: tl.constexpr,
     NORMALIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr = 256,
 ):
     """Reduce query-head score rows into one selector row per KV-head domain."""
+    QUERY_GROUP_SIZE: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
+    SELECTION_ROWS: tl.constexpr = NUM_LAYERS * NUM_KV_HEADS if PER_LAYER else NUM_KV_HEADS
     request = tl.program_id(0)
     selection_row = tl.program_id(1)
     token_block = tl.program_id(2)
@@ -160,7 +159,7 @@ def _score_per_head_reduce_kernel(
         reduced = tl.full((BLOCK,), -float("inf"), tl.float32)
         for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
             query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
-            flat_row = (request * NUM_LAYERS + layer) * NUM_QUERY_HEADS + query_head
+            flat_row = (request * NUM_LAYERS + layer) * NUM_Q_HEADS + query_head
             value = tl.load(
                 scores + flat_row * WIDTH + token,
                 mask=valid_token,
@@ -177,7 +176,7 @@ def _score_per_head_reduce_kernel(
             layer_max = tl.full((BLOCK,), -float("inf"), tl.float32)
             for query_in_group in tl.static_range(0, QUERY_GROUP_SIZE):
                 query_head = kv_head * QUERY_GROUP_SIZE + query_in_group
-                flat_row = (request * NUM_LAYERS + layer) * NUM_QUERY_HEADS + query_head
+                flat_row = (request * NUM_LAYERS + layer) * NUM_Q_HEADS + query_head
                 value = tl.load(
                     scores + flat_row * WIDTH + token,
                     mask=valid_token,
@@ -202,20 +201,15 @@ def prepare_per_head_scores(
     row_inv_std: torch.Tensor,
     selection_scores: torch.Tensor,
     selection_seq_lens: torch.Tensor,
-    request_count: int,
     *,
-    num_kv_heads: int,
     per_layer: bool,
     normalize_scores: bool,
 ) -> None:
     """Normalize and reduce score rows for either per-head eviction mode."""
-    request_count = int(request_count)
-    num_kv_heads = int(num_kv_heads)
-    _, num_layers, num_query_heads, width = scores.shape
-    selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
-    # 256 lanes / 4 warps, matching the settle shape.
-    stats_block = 256
-    rows = num_layers * num_query_heads
+    request_count, num_layers, num_q_heads, width = scores.shape
+    selection_rows = int(selection_scores.shape[1])
+    num_kv_heads = selection_rows // num_layers if per_layer else selection_rows
+    rows = num_layers * num_q_heads
     if normalize_scores:
         _score_row_stats_kernel[(request_count * rows,)](
             scores,
@@ -224,14 +218,9 @@ def prepare_per_head_scores(
             row_inv_std,
             ROWS=rows,
             WIDTH=width,
-            BLOCK=stats_block,
-            EPSILON=STD_EPSILON,
-            num_warps=4,
         )
-    reduction_block = 256
-    _score_per_head_reduce_kernel[
-        (request_count, selection_rows, triton.cdiv(width, reduction_block))
-    ](
+    # 256-token tiles match the reduce kernel's BLOCK default.
+    _score_per_head_reduce_kernel[(request_count, selection_rows, triton.cdiv(width, 256))](
         scores,
         valid_widths,
         row_mean,
@@ -239,37 +228,28 @@ def prepare_per_head_scores(
         selection_scores,
         selection_seq_lens,
         NUM_LAYERS=num_layers,
-        NUM_QUERY_HEADS=num_query_heads,
+        NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
-        QUERY_GROUP_SIZE=num_query_heads // num_kv_heads,
-        SELECTION_ROWS=selection_rows,
         WIDTH=width,
         PER_LAYER=per_layer,
         NORMALIZE=normalize_scores,
-        BLOCK=reduction_block,
-        num_warps=4,
     )
 
 
 # ---- Selection finalize: settle threshold ties into the kept-ordinal rows ----
 
 
-# Settle launch shape, shared by every launch site.
-SETTLE_BLOCK = 256
-SETTLE_NUM_WARPS = 4
-
-
 @triton.jit
 def _settle_ties_kernel(
-    scores,
-    seq_lens,
-    prompt_offsets,
-    provisional_indices,
-    output_indices,
+    selection_scores_rows,
+    selection_row_lengths,
+    token_starts,
+    provisional_rows,
+    kept_ordinal_rows,
     WIDTH: tl.constexpr,
     KEEP_COUNT: tl.constexpr,
     SELECTION_ROWS: tl.constexpr,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr = 256,
 ):
     """Settle one selection row's ties into its kept-ordinal output row
     (threshold recovery with sentinel-skip, strictly-greater count,
@@ -278,12 +258,12 @@ def _settle_ties_kernel(
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
     row = request * SELECTION_ROWS + selection_domain
-    row_output = output_indices + row * KEEP_COUNT
-    row_scores = scores + row * WIDTH
-    row_selected = provisional_indices + row * KEEP_COUNT
+    row_output = kept_ordinal_rows + row * KEEP_COUNT
+    row_scores = selection_scores_rows + row * WIDTH
+    row_selected = provisional_rows + row * KEEP_COUNT
     # Rebases the decode-relative ordinals to absolute positions (per request:
     # every selection row of a request shares its pinned prompt length).
-    prompt_len = tl.load(prompt_offsets + request)
+    prompt_len = tl.load(token_starts + request)
 
     threshold = float("inf")
     for start in tl.static_range(0, KEEP_COUNT, BLOCK):
@@ -303,7 +283,7 @@ def _settle_ties_kernel(
         ).to(tl.float32)
         threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
 
-    seq_len = tl.load(seq_lens + row)
+    seq_len = tl.load(selection_row_lengths + row)
     greater_count = 0
     for start in tl.static_range(0, WIDTH, BLOCK):
         token_index = start + tl.arange(0, BLOCK)

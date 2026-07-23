@@ -31,46 +31,42 @@ import torch
 import triton
 import triton.language as tl
 
-# Pack launch shape, shared by every family's pack launch.
-PACK_BLOCK = 256
-PACK_NUM_WARPS = 4
-
 
 @triton.jit
 def _pack_move_sources_kernel(
     kept_ordinal_rows,
     valid_seq_lens,
-    dense_offsets,
-    dense_indices,
-    swa_offsets,
-    swa_indices,
+    dense_move_offsets,
+    dense_move_indices,
+    swa_move_offsets,
+    swa_move_indices,
     KEEP_COUNT: tl.constexpr,
     DECISION_ROWS: tl.constexpr,
-    DENSE_TOTAL: tl.constexpr,
-    SWA_TOTAL: tl.constexpr,
     MOVE_CAPACITY: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
-    SWA_WINDOW: tl.constexpr,
-    BROADCAST: tl.constexpr,
     PER_LAYER: tl.constexpr,
-    HAS_SWA: tl.constexpr,
-    BLOCK: tl.constexpr,
+    DENSE_TOTAL: tl.constexpr,
+    SWA_TOTAL: tl.constexpr,
+    SWA_WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr = 256,
 ):
     """Pack one decision row into one family's move sources (increasing
     kept ordinals; C++ in-place copy contract): dense rows forward the row
     content verbatim for the first KEEP_COUNT moves, then append the
     protected tail; SWA rows write latest-window ordinals once per KV head."""
+    BROADCAST: tl.constexpr = DECISION_ROWS == 1
+    HAS_SWA: tl.constexpr = SWA_TOTAL > 0
     request = tl.program_id(0)
     decision_row = tl.program_id(1)
     row = request * DECISION_ROWS + decision_row
     kept_row = kept_ordinal_rows + row * KEEP_COUNT
-    dense_begin = tl.load(dense_offsets + request)
-    dense_end = tl.load(dense_offsets + request + 1)
+    dense_begin = tl.load(dense_move_offsets + request)
+    dense_end = tl.load(dense_move_offsets + request + 1)
     dense_count = dense_end - dense_begin
     valid_len = tl.load(valid_seq_lens + request)
     if HAS_SWA:
-        swa_begin = tl.load(swa_offsets + request)
-        swa_end = tl.load(swa_offsets + request + 1)
+        swa_begin = tl.load(swa_move_offsets + request)
+        swa_end = tl.load(swa_move_offsets + request + 1)
         swa_count = swa_end - swa_begin
     for move_start in tl.static_range(0, MOVE_CAPACITY, BLOCK):
         move = move_start + tl.arange(0, BLOCK)
@@ -84,19 +80,19 @@ def _pack_move_sources_kernel(
             # The one decision row per request feeds every KV head's packed row.
             for head in tl.static_range(0, NUM_KV_HEADS):
                 tl.store(
-                    dense_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
+                    dense_move_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
                     dense_source,
                     mask=move < dense_count,
                 )
         else:
             dense_output = decision_row.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
-            tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
+            tl.store(dense_move_indices + dense_output, dense_source, mask=move < dense_count)
         if HAS_SWA:
             swa_source = valid_len - SWA_WINDOW + move
             if BROADCAST:
                 for head in tl.static_range(0, NUM_KV_HEADS):
                     tl.store(
-                        swa_indices + head * SWA_TOTAL + swa_begin.to(tl.int64) + move,
+                        swa_move_indices + head * SWA_TOTAL + swa_begin.to(tl.int64) + move,
                         swa_source,
                         mask=move < swa_count,
                     )
@@ -108,7 +104,7 @@ def _pack_move_sources_kernel(
                 head = decision_row % NUM_KV_HEADS
                 swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
                 tl.store(
-                    swa_indices + swa_output,
+                    swa_move_indices + swa_output,
                     swa_source,
                     mask=swa_mask,
                 )
@@ -117,21 +113,21 @@ def _pack_move_sources_kernel(
 def _make_move_indices(
     index_prefix: Tuple[int, ...],
     moves_per_request: int,
-    request_count: int,
+    max_requests: int,
     device: torch.device,
 ) -> torch.Tensor:
     return torch.empty(
-        (*index_prefix, moves_per_request * request_count), dtype=torch.int32, device=device
+        (*index_prefix, moves_per_request * max_requests), dtype=torch.int32, device=device
     )
 
 
 def _compact_groups(
     entries: List[Tuple[int, torch.Tensor, torch.Tensor]],
     pool_keys: Tuple[object, ...],
-    device: torch.device,
     per_layer_slots: Optional[Dict[int, int]] = None,
 ) -> Tuple[Dict[str, object], ...]:
     """Batch layers into one ``sparse_kv_cache_compact_layers`` launch per uniform V2 pool."""
+    device = entries[0][1].device
     grouped = OrderedDict()
     for layer, pool, page_table in entries:
         key = (
@@ -172,8 +168,8 @@ def _compact_groups(
 
 def _launch_tuples(
     groups: Tuple[Dict[str, object], ...],
-    source: torch.Tensor,
-    offsets: torch.Tensor,
+    move_indices: torch.Tensor,
+    move_offsets: torch.Tensor,
     destination_bases: torch.Tensor,
 ) -> Tuple[tuple, ...]:
     return tuple(
@@ -181,8 +177,8 @@ def _launch_tuples(
             group["pools"],
             group["pool_pointers"],
             group["page_table"],
-            source,
-            offsets,
+            move_indices,
+            move_offsets,
             destination_bases,
             group["source_layer_indices"],
         )
@@ -203,15 +199,15 @@ def init_compaction_buffers(
     contract). ``target`` carries the resolved dense/SWA grouping inputs from
     the runtime layout (``per_layer_sources`` selects 3-D per-layer move rows)
     plus the decision inputs :func:`compact` packs each round:
-    ``kept_ordinal_rows`` (``request_capacity * decision_rows`` rows of
-    ``decode_keep_count`` int32 kept ordinals, forwarded verbatim), the
+    ``kept_ordinal_rows`` (``max_requests * decision_rows`` rows of
+    ``keep_count`` int32 kept ordinals, forwarded verbatim), the
     per-request ``decision_rows`` count (1 = one shared row broadcast over
     every KV head), and the staged per-request ``valid_seq_lens`` the
     protected tail rides after. ``draft`` is one all-or-none resolved branch
     (its dense-only moves broadcast the one shared decision row over the
     draft's own KV heads); ``capacities`` the request/keep/tail capacity
-    numbers. The returned contract exposes the agreed move-source buffers and
-    geometry constants; its launch tuples are private to :func:`compact`.
+    numbers. The returned contract exposes the SWA/draft geometry the caller
+    stages against; its launch tuples are private to :func:`compact`.
     """
     layer_pools = target["layer_pools"]
     dense_layers = tuple(int(layer) for layer in target["dense_layers"])
@@ -220,7 +216,7 @@ def init_compaction_buffers(
     kv_block_offsets = target["kv_block_offsets"]
     page_table_slots = target["page_table_slots"]
     layer_group_representative = target["layer_group_representative"]
-    prompt_offsets = target["prompt_offsets"]
+    token_starts = target["token_starts"]
     dense_move_offsets = target["dense_move_offsets"]
     swa_move_offsets = target["swa_move_offsets"]
     swa_window = target["swa_window"]
@@ -230,8 +226,8 @@ def init_compaction_buffers(
     valid_seq_lens = target["valid_seq_lens"]
 
     device = layer_pools[dense_layers[0]].device
-    request_count = int(capacities["request_capacity"])
-    decode_keep_count = int(capacities["decode_keep_count"])
+    max_requests = int(capacities["max_requests"])
+    keep_count = int(capacities["keep_count"])
     protected_tail_capacity = int(capacities["protected_tail_capacity"])
 
     # Pool shape [pages, K/V, heads, tokens, dim].
@@ -239,17 +235,15 @@ def init_compaction_buffers(
     dense_index_prefix = (len(dense_layers), num_kv_heads) if per_layer_sources else (num_kv_heads,)
     dense_move_indices = _make_move_indices(
         dense_index_prefix,
-        decode_keep_count + protected_tail_capacity,
-        request_count,
+        keep_count + protected_tail_capacity,
+        max_requests,
         device,
     )
     dense_entries = [
         (
             layer,
             layer_pools[layer],
-            kv_block_offsets[
-                page_table_slots[layer_group_representative[layer]], :request_count, 0
-            ],
+            kv_block_offsets[page_table_slots[layer_group_representative[layer]], :max_requests, 0],
         )
         for layer in dense_layers
     ]
@@ -262,11 +256,11 @@ def init_compaction_buffers(
         swa_window = 0
     else:
         swa_window = int(swa_window)
-        swa_destination_bases = torch.empty_like(prompt_offsets)
+        swa_destination_bases = torch.empty_like(token_starts)
         swa_move_indices = _make_move_indices(
             (num_kv_heads,),
             swa_window + protected_tail_capacity,
-            request_count,
+            max_requests,
             device,
         )
         # SWA layers are staged as their own page-table representatives.
@@ -274,7 +268,7 @@ def init_compaction_buffers(
             (
                 layer,
                 layer_pools[layer],
-                kv_block_offsets[page_table_slots[layer], :request_count, 0],
+                kv_block_offsets[page_table_slots[layer], :max_requests, 0],
             )
             for layer in swa_layers
         ]
@@ -285,22 +279,22 @@ def init_compaction_buffers(
     has_swa = swa_move_indices is not None
     swa_total = int(swa_move_indices.shape[-1]) if has_swa else 0
     # Widest per-request move count any staged offsets may express.
-    move_capacity = decode_keep_count + protected_tail_capacity
+    move_capacity = keep_count + protected_tail_capacity
     if has_swa:
         move_capacity = max(move_capacity, swa_window + protected_tail_capacity)
 
     target_launches = list(
         _launch_tuples(
-            _compact_groups(dense_entries, layer_pool_keys, device, dense_slots),
+            _compact_groups(dense_entries, layer_pool_keys, dense_slots),
             dense_move_indices,
             dense_move_offsets,
-            prompt_offsets,
+            token_starts,
         )
     )
     if swa_layers:
         target_launches.extend(
             _launch_tuples(
-                _compact_groups(swa_entries, layer_pool_keys, device),
+                _compact_groups(swa_entries, layer_pool_keys),
                 swa_move_indices,
                 swa_move_offsets,
                 swa_destination_bases,
@@ -318,18 +312,14 @@ def init_compaction_buffers(
             swa_move_indices,
         ),
         dict(
-            KEEP_COUNT=decode_keep_count,
+            KEEP_COUNT=keep_count,
             DECISION_ROWS=decision_rows,
-            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
-            SWA_TOTAL=swa_total,
             MOVE_CAPACITY=move_capacity,
             NUM_KV_HEADS=num_kv_heads,
-            SWA_WINDOW=swa_window,
-            BROADCAST=decision_rows == 1,
             PER_LAYER=per_layer_sources,
-            HAS_SWA=has_swa,
-            BLOCK=PACK_BLOCK,
-            num_warps=PACK_NUM_WARPS,
+            DENSE_TOTAL=int(dense_move_indices.shape[-1]),
+            SWA_TOTAL=swa_total,
+            SWA_WINDOW=swa_window,
         ),
     )
 
@@ -343,14 +333,14 @@ def init_compaction_buffers(
                 f"got {decision_rows} decision rows"
             )
         draft_layer_pools = draft["layer_pools"]
-        draft_layers = tuple(int(layer) for layer in draft["layers"])
+        draft_dense_layers = tuple(int(layer) for layer in draft["dense_layers"])
         draft_tail = int(draft["protected_tail_capacity"])
         # Own launch groups: the draft may use a different KV-head count.
-        draft_num_kv_heads = int(draft_layer_pools[draft_layers[0]].shape[2])
+        draft_num_kv_heads = int(draft_layer_pools[draft_dense_layers[0]].shape[2])
         draft_move_indices = _make_move_indices(
             (draft_num_kv_heads,),
-            decode_keep_count + draft_tail,
-            request_count,
+            keep_count + draft_tail,
+            max_requests,
             device,
         )
         draft_entries = [
@@ -359,58 +349,49 @@ def init_compaction_buffers(
                 draft_layer_pools[layer],
                 draft["kv_block_offsets"][
                     draft["page_table_slots"][draft["layer_group_representative"][layer]],
-                    :request_count,
+                    :max_requests,
                     0,
                 ],
             )
-            for layer in draft_layers
+            for layer in draft_dense_layers
         ]
         draft_launches = _launch_tuples(
-            _compact_groups(draft_entries, tuple(draft["layer_pool_keys"]), device),
+            _compact_groups(draft_entries, tuple(draft["layer_pool_keys"])),
             draft_move_indices,
-            draft["move_offsets"],
-            prompt_offsets,
+            draft["dense_move_offsets"],
+            token_starts,
         )
         draft_pack_launch = (
             1,
             (
                 kept_ordinal_rows,
                 valid_seq_lens,
-                draft["move_offsets"],
+                draft["dense_move_offsets"],
                 draft_move_indices,
                 None,
                 None,
             ),
             dict(
-                KEEP_COUNT=decode_keep_count,
+                KEEP_COUNT=keep_count,
                 DECISION_ROWS=1,
+                MOVE_CAPACITY=int(draft_move_indices.shape[-1]) // max_requests,
+                NUM_KV_HEADS=draft_num_kv_heads,
+                PER_LAYER=False,
                 DENSE_TOTAL=int(draft_move_indices.shape[-1]),
                 SWA_TOTAL=0,
-                MOVE_CAPACITY=int(draft_move_indices.shape[-1]) // request_count,
-                NUM_KV_HEADS=draft_num_kv_heads,
                 SWA_WINDOW=0,
-                BROADCAST=True,
-                PER_LAYER=False,
-                HAS_SWA=False,
-                BLOCK=PACK_BLOCK,
-                num_warps=PACK_NUM_WARPS,
             ),
         )
 
     return dict(
-        # Agreed decision buffers and geometry constants (the public interface).
-        dense_move_indices=dense_move_indices,
-        swa_move_indices=swa_move_indices,
-        draft_move_indices=draft_move_indices,
-        dense_total=int(dense_move_indices.shape[-1]),
-        swa_total=swa_total,
-        move_capacity=move_capacity,
-        num_kv_heads=num_kv_heads,
-        swa_window=swa_window,
+        # SWA/draft geometry the caller stages against (the public interface).
         has_swa=has_swa,
+        swa_window=swa_window,
         swa_destination_bases=swa_destination_bases,
         # Per-round SWA destination rebase delta.
-        swa_rebase_delta=decode_keep_count - swa_window,
+        swa_rebase_delta=keep_count - swa_window,
+        has_draft=draft is not None,
+        draft_move_indices=draft_move_indices,
         # Completion event: compact() records it after the last native launch.
         consume_done=torch.cuda.Event(),
         # Private launch tuples: only compact() interprets these.
@@ -418,7 +399,6 @@ def init_compaction_buffers(
         draft_launches=draft_launches,
         target_pack_launch=target_pack_launch,
         draft_pack_launch=draft_pack_launch,
-        has_draft=draft is not None,
     )
 
 

@@ -11,15 +11,7 @@ pre-settled rows). All outputs are integers, so comparisons are
 import pytest
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.compaction import PACK_BLOCK as _PACK_BLOCK
-from tensorrt_llm._torch.kv_cache_compression.compaction import PACK_NUM_WARPS as _PACK_NUM_WARPS
 from tensorrt_llm._torch.kv_cache_compression.compaction import _pack_move_sources_kernel
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    SETTLE_BLOCK as _SETTLE_BLOCK,
-)
-from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    SETTLE_NUM_WARPS as _SETTLE_NUM_WARPS,
-)
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     _settle_ties_kernel,
 )
@@ -174,8 +166,6 @@ def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
             WIDTH=width,
             KEEP_COUNT=keep_count,
             SELECTION_ROWS=selection_rows,
-            BLOCK=_SETTLE_BLOCK,
-            num_warps=_SETTLE_NUM_WARPS,
         )
         torch.cuda.synchronize(device)
 
@@ -259,16 +249,12 @@ def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, w
             swa_actual if has_swa else None,
             KEEP_COUNT=keep_count,
             DECISION_ROWS=selection_rows,
-            DENSE_TOTAL=dense_total,
-            SWA_TOTAL=swa_total if has_swa else 0,
             MOVE_CAPACITY=move_capacity,
             NUM_KV_HEADS=num_kv_heads,
-            SWA_WINDOW=swa_window if has_swa else 0,
-            BROADCAST=union,
             PER_LAYER=per_layer,
-            HAS_SWA=has_swa,
-            BLOCK=_PACK_BLOCK,
-            num_warps=_PACK_NUM_WARPS,
+            DENSE_TOTAL=dense_total,
+            SWA_TOTAL=swa_total if has_swa else 0,
+            SWA_WINDOW=swa_window if has_swa else 0,
         )
         torch.cuda.synchronize(device)
 
@@ -318,8 +304,6 @@ def test_settle_handles_topk_sentinel_padding():
         WIDTH=width,
         KEEP_COUNT=keep_count,
         SELECTION_ROWS=1,
-        BLOCK=_SETTLE_BLOCK,
-        num_warps=_SETTLE_NUM_WARPS,
     )
     torch.cuda.synchronize(device)
 

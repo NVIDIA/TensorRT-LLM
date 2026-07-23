@@ -160,12 +160,12 @@ def build_compaction(**overrides):
     if has_draft:
         draft = dict(
             layer_pools=args["draft_layer_pools"],
-            layers=args["draft_layers"],
+            dense_layers=args["draft_layers"],
             layer_group_representative=args["draft_layer_group_representative"],
             layer_pool_keys=args["draft_layer_pool_keys"],
             kv_block_offsets=args["draft_kv_block_offsets"],
             page_table_slots=args["draft_page_table_slots"],
-            move_offsets=args["draft_move_offsets"],
+            dense_move_offsets=args["draft_move_offsets"],
             protected_tail_capacity=draft_tail,
         )
     compaction = init_compaction_buffers(
@@ -178,7 +178,7 @@ def build_compaction(**overrides):
             layer_pool_keys=args["layer_pool_keys"],
             kv_block_offsets=args["kv_block_offsets"],
             page_table_slots=args["page_table_slots"],
-            prompt_offsets=args["prompt_offsets"],
+            token_starts=args["prompt_offsets"],
             dense_move_offsets=args["dense_move_offsets"],
             swa_move_offsets=args["swa_move_offsets"],
             per_layer_sources=per_layer,
@@ -187,8 +187,8 @@ def build_compaction(**overrides):
             valid_seq_lens=args["valid_sequence_lengths"],
         ),
         capacities=dict(
-            request_capacity=request_count,
-            decode_keep_count=keep_count,
+            max_requests=request_count,
+            keep_count=keep_count,
             protected_tail_capacity=tail,
         ),
         draft=draft,
@@ -238,7 +238,7 @@ def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None
     staging.bulk_consume_done = torch.cuda.Event()
     staging.copy_done = torch.cuda.Event()
     staging.copy_pending = False
-    staging._bulk_offsets_src = torch.empty(
+    staging._block_offsets_host = torch.empty(
         1, max_requests, 2, copy_block_count, dtype=torch.int32, device="cpu", pin_memory=True
     )
     staging._bulk_copy_idx_src = torch.arange(

@@ -184,7 +184,7 @@ def test_union_fusion_matches_split_pipeline(
 def test_union_fusion_frequency_count_guard_raises() -> None:
     """16 frequencies (head size 32) sit outside the fused kernel contract
     and are rejected at kernel construction."""
-    cutlass = pytest.importorskip("cutlass")
+    pytest.importorskip("cutlass")
 
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_cute_score_fused import (  # noqa: E501
         _TriAttentionScoreKernel,
@@ -195,12 +195,9 @@ def test_union_fusion_frequency_count_guard_raises() -> None:
             num_layers=1,
             seq_len=256,
             num_q_heads=8,
-            num_kv_heads=1,
             num_freqs=16,
-            tokens_per_block=128,
             pool_shape=(2, 2, 1, 128, 32),
             pool_strides=(8192, 4096, 4096, 32, 1),
-            pool_dtype=cutlass.BFloat16,
             page_shards=3,
         )
 

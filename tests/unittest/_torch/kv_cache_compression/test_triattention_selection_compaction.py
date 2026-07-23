@@ -17,8 +17,6 @@ from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import settle_top_tokens
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    SETTLE_BLOCK,
-    SETTLE_NUM_WARPS,
     prepare_per_head_scores,
 )
 
@@ -63,34 +61,34 @@ def _make_selection_buffers(
         stream=None,
     )
     bufs.valid_widths = torch.full((max_requests,), width, dtype=torch.int32, device=device)
-    bufs.prompt_offsets = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    bufs.token_starts_device = torch.zeros(max_requests, dtype=torch.int32, device=device)
     if eviction_mode == "union":
         bufs.selection_rows_per_request = 1
         bufs.combined = torch.empty((max_requests, width), dtype=torch.float32, device=device)
         # Padded rows carry zero valid width; their provisional TopK entries
         # must still be in-range ordinals for the finalizer's score gather.
-        bufs.final_indices = torch.zeros(
+        bufs.provisional_indices = torch.zeros(
             (max_requests, keep_count), dtype=torch.int32, device=device
         )
         bufs.keep = torch.empty((max_requests, keep_count), dtype=torch.int32, device=device)
         bufs.selection_scores_rows = bufs.combined
         bufs.selection_row_lengths = bufs.valid_widths
-        bufs.provisional_rows = bufs.final_indices
-        bufs.keep_rows = bufs.keep
+        bufs.provisional_rows = bufs.provisional_indices
+        bufs.kept_ordinal_rows = bufs.keep
     else:
         selection_rows = num_kv_heads if eviction_mode == "per_head" else num_layers * num_kv_heads
         bufs.selection_rows_per_request = selection_rows
         bufs.row_mean = torch.empty(
             max_requests, num_layers, num_query_heads, 1, dtype=torch.float32, device=device
         )
-        bufs.row_std = torch.empty_like(bufs.row_mean)
+        bufs.row_inv_std = torch.empty_like(bufs.row_mean)
         bufs.selection_scores = torch.empty(
             (max_requests, selection_rows, width), dtype=torch.float32, device=device
         )
-        bufs.row_seq_lens = torch.full(
+        bufs.selection_seq_lens = torch.full(
             (max_requests, selection_rows), width, dtype=torch.int32, device=device
         )
-        bufs.top_indices_i32 = torch.zeros(
+        bufs.provisional_indices = torch.zeros(
             (max_requests, selection_rows, keep_count), dtype=torch.int32, device=device
         )
         bufs.keep = torch.empty(
@@ -99,24 +97,22 @@ def _make_selection_buffers(
         bufs.selection_scores_rows = bufs.selection_scores.view(
             max_requests * selection_rows, width
         )
-        bufs.selection_row_lengths = bufs.row_seq_lens.view(-1)
-        bufs.provisional_rows = bufs.top_indices_i32.view(-1, keep_count)
-        bufs.keep_rows = bufs.keep.view(-1, keep_count)
+        bufs.selection_row_lengths = bufs.selection_seq_lens.view(-1)
+        bufs.provisional_rows = bufs.provisional_indices.view(-1, keep_count)
+        bufs.kept_ordinal_rows = bufs.keep.view(-1, keep_count)
     # The launch args mirror the product's ``bufs.settle_args``/
     # ``bufs.settle_kwargs`` order and keys exactly.
     bufs.settle_args = (
         bufs.selection_scores_rows,
         bufs.selection_row_lengths,
-        bufs.prompt_offsets,
+        bufs.token_starts_device,
         bufs.provisional_rows,
-        bufs.keep_rows,
+        bufs.kept_ordinal_rows,
     )
     bufs.settle_kwargs = dict(
         WIDTH=width,
         KEEP_COUNT=keep_count,
         SELECTION_ROWS=bufs.selection_rows_per_request,
-        BLOCK=SETTLE_BLOCK,
-        num_warps=SETTLE_NUM_WARPS,
     )
     return bufs
 
@@ -127,11 +123,9 @@ def _select_per_head(bufs, scores, *, normalize_scores):
         scores,
         bufs.valid_widths,
         bufs.row_mean,
-        bufs.row_std,
+        bufs.row_inv_std,
         bufs.selection_scores,
-        bufs.row_seq_lens,
-        bufs.max_requests,
-        num_kv_heads=bufs.num_kv_heads,
+        bufs.selection_seq_lens,
         per_layer=bufs.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
@@ -253,7 +247,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         max_requests=request_count,
     )
     bufs.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
-    bufs.prompt_offsets[:request_count].copy_(
+    bufs.token_starts_device[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
     bufs.combined.copy_(scores.amax(dim=1))
@@ -303,8 +297,6 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
         row_inv_std,
         selection_scores,
         selection_seq_lens,
-        request_count,
-        num_kv_heads=kv_heads,
         per_layer=per_layer,
         normalize_scores=normalize_scores,
     )
@@ -525,7 +517,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         num_slots=2,
     )
     prepared = [_make_prepared_item(request_id=7, seq_len=seq_len, round_start=0)]
-    execute_eviction_round(bufs, manager, None, prepared, normalize_scores=False)
+    execute_eviction_round(bufs, manager, prepared, normalize_scores=False)
     assert torch.equal(bufs.keep, expected_keep)
     torch.cuda.synchronize(device)
 
@@ -686,7 +678,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             # the derived move offsets stage keep_count + protected_tail
             # moves. Z-normalization is monotonic per row, so the raw-score
             # keep set is unchanged.
-            execute_eviction_round(bufs, manager, None, prepared, normalize_scores=True)
+            execute_eviction_round(bufs, manager, prepared, normalize_scores=True)
             selected = bufs.keep[0].clone().to(torch.long)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)

@@ -41,8 +41,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 from ..compaction import compact, init_compaction_buffers
 from .triattention_kernels import (
-    SETTLE_BLOCK,
-    SETTLE_NUM_WARPS,
     _gather_mean_phase_kernel,
     _settle_ties_kernel,
     grow_mean_phase_table,
@@ -81,12 +79,12 @@ def _allocate_page_table_plane(
     num_page_table_slots: int,
     token_capacity: int,
     max_requests: int,
-    device: torch.device,
 ) -> Dict[str, object]:
     representative_slots = {
         representative: int(key[1])
         for representative, key in zip(page_representatives, page_table_keys)
     }
+    device = layer_pools[page_representatives[0]].device
     tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
     page_count = (token_capacity + tokens_per_block - 1) // tokens_per_block
     copy_block_count = (page_count + 3) // 4 * 4
@@ -160,15 +158,14 @@ def init_eviction_buffers(
         num_page_table_slots,
         page_table_token_capacity,
         max_requests,
-        device,
     )
     bufs.representative_slots = plane["slots"]
     bufs.copy_block_count = plane["copy_block_count"]
-    bufs._bulk_offsets_src = plane["host"]
+    bufs._block_offsets_host = plane["host"]
     bufs.block_offsets_device = plane["dev"]
     # The draft is never scored: these offsets feed only the draft compacts.
     bufs.draft_block_offsets_device = None
-    bufs._draft_bulk_offsets_src = None
+    bufs._draft_block_offsets_host = None
     bufs.draft_copy_block_count = 0
     draft_page_slots: Dict[int, int] = {}
     if draft is not None:
@@ -181,11 +178,10 @@ def init_eviction_buffers(
             int(draft_layout["manager"].num_pools),
             int(draft["page_table_token_capacity"]),
             max_requests,
-            device,
         )
         draft_page_slots = draft_plane["slots"]
         bufs.draft_copy_block_count = draft_plane["copy_block_count"]
-        bufs._draft_bulk_offsets_src = draft_plane["host"]
+        bufs._draft_block_offsets_host = draft_plane["host"]
         bufs.draft_block_offsets_device = draft_plane["dev"]
 
     # ---- per-round metadata table: one H2D copy; move-offsets rows need the +1 column ----
@@ -228,15 +224,15 @@ def init_eviction_buffers(
         raise ValueError("scored layer index exceeds the calibrated layer extent")
     _rep_of = {layer: layers[0] for layers in dense_groups for layer in layers}
     page_table_slots = [bufs.representative_slots[_rep_of[layer]] for layer in dense_layers]
-    bufs.seg_req = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
+    seg_req_id = torch.arange(max_requests, dtype=torch.int32, device=device).repeat_interleave(
         bufs.num_layers
     )
-    seg_layer = torch.tensor(list(dense_layers), dtype=torch.int32, device=device).repeat(
+    seg_layer_id = torch.tensor(list(dense_layers), dtype=torch.int32, device=device).repeat(
         max_requests
     )
     block_offsets = bufs.block_offsets_device
     slots_t = torch.tensor(page_table_slots, dtype=torch.int64, device=device)
-    req_idx = bufs.seg_req.to(torch.int64)
+    req_idx = seg_req_id.to(torch.int64)
     slot_idx = slots_t.repeat(max_requests)
     seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
 
@@ -279,25 +275,22 @@ def init_eviction_buffers(
             num_q_heads // num_kv_heads_early,
             decode_width,
         )
-    bufs.union_rows = None
+    bufs.union_scores = None
     if union:
         # Bucket-wide rows; consumers mask by the per-request widths.
-        bufs.union_rows = torch.empty((max_requests, seq_len), dtype=torch.float32, device=device)
+        bufs.union_scores = torch.empty((max_requests, seq_len), dtype=torch.float32, device=device)
     try:
         bufs.runner = TriAttentionCuteScoreRunner(
             layer_pools=list(layer_pools),
             layer_indices=[int(layer) for layer in dense_layers],
             max_requests=max_requests,
-            num_layers=bufs.num_layers,
             seq_len=seq_len,
             num_q_heads=bufs.num_q_heads,
-            num_kv_heads=bufs.num_kv_heads,
             num_freqs=bufs.num_freqs,
-            tokens_per_block=bufs.tokens_per_block,
             page_ids=block_offsets.view(-1),
             seg_page_off=seg_page_off,
-            seg_req_id=bufs.seg_req,
-            seg_layer_id=seg_layer,
+            seg_req_id=seg_req_id,
+            seg_layer_id=seg_layer_id,
             # Pointer capture of the staged metadata rows.
             valid_seq_lens=bufs.valid_seq_lens_device,
             seg_out_offset=seg_out_offset,
@@ -322,13 +315,12 @@ def init_eviction_buffers(
 
     # ---- selection buffers --------------------------------------------------
     bufs.valid_widths = torch.full((max_requests,), decode_width, dtype=torch.int32, device=device)
-    bufs.prompt_offsets = bufs.token_starts_device
     if union:
         bufs.selection_rows_per_request = 1
         bufs.combined = torch.empty(
             (max_requests, decode_width), dtype=torch.float32, device=device
         )
-        bufs.final_indices = torch.empty(
+        bufs.provisional_indices = torch.empty(
             (max_requests, keep_count), dtype=torch.int32, device=device
         )
         # Kept decode ordinals only (prompt-length independent rows).
@@ -336,10 +328,10 @@ def init_eviction_buffers(
         # Row-major views consumed by the top-k settle launch.
         bufs.selection_scores_rows = bufs.combined
         bufs.selection_row_lengths = bufs.valid_widths
-        bufs.provisional_rows = bufs.final_indices
-        bufs.keep_rows = bufs.keep
+        bufs.provisional_rows = bufs.provisional_indices
+        bufs.kept_ordinal_rows = bufs.keep
         # Padded rows still need in-range ordinals for the finalizer's gather.
-        bufs.final_indices.zero_()
+        bufs.provisional_indices.zero_()
         bufs.score_output = None
     else:
         selection_rows = (
@@ -367,23 +359,23 @@ def init_eviction_buffers(
         )
         score_shape = (max_requests, bufs.num_layers, bufs.num_q_heads, 1)
         bufs.row_mean = torch.empty(score_shape, dtype=torch.float32, device=device)
-        bufs.row_std = torch.empty_like(bufs.row_mean)
+        bufs.row_inv_std = torch.empty_like(bufs.row_mean)
         bufs.selection_scores = torch.empty(
             (max_requests, selection_rows, decode_width), dtype=torch.float32, device=device
         )
-        bufs.row_seq_lens = torch.full(
+        bufs.selection_seq_lens = torch.full(
             (max_requests, selection_rows), decode_width, dtype=torch.int32, device=device
         )
         selection_shape = (max_requests, selection_rows, keep_count)
-        bufs.top_indices_i32 = torch.empty(selection_shape, dtype=torch.int32, device=device)
+        bufs.provisional_indices = torch.empty(selection_shape, dtype=torch.int32, device=device)
         bufs.keep = torch.empty(selection_shape, dtype=torch.int32, device=device)
         bufs.selection_scores_rows = bufs.selection_scores.view(
             max_requests * selection_rows, decode_width
         )
-        bufs.selection_row_lengths = bufs.row_seq_lens.view(-1)
-        bufs.provisional_rows = bufs.top_indices_i32.view(-1, keep_count)
-        bufs.keep_rows = bufs.keep.view(-1, keep_count)
-        bufs.top_indices_i32.zero_()
+        bufs.selection_row_lengths = bufs.selection_seq_lens.view(-1)
+        bufs.provisional_rows = bufs.provisional_indices.view(-1, keep_count)
+        bufs.kept_ordinal_rows = bufs.keep.view(-1, keep_count)
+        bufs.provisional_indices.zero_()
 
     # ---- compaction contract + decision-materialization prebinds ------------
     per_layer = eviction_mode == "per_layer_perhead"
@@ -392,12 +384,12 @@ def init_eviction_buffers(
         draft_layout = draft["layout"]
         draft_contract = dict(
             layer_pools=draft_layout["layer_pools"],
-            layers=list(draft_layout["dense_layers"]),
+            dense_layers=list(draft_layout["dense_layers"]),
             layer_group_representative=draft_layout["layer_group_representative"],
             layer_pool_keys=list(draft_layout["layer_pool_keys"]),
             kv_block_offsets=bufs.draft_block_offsets_device,
             page_table_slots=draft_page_slots,
-            move_offsets=draft_move_offsets_row,
+            dense_move_offsets=draft_move_offsets_row,
             protected_tail_capacity=int(draft["protected_tail_capacity"]),
         )
     contract = init_compaction_buffers(
@@ -410,19 +402,19 @@ def init_eviction_buffers(
             layer_pool_keys=list(layer_pool_keys),
             kv_block_offsets=bufs.block_offsets_device,
             page_table_slots=bufs.representative_slots,
-            prompt_offsets=bufs.token_starts_device,
+            token_starts=bufs.token_starts_device,
             # Per-round tails: the move offsets ride the staged metadata rows.
             dense_move_offsets=dense_move_offsets_row,
             swa_move_offsets=swa_move_offsets_row,
             per_layer_sources=per_layer,
             # The decision rows the contract packs into move sources.
-            kept_ordinal_rows=bufs.keep_rows,
+            kept_ordinal_rows=bufs.kept_ordinal_rows,
             decision_rows=bufs.selection_rows_per_request,
             valid_seq_lens=bufs.valid_seq_lens_device,
         ),
         capacities=dict(
-            request_capacity=max_requests,
-            decode_keep_count=keep_count,
+            max_requests=max_requests,
+            keep_count=keep_count,
             protected_tail_capacity=int(protected_tail_capacity),
         ),
         draft=draft_contract,
@@ -434,16 +426,14 @@ def init_eviction_buffers(
     bufs.settle_args = (
         bufs.selection_scores_rows,
         bufs.selection_row_lengths,
-        bufs.prompt_offsets,
+        bufs.token_starts_device,
         bufs.provisional_rows,
-        bufs.keep_rows,
+        bufs.kept_ordinal_rows,
     )
     bufs.settle_kwargs = dict(
         WIDTH=decode_width,
         KEEP_COUNT=keep_count,
         SELECTION_ROWS=bufs.selection_rows_per_request,
-        BLOCK=SETTLE_BLOCK,
-        num_warps=SETTLE_NUM_WARPS,
     )
 
     # ---- round-ordering events ----------------------------------------------
@@ -459,9 +449,8 @@ def _stage_block_offsets(
     bufs: SimpleNamespace,
     manager: KVCacheManagerV2,
     request_ids: List[int],
-    current_stream: torch.cuda.Stream,
-    source: torch.Tensor,
-    destination: torch.Tensor,
+    host_block_offsets: torch.Tensor,
+    device_block_offsets: torch.Tensor,
     copy_block_count: int,
 ) -> None:
     """Gather the pinned snapshot before the async device copy: resize mutates the live host table."""
@@ -469,21 +458,21 @@ def _stage_block_offsets(
         bufs.copy_done.synchronize()
     manager.index_mapper.gather_k_block_offsets(
         manager.host_kv_cache_block_offsets,
-        source,
+        host_block_offsets,
         request_ids,
         copy_block_count,
     )
     manager._stream.wait_event(bufs.copy_done)
     copy_batch_block_offsets_to_device(
-        source,
-        destination,
+        host_block_offsets,
+        device_block_offsets,
         bufs._bulk_copy_idx_src[: len(request_ids)],
         manager.index_scales,
         manager.kv_offset,
         manager._stream.cuda_stream,
     )
     bufs.bulk_copy_done.record(manager._stream)
-    current_stream.wait_event(bufs.bulk_copy_done)
+    torch.cuda.current_stream(bufs.device).wait_event(bufs.bulk_copy_done)
 
 
 def _cohort_move_offsets(
@@ -534,8 +523,8 @@ def settle_top_tokens(bufs: SimpleNamespace, request_count: int) -> None:
 def execute_eviction_round(
     bufs: SimpleNamespace,
     manager: KVCacheManagerV2,
-    draft_manager: Optional[KVCacheManagerV2],
     prepared: Sequence[Dict[str, object]],
+    draft_manager: Optional[KVCacheManagerV2] = None,
     *,
     normalize_scores: bool,
 ) -> None:
@@ -580,8 +569,7 @@ def execute_eviction_round(
             bufs,
             manager,
             request_ids,
-            stream,
-            bufs._bulk_offsets_src,
+            bufs._block_offsets_host,
             bufs.block_offsets_device,
             bufs.copy_block_count,
         )
@@ -590,8 +578,7 @@ def execute_eviction_round(
                 bufs,
                 draft_manager,
                 request_ids,
-                stream,
-                bufs._draft_bulk_offsets_src,
+                bufs._draft_block_offsets_host,
                 bufs.draft_block_offsets_device,
                 bufs.draft_copy_block_count,
             )
@@ -610,13 +597,13 @@ def execute_eviction_round(
                 bufs.round_starts_device,
                 bufs.phase["cos"],
                 bufs.phase["sin"],
-                bufs.mean_cos,
-                bufs.mean_sin,
+                bufs.phase["rows"],
                 bufs.valid_seq_lens_device,
                 bufs.token_starts_device,
+                bufs.mean_cos,
+                bufs.mean_sin,
                 bufs.valid_widths,
                 bufs.swa_destination_bases,
-                bufs.phase["rows"],
                 bufs.swa_rebase_delta,
                 NUM_FREQS=bufs.phase_num_freqs,
                 F_BLOCK=bufs.phase_f_block,
@@ -625,11 +612,11 @@ def execute_eviction_round(
             )
             if union:
                 bufs.runner.launch_union_fusion(
-                    request_count, bufs.mean_cos, bufs.mean_sin, bufs.union_rows[:request_count]
+                    request_count, bufs.mean_cos, bufs.mean_sin, bufs.union_scores[:request_count]
                 )
-                columns = min(bufs.union_rows.shape[1], bufs.combined.shape[1])
+                columns = min(bufs.union_scores.shape[1], bufs.combined.shape[1])
                 bufs.combined[:request_count, :columns].copy_(
-                    bufs.union_rows[:request_count, :columns]
+                    bufs.union_scores[:request_count, :columns]
                 )
             else:
                 bufs.runner.launch(request_count, bufs.mean_cos, bufs.mean_sin)
@@ -671,11 +658,9 @@ def execute_eviction_round(
                     bufs.score_output[:request_count],
                     bufs.valid_widths,
                     bufs.row_mean,
-                    bufs.row_std,
+                    bufs.row_inv_std,
                     bufs.selection_scores,
-                    bufs.row_seq_lens,
-                    request_count,
-                    num_kv_heads=bufs.num_kv_heads,
+                    bufs.selection_seq_lens,
                     per_layer=bufs.eviction_mode == "per_layer_perhead",
                     normalize_scores=normalize_scores,
                 )
@@ -1025,13 +1010,12 @@ class TriAttention(BaseKVCacheCompressionManager):
 
         if not prepared:
             return
-        num_layers = self._num_layers_from_manager()
         # Ungated NVTX: the due count in the message shows each round's size.
         with nvtx_range(
             f"triattention.evict_request_group reqs={len(prepared)}",
             color="purple",
         ):
-            compacted = self._evict_requests(prepared, num_layers)
+            compacted = self._evict_requests(prepared)
         self._resize_compacted_requests(compacted)
 
     def _resize_compacted_requests(self, prepared) -> None:
@@ -1076,9 +1060,9 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _local_score_calibration(
         self,
-        num_layers: int,
         global_layers: List[int],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_layers = len(global_layers)
         if global_layers and max(global_layers) >= self._triattn_q_real.shape[0]:
             raise ValueError(
                 f"TriAttention calibration has {self._triattn_q_real.shape[0]} layers, "
@@ -1243,9 +1227,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             manager,
             global_layers,
             dense_layers=dense_layers,
+            dense_storage_groups=self._dense_layer_pool_groups(dense_layers, global_layers),
             swa_layers=swa_layers,
             swa_window=swa_window,
-            dense_storage_groups=self._dense_layer_pool_groups(dense_layers, global_layers),
             what="",
         )
         self._runtime_kv_layout_cache = layout
@@ -1257,9 +1241,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         global_layers: List[int],
         *,
         dense_layers: List[int],
+        dense_storage_groups: Optional[Dict[object, List[int]]],
         swa_layers: List[int],
         swa_window: Optional[int],
-        dense_storage_groups: Optional[Dict[object, List[int]]],
         what: str,
     ) -> Dict[str, object]:
         num_layers = len(global_layers)
@@ -1328,9 +1312,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             manager,
             global_layers,
             dense_layers=list(range(len(global_layers))),
+            dense_storage_groups=None,
             swa_layers=[],
             swa_window=None,
-            dense_storage_groups=None,
             what="draft ",
         )
         self._draft_runtime_kv_layout_cache = layout
@@ -1424,9 +1408,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 "rows": 0,
             }
             grow_mean_phase_table(self._phase, max(int(seq_capacity), 1))
-        q_real, q_imag, mlr_coef = self._local_score_calibration(
-            layout["num_layers"], layout["global_layers"]
-        )
+        q_real, q_imag, mlr_coef = self._local_score_calibration(layout["global_layers"])
         bufs = init_eviction_buffers(
             eviction_mode=self.eviction_mode,
             layout=layout,
@@ -1452,7 +1434,7 @@ class TriAttention(BaseKVCacheCompressionManager):
 
     def _page_table_pool_keys(
         self,
-        representatives: List[int],
+        local_layers: List[int],
         global_layers: List[int],
         manager: Optional[KVCacheManagerV2] = None,
     ) -> List[object]:
@@ -1463,7 +1445,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         try:
             return [
                 ("pool", int(layer_to_pool[layer_offsets[global_layers[layer]]]))
-                for layer in representatives
+                for layer in local_layers
             ]
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("KVCacheManagerV2 exposes an invalid layer-to-pool mapping") from exc
@@ -1484,18 +1466,17 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _evict_requests(
         self,
         prepared: List[Dict[str, object]],
-        num_layers: int,
     ) -> List[Dict[str, object]]:
         with nvtx_range_debug("triattention.resolve_layout", color="blue"):
-            layout = self._runtime_kv_layout(num_layers)
+            layout = self._runtime_kv_layout(self._num_layers_from_manager())
         with nvtx_range_debug("triattention.staging_lookup", color="blue"):
             # Retained spans always cover the model window (construction rejects budget < window).
             bufs = self._buffers_for(layout, prepared)
         execute_eviction_round(
             bufs,
             self.kv_cache_manager,
-            self.draft_kv_cache_manager,
             prepared,
+            self.draft_kv_cache_manager,
             normalize_scores=self.normalize_scores,
         )
         for item in prepared:

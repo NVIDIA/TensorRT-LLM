@@ -73,18 +73,14 @@ class _TriAttentionScoreKernel:
         num_layers: int,
         seq_len: int,
         num_q_heads: int,
-        num_kv_heads: int,
         num_freqs: int,
-        tokens_per_block: int,
         pool_shape: tuple[int, int, int, int, int],
         pool_strides: tuple[int, int, int, int, int],
-        pool_dtype: type[cutlass.Numeric],
         page_shards: int,
         write_partial_stats: bool = False,
     ) -> None:
         """Build the single validated production specialization."""
-        if pool_dtype is not cutlass.BFloat16:
-            raise ValueError("TriAttention CuTe score requires BF16 K pages")
+        self.num_physical_pages, _, num_kv_heads, tokens_per_block, pool_dim = pool_shape
         if num_freqs not in (32, 64):
             raise ValueError(
                 "TriAttention CuTe score requires 32 or 64 frequencies (head size 64/128)"
@@ -130,12 +126,7 @@ class _TriAttentionScoreKernel:
         self.producer_warp_id = 0
         self.physical_threads = THREADS
 
-        self.num_physical_pages, _, pool_kv_heads, pool_tokens, pool_dim = pool_shape
-        if (
-            pool_kv_heads != num_kv_heads
-            or pool_tokens != tokens_per_block
-            or pool_dim != 2 * num_freqs
-        ):
+        if pool_dim != 2 * num_freqs:
             raise ValueError("K pool shape does not match the CuTe score specialization")
         self.s_page, _, self.s_kv_head, self.s_slot, self.s_dim = pool_strides
         if self.s_slot != 2 * num_freqs or self.s_dim != 1:
@@ -1374,12 +1365,9 @@ class TriAttentionCuteScoreRunner:
         layer_pools: list[torch.Tensor],
         layer_indices: list[int],
         max_requests: int,
-        num_layers: int,
         seq_len: int,
         num_q_heads: int,
-        num_kv_heads: int,
         num_freqs: int,
-        tokens_per_block: int,
         page_ids: torch.Tensor,
         seg_page_off: torch.Tensor,
         seg_req_id: torch.Tensor,
@@ -1396,12 +1384,17 @@ class TriAttentionCuteScoreRunner:
         output: torch.Tensor,
         enable_partial_stats: bool = False,
     ) -> None:
+        # Pool shape [pages, K/V, heads, tokens, dim] of the anchor scored layer.
+        anchor_pool = layer_pools[layer_indices[0]]
+        num_layers = len(layer_indices)
+        num_kv_heads = int(anchor_pool.shape[2])
+        tokens_per_block = int(anchor_pool.shape[3])
         self.max_requests = int(max_requests)
-        self.num_layers = int(num_layers)
+        self.num_layers = num_layers
         # The widest score window (the whole bucket) sizes every start-dependent buffer.
         self.width = int(seq_len)
         self.num_q_heads = int(num_q_heads)
-        self.num_kv_heads = int(num_kv_heads)
+        self.num_kv_heads = num_kv_heads
         self.sm_count = int(torch.cuda.get_device_properties(output.device).multi_processor_count)
         self.enable_partial_stats = bool(enable_partial_stats)
         # One [stats_row, page_shard, {count, mean, m2}] record array.
@@ -1434,7 +1427,7 @@ class TriAttentionCuteScoreRunner:
             freq_scale_sq,
             output,
             self.partial_stats,
-            layer_pools[layer_indices[0]],
+            anchor_pool,
             self.descriptors,
         )
         # valid_seq_lens/token_starts are only 4-byte-aligned row views, read as per-CTA scalars.
@@ -1447,7 +1440,7 @@ class TriAttentionCuteScoreRunner:
             _to_cute(freq_scale_sq),
             _to_cute(output),
             _to_cute(self.partial_stats),
-            _to_cute(layer_pools[layer_indices[0]]),
+            _to_cute(anchor_pool),
             _to_cute(self.descriptors, assumed_align=128),
         )
         self._compiled: dict[int, object] = {}
@@ -1477,8 +1470,8 @@ class TriAttentionCuteScoreRunner:
             num_kv_heads,
             num_freqs,
             tokens_per_block,
-            tuple(int(value) for value in layer_pools[layer_indices[0]].shape),
-            tuple(int(value) for value in layer_pools[layer_indices[0]].stride()),
+            tuple(int(value) for value in anchor_pool.shape),
+            tuple(int(value) for value in anchor_pool.stride()),
         )
         tensor_specs = tuple(
             _tensor_spec(tensor)
@@ -1497,12 +1490,9 @@ class TriAttentionCuteScoreRunner:
             num_layers=num_layers,
             seq_len=seq_len,
             num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
             num_freqs=num_freqs,
-            tokens_per_block=tokens_per_block,
-            pool_shape=tuple(int(value) for value in layer_pools[layer_indices[0]].shape),
-            pool_strides=tuple(int(value) for value in layer_pools[layer_indices[0]].stride()),
-            pool_dtype=cutlass.BFloat16,
+            pool_shape=tuple(int(value) for value in anchor_pool.shape),
+            pool_strides=tuple(int(value) for value in anchor_pool.stride()),
         )
         if self.enable_partial_stats:
             variant_key = "triattention_cute_score_stats"
