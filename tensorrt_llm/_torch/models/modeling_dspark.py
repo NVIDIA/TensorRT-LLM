@@ -331,6 +331,8 @@ class DSparkDraftModel(nn.Module):
         # Shared with target; wired by the spec wrapper after construction.
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
+        self._loaded_weight_stages: set[int] = set()
+        self._cached_attn_stages: set[int] = set()
 
         # Scalar attention params for the captured-context draft attention. These
         # are the dense (compress_ratio == 0) DSparkAttention constants — see the
@@ -374,6 +376,20 @@ class DSparkDraftModel(nn.Module):
         skipped here (they would otherwise be transformed into the deep_gemm layout we
         don't consume).
         """
+        expected_stages = set(range(len(self.mtp_layers)))
+        if self._loaded_weight_stages != expected_stages:
+            raise RuntimeError(
+                "DSpark draft weight loading is incomplete: "
+                f"expected stages {sorted(expected_stages)}, "
+                f"loaded {sorted(self._loaded_weight_stages)}."
+            )
+        if self._cached_attn_stages != expected_stages:
+            raise RuntimeError(
+                "DSpark attention weight caching is incomplete: "
+                f"expected stages {sorted(expected_stages)}, "
+                f"cached {sorted(self._cached_attn_stages)}."
+            )
+
         attn_linear_ids = set()
         for stage in self.mtp_layers:
             for m in stage.self_attn.modules():
@@ -409,7 +425,18 @@ class DSparkDraftModel(nn.Module):
         ``q_a``+``kv`` and stores the scale interleaved). This mirrors the
         golden-validated dequant exactly.
         """
-        for s, stage in enumerate(self.mtp_layers):
+        present_stages = {
+            int(match.group(1))
+            for key in src
+            if (match := _DSPARK_MTP_RE.match(key)) is not None and ".attn." in key
+        }
+        for s in sorted(present_stages):
+            if s >= len(self.mtp_layers):
+                raise ValueError(
+                    f"DSpark checkpoint contains out-of-range draft stage {s}; "
+                    f"expected [0, {len(self.mtp_layers)})."
+                )
+            stage = self.mtp_layers[s]
             pref = f"mtp.{s}.attn."
             dev = stage.input_layernorm.weight.device
 
@@ -430,6 +457,7 @@ class DSparkDraftModel(nn.Module):
                 wo_b=deq("wo_b", True),
                 attn_sink=src[f"{pref}attn_sink"].to(dev).float(),
             )
+            self._cached_attn_stages.add(s)
 
     def cache_attn_weights_from_checkpoint(self, ckpt_dir: str, weight_map: Dict[str, str]) -> None:
         """Populate ``_dspark_attn`` by reading the ``mtp.{s}.attn.*`` tensors from the
@@ -1030,9 +1058,10 @@ class DSparkForCausalLM(nn.Module):
     ``embed_tokens`` / ``lm_head`` are shared with the target model
     (:meth:`load_weights_from_target_model`). The draft weights live in the SAME
     checkpoint under ``mtp.*``; :meth:`load_weights` remaps them
-    (``remap_dspark_draft_keys``), loads via ``DeepseekV4WeightLoader``, runs the
-    fp8 ``post_load_weights`` transforms, and caches the bf16 captured-context
-    attention weights from the in-memory state dict.
+    (``remap_dspark_draft_keys``), loads via ``DeepseekV4WeightLoader``, and
+    caches the bf16 captured-context attention weights from the in-memory state
+    dict. The model-level post-load phase runs the fp8 transforms once all draft
+    stages have been loaded.
     """
 
     def __init__(self, draft_config, aux_stream_dict=None, num_stages=None, block_size=None):
@@ -1083,22 +1112,45 @@ class DSparkForCausalLM(nn.Module):
             main_hidden, positions, slots, mask, kv_windows
         )
 
-    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
-        """Load the ``mtp.*`` draft weights from the (full) checkpoint dict.
+    def load_weights(
+        self,
+        weights: Dict[str, torch.Tensor],
+        weight_mapper=None,
+        initial_bucket_loading: bool = False,
+    ) -> None:
+        """Load the ``mtp.*`` draft weights from a full dict or one stage bucket.
 
         ``weight_mapper`` is accepted for interface parity with the draft-weight
         loader but unused: DSpark does its own ``mtp.{s}.* -> mtp_layers.{s}.*``
         remap (``remap_dspark_draft_keys``) onto the shared V4 weight loader.
         """
+        stages = {
+            int(match.group(1))
+            for key in weights
+            if (match := _DSPARK_MTP_RE.match(key)) is not None
+        }
+        out_of_range = sorted(stage for stage in stages if stage >= self.num_stages)
+        if out_of_range:
+            raise ValueError(
+                "DSpark checkpoint contains out-of-range draft stages "
+                f"{out_of_range}; expected [0, {self.num_stages})."
+            )
+        if initial_bucket_loading and len(stages) != 1:
+            raise ValueError(
+                f"A DSpark draft bucket must contain exactly one mtp.* stage, got {sorted(stages)}."
+            )
+
         remapped = remap_dspark_draft_keys(weights, num_stages=self.num_stages)
         logger.info(
             f"[DSpark] loading {len(remapped)} draft params across {self.num_stages} stages"
         )
-        DeepseekV4WeightLoader(self.dspark_model).load_weights(remapped)
-        self.dspark_model.post_load_weights()
+        DeepseekV4WeightLoader(self.dspark_model).load_weights(
+            remapped, initial_bucket_loading=initial_bucket_loading
+        )
         # bf16 captured-context attention path: dequantize the raw mtp.{s}.attn.*
         # tensors for ``dspark_attention_forward``.
         self.dspark_model.cache_attn_weights_from_state_dict(weights)
+        self.dspark_model._loaded_weight_stages.update(stages)
         logger.info("[DSpark] draft weight load complete")
 
     def load_weights_from_target_model(self, target_model):

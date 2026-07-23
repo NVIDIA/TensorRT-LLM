@@ -1,6 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+from collections.abc import Iterator
+from pathlib import Path
+from types import TracebackType
+from typing import Protocol, cast
 from unittest import mock
 
 import pytest
+import safetensors
+import torch
+from safetensors.torch import save_file
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
@@ -11,8 +22,331 @@ class MyError(Exception):
     pass
 
 
+class _SafeTensorHandle(Protocol):
+    def keys(self) -> list[str]: ...
+
+    def get_tensor(self, key: str) -> torch.Tensor: ...
+
+
+class _SafeOpenContext(Protocol):
+    def __enter__(self) -> _SafeTensorHandle: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None: ...
+
+
+def test_layerwise_safetensors_keeps_cross_shard_layer_atomic(tmp_path: Path) -> None:
+    shard1 = tmp_path / "model-00001-of-00002.safetensors"
+    shard2 = tmp_path / "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            "embed.weight": torch.tensor([1.0]),
+            "layers.0.attn.compressor.wkv.weight": torch.tensor([2.0]),
+        },
+        str(shard1),
+    )
+    save_file(
+        {
+            "layers.0.attn.compressor.wgate.weight": torch.tensor([3.0]),
+            "layers.1.attn.wq_b.weight": torch.tensor([4.0]),
+            "mtp.0.enorm.weight": torch.tensor([5.0]),
+        },
+        str(shard2),
+    )
+    weight_map = {
+        "embed.weight": shard1.name,
+        "layers.0.attn.compressor.wkv.weight": shard1.name,
+        "layers.0.attn.compressor.wgate.weight": shard2.name,
+        "layers.1.attn.wq_b.weight": shard2.name,
+        "mtp.0.enorm.weight": shard2.name,
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+
+    loader = HfWeightLoader()
+    buckets = []
+    for bucket in loader.iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()):
+        buckets.append(set(bucket.keys()))
+
+    assert buckets == [
+        {"embed.weight"},
+        {
+            "layers.0.attn.compressor.wkv.weight",
+            "layers.0.attn.compressor.wgate.weight",
+        },
+        {"layers.1.attn.wq_b.weight"},
+        {"mtp.0.enorm.weight"},
+    ]
+
+
+def test_layerwise_safetensors_without_index_discovers_keys(tmp_path: Path) -> None:
+    save_file(
+        {
+            "model.layers.2.foo.weight": torch.tensor([2.0]),
+            "lm_head.weight": torch.tensor([1.0]),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+
+    loader = HfWeightLoader()
+    buckets = [
+        set(bucket.keys())
+        for bucket in loader.iter_layer_weight_buckets(str(tmp_path), mapping=Mapping())
+    ]
+
+    assert buckets == [{"lm_head.weight"}, {"model.layers.2.foo.weight"}]
+
+
+def test_layerwise_safetensors_rejects_missing_index_shard(tmp_path: Path) -> None:
+    shard1 = tmp_path / "model-00001-of-00002.safetensors"
+    save_file({"layers.0.foo.weight": torch.tensor([1.0])}, str(shard1))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layers.0.foo.weight": shard1.name,
+                    "layers.1.foo.weight": "model-00002-of-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loader = HfWeightLoader()
+    with pytest.raises(RuntimeError, match="missing checkpoint files"):
+        next(loader.iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+
+def test_layerwise_safetensors_uses_natural_layer_order_and_preserves_values(
+    tmp_path: Path,
+) -> None:
+    save_file(
+        {
+            "layers.10.weight": torch.tensor([10.0]),
+            "layers.2.weight": torch.tensor([2.0]),
+            "mtp.1.weight": torch.tensor([101.0]),
+            "mtp.0.weight": torch.tensor([100.0]),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+
+    buckets = list(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+    assert [next(iter(bucket)) for bucket in buckets] == [
+        "layers.2.weight",
+        "layers.10.weight",
+        "mtp.0.weight",
+        "mtp.1.weight",
+    ]
+    assert [next(iter(bucket.values())).item() for bucket in buckets] == [2.0, 10.0, 100.0, 101.0]
+
+
+def test_layerwise_safetensors_rejects_empty_index(tmp_path: Path) -> None:
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(tmp_path / "model.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {}}), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="empty weight_map"):
+        next(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+
+def test_layerwise_safetensors_rejects_empty_unindexed_checkpoint(tmp_path: Path) -> None:
+    save_file({}, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(RuntimeError, match="contains no tensors"):
+        next(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+
+def test_layerwise_safetensors_rejects_duplicate_keys_without_index(tmp_path: Path) -> None:
+    for shard_idx in range(2):
+        save_file(
+            {"layers.0.weight": torch.tensor([float(shard_idx)])},
+            str(tmp_path / f"model-{shard_idx}.safetensors"),
+        )
+
+    with pytest.raises(RuntimeError, match="Duplicate tensor key"):
+        next(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+
+def test_layerwise_safetensors_rejects_multiple_indexes(tmp_path: Path) -> None:
+    shard = tmp_path / "model.safetensors"
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(shard))
+    index = json.dumps({"weight_map": {"layers.0.weight": shard.name}})
+    (tmp_path / "model.safetensors.index.json").write_text(index, encoding="utf-8")
+    (tmp_path / "weights.safetensors.index.json").write_text(index, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Multiple safetensors indexes"):
+        next(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+
+def test_layerwise_safetensors_rejects_index_key_missing_from_shard(tmp_path: Path) -> None:
+    shard = tmp_path / "model.safetensors"
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layers.1.weight": shard.name}}), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="references missing tensor keys"):
+        next(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+
+def test_layerwise_safetensors_ignores_consolidated_index_for_ordinary_weights(
+    tmp_path: Path,
+) -> None:
+    ordinary = tmp_path / "model.safetensors"
+    consolidated = tmp_path / "model-consolidated.safetensors"
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(ordinary))
+    save_file({"layers.1.weight": torch.tensor([2.0])}, str(consolidated))
+    (tmp_path / "model-consolidated.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layers.1.weight": consolidated.name}}), encoding="utf-8"
+    )
+
+    buckets = list(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+
+    assert [set(bucket) for bucket in buckets] == [{"layers.0.weight"}]
+
+
+def test_layerwise_safetensors_strictly_selects_consolidated_files(tmp_path: Path) -> None:
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(tmp_path / "model.safetensors"))
+    save_file(
+        {"layers.1.weight": torch.tensor([2.0])},
+        str(tmp_path / "model-consolidated.safetensors"),
+    )
+
+    ordinary = list(HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
+    consolidated = list(
+        HfWeightLoader().iter_layer_weight_buckets(
+            str(tmp_path), mapping=Mapping(), use_consolidated=True
+        )
+    )
+
+    assert [set(bucket) for bucket in ordinary] == [{"layers.0.weight"}]
+    assert [set(bucket) for bucket in consolidated] == [{"layers.1.weight"}]
+
+
+@pytest.mark.parametrize("use_consolidated", [False, True])
+def test_layerwise_safetensors_does_not_fallback_to_wrong_file_kind(
+    tmp_path: Path, use_consolidated: bool
+) -> None:
+    filename = "model.safetensors" if use_consolidated else "model-consolidated.safetensors"
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(tmp_path / filename))
+
+    with pytest.raises(RuntimeError, match="requires .*safetensors weights"):
+        next(
+            HfWeightLoader().iter_layer_weight_buckets(
+                str(tmp_path), mapping=Mapping(), use_consolidated=use_consolidated
+            )
+        )
+
+
+def test_layerwise_safetensors_handles_follow_bucket_lifetime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shard = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "layers.0.weight": torch.tensor([1.0]),
+            "layers.1.weight": torch.tensor([2.0]),
+        },
+        str(shard),
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "layers.0.weight": shard.name,
+                    "layers.1.weight": shard.name,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    opened: list[str | Path] = []
+    closed: list[str | Path] = []
+    real_safe_open = safetensors.safe_open
+
+    class RecordingHandle:
+        def __init__(self, path: str | Path, **kwargs: str) -> None:
+            self._context = cast(_SafeOpenContext, real_safe_open(path, **kwargs))
+            self._path = path
+
+        def __enter__(self) -> _SafeTensorHandle:
+            self._handle = self._context.__enter__()
+            opened.append(self._path)
+            return self._handle
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool | None:
+            closed.append(self._path)
+            return self._context.__exit__(exc_type, exc_value, traceback)
+
+    monkeypatch.setattr(safetensors, "safe_open", RecordingHandle)
+    iterator = HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping())
+
+    first = next(iterator)
+    assert first["layers.0.weight"].item() == 1.0
+    # Index validation opens and closes the shard once before the first bucket.
+    assert len(opened) == 2
+    assert len(closed) == 1
+
+    second = next(iterator)
+    assert second["layers.1.weight"].item() == 2.0
+    assert len(opened) == 3
+    assert len(closed) == 2
+
+    iterator.close()
+    assert len(closed) == 3
+
+
+def test_layerwise_safetensors_closes_handle_on_consumer_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shard = tmp_path / "model.safetensors"
+    save_file({"layers.0.weight": torch.tensor([1.0])}, str(shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layers.0.weight": shard.name}}), encoding="utf-8"
+    )
+    closed: list[bool] = []
+    real_safe_open = safetensors.safe_open
+
+    class RecordingHandle:
+        def __init__(self, path: str | Path, **kwargs: str) -> None:
+            self._context = cast(_SafeOpenContext, real_safe_open(path, **kwargs))
+
+        def __enter__(self) -> _SafeTensorHandle:
+            return self._context.__enter__()
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool | None:
+            closed.append(True)
+            return self._context.__exit__(exc_type, exc_value, traceback)
+
+    monkeypatch.setattr(safetensors, "safe_open", RecordingHandle)
+
+    with pytest.raises(MyError):
+        for _bucket in HfWeightLoader().iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()):
+            raise MyError
+
+    # Both the metadata-validation handle and active bucket handle are closed.
+    assert closed == [True, True]
+
+
 @pytest.fixture(autouse=True)
-def clean_weight_cache():
+def clean_weight_cache() -> Iterator[None]:
     HfWeightLoader._clear_weight_cache()
     yield
     HfWeightLoader._clear_weight_cache()

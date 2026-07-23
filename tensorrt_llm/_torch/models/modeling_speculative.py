@@ -1,4 +1,5 @@
 import inspect
+import os
 from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
 
@@ -2060,20 +2061,46 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                              allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
-                           weights: Dict,
-                           weight_mapper: Optional[BaseWeightMapper] = None):
-        args = inspect.getfullargspec(self.draft_model.load_weights).args
-        if "weight_mapper" in args:
-            self.draft_model.load_weights(weights=weights,
-                                          weight_mapper=weight_mapper)
-        else:
-            self.draft_model.load_weights(weights=weights)
+                           weights: Dict[str, torch.Tensor],
+                           weight_mapper: Optional[BaseWeightMapper] = None,
+                           initial_bucket_loading: bool = False) -> None:
+        parameters = inspect.signature(self.draft_model.load_weights).parameters
+        kwargs = {}
+        if "weight_mapper" in parameters:
+            kwargs["weight_mapper"] = weight_mapper
+        if "initial_bucket_loading" in parameters:
+            kwargs["initial_bucket_loading"] = initial_bucket_loading
+        elif initial_bucket_loading:
+            raise RuntimeError(
+                "initial_bucket_loading is not supported for this draft model")
+        self.draft_model.load_weights(weights=weights, **kwargs)
 
         if self.spec_config and (
                 not self.spec_config.spec_dec_mode.is_external_drafter()
                 or self.spec_config.spec_dec_mode.is_dflash()
                 or self.spec_config.spec_dec_mode.is_dspark()):
             self.draft_model.load_weights_from_target_model(self)
+
+    def supports_embedded_draft_weight_loading(
+            self, checkpoint_dir: str) -> bool:
+        """Whether draft buckets are embedded in the target checkpoint."""
+        if not (self.spec_config
+                and self.spec_config.spec_dec_mode.is_dspark()):
+            return False
+        speculative_model = self.spec_config.speculative_model
+        if speculative_model is None:
+            return False
+        draft_dir = os.fspath(speculative_model)
+        return os.path.realpath(draft_dir) == os.path.realpath(checkpoint_dir)
+
+    def is_embedded_draft_weight_bucket(
+            self, weights: Dict[str, torch.Tensor]) -> bool:
+        """Classify a DSpark ``mtp.*`` bucket without generic-loader key logic."""
+        draft_keys = [key.startswith("mtp.") for key in weights]
+        if any(draft_keys) and not all(draft_keys):
+            raise RuntimeError(
+                "Embedded draft bucket mixes mtp.* and target checkpoint keys.")
+        return bool(draft_keys) and all(draft_keys)
 
     def set_guided_decoder(self,
                            guided_decoder: CapturableGuidedDecoder) -> bool:

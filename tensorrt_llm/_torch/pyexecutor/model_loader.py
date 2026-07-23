@@ -10,8 +10,12 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
-    AutoCheckpointMapper, BaseCheckpointLoader)
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    AutoCheckpointMapper
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm._torch.weight_sharing import (
     IdentityCheckPolicy, PostTransformFeature, PostTransformProfile,
     PostTransformProfileRegistry, PostTransformQualificationDecision,
@@ -559,6 +563,7 @@ class ModelLoader:
             loads_draft_weights = (
                 self.spec_config is not None
                 and self.spec_config.spec_dec_mode.need_load_draft_weights())
+            draft_weights_streamed = False
             speculative_mode = self._speculative_mode_name(self.spec_config)
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below
@@ -594,26 +599,86 @@ class ModelLoader:
                         load_weights_kwargs[
                             "prepare_post_transform_receiver"] = self._setup_aliases
 
-                if hasattr(model, 'llm_checkpoint_dir'):
-                    weights = checkpoint_loader.load_weights(
-                        model.llm_checkpoint_dir, **load_weights_kwargs)
+                model_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
+                    model, 'llm_checkpoint_dir') else checkpoint_dir)
+                layerwise_loading = (checkpoint_loader.checkpoint_format == "HF"
+                                     and getattr(self.llm_args,
+                                                 'enable_hf_layerwise_loading',
+                                                 False))
+                if layerwise_loading:
+                    supports_embedded_draft = getattr(
+                        model, "supports_embedded_draft_weight_loading", None)
+                    embedded_draft_loading = (
+                        loads_draft_weights
+                        and supports_embedded_draft is not None
+                        and supports_embedded_draft(model_checkpoint_dir))
+                    if loads_draft_weights and not embedded_draft_loading:
+                        raise RuntimeError(
+                            "HF layer-wise loading does not yet support a "
+                            "separate speculative draft checkpoint.")
+                    # Validate the model contract before constructing the
+                    # generator: advancing it would open files and may start
+                    # mutating the model with the first bucket.
+                    load_parameters = inspect.signature(
+                        model.load_weights).parameters
+                    if "initial_bucket_loading" not in load_parameters:
+                        raise RuntimeError(
+                            "enable_hf_layerwise_loading is enabled, but "
+                            f"{type(model).__name__}.load_weights does not support "
+                            "initial_bucket_loading.")
+                    if embedded_draft_loading:
+                        draft_load_parameters = inspect.signature(
+                            model.load_draft_weights).parameters
+                        if "initial_bucket_loading" not in draft_load_parameters:
+                            raise RuntimeError(
+                                "enable_hf_layerwise_loading is enabled, but "
+                                f"{type(model).__name__}.load_draft_weights does not support "
+                                "initial_bucket_loading.")
+                    self.weight_mapper = (
+                        checkpoint_loader.get_initialized_weight_mapper(
+                            model, config)
+                        if "weight_mapper" in load_parameters else None)
+                    logger.info(
+                        "Loading HF checkpoint with one semantic layer per host-memory bucket."
+                    )
+                    for weight_bucket in checkpoint_loader.iter_layer_weight_buckets(
+                            model_checkpoint_dir, **load_weights_kwargs):
+                        load_method = model.load_weights
+                        weight_mapper = self.weight_mapper
+                        if (embedded_draft_loading
+                                and model.is_embedded_draft_weight_bucket(
+                                    weight_bucket)):
+                            load_method = model.load_draft_weights
+                            weight_mapper = None
+                            draft_weights_streamed = True
+                        self._call_load_weights(
+                            load_method,
+                            weight_bucket,
+                            weight_mapper,
+                            initial_bucket_loading=True)
+                        # copy_(..., non_blocking=True) and backend transforms
+                        # may still consume mmap-backed source storage.
+                        torch.cuda.synchronize()
+                        del weight_bucket
+                    if embedded_draft_loading and not draft_weights_streamed:
+                        raise RuntimeError(
+                            "HF layer-wise loading did not find any embedded "
+                            "draft weight buckets.")
                 else:
                     weights = checkpoint_loader.load_weights(
-                        checkpoint_dir, **load_weights_kwargs)
+                        model_checkpoint_dir, **load_weights_kwargs)
 
-                # When MX P2P succeeds, weights are already in model params.
-                # A non-empty dict contains size-mismatched tensors that
-                # should be merged via the standard disk pipeline.
-                weights_preloaded = checkpoint_loader.is_weights_preloaded()
-                self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
-                    model, config)
+                    # When MX P2P succeeds, weights are already in model params.
+                    # A non-empty dict contains size-mismatched tensors that
+                    # should be merged via the standard disk pipeline.
+                    weights_preloaded = checkpoint_loader.is_weights_preloaded()
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+                    if weights:
+                        self._call_load_weights(model.load_weights, weights,
+                                                self.weight_mapper)
 
-                if weights:
-                    self._call_load_weights(model.load_weights, weights,
-                                            self.weight_mapper)
-
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights and not draft_weights_streamed:
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -1395,17 +1460,38 @@ class ModelLoader:
         return config
 
     def _call_load_weights(self,
-                           load_method: Callable,
-                           weights,
-                           weight_mapper,
-                           allow_partial_loading: bool = False):
-        """Calls the model's weight loading method with the correct arguments."""
-        args = inspect.getfullargspec(load_method).args
+                           load_method: Callable[..., None],
+                           weights: dict[str, torch.Tensor]
+                           | ConsumableWeightsDict,
+                           weight_mapper: BaseWeightMapper | None,
+                           allow_partial_loading: bool = False,
+                           initial_bucket_loading: bool = False) -> None:
+        """Call a model weight loader with only the options it declares.
+
+        Args:
+            load_method: Bound model method that consumes checkpoint weights.
+            weights: Weight dictionary passed to ``load_method``.
+            weight_mapper: Initialized checkpoint-to-model name mapper.
+            allow_partial_loading: Whether a reload may omit model weights.
+            initial_bucket_loading: Whether ``weights`` is one bucket from the
+                initial semantic-layer checkpoint load.
+
+        Raises:
+            RuntimeError: If a requested option is unsupported by the model
+                method.
+        """
+        args = inspect.signature(load_method).parameters
         kargs = {}
         if "weight_mapper" in args:
             kargs["weight_mapper"] = weight_mapper
         if "allow_partial_loading" in args:
             kargs["allow_partial_loading"] = allow_partial_loading
-        else:
-            assert allow_partial_loading is False, "allow_partial_loading is not supported for this model"
+        elif allow_partial_loading:
+            raise RuntimeError(
+                "allow_partial_loading is not supported for this model")
+        if "initial_bucket_loading" in args:
+            kargs["initial_bucket_loading"] = initial_bucket_loading
+        elif initial_bucket_loading:
+            raise RuntimeError(
+                "initial_bucket_loading is not supported for this model")
         load_method(weights, **kargs)

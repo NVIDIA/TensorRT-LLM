@@ -5,9 +5,11 @@ import struct
 import textwrap
 import weakref
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 # from utils.util import default_dtype
@@ -31,8 +33,10 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
     DeepseekV4MTP,
+    DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
+    _is_deepseek_v4_semantic_layer_target,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
@@ -163,7 +167,7 @@ def test_deepseek_v4_model_defaults():
     }
 
 
-def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
+def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts() -> None:
     weights = {
         "layers.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),
         "layers.0.ffn.experts.0.w1.scale": torch.tensor([1, 2], dtype=torch.int8),
@@ -175,7 +179,7 @@ def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts():
     assert remapped["model.layers.0.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
 
 
-def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
+def test_deepseek_v4_weight_remap_for_fp8_routed_experts() -> None:
     weights = {
         "layers.0.ffn.experts.0.w1.weight": torch.zeros((2, 2), dtype=torch.float32),
         "layers.0.ffn.experts.0.w1.scale": torch.ones((2, 2), dtype=torch.float32),
@@ -185,6 +189,196 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
 
     assert "model.layers.0.mlp.experts.0.w1.weight_scale_inv" in remapped
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
+
+
+def test_deepseek_v4_weight_remap_for_mtp_mxfp4_routed_experts() -> None:
+    weights = {
+        "mtp.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),
+        "mtp.0.ffn.experts.0.w1.scale": torch.tensor([1, 2], dtype=torch.int8),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=61, kv_lora_rank=448)
+
+    assert remapped["model.layers.61.mlp.experts.0.w1.weight"].dtype == torch.uint8
+    assert remapped["model.layers.61.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
+
+
+def test_deepseek_v4_weight_remap_supports_multiple_mtp_layers() -> None:
+    weights = {
+        "mtp.0.enorm.weight": torch.tensor([1.0]),
+        "mtp.1.enorm.weight": torch.tensor([2.0]),
+        "mtp.1.head.weight": torch.tensor([3.0]),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=61, kv_lora_rank=448)
+
+    assert torch.equal(remapped["model.layers.61.enorm.weight"], weights["mtp.0.enorm.weight"])
+    assert torch.equal(remapped["model.layers.62.enorm.weight"], weights["mtp.1.enorm.weight"])
+    assert all(not key.endswith("head.weight") for key in remapped)
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {
+            "layers.0.attn.weight": torch.tensor([1.0]),
+            "layers.1.attn.weight": torch.tensor([2.0]),
+        },
+        {
+            "embed.weight": torch.tensor([1.0]),
+            "layers.0.attn.weight": torch.tensor([2.0]),
+        },
+        {
+            "mtp.0.enorm.weight": torch.tensor([1.0]),
+            "mtp.1.enorm.weight": torch.tensor([2.0]),
+        },
+    ],
+)
+def test_deepseek_v4_layerwise_loading_rejects_non_atomic_bucket(
+    weights: dict[str, torch.Tensor],
+) -> None:
+    loader = DeepseekV4WeightLoader.__new__(DeepseekV4WeightLoader)
+    loader.config = SimpleNamespace(num_hidden_layers=61)
+
+    with pytest.raises(
+        ValueError, match="exactly one target layer, draft layer, or top-level weights"
+    ):
+        loader.load_weights(weights, initial_bucket_loading=True)
+
+
+def _make_deepseek_v4_layer_scope_loader() -> tuple[DeepseekV4WeightLoader, nn.Module]:
+    model = nn.Module()
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Linear(1, 1, bias=False) for _ in range(4)])
+    model.top = nn.Linear(1, 1, bias=False)
+    for parameter in model.parameters():
+        nn.init.zeros_(parameter)
+    model.config = SimpleNamespace(
+        q_lora_rank=None,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=1,
+        num_hidden_layers=2,
+        num_nextn_predict_layers=1,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=True,
+        )
+    )
+    return DeepseekV4WeightLoader(model), model
+
+
+def test_deepseek_v4_layerwise_loading_accepts_single_base_layer() -> None:
+    loader, model = _make_deepseek_v4_layer_scope_loader()
+
+    loader.load_weights({"model.layers.0.weight": torch.ones((1, 1))}, initial_bucket_loading=True)
+
+    assert torch.equal(model.model.layers[0].weight, torch.ones((1, 1)))
+    assert all(torch.count_nonzero(model.model.layers[index].weight) == 0 for index in range(1, 4))
+    assert torch.count_nonzero(model.top.weight) == 0
+
+
+def test_deepseek_v4_layerwise_loading_accepts_single_mtp_layer() -> None:
+    loader, model = _make_deepseek_v4_layer_scope_loader()
+
+    loader.load_weights({"model.layers.2.weight": torch.ones((1, 1))}, initial_bucket_loading=True)
+
+    assert all(torch.count_nonzero(model.model.layers[index].weight) == 0 for index in range(2))
+    assert all(
+        torch.equal(model.model.layers[index].weight, torch.ones((1, 1))) for index in range(2, 4)
+    )
+    assert torch.count_nonzero(model.top.weight) == 0
+
+
+def test_deepseek_v4_layerwise_loading_accepts_top_level_bucket() -> None:
+    loader, model = _make_deepseek_v4_layer_scope_loader()
+
+    loader.load_weights({"top.weight": torch.ones((1, 1))}, initial_bucket_loading=True)
+
+    assert torch.equal(model.top.weight, torch.ones((1, 1)))
+    assert all(torch.count_nonzero(layer.weight) == 0 for layer in model.model.layers)
+
+
+def test_deepseek_v4_layerwise_loading_accepts_single_dspark_stage() -> None:
+    model = nn.Module()
+    model.mtp_layers = nn.ModuleList([nn.Linear(1, 1, bias=False) for _ in range(3)])
+    for parameter in model.parameters():
+        nn.init.zeros_(parameter)
+    model.config = SimpleNamespace(
+        q_lora_rank=None,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=1,
+        num_hidden_layers=2,
+        num_nextn_predict_layers=1,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=True,
+        )
+    )
+    loader = DeepseekV4WeightLoader(model)
+
+    loader.load_weights(
+        {"mtp_layers.1.weight": torch.ones((1, 1))},
+        initial_bucket_loading=True,
+    )
+
+    assert torch.count_nonzero(model.mtp_layers[0].weight) == 0
+    assert torch.equal(model.mtp_layers[1].weight, torch.ones((1, 1)))
+    assert torch.count_nonzero(model.mtp_layers[2].weight) == 0
+
+
+@pytest.mark.parametrize(
+    "module_layer,active_layer,num_hidden_layers,num_nextn_predict_layers,expected",
+    [
+        # Base-layer buckets select only the exact base layer.
+        (3, 3, 61, 1, True),
+        (4, 3, 61, 1, False),
+        # Regression: negative modulo must not classify base layers as MTP.
+        (0, 61, 61, 1, False),
+        (60, 61, 61, 1, False),
+        (0, 62, 61, 2, False),
+        # One checkpoint MTP layer may back multiple runtime replicas.
+        (61, 61, 61, 1, True),
+        (62, 61, 61, 1, True),
+        (63, 61, 61, 1, True),
+        # Multiple checkpoint MTP layers retain their modulo mapping.
+        (61, 61, 61, 2, True),
+        (63, 61, 61, 2, True),
+        (62, 61, 61, 2, False),
+        (62, 62, 61, 2, True),
+        (64, 62, 61, 2, True),
+        (63, 62, 61, 2, False),
+    ],
+)
+def test_deepseek_v4_semantic_layer_target(
+    module_layer: int,
+    active_layer: int,
+    num_hidden_layers: int,
+    num_nextn_predict_layers: int,
+    expected: bool,
+) -> None:
+    assert (
+        _is_deepseek_v4_semantic_layer_target(
+            module_layer,
+            active_layer,
+            num_hidden_layers,
+            num_nextn_predict_layers,
+        )
+        is expected
+    )
 
 
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
