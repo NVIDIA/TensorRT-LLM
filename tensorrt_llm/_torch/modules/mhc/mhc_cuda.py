@@ -576,6 +576,20 @@ _FUSED_HC_HALF_FMA_TN_KS = (
     (12, 1),
     (24, 1),
 )
+# Split O_b inputs are generation-only and support just the half-fused
+# backends. Keep a structurally diverse subset of the full FMA grid so the
+# runtime tuner makes the choice without multiplying startup work by every
+# historical pre-mapping experiment.
+_FUSED_HC_SPLIT_X_FMA_TN_KS = (
+    (1, 1),
+    (1, 2),
+    (2, 1),
+    (2, 2),
+    (3, 1),
+    (3, 2),
+    (4, 1),
+    (4, 2),
+)
 # Tactics for the half-fused MMA path: (num_k_splits,). Matches Path D
 # (pickFhcAllInOne) so the autotuner can compare half-fused vs all-in-one at
 # the same ks across the full range. Includes high-KS divisors of HIDDEN/64
@@ -664,6 +678,7 @@ def _fused_hc_call(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    x_num_splits: int = 1,
 ):
     torch.ops.trtllm.mhc_fused_hc(
         x_prev,
@@ -695,6 +710,7 @@ def _fused_hc_call(
         tile_m,
         norm_weight,
         norm_eps,
+        x_num_splits,
     )
 
 
@@ -738,6 +754,58 @@ _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
 
+def _mhc_gen_split4_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
+    del max_num_tokens
+    return (1, 2, 4, 8, 16)
+
+
+def _mhc_map_split4_tuning_bucket(num_tokens: int) -> int:
+    return min(1 << max(0, (num_tokens - 1).bit_length()), 16)
+
+
+def _mhc_gen_split2_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
+    del max_num_tokens
+    return (32, 64, 128)
+
+
+def _mhc_map_split2_tuning_bucket(num_tokens: int) -> int:
+    return min(max(1 << max(0, (num_tokens - 1).bit_length()), 32), 128)
+
+
+def _make_fused_hc_tuning_config(x_num_splits: int) -> TuningConfig:
+    if x_num_splits == 4:
+        gen_tuning_buckets = _mhc_gen_split4_tuning_buckets
+        map_to_tuning_bucket = _mhc_map_split4_tuning_bucket
+    elif x_num_splits == 2:
+        gen_tuning_buckets = _mhc_gen_split2_tuning_buckets
+        map_to_tuning_bucket = _mhc_map_split2_tuning_bucket
+    else:
+        gen_tuning_buckets = _mhc_gen_tuning_buckets
+        map_to_tuning_bucket = _mhc_map_to_tuning_bucket
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=1,  # residual_prev [B, n, hidden]
+                dim_idx=0,
+                gen_tuning_buckets=gen_tuning_buckets,
+                map_to_tuning_buckets=map_to_tuning_bucket,
+            ),
+        ),
+        constraint_specs=(
+            # x_prev (input[0]) dim 0 = x_num_splits * B
+            ConstraintSpec(
+                input_idx=0,
+                dim_idx=0,
+                infer_shape=lambda shapes: x_num_splits * shapes[1][0],
+            ),
+            # post_mix_prev (input[2]) dim 0 = B
+            ConstraintSpec(input_idx=2, dim_idx=0, infer_shape=lambda shapes: shapes[1][0]),
+            # comb_mix_prev (input[3]) dim 0 = B
+            ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[1][0]),
+        ),
+    )
+
+
 def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
     mma_ok = _fused_hc_mma_supported()
     if hidden_size is not None:
@@ -768,24 +836,9 @@ class MhcFusedHcRunner(TunableRunner):
     + auto bs).
     """
 
-    tuning_config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=0,  # x_prev [B, hidden]
-                dim_idx=0,
-                gen_tuning_buckets=_mhc_gen_tuning_buckets,
-                map_to_tuning_buckets=_mhc_map_to_tuning_bucket,
-            ),
-        ),
-        constraint_specs=(
-            # residual_prev (input[1]) dim 0 = M
-            ConstraintSpec(input_idx=1, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
-            # post_mix_prev (input[2]) dim 0 = M
-            ConstraintSpec(input_idx=2, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
-            # comb_mix_prev (input[3]) dim 0 = M
-            ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
-        ),
-    )
+    _TUNING_CONFIGS = {split: _make_fused_hc_tuning_config(split) for split in (1, 2, 4)}
+    # Preserve the public class attribute used by callers outside this module.
+    tuning_config = _TUNING_CONFIGS[1]
 
     def __init__(
         self,
@@ -808,8 +861,18 @@ class MhcFusedHcRunner(TunableRunner):
     def unique_id(self):
         return (self.n, self.hidden_size)
 
+    @classmethod
+    def get_tuning_config(cls, x_num_splits: int) -> TuningConfig:
+        return cls._TUNING_CONFIGS[x_num_splits]
+
     def get_valid_tactics(self, inputs, profile: OptimizationProfile, **kwargs):
-        M = inputs[0].shape[0]
+        del profile, kwargs
+        M = inputs[1].shape[0]
+        if M <= 0 or inputs[0].shape[0] % M != 0:
+            return []
+        x_num_splits = inputs[0].shape[0] // M
+        if x_num_splits not in (1, 2, 4):
+            return []
         tactics = []
         seen = set()
 
@@ -827,16 +890,21 @@ class MhcFusedHcRunner(TunableRunner):
         mma_ok = _fused_hc_mma_supported() and bool(mma_ks)
 
         if M <= 32:
-            for tn, ks, tm in _FUSED_HC_ALL_FMA_TN_KS_TM:
-                # Skip grids that wildly oversubscribe SMs.
-                m_batches = (M + tm - 1) // tm
-                if m_batches * (self.n * (2 + self.n) // tn) * ks > 148 * 4:
-                    continue
-                add(("fused_all_fma", tn, ks, 0, tm))
-            for tn, ks in _FUSED_HC_HALF_FMA_TN_KS:
+            if x_num_splits == 1:
+                for tn, ks, tm in _FUSED_HC_ALL_FMA_TN_KS_TM:
+                    # Skip grids that wildly oversubscribe SMs.
+                    m_batches = (M + tm - 1) // tm
+                    if m_batches * (self.n * (2 + self.n) // tn) * ks > 148 * 4:
+                        continue
+                    add(("fused_all_fma", tn, ks, 0, tm))
+            fma_tn_ks = (
+                _FUSED_HC_HALF_FMA_TN_KS if x_num_splits == 1 else _FUSED_HC_SPLIT_X_FMA_TN_KS
+            )
+            bigfuse_options = _FUSED_HC_BIGFUSE_BS if x_num_splits == 1 else (256, 512)
+            for tn, ks in fma_tn_ks:
                 if ks > 1 and M * (self.n * (2 + self.n) // tn) >= 148 * 2:
                     continue
-                for bs in _FUSED_HC_BIGFUSE_BS:
+                for bs in bigfuse_options:
                     add(("fused_half_fma", tn, ks, bs, 1))
 
         if mma_ok and M >= 32:
@@ -846,7 +914,7 @@ class MhcFusedHcRunner(TunableRunner):
                 if m_tiles * ks <= 148 * 4:
                     for bs in _fused_hc_mma_bigfuse_bs_options(M):
                         add(("fused_half_mma", 0, ks, bs, 1))
-                    if M >= 64:
+                    if M >= 64 and x_num_splits == 1:
                         add(("fused_all_mma", 0, ks, 0, 1))
 
         if not mma_ok and M > 32:
@@ -894,10 +962,23 @@ class MhcFusedHcRunner(TunableRunner):
             norm_weight = norm_weight.contiguous()
 
         B = residual_prev.shape[0]
+        if x_prev.ndim != 2 or x_prev.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"x_prev must have shape [SK * B, {self.hidden_size}], got {tuple(x_prev.shape)}"
+            )
+        if B <= 0 or x_prev.shape[0] % B != 0:
+            raise ValueError(
+                f"x_prev rows ({x_prev.shape[0]}) must be an integer multiple of residual rows ({B})"
+            )
+        x_num_splits = x_prev.shape[0] // B
+        if x_num_splits not in (1, 2, 4):
+            raise ValueError(f"unsupported x_prev split count: {x_num_splits}")
         residual_cur = torch.empty_like(residual_prev)
         post_mix_cur = torch.empty((B, self.n), dtype=torch.float32, device=x_prev.device)
         comb_mix_cur = torch.empty((B, self.n * self.n), dtype=torch.float32, device=x_prev.device)
-        layer_input_cur = torch.empty_like(x_prev)
+        layer_input_cur = torch.empty(
+            (B, self.hidden_size), dtype=torch.bfloat16, device=x_prev.device
+        )
         y_acc_ws, r_acc_ws, done_counter_ws = _alloc_fused_hc_scratch(
             backend=backend,
             B=B,
@@ -937,6 +1018,7 @@ class MhcFusedHcRunner(TunableRunner):
             self.sinkhorn_repeat,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            x_num_splits=x_num_splits,
         )
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
@@ -999,6 +1081,11 @@ def mhc_fused_hc(
 ):
     """Fuse the previous block's post_mapping with the current block's pre_mapping.
 
+    ``x_prev`` may be either reduced ``[B, hidden]`` or split-major O-projection
+    partials ``[SK * B, hidden]``. For SK2/SK4 the half-MMA path streams and
+    sums partials in its pmap x-ring, while half-FMA sums them at its register
+    x-load. Both accumulate in FP32.
+
     The autotuner chooses between four backends:
       * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM atomic + bigfuse.
       * "fused_half_fma" — 2-kernel pmap inline + FMA GEMM + sqrsum + bigfuse.
@@ -1030,26 +1117,74 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
+    B = residual_prev.shape[0]
+    if x_prev.ndim != 2 or B <= 0 or x_prev.shape[0] % B != 0:
+        raise ValueError(
+            f"x_prev must have split-major shape [SK * B, hidden], got {tuple(x_prev.shape)} "
+            f"for B={B}"
+        )
+    x_num_splits = x_prev.shape[0] // B
+    if x_num_splits not in (1, 2, 4):
+        raise ValueError(f"unsupported x_prev split count: {x_num_splits}")
+    inputs = [
+        x_prev,
+        residual_prev,
+        post_mix_prev,
+        comb_mix_prev,
+        w_t_cur,
+        hc_scale_cur,
+        hc_base_cur,
+    ]
     tuner = AutoTuner.get()
-    _, best_tactic = tuner.choose_one(
-        "trtllm::mhc_fused_hc",
-        [runner],
-        MhcFusedHcRunner.tuning_config,
-        [x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t_cur, hc_scale_cur, hc_base_cur],
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
+
+    def choose_tactic(tuning_inputs, split):
+        return tuner.choose_one(
+            f"trtllm::mhc_fused_hc::split{split}",
+            [runner],
+            runner.get_tuning_config(split),
+            tuning_inputs,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+    best_tactic = None
+    if tuner.is_tuning_mode:
+        # Engine warmup is context-only, so explicitly populate the generation
+        # split contracts. The actual kernel tactic for each contract remains
+        # entirely AutoTuner-selected.
+        tuning_contracts = [(4, min(B, 16))]
+        if B > 16:
+            tuning_contracts.append((2, min(B, 128)))
+        if B > 128:
+            tuning_contracts.append((1, B))
+        if (x_num_splits, B) not in tuning_contracts:
+            tuning_contracts.append((x_num_splits, B))
+
+        for tuning_split, tuning_m in tuning_contracts:
+            if tuning_split == x_num_splits and tuning_m == B:
+                tuning_inputs = inputs
+            else:
+                base_x = x_prev[:tuning_m]
+                tuning_inputs = [
+                    base_x.repeat(tuning_split, 1),
+                    residual_prev[:tuning_m],
+                    post_mix_prev[:tuning_m],
+                    comb_mix_prev[:tuning_m],
+                    w_t_cur,
+                    hc_scale_cur,
+                    hc_base_cur,
+                ]
+            _, tuning_tactic = choose_tactic(tuning_inputs, tuning_split)
+            if tuning_split == x_num_splits and tuning_m == B:
+                best_tactic = tuning_tactic
+    else:
+        _, best_tactic = choose_tactic(inputs, x_num_splits)
+
+    if best_tactic is None:
+        raise RuntimeError(f"mHC autotuner did not select a split-{x_num_splits} input tactic")
 
     return runner(
-        inputs=[
-            x_prev,
-            residual_prev,
-            post_mix_prev,
-            comb_mix_prev,
-            w_t_cur,
-            hc_scale_cur,
-            hc_base_cur,
-        ],
+        inputs=inputs,
         tactic=best_tactic,
         norm_weight=norm_weight,
         norm_eps=norm_eps,

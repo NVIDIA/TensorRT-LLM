@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.autotuner import OptimizationProfile
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
 
 BENCH_WARMUP = 50
@@ -555,6 +556,50 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
     assert supported_by_hidden_size[8192] == set()
 
 
+@pytest.mark.parametrize("x_num_splits", [1, 2, 4])
+def test_mhc_fused_hc_tuning_config_tracks_residual_m(x_num_splits: int):
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    config = MhcFusedHcRunner.get_tuning_config(x_num_splits)
+    dynamic_spec = config.dynamic_tensor_specs[0]
+
+    assert (dynamic_spec.input_idx, dynamic_spec.dim_idx) == (1, 0)
+    inferred_shapes = [[x_num_splits * 37, 7168], [37, 4, 7168], [37, 4], [37, 4, 4]]
+    assert config.constraint_specs[0].infer_shape(inferred_shapes) == x_num_splits * 37
+    assert config.constraint_specs[1].infer_shape(inferred_shapes) == 37
+    assert config.constraint_specs[2].infer_shape(inferred_shapes) == 37
+
+
+@pytest.mark.parametrize("x_num_splits", [2, 4])
+def test_mhc_fused_hc_split_inputs_exclude_unsupported_all_in_one_tactics(
+    x_num_splits: int, monkeypatch: pytest.MonkeyPatch
+):
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: True)
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=4,
+        hidden_size=7168,
+        rms_eps=1e-5,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=20,
+    )
+    m = 32
+    inputs = [
+        torch.empty((x_num_splits * m, 7168), device="meta", dtype=torch.bfloat16),
+        torch.empty((m, 4, 7168), device="meta", dtype=torch.bfloat16),
+        torch.empty((m, 4), device="meta"),
+        torch.empty((m, 4, 4), device="meta"),
+    ]
+
+    tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
+
+    assert tactics
+    assert all(tactic[0] in ("fused_half_mma", "fused_half_fma") for tactic in tactics)
+
+
 @pytest.mark.parametrize("n", [128, 2048])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
@@ -801,6 +846,64 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
             **bf16_tol,
             msg=f"[vs {gold}] tactic={tactic} n={n} hidden={hidden_size} layer_input mismatch",
         )
+
+
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        ("fused_half_mma", 0, 0, 0, 1),
+        ("fused_half_fma", 3, 2, 256, 1),
+    ],
+)
+@pytest.mark.parametrize("x_splits", [2, 4])
+def test_mhc_fused_hc_reduces_split_x_for_production_backends(
+    tactic: tuple[str, int, int, int, int], x_splits: int
+) -> None:
+    """Production half backends consume split-major O_b partials correctly."""
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    n, hidden_size, hc_mult = 32, 7168, 4
+    pre_data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+    torch.random.manual_seed(23)
+
+    x_partials = (
+        torch.randn((x_splits, n, hidden_size), dtype=torch.float32, device="cuda") * 0.25
+    ).bfloat16()
+    x_reduced = x_partials.float().sum(dim=0).bfloat16()
+    residual_prev = torch.randn(
+        (n, hc_mult, hidden_size), dtype=torch.float32, device="cuda"
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult), dtype=torch.float32, device="cuda") * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device="cuda") * 0.1
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+
+    def inputs(x_prev: torch.Tensor) -> list[torch.Tensor]:
+        return [
+            x_prev.contiguous(),
+            residual_prev,
+            post_mix_prev,
+            comb_mix_prev,
+            pre_data["fn"].contiguous(),
+            pre_data["hc_scale"].contiguous(),
+            pre_data["hc_base"].contiguous(),
+        ]
+
+    reference = tuple(output.clone() for output in runner(inputs(x_reduced), tactic=tactic))
+    split_output = runner(inputs(x_partials.reshape(x_splits * n, hidden_size)), tactic=tactic)
+
+    torch.testing.assert_close(split_output[0], reference[0], rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(split_output[1], reference[1], rtol=3e-3, atol=5e-3)
+    torch.testing.assert_close(split_output[2], reference[2], rtol=3e-3, atol=5e-3)
+    torch.testing.assert_close(split_output[3], reference[3], rtol=1e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize(

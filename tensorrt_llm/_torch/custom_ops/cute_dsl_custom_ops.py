@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import bisect
 import functools
 import itertools
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -3947,6 +3949,565 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
+    _Dsv4ObBuckets = Tuple[int, ...]
+    _DSV4_OB_TUNING_BUCKETS = {
+        1: (192, 256, 320, 384, 448, 512, 640, 768, 1024, 1280, 1536, 2048,
+            3072, 4096, 6144, 8192, 12288, 16384),
+        2: (32, 64, 128),
+        4: (1, 2, 4, 8, 16),
+    }
+
+    def _dsv4_ob_gen_tuning_buckets(max_num_tokens: int,
+                                    buckets: _Dsv4ObBuckets,
+                                    truncate: bool) -> _Dsv4ObBuckets:
+        if not truncate:
+            return buckets
+        # Include the first bucket above the engine's configured maximum.
+        return buckets[:bisect.bisect_left(buckets, max_num_tokens) + 1]
+
+    def _dsv4_ob_map_tuning_bucket(num_tokens: int,
+                                   buckets: _Dsv4ObBuckets) -> int:
+        index = min(bisect.bisect_left(buckets, num_tokens), len(buckets) - 1)
+        return buckets[index]
+
+    def _prepare_dsv4_ob_tuning_inputs(
+            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Restore the packed activation-scale layout after M-bucket expansion."""
+        a, sfa, b, sfb, output = inputs
+        m, packed_k = sfa.shape
+        aligned_m = pad_up(m, 4)
+        packed_sfa_storage = torch.empty_strided((aligned_m, packed_k),
+                                                 (1, aligned_m),
+                                                 dtype=sfa.dtype,
+                                                 device=sfa.device)
+        return [a, packed_sfa_storage[:m], b, sfb, output]
+
+    class Dsv4DeepGemmObWarmupRunner(TunableRunner):
+        """Precompile fused DSV4 O_b DeepGEMM layouts during engine startup."""
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, deep_gemm_gen_tuning_buckets), ),
+            constraint_specs=(
+                ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
+            ),
+            inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+            exclude_from_cache=True,
+        )
+
+        def __init__(self, output_dtype: torch.dtype):
+            self.output_dtype = output_dtype
+
+        def unique_id(self):
+            return (self.output_dtype, )
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            del inputs, profile
+            return [0]
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+        ) -> torch.Tensor:
+            del tactic
+            from tensorrt_llm import deep_gemm
+
+            a, sfa, b, sfb, output = inputs
+            deep_gemm.fp8_gemm_nt(
+                (a, sfa),
+                (b, sfb),
+                output,
+                c=None,
+                disable_ue8m0_cast=False,
+            )
+            return output
+
+    def warmup_dsv4_deep_gemm_ob(
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        max_num_tokens: int,
+    ) -> None:
+        """JIT all fused DSV4 O_b DeepGEMM M buckets before inference."""
+        if max_num_tokens <= 0:
+            return
+
+        n, k = weight.shape
+        packed_scale_k = 128 * 4
+        if k % packed_scale_k != 0:
+            raise ValueError(
+                f"DSV4 O_b K={k} must be divisible by {packed_scale_k}")
+
+        packed_k = k // packed_scale_k
+        aligned_m = pad_up(max_num_tokens, 4)
+        a = torch.empty((max_num_tokens, k),
+                        device=weight.device,
+                        dtype=torch.float8_e4m3fn)
+        sfa_storage = torch.empty_strided(
+            (aligned_m, packed_k),
+            (1, aligned_m),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        sfa = sfa_storage[:max_num_tokens]
+        output = torch.empty((max_num_tokens, n),
+                             device=weight.device,
+                             dtype=output_dtype)
+
+        tuner = AutoTuner.get()
+        if not tuner.is_tuning_mode:
+            raise RuntimeError(
+                "DSV4 DeepGEMM O_b warmup must run inside autotune()")
+        runner = Dsv4DeepGemmObWarmupRunner(output_dtype)
+        tuner.choose_one(
+            "trtllm::dsv4_deep_gemm_ob::startup_warmup",
+            [runner],
+            runner.tuning_config,
+            [a, sfa, weight, weight_scale, output],
+        )
+
+    def _make_dsv4_ob_tuning_config(num_splits: int) -> TuningConfig:
+        buckets = _DSV4_OB_TUNING_BUCKETS[num_splits]
+        return TuningConfig(
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0,
+                0,
+                functools.partial(_dsv4_ob_gen_tuning_buckets,
+                                  buckets=buckets,
+                                  truncate=num_splits == 1),
+                functools.partial(_dsv4_ob_map_tuning_bucket, buckets=buckets),
+            ), ),
+            constraint_specs=(
+                ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                ConstraintSpec(4, 0, lambda shapes: num_splits * shapes[0][0]),
+            ),
+            inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+            exclude_from_cache=True,
+        )
+
+    class CuteDSLFp8SplitKGemmRunner(TunableRunner):
+        """DSV4-Pro O_b runner using native block-scaled tcgen05 MMA."""
+
+        kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
+        kernel_cache = dict()
+        alpha_cache = dict()
+        active_clusters_cache = dict()
+        _TILE_M = 256
+        _SCALE_BLOCK_K = 128
+        _SCALES_PER_WORD = 4
+        _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
+        _SPLIT_K4_MAX_M = 16
+        _SPLIT_K2_MAX_M = 128
+
+        # Candidate pools contain structurally distinct, production-validated
+        # kernels. Runtime AutoTuner profiling, rather than an M-based table,
+        # selects the winner for every token bucket and GPU SKU.
+        _SPLIT_K4_TACTICS = (
+            ((128, 32), (1, 1), True, None, False),
+            ((128, 32), (1, 1), True, None, True),
+            ((256, 32), (2, 1), True, None, False),
+            ((256, 32), (2, 1), True, None, True),
+        )
+        _SPLIT_K2_TACTICS = (
+            ((128, 32), (1, 1), True, None, False),
+            ((128, 32), (1, 1), True, None, True),
+            ((256, 64), (2, 1), True, 8, False),
+            ((256, 64), (2, 1), True, 8, True),
+            ((256, 128), (2, 1), True, None, False),
+            ((256, 128), (2, 1), True, None, True),
+        )
+        _SPLIT_K1_TACTICS = (
+            ((128, 128), (1, 1), True, None, False),
+            ((128, 128), (1, 1), True, None, True),
+            ((256, 112), (2, 1), False, None, True),
+            ((256, 128), (2, 1), True, None, False),
+            ((256, 128), (2, 1), True, None, True),
+            ((256, 144), (2, 1), True, None, False),
+            ((256, 144), (2, 1), True, None, True),
+            ((256, 160), (2, 1), False, None, True),
+            ((256, 160), (2, 1), True, None, True),
+            ((256, 192), (2, 1), True, None, True),
+            ((256, 208), (2, 1), False, None, True),
+            ((256, 208), (2, 1), True, None, True),
+            ((256, 224), (2, 1), False, None, True),
+            ((256, 224), (2, 1), True, None, True),
+            ((256, 240), (2, 1), False, None, True),
+            ((256, 240), (2, 1), True, None, True),
+            ((256, 256), (2, 1), True, None, True),
+        )
+
+        _TUNING_CONFIGS = {
+            num_splits: _make_dsv4_ob_tuning_config(num_splits)
+            for num_splits in (1, 2, 4)
+        }
+
+        @staticmethod
+        def _select_num_splits(num_tokens: int) -> int:
+            """Resolve the shape-affecting split-output contract.
+
+            Unlike tile/cluster/stage choices, this value changes the public
+            output shape consumed by mHC and therefore must be resolved before
+            fake-tensor propagation. Kernel tactics within each fixed contract
+            are selected exclusively by AutoTuner.
+            """
+            env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
+            if env_split:
+                num_splits = env_split
+            elif 0 < num_tokens <= CuteDSLFp8SplitKGemmRunner._SPLIT_K4_MAX_M:
+                num_splits = 4
+            else:
+                num_splits = (2 if 0 < num_tokens <=
+                              CuteDSLFp8SplitKGemmRunner._SPLIT_K2_MAX_M else 1)
+            if num_splits not in (1, 2, 4):
+                raise ValueError(
+                    f"unsupported DeepSeek-V4 O_b split-K factor: {num_splits}")
+            return num_splits
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            self.use_tvm_ffi = use_tvm_ffi
+
+        def unique_id(self):
+            return (self.use_tvm_ffi, )
+
+        @classmethod
+        def get_tuning_config(cls, num_splits: int) -> TuningConfig:
+            return cls._TUNING_CONFIGS[num_splits]
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[tuple]:
+            del inputs, profile
+            num_splits = kwargs["num_splits"]
+            if num_splits == 4:
+                return list(self._SPLIT_K4_TACTICS)
+            if num_splits == 2:
+                return list(self._SPLIT_K2_TACTICS)
+            if num_splits == 1:
+                return list(self._SPLIT_K1_TACTICS)
+            raise ValueError(
+                f"unsupported DeepSeek-V4 O_b split-K factor: {num_splits}")
+
+        @classmethod
+        def _get_fallback_tactic(cls, num_splits: int) -> tuple:
+            if num_splits == 4:
+                return cls._SPLIT_K4_TACTICS[0]
+            if num_splits == 2:
+                return cls._SPLIT_K2_TACTICS[0]
+            if num_splits == 1:
+                return cls._SPLIT_K1_TACTICS[0]
+            raise ValueError(
+                f"unsupported DeepSeek-V4 O_b split-K factor: {num_splits}")
+
+        @staticmethod
+        def _get_compile_key(k: int, num_splits: int, mma_tiler_mn: tuple,
+                             cluster_shape_mn: tuple, swap_ab: bool,
+                             max_ab_stages: Optional[int], l2_swizzle: bool,
+                             max_active_clusters: int,
+                             use_tvm_ffi: bool) -> tuple:
+            # Exact problem dimensions and scale strides are runtime arguments.
+            # Do not add them here: doing so causes multi-second synchronous JIT
+            # compilation on previously unseen request token counts.
+            return (k, num_splits, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                    max_ab_stages, l2_swizzle, max_active_clusters, use_tvm_ffi)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            *,
+            tactic=-1,
+            num_splits: int,
+        ) -> None:
+            a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, output = inputs
+            m, k = a_tensor.shape
+            n = b_tensor.shape[0]
+
+            device_key = a_tensor.device
+            if tactic == -1:
+                tactic = self._get_fallback_tactic(num_splits)
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
+             l2_swizzle) = tactic
+            # The persistent grid is capped at max_active_clusters *clusters
+            # of this tactic's size*; querying it for the wrong cluster size
+            # halves the grid for (1, 1)-cluster tactics.
+            cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+            clusters_key = (device_key, cluster_size)
+            max_active_clusters = self.__class__.active_clusters_cache.get(
+                clusters_key)
+            if max_active_clusters is None:
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(cluster_size)
+                self.__class__.active_clusters_cache[
+                    clusters_key] = max_active_clusters
+            if swap_ab:
+                # Swap M/N to expose more output tiles.
+                kernel_m, kernel_n = n, m
+                kernel_a, kernel_b = b_tensor, a_tensor
+                kernel_sfa, kernel_sfb = b_sf_tensor, a_sf_tensor
+            else:
+                kernel_m, kernel_n = m, n
+                kernel_a, kernel_b = a_tensor, b_tensor
+                kernel_sfa, kernel_sfb = a_sf_tensor, b_sf_tensor
+            kernel_sfa_stride = kernel_sfa.stride(1)
+            kernel_sfb_stride = kernel_sfb.stride(1)
+            cache_key = self._get_compile_key(
+                k,
+                num_splits,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                max_ab_stages,
+                l2_swizzle,
+                max_active_clusters,
+                self.use_tvm_ffi,
+            )
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                kernel_a.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                kernel_b.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Uint32,
+                kernel_sfa.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Uint32,
+                kernel_sfb.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_cute_tensor = cute.runtime.from_dlpack(
+                output).mark_layout_dynamic(leading_dim=1)
+            alpha = self.__class__.alpha_cache.get(device_key)
+            if alpha is None:
+                alpha = torch.ones((1, ),
+                                   device=device_key,
+                                   dtype=torch.float32)
+                self.__class__.alpha_cache[device_key] = alpha
+            alpha_cute_tensor = cute.runtime.from_dlpack(alpha)
+            stream = (cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True) if self.use_tvm_ffi else
+                      cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    32,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    False,
+                    packed_k128_scales=True,
+                    tma_packed_scales=False,
+                    dynamic_mma_n=True,
+                    apply_alpha=False,
+                    max_ab_stages=max_ab_stages,
+                    l2_swizzle=l2_swizzle,
+                    # PDL contends with the following full-SM mHC kernel.
+                    use_pdl=False,
+                )
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_dsv4_splitk_packed_ue8m0,
+                    kernel_m,
+                    kernel_n,
+                    k,
+                    num_splits,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    swap_ab,
+                    options=("--opt-level 2 --enable-tvm-ffi"
+                             if self.use_tvm_ffi else "--opt-level 2"),
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    kernel_m,
+                    kernel_n,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
+                    kernel_a.data_ptr(),
+                    kernel_b.data_ptr(),
+                    kernel_sfa.data_ptr(),
+                    kernel_sfb.data_ptr(),
+                    output,
+                    alpha,
+                )
+            else:
+                compiled_gemm(
+                    kernel_m,
+                    kernel_n,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    alpha_cute_tensor,
+                    stream=stream,
+                )
+
+    @torch.library.custom_op(
+        "trtllm::dsv4_fp8_splitk_gemm",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def dsv4_fp8_splitk_gemm(
+        a: torch.Tensor,
+        sfa: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Emit mHC-ready split-major BF16 output for the DSV4 O_b GEMM."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"dsv4_fp8_splitk_gemm requires the SM100 family, got {get_sm_version()}"
+            )
+        if not all(t.is_cuda for t in (a, sfa, b, sfb)):
+            raise ValueError(
+                "all dsv4_fp8_splitk_gemm tensors must be CUDA tensors")
+        if len({t.device for t in (a, sfa, b, sfb)}) != 1:
+            raise ValueError(
+                "all dsv4_fp8_splitk_gemm tensors must be on the same device")
+        if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+            raise TypeError("A and B must have dtype torch.float8_e4m3fn")
+        if sfa.dtype != torch.int32 or sfb.dtype != torch.int32:
+            raise TypeError(
+                "SFA and SFB must contain packed int32 UE8M0 scales")
+        if a.dim() != 2 or b.dim(
+        ) != 2 or not a.is_contiguous() or not b.is_contiguous():
+            raise ValueError("A and B must be contiguous rank-2 tensors")
+
+        m, k = a.shape
+        n = b.shape[0]
+        num_splits = CuteDSLFp8SplitKGemmRunner._select_num_splits(m)
+        if b.shape[1] != k:
+            raise ValueError("A and B K dimensions must match")
+        packed_scale_k = CuteDSLFp8SplitKGemmRunner._PACKED_SCALE_K
+        scale_block_k = CuteDSLFp8SplitKGemmRunner._SCALE_BLOCK_K
+        scales_per_word = CuteDSLFp8SplitKGemmRunner._SCALES_PER_WORD
+        if k % (packed_scale_k * num_splits) != 0:
+            raise ValueError(
+                f"K={k} must be divisible by {packed_scale_k}*num_splits")
+        if n % scale_block_k != 0:
+            raise ValueError(f"N={n} must be divisible by {scale_block_k}")
+        packed_k = k // packed_scale_k
+        if (sfa.dim() != 2 or sfa.shape != (m, packed_k) or sfa.stride(0) != 1
+                or sfa.stride(1) < m or sfa.stride(1) % scales_per_word != 0):
+            raise ValueError(
+                f"SFA must be packed MN-major [M,K/{packed_scale_k}] with "
+                f"{scales_per_word}-aligned K stride")
+        if (sfb.dim() != 2 or sfb.shape != (n, packed_k) or sfb.stride(0) != 1
+                or sfb.stride(1) != n):
+            raise ValueError(
+                f"SFB must be packed MN-major [N,K/{packed_scale_k}]")
+
+        output = torch.empty((num_splits * m, n),
+                             device=a.device,
+                             dtype=torch.bfloat16)
+        if m == 0:
+            return output
+        runner = CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True)
+        tuner = AutoTuner.get()
+
+        def choose_tactic(tuning_inputs: List[torch.Tensor], split_k: int):
+            return tuner.choose_one(
+                f"trtllm::dsv4_fp8_splitk_gemm::split{split_k}",
+                [runner],
+                runner.get_tuning_config(split_k),
+                tuning_inputs,
+                num_splits=split_k,
+            )
+
+        best_tactic = None
+        if tuner.is_tuning_mode:
+            # The engine's autotuner warmup is context-only and normally sees
+            # split-1. Explicitly tune the smaller split-output contracts that
+            # generation can reach so CUDA-graph capture and inference never
+            # trigger synchronous CuTe compilation.
+            tuning_splits = [(4, min(m, runner._SPLIT_K4_MAX_M))]
+            if m > runner._SPLIT_K4_MAX_M:
+                tuning_splits.append((2, min(m, runner._SPLIT_K2_MAX_M)))
+            if m > runner._SPLIT_K2_MAX_M:
+                tuning_splits.append((1, m))
+            if (num_splits, m) not in tuning_splits:
+                tuning_splits.append((num_splits, m))
+
+            for tuning_split, tuning_m in tuning_splits:
+                if tuning_split == num_splits and tuning_m == m:
+                    tuning_inputs = [a, sfa, b, sfb, output]
+                else:
+                    tuning_output = torch.empty(
+                        (tuning_split * tuning_m, n),
+                        device=a.device,
+                        dtype=torch.bfloat16,
+                    )
+                    tuning_inputs = [
+                        a[:tuning_m],
+                        sfa[:tuning_m],
+                        b,
+                        sfb,
+                        tuning_output,
+                    ]
+                _, tuning_tactic = choose_tactic(tuning_inputs, tuning_split)
+                if tuning_split == num_splits and tuning_m == m:
+                    best_tactic = tuning_tactic
+        else:
+            _, best_tactic = choose_tactic([a, sfa, b, sfb, output], num_splits)
+
+        if best_tactic is None:
+            raise RuntimeError(
+                f"DSV4 O_b autotuner did not select a split-{num_splits} tactic"
+            )
+        runner(
+            [a, sfa, b, sfb, output],
+            tactic=best_tactic,
+            num_splits=num_splits,
+        )
+        logger.info_once(
+            f"[obsk-fused] O_b CuTe DSL ENGAGED: SK={num_splits} M={m} K={k} N={n}",
+            key="obsk_fused_engaged",
+        )
+        return output
+
+    @torch.library.register_fake("trtllm::dsv4_fp8_splitk_gemm")
+    def _(
+        a: torch.Tensor,
+        sfa: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+    ) -> torch.Tensor:
+        num_splits = CuteDSLFp8SplitKGemmRunner._select_num_splits(a.shape[0])
+        return a.new_empty((num_splits * a.shape[0], b.shape[0]),
+                           dtype=torch.bfloat16)
+
     class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
@@ -4208,6 +4769,208 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream=stream,
                 )
 
+        @staticmethod
+        def _validate_fp8out_inputs(
+            inputs: List[torch.Tensor],
+        ) -> Tuple[int, int, int, int, int, int, int]:
+            if len(inputs) != 6:
+                raise ValueError(
+                    f"FP8-output BMM expects 6 tensors, got {len(inputs)}")
+
+            a, b, a_sf, b_sf, output, sf_out = inputs
+            tensors = (a, b, a_sf, b_sf, output, sf_out)
+            if not all(t.is_cuda for t in tensors):
+                raise ValueError(
+                    "all FP8-output BMM tensors must be CUDA tensors")
+            if len({t.device for t in tensors}) != 1:
+                raise ValueError(
+                    "all FP8-output BMM tensors must be on the same device")
+
+            expected_dtypes = (
+                ("input", a, torch.float8_e4m3fn),
+                ("weight", b, torch.float8_e4m3fn),
+                ("input_scale", a_sf, torch.float32),
+                ("weight_scale", b_sf, torch.float32),
+                ("output_fp8", output, torch.float8_e4m3fn),
+                ("sf_out", sf_out, torch.int32),
+            )
+            for name, tensor, dtype in expected_dtypes:
+                if tensor.dtype != dtype:
+                    raise TypeError(
+                        f"{name} must have dtype {dtype}, got {tensor.dtype}")
+
+            if any(t.dim() != 3
+                   for t in (a, b, a_sf,
+                             b_sf)) or output.dim() != 2 or sf_out.dim() != 2:
+                raise ValueError(
+                    "FP8-output BMM inputs must have ranks [3, 3, 3, 3, 2, 2]")
+
+            batch_size, m, k = a.shape
+            if min(batch_size, m, k) <= 0:
+                raise ValueError(
+                    f"FP8-output BMM dimensions must be positive, got {tuple(a.shape)}"
+                )
+            if b.shape[0] != batch_size or b.shape[2] != k:
+                raise ValueError(
+                    "input and weight batch/K dimensions must match")
+            n = b.shape[1]
+            if n <= 0 or n % 128 != 0 or k % 128 != 0:
+                raise ValueError(
+                    f"FP8-output BMM requires N and K divisible by 128, got N={n}, K={k}"
+                )
+
+            sf_m = pad_up(m, 4)
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+            packed_sf_n = ceil_div(batch_size * sf_n, 4)
+            expected_shapes = (
+                ("weight", b, (batch_size, n, k)),
+                ("input_scale", a_sf, (batch_size, sf_k, sf_m)),
+                ("weight_scale", b_sf, (batch_size, sf_n, sf_k)),
+                ("output_fp8", output, (m, batch_size * n)),
+                ("sf_out", sf_out, (m, packed_sf_n)),
+            )
+            for name, tensor, shape in expected_shapes:
+                if tensor.shape != shape:
+                    raise ValueError(
+                        f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+                    )
+
+            for name, tensor in (
+                ("input", a),
+                ("weight", b),
+                ("input_scale", a_sf),
+                ("weight_scale", b_sf),
+            ):
+                if not tensor.is_contiguous():
+                    raise ValueError(f"{name} must be contiguous")
+                if tensor.data_ptr() % 16 != 0:
+                    raise ValueError(f"{name} must be 16-byte aligned")
+
+            if not output.is_contiguous():
+                raise ValueError("output_fp8 must be contiguous")
+            if output.data_ptr() % 16 != 0:
+                raise ValueError("output_fp8 must be 16-byte aligned")
+            if sf_out.stride() != (1, sf_m):
+                raise ValueError(
+                    f"sf_out must have MN-major stride (1, {sf_m})")
+
+            return batch_size, m, n, k, sf_m, sf_n, sf_k
+
+        def forward_fp8out(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+        ) -> None:
+            """Run the fixed DSV4 o_a tactic with FP8 and packed-UE8M0 output."""
+            fixed_tactic = (False, (128, 128), (1, 1))
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = (
+                tactic if isinstance(tactic, tuple) else fixed_tactic)
+            if (use_2cta_instrs, mma_tiler_mn,
+                    cluster_shape_mn) != fixed_tactic:
+                raise ValueError("FP8-output BMM supports only the fixed "
+                                 "(1-CTA, 128x128, 1x1 cluster) tactic")
+            if not self.use_tvm_ffi:
+                raise ValueError("FP8-output BMM requires TVM FFI")
+
+            (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor,
+             sf_out_tensor) = inputs
+            batch_size, m, n, k, aligned_m, sf_n, sf_k = self._validate_fp8out_inputs(
+                inputs)
+            sf_m = aligned_m
+            # SMEM cooperation wins through M=32.
+            use_fp8_smem_epilogue = m <= 32
+            fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
+
+            cache_key = (
+                "fp8out",
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+                fp8_smem_row_iters,
+                use_fp8_smem_epilogue,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                a_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                 a_tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                b_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                 b_tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                a_sf_ptr = make_ptr(cutlass.Float32,
+                                    a_sf_tensor.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                b_sf_ptr = make_ptr(cutlass.Float32,
+                                    b_sf_tensor.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tensor).mark_layout_dynamic(leading_dim=1)
+                sf_out_ptr = make_ptr(cutlass.Int32,
+                                      sf_out_tensor.data_ptr(),
+                                      cute.AddressSpace.gmem,
+                                      assumed_align=4)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(cluster_size)
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_fp8sf,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    sf_out_ptr,
+                    aligned_m,
+                    sf_n,
+                    fp8_smem_row_iters,
+                    use_fp8_smem_epilogue,
+                    options="--opt-level 2 --enable-tvm-ffi",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                batch_size,
+                a_tensor.data_ptr(),
+                b_tensor.data_ptr(),
+                a_sf_tensor.data_ptr(),
+                b_sf_tensor.data_ptr(),
+                c_tensor,
+                sf_out_tensor.data_ptr(),
+                aligned_m,
+                sf_n,
+            )
+
     # a/b: fp8, scale: fp32, output: bf16
     @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
                              mutates_args=("output", ),
@@ -4261,6 +5024,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+
+    # Emit FP8 O_a output and packed UE8M0 scales in one pass.
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell_fp8out",
+                             mutates_args=("output_fp8", "sf_out"),
+                             device_types="cuda")
+    def cute_dsl_fp8_bmm_blackwell_fp8out(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_fp8: torch.Tensor,
+        sf_out: torch.Tensor,
+    ) -> None:
+        """Write flattened [M,L*N] FP8 output and MN-major packed scales."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"cute_dsl_fp8_bmm_blackwell_fp8out requires SM100 family, got {get_sm_version()}"
+            )
+        runner = CuteDSLFp8BlackwellBmmRunner(use_tvm_ffi=True)
+        runner.forward_fp8out(
+            [input, weight, input_scale, weight_scale, output_fp8, sf_out])
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_blackwell_fp8out")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_fp8: torch.Tensor,
+        sf_out: torch.Tensor,
+    ) -> None:
+        return None
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)

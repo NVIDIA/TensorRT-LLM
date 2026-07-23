@@ -1319,6 +1319,7 @@ class DeepseekV4Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
         mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
+        allow_split_output: bool = False,
     ):
         config = model_config.pretrained_config
         assert config.qk_rope_head_dim == 64, (
@@ -1353,6 +1354,7 @@ class DeepseekV4Attention(MLA):
             o_lora_rank=config.o_lora_rank,
             mapping_with_cp=mapping_with_cp,
             reduce_output=reduce_output,
+            allow_dsv4_split_output=allow_split_output,
         )
 
         self.indexer = getattr(self.mqa, "indexer", None)
@@ -1758,6 +1760,10 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         self.enable_attention_dp = mapping.enable_attention_dp
         self.mlp_tp_size = mapping.tp_size
         self.is_p2p_supported = can_access_peer(mapping)
+        # The split O_b projection output is consumed directly by fused_hc.
+        # Resolve this before constructing attention so the producer and
+        # consumer use the same output-shape contract.
+        self.enable_fused_hc = _resolve_enable_fused_hc(config)
 
         self.hc_attn = mHC(
             config.hc_mult,
@@ -1775,6 +1781,7 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             layer_idx=attention_layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention],
             reduce_output=not self.enable_attention_dp and self.mapping.tp_size > 1,
+            allow_split_output=self.enable_fused_hc,
         )
 
         self.fusion_config = EagerFusionConfig()
@@ -1850,12 +1857,6 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # is_first_layer is baked in at __init__ time so the Python-side branch in
         # forward() resolves at CUDA-graph capture time.
         self.is_first_layer = layer_idx == 0
-        # fused_hc knob: pretrained-config attr `enable_fused_hc` controls whether
-        # the MHC boundary fusion (`mHC.fused_hc`) is used. When False, fall back
-        # to the unfused `post_mapping → pre_mapping` chain (same path engram
-        # layers already take). Env var TRTLLM_MHC_ENABLE_FUSED_HC overrides the
-        # config attr (set to "0" to force-disable for validation/rollback).
-        self.enable_fused_hc = _resolve_enable_fused_hc(config)
         self.next_layer_layernorm: RMSNorm = None
         # Finalized in DeepseekV4ForCausalLM.post_load_weights once the full layer
         # list is visible: a layer may defer its hc_ffn.post_mapping only if
@@ -2625,6 +2626,39 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             return_context_logits=return_context_logits,
             **kwargs,
         )
+
+    def warmup_dsv4_fused_ob(self, max_num_tokens: int) -> None:
+        """Precompile each fused DeepGEMM O_b signature during startup."""
+        from ..custom_ops import cute_dsl_custom_ops
+
+        warmed_signatures = set()
+        for layer in self.model.layers:
+            attention = getattr(layer, "self_attn", None)
+            should_warmup = getattr(attention, "_should_warmup_dsv4_deep_gemm_ob", None)
+            if should_warmup is None or not should_warmup():
+                continue
+
+            weight = attention.o_b_proj.weight
+            weight_scale = attention.o_b_proj.weight_scale
+            signature = (
+                tuple(weight.shape),
+                tuple(weight.stride()),
+                weight.dtype,
+                tuple(weight_scale.shape),
+                tuple(weight_scale.stride()),
+                weight_scale.dtype,
+                attention.dtype,
+                weight.device,
+            )
+            if signature in warmed_signatures:
+                continue
+            warmed_signatures.add(signature)
+            cute_dsl_custom_ops.warmup_dsv4_deep_gemm_ob(
+                weight,
+                weight_scale,
+                attention.dtype,
+                max_num_tokens,
+            )
 
     def load_weights(self, weights: Dict):
         weight_loader = DeepseekV4WeightLoader(self)

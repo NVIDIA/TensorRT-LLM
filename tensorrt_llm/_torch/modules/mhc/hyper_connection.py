@@ -166,7 +166,7 @@ class mHC(nn.Module):
         kernel launch on the model's pre-attention norm.
 
         Args:
-            x_prev:        [..., hidden]    bf16  (attn / MoE output of prev block)
+            x_prev:        [..., hidden] or split-major [SK * B, hidden] bf16
             residual_prev: [..., mult, hidden] bf16
             post_mix_prev: [..., mult] or [..., mult, 1] fp32
             comb_mix_prev: [..., mult, mult] fp32
@@ -193,7 +193,14 @@ class mHC(nn.Module):
 
         residual_prev_flat = residual_prev.reshape(-1, n, hidden).contiguous()
         B = residual_prev_flat.shape[0]
-        x_prev_flat = x_prev.reshape(B, hidden).contiguous()
+        expected_per_split = B * hidden
+        assert x_prev.numel() % expected_per_split == 0, (
+            f"x_prev has {x_prev.numel()} elements, expected an integer multiple "
+            f"of B * hidden = {expected_per_split}"
+        )
+        x_num_splits = x_prev.numel() // expected_per_split
+        assert x_num_splits in (1, 2, 4), f"unsupported x_prev split count: {x_num_splits}"
+        x_prev_flat = x_prev.reshape(x_num_splits * B, hidden).contiguous()
         post_mix_prev_flat = post_mix_prev.reshape(B, n)
         comb_mix_prev_flat = comb_mix_prev.reshape(B, n, n)
 
