@@ -33,10 +33,9 @@ def test_chunked_value_swizzle_matches_one_shot(shape, max_chunk_bytes):
     # Match the (num_experts, K, N) stride layout used at the real call site.
     w = update_weight_stride(w)
 
-    reference = convert_layout(wrap_torch_tensor(w, dtype=FP4), HopperMXValueLayout, mx_axis=1)
-    chunked = convert_layout_expert_chunked(
-        w, FP4, HopperMXValueLayout, {"mx_axis": 1}, max_chunk_bytes=max_chunk_bytes
-    )
+    value_layout = HopperMXValueLayout(mx_axis=-2, mma_version=3)
+    reference = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout)
+    chunked = convert_layout_expert_chunked(w, FP4, value_layout, max_chunk_bytes=max_chunk_bytes)
     _assert_tensors_identical(chunked, reference)
 
 
@@ -47,14 +46,12 @@ def test_chunked_scale_swizzle_matches_one_shot(shape, num_warps, max_chunk_byte
     torch.manual_seed(1234)
     w_scale = torch.randint(0, 256, shape, dtype=torch.uint8)
 
-    reference = convert_layout(
-        wrap_torch_tensor(w_scale), HopperMXScaleLayout, mx_axis=1, num_warps=num_warps
-    )
+    scale_layout = HopperMXScaleLayout(mx_axis=-2, num_warps=num_warps)
+    reference = convert_layout(wrap_torch_tensor(w_scale), scale_layout)
     chunked = convert_layout_expert_chunked(
         w_scale,
         None,
-        HopperMXScaleLayout,
-        {"mx_axis": 1, "num_warps": num_warps},
+        scale_layout,
         max_chunk_bytes=max_chunk_bytes,
     )
     _assert_tensors_identical(chunked, reference)

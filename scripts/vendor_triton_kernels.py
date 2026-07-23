@@ -10,7 +10,7 @@ This script:
 6. Creates a README.md with clear copyright attribution
 
 To update to a new version:
-    python scripts/vendor_triton_kernels.py --tag v3.6.0
+    python scripts/vendor_triton_kernels.py --tag v3.7.1
 """
 
 import argparse

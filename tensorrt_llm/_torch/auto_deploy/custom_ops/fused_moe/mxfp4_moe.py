@@ -21,24 +21,18 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
-from triton_kernels.matmul_ogs import (
-    FlexCtx,
-    FnSpecs,
-    FusedActivation,
-    GatherIndx,
-    PrecisionConfig,
-    RoutingData,
-    ScatterIndx,
-    matmul_ogs,
-)
+from triton_kernels.matmul import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig, matmul
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.target_info import cuda_capability_geq
 from triton_kernels.tensor import FP4, Tensor, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
-from triton_kernels.tensor_details.layout import StridedLayout
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import (
+    TritonEPRouter,
+    TritonRoutingData,
+    combine_expert_outputs,
+)
 
 PreparedWeights = tuple[Tensor, Tensor, Tensor, Tensor]
 TensorCacheKey = tuple[
@@ -64,29 +58,43 @@ _MXFP4_WEIGHT_CACHE: OrderedDict[WeightCacheKey, tuple[PreparedWeights, list[wea
 def _mxfp4_value_layout(mx_axis: int):
     # Blackwell's default value layout is only supported by the persistent TMA
     # kernel. GPT-OSS MoE can select the non-persistent kernel for small shapes,
-    # where unswizzled values use the native MXFP4 dot_scaled path.
+    # where unswizzled values use the native MXFP4 dot_scaled path. Returning
+    # ``None`` keeps the natural strided layout of the data (pre-3.7.0 this
+    # used a StridedLayout whose swizzle was an identity operation; in 3.7.0
+    # converting to StridedLayout repacks, so the conversion is skipped).
     if cuda_capability_geq(10):
-        return StridedLayout, {}
-    return layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
+        return None
+    # triton 3.7.0: the layout factory returns a Layout instance. When the
+    # factory falls back to StridedLayout (pre-Hopper GPUs), skip the
+    # conversion as well: the data already is in its natural strided layout,
+    # and a 3.7.0 StridedLayout conversion repacks (two full copies) instead
+    # of aliasing like the 3.6 identity swizzle did.
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
+    if isinstance(value_layout, layout.StridedLayout):
+        return None
+    return value_layout
 
 
 def _swizzle_mxfp4(w, w_scale):
-    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
-    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
-    w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+    # The mx axis is the K dim of the (num_experts, K, N) weights, i.e. -2 in
+    # the trailing-dims convention required by triton 3.7.0.
+    value_layout = _mxfp4_value_layout(mx_axis=-2)
+    w = wrap_torch_tensor(w, dtype=FP4)
+    if value_layout is not None:
+        w = convert_layout(w, value_layout)
+    # Scales keep their natural strided layout (identity, as before 3.7.0).
+    w_scale = wrap_torch_tensor(w_scale)
     return w, w_scale
 
 
-RouteFn = Callable[[torch.Tensor], tuple[RoutingData, GatherIndx, ScatterIndx]]
+RouteFn = Callable[[torch.Tensor], tuple[TritonRoutingData, torch.Tensor, torch.Tensor]]
 
 
 def _mxfp4_layout_cache_key() -> tuple[object, ...]:
-    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
-    return (
-        value_layout.__module__,
-        value_layout.__qualname__,
-        tuple(sorted(value_layout_opts.items())),
-    )
+    value_layout = _mxfp4_value_layout(mx_axis=-2)
+    # Layout instances are frozen dataclasses, so repr() deterministically
+    # captures both the layout type and its parameters (None → "None").
+    return (type(value_layout).__module__, repr(value_layout))
 
 
 def _source_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -252,11 +260,9 @@ def _run_mxfp4_mlp_core(
     )
 
     gate_pc = PrecisionConfig(
-        weight_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        b_mx_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
     )
-    down_pc = PrecisionConfig(
-        weight_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
-    )
+    down_pc = PrecisionConfig(b_mx_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData()))
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
@@ -264,27 +270,29 @@ def _run_mxfp4_mlp_core(
     )
 
     # gate_up (with SWiGLU fused)
-    inter = matmul_ogs(
+    inter = matmul(
         x,
         triton_gate_up_w,
         gate_up_bias.to(torch.float32),
-        routing_data,
+        a_ragged_metadata=routing_data.ragged_metadata,
         gather_indx=gather_idx,
         precision_config=gate_pc,
         gammas=None,
         fused_activation=act,
     )
 
-    # down
-    y = matmul_ogs(
+    # down (matmul scatters into token-major order; the top-k combine is
+    # done explicitly below since triton 3.7.0 removed the fused finalize)
+    y = matmul(
         inter,
         triton_down_w,
         down_bias.to(torch.float32),
-        routing_data,
+        a_ragged_metadata=routing_data.ragged_metadata,
         scatter_indx=scatter_idx,
         precision_config=down_pc,
         gammas=routing_data.gate_scal,
     )
+    y = combine_expert_outputs(y, routing_data)
 
     y = y.reshape(*leading_shape, hidden_size)
     return y

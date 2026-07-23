@@ -4369,8 +4369,7 @@ def runLLMBuild(
     wheel_path="",
     version_local="",
     cpver="cp312",
-    plat_name="",
-    pin_torch=false)
+    plat_name="")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -4380,13 +4379,6 @@ def runLLMBuild(
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
-    if (pin_torch) {
-        // WAR: Upgrading to torch 2.12 conflicts with the current triton dependency, so we
-        // pin build_wheel to the public torch 2.11.0 here. Remove this WAR once triton is
-        // upgraded to 3.7.0 and torch is upgraded to 2.12.0.
-        sh "cd tensorrt_llm/ && sed -i 's#^torch[><=].*#torch==2.11.0#g' requirements.txt && cat requirements.txt"
-    }
-
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
     sh "curl ifconfig.me || true"
@@ -5443,7 +5435,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7], values[0] != LLM_DOCKER_IMAGE)
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7])
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
@@ -5492,7 +5484,7 @@ def launchTestJobs(pipeline, testFilter)
                             echo "###### Extra PyTorch CUDA 13.2 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.11.0+cu130 torchvision==0.26.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.1+cu130 torchvision==0.27.1+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
                         }
 
                         def libEnv = []

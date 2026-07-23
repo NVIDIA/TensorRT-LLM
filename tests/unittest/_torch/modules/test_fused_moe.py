@@ -2590,14 +2590,33 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE),
                               dtype=dtype).cuda()
 
+        # triton 3.7.0: the fast downcast_to_mxfp/upcast_from_mxfp kernels
+        # require the quantization axis to be a multiple of 32 (pre-3.7.0
+        # they padded internally and returned unpadded results). Pad and
+        # slice around them here to keep the old behavior for the unaligned
+        # intermediate sizes exercised by this test.
         from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp,
                                                           upcast_from_mxfp)
 
+        def _pad_quant_axis(tensor, k):
+            padded_k = (k + 31) // 32 * 32
+            if padded_k != k:
+                tensor = torch.nn.functional.pad(tensor,
+                                                 (0, 0, 0, padded_k - k))
+            return tensor
+
         def fp32_to_mxfp4(tensor):
             tensor = tensor.transpose(1, 2).contiguous()
-            tensor_fp4, tensor_scales = downcast_to_mxfp(tensor,
+            k = tensor.shape[1]
+            # MXFP4 packs two values per byte along the quantization axis.
+            assert k % 2 == 0, f"quantization axis must be even, got {k}"
+            tensor_fp4, tensor_scales = downcast_to_mxfp(_pad_quant_axis(
+                tensor, k),
                                                          torch.uint8,
                                                          axis=1)
+            # Slice the packed values back to the unpadded logical size; the
+            # scale count (ceil(k / 32)) is unchanged by the padding.
+            tensor_fp4 = tensor_fp4[:, :k // 2]
             tensor_fp4 = tensor_fp4.transpose(1, 2).contiguous()
             tensor_scales = tensor_scales.transpose(1, 2).contiguous()
             return tensor_fp4, tensor_scales
@@ -2605,8 +2624,16 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         def mxfp4_to_fp32(tensor, scales):
             tensor = tensor.transpose(1, 2).contiguous()
             scales = scales.transpose(1, 2).contiguous()
+            k = tensor.shape[1] * 2
+            # Zero-pad the packed values so the logical size matches the
+            # scale blocks (scales.shape[1] * 32); zero nibbles decode to
+            # 0.0 and are sliced away below.
+            padded_packed = scales.shape[1] * 16
+            if padded_packed != tensor.shape[1]:
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, 0, 0, padded_packed - tensor.shape[1]))
             tensor = upcast_from_mxfp(tensor, scales, torch.float32, axis=1)
-            return tensor.transpose(1, 2).contiguous()
+            return tensor[:, :k].transpose(1, 2).contiguous()
 
         w1_weight_fp4, w1_weight_scale = fp32_to_mxfp4(w1_weight)
         w2_weight_fp4, w2_weight_scale = fp32_to_mxfp4(w2_weight)
