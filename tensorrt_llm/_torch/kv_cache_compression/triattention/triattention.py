@@ -82,7 +82,7 @@ def _allocate_page_table_plane(
     token_capacity: int,
     max_requests: int,
     device: torch.device,
-) -> Tuple[Dict[int, int], int, torch.Tensor, torch.Tensor]:
+) -> Dict[str, object]:
     representative_slots = {
         representative: int(key[1])
         for representative, key in zip(page_representatives, page_table_keys)
@@ -93,7 +93,7 @@ def _allocate_page_table_plane(
     plane_shape = (num_page_table_slots, max_requests, 2, copy_block_count)
     host = torch.empty(plane_shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned())
     dev = torch.empty(plane_shape, dtype=torch.int32, device=device)
-    return representative_slots, copy_block_count, host, dev
+    return dict(slots=representative_slots, copy_block_count=copy_block_count, host=host, dev=dev)
 
 
 def init_eviction_buffers(
@@ -153,12 +153,7 @@ def init_eviction_buffers(
     bufs.page_table_token_capacity = page_table_token_capacity
 
     # ---- staged page-table planes (target, plus the co-compressed draft) ---
-    (
-        bufs.representative_slots,
-        bufs.copy_block_count,
-        bufs._bulk_offsets_src,
-        bufs.block_offsets_device,
-    ) = _allocate_page_table_plane(
+    plane = _allocate_page_table_plane(
         layer_pools,
         page_representatives,
         page_table_keys,
@@ -167,6 +162,10 @@ def init_eviction_buffers(
         max_requests,
         device,
     )
+    bufs.representative_slots = plane["slots"]
+    bufs.copy_block_count = plane["copy_block_count"]
+    bufs._bulk_offsets_src = plane["host"]
+    bufs.block_offsets_device = plane["dev"]
     # The draft is never scored: these offsets feed only the draft compacts.
     bufs.draft_block_offsets_device = None
     bufs._draft_bulk_offsets_src = None
@@ -175,12 +174,7 @@ def init_eviction_buffers(
     if draft is not None:
         draft_layout = draft["layout"]
         draft_representatives = list(draft_layout["pool_representatives"])
-        (
-            draft_page_slots,
-            bufs.draft_copy_block_count,
-            bufs._draft_bulk_offsets_src,
-            bufs.draft_block_offsets_device,
-        ) = _allocate_page_table_plane(
+        draft_plane = _allocate_page_table_plane(
             draft_layout["layer_pools"],
             draft_representatives,
             [draft_layout["layer_pool_keys"][layer] for layer in draft_representatives],
@@ -189,6 +183,10 @@ def init_eviction_buffers(
             max_requests,
             device,
         )
+        draft_page_slots = draft_plane["slots"]
+        bufs.draft_copy_block_count = draft_plane["copy_block_count"]
+        bufs._draft_bulk_offsets_src = draft_plane["host"]
+        bufs.draft_block_offsets_device = draft_plane["dev"]
 
     # ---- per-round metadata table: one H2D copy; move-offsets rows need the +1 column ----
     bufs.request_metadata_host = torch.empty(
