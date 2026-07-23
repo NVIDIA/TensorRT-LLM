@@ -116,9 +116,11 @@ class DeepEPLowLatency(Communication):
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
         if get_sm_version() in (120, 121):
             return False
-        # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on systems
-        # without a fabric-attached MNNVL domain, so reject them before setup.
-        if not MnnvlMemory.supports_mnnvl():
+        # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
+        # H100/H200 NVL systems, so reject them before setup. DeepEP low
+        # latency otherwise uses RDMA and does not require MNNVL support.
+        dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
             return False
         return True
 
