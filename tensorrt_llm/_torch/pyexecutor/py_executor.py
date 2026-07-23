@@ -251,10 +251,12 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     if not mm_data:
         return
     strip_mm_data_for_generation(mm_data)
-    # Drop the per-item encoder state alongside the dict clear above: both
-    # alias manager-owned entries, so every alias source disappears at the
-    # same moment the caller releases the request's holds — after this,
-    # eviction of the zero-ref entries actually frees the GPU memory.
+    # Drop the per-item encoder state alongside the dict clear above: the
+    # state owns the request's encoder output tensors and the published
+    # `multimodal_embedding` list aliases them, so both alias sources
+    # disappear together and the GPU memory is actually freed. Clearing the
+    # state is also the byte-budget release: the scheduler derives occupancy
+    # from live states, so this request stops counting next tick.
     request.py_mm_encoder_state = None
 
 
@@ -2581,17 +2583,6 @@ class PyExecutor:
                 if self.dist.rank != 0:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
-                    # Replay the cache-hit attach (mirrors `_schedule()` on
-                    # the scheduling rank): every rank encodes the same
-                    # broadcast items into its own cache, so the replay makes
-                    # identical hit decisions. Without it, leader-side hits
-                    # stay pending here and the model forward falls back to
-                    # the unbudgeted legacy inline encode.
-                    # TODO: interim — proper VLM PP support should scope MM
-                    # work to the embedding-consuming stages (fuse +
-                    # deepstack-injection) so other ranks skip it entirely.
-                    if self._supports_mm_encoder_item_scheduling:
-                        self._attach_mm_encoder_cache_hits()
                     # Run scheduler locally because scheduler may change llm requests' state.
                     if hasattr(self.kv_cache_manager,
                                "prepare_expect_snapshot_points"):
@@ -5263,12 +5254,11 @@ class PyExecutor:
             try:
                 self._validate_request(request)
                 if self._supports_mm_encoder_item_scheduling:
-                    manager = self.model_engine.mm_encoder_cache_manager
                     initialize_multimodal_encoder_request(
                         request,
                         max_num_tokens=self.model_engine.encoder_max_num_tokens,
-                        max_output_bytes=(manager.max_bytes
-                                          if manager is not None else None),
+                        max_output_bytes=self.model_engine.
+                        mm_encoder_output_budget_bytes,
                         embedding_row_bytes=getattr(self.model_engine,
                                                     "mm_embedding_row_bytes",
                                                     0))
@@ -5472,45 +5462,12 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
-    def _attach_mm_encoder_cache_hits(self) -> None:
-        """Complete pending MM items from resident cache entries before
-        scheduling.
-
-        Hits are held for the request and recorded into its item slots
-        ahead of scheduler selection, so they neither consume the encoder
-        budgets nor get re-encoded. A request with remaining misses becomes
-        PARTIAL and keeps following the item path, which re-computes only
-        those misses; a fully attached request graduates to READY without
-        any encoder work. Requests without stable content keys can never
-        hit (their outputs live under request-scoped temporary keys), so
-        they are skipped.
-        """
-        manager = self.model_engine.mm_encoder_cache_manager
-        if manager is None:
-            return
-        for request in self.active_requests:
-            state = request.py_mm_encoder_state
-            if state is None or is_multimodal_encoder_ready(request):
-                continue
-            item_keys = self.model_engine.get_mm_encoder_item_keys(request)
-            if item_keys is None:
-                continue
-            for item_idx in state.pending_item_indices():
-                cached_output = manager.get_and_hold(item_keys[item_idx],
-                                                     request.request_id)
-                if cached_output is None:
-                    continue
-                state.record(item_idx, cached_output)
-            state.finalize_into(request.py_multimodal_data)
-
     @nvtx_range("_schedule")
     def _schedule(self):
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        if self._supports_mm_encoder_item_scheduling:
-            self._attach_mm_encoder_cache_hits()
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -6630,7 +6587,6 @@ class PyExecutor:
                 # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
                 # at high concurrency.
                 _strip_py_multimodal_data_post_prefill(request)
-                self._release_mm_encoder_holds(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -6858,22 +6814,7 @@ class PyExecutor:
         else:
             self._do_terminate_request(request)
 
-    def _release_mm_encoder_holds(self, request: LlmRequest) -> None:
-        """Release the request's MM encoder cache holds early (idempotent).
-
-        The registered MM_ENCODER_CACHE_MANAGER resource manager already
-        releases holds on every termination path via
-        `resource_manager.free_resources`; this early call at the
-        post-prefill strip makes entries reclaimable as soon as their
-        embedding has been consumed instead of at request end.
-        """
-        manager = getattr(self.model_engine, "mm_encoder_cache_manager", None)
-        if manager is not None:
-            manager.free_resources(request)
-
     def _do_terminate_request(self, request: LlmRequest):
-        # MM encoder holds release inside free_resources via the registered
-        # MM_ENCODER_CACHE_MANAGER resource manager.
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)

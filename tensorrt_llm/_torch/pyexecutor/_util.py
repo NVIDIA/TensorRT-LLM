@@ -915,24 +915,33 @@ class KvCacheCreator:
     ) -> int:
         """Reserve encoder-output storage capacity in the estimated peak.
 
-        Item-scheduling models store every encoder output in the
-        engine-owned `MultimodalEncoderCacheManager`, so reserving its
-        (min-clamped) byte budget bounds ALL runtime encoder-output
-        residency: together with the boundary-batch transient profiled by
-        `_run_dummy_encoder_forwards`, runtime cannot exceed the estimated
-        peak. Other models keep the legacy full-request clone cache
+        For item-scheduling models the scheduler bounds the in-flight
+        request outputs (held between encode and prefill) by the engine's
+        byte budget, so that budget is reserved. Cache-enabled item models
+        also populate the read-through encoder cache, whose contents are a
+        separate resident allocation, so its `encoder_cache_max_bytes` is
+        reserved on top. Together with the boundary-batch transient profiled
+        by `_run_dummy_encoder_forwards`, runtime cannot exceed the estimated
+        peak. Non-item models keep the legacy full-request clone cache
         reservation.
         """
-        manager = getattr(self._model_engine, "mm_encoder_cache_manager", None)
-        if manager is not None:
-            return peak_memory + manager.max_bytes
-
         model = self._model_engine.model
-        if (not isinstance(model, MultimodalModelMixin)
-                or not model.encoder_cache_active):
-            return peak_memory
+        cache_enabled = (isinstance(model, MultimodalModelMixin)
+                         and model.encoder_cache_active)
+        multimodal_config = (model.model_config.multimodal_config if isinstance(
+            model, MultimodalModelMixin) else None)
 
-        return peak_memory + model.model_config.multimodal_config.encoder_cache_max_bytes
+        budget = getattr(self._model_engine, "mm_encoder_output_budget_bytes",
+                         None)
+        if budget is not None:
+            reserved = peak_memory + budget
+            if cache_enabled and multimodal_config is not None:
+                reserved += multimodal_config.encoder_cache_max_bytes
+            return reserved
+
+        if not cache_enabled or multimodal_config is None:
+            return peak_memory
+        return peak_memory + multimodal_config.encoder_cache_max_bytes
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -2802,12 +2811,6 @@ def create_py_executor_instance(
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
 
-    if getattr(model_engine, "mm_encoder_cache_manager", None) is not None:
-        # Route MM encoder-output teardown through the standard
-        # free_resources funnel (completion, cancellation, and error paths).
-        resources[ResourceManagerType.MM_ENCODER_CACHE_MANAGER] = (
-            model_engine.mm_encoder_cache_manager)
-
     # Register the compression manager (if one is configured) with the other
     # managers, before building ResourceManager, so it is part of the manager
     # set from the start. Reads its own config, not the sparse-attention one.
@@ -2963,7 +2966,7 @@ def create_py_executor_instance(
             scheduler,
             max_num_items=model_engine.encoder_max_num_items,
             max_num_tokens=model_engine.encoder_max_num_tokens,
-            cache_manager=model_engine.mm_encoder_cache_manager,
+            output_budget_bytes=model_engine.mm_encoder_output_budget_bytes,
             embedding_row_bytes=model_engine.mm_embedding_row_bytes,
         )
 

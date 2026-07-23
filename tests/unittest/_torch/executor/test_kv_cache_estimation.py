@@ -271,19 +271,26 @@ def test_kv_cache_estimation_reserves_multimodal_encoder_cache(
     assert creator._reserve_multimodal_encoder_cache_memory(1000) == expected
 
 
-def test_reserve_uses_manager_budget_for_item_scheduling_models():
-    from tensorrt_llm._torch.pyexecutor.multimodal_encoder_cache_manager import (
-        MultimodalEncoderCacheManager,
-    )
-
+def test_reserve_uses_engine_budget_for_item_scheduling_models():
+    # Item model without the encoder cache: only the engine's output byte
+    # budget (in-flight residency) is reserved.
     creator = object.__new__(KvCacheCreator)
-    # The min-clamped manager budget (not the raw config bytes) bounds all
-    # encoder-output residency for item-scheduling models.
     creator._model_engine = SimpleNamespace(
-        mm_encoder_cache_manager=MultimodalEncoderCacheManager(512, name="t")
+        mm_encoder_output_budget_bytes=512, model=_MultimodalModel(64)
     )
 
     assert creator._reserve_multimodal_encoder_cache_memory(1000) == 1512
+
+
+def test_reserve_adds_read_through_cache_for_cache_enabled_item_models():
+    # A cache-enabled item model populates the read-through cache too, so its
+    # encoder_cache_max_bytes is reserved on top of the output budget.
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        mm_encoder_output_budget_bytes=512, model=_EncoderCacheMultimodalModel(64)
+    )
+
+    assert creator._reserve_multimodal_encoder_cache_memory(1000) == 1000 + 512 + 64
 
 
 # ---------------------------------------------------------------------------
@@ -674,9 +681,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     # Explicit False: try_prepare_estimation skips estimation for
     # encoder-decoder models, and a bare Mock attribute is truthy.
     model_engine.model.model_config.is_encoder_decoder = False
-    # A bare Mock would auto-create the manager attribute; real engines set
-    # it to None unless the model opted into MM item scheduling.
-    model_engine.mm_encoder_cache_manager = None
+    # A bare Mock would auto-create the attribute; real engines set it to
+    # None unless the model opted into MM item scheduling.
+    model_engine.mm_encoder_output_budget_bytes = None
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(

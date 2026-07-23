@@ -491,10 +491,12 @@ class MultimodalScheduler(RequestScheduler):
     that split one item into multiple attention sequences derive their own
     workspace capacity from the token budget.
 
-    When a ``MultimodalEncoderCacheManager`` is attached, selection also
-    enforces its byte budget (allocate-before-compute): encoder outputs are
-    stored exclusively in the manager, so an item is only selected when its
-    embedding bytes fit alongside everything already held or claimed.
+    When ``output_budget_bytes`` is configured, selection also enforces the
+    encoder output byte budget (allocate-before-compute): an item is only
+    selected when its embedding bytes fit alongside the outputs already
+    resident on live requests and bytes claimed earlier in the pass.
+    Occupancy is derived from request states each pass rather than tracked
+    by a counter, so a stripped or aborted request self-heals the budget.
     """
 
     def __init__(
@@ -503,48 +505,62 @@ class MultimodalScheduler(RequestScheduler):
         max_num_items: int,
         max_num_tokens: int,
         *,
-        cache_manager=None,
+        output_budget_bytes: int | None = None,
         embedding_row_bytes: int = 0,
     ) -> None:
         self.scheduler = scheduler
         self.max_num_items = max_num_items
         self.max_num_tokens = max_num_tokens
-        # Optional `MultimodalEncoderCacheManager`: when present, item
-        # selection additionally performs allocate-before-compute against
-        # the manager's byte budget (encoder outputs are stored exclusively
-        # there). `embedding_row_bytes` converts declared embedding rows to
-        # bytes and must be positive alongside a manager.
-        self.cache_manager = cache_manager
+        # Optional byte budget for encoder outputs living outside a forward
+        # pass. Item selection performs allocate-before-compute against it:
+        # occupancy is *derived* each pass from live request states (their
+        # recorded, not-yet-consumed outputs) — there is no counter to
+        # release or keep in sync; a stripped or aborted request simply
+        # stops contributing. `embedding_row_bytes` converts declared
+        # embedding rows to bytes and must be positive alongside a budget.
+        self.output_budget_bytes = output_budget_bytes
         self.embedding_row_bytes = embedding_row_bytes
-        if cache_manager is not None and embedding_row_bytes <= 0:
+        if output_budget_bytes is not None and embedding_row_bytes <= 0:
             raise ValueError(
-                "embedding_row_bytes must be positive when a cache manager "
-                "budgets MM encoder output storage"
+                "embedding_row_bytes must be positive when a byte budget bounds MM encoder outputs"
             )
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
             scheduler, "micro_batch_scheduler"
         )
 
-    def _select_items(self, requests: RequestList) -> tuple[dict[int, list[int]], RequestList]:
+    def _total_resident_output_bytes(self, active_requests: RequestList) -> int:
+        """Sum per-request resident encoder-output bytes across live states.
+
+        Summed fresh every pass: a request whose outputs were consumed
+        (stripped post-prefill) or that was aborted no longer contributes,
+        so the accounting self-heals with no release bookkeeping.
+        """
+        return sum(
+            state.resident_output_bytes(self.embedding_row_bytes)
+            for request in active_requests
+            if (state := request.py_mm_encoder_state) is not None
+        )
+
+    def _select_items(
+        self, requests: RequestList, *, active_requests: RequestList | None = None
+    ) -> tuple[dict[int, list[int]], RequestList]:
         """Greedily select pending MM items under the encoder budgets.
 
         Requests are visited in the wrapped capacity scheduler's FCFS order
         with no explicit `MultimodalEncoderProgress`-based priority: a
         request left `PARTIAL` by a budget split necessarily sits ahead of
         anything admitted later, so its remaining items resume before newer
-        work by order alone. A request that arrives `PARTIAL` through cache
-        hits gets no boost over older `PENDING` requests — a deliberate
-        fairness default.
+        work by order alone.
 
-        When a cache manager is attached, selection also performs
-        allocate-before-compute: an item is only selected if the manager can
-        host its embedding bytes, counting bytes claimed earlier in this
-        pass (selected items are adopted only later this iteration). The
-        first request left incomplete additionally reserves its remaining
-        bytes so requests behind it cannot squat the space it needs across
-        iterations — without this head-of-line reservation, several
-        partially-stored requests could hold fragments of the budget and
-        deadlock waiting on one another.
+        When a byte budget is configured, selection also performs
+        allocate-before-compute: an item is only selected if its embedding
+        bytes fit alongside (a) outputs already resident on live requests
+        (derived from `active_requests`) and (b) bytes claimed earlier in
+        this pass. The first request left incomplete additionally reserves
+        its remaining bytes so requests behind it cannot squat the space it
+        needs across iterations — without this head-of-line reservation,
+        several partially-complete requests could hold fragments of the
+        budget and deadlock waiting on one another.
 
         Returns the selected item indices per request id, plus the requests
         eligible for LLM microbatch scheduling this iteration (encoder
@@ -552,7 +568,14 @@ class MultimodalScheduler(RequestScheduler):
         """
         remaining_items = self.max_num_items
         remaining_tokens = self.max_num_tokens
-        manager = self.cache_manager
+        budget = self.output_budget_bytes
+        resident_bytes = (
+            self._total_resident_output_bytes(
+                active_requests if active_requests is not None else requests
+            )
+            if budget is not None
+            else 0
+        )
         reserved_bytes = 0
         head_of_line_reserved = False
         selected: dict[int, list[int]] = {}
@@ -586,9 +609,9 @@ class MultimodalScheduler(RequestScheduler):
                 cost = token_lengths[item_idx]
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
-                if manager is not None:
+                if budget is not None:
                     item_bytes = state.embedding_lengths[item_idx] * self.embedding_row_bytes
-                    if not manager.can_allocate(item_bytes, reserved_bytes=reserved_bytes):
+                    if resident_bytes + reserved_bytes + item_bytes > budget:
                         break
                     reserved_bytes += item_bytes
                 request_items.append(item_idx)
@@ -600,7 +623,7 @@ class MultimodalScheduler(RequestScheduler):
 
             if pending and len(request_items) == len(pending):
                 llm_eligible.append(request)
-            elif manager is not None and not head_of_line_reserved:
+            elif budget is not None and not head_of_line_reserved:
                 # Head-of-line reservation: `request_items` is a prefix of
                 # `pending`, so the unselected suffix is what this request
                 # still needs in future iterations.
@@ -612,18 +635,18 @@ class MultimodalScheduler(RequestScheduler):
                     * self.embedding_row_bytes
                 )
                 total_request_bytes = sum(state.embedding_lengths) * self.embedding_row_bytes
-                if total_request_bytes > manager.max_bytes:
+                if total_request_bytes > budget:
                     # Liveness backstop: admission
                     # (`initialize_multimodal_encoder_request`) already
-                    # rejects requests whose holds can never coexist within
-                    # the budget, so reaching this means an accounting bug
-                    # rather than a user input.
+                    # rejects requests whose outputs can never coexist
+                    # within the budget, so reaching this means an
+                    # accounting bug rather than a user input.
                     raise RuntimeError(
                         f"Multimodal request {request.py_request_id} needs "
-                        f"{total_request_bytes} bytes of encoder output "
-                        "storage but multimodal_config."
-                        f"encoder_cache_max_bytes only allows "
-                        f"{manager.max_bytes}; raise the cache budget"
+                        f"{total_request_bytes} bytes of resident encoder "
+                        "output but the encoder output budget is only "
+                        f"{budget} bytes (one prefill iteration); raise "
+                        "max_num_tokens to serve inputs of this size"
                     )
                 reserved_bytes += remaining_request_bytes
                 head_of_line_reserved = True
@@ -675,7 +698,8 @@ class MultimodalScheduler(RequestScheduler):
                 active_requests, inflight_request_ids
             )
             selected_items, llm_eligible = self._select_items(
-                list(scheduler_output.context_requests)
+                list(scheduler_output.context_requests),
+                active_requests=active_requests,
             )
             return scheduler_output._replace(
                 context_requests=llm_eligible,
@@ -687,7 +711,9 @@ class MultimodalScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.scheduler.capacity_scheduler.schedule_request(active_requests)
         )
-        selected_items, llm_eligible = self._select_items(list(fitting_requests))
+        selected_items, llm_eligible = self._select_items(
+            list(fitting_requests), active_requests=active_requests
+        )
         # Preserve the capacity scheduler's decisions while attaching the MM
         # item plan that the executor must run before the selected LLM
         # microbatch.

@@ -363,8 +363,6 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
                               BaseMultimodalDummyInputsBuilder):
     """Input processor for Mistral VLM checkpoints in HuggingFace format."""
 
-    supports_mm_encoder_item_scheduling = True
-
     def __init__(self,
                  model_path: str,
                  config: PretrainedConfig,
@@ -772,6 +770,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     """
 
     supports_encoder_cache = True
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(
         self,

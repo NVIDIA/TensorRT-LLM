@@ -255,10 +255,6 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
-    # Whether this processor provides complete atomic-item metadata for the
-    # multimodal encoder runtime scheduler.
-    supports_mm_encoder_item_scheduling: ClassVar[bool] = False
-
     def get_mm_encoder_item_metadata(
         self,
         prompt_token_ids: List[int],
@@ -1443,23 +1439,28 @@ def create_input_processor_with_hash(
                 or multimodal_data.get("multimodal_embedding") is not None):
             return prompt_token_ids, extra_processed_inputs
 
-        # `getattr` because unregistered/text-only models wrap a
-        # `DefaultInputProcessor`, which is not a
-        # `BaseMultimodalInputProcessor` and lacks the class var.
-        supports_item_scheduling = getattr(
-            input_processor, "supports_mm_encoder_item_scheduling", False)
+        # A processor participates in item scheduling by overriding
+        # `get_mm_encoder_item_metadata`; the base returns `None`, so its
+        # result gates routing without a separate capability flag. `getattr`
+        # because unregistered/text-only models wrap a `DefaultInputProcessor`
+        # that lacks the method entirely.
+        get_item_metadata = getattr(input_processor,
+                                    "get_mm_encoder_item_metadata", None)
         has_raw_payload = any(
             isinstance(multimodal_data.get(modality), dict)
             for modality in ("image", "video", "audio"))
-        if not (supports_item_scheduling and has_raw_payload):
+        if not has_raw_payload or get_item_metadata is None:
             return prompt_token_ids, extra_processed_inputs
 
-        item_metadata = input_processor.get_mm_encoder_item_metadata(
-            prompt_token_ids, multimodal_data)
+        item_metadata = get_item_metadata(prompt_token_ids, multimodal_data)
+        if item_metadata is None:
+            # Processor does not emit item metadata for this input; fall back
+            # to the non-item-scheduled path.
+            return prompt_token_ids, extra_processed_inputs
         if not isinstance(item_metadata, MultimodalEncoderItemMetadata):
             raise TypeError(
-                "get_mm_encoder_item_metadata() must return item metadata "
-                "(a MultimodalEncoderItemMetadata) for raw multimodal "
+                "get_mm_encoder_item_metadata() must return a "
+                "MultimodalEncoderItemMetadata or None for raw multimodal "
                 f"payloads, got {type(item_metadata).__name__}")
         item_metadata.validate()
 
