@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/zhanruis/TRTLLMINF-218-pr-label-approval']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -644,60 +644,48 @@ def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
     return result
 }
 
-// Returns true if the GitHub PR has the given label, false if absent.
-// Fails open (returns true) on network/auth errors so CI is not blocked.
-// Only meaningful for GitHub PRs; callers must guard with globalVars[GITHUB_PR_API_URL].
-def hasGithubPRLabel(pipeline, githubPrApiUrl, labelName) {
-    try {
-        def rawDataJson = null
-        withCredentials([
-            usernamePassword(
-                credentialsId: 'github-cred-trtllm-ci',
-                usernameVariable: 'NOT_USED_YET',
-                passwordVariable: 'GITHUB_API_TOKEN'
-            ),
-        ]) {
-            rawDataJson = pipeline.sh(
-                script: """
-                    curl --silent --fail --show-error \
-                         --header "Authorization: Bearer \${GITHUB_API_TOKEN}" \
-                         --url "${githubPrApiUrl}"
-                """,
-                returnStdout: true
-            )
-        }
-        def prData = readJSON text: rawDataJson, returnPojo: true
-        def labels = prData.get("labels", []) ?: []
-        def found = labels.any { label -> label?.get("name", "") == labelName }
-        echo "[hasGithubPRLabel] label '${labelName}' present: ${found}"
-        return found
-    } catch (Exception e) {
-        echo "[hasGithubPRLabel] Warning: failed to check GitHub PR labels: ${e.toString()}. Failing open."
-        return true  // fail-open: do not block CI if the label check itself fails
-    }
-}
-
 // Gate multi-GPU stages behind 'ci: full pre-merge approved' label.
-// Returns true if the stage should be blocked (label absent), false otherwise.
+// Uses trtllm_utils.validatePRLabelApproval() from the shared lib to verify
+// both label existence and that the labeler is an active team member.
 // Exempt: PostMerge pipelines and GitLab MR builds (no GITHUB_PR_API_URL).
 def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
-    if (!globalVars[GITHUB_PR_API_URL] || (env.JOB_NAME ==~ /.*PostMerge.*/)) {
+    if (!globalVars[GITHUB_PR_API_URL]) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: not a GitHub PR (no GITHUB_PR_API_URL)"
         return false
     }
-    if (hasGithubPRLabel(pipeline, globalVars[GITHUB_PR_API_URL],
-                          "ci: full pre-merge approved")) {
+    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+        echo "[requireMultiGpuApprovalLabel] Skipping label check: PostMerge pipeline is exempt"
         return false
     }
+
+    def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+    if (!prMatch) {
+        echo "[requireMultiGpuApprovalLabel] Could not extract PR number from ${globalVars[GITHUB_PR_API_URL]}. Failing open."
+        return false
+    }
+    def prNumber = prMatch[0][1]
+
+    def result = trtllm_utils.validatePRLabelApproval(pipeline, prNumber, "ci: full pre-merge approved")
+    if (!result.checkCompleted) {
+        // API error — fail-open: do not block CI if the label check itself fails
+        echo "[requireMultiGpuApprovalLabel] Label validation incomplete (${result.error}). Failing open."
+        return false
+    }
+    if (result.labelExists && result.authorized) {
+        return false
+    }
+
     def existingDesc = currentBuild.description ?: ""
     currentBuild.description = existingDesc + (existingDesc ? "<br/>" : "") +
         "<span data-multi-gpu-label-required='true'>" +
         "Multi-GPU tests require label 'ci: full pre-merge approved'" +
         "</span>"
-    error "${arch} Multi-GPU tests require the GitHub label " +
-          "'ci: full pre-merge approved' on this PR. " +
+    def reason = !result.labelExists
+        ? "label not present"
+        : "label applied by '${result.actor}' who is not an active member of NVIDIA/trt-llm-ci-approvers"
+    error "${arch} Multi-GPU tests blocked: ${reason}. " +
           "Ask a member of NVIDIA/trt-llm-ci-approvers to add the label, " +
           "then re-trigger CI."
-    return true  // unreachable, but keeps intent clear
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
