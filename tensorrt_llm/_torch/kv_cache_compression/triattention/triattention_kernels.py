@@ -21,7 +21,7 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import triton
@@ -54,14 +54,19 @@ def _gather_mean_phase_kernel(
     valid_seq_lens,
     token_starts,
     valid_widths,
+    swa_destination_bases,
     table_rows,
+    rebase_delta,
     NUM_FREQS: tl.constexpr,
     F_BLOCK: tl.constexpr,
+    HAS_SWA: tl.constexpr,
 ):
     """Copy each request's precomputed phase-table row into the fixed buffers.
 
     The same launch derives the request's valid decode width (valid length
-    minus window start) so the round needs no separate subtraction launch.
+    minus window start), and with SWA layers also rebases the round's SWA
+    landing positions (window start plus the init-frozen delta), so the
+    round needs no separate subtraction or rebase launches.
     """
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
@@ -76,8 +81,10 @@ def _gather_mean_phase_kernel(
     row_sin = tl.load(table_sin + source_offset, mask=frequency_mask, other=0.0)
     tl.store(mean_cos + output_offset, row_cos, mask=frequency_mask)
     tl.store(mean_sin + output_offset, row_sin, mask=frequency_mask)
-    width = tl.load(valid_seq_lens + request) - tl.load(token_starts + request)
-    tl.store(valid_widths + request, width)
+    token_start = tl.load(token_starts + request)
+    tl.store(valid_widths + request, tl.load(valid_seq_lens + request) - token_start)
+    if HAS_SWA:
+        tl.store(swa_destination_bases + request, token_start + rebase_delta)
 
 
 def build_mean_phase_table(
@@ -141,12 +148,17 @@ def gather_mean_phases(
     token_starts: torch.Tensor,
     valid_widths: torch.Tensor,
     request_count: int,
+    *,
+    swa_destination_bases: Optional[torch.Tensor] = None,
+    rebase_delta: int = 0,
 ) -> None:
     """Refresh the fixed mean buffers and valid widths from staged metadata.
 
-    Writes in place because the compiled CuTe score launch captured the
-    destination buffers' device pointers. CUDA-only; eviction never runs
-    under CUDA graph capture.
+    With SWA layers the same launch rebases ``swa_destination_bases``
+    (window start + ``rebase_delta``); without them the HAS_SWA branch is
+    compiled away and the pointer argument is None. Writes in place because
+    the compiled CuTe score launch captured the destination buffers' device
+    pointers. CUDA-only; eviction never runs under CUDA graph capture.
     """
     num_freqs = phase["omega"].numel()
     _gather_mean_phase_kernel[(request_count,)](
@@ -158,9 +170,12 @@ def gather_mean_phases(
         valid_seq_lens,
         token_starts,
         valid_widths,
+        swa_destination_bases,
         phase["rows"],
+        rebase_delta,
         NUM_FREQS=num_freqs,
         F_BLOCK=triton.next_power_of_2(num_freqs),
+        HAS_SWA=swa_destination_bases is not None,
         num_warps=1,
     )
 

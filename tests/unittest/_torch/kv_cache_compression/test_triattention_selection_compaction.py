@@ -456,6 +456,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     """Keep score and compaction layer axes aligned across interleaved V2 pools."""
     pytest.importorskip("cutlass")
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        attach_compaction_bundle,
         init_eviction_buffers,
         run_eviction_round,
     )
@@ -559,12 +560,9 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         protected_tail_capacity=0,
     )
     _set_protected_tails(compaction, [0])
-    bufs.compaction_families = compaction["families"]
-    bufs.settle_pack_tensors = compaction["settle_pack_tensors"]
-    bufs.settle_pack_shape = compaction["settle_pack_shape"]
-    bufs.swa_destination_bases = compaction["swa_destination_bases"]
-    bufs.swa_rebase_delta = compaction["swa_rebase_delta"]
-    bufs.draft_pack = compaction["draft_pack"]
+    # Attach wholesale: the round consumes the PREBOUND launch args, so the
+    # bundle must land through the same helper production uses.
+    attach_compaction_bundle(bufs, compaction)
     run_eviction_round(bufs, normalize_scores=False)
     assert torch.equal(bufs.keep, expected_keep)
     torch.cuda.synchronize(device)

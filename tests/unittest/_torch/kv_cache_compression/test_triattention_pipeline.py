@@ -60,18 +60,10 @@ requires_sm100 = pytest.mark.skipif(
 )
 
 
-def _set_request_state(
-    manager,
-    request_id,
-    *,
-    generation_steps=0,
-    evicted_tokens=0,
-    confirmed_kv_length=None,
-):
+def _set_request_state(manager, request_id, *, generation_steps=0, evicted_tokens=0):
     state = {
         "generation_steps": generation_steps,
         "evicted_tokens": evicted_tokens,
-        "confirmed_kv_length": confirmed_kv_length,
     }
     manager._request_states[request_id] = state
     return state
@@ -90,6 +82,8 @@ def _prepared_eviction(
     return {
         "request": request,
         "request_id": request_id,
+        "kv_cache": None,
+        "draft_kv_cache": None,
         "seq_len": seq_len,
         "round_start": int(seq_len if round_start is None else round_start),
         "prompt_len": prompt_len,
@@ -427,27 +421,22 @@ class TestEvictionLifecycle:
             manager._periodic_evict(batch)
 
         assert first_state["generation_steps"] == 127
-        assert first_state["confirmed_kv_length"] is None
         assert second_state["generation_steps"] == 127
-        assert second_state["confirmed_kv_length"] is None
 
     def test_request_finish_clears_state_but_keeps_buffers_resident(self):
         manager = _make_triattention()
-        _set_request_state(
-            manager,
-            7,
-            generation_steps=1,
-            evicted_tokens=127,
-            confirmed_kv_length=128,
-        )
+        _set_request_state(manager, 7, generation_steps=1, evicted_tokens=127)
         buffers = object()
         manager._buffers = buffers
-        manager._prepared_generation_batch = (SimpleNamespace(), {7: 1})
+        batch = SimpleNamespace()
+        manager._prepared_generation_batch = batch
 
         manager.on_request_finish(_make_request(7))
 
         assert manager._request_states == {}
-        assert manager._prepared_generation_batch[1] == {}
+        # The batch reference survives finish (it belongs to the step, not
+        # the request).
+        assert manager._prepared_generation_batch is batch
         # The buffers are sized for the executor limits, not one cohort, so
         # they stay resident for the next generation batch.
         assert manager._buffers is buffers
@@ -465,12 +454,10 @@ class TestEvictionLifecycle:
         cache.capacity = confirmed + tail
         mgr.kv_cache_manager.num_extra_kv_tokens = reserve
         # The configured tail capacity (reserve + draft reserve + 1) must
-        # cover this round's actual tail, as in production.
-        mgr.kv_cache_manager._kv_reserve_draft_tokens = current_growth
-        mgr._prepared_generation_batch = (
-            SimpleNamespace(generation_requests=[request]),
-            {7: current_growth},
-        )
+        # cover this round's actual tail, as in production; the growth
+        # constant is 1 + _kv_reserve_draft_tokens for batch members.
+        mgr.kv_cache_manager._kv_reserve_draft_tokens = current_growth - 1
+        mgr._prepared_generation_batch = SimpleNamespace(generation_requests=[request])
         draft_manager = _make_fake_v2(is_draft=True)
         draft_cache = SimpleNamespace(is_active=True, resize=mock.Mock(return_value=True))
         draft_manager.kv_cache_map = {7: draft_cache}
@@ -478,8 +465,7 @@ class TestEvictionLifecycle:
         mgr.draft_kv_cache_manager = draft_manager
 
         def compact(*_args, **_kwargs):
-            mgr._request_states[7]["confirmed_kv_length"] = retained
-            return [(7, retained)]
+            return [(7, cache, draft_cache, retained)]
 
         with mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict:
             mgr._periodic_evict(batch)
@@ -491,6 +477,8 @@ class TestEvictionLifecycle:
                 {
                     "request": request,
                     "request_id": 7,
+                    "kv_cache": cache,
+                    "draft_kv_cache": draft_cache,
                     "seq_len": confirmed,
                     "round_start": confirmed,
                     "prompt_len": 1024,
@@ -500,17 +488,18 @@ class TestEvictionLifecycle:
             ],
             2,
         )
-        assert mgr._request_states[7]["confirmed_kv_length"] == retained
         cache.resize.assert_called_once_with(retained + tail, None)
         # The draft cache shrinks in the same round, to the same retained
         # length plus the draft's own protected tail.
         draft_cache.resize.assert_called_once_with(retained + 1, None)
 
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
+        # The due-branch seq_len must come from the physical capacity ledger
+        # (capacity minus the protected tail), never the logical length.
         physical_confirmed = 6100
         manager = _make_triattention(beta=128)
         manager._calibrated = True
-        _set_request_state(manager, 7, evicted_tokens=100)
+        _set_request_state(manager, 7, generation_steps=127, evicted_tokens=100)
         cache = SimpleNamespace(
             capacity=physical_confirmed,
             history_length=1024,
@@ -527,9 +516,11 @@ class TestEvictionLifecycle:
             py_draft_tokens=[1, 2, 3, 4],
         )
 
-        manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
+        with mock.patch.object(manager, "_evict_requests", return_value=[]) as evict:
+            manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
-        assert manager._request_states[7]["confirmed_kv_length"] == physical_confirmed
+        prepared = evict.call_args.args[0]
+        assert prepared[0]["seq_len"] == physical_confirmed
         cache.resize.assert_not_called()
 
     def test_one_model_draft_co_compression_contract_is_accepted(self):
@@ -562,19 +553,18 @@ class TestEvictionLifecycle:
         )
 
     @pytest.mark.parametrize(
-        "num_extra_kv_tokens,reserved_draft,draft_tokens,expected_growth",
+        "reserved_draft,expected_growth",
         [
-            (2, 0, [1, 2, 3], 4),
-            # The reserved draft width protects capacity even when this step's
-            # actual draft is shorter.
-            (0, 6, [1, 2], 7),
+            (0, 1),
+            # The reserved draft width protects capacity regardless of any
+            # step's actual draft length: growth is the cached constant.
+            (6, 7),
         ],
     )
     def test_prepare_snapshots_fixed_linear_generation_growth(
-        self, num_extra_kv_tokens, reserved_draft, draft_tokens, expected_growth
+        self, reserved_draft, expected_growth
     ):
         manager = _make_fake_v2()
-        manager.num_extra_kv_tokens = num_extra_kv_tokens
         manager._kv_reserve_draft_tokens = reserved_draft
         manager.kv_cache_map = {
             7: SimpleNamespace(capacity=106, is_active=True),
@@ -582,13 +572,17 @@ class TestEvictionLifecycle:
         triattention = TriAttention(manager, budget=8, model_path="/models/test")
         batch = SimpleNamespace(
             context_requests=[],
-            generation_requests=[_make_request(7, py_draft_tokens=draft_tokens)],
+            generation_requests=[_make_request(7, py_draft_tokens=[1, 2, 3])],
         )
 
         triattention.prepare_resources(batch)
 
-        assert triattention._prepared_generation_batch[0] is batch
-        assert triattention._prepared_generation_batch[1] == {7: expected_growth}
+        assert triattention._prepared_generation_batch is batch
+        # Members of the prepared batch grow by the cached constant; others
+        # by zero. The prepared batch itself is the identity early-out.
+        assert triattention._inflight_generation_growth(SimpleNamespace(), 7) == expected_growth
+        assert triattention._inflight_generation_growth(SimpleNamespace(), 99) == 0
+        assert triattention._inflight_generation_growth(batch, 7) == 0
 
 
 class TestFixedScoreMetadata:
@@ -728,8 +722,8 @@ class TestFixedScoreMetadata:
         )
         first = _make_request(7, py_prompt_len=3)
         second = _make_request(8, py_prompt_len=5)
-        _set_request_state(manager, 7, confirmed_kv_length=8)
-        _set_request_state(manager, 8, confirmed_kv_length=10)
+        _set_request_state(manager, 7)
+        _set_request_state(manager, 8)
 
         with _mocked_eviction_internals(manager) as internals:
             manager._evict_requests(
@@ -867,9 +861,9 @@ class TestFixedScoreMetadata:
             )
 
         score_sentinel = -12345.0
-        # Isolate the score stage: an empty family list makes the compact
-        # stage a no-op (this synthetic round never stages move offsets).
-        bufs.compaction_families = []
+        # Isolate the score stage: empty prebound launch args make the
+        # compact stage a no-op (this synthetic round never stages offsets).
+        bufs.compact_launch_args = ()
         stage_round()
         bufs.score_output.fill_(score_sentinel)
         module.run_eviction_round(bufs, normalize_scores=False)

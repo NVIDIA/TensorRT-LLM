@@ -38,7 +38,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 
 def _fresh_request_state():
     """One request's compression ledger, as the manager initializes it."""
-    return {"generation_steps": 0, "evicted_tokens": 0, "confirmed_kv_length": None}
+    return {"generation_steps": 0, "evicted_tokens": 0}
 
 
 def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
@@ -300,6 +300,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     confirmed = uncompressed
     cache.capacity = confirmed
     previous_published = 0
+    previous_evicted = 0
     eviction_rounds = 0
     with _mocked_eviction_internals(manager) as internals:
         for _ in range(6):
@@ -310,10 +311,11 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
             manager._periodic_evict(batch)
 
             state = manager._request_states[7]
-            if state["confirmed_kv_length"] < confirmed:
+            if state["evicted_tokens"] > previous_evicted:
                 # An eviction round compacted the cache to prompt + budget.
                 eviction_rounds += 1
-                confirmed = state["confirmed_kv_length"]
+                confirmed -= state["evicted_tokens"] - previous_evicted
+                previous_evicted = state["evicted_tokens"]
                 cache.capacity = confirmed
                 assert confirmed == 2 + 4
                 # The staged logical position restores the uncompressed
