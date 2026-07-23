@@ -44,9 +44,12 @@ jobs:
 
     steps:
       - name: Checkout merge commit without LFS smudge
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
+          # This job only handles merged PRs and does not execute code from the
+          # checked-out tree, so explicitly allow the required merge checkout.
+          allow-unsafe-pr-checkout: true
           lfs: false
           fetch-depth: 2
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -200,7 +203,7 @@ jobs:
 
       - name: Comment on PR — already in storage
         if: steps.detect-lfs.outputs.lfs_status == 'present'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const files = require('fs').readFileSync('/tmp/lfs_files.txt', 'utf8').trim().split('\n');
@@ -221,7 +224,7 @@ jobs:
 
       - name: Comment on PR — sync succeeded
         if: steps.detect-lfs.outputs.lfs_status == 'pending' && steps.verify.outcome == 'success'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const files = require('fs').readFileSync('/tmp/lfs_files.txt', 'utf8').trim().split('\n');
@@ -242,7 +245,7 @@ jobs:
 
       - name: Comment on PR — sync failed
         if: always() && steps.detect-lfs.outputs.lfs_status == 'pending' && (steps.fetch-lfs.outcome != 'success' || steps.push-lfs.outcome != 'success' || steps.verify.outcome != 'success')
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const forkRepo = context.payload.pull_request.head.repo.full_name;

@@ -117,10 +117,16 @@ class TestPackedBeamBlockLayout:
 
             def __init__(self):
                 self.beam_width = None
+                self.pool_indices_window = None
 
             def get_batch_cache_indices(self, request_ids, layer_idx=None, beam_width=1):
                 self.beam_width = beam_width
                 return [[10, 11, 12, 13]]
+
+            def get_memory_pool_block_indices(self, block_ids, window_size):
+                # Identity translation: nothing offloaded, block_id == pool slot.
+                self.pool_indices_window = window_size
+                return block_ids
 
         req = _FakeReq(prompt_len=7)
         req.py_request_id = 1
@@ -128,9 +134,10 @@ class TestPackedBeamBlockLayout:
         req.sampling_config = _FakeSamplingConfig(beam_width=1)
         mgr = _FakeMgr()
 
-        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg())
+        block_ids = _CacheReuseAdapterV1(mgr).get_block_ids(req, 0, _lg(window=512))
 
         assert mgr.beam_width == 4
+        assert mgr.pool_indices_window == 512
         np.testing.assert_array_equal(block_ids, [10, 11, 12, 13])
 
     def test_pack_beam_cache_indices_single_block_prompt_keeps_all_beams(self):
@@ -269,8 +276,8 @@ class TestTokenRange:
 
 
 # ---------------------------------------------------------------------------
-# _create_kv_slice: default TokenRange spans prompt_len + num_extra_kv_tokens
-# so transferred KV matches what resize_context / _get_context_bytes allocate.
+# _create_kv_slice: default TokenRange spans prompt_len, matching the
+# trimmed block list actually transferred.
 # ---------------------------------------------------------------------------
 
 
@@ -310,15 +317,14 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
 
 
 class TestCreateKvSliceTokenRange:
-    """Default TokenRange built by _create_kv_slice must align with KV-cache allocation.
+    """token_range.end must be prompt_len, matching the trimmed block list.
 
-    KV cache allocation in resize_context (V2) and prepare_resources (V1) reserves
-    prompt_len + num_extra_kv_tokens slots whenever speculative decoding (e.g.
-    EAGLE3, MTP) consumes extra KV positions per request. The transferred token
-    range must cover the same span, otherwise the receiver under-receives KV.
+    The sender reconstructs total_blocks from token_range.end (ceil(end / tpb)),
+    so end must stay at prompt_len -- not prompt_len + num_extra_kv_tokens --
+    to match the blocks actually transferred.
     """
 
-    def test_includes_num_extra_kv_tokens(self):
+    def test_excludes_num_extra_kv_tokens(self):
         prompt_len = 17
         num_extra_kv_tokens = 7
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
@@ -326,10 +332,25 @@ class TestCreateKvSliceTokenRange:
         kv_slice = transceiver._create_kv_slice(req)
 
         assert kv_slice.token_range is not None
-        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (
-            0,
-            prompt_len + num_extra_kv_tokens,
-        )
+        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+
+    def test_extra_tokens_do_not_cross_block_boundary(self):
+        # Reconstructed total_blocks (ceil(end / tpb)) must match the blocks sent.
+        prompt_len = 16
+        num_extra_kv_tokens = 7
+        transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+        tpb = transceiver._reuse_adapter.tokens_per_block
+
+        # Setup must actually exercise a boundary crossing: prompt_len ends on a
+        # block boundary and the extra tokens would otherwise add a block.
+        assert prompt_len % tpb == 0
+        assert (prompt_len + num_extra_kv_tokens + tpb - 1) // tpb == prompt_len // tpb + 1
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        end = kv_slice.token_range.end
+        transferred_blocks = kv_slice.block_ids_per_layer_groups[0].size
+        assert (end + tpb - 1) // tpb == transferred_blocks
 
     def test_defaults_to_prompt_len_when_no_extra(self):
         prompt_len = 17

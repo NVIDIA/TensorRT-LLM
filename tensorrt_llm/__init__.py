@@ -104,24 +104,6 @@ _setup_vendored_triton_kernels()
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
-
-def _preload_tensorrt_libs():
-    """Preload the TensorRT libraries needed by the bindings extension.
-
-    The C++ runtime still links against the TensorRT libraries until it is
-    decoupled from TensorRT. Importing the tensorrt package loads libnvinfer
-    from the tensorrt_libs wheel for environments where it is not on the
-    system loader path; without it, importing tensorrt_llm.bindings raises
-    ImportError: libnvinfer.so.10: cannot open shared object file.
-    """
-    try:
-        import tensorrt  # noqa: F401
-    except ImportError:
-        pass
-
-
-_preload_tensorrt_libs()
-
 import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.math_utils as math_utils
 import tensorrt_llm.models as models

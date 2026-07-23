@@ -40,13 +40,22 @@ from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
-from .config_utils import is_hybrid_linear
+from .config_utils import is_hybrid_linear, is_minimax_m3
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 
 
 class _ExecutorMemoryMonitor:
@@ -411,6 +420,13 @@ def create_py_executor(
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
 
+    # The MSA kernels require a page size of 128; the Triton reference uses TRT-LLM's default
+    # of 32.
+    m3_sparse_config = llm_args.sparse_attention_config
+    if is_minimax_m3(m3_sparse_config):
+        tokens_per_block = 128 if m3_sparse_config.implementation == "msa" else 32
+        kv_cache_config.tokens_per_block = tokens_per_block
+
     if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
         # Workaround for flashinfer and star attention
         if kv_cache_config.enable_block_reuse:
@@ -668,10 +684,6 @@ def create_py_executor(
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
 
-    # Set default value for cache_transceiver_config.max_tokens_in_buffer
-    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
-        cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
-
     config = model_engine.model.model_config.pretrained_config
     max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
                                 max_batch_size * getattr(mapping, "pp_size", 1))
@@ -704,12 +716,11 @@ def create_py_executor(
             )
 
         sm_version = get_sm_version()
-        if kv_cache_config.enable_block_reuse and sm_version not in [
-                90, 100, 103, 120
-        ]:
-            logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_block_reuse for SM{sm_version}")
+        if (kv_cache_config.enable_block_reuse and sm_version
+                not in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS):
+            logger.warning("KV cache reuse for MLA can only be enabled on "
+                           f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
@@ -725,14 +736,26 @@ def create_py_executor(
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
-        if enable_chunked_context and sm_version not in [90, 100, 103, 120]:
-            logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM120, "
-                f"disable enable_chunked_context for SM{sm_version}")
+        if (enable_chunked_context and sm_version
+                not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
+            logger.warning("Chunked Prefill for MLA can only be enabled on "
+                           f"{_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
                 draft_model_engine.attn_runtime_features.chunked_prefill = False
+
+    # Set default value for cache_transceiver_config.max_tokens_in_buffer.
+    # Placed after the FlashMLA tokens_per_block override and rounded up to a
+    # tokens_per_block multiple: CacheTransBufferManager requires
+    # max_tokens_in_buffer % tokens_per_block == 0 (cacheTransBuffer.cpp),
+    # and net_max_seq_len is in general not aligned (e.g. max_seq_len plus a
+    # non-power-of-two seq_len offset).
+    if cache_transceiver_config and cache_transceiver_config.max_tokens_in_buffer is None:
+        cache_transceiver_config.max_tokens_in_buffer = (
+            (net_max_seq_len + tokens_per_block - 1) // tokens_per_block *
+            tokens_per_block)
 
     if enable_chunked_context:
         chunk_unit_size = tokens_per_block

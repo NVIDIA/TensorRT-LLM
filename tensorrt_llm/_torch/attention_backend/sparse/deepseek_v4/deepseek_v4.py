@@ -250,6 +250,7 @@ def make_deepseek_v4_sparse_metadata_params(
         ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
+        use_cute_dsl_topk=sparse_attention_config.use_cute_dsl_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
         q_split_threshold=sparse_attention_config.q_split_threshold,
         compress_ratios=sparse_attention_config.compress_ratios,
@@ -529,6 +530,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.host_indexer_k_cache_block_offsets[: self.num_seqs],
             non_blocking=True,
         )
+        # Columns beyond each sequence's allocated indexer blocks contain BAD_PAGE_INDEX (-1).
+        # CUDA-graph padded token slots may still compute scatter addresses from those columns
+        # before being ignored, so map them to block 0, matching the base DSA metadata path.
+        self.indexer_k_cache_block_offsets.clamp_(min=0)
 
     def prepare_for_block_tables(self):
         """Prepare block tables for sliding-window and compressed attention."""

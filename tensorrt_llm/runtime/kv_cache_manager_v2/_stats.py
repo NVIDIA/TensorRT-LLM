@@ -76,3 +76,8 @@ class KVCacheIterationStatsDelta(_StatsDeltaMixin):
         if self.iter_reused_blocks == 0 or total == 0:
             return 0.0
         return self.iter_reused_blocks / total
+
+
+_KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(
+    field.name for field in fields(KVCacheIterationStatsDelta)
+)
