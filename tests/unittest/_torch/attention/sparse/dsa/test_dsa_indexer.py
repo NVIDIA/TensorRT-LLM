@@ -145,9 +145,8 @@ def test_shared_topk_indices_lifecycle():
     ):
         metadata.create_buffers_for_indexer()
 
-    buffer = metadata.shared_topk_indices_buffer
+    buffer = metadata.shared_topk_indices
     assert buffer.shape == (4, 3)
-    assert metadata.shared_topk_indices is None
 
     context_topk = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32)
     generation_topk = torch.tensor([[2, 1, 0], [3, 2, 1]], dtype=torch.int32)
@@ -205,8 +204,7 @@ def test_shared_topk_indices_lifecycle():
     metadata.prepare_dense_topk_indices = Mock()
     metadata.on_update_kv_lens()
 
-    assert metadata.shared_topk_indices is None
-    assert metadata.shared_topk_indices_buffer is buffer
+    assert metadata.shared_topk_indices is buffer
 
 
 def test_indexer_post_load_weights_caches_fused_weight():
