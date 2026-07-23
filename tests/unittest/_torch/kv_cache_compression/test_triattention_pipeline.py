@@ -239,6 +239,60 @@ class TestTriAttentionClass:
         for key in ("E_q", "E_q_norm", "omega", "freq_scale_sq"):
             assert key in loaded
 
+    def test_rope_tables_resolve_theta_and_attention_factor(self, tmp_path):
+        # transformers>=5.5 folds rope_theta into ``rope_parameters`` and drops
+        # "default" from ROPE_INIT_FUNCTIONS; resolution must find the true
+        # theta and scaled-rope attention factor on both config generations
+        # (the silent base-10000 analytic fallback was the B1 bug).
+        pytest.importorskip("transformers")
+        import json
+
+        def config_dir(name, body):
+            d = tmp_path / name
+            d.mkdir()
+            (d / "config.json").write_text(json.dumps(body))
+            return str(d)
+
+        common = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "num_hidden_layers": 2,
+            "head_dim": 64,
+            "max_position_embeddings": 8192,
+        }
+        plain = config_dir("plain", {**common, "rope_theta": 1000000.0})
+        yarn = config_dir(
+            "yarn",
+            {
+                **common,
+                "rope_theta": 150000.0,
+                "rope_scaling": {
+                    "rope_type": "yarn",
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 2048,
+                    "attention_factor": 1.25,
+                },
+            },
+        )
+        mgr = _make_triattention()
+        freq_count = 32
+
+        mgr.model_path = plain
+        omega, freq_scale_sq = mgr._rope_tables(freq_count)
+        idx = torch.arange(0, 64, 2, dtype=torch.float32)
+        torch.testing.assert_close(omega, (1.0 / (1000000.0 ** (idx / 64)))[:freq_count])
+        assert torch.equal(freq_scale_sq, torch.ones(freq_count))
+
+        mgr.model_path = yarn
+        omega_yarn, freq_scale_sq_yarn = mgr._rope_tables(freq_count)
+        # Routed through transformers' yarn init: the explicit attention
+        # factor lands squared, and the ladder leaves the plain-theta curve.
+        torch.testing.assert_close(freq_scale_sq_yarn, torch.full((freq_count,), 1.25**2))
+        assert not torch.allclose(omega_yarn, omega)
+
 
 class TestCompressedTokenPublication:
     # The cumulative/monotone publication contract itself (including the

@@ -1984,25 +1984,62 @@ class TriAttention(BaseKVCacheCompressionManager):
     def _rope_tables(self, freq_count: int):
         """RoPE ``omega`` (inv_freq) + ``freq_scale_sq`` (squared position-0
         amplitude) from the model config -- model-intrinsic, corpus-independent
-        (the official file does not store them). transformers' rope-init handles
-        plain and scaled RoPE; plain RoPE has attention_factor 1 so freq_scale_sq
-        is all ones. Falls back to the analytic inv_freq if rope-init is absent."""
+        (the official file does not store them). Reads both config generations:
+        transformers>=5.5 ``rope_parameters`` (rope_theta folded inside) and the
+        legacy top-level ``rope_scaling``/``rope_theta``. Plain RoPE uses the
+        standard formula with the resolved theta (attention_factor 1); scaled
+        variants (yarn, llama3, ...) go through transformers' rope-init so their
+        attention_factor is honored. The analytic fallback survives ONLY for
+        ImportError (rope-init module absent); every other failure raises."""
+        import transformers
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True).get_text_config()
         config_values = cfg.to_dict()
         head_dim = freq_count * 2
-        base = float(config_values.get("rope_theta", 10000.0))
-        try:
-            from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+        rope_params = (
+            config_values.get("rope_parameters") or config_values.get("rope_scaling") or {}
+        )
+        if rope_params and all(isinstance(v, dict) for v in rope_params.values()):
+            raise ValueError(
+                f"TriAttention: layer-type-keyed rope_parameters are not supported for "
+                f"calibration conversion (model {self.model_path}); got {rope_params!r}."
+            )
+        rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
+        theta_seen = rope_params.get("rope_theta", config_values.get("rope_theta"))
+        base = float(theta_seen) if theta_seen is not None else 10000.0
 
-            scaling = config_values.get("rope_scaling") or {}
-            rope_type = scaling.get("rope_type") or scaling.get("type") or "default"
-            inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](cfg, device="cpu")
+        def analytic_inv_freq():
+            idx = torch.arange(0, head_dim, 2, dtype=torch.float32)
+            return (1.0 / (base ** (idx / head_dim)))[:freq_count].clone()
+
+        if rope_type == "default":
+            # The original RoPE formula (transformers>=5.5 computes it per-model
+            # and no longer keys "default" in ROPE_INIT_FUNCTIONS).
+            omega, scale_sq = analytic_inv_freq(), 1.0
+        else:
+            try:
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+            except ImportError:
+                logger.warning(
+                    f"TriAttention: transformers rope-init unavailable; using the analytic "
+                    f"inv_freq with theta={base} for {self.model_path} and IGNORING "
+                    f"rope_type={rope_type!r} scaling corrections."
+                )
+                return analytic_inv_freq(), torch.ones(freq_count, dtype=torch.float32)
+            if rope_type not in ROPE_INIT_FUNCTIONS:
+                raise ValueError(
+                    f"TriAttention: unknown rope_type {rope_type!r} for {self.model_path} "
+                    f"(transformers {transformers.__version__} provides "
+                    f"{sorted(ROPE_INIT_FUNCTIONS)}); rope config seen: {rope_params!r}."
+                )
+            try:
+                inv_freq, attention_factor = ROPE_INIT_FUNCTIONS[rope_type](cfg, device="cpu")
+            except Exception as exc:
+                raise ValueError(
+                    f"TriAttention: rope-init {rope_type!r} failed for {self.model_path}; "
+                    f"rope config seen: {rope_params!r}."
+                ) from exc
             omega = inv_freq.to(torch.float32)[:freq_count].clone()
             scale_sq = float(attention_factor) ** 2
-        except Exception:
-            idx = torch.arange(0, head_dim, 2, dtype=torch.float32)
-            omega = (1.0 / (base ** (idx / head_dim)))[:freq_count].clone()
-            scale_sq = 1.0
         return omega, torch.full((freq_count,), scale_sq, dtype=torch.float32)
