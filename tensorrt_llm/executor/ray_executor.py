@@ -256,6 +256,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                    target_ranks=target_ranks)
         return await asyncio.gather(*refs)
 
+    def get_startup_metrics(self) -> dict:
+        """Get startup metrics from rank 0."""
+        metrics = self.collective_rpc("get_startup_metrics", target_ranks=0)
+        return metrics[0] if metrics and isinstance(metrics[0], dict) else {}
+
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
         Low-level API to the executor. Return a "future" GenerationResult

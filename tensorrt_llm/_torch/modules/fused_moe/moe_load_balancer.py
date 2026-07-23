@@ -1,7 +1,7 @@
 import gc
 import os
 import threading
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from multiprocessing import resource_tracker, shared_memory
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -1035,14 +1035,16 @@ moe_model_arch_list = [
 
 
 def maybe_create_moe_load_balancer(
-        model_config, mapping: Optional[Mapping]) -> Optional[MoeLoadBalancer]:
+    model_config, mapping: Optional[Mapping]
+) -> AbstractContextManager[MoeLoadBalancer | None]:
     ep_rank = model_config.mapping.moe_ep_rank
     ep_size = model_config.mapping.moe_ep_size
     model_arch = model_config.pretrained_config.architectures[0]
     using_ep = mapping and mapping.moe_ep_size > 1
     in_supported_model_arch = model_arch in moe_model_arch_list
     using_smart_router = mapping and mapping.moe_cluster_size > 1
-    moe_load_balancer = nullcontext()
+    moe_load_balancer: AbstractContextManager[MoeLoadBalancer
+                                              | None] = nullcontext()
     if in_supported_model_arch and using_ep and not using_smart_router and model_config.moe_load_balancer is not None:
         model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
         if model_config.moe_load_balancer.layer_updates_per_iter > 0:

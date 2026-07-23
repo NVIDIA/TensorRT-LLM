@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import torch
 from torch import nn
 
@@ -22,16 +24,21 @@ class HfWeightMapper(BaseWeightMapper):
             'gate_up_proj': ['gate_proj', 'up_proj']
         })
 
-    def apply_callbacks(self, module: nn.Module, module_name: str,
-                        module_names_breakdown: list[str],
-                        weights: dict) -> list[dict]:
+    def apply_callbacks(
+            self, module: nn.Module, module_name: str,
+            module_names_breakdown: list[str],
+            weights: Mapping[str,
+                             torch.Tensor]) -> list[dict[str, torch.Tensor]]:
         module_weights = []
 
-        for new_name in self._mapping[module_name]:
-            fw = self.filter_weights(
-                '.'.join(module_names_breakdown + [new_name]), weights)
+        # For each raw checkpoint module name needed by `module`:
+        for source_name in self._mapping[module_name]:
+            # Find the tensors under this checkpoint module and remove
+            # their module path prefixes
+            fw: dict[str, torch.Tensor] = self.filter_weights(
+                '.'.join(module_names_breakdown + [source_name]), weights)
             for callback in self._callbacks:
-                fw = callback(module, new_name, fw)
+                fw = callback(module, source_name, fw)
             module_weights.append(fw)
 
         return module_weights
@@ -65,8 +72,17 @@ class HfWeightMapper(BaseWeightMapper):
             return config.num_key_value_heads
         return config.num_attention_heads
 
-    def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
-                              weights: dict):
+    def _duplicate_kv_weights(
+            self, module: nn.Module, new_name: str,
+            weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """
+
+        If `new_name` is `k_proj` or `v_proj`, duplicate "weight" and "bias" weights
+        in `weights` if needed so that they can be sliced later to match sliced query heads,
+        allowing tensor parallelism to work on attention.
+
+        Returned the potentially processed `weights`.
+        """
         if new_name in ['k_proj', 'v_proj']:
             num_kv_heads = self._num_kv_heads
 
@@ -87,26 +103,48 @@ class HfWeightMapper(BaseWeightMapper):
         return weights
 
     def _duplicate_kv(self, weight: torch.Tensor, num_kv_heads: int,
-                      tensor_parallel_size: int):
+                      tensor_parallel_size: int) -> torch.Tensor:
+        """
+        Duplicate K/V proj weight to match `tensor_parallel_size`.
+
+        It expands kv proj weight [num_kv_heads*kv_head_dim, hidden_size] into
+        [num_kv_heads*rep*kv_head_dim, hidden_size], where rep = tp_size / num_kv_heads.
+        As an example, if rep == 2, the weight will be converted from logically:
+        [head_0_proj_matrix, head_1_proj_matrix, ...] to
+        [head_0_proj_matrix, head_0_proj_matrix, head_1_proj_matrix, head_1_proj_matrix, ...]
+        so that there are `tensor_parallel_size` proj matrices total, to be divided later
+        as one proj matrix per tp rank.
+
+        Return the expanded weight tensor.
+        """
 
         if num_kv_heads >= tensor_parallel_size:
+            # assume `num_kv_heads` is divisible by tp_size
             assert num_kv_heads % tensor_parallel_size == 0
             return weight
 
+        # assume tp_size is divisible by `num_kv_heads`
         assert tensor_parallel_size % num_kv_heads == 0
         reps = tensor_parallel_size // num_kv_heads
 
         # bias
         if weight.ndim == 1:
+            # From Yijing: this might be a bug, repeat_interleave does:
+            # repeat_interleave([1, 2, 3], 2) -> [1, 1, 2, 2, 3, 3]
+            # this is not how we usually slice tensors for tensor parallelism.
+            # This bug is not triggered yet since most if not all of LLM attention modules
+            # have no bias.
             return weight.repeat_interleave(reps)
 
         # weight and scale
         assert weight.shape[0] % num_kv_heads == 0
-        size_per_kv_head = weight.shape[0] // num_kv_heads
+        size_per_kv_head = weight.shape[0] // num_kv_heads  # aka, kv_head_dim
+        # Build a view of the tensor with shape [num_kv_heads, reps, kv_head_dim, hidden_size]
         weight = weight.reshape(num_kv_heads, size_per_kv_head,
                                 -1)[:,
                                     None, :, :].expand(num_kv_heads, reps,
                                                        size_per_kv_head,
                                                        weight.shape[1])
+        # Return a new tensor of shape [num_kv_heads*reps*kv_head_dim, hidden_size]
         return weight.reshape(num_kv_heads * reps * size_per_kv_head,
                               -1).clone().detach()

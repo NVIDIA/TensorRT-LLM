@@ -18,6 +18,7 @@ from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, RequestOutput)
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
@@ -1291,6 +1292,41 @@ class _FakeRawRequest:
 
     async def is_disconnected(self):
         return True
+
+
+def test_startup_metrics_are_cached_and_reported_by_server_info() -> None:
+
+    class FakeExecutor:
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_startup_metrics(self):
+            self.calls += 1
+            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+
+    executor = FakeExecutor()
+    generator = object.__new__(BaseLLM)
+    generator._executor = executor
+    generator._startup_metrics = None
+    generator._disaggregated_params = {}
+
+    server = object.__new__(OpenAIServer)
+    server.generator = generator
+    first_response = asyncio.run(server.get_server_info())
+    second_response = asyncio.run(server.get_server_info())
+
+    expected = {
+        "disaggregated_params": {},
+        "startup_metrics": {
+            "model_loader": {
+                "total_model_loading_seconds": 1.5
+            }
+        },
+    }
+    assert json.loads(first_response.body) == expected
+    assert json.loads(second_response.body) == expected
+    assert executor.calls == 1
 
 
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:

@@ -468,6 +468,7 @@ def throughput_command(
             "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
         llm = get_llm(runtime_config, kwargs)
+        startup_metrics = None if options.report_json is None else llm.startup_metrics
 
         sampler_args = {
             "end_id": options.eos_id,
@@ -525,8 +526,13 @@ def throughput_command(
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
-        report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, options.streaming)
+        report_utility = ReportUtility(statistics,
+                                       metadata,
+                                       runtime_config,
+                                       logger,
+                                       kwargs,
+                                       options.streaming,
+                                       startup_metrics=startup_metrics)
         # Generate reports for statistics, output tokens, and request info.
         generate_json_report(options.report_json,
                              report_utility.get_statistics_dict)

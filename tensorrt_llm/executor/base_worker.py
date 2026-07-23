@@ -972,6 +972,25 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
+    def get_startup_metrics(self) -> dict:
+        """Return rank-local startup metrics for the PyTorch backend."""
+        if not self._is_pytorch_backend or self.engine is None:
+            return {}
+
+        startup_metrics = {}
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_loader = getattr(model_engine, "model_loader", None)
+        if model_loader is not None:
+            startup_metrics["model_loader"] = dict(model_loader.metrics)
+
+        draft_model_engine = getattr(self.engine, "draft_model_engine", None)
+        draft_model_loader = getattr(draft_model_engine, "model_loader", None)
+        if draft_model_loader is not None:
+            startup_metrics["draft_model_loader"] = dict(
+                draft_model_loader.metrics)
+
+        return startup_metrics
+
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
