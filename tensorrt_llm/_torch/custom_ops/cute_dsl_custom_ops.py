@@ -8532,9 +8532,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             one in-autotune forward at ANY batch then profiles every bucket
             up to the engine's max batch, so no runtime batch falls to
             ``default_tactic`` (whose freshly computed split_kv could
-            JIT-compile a kernel inside the timed region). Without
-            max_batch_size (standalone / unit-test callers) the ladder is
-            derived from the tuning-time batch instead.
+            JIT-compile a kernel inside the timed region).
 
             Every other dim carrying batch is tied to it via constraints.
             seq_len_q needs no dynamic axis: it is fixed per runner (part of
@@ -8543,43 +8541,38 @@ if IS_CUTLASS_DSL_AVAILABLE:
             key = self.unique_id()
             cache = self.__class__.tuning_config_cache
             if key not in cache:
-                # Inputs: 0 q_latent  1 q_rope  2 c_latent  3 c_rope
-                #         4 page_table  5 cache_seqs  6 o  7 workspace
-                # Batch dim per input: q/o (H, D, S, B) -> 3,
-                # cache_seqs (B,) -> 0, page_table (max_blocks, B) -> 1.
+                # Tensors' (index, name: shape):
+                #   0 q_latent:   (H, D, S_q, B)
+                #   1 q_rope:     (H, R, S_q, B)
+                #   2 c_latent:   (page_size, D, num_pages)
+                #   3 c_rope:     (page_size, R, num_pages)
+                #   4 page_table: (max_blocks_per_sequence, B)
+                #   5 cache_seqs: (B,)
+                #   6 o:          (H, D, S_q, B)
+                #   7 workspace:  (workspace_size,)
+
+                # cache_seqs (index 5) is the single free dynamic batch dim;
+                # every other batch-carrying dim is tied to it by a constraint.
                 batch_dims = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3))
-                free = 5  # cache_seqs -- the free dynamic batch dim
-                # (input, dim) whose size is a static config quantity, not
-                # per-request -- kept at its real size for profiling but
-                # excluded from the cache key (constraint dims are set to -1 in
-                # the key): page_table dim0 (max_blocks) and workspace dim0.
-                # Small tensors, so reconstructing them at real size is cheap.
-                #
-                # NOTE: the paged-KV pool (c_latent/c_rope) is deliberately NOT
-                # listed in ANY spec. The AutoTuner rebuilds (via torch.rand)
-                # only inputs that carry a DynamicDim; a purely-static input is
-                # reused BY REFERENCE (_prepare_input_tensors). Constraining
-                # num_pages to drop it from the cache key would instead turn it
-                # into a DynamicDim, and the AutoTuner would allocate a fresh
-                # copy of the WHOLE KV pool per profiled batch -- during KV-cache
-                # estimation / final warmup the pool fills most of GPU memory, so
-                # duplicating it OOMs. Leaving c_latent/c_rope static means the
-                # profiling forward reads the real pool (zero extra memory, real
-                # addresses/content). The cost is that num_pages then enters the
-                # cache key: estimation-phase entries (small pool) don't transfer
-                # to the final warmup (large pool), so the final warmup re-tunes
-                # -- harmless, since runtime num_pages equals the final pool and
-                # thus hits the final-warmup entries (no in-run JIT stall).
-                static_size_dims = ((4, 0), (7, 0))
-                constraint_dims = [(i, d) for (i, d) in batch_dims if i != free]
+                free = 5  # cache_seqs
                 batch_constraints = tuple(
                     ConstraintSpec(
                         i, d, lambda shapes, _free=free: shapes[_free][0])
-                    for (i, d) in constraint_dims)
+                    for (i, d) in batch_dims if i != free)
+
+                # (input, dim) whose size is a static config quantity, not
+                # per-request: kept at its real size for profiling but excluded
+                # from the cache key (constraint dims are set to -1 in the key).
+                # page_table dim0 (max_blocks) and workspace dim0 -- both small
+                # (page_table is int32 max_blocks x B; the workspace is the
+                # max-batch LSE + a batch-independent split-KV region, tens of
+                # MB), so rebuilding them for profiling is cheap.
+                static_size_dims = ((4, 0), (7, 0))
                 static_constraints = tuple(
                     ConstraintSpec(
                         i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])
                     for (i, d) in static_size_dims)
+
                 # The batch search space, fixed up-front by max_batch_size
                 # when the engine max is known.
                 batch_buckets = (get_last_power_of_2_num_tokens_buckets(
@@ -8622,19 +8615,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             Args:
                 inputs (List[torch.Tensor]):
-                    inputs[0]: Query latent tensor of shape (H, D, S_q, B).
-                    inputs[1]: Query RoPE tensor of shape (H, R, S_q, B).
-                    inputs[2]: Paged latent-cache tensor of shape
+                    inputs[0] (q_latent): Query latent tensor of shape
+                        (H, D, S_q, B).
+                    inputs[1] (q_rope): Query RoPE tensor of shape (H, R, S_q, B).
+                    inputs[2] (c_latent): Paged latent-cache tensor of shape
                         (page_size, D, num_pages).
-                    inputs[3]: Paged RoPE-cache tensor of shape
+                    inputs[3] (c_rope): Paged RoPE-cache tensor of shape
                         (page_size, R, num_pages).
-                    inputs[4]: Page table tensor of shape
+                    inputs[4] (page_table): Page table tensor of shape
                         (max_blocks_per_sequence, B), dtype: int32.
-                    inputs[5]: Cache sequence lengths tensor of shape (B),
-                        dtype: int32.
-                    inputs[6]: Output tensor of shape (H, D, S_q, B).
-                    inputs[7]: Contiguous raw workspace with at least the
-                        workspace_size returned by get_workspace_layout.
+                    inputs[5] (cache_seqs): Cache sequence lengths tensor of
+                        shape (B), dtype: int32.
+                    inputs[6] (o): Output tensor of shape (H, D, S_q, B).
+                    inputs[7] (workspace): Contiguous raw workspace with at least
+                        the workspace_size returned by get_workspace_layout.
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional softmax_scale and output_scale values.
@@ -8671,17 +8665,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             seq_len_q = self.seq_len_q
 
-            # LSE output lives at [lse_offset, lse_offset + lse_size); the
-            # split-KV intermediates follow at the fixed split_kv_offset so their
-            # base address is batch-independent (CUDA-graph safe: a graph
-            # captured at one batch must not see the split-KV base move at
-            # another). The slice taken here is the current batch's LSE; the
-            # reserved region is sized from the max batch to match
-            # get_max_padded_workspace_size, falling back to the current batch
-            # for standalone callers without an engine max. LSE is carved (not
-            # an op input, which under CUDA graphs would pin one throwaway copy
-            # per captured graph); it is never read downstream, the kernel only
-            # writes it.
+            # workspace = lse + split_kv_workspace
             batch_size = cache_seqs.shape[0]
             d_latent = q_latent.shape[1]
             max_batch_size = max(batch_size, self.max_batch_size)
@@ -8846,12 +8830,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: int = 0,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
-
-        ``o`` and ``workspace`` are mutated in place (the LSE output is carved
-        from ``workspace`` internally and never returned). Tensor layouts:
-        see ``BlackwellMultiHeadLatentAttentionForwardFP8``.
-        ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
-        the engine's max batch instead of stopping at the tuning-time batch.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -8931,12 +8909,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         max_batch_size: int = 0,
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
-
-        ``o`` and ``workspace`` are mutated in place (the LSE output is carved
-        from ``workspace`` internally and never returned). Tensor layouts:
-        see ``BlackwellMultiHeadLatentAttentionForwardFP16``.
-        ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
-        the engine's max batch instead of stopping at the tuning-time batch.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(

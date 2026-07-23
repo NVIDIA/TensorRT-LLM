@@ -207,10 +207,7 @@ class CuteDslMlaFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            # info_once keyed on the reason text (which embeds the offending
-            # shape), so each distinct reject cause is visible in default logs
-            # exactly once per process instead of flooding every dispatch.
-            logger.info_once(f"CuTe DSL MLA FMHA does not support request: {reason}", key=reason)
+            logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
         return supported
 
     @staticmethod
@@ -312,12 +309,15 @@ class CuteDslMlaFmha(PhasedFmha):
             return False, f"Query length must be >= 1, got {seq_len_q}."
         batch_size = meta.num_generations
 
-        # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
-        # beats the default path E2E; everything else falls back. Skipped
-        # entirely while the AutoTuner is tuning.
         from tensorrt_llm._torch.autotuner import AutoTuner
 
+        # Skip the perf gate while the AutoTuner is tuning. The autotuner warmup
+        # issues gen requests at a single batch size, which the perf gate would
+        # very likely reject as not favorable; that rejection would keep this
+        # shape from ever being tuned. Letting tuning through here ensures the
+        # tactics are profiled, so the gate at runtime picks from a tuned cache.
         if not AutoTuner.get().is_tuning_mode:
+            # Perf gate (NOT a correctness limit)
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
                 batch_size,
@@ -374,15 +374,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 )
 
         # Final authority: the kernel's own can_implement under the default
-        # tiler the op launches with (the FMHA library bypasses the AutoTuner's
-        # can_implement filter), so a request that reaches the gate is one the
-        # kernel can actually serve.
-        # Real kernel input/output torch dtypes: the input is fp8 on the fp8-KV
-        # path (``kernel_dtype``), the output is written straight into
-        # ``fwd.output`` (no temp buffer in ``_run_mla_decode``), so its dtype is
-        # the authoritative output dtype -- can_implement rejects the request if
-        # the kernel cannot emit it. ``_kernel_can_implement`` converts both to
-        # cutlass dtypes internally.
+        # tiler the op launches with.
         return self._kernel_can_implement(
             kernel_dtype,
             fwd.output.dtype,
@@ -468,11 +460,7 @@ class CuteDslMlaFmha(PhasedFmha):
         block_offsets = meta.kv_cache_block_offsets
         pool_mapping = meta.host_kv_cache_pool_mapping
         # Select this layer's [num_seqs, max_blocks] page table from the 4D
-        # kv_cache_block_offsets via the layer -> pool mapping.
-        # ``host_kv_cache_pool_mapping`` is indexed by the LOCAL (compacted)
-        # layer index, not the global ``attn.layer_idx`` -- they coincide for a
-        # full model but differ when the KV cache manager allocates a subset of
-        # layers (e.g. PP, or the layer-wise benchmark's ``layer_mask``).
+        # kv_cache_block_offsets.
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
@@ -487,9 +475,6 @@ class CuteDslMlaFmha(PhasedFmha):
         kv_pages = kv_pool_typed[:, 0, :, 0, : d_latent + d_rope]
         c_pool_latent = kv_pages[..., :d_latent].permute(1, 2, 0)
         c_pool_rope = kv_pages[..., d_latent:].permute(1, 2, 0)
-
-        # Split-KV parallelism is owned ENTIRELY by the op's AutoTuner: it
-        # profiles the per-shape split_kv candidates
 
         workspace = params.workspace
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
