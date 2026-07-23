@@ -21,7 +21,6 @@ class RankInfo:
     pp_rank: int
     layer_num_per_pp: List[int]
     sender_endpoints: List[str]
-    server_endpoint: str
     self_endpoint: str
     transfer_engine_info: bytes
 
@@ -74,7 +73,6 @@ class RankInfo:
             device_id=device_id,
             layer_num_per_pp=[len(kvm.pp_layers)],
             sender_endpoints=[],
-            server_endpoint="",
             self_endpoint="",
             transfer_engine_info=bytes(),
             attention=AttentionInfo(

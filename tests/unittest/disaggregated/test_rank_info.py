@@ -33,7 +33,6 @@ def test_rank_info_construction():
         pp_rank=0,
         layer_num_per_pp=[32],
         sender_endpoints=["tcp://10.0.0.1:5000"],
-        server_endpoint="tcp://10.0.0.1:5000",
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"\x00\x01\x02",
     )
@@ -54,7 +53,6 @@ def test_rank_info_msgpack_roundtrip():
         pp_rank=0,
         layer_num_per_pp=[32],
         sender_endpoints=["tcp://10.0.0.1:5000"],
-        server_endpoint="tcp://10.0.0.1:5000",
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"\x00\x01\x02",
     )
@@ -82,7 +80,6 @@ def test_rank_info_roundtrip_with_aux_meta():
         pp_rank=0,
         layer_num_per_pp=[32],
         sender_endpoints=["tcp://10.0.0.1:5000"],
-        server_endpoint="tcp://10.0.0.1:5000",
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"",
         aux_meta=meta,

@@ -43,7 +43,6 @@ def make_rankinfo(
         device_id=0,
         layer_num_per_pp=[1],
         sender_endpoints=[],
-        server_endpoint="",
         self_endpoint="",
         transfer_engine_info=b"",
         attention=AttentionInfo(
