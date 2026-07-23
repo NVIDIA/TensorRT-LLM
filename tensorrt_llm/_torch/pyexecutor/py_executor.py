@@ -3259,6 +3259,7 @@ class PyExecutor:
                 if spec_config is not None and spec_config.is_linear_tree else
                 self.model_engine.max_total_draft_tokens)
 
+    @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -3863,6 +3864,7 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    @nvtx_range("_handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
         """Rank-safe disagg cache error and poison handler.
 
