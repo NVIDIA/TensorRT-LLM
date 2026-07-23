@@ -528,9 +528,9 @@ def _logic_tp2_attn2d_2x1_groups(rank, world_size):
     """Groups compose under tp=2 × attn2d(2×1) on 4 GPUs (guard removed).
 
     Mesh cfg-tp-cp_row-cp_col-ulysses with tp=2, attn2d_row=2, attn2d_col=1:
-        tp_rank    = rank % 2
-        cp_rank    = (rank // 2) % 2   (row-major over cp_row × cp_col)
-    TP groups: {0,1} and {2,3}. attn2d_row groups: {0,2} and {1,3}.
+        tp_rank    = (rank // 2) % 2
+        cp_rank    = rank % 2   (row-major over cp_row × cp_col)
+    TP groups: {0,2} and {1,3}. attn2d_col groups: {0,1} and {2,3}.
     """
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
 
@@ -546,14 +546,16 @@ def _logic_tp2_attn2d_2x1_groups(rank, world_size):
 
     assert vgm.tp_size == 2
     assert vgm.cp_size == 2
-    assert vgm.tp_rank == rank % 2
-    assert vgm.cp_rank == (rank // 2) % 2
+    assert vgm.tp_rank == (rank // 2) % 2
+    assert vgm.cp_rank == rank % 2
 
     assert vgm.tp_group_pg is not None
     assert vgm.attn2d_row_group is not None
+    assert vgm.attn2d_col_group is not None
     assert vgm.attn2d_mesh_group is not None
     assert dist.get_world_size(vgm.tp_group_pg) == 2
-    assert dist.get_world_size(vgm.attn2d_row_group) == 2
+    assert dist.get_world_size(vgm.attn2d_row_group) == 1
+    assert dist.get_world_size(vgm.attn2d_col_group) == 2
     assert dist.get_world_size(vgm.attn2d_mesh_group) == 2
 
     device = torch.device(f"cuda:{rank}")
@@ -564,8 +566,8 @@ def _logic_tp2_attn2d_2x1_groups(rank, world_size):
     assert x.item() == 2.0, f"Rank {rank}: tp all_reduce expected 2, got {x.item()}"
 
     x = one.clone()
-    dist.all_reduce(x, group=vgm.attn2d_row_group)
-    assert x.item() == 2.0, f"Rank {rank}: attn2d_row all_reduce expected 2, got {x.item()}"
+    dist.all_reduce(x, group=vgm.attn2d_col_group)
+    assert x.item() == 2.0, f"Rank {rank}: attn2d_col all_reduce expected 2, got {x.item()}"
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")

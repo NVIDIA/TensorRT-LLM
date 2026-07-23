@@ -51,6 +51,8 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _visual_gen_dist_utils import spawn_with_retry
 
+    from .tp_shard_utils import copy_tp_parameter
+
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
@@ -264,6 +266,27 @@ def _free(*objs) -> None:
     torch.cuda.empty_cache()
 
 
+def _copy_ref_weights_to_tp(ref_model, tp_model, pretrained_config) -> None:
+    """Copy reference weights into a TP model using its local parameter layouts."""
+    ref_params = dict(ref_model.named_parameters())
+    vgm = tp_model.model_config.visual_gen_mapping
+    num_heads = int(pretrained_config["num_attention_heads"])
+    head_dim = int(pretrained_config["attention_head_dim"])
+
+    with torch.no_grad():
+        for tp_name, tp_param in tp_model.named_parameters():
+            copy_tp_parameter(
+                tp_name,
+                ref_params[tp_name],
+                tp_param,
+                vgm.tp_rank,
+                vgm.tp_size,
+                num_heads,
+                head_dim,
+                ulysses_size=vgm.ulysses_size,
+            )
+
+
 # =============================================================================
 # Core logic
 # =============================================================================
@@ -298,7 +321,10 @@ def _logic_wan_transformer_parallel_vs_single_gpu(
     except (ImportError, ValueError, NotImplementedError) as e:
         pytest.skip(f"[{label}] Parallel backend unavailable: {e}")
 
-    dist_model.load_state_dict(ref_state)
+    if dist_config.visual_gen_mapping.tp_size > 1:
+        _copy_ref_weights_to_tp(ref_model, dist_model, pretrained_cfg)
+    else:
+        dist_model.load_state_dict(ref_state)
 
     torch.manual_seed(SEED_INPUT)
     hidden_states = torch.randn((B, C, T, H, W), device=device, dtype=dtype) * 0.1
