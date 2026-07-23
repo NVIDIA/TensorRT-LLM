@@ -23,6 +23,7 @@ from .interface import Fmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
+
 def init_fmha_libs() -> dict[str, "FmhaCls"]:
     """Build the ordered FMHA library registry.
 
