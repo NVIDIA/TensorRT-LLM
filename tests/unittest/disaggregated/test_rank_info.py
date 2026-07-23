@@ -157,3 +157,41 @@ def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     assert info.attention.kv_heads_per_rank == 0
     assert info.attention.enable_attention_dp
     assert MambaPolicy._mamba_tp(info) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_element_bytes", "expected_type"),
+    [(bindings.DataType.NVFP4, 0.5, float), (bindings.DataType.HALF, 2, int)],
+)
+def test_rank_info_represents_cache_element_bytes(
+    monkeypatch, dtype, expected_element_bytes, expected_type
+):
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _manager: None)
+    manager = SimpleNamespace(
+        mapping=SimpleNamespace(
+            rank=0,
+            tp_size=2,
+            tp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            cp_size=1,
+            cp_rank=0,
+            enable_attention_dp=False,
+        ),
+        pp_layers=[0],
+        num_kv_heads_per_layer=[4],
+        tokens_per_block=64,
+        head_dim=128,
+        dtype=dtype,
+        kv_factor=2,
+    )
+
+    rank_info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+    assert rank_info.attention.element_bytes == expected_element_bytes
+    assert isinstance(rank_info.attention.element_bytes, expected_type)
+
+    restored = RankInfo.from_bytes(rank_info.to_bytes())
+    assert restored.attention.element_bytes == expected_element_bytes
+    assert isinstance(restored.attention.element_bytes, expected_type)
