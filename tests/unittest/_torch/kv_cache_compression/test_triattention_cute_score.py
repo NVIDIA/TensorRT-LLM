@@ -141,7 +141,7 @@ def test_cute_kernel_matches_torch_oracle(case):
         mean_sin,
         oracle_inputs,
     ) = _build_case(prompt_len=prompt_len, seed=20260719, **case)
-    device = bufs.device
+    device = bufs.score_scratch.device
 
     oracle = _torch_tri_score_oracle(
         pools,
@@ -204,7 +204,9 @@ def test_unsupported_geometry_raises_at_buffer_construction():
         for _ in range(num_layers)
     ]
     calib = torch.randn(num_layers, 2, num_freqs, device=device)
-    with pytest.raises(RuntimeError, match="no other score path exists"):
+    # No rewrap: the runner's own contract error surfaces directly (the
+    # fp32 pools trip the BF16 gate first, at TMA descriptor encoding).
+    with pytest.raises(TypeError, match="BF16"):
         _make_cute_buffers(
             eviction_mode="per_head",
             layer_pools=pools,

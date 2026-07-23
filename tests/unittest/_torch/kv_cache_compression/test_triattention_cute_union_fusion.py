@@ -284,7 +284,7 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         decode_width=decode_window,
     )
     bufs = _make_cute_buffers(eviction_mode="union", max_requests=max_requests, **common)
-    assert (bufs.cute_scratch.numel() > 2**31) == (max_requests == 64)
+    assert (bufs.score_scratch.numel() > 2**31) == (max_requests == 64)
     # The split reference leg only scores the two live requests; its own
     # small per_head buffers keep the giant scratch on the union side.
     ref_bufs = _make_cute_buffers(eviction_mode="per_head", max_requests=request_count, **common)

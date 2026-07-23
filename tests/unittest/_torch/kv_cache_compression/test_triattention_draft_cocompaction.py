@@ -182,14 +182,14 @@ def test_execute_eviction_round_orders_both_manager_streams():
     event = mock.Mock()
     host = torch.zeros(6, 9, dtype=torch.int32)
     buffers = SimpleNamespace(
-        device=torch.device("cuda", torch.cuda.current_device()),
         max_requests=8,
         keep_count=4,
         eviction_mode="union",
-        compaction={"has_swa": False},
+        compaction_plan={"has_swa": False},
+        draft_protected_tail_capacity=1,
         copy_pending=False,
-        copy_done=mock.Mock(),
-        bulk_consume_done=event,
+        staging_reuse_event=mock.Mock(),
+        compaction_done_event=event,
         request_metadata_host=host,
         request_metadata_host_np=host.numpy(),
         request_metadata_device=torch.zeros_like(host),
@@ -204,11 +204,9 @@ def test_execute_eviction_round_orders_both_manager_streams():
         mean_sin=None,
         swa_destination_bases=None,
         swa_rebase_delta=0,
-        copy_block_count=0,
-        _block_offsets_host=None,
-        block_offsets_device=None,
-        draft_copy_block_count=0,
-        _draft_block_offsets_host=None,
+        block_offsets_host=None,
+        block_offsets_device=torch.zeros(1, dtype=torch.int32),
+        draft_block_offsets_host=None,
         draft_block_offsets_device=None,
     )
     target_stream = mock.Mock()
@@ -233,9 +231,7 @@ def test_execute_eviction_round_orders_both_manager_streams():
         mock.patch.object(module, "compact") as compact,
     ):
         with pytest.raises(Boom):
-            module.execute_eviction_round(
-                buffers, manager, prepared, draft_manager, normalize_scores=True
-            )
+            module.execute_eviction_round(buffers, manager, prepared, draft_manager)
 
     # Both page-table planes were snapshotted before the round body fired.
     assert stage.call_count == 2
@@ -327,6 +323,8 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     draft_manager.kv_cache_map = {7: draft_cache}
     draft_manager._stream = mock.Mock()
     manager.draft_kv_cache_manager = draft_manager
+    # Injected post-construction: mirror the ctor-cached manager-lifetime tail.
+    manager._draft_protected_tail_capacity = 1
 
     request = _make_request(7, py_prompt_len=2, py_num_accepted_draft_tokens=1)
     manager._request_states[7] = _fresh_request_state()
@@ -377,7 +375,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
         assert call.args[0] is internals.buffers
         assert call.args[1] is target
         assert call.args[3] is draft_manager
-        assert call.kwargs == {"normalize_scores": True}
+        assert call.kwargs == {}
 
 
 def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
@@ -394,6 +392,8 @@ def test_cohort_growth_rebuilds_buffers_and_drops_cached_compaction():
     draft_manager.num_pools = 1
     draft_manager.host_kv_cache_block_offsets = torch.zeros(1, 8, 2, 4, dtype=torch.int32)
     manager.draft_kv_cache_manager = draft_manager
+    # Injected post-construction: mirror the ctor-cached manager-lifetime tail.
+    manager._draft_protected_tail_capacity = 1
     manager._draft_runtime_kv_layout = mock.Mock(
         return_value=dict(
             layer_pools=[],

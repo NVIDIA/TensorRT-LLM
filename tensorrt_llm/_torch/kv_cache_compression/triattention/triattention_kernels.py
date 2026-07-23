@@ -199,15 +199,20 @@ def prepare_per_head_scores(
     valid_widths: torch.Tensor,
     row_mean: torch.Tensor,
     row_inv_std: torch.Tensor,
-    selection_scores: torch.Tensor,
-    selection_seq_lens: torch.Tensor,
+    selection_scores_rows: torch.Tensor,
+    selection_row_lengths: torch.Tensor,
     *,
     per_layer: bool,
     normalize_scores: bool,
 ) -> None:
-    """Normalize and reduce score rows for either per-head eviction mode."""
+    """Normalize and reduce score rows for either per-head eviction mode.
+
+    ``selection_scores_rows``/``selection_row_lengths`` are the canonical
+    row-major selection buffers over the full request capacity
+    (``capacity * selection_rows`` rows); ``valid_widths`` also spans the
+    capacity, so the per-request row count derives from the shapes."""
     request_count, num_layers, num_q_heads, width = scores.shape
-    selection_rows = int(selection_scores.shape[1])
+    selection_rows = int(selection_scores_rows.shape[0]) // int(valid_widths.shape[0])
     num_kv_heads = selection_rows // num_layers if per_layer else selection_rows
     rows = num_layers * num_q_heads
     if normalize_scores:
@@ -225,8 +230,8 @@ def prepare_per_head_scores(
         valid_widths,
         row_mean,
         row_inv_std,
-        selection_scores,
-        selection_seq_lens,
+        selection_scores_rows,
+        selection_row_lengths,
         NUM_LAYERS=num_layers,
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,

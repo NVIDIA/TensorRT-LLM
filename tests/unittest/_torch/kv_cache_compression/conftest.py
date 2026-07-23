@@ -63,7 +63,7 @@ def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
             compaction["swa_move_offsets"],
             [compaction["swa_window"] + int(tail) for tail in tail_lengths],
         )
-    if compaction["has_draft"]:
+    if compaction["draft_move_offsets"] is not None:
         if draft_tail_lengths is None:
             draft_tail_lengths = [0] * len(tail_lengths)
         if len(draft_tail_lengths) != len(tail_lengths):
@@ -224,34 +224,31 @@ def run_compaction(compaction):
     compact(compaction, compaction["request_count"])
 
 
-def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None):
+def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
     """A bare buffer namespace for the bulk page-table copy tests."""
     staging = SimpleNamespace()
-    staging.device = device
     staging.max_requests = max_requests
-    staging.copy_block_count = copy_block_count
-    if page_count is not None:
-        staging.page_count = page_count
     staging.keep_count = 4
-    staging.compaction = {"has_swa": False}
-    staging.bulk_copy_done = torch.cuda.Event()
-    staging.bulk_consume_done = torch.cuda.Event()
-    staging.copy_done = torch.cuda.Event()
+    staging.compaction_plan = {"has_swa": False}
+    staging.draft_protected_tail_capacity = None
+    staging.block_offsets_ready_event = torch.cuda.Event()
+    staging.compaction_done_event = torch.cuda.Event()
+    staging.staging_reuse_event = torch.cuda.Event()
     staging.copy_pending = False
-    staging._block_offsets_host = torch.empty(
-        1, max_requests, 2, copy_block_count, dtype=torch.int32, device="cpu", pin_memory=True
+    staging.block_offsets_host = torch.empty(
+        1, max_requests, 2, staged_blocks_per_seq, dtype=torch.int32, device="cpu", pin_memory=True
     )
-    staging._bulk_copy_idx_src = torch.arange(
+    staging.identity_copy_indices_host = torch.arange(
         max_requests, dtype=torch.int32, device="cpu", pin_memory=True
     )
     staging.block_offsets_device = torch.empty(
-        1, max_requests, 2, copy_block_count, dtype=torch.int32, device=device
+        1, max_requests, 2, staged_blocks_per_seq, dtype=torch.int32, device=device
     )
     return staging
 
 
 def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
-    """The manager surface ``_stage_page_tables_bulk``/``stage`` consume."""
+    """The manager surface ``_stage_block_offsets`` consumes."""
     return SimpleNamespace(
         host_kv_cache_block_offsets=host_table,
         kv_factor=2,
@@ -264,10 +261,7 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
 
 def make_buffer_stubs(manager, *, decode_width=260):
     """Stub the calibration/layout surfaces around ``_buffers_for``."""
-    manager._H = 2
-    manager._F = 2
     manager._freq_scale_sq = torch.ones(2)
-    manager._offsets = torch.ones(2)
     manager._phase = {"rows": 8}
     manager.calibration = {"omega": torch.ones(2)}
     manager._local_score_calibration = mock.Mock(return_value=(torch.ones(2, 2, 2),) * 3)
@@ -275,7 +269,6 @@ def make_buffer_stubs(manager, *, decode_width=260):
     pool = torch.empty(8, 2, 1, 4, 4)
     layout = dict(
         manager=SimpleNamespace(num_pools=1),
-        num_layers=2,
         global_layers=[0, 1],
         layer_pools=[pool, pool],
         dense_layers=[0, 1],
@@ -458,7 +451,6 @@ def make_phase_table(offsets, omega, initial_rows):
     )
 
     phase = {
-        "offsets": offsets.contiguous(),
         "omega": omega.to(dtype=torch.float32).contiguous(),
         "offset_values": offsets.tolist(),
         "cos": None,
@@ -488,6 +480,7 @@ def make_cute_buffers(
     protected_tail_capacity=0,
     storage_groups=None,
     layer_pool_keys=None,
+    normalize_scores=True,
 ):
     """Real eviction buffers over the one-shared-slot default layout; split
     reference legs use ``eviction_mode="per_head"`` over the same pools.
@@ -539,6 +532,7 @@ def make_cute_buffers(
             keep_count=keep_count,
             protected_tail_capacity=protected_tail_capacity,
         ),
+        normalize_scores=normalize_scores,
     )
 
 
@@ -571,7 +565,7 @@ def launch_split_scores(
     num_segments = request_count * bufs.num_layers
     group_size = bufs.num_q_heads // bufs.num_kv_heads
     source = (
-        bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
+        bufs.score_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
         .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
             :, :group_size
         ]
@@ -587,7 +581,7 @@ def launch_split_scores(
         (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
         float("nan"),
         dtype=torch.float32,
-        device=bufs.device,
+        device=bufs.score_scratch.device,
     )
     torch.gather(
         source,

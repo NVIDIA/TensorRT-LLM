@@ -145,7 +145,6 @@ class TestTriAttentionClass:
         triattention.kv_cache_manager = manager
         cached = dict(
             manager=manager,
-            num_layers=3,
             global_layers=[10, 11, 12],
             layer_pools=[torch.empty(4), torch.empty(8), torch.empty(4)],
             dense_layers=[0, 1, 2],
@@ -160,7 +159,7 @@ class TestTriAttentionClass:
         )
         triattention._runtime_kv_layout_cache = cached
 
-        assert triattention._runtime_kv_layout(3) is cached
+        assert triattention._runtime_kv_layout() is cached
         manager.get_buffers.assert_not_called()
         assert page_count_query.call_args_list == [
             mock.call(100, Role.KEY),
@@ -168,7 +167,7 @@ class TestTriAttentionClass:
         ]
 
         with pytest.raises(RuntimeError, match="pool layout changed"):
-            triattention._runtime_kv_layout(3)
+            triattention._runtime_kv_layout()
         manager.get_buffers.assert_not_called()
         assert page_count_query.call_args_list == [
             mock.call(100, Role.KEY),
@@ -311,7 +310,9 @@ class TestCompressedTokenPublication:
     # The monotone publication contract is covered end to end in
     # test_triattention_draft_cocompaction.py.
 
-    def test_identity_compaction_is_rejected_instead_of_published(self):
+    def test_identity_selection_is_filtered_before_launch(self):
+        # Identity cohorts (seq_len == prompt + budget) are the pre-launch
+        # owner no-op: nothing launches and nothing is published.
         manager = _make_triattention(budget=4)
         manager.kv_cache_manager._stream = mock.Mock()
         request = _make_request(7, py_prompt_len=2)
@@ -330,22 +331,6 @@ class TestCompressedTokenPublication:
         assert request.py_num_compressed_tokens == 0
         assert state["evicted_tokens"] == 0
         cache.resize.assert_not_called()
-
-        # A keep-contract violation fails loudly, never publishes.
-        with _mocked_eviction_internals(manager):
-            with pytest.raises(RuntimeError, match="identity compaction"):
-                manager._evict_requests(
-                    [
-                        _make_prepared_item(
-                            request,
-                            request_id=7,
-                            seq_len=6,
-                            expected_keep_count=6,
-                            prompt_len=2,
-                        )
-                    ]
-                )
-        assert request.py_num_compressed_tokens == 0
 
 
 class TestEvictionLifecycle:
@@ -369,17 +354,6 @@ class TestEvictionLifecycle:
             manager.update_resources(batch)
 
         periodic_evict.assert_called_once_with(batch)
-
-    def test_unregistered_generation_request_is_rejected(self):
-        # Missing on_request_init = framework ordering bug: fail loudly.
-        manager = _make_triattention()
-        manager._calibrated = True
-        cache = SimpleNamespace(capacity=8, history_length=0, is_active=True)
-        manager.kv_cache_manager.kv_cache_map = {7: cache}
-        request = _make_request(7, py_prompt_len=2)
-
-        with pytest.raises(RuntimeError, match="without on_request_init"):
-            manager._periodic_evict(SimpleNamespace(generation_requests=[request]))
 
     @staticmethod
     def _make_due_decode_request(seq_len, *, num_extra_kv_tokens=0, kv_reserve_draft_tokens=0):
@@ -410,14 +384,16 @@ class TestEvictionLifecycle:
             num_extra_kv_tokens=num_extra_kv_tokens,
             _kv_reserve_draft_tokens=kv_reserve_draft_tokens,
         )
-        mgr._L = 2
         mgr._request_states = {}
         _set_request_state(mgr, 7, generation_steps=127)
         mgr.beta = 128
         mgr.budget = 4096
         return mgr, request, batch
 
-    def test_suspended_cache_rejects_batch_before_cadence_mutation(self):
+    def test_suspended_cache_defers_that_request_pre_launch(self):
+        # A suspended cache is a legal overlap-scheduler transient: that
+        # request defers (pre-launch, no cadence mutation) while the rest of
+        # the cohort proceeds.
         manager, first_request, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         second_request = _make_request(8, py_prompt_len=1024)
         manager.kv_cache_manager.kv_cache_map[8] = SimpleNamespace(is_active=False)
@@ -425,10 +401,13 @@ class TestEvictionLifecycle:
         second_state = _set_request_state(manager, 8, generation_steps=127)
         batch = SimpleNamespace(generation_requests=[first_request, second_request])
 
-        with pytest.raises(RuntimeError, match="request 8 must be resumed"):
+        with mock.patch.object(manager, "_evict_requests", side_effect=lambda p: p) as evict:
             manager._periodic_evict(batch)
 
-        assert first_state["generation_steps"] == 127
+        # Only the active request launched; the suspended one deferred whole.
+        prepared = evict.call_args.args[0]
+        assert [item["request_id"] for item in prepared] == [7]
+        assert first_state["generation_steps"] == 128
         assert second_state["generation_steps"] == 127
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
@@ -453,6 +432,8 @@ class TestEvictionLifecycle:
         draft_manager.kv_cache_map = {7: draft_cache}
         draft_manager._stream = mock.Mock()
         mgr.draft_kv_cache_manager = draft_manager
+        # Injected post-construction: mirror the ctor-cached manager-lifetime tail.
+        mgr._draft_protected_tail_capacity = 1
 
         def compact(prepared):
             # Publish and resize consume the same prepared cohort.
@@ -584,7 +565,7 @@ class TestFixedScoreMetadata:
         )
 
         device = torch.device("cuda", torch.cuda.current_device())
-        staging = _make_bare_staging(device, max_requests=1, copy_block_count=8)
+        staging = _make_bare_staging(device, max_requests=1, staged_blocks_per_seq=8)
         gather = mock.Mock()
         manager = _make_staging_manager(
             torch.zeros(1, 2, 2, 12, dtype=torch.int32), gather, torch.cuda.Stream(device=device)
@@ -592,7 +573,7 @@ class TestFixedScoreMetadata:
         prepared = [_make_prepared_item(request_id=7, seq_len=64, round_start=2**31)]
 
         with pytest.raises((RuntimeError, OverflowError, ValueError)):
-            execute_eviction_round(staging, manager, prepared, normalize_scores=True)
+            execute_eviction_round(staging, manager, prepared)
         assert gather.call_count == 0
 
     def test_bulk_page_table_copy_snapshots_and_orders_consumers(self):
@@ -633,8 +614,8 @@ class TestFixedScoreMetadata:
             )
 
         gather = mock.Mock(side_effect=gather_k_block_offsets)
-        staging = _make_bare_staging(device, max_requests=1, copy_block_count=8, page_count=5)
-        staging.copy_done.record(current_stream)
+        staging = _make_bare_staging(device, max_requests=1, staged_blocks_per_seq=8)
+        staging.staging_reuse_event.record(current_stream)
         manager = _make_staging_manager(host_table, gather, manager_stream)
 
         def stage_once():
@@ -643,9 +624,8 @@ class TestFixedScoreMetadata:
                 staging,
                 manager,
                 [7],
-                staging._block_offsets_host,
+                staging.block_offsets_host,
                 staging.block_offsets_device,
-                staging.copy_block_count,
             )
 
         # Round 1: mutate the host table and the slot assignment right after
@@ -659,7 +639,7 @@ class TestFixedScoreMetadata:
             side_effect=AssertionError("page-table staging used torch.index_select"),
         ):
             stage_once()
-        assert staging._block_offsets_host.shape == (1, 1, 2, 8)
+        assert staging.block_offsets_host.shape == (1, 1, 2, 8)
         host_table[0, 0, 0, :5] = torch.tensor([13, 14, 15, 16, 17], dtype=torch.int32)
         selected_slot[0] = 1
         current_stream.synchronize()
@@ -690,8 +670,8 @@ class TestFixedScoreMetadata:
         snapshot.copy_(staging.block_offsets_device)
         # ``execute_eviction_round``'s completion ordering: one event records
         # the consumers and the manager stream waits on it.
-        staging.bulk_consume_done.record(torch.cuda.current_stream(device))
-        manager_stream.wait_event(staging.bulk_consume_done)
+        staging.compaction_done_event.record(torch.cuda.current_stream(device))
+        manager_stream.wait_event(staging.compaction_done_event)
 
         stage_once()
         current_stream.synchronize()
@@ -744,7 +724,7 @@ class TestFixedScoreMetadata:
         assert [item["round_start"] for item in prepared] == [8, 10]
         assert [item["prompt_len"] for item in prepared] == [3, 5]
         assert [item["seq_len"] for item in prepared] == [8, 10]
-        assert args.kwargs == {"normalize_scores": True}
+        assert args.kwargs == {}
 
         # The derived move offsets stage keep + tail moves per request
         # (budget=4 -> [6, 7]); padded rows repeat the final offset.
@@ -753,9 +733,12 @@ class TestFixedScoreMetadata:
         )
 
         offsets_buffers = SimpleNamespace(
-            max_requests=8, keep_count=4, compaction={"has_swa": False}
+            max_requests=8,
+            keep_count=4,
+            compaction_plan={"has_swa": False},
+            draft_protected_tail_capacity=None,
         )
-        dense, swa, draft = _cohort_move_offsets(offsets_buffers, prepared, None)
+        dense, swa, draft = _cohort_move_offsets(offsets_buffers, prepared)
         assert dense == [0, 6, 13, 13, 13, 13, 13, 13, 13]
         assert swa is None
         assert draft is None
@@ -828,6 +811,7 @@ class TestFixedScoreMetadata:
             # One storage group and page-table slot per layer (distinct pools).
             storage_groups={("pool", layer): [layer] for layer in layer_order},
             layer_pool_keys=[("pool", layer) for layer in layer_order],
+            normalize_scores=False,
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
@@ -863,7 +847,7 @@ class TestFixedScoreMetadata:
         # The compact stage is stubbed to a no-op: this test owns the score
         # buffers only, never a staged move decision.
         with mock.patch.object(module, "compact"):
-            module.execute_eviction_round(bufs, manager, prepared_cohort(), normalize_scores=False)
+            module.execute_eviction_round(bufs, manager, prepared_cohort())
         fixed = bufs.score_output.clone()
         assert bufs.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
@@ -902,7 +886,7 @@ class TestFixedScoreMetadata:
         bufs.score_output.fill_(score_sentinel)
         bufs.valid_widths.fill_(-1)
         with mock.patch.object(module, "compact"):
-            module.execute_eviction_round(bufs, manager, prepared_cohort(), normalize_scores=False)
+            module.execute_eviction_round(bufs, manager, prepared_cohort())
         second_launch = bufs.score_output.clone()
         assert torch.equal(bufs.valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
@@ -929,9 +913,9 @@ class TestKernelMaskedSwa:
             if not fits_window:
                 # The decode budget must cover the kernel-masked SWA window.
                 with pytest.raises(ValueError, match="budget=127"):
-                    mgr._attention_layer_partition(4)
+                    mgr._attention_layer_partition()
                 return
-            dense, sliding, window = mgr._attention_layer_partition(4)
+            dense, sliding, window = mgr._attention_layer_partition()
 
         load.assert_called_once_with(
             "/models/gpt-oss", trust_remote_code=True, local_files_only=True

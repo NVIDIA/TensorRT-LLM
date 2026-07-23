@@ -390,10 +390,7 @@ def init_compaction_buffers(
         swa_destination_bases=swa_destination_bases,
         # Per-round SWA destination rebase delta.
         swa_rebase_delta=keep_count - swa_window,
-        has_draft=draft is not None,
         draft_move_indices=draft_move_indices,
-        # Completion event: compact() records it after the last native launch.
-        consume_done=torch.cuda.Event(),
         # Private launch tuples: only compact() interprets these.
         target_launches=tuple(target_launches),
         draft_launches=draft_launches,
@@ -403,10 +400,11 @@ def init_compaction_buffers(
 
 
 def compact(compaction: Dict[str, object], request_count: int) -> None:
-    """Pack each family's move sources, fire its native compacts, and record completion.
+    """Pack each family's move sources and fire its native compacts.
 
     Pure mover: the caller has already materialized its kept ordinals into the
-    agreed decision rows for the active ``request_count`` cohort.
+    agreed decision rows for the active ``request_count`` cohort, and the
+    caller owns the completion ordering of the whole round.
     """
     rows, pack_args, pack_kwargs = compaction["target_pack_launch"]
     _pack_move_sources_kernel[(request_count, rows)](*pack_args, **pack_kwargs)
@@ -418,4 +416,3 @@ def compact(compaction: Dict[str, object], request_count: int) -> None:
         _pack_move_sources_kernel[(request_count, rows)](*pack_args, **pack_kwargs)
     for launch in compaction["draft_launches"]:
         torch.ops.trtllm.sparse_kv_cache_compact_layers(*launch)
-    compaction["consume_done"].record(torch.cuda.current_stream())
