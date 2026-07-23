@@ -37,8 +37,6 @@
 /tests/unittest @NVIDIA/trt-llm-devs
 
 # ===== TensorRT backend (will be deprecated soon) — also on the trt-llm-devs fallback =====
-/cpp/include/tensorrt_llm/plugins @NVIDIA/trt-llm-devs
-/cpp/tensorrt_llm/plugins @NVIDIA/trt-llm-devs
 /tensorrt_llm/builder.py @NVIDIA/trt-llm-devs
 /tensorrt_llm/commands/build.py @NVIDIA/trt-llm-devs
 /tensorrt_llm/commands/prune.py @NVIDIA/trt-llm-devs
@@ -105,7 +103,6 @@
 /cpp/tensorrt_llm/batch_manager @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/common @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
-/cpp/tensorrt_llm/executor_worker @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/layers @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/nanobind @NVIDIA/trt-llm-runtime-devs
 /cpp/tensorrt_llm/runtime @NVIDIA/trt-llm-runtime-devs
@@ -169,7 +166,6 @@
 /examples/llm-api/quickstart_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /examples/models @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /examples/serve/*multimodal* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
-/scripts/build_cpp_examples.py @NVIDIA/trt-llm-models-devs
 /scripts/generate_config_database_tests.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /scripts/generate_config_table.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /tensorrt_llm/_torch/models @NVIDIA/trt-llm-models-devs
@@ -441,6 +437,7 @@
 /cpp/tensorrt_llm/batch_manager/allocateKvCache.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
+/tensorrt_llm/_torch/attention_backend/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs

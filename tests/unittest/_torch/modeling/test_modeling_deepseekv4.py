@@ -240,7 +240,9 @@ def test_deepseek_v4_layerwise_loading_rejects_non_atomic_bucket(
     loader = DeepseekV4WeightLoader.__new__(DeepseekV4WeightLoader)
     loader.config = SimpleNamespace(num_hidden_layers=61)
 
-    with pytest.raises(ValueError, match="exactly one model layer or top-level weights"):
+    with pytest.raises(
+        ValueError, match="exactly one target layer, draft layer, or top-level weights"
+    ):
         loader.load_weights(weights, initial_bucket_loading=True)
 
 
@@ -301,6 +303,41 @@ def test_deepseek_v4_layerwise_loading_accepts_top_level_bucket() -> None:
 
     assert torch.equal(model.top.weight, torch.ones((1, 1)))
     assert all(torch.count_nonzero(layer.weight) == 0 for layer in model.model.layers)
+
+
+def test_deepseek_v4_layerwise_loading_accepts_single_dspark_stage() -> None:
+    model = nn.Module()
+    model.mtp_layers = nn.ModuleList([nn.Linear(1, 1, bias=False) for _ in range(3)])
+    for parameter in model.parameters():
+        nn.init.zeros_(parameter)
+    model.config = SimpleNamespace(
+        q_lora_rank=None,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=1,
+        num_hidden_layers=2,
+        num_nextn_predict_layers=1,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0,
+            tp_size=1,
+            cp_rank=0,
+            cp_size=1,
+            enable_attention_dp=True,
+        )
+    )
+    loader = DeepseekV4WeightLoader(model)
+
+    loader.load_weights(
+        {"mtp_layers.1.weight": torch.ones((1, 1))},
+        initial_bucket_loading=True,
+    )
+
+    assert torch.count_nonzero(model.mtp_layers[0].weight) == 0
+    assert torch.equal(model.mtp_layers[1].weight, torch.ones((1, 1)))
+    assert torch.count_nonzero(model.mtp_layers[2].weight) == 0
 
 
 @pytest.mark.parametrize(

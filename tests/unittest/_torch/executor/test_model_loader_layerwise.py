@@ -60,6 +60,24 @@ class _MapperlessLayerwiseModel(_LayerwiseModel):
         self._events.append(("load", next(iter(weights)), None, initial_bucket_loading))
 
 
+class _EmbeddedDraftLayerwiseModel(_LayerwiseModel):
+    def supports_embedded_draft_weight_loading(self, checkpoint_dir: str) -> bool:
+        return checkpoint_dir == self.llm_checkpoint_dir
+
+    def is_embedded_draft_weight_bucket(self, weights: dict[str, object]) -> bool:
+        return all(key.startswith("mtp.") for key in weights)
+
+    def load_draft_weights(
+        self,
+        weights: dict[str, object],
+        *,
+        initial_bucket_loading: bool = False,
+    ) -> None:
+        self._events.append(
+            ("load_draft", next(iter(weights)), initial_bucket_loading)
+        )
+
+
 @contextmanager
 def _moe_context(_config: object, _mapping: object) -> Iterator[None]:
     yield None
@@ -252,6 +270,31 @@ def test_layerwise_model_loader_rejects_draft_checkpoint_before_iteration(
     checkpoint_loader.get_initialized_weight_mapper.assert_not_called()
     checkpoint_loader.iter_layer_weight_buckets.assert_not_called()
     assert events == []
+
+
+def test_layerwise_model_loader_streams_embedded_draft_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    spec_config = MagicMock()
+    spec_config.spec_dec_mode.need_load_draft_weights.return_value = True
+    model = _EmbeddedDraftLayerwiseModel(events)
+    loader = _make_loader(monkeypatch, model, spec_config=spec_config)
+    checkpoint_loader, mapper = _make_checkpoint_loader(
+        events,
+        [
+            {"layers.0.weight": object()},
+            {"mtp.0.weight": object()},
+        ],
+    )
+
+    loaded_model, _ = loader.load("/checkpoint", checkpoint_loader)
+
+    assert loaded_model is model
+    assert ("load", "layers.0.weight", mapper, True) in events
+    assert ("load_draft", "mtp.0.weight", True) in events
+    assert events.count(("post_load",)) == 1
+    checkpoint_loader.load_weights.assert_not_called()
 
 
 def test_layerwise_model_loader_closes_iterator_and_stops_after_consumer_error(

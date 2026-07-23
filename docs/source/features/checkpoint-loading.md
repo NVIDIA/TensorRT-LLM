@@ -117,9 +117,20 @@ Current limitations:
 - Only DeepSeek V4 implements the required model-specific layer scoping.
 - Only safetensors checkpoints are supported; `.bin` and `.pth` checkpoints
   continue to use eager loading.
-- A separate speculative draft checkpoint is not supported in layer-wise mode.
+- DSpark draft weights embedded as `mtp.*` tensors in the target checkpoint are
+  supported. A separate speculative draft checkpoint is not supported in
+  layer-wise mode.
 - Closing each bucket releases its mmap-backed tensor storage, but filesystem
   data may remain in the reclaimable Linux page cache.
+
+### ModelExpress (MX) Loading Path
+
+The PyTorch backend can use ModelExpress (MX) for peer-to-peer weight transfer
+from a running TensorRT-LLM source instance before falling back to Hugging Face
+checkpoint loading. Selecting MX does not require an MX-specific on-disk
+checkpoint or conversion of the Hugging Face checkpoint. For installation, MX
+service deployment, and configuration details, see
+[ModelExpress (MX) Checkpoint Loading](./model-express.md).
 
 ## Using Checkpoint Loaders
 

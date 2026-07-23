@@ -204,8 +204,6 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 
 | Flag | Description |
 |------|-------------|
-| `--trt_root /usr/local/tensorrt` | TensorRT installation path (standard in NVIDIA containers) |
-| `--benchmarks` | Build the C++ benchmarks |
 | `-a "100-real"` | Target architecture — `100` for Blackwell, `90` for Hopper, etc. |
 | `--nvtx` | Enable NVTX markers for profiling |
 | `--no-venv` | Skip virtual environment creation |
@@ -228,7 +226,6 @@ Common architecture values:
 | `sbatch: error: invalid partition` | Verify partition name with `sinfo -s` |
 | `sbatch: error: invalid account` | Check available accounts with `sacctmgr show assoc user=$USER` |
 | Container image not found | Verify the `.sqsh` path exists and is readable |
-| Build fails with missing TensorRT | Ensure `--trt_root` points to the correct path inside the container |
 | Build OOM (out of memory) | Reduce parallelism with `-j <N>` flag to `build_wheel.py` |
 | `srun: error: Unable to create step` | The node may lack enroot/pyxis — check with cluster admin |
 | Job stuck in `PD` state | Check `squeue -j <id> -o %R` for the reason (e.g., resource limits, priority) |

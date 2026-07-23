@@ -22,7 +22,7 @@
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/common.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdint>
 #ifdef ENABLE_FP8
@@ -88,13 +88,13 @@ struct MemoryTypeString<MemoryType::kPINNEDPOOL>
 };
 
 //! \brief For converting a TensorRT data type to a C++ data type.
-template <nvinfer1::DataType kDataType, bool kIsUnsigned = false, bool kIsPointer = false>
+template <tensorrt_llm::DataType kDataType, bool kIsUnsigned = false, bool kIsPointer = false>
 struct DataTypeTraits
 {
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kFLOAT>
+struct DataTypeTraits<tensorrt_llm::DataType::kFLOAT>
 {
     using type = float;
     static char constexpr name[] = "float";
@@ -102,7 +102,7 @@ struct DataTypeTraits<nvinfer1::DataType::kFLOAT>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kHALF>
+struct DataTypeTraits<tensorrt_llm::DataType::kHALF>
 {
     using type = half;
     static char constexpr name[] = "half";
@@ -110,7 +110,7 @@ struct DataTypeTraits<nvinfer1::DataType::kHALF>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT8>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT8>
 {
     using type = std::int8_t;
     static char constexpr name[] = "int8";
@@ -118,7 +118,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT8>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT32>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT32>
 {
     using type = std::int32_t;
     static char constexpr name[] = "int32";
@@ -126,7 +126,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT32>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT64>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT64>
 {
     using type = std::int64_t;
     static char constexpr name[] = "int64";
@@ -134,7 +134,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT64>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT32, true>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT32, true>
 {
     using type = std::uint32_t;
     static char constexpr name[] = "uint32";
@@ -142,7 +142,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT32, true>
 };
 
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kINT64, true>
+struct DataTypeTraits<tensorrt_llm::DataType::kINT64, true>
 {
     using type = std::uint64_t;
     static char constexpr name[] = "uint64";
@@ -150,7 +150,7 @@ struct DataTypeTraits<nvinfer1::DataType::kINT64, true>
 };
 
 template <bool kUnsigned>
-struct DataTypeTraits<nvinfer1::DataType::kBOOL, kUnsigned>
+struct DataTypeTraits<tensorrt_llm::DataType::kBOOL, kUnsigned>
 {
     using type = bool;
     static char constexpr name[] = "bool";
@@ -158,7 +158,7 @@ struct DataTypeTraits<nvinfer1::DataType::kBOOL, kUnsigned>
 };
 
 template <bool kUnsigned>
-struct DataTypeTraits<nvinfer1::DataType::kUINT8, kUnsigned>
+struct DataTypeTraits<tensorrt_llm::DataType::kUINT8, kUnsigned>
 {
     using type = std::uint8_t;
     static char constexpr name[] = "uint8";
@@ -167,7 +167,7 @@ struct DataTypeTraits<nvinfer1::DataType::kUINT8, kUnsigned>
 
 #ifdef ENABLE_BF16
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kBF16>
+struct DataTypeTraits<tensorrt_llm::DataType::kBF16>
 {
     using type = __nv_bfloat16;
     static char constexpr name[] = "bfloat16";
@@ -177,7 +177,7 @@ struct DataTypeTraits<nvinfer1::DataType::kBF16>
 
 #ifdef ENABLE_FP8
 template <>
-struct DataTypeTraits<nvinfer1::DataType::kFP8>
+struct DataTypeTraits<tensorrt_llm::DataType::kFP8>
 {
     using type = __nv_fp8_e4m3;
     static char constexpr name[] = "fp8";
@@ -185,7 +185,7 @@ struct DataTypeTraits<nvinfer1::DataType::kFP8>
 };
 #endif
 
-template <nvinfer1::DataType kDataType, bool kUnsigned>
+template <tensorrt_llm::DataType kDataType, bool kUnsigned>
 struct DataTypeTraits<kDataType, kUnsigned, true>
 {
     using type = typename DataTypeTraits<kDataType, kUnsigned, false>::type*;
@@ -193,26 +193,26 @@ struct DataTypeTraits<kDataType, kUnsigned, true>
     static auto constexpr size = sizeof(type);
 };
 
-//! \brief A wrapper around `nvinfer1::DataType` that provides a support for pointer types.
+//! \brief A wrapper around `tensorrt_llm::DataType` that provides a support for pointer types.
 class BufferDataType
 {
 public:
     constexpr BufferDataType( // NOLINT(*-explicit-constructor)
-        nvinfer1::DataType dataType, bool _unsigned = false, bool pointer = false)
+        tensorrt_llm::DataType dataType, bool _unsigned = false, bool pointer = false)
         : mDataType{dataType}
         , mUnsigned{_unsigned}
         , mPointer{pointer}
     {
     }
 
-    static auto constexpr kTrtPointerType = nvinfer1::DataType::kINT64;
+    static auto constexpr kTrtPointerType = tensorrt_llm::DataType::kINT64;
 
-    constexpr operator nvinfer1::DataType() const noexcept // NOLINT(*-explicit-constructor)
+    constexpr operator tensorrt_llm::DataType() const noexcept // NOLINT(*-explicit-constructor)
     {
         return mPointer ? kTrtPointerType : mDataType;
     }
 
-    [[nodiscard]] constexpr nvinfer1::DataType getDataType() const noexcept
+    [[nodiscard]] constexpr tensorrt_llm::DataType getDataType() const noexcept
     {
         return mDataType;
     }
@@ -226,24 +226,24 @@ public:
     {
         switch (mDataType)
         {
-        case nvinfer1::DataType::kBOOL: [[fallthrough]];
-        case nvinfer1::DataType::kUINT8: return true;
+        case tensorrt_llm::DataType::kBOOL: [[fallthrough]];
+        case tensorrt_llm::DataType::kUINT8: return true;
         default: return mUnsigned;
         }
     }
 
     [[nodiscard]] constexpr std::size_t getSize() const noexcept
     {
-        return tensorrt_llm::common::getDTypeSize(static_cast<nvinfer1::DataType>(*this));
+        return tensorrt_llm::common::getDTypeSize(static_cast<tensorrt_llm::DataType>(*this));
     }
 
     [[nodiscard]] constexpr std::size_t getSizeInBits() const noexcept
     {
-        return tensorrt_llm::common::getDTypeSizeInBits(static_cast<nvinfer1::DataType>(*this));
+        return tensorrt_llm::common::getDTypeSizeInBits(static_cast<tensorrt_llm::DataType>(*this));
     }
 
 private:
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     bool mUnsigned;
     bool mPointer;
 };
@@ -257,62 +257,62 @@ struct TRTDataType
 template <>
 struct TRTDataType<float>
 {
-    static constexpr auto value = nvinfer1::DataType::kFLOAT;
+    static constexpr auto value = tensorrt_llm::DataType::kFLOAT;
 };
 
 template <>
 struct TRTDataType<half>
 {
-    static constexpr auto value = nvinfer1::DataType::kHALF;
+    static constexpr auto value = tensorrt_llm::DataType::kHALF;
 };
 
 template <>
 struct TRTDataType<std::int8_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT8;
+    static constexpr auto value = tensorrt_llm::DataType::kINT8;
 };
 
 template <>
 struct TRTDataType<std::int32_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT32;
+    static constexpr auto value = tensorrt_llm::DataType::kINT32;
 };
 
 template <>
 struct TRTDataType<std::uint32_t>
 {
-    static constexpr auto value = BufferDataType{nvinfer1::DataType::kINT32, true};
+    static constexpr auto value = BufferDataType{tensorrt_llm::DataType::kINT32, true};
 };
 
 template <>
 struct TRTDataType<std::int64_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kINT64;
+    static constexpr auto value = tensorrt_llm::DataType::kINT64;
 };
 
 template <>
 struct TRTDataType<std::uint64_t>
 {
-    static constexpr auto value = BufferDataType{nvinfer1::DataType::kINT64, true};
+    static constexpr auto value = BufferDataType{tensorrt_llm::DataType::kINT64, true};
 };
 
 template <>
 struct TRTDataType<bool>
 {
-    static constexpr auto value = nvinfer1::DataType::kBOOL;
+    static constexpr auto value = tensorrt_llm::DataType::kBOOL;
 };
 
 template <>
 struct TRTDataType<std::uint8_t>
 {
-    static constexpr auto value = nvinfer1::DataType::kUINT8;
+    static constexpr auto value = tensorrt_llm::DataType::kUINT8;
 };
 
 #ifdef ENABLE_BF16
 template <>
 struct TRTDataType<__nv_bfloat16>
 {
-    static constexpr auto value = nvinfer1::DataType::kBF16;
+    static constexpr auto value = tensorrt_llm::DataType::kBF16;
 };
 #endif
 
@@ -320,7 +320,7 @@ struct TRTDataType<__nv_bfloat16>
 template <>
 struct TRTDataType<__nv_fp8_e4m3>
 {
-    static constexpr auto value = nvinfer1::DataType::kFP8;
+    static constexpr auto value = tensorrt_llm::DataType::kFP8;
 };
 #endif
 
@@ -380,7 +380,7 @@ public:
     using SharedPtr = std::shared_ptr<IBuffer>;
     using UniqueConstPtr = std::unique_ptr<IBuffer const>;
     using SharedConstPtr = std::shared_ptr<IBuffer const>;
-    using DataType = nvinfer1::DataType;
+    using DataType = tensorrt_llm::DataType;
 
     //!
     //! \brief Returns a pointer to underlying array.

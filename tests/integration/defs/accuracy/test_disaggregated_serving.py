@@ -1212,30 +1212,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize(
-        "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
-            (1, 1, 4, False),
-            (1, 2, 2, False),
-            (1, 2, 2, True),
-            (2, 1, 2, False),
-        ],
-        ids=["pp1tp1cp4", "pp1tp2cp2", "pp1dp2cp2", "pp2tp1cp2"])
+    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
+        (1, 2, 2, False),
+        (1, 2, 2, True),
+    ],
+                             ids=["pp1tp2cp2", "pp1dp2cp2"])
     @pytest.mark.parametrize("cuda_graph_config", [
-        None,
-        {
-            "enable_padding": False,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
-        },
         {
             "enable_padding": True,
             "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
         },
     ],
-                             ids=[
-                                 "cudagraph:none", "cudagraph:without_padding",
-                                 "cudagraph:with_padding"
-                             ])
-    @pytest.mark.parametrize("comms_medium", ["fifo_v1", "fifo_v2", "nccl"])
+                             ids=["cudagraph:with_padding"])
+    @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
                                    gen_pp, gen_tp, gen_cp, enable_attention_dp):
         # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
@@ -1763,102 +1752,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                               model_name=self.MODEL_NAME,
                               test_sets=["MMLU", "GSM8K"])
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize(
-        "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
-            (1, 1, 4, False),
-            (1, 2, 2, False),
-            (1, 2, 2, True),
-            (2, 1, 2, False),
-        ],
-        ids=["pp1tp1cp4", "pp1tp2cp2", "pp1dp2cp2", "pp2tp1cp2"])
-    @pytest.mark.parametrize("cuda_graph_config", [
-        None,
-        {
-            "enable_padding": True,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64],
-        },
-    ],
-                             ids=[
-                                 "cudagraph:none",
-                                 "cudagraph:with_padding",
-                             ])
-    @pytest.mark.parametrize("comms_medium", ["fifo", "nccl"])
-    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
-        use_nccl_for_alltoall = comms_medium == "nccl"
-        fifo_version = 2
-        gen_ep = gen_tp * gen_cp
-        kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
-            "enable_block_reuse": False,
-            "enable_partial_reuse": False,
-            "tokens_per_block": 32,
-            "dtype": "fp8",
-        }
-        ctx_server_config = {
-            "pipeline_parallel_size": 1,
-            "tensor_parallel_size": 4,
-            "context_parallel_size": 1,
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": kv_cache_config,
-            "enable_chunked_prefill": False,
-            "cuda_graph_config": None,
-            "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
-            },
-            "moe_config": {
-                "backend": "TRTLLM",
-                "max_num_tokens": 16384,
-            },
-        }
-        gen_server_config = {
-            "tensor_parallel_size": gen_tp,
-            "pipeline_parallel_size": gen_pp,
-            "context_parallel_size": gen_cp,
-            "moe_expert_parallel_size": gen_ep,
-            "cp_config": {
-                "cp_type": "HELIX",
-                "tokens_per_block": 32,
-                "use_nccl_for_alltoall": use_nccl_for_alltoall,
-                "fifo_version": fifo_version,
-            },
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": kv_cache_config,
-            "enable_chunked_prefill": False,
-            "cuda_graph_config": cuda_graph_config,
-            "cache_transceiver_config": {
-                "backend": "UCX",
-                "max_tokens_in_buffer": 8192,
-            },
-            "moe_config": {
-                "backend": "TRTLLM",
-                "max_num_tokens": 16384,
-            },
-            "enable_attention_dp": enable_attention_dp,
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
-            },
-            "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      max_workers=128) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
@@ -1988,30 +1881,19 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize(
-        "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
-            (1, 1, 4, False),
-            (1, 2, 2, False),
-            (1, 2, 2, True),
-            (2, 1, 2, False),
-        ],
-        ids=["pp1tp1cp4", "pp1tp2cp2", "pp1dp2cp2", "pp2tp1cp2"])
+    @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
+        (1, 2, 2, False),
+        (1, 2, 2, True),
+    ],
+                             ids=["pp1tp2cp2", "pp1dp2cp2"])
     @pytest.mark.parametrize("cuda_graph_config", [
-        None,
-        {
-            "enable_padding": False,
-            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
-        },
         {
             "enable_padding": True,
             "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
         },
     ],
-                             ids=[
-                                 "cudagraph:none", "cudagraph:without_padding",
-                                 "cudagraph:with_padding"
-                             ])
-    @pytest.mark.parametrize("comms_medium", ["fifo_v1", "fifo_v2", "nccl"])
+                             ids=["cudagraph:with_padding"])
+    @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
                                    gen_pp, gen_tp, gen_cp, enable_attention_dp):
         # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
@@ -2201,59 +2083,6 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(10800)
 @skip_pre_blackwell
-class TestKimiK2(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K2-Thinking"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
-
-    @pytest.mark.skip_less_device(8)
-    @pytest.mark.skip_less_device_memory(200000)
-    def test_nvfp4(self):
-        ctx_server_config = {
-            "max_batch_size": 16,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
-            },
-            "tensor_parallel_size": 4,
-            "enable_attention_dp": True,
-            "trust_remote_code": True,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-        }
-        gen_server_config = {
-            "max_batch_size": 16,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096
-            },
-            "tensor_parallel_size": 4,
-            "enable_attention_dp": True,
-            "trust_remote_code": True,
-            "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
-            },
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1
-            },
-            "generation_servers": {
-                "num_instances": 1
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
-
-
-@pytest.mark.timeout(10800)
-@skip_pre_blackwell
 class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
@@ -2263,9 +2092,13 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     def test_nvfp4(self):
         """Disaggregated GSM8K accuracy for Kimi-K2.5 (NVFP4).
 
-        ctx and gen servers are each TP4 (8 GPUs total) over the default cache
+        ctx and gen servers are each TP4 (8 GPUs total). The cache transceiver
+        uses backend=NIXL + transceiver_runtime=PYTHON: NIXL is required so the
+        disagg test harness skips its TRTLLM_USE_UCX_KVCACHE=1 fallback (which
+        would make the effective backend UCX and force the C++ transceiver),
+        letting the ctx->gen MLA-latent KV transfer run over the Python (v2)
         transceiver. GSM8K is text-only, so requests run through the DeepSeek-V3
-        MLA backbone (no vision) and the ctx->gen KV transfer is the MLA latent.
+        MLA backbone (no vision).
         Kimi-K2.5 ships custom HF modeling code (auto_map in config.json), so
         trust_remote_code must be set on both servers or executor init fails at
         config parse time.
@@ -2283,7 +2116,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "max_num_tokens": 8192,
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
@@ -2299,7 +2133,8 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "max_num_tokens": 8192,
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,

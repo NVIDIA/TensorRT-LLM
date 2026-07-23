@@ -563,6 +563,7 @@ class ModelLoader:
             loads_draft_weights = (
                 self.spec_config is not None
                 and self.spec_config.spec_dec_mode.need_load_draft_weights())
+            draft_weights_streamed = False
             speculative_mode = self._speculative_mode_name(self.spec_config)
             # Set when either GMS RW or GMS RO branch has already run the
             # post_load_* hooks itself, so the shared post-load block below
@@ -605,7 +606,13 @@ class ModelLoader:
                                                  'enable_hf_layerwise_loading',
                                                  False))
                 if layerwise_loading:
-                    if loads_draft_weights:
+                    supports_embedded_draft = getattr(
+                        model, "supports_embedded_draft_weight_loading", None)
+                    embedded_draft_loading = (
+                        loads_draft_weights
+                        and supports_embedded_draft is not None
+                        and supports_embedded_draft(model_checkpoint_dir))
+                    if loads_draft_weights and not embedded_draft_loading:
                         raise RuntimeError(
                             "HF layer-wise loading does not yet support a "
                             "separate speculative draft checkpoint.")
@@ -619,6 +626,14 @@ class ModelLoader:
                             "enable_hf_layerwise_loading is enabled, but "
                             f"{type(model).__name__}.load_weights does not support "
                             "initial_bucket_loading.")
+                    if embedded_draft_loading:
+                        draft_load_parameters = inspect.signature(
+                            model.load_draft_weights).parameters
+                        if "initial_bucket_loading" not in draft_load_parameters:
+                            raise RuntimeError(
+                                "enable_hf_layerwise_loading is enabled, but "
+                                f"{type(model).__name__}.load_draft_weights does not support "
+                                "initial_bucket_loading.")
                     self.weight_mapper = (
                         checkpoint_loader.get_initialized_weight_mapper(
                             model, config)
@@ -628,14 +643,27 @@ class ModelLoader:
                     )
                     for weight_bucket in checkpoint_loader.iter_layer_weight_buckets(
                             model_checkpoint_dir, **load_weights_kwargs):
-                        self._call_load_weights(model.load_weights,
-                                                weight_bucket,
-                                                self.weight_mapper,
-                                                initial_bucket_loading=True)
+                        load_method = model.load_weights
+                        weight_mapper = self.weight_mapper
+                        if (embedded_draft_loading
+                                and model.is_embedded_draft_weight_bucket(
+                                    weight_bucket)):
+                            load_method = model.load_draft_weights
+                            weight_mapper = None
+                            draft_weights_streamed = True
+                        self._call_load_weights(
+                            load_method,
+                            weight_bucket,
+                            weight_mapper,
+                            initial_bucket_loading=True)
                         # copy_(..., non_blocking=True) and backend transforms
                         # may still consume mmap-backed source storage.
                         torch.cuda.synchronize()
                         del weight_bucket
+                    if embedded_draft_loading and not draft_weights_streamed:
+                        raise RuntimeError(
+                            "HF layer-wise loading did not find any embedded "
+                            "draft weight buckets.")
                 else:
                     weights = checkpoint_loader.load_weights(
                         model_checkpoint_dir, **load_weights_kwargs)
@@ -650,8 +678,7 @@ class ModelLoader:
                         self._call_load_weights(model.load_weights, weights,
                                                 self.weight_mapper)
 
-                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
-                ):
+                if loads_draft_weights and not draft_weights_streamed:
                     weights = checkpoint_loader.load_weights(
                         self.spec_config.speculative_model,
                         mapping=self.mapping)
@@ -1310,6 +1337,8 @@ class ModelLoader:
             force_dynamic_quantization=self.llm_args.force_dynamic_quantization,
             spec_config=self.spec_config,
             sparse_attention_config=self.sparse_attention_config,
+            kv_cache_compression_config=(
+                self.llm_args.kv_cache_compression_config),
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             moe_max_num_tokens=self.llm_args.moe_config.max_num_tokens,

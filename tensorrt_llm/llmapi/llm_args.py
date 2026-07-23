@@ -680,20 +680,18 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
 
     Drives the two-step sparse attention used by MiniMax-M3 layers 3..N:
 
-      1. An index attention branch projects a per-head Q vector and a
-         **single replicated** K vector, scores main K/V cache blocks,
-         and selects the top-``topk`` blocks per ``(num_kv_heads, q_token)``
-         pair (with ``init_blocks`` forced at the head and ``local_blocks``
-         forced at the tail).
+      1. An index attention branch projects a per-head Q vector and a single
+         replicated K vector, scores main K/V cache blocks, and selects the
+         top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced
+         at the head and local_blocks forced at the tail.
       2. A sparse GQA attention runs only over the selected blocks.
 
-    The selected backend at runtime uses
-    :class:`tensorrt_llm._torch.attention_backend.sparse.minimax_m3.MiniMaxM3SparseAttention`
-    on top of a :class:`MiniMaxM3KVCacheManagerV2` that allocates a
-    paged side index-K cache (``[num_slots, 1, sparse_index_dim]``)
-    parallel to the main K/V cache. The M3 checkpoint sets
-    ``disable_index_value=True`` on every sparse layer so no index V
-    cache is allocated for the bring-up.
+    At runtime one of the MiniMax-M3 sparse attention backends under
+    tensorrt_llm._torch.attention_backend.sparse.minimax_m3 is selected. The
+    chosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a
+    paged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel
+    to the main K/V cache. The M3 checkpoint sets disable_index_value=True on
+    every sparse layer, so no index V cache is allocated.
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
@@ -730,6 +728,34 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
+    num_attention_heads: Optional[int] = Field(
+        default=None,
+        description=
+        "Global number of attention (query) heads. When unset, it falls back "
+        "to pretrained_config.num_attention_heads.",
+    )
+    num_key_value_heads: Optional[int] = Field(
+        default=None,
+        description=
+        "Global number of key/value heads. When unset, it falls back to "
+        "pretrained_config.num_key_value_heads, then to num_attention_heads.",
+    )
+    implementation: Literal["triton", "msa"] = Field(
+        default="triton",
+        description=
+        "Sparse attention implementation: 'triton' reference (default) or 'msa' "
+        "(fmha_sm100 kernels). The 'msa' implementation requires an SM100 GPU, "
+        "the fmha_sm100 package, and sparse_block_size == 128.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def _validate_msa_block_size(self):
+        if self.implementation == "msa" and self.sparse_block_size != 128:
+            raise ValueError(
+                "MiniMax-M3 'msa' implementation requires sparse_block_size == "
+                f"128, got {self.sparse_block_size}.")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -738,7 +764,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         return self.sparse_block_size
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.metadata import \
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
             MiniMaxM3SparseParams
 
         return MiniMaxM3SparseParams(
@@ -750,6 +776,36 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             local_blocks=self.sparse_local_blocks,
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
+            implementation=self.implementation,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        """Lower into MiniMaxM3SparseMetadataParams for the attention metadata.
+
+        Head counts resolve as this config, then pretrained_config, then a
+        default; num_key_value_heads falls back to num_attention_heads. Setting
+        them on the config lets tests skip building a pretrained_config.
+        """
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import \
+            MiniMaxM3SparseMetadataParams
+
+        pretrained_config = kwargs.get("pretrained_config", None)
+
+        def _value(name: str, default=None):
+            value = getattr(self, name)
+            if value is not None:
+                return value
+            if pretrained_config is not None:
+                return getattr(pretrained_config, name, default)
+            return default
+
+        num_attention_heads = int(_value("num_attention_heads", 0))
+        num_kv_heads = int(_value("num_key_value_heads", num_attention_heads))
+        return MiniMaxM3SparseMetadataParams(
+            global_num_q_heads=num_attention_heads,
+            global_num_kv_heads=num_kv_heads,
+            num_index_heads=self.sparse_num_index_heads,
+            topk=self.sparse_topk_blocks,
         )
 
 
@@ -1750,14 +1806,17 @@ class DecodingBaseConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def validate_rejection_sampling_config(self):
-        """Disable rejection sampling when SA-enhanced configurations are
-        active, since SA may override the proposed draft tokens. This is a
-        silent fallback so the new default (True) does not break sa_config
-        users.
+        """Disable rejection sampling when SA-enhanced configurations are active.
+
+        Only silently disable a default-inherited value; an explicit
+        ``use_rejection_sampling=True`` is preserved so
+        ``TorchLlmArgs.validate_speculative_config`` can raise for the
+        unsupported SA combination.
         """
         if self.use_rejection_sampling and getattr(self, 'sa_config',
                                                    None) is not None:
-            self.use_rejection_sampling = False
+            if "use_rejection_sampling" not in self.model_fields_set:
+                self.use_rejection_sampling = False
         return self
 
     @model_validator(mode='before')
@@ -1968,8 +2027,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
     )
     dynamic_tree_max_topK: Optional[int] = Field(
         default=None,
-        description="The topK value for each layer when dynamic tree is enabled."
-    )
+        description=
+        "The topK value for each layer when dynamic tree is enabled. Required "
+        "when use_dynamic_tree is True; ignored (with a warning) when "
+        "use_dynamic_tree is False.")
     num_eagle_layers: Optional[int] = Field(
         default=None,
         description=
@@ -2045,9 +2106,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
             # So the number of choices also represents the number of max draft nodes.
             self.max_total_draft_tokens = len(self.eagle_choices)
 
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
         # Dynamic tree logic
-        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
-            self.use_dynamic_tree = True
+        if self.use_dynamic_tree:
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -2067,16 +2136,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 logger.warning(
                     f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
-            else:
-                if self.max_total_draft_tokens < self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
-                    )
-                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
-                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
-                    )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
 
         # Linear tree
         if self.max_total_draft_tokens is None:
@@ -2422,6 +2487,22 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
+    use_dynamic_tree: bool = Field(
+        default=False,
+        description=
+        "Enable EAGLE-style dynamic-tree drafting for one-model MTP. When True, "
+        "each draft step expands dynamic_tree_max_topK candidates per node and the "
+        "tree is verified against the target, instead of a linear chain.")
+    dynamic_tree_max_topK: Optional[int] = Field(
+        default=None,
+        description=
+        "Top-K candidates expanded per node per draft layer when use_dynamic_tree "
+        "is enabled. Required when use_dynamic_tree is True; ignored (with a "
+        "warning) when use_dynamic_tree is False.")
+
+    # Internal max batch size for dynamic-tree worker buffers.
+    _max_batch_size: Optional[int] = PrivateAttr(default=None)
+
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
         status="beta",
@@ -2466,15 +2547,43 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        # Leave max_draft_len as None ("use the model's num_nextn_predict_layers")
-        # when the user doesn't set it; update_spec_config_from_model_config
-        # resolves it from the checkpoint before the model runs. When the user
-        # does set it, validate and mirror to max_total_draft_tokens (current MTP
-        # only supports a linear tree).
+        # None means update_spec_config_from_model_config resolves it from checkpoint.
         if self.max_draft_len is not None:
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
-            self.max_total_draft_tokens = self.max_draft_len
+
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
+        # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
+        if self.use_dynamic_tree:
+            if self.max_draft_len is None:
+                raise ValueError(
+                    "max_draft_len must be set when use_dynamic_tree is True")
+            if self.dynamic_tree_max_topK is None or self.dynamic_tree_max_topK <= 0:
+                raise ValueError(
+                    "dynamic_tree_max_topK must be > 0 when use_dynamic_tree is True"
+                )
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
+                )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
+        elif self.max_draft_len is not None:
+            self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
 
     @model_validator(mode="after")
@@ -2624,6 +2733,91 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.DFLASH
+
+
+class DSparkDecodingConfig(DecodingBaseConfig):
+    """Configuration for DSpark speculative decoding.
+
+    DSpark (DeepSeek) is a target-dependent, "semi-parallel" speculative
+    decoding method. Like DFlash it captures hidden states from several target
+    layers as cross-attention context and drafts a whole block in a single
+    backbone forward, but it additionally refines the per-position draft logits
+    with a lightweight sequential head (a low-rank Markov head, optionally an RNN
+    head) and predicts an acceptance-confidence per position to truncate the
+    proposed prefix.
+
+    Key features:
+    - Target-dependent: captures hidden states from ``target_layer_ids``.
+    - Semi-parallel: one block backbone forward + cheap sequential head refine.
+    - Confidence head: truncates the proposed draft length (NOT the accept rule;
+      acceptance stays standard target verification, preserving greedy parity).
+
+    Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
+    """
+    mask_token_id: Optional[int] = Field(
+        default=None,
+        description=
+        "Token ID used as the mask/noise token for parallel draft prediction. "
+        "If None, read from the draft model config (dspark_noise_token_id).")
+
+    target_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Target model layer indices whose hidden states are captured for "
+        "cross-attention in the draft model. If None, read from the draft model "
+        "config (dspark_target_layer_ids).")
+
+    block_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Number of draft positions produced per block. If None, read from the "
+        "draft model config (dspark_block_size). Should equal max_draft_len.")
+
+    markov_rank: Optional[int] = Field(
+        default=None,
+        description=
+        "Low-rank dimension of the Markov head logit-bias. If None, read from "
+        "the draft model config (dspark_markov_rank). 0 disables the head.")
+
+    markov_head_type: Optional[Literal["vanilla", "gated", "rnn"]] = Field(
+        default=None,
+        description=
+        "Type of the sequential refinement head used within a block. If None, "
+        "read from the draft model config (dspark_markov_head_type), "
+        "defaulting to \"vanilla\".")
+
+    # NOTE: confidence-based dynamic drafting (the draft model's confidence head
+    # that truncates the proposed block) is NOT enabled in this PR. The user-facing
+    # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally
+    # omitted and will be added when the feature is actually wired into the
+    # speculative scheduling/verification path. The confidence head module and its
+    # internal plumbing remain as scaffolding (see DSparkConfidenceHead /
+    # dspark_propose).
+
+    decoding_type: Literal["DSpark"] = Field(default="DSpark")
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """DSpark needs K+1 tokens per gen request (K drafts + 1 bonus).
+
+        The draft produces its own mask queries internally; passing mask
+        fillers through the target is pure wasted work at large batch size.
+        """
+        return self.max_draft_len + 1
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.DSPARK
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
@@ -3292,6 +3486,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
         DFlashDecodingConfig,
+        DSparkDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
@@ -3323,6 +3518,14 @@ class KvCacheCompressionConfig(StrictBaseModel):
         "Name of the KV-cache compression algorithm to run; selects which "
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
+
+    @property
+    def kv_cache_compression_mode(self):
+        # The mode carries algorithm-level traits (``is_*`` predicates) the
+        # raw algorithm string does not.
+        from tensorrt_llm._torch.kv_cache_compression.interface import \
+            KvCacheCompressionMode
+        return KvCacheCompressionMode.from_string(self.algorithm)
 
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
@@ -3528,7 +3731,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     max_util_for_resume: float = Field(
         default=0.95,
-        ge=0,
+        gt=0,
         le=1,
         status="prototype",
         description=
@@ -3577,12 +3780,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "pool_ratio is set.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    block_reuse_policy: Literal["all_reusable", "per_request"] = Field(
-        default="all_reusable",
-        status="prototype",
-        description="KV cache manager v2 block reuse policy. "
-        "With SWA scratch reuse and 'all_reusable', only non-scratch "
-        "blocks are saved for reuse.")
+    block_reuse_policy: Literal[
+        "all_reusable", "per_request", "per_conversation"] = Field(
+            default="all_reusable",
+            status="prototype",
+            description="KV cache manager v2 block reuse policy. "
+            "'all_reusable' commits reusable blocks after every context chunk; "
+            "'per_request' commits them only after the final context chunk; "
+            "'per_conversation' uses 'per_request' commits and drops the previous "
+            "turn's committed SWA-window blocks after the current turn's final context "
+            "chunk. All reusable blocks remain subject to normal cache eviction. "
+            "Requests without conversation params use 'per_request' behavior. When "
+            "'all_reusable' and SWA scratch reuse are both enabled, only non-scratch "
+            "blocks are committed for reuse.")
 
     def _to_pybind(self):
         config = _KvCacheConfig(
@@ -3675,14 +3885,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
-        return v
-
-    @field_validator('max_util_for_resume')
-    @classmethod
-    def validate_max_util_for_resume(cls, v: float):
-        if not 0 <= v <= 1:
-            raise ValueError(
-                "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
 
     @field_validator('pool_ratio')
@@ -4116,6 +4318,19 @@ class BaseLlmArgs(StrictBaseModel):
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
         description="The path to the tokenizer directory for postprocessing.",
+        status="prototype")
+
+    num_serve_frontends: int = Field(
+        default=1,
+        ge=1,
+        # = executor.utils.MAX_NUM_FRONTENDS (cannot be imported here);
+        # test_multi_frontend_routing pins the two together.
+        le=64,
+        description=
+        "The number of HTTP frontend processes serving one executor. Used by "
+        "trtllm-serve: values > 1 run additional attached frontend processes "
+        "that share the serving port via SO_REUSEPORT (classic IPC executor "
+        "path only).",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
@@ -4838,7 +5053,9 @@ class TorchLlmArgs(BaseLlmArgs):
     checkpoint_format: Optional[str] = Field(
         default=None,
         description=
-        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P "
+        "loading path and falls back to loading the provided Hugging Face checkpoint; it does not require "
+        "converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
         "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
         "and the default HfCheckpointLoader will be used.\n"
@@ -5089,17 +5306,132 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
-            if self.speculative_config.use_rejection_sampling and not isinstance(
-                    self.speculative_config, Eagle3DecodingConfig):
-                # Rejection sampling is only wired up for Eagle3 one-model paths.
-                # Silently fall back for other spec types so the new default
-                # (True) does not break them.
-                # TODO: extend rejection sampling to the remaining speculative
-                # decoding paths (MTP / DraftTarget / PARD / DFlash /
-                # SaveHiddenStates / SA) and unify the dispatch in SpecMetadata
-                # so new spec algorithms get rejection sampling for free; once
-                # all paths are covered this whitelist guard can be removed.
-                self.speculative_config.use_rejection_sampling = False
+            if self.speculative_config.use_rejection_sampling:
+                # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
+                # vanilla MTP, PARD, DFlash, DraftTarget one-model. Classify by
+                # spec-dec mode; MTP-Eagle one-model shares the Eagle3 one-model
+                # worker/metadata/sampler, so it rides the same unified
+                # production/acceptance path.
+                #
+                # Every supported path runs a neural draft head that yields a
+                # per-token proposal distribution q(x). Rejection sampling needs
+                # q to form min(1, p/q) and the (p - q)+ residual correction, so
+                # retrieval-based drafters that emit only token ids with no q are
+                # excluded: NGram is simply absent from this whitelist, and SA
+                # (sa_config) is rejected below via rs_sa_active.
+                from tensorrt_llm._torch.speculative.interface import \
+                    SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+
+                spec_mode = self.speculative_config.spec_dec_mode
+                is_supported = (isinstance(self.speculative_config,
+                                           Eagle3DecodingConfig)
+                                or spec_mode == TorchSpeculativeDecodingMode.MTP
+                                or spec_mode.is_mtp_eagle_one_model()
+                                or spec_mode.is_pard() or spec_mode.is_dflash()
+                                or spec_mode.is_dspark()
+                                or spec_mode.is_draft_target_one_model())
+
+                # Combinations that break the proposal-distribution invariant.
+                # SA is gated for every method; relaxed / parallel / guided gates
+                # apply only to the newly wired methods (vanilla MTP, PARD,
+                # DFlash, DraftTarget one-model).
+                is_new_rejection_method = (
+                    spec_mode == TorchSpeculativeDecodingMode.MTP
+                    or spec_mode.is_pard() or spec_mode.is_dflash()
+                    or spec_mode.is_dspark()
+                    or spec_mode.is_draft_target_one_model())
+                # Plain tensor parallelism is supported (the draft path
+                # all-gathers vocab-sharded draft logits before rejection, see
+                # SpecWorkerBase.maybe_gather_sharded_draft_logits).
+                # Attention DP is supported: each rank holds full-vocab draft
+                # logits for its own requests (the LM-head-TP fast path is
+                # bypassed for advanced sampling, and is_all_greedy_sample is
+                # group-synchronized so the LM-head-TP group's collectives stay
+                # uniform -- see SpecMetadata.group_all_greedy_sample). Only
+                # context parallelism remains gated.
+                rs_parallel_active = self.context_parallel_size > 1
+                rs_guided_active = self.guided_decoding_backend is not None
+                rs_sa_active = getattr(self.speculative_config, "sa_config",
+                                       None) is not None
+                rs_relaxed_active = getattr(
+                    self.speculative_config,
+                    "use_relaxed_acceptance_for_thinking", False)
+                # Eagle3 dynamic-tree rejection records at most kMaxTriedPerLevel
+                # (=32, cpp/.../speculativeDecoding/dynamicTreeKernels.cu) tried
+                # siblings per level; dynamic_tree_max_topK > 32 yields a wrong
+                # correction distribution, so cap supported topK at 32.
+                _DYNAMIC_TREE_REJECTION_MAX_TOPK = 32
+                rs_dynamic_tree_active = getattr(self.speculative_config,
+                                                 "use_dynamic_tree", False)
+                rs_dynamic_tree_topk_unsupported = (
+                    rs_dynamic_tree_active
+                    and (self.speculative_config.dynamic_tree_max_topK
+                         or 0) > _DYNAMIC_TREE_REJECTION_MAX_TOPK)
+                mtp_unsupported_combo = (
+                    rs_sa_active or rs_dynamic_tree_topk_unsupported
+                    or (is_new_rejection_method and
+                        (rs_relaxed_active or rs_parallel_active
+                         or rs_guided_active)))
+
+                if not is_supported or mtp_unsupported_combo:
+                    # Explicit opt-in raises; a default-inherited value is
+                    # silently disabled for backward compatibility.
+                    explicitly_set = "use_rejection_sampling" in \
+                        self.speculative_config.model_fields_set
+                    if explicitly_set:
+                        reasons = []
+                        if not is_supported:
+                            reasons.append(
+                                f"spec mode {spec_mode.name} is not a supported "
+                                "rejection-sampling path (supported: the Eagle3 "
+                                "one-model path, vanilla MTP, PARD, DFlash, and "
+                                "DraftTarget one-model)")
+                        if rs_sa_active:
+                            reasons.append("SA (sa_config) is active")
+                        if rs_dynamic_tree_topk_unsupported:
+                            reasons.append(
+                                "dynamic_tree_max_topK="
+                                f"{self.speculative_config.dynamic_tree_max_topK}"
+                                " exceeds the dynamic-tree rejection kernel limit "
+                                f"of {_DYNAMIC_TREE_REJECTION_MAX_TOPK} tried "
+                                "siblings per level")
+                        if is_new_rejection_method:
+                            if rs_relaxed_active:
+                                reasons.append(
+                                    "relaxed-thinking acceptance is enabled")
+                            if rs_parallel_active:
+                                reasons.append(
+                                    "context parallelism is active (the draft "
+                                    "path resolves only the global argmax, "
+                                    "not full distributions)")
+                            if rs_guided_active:
+                                reasons.append("guided decoding is enabled")
+                        raise ValueError(
+                            "use_rejection_sampling=True is not supported for "
+                            f"this configuration: {'; '.join(reasons)}.")
+                    self.speculative_config.use_rejection_sampling = False
+                elif self.speculative_config.use_rejection_sampling:
+                    # The non-dynamic-tree one-model rejection path depends on
+                    # FlashInfer (sampling_from_probs /
+                    # chain_speculative_sampling); fail fast if it is missing.
+                    # The dynamic-tree path uses
+                    # verify_dynamic_tree_rejection_out /
+                    # compute_probs_from_logits (CUDA op with a PyTorch
+                    # fallback) and does not require FlashInfer.
+                    rs_dynamic_tree_active = getattr(self.speculative_config,
+                                                     "use_dynamic_tree", False)
+                    if not rs_dynamic_tree_active:
+                        from tensorrt_llm._torch.flashinfer_utils import \
+                            IS_FLASHINFER_AVAILABLE
+                        if not IS_FLASHINFER_AVAILABLE:
+                            raise ValueError(
+                                "use_rejection_sampling=True requires FlashInfer, "
+                                "which is not available in this environment. "
+                                "Install flashinfer-python or set "
+                                "use_rejection_sampling=False.")
+                # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
+                # DraftTarget one-model) share the SpecMetadata slot-indexed
+                # dispatch.
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
@@ -5126,6 +5458,92 @@ class TorchLlmArgs(BaseLlmArgs):
                             mask_id = dflash_cfg.get("mask_token_id")
                             if mask_id is not None:
                                 self.speculative_config.mask_token_id = mask_id
+
+            if isinstance(self.speculative_config, DSparkDecodingConfig):
+                spec_cfg = self.speculative_config
+                if not spec_cfg.max_draft_len:
+                    raise ValueError("DSpark max_draft_len must be > 0; got "
+                                     f"{spec_cfg.max_draft_len}")
+                # The DSpark draft weights live in the ``mtp.*`` namespace of a
+                # local checkpoint directory; without ``speculative_model``
+                # neither the draft weights nor the ``dspark_*`` config
+                # defaults can be located, and engine construction would fail
+                # much later with an opaque error.
+                if spec_cfg.speculative_model is None:
+                    raise ValueError(
+                        "DSpark requires speculative_config.speculative_model "
+                        "to point at the checkpoint directory containing the "
+                        "mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this "
+                        "is the target checkpoint directory itself).")
+                # Resolve target_layer_ids / mask_token_id / block_size /
+                # markov_rank from the draft (or main) model config if not set.
+                # DSpark ships these as top-level ``dspark_*`` keys in the
+                # DeepSeek-V4-Pro config.json; also accept a nested
+                # ``dspark_config`` dict for forward compatibility.
+                draft_config_path = os.path.join(spec_cfg.speculative_model,
+                                                 "config.json")
+                if os.path.exists(draft_config_path):
+                    with open(draft_config_path) as f:
+                        draft_cfg = json.load(f)
+                    dspark_cfg = draft_cfg.get("dspark_config", {})
+
+                    def _dspark_get(key, top_level_key):
+                        value = dspark_cfg.get(key)
+                        if value is None:
+                            value = draft_cfg.get(top_level_key)
+                        return value
+
+                    # The checkpoint's ``dspark_target_layer_ids`` is
+                    # authoritative: it fixes both which target hidden states
+                    # were captured during draft training and the input width of
+                    # ``main_proj`` (hidden_size * num_capture_layers). If the
+                    # user leaves ``target_layer_ids`` unset we copy it verbatim
+                    # (order preserved, since the projection columns are
+                    # order-dependent). An explicit override that does not match
+                    # the checkpoint list exactly would either mismatch the
+                    # projection shape at runtime (different count) or feed the
+                    # draft hidden states it was not trained on (same count,
+                    # different layers), so reject it during validation.
+                    ckpt_layer_ids = _dspark_get("target_layer_ids",
+                                                 "dspark_target_layer_ids")
+                    if spec_cfg.target_layer_ids is None:
+                        if ckpt_layer_ids is not None:
+                            spec_cfg.target_layer_ids = list(ckpt_layer_ids)
+                    elif ckpt_layer_ids is not None and list(
+                            spec_cfg.target_layer_ids) != list(ckpt_layer_ids):
+                        raise ValueError(
+                            "DSpark target_layer_ids must match the checkpoint's "
+                            "dspark_target_layer_ids exactly (the draft "
+                            "projection weights are trained for that specific "
+                            f"layer set); got override {spec_cfg.target_layer_ids} "
+                            f"but the checkpoint specifies {list(ckpt_layer_ids)}. "
+                            "Leave target_layer_ids unset to use the checkpoint "
+                            "value.")
+                    if spec_cfg.mask_token_id is None:
+                        mask_id = _dspark_get("mask_token_id",
+                                              "dspark_noise_token_id")
+                        if mask_id is not None:
+                            spec_cfg.mask_token_id = mask_id
+                    if spec_cfg.block_size is None:
+                        block_size = _dspark_get("block_size",
+                                                 "dspark_block_size")
+                        if block_size is not None:
+                            spec_cfg.block_size = int(block_size)
+                    if spec_cfg.markov_rank is None:
+                        markov_rank = _dspark_get("markov_rank",
+                                                  "dspark_markov_rank")
+                        if markov_rank is not None:
+                            spec_cfg.markov_rank = markov_rank
+                if spec_cfg.block_size is None:
+                    spec_cfg.block_size = spec_cfg.max_draft_len
+                if spec_cfg.block_size <= 0:
+                    raise ValueError(
+                        "DSpark block_size must be greater than zero")
+                if spec_cfg.block_size != spec_cfg.max_draft_len:
+                    raise ValueError(
+                        "DSpark block_size must equal max_draft_len; got "
+                        f"block_size={spec_cfg.block_size} and "
+                        f"max_draft_len={spec_cfg.max_draft_len}")
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
