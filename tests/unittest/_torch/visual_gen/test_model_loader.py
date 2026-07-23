@@ -534,3 +534,139 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
         f"FP8 Blockwise:  {fp8_block_model_mem:.2f} GB model, {fp8_block_peak_mem:.2f} GB peak "
         f"({block_model_mem_ratio:.2f}x savings)"
     )
+
+
+# =============================================================================
+# Mixed-Precision Quantization Tests
+# =============================================================================
+
+
+def test_load_diffusion_quant_config_per_layer_parsing():
+    """Test that per_layer overrides are parsed into a Dict[pattern, QuantConfig]."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    parse = DiffusionModelConfig.load_diffusion_quant_config
+
+    # Mixed: global NVFP4, attention layers override to FP8_BLOCK_SCALES.
+    qc, layer_cfg, dwq, daq = parse(
+        {
+            "quant_algo": "NVFP4",
+            "per_layer": {
+                "blocks.*.attn1.*": "FP8_BLOCK_SCALES",
+                "blocks.*.attn2.*": "FP8_BLOCK_SCALES",
+            },
+        }
+    )
+
+    assert qc.quant_algo == QuantAlgo.NVFP4
+    assert layer_cfg is not None
+    assert len(layer_cfg) == 2
+    assert layer_cfg["blocks.*.attn1.*"].quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert layer_cfg["blocks.*.attn1.*"].group_size == 128
+    assert layer_cfg["blocks.*.attn2.*"].quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+    assert dwq is True  # auto-enabled for NVFP4
+
+
+def test_load_diffusion_quant_config_per_layer_invalid_algo():
+    """Unknown algo in per_layer raises a clear ValueError."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+
+    import pytest
+
+    with pytest.raises(ValueError, match="Unknown quant_algo in per_layer"):
+        DiffusionModelConfig.load_diffusion_quant_config(
+            {
+                "quant_algo": "NVFP4",
+                "per_layer": {"blocks.*.attn1.*": "BOGUS_ALGO"},
+            }
+        )
+
+
+def test_get_quant_config_fnmatch():
+    """get_quant_config uses fnmatch patterns; first match wins; fallback to global."""
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    global_cfg = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    attn_cfg = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+
+    model_cfg = DiffusionModelConfig(
+        quant_config=global_cfg,
+        quant_config_dict={"blocks.*.attn1.*": attn_cfg},
+    )
+
+    # Matching pattern
+    result = model_cfg.get_quant_config("blocks.0.attn1.qkv_proj")
+    assert result.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+    result = model_cfg.get_quant_config("blocks.5.attn1.to_out.0")
+    assert result.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+
+    # Non-matching → global fallback
+    result = model_cfg.get_quant_config("blocks.0.ffn.ff_in")
+    assert result.quant_algo == QuantAlgo.NVFP4
+
+    # No name → global
+    result = model_cfg.get_quant_config()
+    assert result.quant_algo == QuantAlgo.NVFP4
+
+
+def test_load_wan_pipeline_with_mixed_precision(checkpoint_exists):
+    """Test loading with mixed precision: NVFP4 for FFN, FP8_BLOCK_SCALES for attn linears.
+
+    Verifies:
+    - Attention Linear modules (attn1.*, attn2.*) have FP8 weight buffers
+    - FFN Linear modules (ffn.*) have NVFP4 weight buffers
+    """
+    if not checkpoint_exists:
+        pytest.skip("Checkpoint not available")
+
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen import PipelineLoader
+    from tensorrt_llm.quantization.mode import QuantAlgo
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    args = VisualGenArgs(
+        model=CHECKPOINT_PATH,
+        quant_config={
+            "quant_algo": "NVFP4",
+            "per_layer": {
+                "blocks.*.attn1.*": "FP8_BLOCK_SCALES",
+                "blocks.*.attn2.*": "FP8_BLOCK_SCALES",
+            },
+        },
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True, skip_components=SKIP_HEAVY_COMPONENTS)
+
+    attn_fp8_count = 0
+    ffn_nvfp4_count = 0
+
+    for name, module in pipeline.transformer.named_modules():
+        if not isinstance(module, Linear):
+            continue
+        if module.weight is None:
+            continue
+
+        is_attn = ".attn1." in name or ".attn2." in name
+        is_ffn = ".ffn." in name
+
+        if is_attn:
+            assert module.weight.dtype == torch.float8_e4m3fn, (
+                f"Attention Linear {name} should have FP8 weight, got {module.weight.dtype}"
+            )
+            assert hasattr(module, "weight_scale") and module.weight_scale is not None, (
+                f"Attention Linear {name} missing weight_scale"
+            )
+            attn_fp8_count += 1
+        elif is_ffn:
+            from tensorrt_llm.quantization.utils import fp4_utils
+
+            assert module.weight.dtype == fp4_utils.float4_e2m1x2, (
+                f"FFN Linear {name} should have NVFP4 weight, got {module.weight.dtype}"
+            )
+            ffn_nvfp4_count += 1
+
+    assert attn_fp8_count > 0, "Expected at least one FP8 attention Linear module"
+    assert ffn_nvfp4_count > 0, "Expected at least one NVFP4 FFN Linear module"
