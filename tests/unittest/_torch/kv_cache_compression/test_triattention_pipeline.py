@@ -44,7 +44,6 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import T
 # in pyexecutor._util (next to _create_kv_cache_manager), matching #15106.
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
 # The SM100 CuTe kernel is the only score path, so every test that actually
 # launches scores (or builds the real staging buffers, whose constructor
@@ -454,25 +453,21 @@ class TestEvictionLifecycle:
         cache.resize.assert_not_called()
 
     def test_one_model_draft_co_compression_contract_is_accepted(self):
-        # Draft physical length tracks the target's: smaller draft
-        # max_seq_len is accepted and both managers are marked.
+        # Construction accepts the separate draft manager, and the executor
+        # call-site gate accepts the one-model MTP roundtrip (base-ctor
+        # marking is asserted in the executor manager tests).
         draft_manager = _make_fake_v2(is_draft=True)
-        draft_manager.max_seq_len = 8192
-        manager = TriAttention(
+        TriAttention(
             _make_fake_v2(),
             _make_tri_config(budget=8),
             draft_kv_cache_manager=draft_manager,
         )
 
-        assert manager.kv_cache_manager.kv_compression_manages_history is True
-        assert draft_manager.kv_compression_manages_history is True
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
         validate_kv_cache_compression_with_spec(
-            TriAttentionKvCacheCompressionConfig(
-                model_path="/models/test", calibration_path="/calib/test.pt", budget=8
-            ),
+            _make_tri_config(budget=8),
             MTPDecodingConfig(max_draft_len=1),
             draft_manager,
         )
