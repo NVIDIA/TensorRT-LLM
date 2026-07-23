@@ -56,8 +56,8 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
-from tensorrt_llm.serve.chat_tokenization import (
-    get_chat_completion_tool_dicts, tokenize_harmony_chat_request)
+from tensorrt_llm.serve.chat_tokenization import \
+    tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
@@ -2046,12 +2046,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 harmony_tokens = tokenize_harmony_chat_request(
                     request, harmony_adapter=self.harmony_adapter)
             except Exception:
-                logger.error(f"messages_dict: {request.messages}")
-                logger.error(
-                    "tools_dict: "
-                    f"{get_chat_completion_tool_dicts(request, empty_as_none=True)}"
-                )
-                logger.error(f"request: {request}")
+                logger.error("messages_dict: %s", request.messages)
+                logger.error("tools: %s", request.tools)
+                logger.error("request: %s", request)
                 raise
 
             # Get harmony stop tokens

@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Callable, Optional, cast
 
+from transformers import PretrainedConfig
+
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 if TYPE_CHECKING:
@@ -26,41 +28,26 @@ if TYPE_CHECKING:
 ToolDict = dict[str, object]
 
 
-def infer_model_type_from_name(model: str) -> Optional[str]:
-    normalized_model = model.lower().replace("_", "-")
-    if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
-        return "gpt_oss"
-    return None
+def resolve_model_type_from_config(model_name_or_path: str) -> Optional[str]:
+    """Return the checkpoint's declared model type from its config metadata."""
 
-
-def resolve_model_type_from_model_or_path(
-    model: str, model_path: Optional[str] = None
-) -> Optional[str]:
-    model_type = infer_model_type_from_name(model)
-    if model_type is not None:
-        return model_type
-    if model_path is None:
-        return None
-    model_type = infer_model_type_from_name(model_path)
-    if model_type is not None:
-        return model_type
-    return None
+    config_dict, _ = PretrainedConfig.get_config_dict(model_name_or_path)
+    model_type = config_dict.get("model_type")
+    return model_type if isinstance(model_type, str) else None
 
 
 def uses_harmony_tokenization(
-    request: ChatCompletionRequest,
     use_harmony: Optional[bool] = None,
     model_type: Optional[str] = None,
-    model_path: Optional[str] = None,
+    model_type_resolver: Optional[Callable[[], Optional[str]]] = None,
 ) -> bool:
     if os.getenv("DISABLE_HARMONY_ADAPTER", "0") == "1":
         return False
     if use_harmony is not None:
         return use_harmony
-    resolved_model_type = model_type or resolve_model_type_from_model_or_path(
-        request.model, model_path
-    )
-    return resolved_model_type == "gpt_oss"
+    if model_type is None and model_type_resolver is not None:
+        model_type = model_type_resolver()
+    return model_type == "gpt_oss"
 
 
 def get_chat_completion_tool_dicts(
@@ -131,7 +118,7 @@ def tokenize_chat_request_for_serving(
     encode_rendered: Callable[[str, object], list[int]],
     use_harmony: Optional[bool] = None,
     model_type: Optional[str] = None,
-    model_path: Optional[str] = None,
+    model_type_resolver: Optional[Callable[[], Optional[str]]] = None,
     harmony_adapter: Optional["HarmonyAdapter"] = None,
     set_prompt_token_ids: bool = True,
 ) -> list[int]:
@@ -139,10 +126,9 @@ def tokenize_chat_request_for_serving(
         return request.prompt_token_ids
 
     if uses_harmony_tokenization(
-        request,
         use_harmony=use_harmony,
         model_type=model_type,
-        model_path=model_path,
+        model_type_resolver=model_type_resolver,
     ):
         return tokenize_harmony_chat_request(
             request,

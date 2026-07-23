@@ -799,14 +799,17 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  custom_tokenizer: Optional[str] = None,
                  tokenizer_dir: Optional[str] = None,
                  use_harmony: Optional[bool] = None,
+                 model_path: Optional[str] = None,
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_block_hashing(tokens_per_block, custom_tokenizer,
-                                 tokenizer_dir, use_harmony)
+                                 tokenizer_dir,
+                                 use_harmony=use_harmony,
+                                 model_path=model_path)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size

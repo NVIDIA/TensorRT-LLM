@@ -29,7 +29,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import Block as 
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import ReuseScope
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import RootBlock as V2RootBlock
 from tensorrt_llm.serve.chat_tokenization import (
-    resolve_model_type_from_model_or_path,
+    resolve_model_type_from_config,
     tokenize_chat_request_for_serving,
 )
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
@@ -193,6 +193,7 @@ class BlockHashMixin:
         custom_tokenizer: Optional[str] = None,
         tokenizer_dir: Optional[str] = None,
         use_harmony: Optional[bool] = None,
+        model_path: Optional[str] = None,
     ) -> None:
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
@@ -203,11 +204,13 @@ class BlockHashMixin:
         self._model_types: dict[str, Optional[str]] = {}
         self._custom_tokenizer = custom_tokenizer
         self._tokenizer_dir = tokenizer_dir
+        self._model_path = model_path
         self._use_harmony = use_harmony
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
             f", custom_tokenizer={self._custom_tokenizer}"
+            f", model_path={self._model_path}"
             f", use_harmony={self._use_harmony}"
         )
 
@@ -244,16 +247,26 @@ class BlockHashMixin:
             cache.popitem(last=False)
         return ids
 
-    def _get_model_type(self, model: str) -> Optional[str]:
-        if model not in self._model_types:
-            model_path = self._tokenizer_dir or model
-            self._model_types[model] = resolve_model_type_from_model_or_path(model, model_path)
-        return self._model_types[model]
+    def _get_model_type(self) -> Optional[str]:
+        model_path = self._model_path or self._tokenizer_dir
+        if model_path is None:
+            return None
+        if model_path not in self._model_types:
+            try:
+                self._model_types[model_path] = resolve_model_type_from_config(model_path)
+            except (OSError, ValueError) as error:
+                logger.warning(
+                    "Unable to resolve model type from checkpoint config at %s: %s. "
+                    "Set use_harmony explicitly if the checkpoint uses Harmony.",
+                    model_path,
+                    error,
+                )
+                self._model_types[model_path] = None
+        return self._model_types[model_path]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
-            model_path = self._tokenizer_dir or request.model
 
             def tokenizer_factory() -> object:
                 return self._get_tokenizer(request.model)
@@ -276,8 +289,7 @@ class BlockHashMixin:
                 tokenizer_factory=tokenizer_factory,
                 encode_rendered=encode_rendered,
                 use_harmony=self._use_harmony,
-                model_type=self._get_model_type(request.model),
-                model_path=model_path,
+                model_type_resolver=self._get_model_type,
                 set_prompt_token_ids=True,
             )
             return [result]
