@@ -666,6 +666,28 @@ class TestStrictLoading:
             "norm",
         }
 
+    def test_model_prefixed_skip_keys_are_intentional(self, monkeypatch):
+        """Checkpoints that namespace top-level tensors under "model." must
+        have their skip keys recognized (prefix normalization runs before the
+        skip check), not warned about as unknown."""
+        import tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 as tf_module
+
+        warnings = []
+        infos = []
+        monkeypatch.setattr(tf_module.logger, "warning", warnings.append)
+        monkeypatch.setattr(tf_module.logger, "info", infos.append)
+        cfg = _reduced_edge_config()
+        sd = _edge_state_dict(cfg)
+        sd["model.lm_head.weight"] = torch.randn(cfg.vocab_size, cfg.hidden_size)
+        sd["model.action_modality_embed"] = torch.randn(cfg.hidden_size)
+        self._model().load_weights(sd)
+
+        assert not any("unknown checkpoint key" in m for m in warnings)
+        skip_logs = [m for m in infos if "intentionally unused" in m]
+        assert len(skip_logs) == 1
+        skipped_families = {name.strip() for name in skip_logs[0].rsplit(": ", 1)[1].split(",")}
+        assert {"lm_head", "action_modality_embed"} <= skipped_families
+
     def test_unconsumed_mapped_tensor_warns(self, monkeypatch):
         """A checkpoint tensor that remaps to a module the recipe didn't
         construct must warn, not vanish: Edge has no und norm_q, and a
@@ -1060,8 +1082,8 @@ DIFFUSERS_COND_TOKEN_GOLDEN = [
 # as the positive branch), which diverges from diffusers' inverse templates —
 # so this is a self-golden recorded from this code path on the real Edge
 # tokenizer (empty negative prompt, num_frames=93, height=480, width=832,
-# fps=24.0, system prompt off). Cross-checking against cosmos-framework's own
-# tokenization is part of the backburnered goldens item.
+# fps=24.0, system prompt off). Not yet cross-checked against
+# cosmos-framework's own tokenization.
 UNCOND_TOKEN_GOLDEN = [
     1010,
     10,

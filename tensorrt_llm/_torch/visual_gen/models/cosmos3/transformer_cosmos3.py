@@ -1394,15 +1394,16 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         for key, value in weights.items():
             k = key
 
-            if k.startswith(skip_prefixes):
-                skipped_keys.append(key)
-                continue
-
-            # Normalize a leading "model." prefix up front so every remap below
-            # matches whether or not the checkpoint namespaces top-level tensors
-            # (e.g. "model.audio_proj_in.weight") under "model.".
+            # Normalize a leading "model." prefix up front so every skip and
+            # remap below matches whether or not the checkpoint namespaces
+            # top-level tensors (e.g. "model.audio_proj_in.weight") under
+            # "model.".
             if k.startswith("model."):
                 k = k[len("model.") :]
+
+            if k.startswith(skip_prefixes):
+                skipped_keys.append(k)
+                continue
 
             if k.startswith("proj_in."):
                 remapped[k.replace("proj_in.", "vae2llm.", 1)] = value
@@ -1438,7 +1439,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             # Und final norm: normalizes the und hidden state consumed only by
             # lm_head; the generation path uses per-layer und K/V exclusively.
             if k.startswith("norm."):
-                skipped_keys.append(key)
+                skipped_keys.append(k)
                 continue
 
             # norm_moe_gen stays at top level
