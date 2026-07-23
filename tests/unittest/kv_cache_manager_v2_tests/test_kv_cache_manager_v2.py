@@ -1989,6 +1989,89 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.resume(stream)
         kv_cache.close()
 
+    @parameterized.expand(
+        [
+            ("miss", None, 48, False, (1, 0, 1, 0, 48, 0, 0)),
+            ("aligned_hit", 32, 48, False, (1, 1, 0, 32, 16, 1, 0)),
+            ("unaligned_hit", 48, 64, True, (1, 1, 0, 48, 16, 0, 1)),
+        ]
+    )
+    def test_ssm_snapshot_iteration_stats(
+        self,
+        _name: str,
+        snapshot_length: int | None,
+        lookup_length: int,
+        enable_partial_reuse: bool,
+        expected: tuple[int, int, int, int, int, int, int],
+    ) -> None:
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(
+            tokens_per_block=tokens_per_block,
+            enable_partial_reuse=enable_partial_reuse,
+        )
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(lookup_length)]
+
+        if snapshot_length is not None:
+            seed = self.manager.create_kv_cache()
+            seed.resume(stream)
+            seed.capacity = snapshot_length
+            seed.history_length = snapshot_length
+            seed.commit(prompt[:snapshot_length], is_end=True)
+            seed.close()
+
+        reused = self.manager.create_kv_cache(
+            input_tokens=prompt,
+            id=101,
+            # This is only a sizing hint; lookup telemetry must use the
+            # actual input_tokens length.
+            expected_prompt_length=lookup_length + 17,
+        )
+        self.assertEqual(reused.num_committed_tokens, expected[3])
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), {101})
+        reused.commit_pending_stats()
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), set())
+
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_life_cycle_id = self.manager._life_cycles.ssm_life_cycle_id
+        snapshot_stats = self.manager.get_and_reset_ssm_snapshot_iteration_stats()
+        self.assertEqual(set(snapshot_stats), {ssm_life_cycle_id})
+        stats = snapshot_stats[ssm_life_cycle_id]
+        self.assertEqual(
+            (
+                stats.iter_snapshot_lookups,
+                stats.iter_snapshot_hits,
+                stats.iter_snapshot_misses,
+                stats.iter_reused_tokens,
+                stats.iter_unreused_tokens,
+                stats.iter_aligned_snapshot_hits,
+                stats.iter_unaligned_snapshot_hits,
+            ),
+            expected,
+        )
+        self.assertEqual(stats.iter_snapshot_hit_rate, expected[1] / expected[0])
+        self.assertEqual(self.manager.get_and_reset_ssm_snapshot_iteration_stats(), {})
+
+        reused.resume(stream)
+        reused.close()
+
+    def test_discard_ssm_snapshot_stats_clears_dirty_state(self) -> None:
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        tokens = [self.next_token() for _ in range(16)]
+
+        kv_cache = self.manager.create_kv_cache(input_tokens=tokens, id=101)
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), {101})
+        kv_cache.discard_pending_stats()
+
+        self.assertEqual(self.manager.get_dirty_stats_kv_cache_ids(), set())
+        self.assertEqual(self.manager.get_and_reset_ssm_snapshot_iteration_stats(), {})
+        stream_holder = CachedCudaStream()
+        kv_cache.resume(cast(CudaStream, stream_holder.handle))
+        kv_cache.close()
+
     def test_ssm(self) -> None:
         """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""
         cfg = self._make_ssm_config()

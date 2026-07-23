@@ -86,6 +86,8 @@ from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
     KVCacheV2PoolGroupIterationStats,
+    KVCacheV2SsmLifeCycleIterationStats,
+    KVCacheV2SsmSnapshotIterationStats,
 )
 from .llm_request import LlmRequest, LlmRequestState, SamplingConfig, get_draft_token_length
 from .resource_manager import (
@@ -2799,7 +2801,7 @@ class KVCacheManagerV2(BaseResourceManager):
             ),
         )
 
-    def _build_life_cycle_iteration_stats(
+    def _build_attention_life_cycle_iteration_stats(
         self,
         life_cycle_id: int,
         life_cycle_metadata,
@@ -2810,6 +2812,7 @@ class KVCacheManagerV2(BaseResourceManager):
         reuse_delta,
     ) -> KVCacheV2LifeCycleIterationStats:
         pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
+        assert kind == "attention"
         return KVCacheV2LifeCycleIterationStats(
             life_cycle_id=life_cycle_id,
             pool_group_id=pool_group_id,
@@ -2823,6 +2826,29 @@ class KVCacheManagerV2(BaseResourceManager):
                 secondary_peak_stats_by_level,
                 reuse_delta,
                 KV_CACHE_ITERATION_STATS_REUSE_FIELDS,
+            ),
+        )
+
+    @staticmethod
+    def _build_ssm_life_cycle_iteration_stats(
+        life_cycle_id: int,
+        life_cycle_metadata,
+        snapshot_delta,
+    ) -> KVCacheV2SsmLifeCycleIterationStats:
+        pool_group_id, window_size, kind = life_cycle_metadata[life_cycle_id]
+        assert kind == "ssm"
+        assert window_size is None
+        return KVCacheV2SsmLifeCycleIterationStats(
+            life_cycle_id=life_cycle_id,
+            pool_group_id=pool_group_id,
+            snapshot_stats=KVCacheV2SsmSnapshotIterationStats(
+                iter_snapshot_lookups=snapshot_delta.iter_snapshot_lookups,
+                iter_snapshot_hits=snapshot_delta.iter_snapshot_hits,
+                iter_snapshot_misses=snapshot_delta.iter_snapshot_misses,
+                iter_reused_tokens=snapshot_delta.iter_reused_tokens,
+                iter_unreused_tokens=snapshot_delta.iter_unreused_tokens,
+                iter_aligned_snapshot_hits=snapshot_delta.iter_aligned_snapshot_hits,
+                iter_unaligned_snapshot_hits=snapshot_delta.iter_unaligned_snapshot_hits,
             ),
         )
 
@@ -2874,6 +2900,7 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_groups_by_window = self._storage_pool_groups_by_window()
         windows_by_pool_group = self._windows_by_pool_group(pool_groups_by_window)
         raw_iteration_stats = self.impl.get_and_reset_iteration_stats()
+        raw_ssm_snapshot_iteration_stats = self.impl.get_and_reset_ssm_snapshot_iteration_stats()
         primary_peak_stats = self._get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
         num_cache_levels = len(self.impl.cache_tier_list)
         secondary_peak_stats_by_level = [
@@ -2928,7 +2955,7 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         stats_by_life_cycle = {
-            life_cycle_id: self._build_life_cycle_iteration_stats(
+            life_cycle_id: self._build_attention_life_cycle_iteration_stats(
                 life_cycle_id,
                 life_cycle_metadata,
                 primary_stats,
@@ -2939,6 +2966,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             for life_cycle_id, reuse_delta in sorted(reuse_deltas_by_life_cycle.items())
         }
+        for life_cycle_id, snapshot_delta in sorted(raw_ssm_snapshot_iteration_stats.items()):
+            assert int(life_cycle_id) not in stats_by_life_cycle
+            stats_by_life_cycle[int(life_cycle_id)] = self._build_ssm_life_cycle_iteration_stats(
+                int(life_cycle_id),
+                life_cycle_metadata,
+                snapshot_delta,
+            )
+        stats_by_life_cycle = dict(sorted(stats_by_life_cycle.items()))
 
         return KVCacheV2IterationStatsReport(
             stats_by_window, stats_by_pool_group, stats_by_life_cycle

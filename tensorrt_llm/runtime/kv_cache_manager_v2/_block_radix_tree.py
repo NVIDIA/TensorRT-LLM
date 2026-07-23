@@ -67,6 +67,7 @@ class ReuseMatch(NamedTuple):
 
     blocks: list["Block"]
     num_tokens: int
+    num_lookup_tokens: int
 
 
 # id_offset is usually vocab_size
@@ -678,7 +679,11 @@ class BlockRadixTree:
         matched = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
-        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+        return ReuseMatch(
+            [block for block, _ in matched],
+            self._num_matched_tokens(matched),
+            len(tokens),
+        )
 
     def _check_sanity(self) -> bool:
         raise NotImplementedError(

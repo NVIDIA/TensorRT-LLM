@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 from .._common import BlockOrdinal
 from .._life_cycle_registry import LifeCycleId
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
+from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
 
 
 @dataclass(slots=True)
@@ -49,6 +49,9 @@ class _PendingStats:
     iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta] = field(
         default_factory=dict
     )
+    ssm_snapshot_iteration_stats_by_life_cycle: dict[
+        LifeCycleId, SsmSnapshotIterationStatsDelta
+    ] = field(default_factory=dict)
     allocation_segments: list[_PendingAllocationSegment] = field(default_factory=list)
 
     @property
@@ -57,12 +60,14 @@ class _PendingStats:
             self.request_stats.empty
             and self.global_stats.empty
             and not self.iteration_stats_by_life_cycle
+            and not self.ssm_snapshot_iteration_stats_by_life_cycle
         )
 
     def clear(self) -> None:
         self.request_stats.clear()
         self.global_stats.clear()
         self.iteration_stats_by_life_cycle.clear()
+        self.ssm_snapshot_iteration_stats_by_life_cycle.clear()
         self.allocation_segments.clear()
 
     def add(self, delta: _PendingStatsDelta) -> bool:
@@ -164,6 +169,39 @@ class _PendingStats:
                 life_cycle=life_cycle,
             )
         )
+
+    def record_ssm_snapshot_lookup(
+        self,
+        life_cycle: LifeCycleId,
+        *,
+        lookup_tokens: int,
+        reused_tokens: int,
+        tokens_per_block: int,
+    ) -> bool:
+        if lookup_tokens == 0:
+            return False
+        assert lookup_tokens > 0
+        assert 0 <= reused_tokens <= lookup_tokens
+        assert tokens_per_block > 0
+
+        is_hit = reused_tokens > 0
+        # Alignment describes the reusable snapshot boundary, not whether the
+        # state itself is complete. Every hit represents one complete SSM
+        # snapshot; token counters carry the benefit of that single lookup.
+        delta = SsmSnapshotIterationStatsDelta(
+            iter_snapshot_lookups=1,
+            iter_snapshot_hits=int(is_hit),
+            iter_snapshot_misses=int(not is_hit),
+            iter_reused_tokens=reused_tokens,
+            iter_unreused_tokens=lookup_tokens - reused_tokens,
+            iter_aligned_snapshot_hits=int(is_hit and reused_tokens % tokens_per_block == 0),
+            iter_unaligned_snapshot_hits=int(is_hit and reused_tokens % tokens_per_block != 0),
+        )
+        pending = self.ssm_snapshot_iteration_stats_by_life_cycle.setdefault(
+            life_cycle, SsmSnapshotIterationStatsDelta()
+        )
+        pending.add(delta)
+        return True
 
     def subtract_allocation_range(self, block_begin: BlockOrdinal, block_end: BlockOrdinal) -> bool:
         if block_begin >= block_end or not self.allocation_segments:

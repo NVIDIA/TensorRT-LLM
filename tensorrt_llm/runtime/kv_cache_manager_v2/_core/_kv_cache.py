@@ -412,6 +412,9 @@ class _KVCache:
         self.manager.commit_stats(
             self._pending_stats.global_stats, self._pending_stats.iteration_stats_by_life_cycle
         )
+        self.manager._commit_ssm_snapshot_iteration_stats(
+            self._pending_stats.ssm_snapshot_iteration_stats_by_life_cycle
+        )
         request_stats = self._pending_stats.request_stats.copy()
         self._pending_stats.clear()
         self.manager.clear_stats_dirty(self.id)
@@ -2081,6 +2084,15 @@ class _KVCache:
             )
             snapshot_holder = unwrap_rawref(snapshot_ref).hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        if should_record_stats and ssm_lc_id is not None:
+            changed = self._pending_stats.record_ssm_snapshot_lookup(
+                ssm_lc_id,
+                lookup_tokens=match.num_lookup_tokens,
+                reused_tokens=num_tokens,
+                tokens_per_block=tokens_per_block,
+            )
+            if changed:
+                self.manager.mark_stats_dirty(self.id)
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:

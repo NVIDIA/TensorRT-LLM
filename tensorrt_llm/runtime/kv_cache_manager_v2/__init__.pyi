@@ -93,6 +93,18 @@ class KVCacheIterationStatsDelta:
     iter_host_dropped_blocks: int = 0
     iter_host_dropped_bytes: int = 0
 
+@dataclass(slots=True)
+class SsmSnapshotIterationStatsDelta:
+    iter_snapshot_lookups: int = 0
+    iter_snapshot_hits: int = 0
+    iter_snapshot_misses: int = 0
+    iter_reused_tokens: int = 0
+    iter_unreused_tokens: int = 0
+    iter_aligned_snapshot_hits: int = 0
+    iter_unaligned_snapshot_hits: int = 0
+    @property
+    def iter_snapshot_hit_rate(self) -> float: ...
+
 @dataclass(slots=True, frozen=True)
 class PoolGroupPeakBlockStats:
     available: int
@@ -486,6 +498,9 @@ class KVCacheManager:
     def get_quota(self, cache_level: CacheLevel) -> int: ...
     def get_committed_stats(self) -> KVCacheStatsDelta: ...
     def get_and_reset_iteration_stats(self) -> dict[LifeCycleId, KVCacheIterationStatsDelta]: ...
+    def get_and_reset_ssm_snapshot_iteration_stats(
+        self,
+    ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]: ...
     def get_and_reset_iteration_peak_block_stats(
         self, cache_level: CacheLevel
     ) -> Sequence[PoolGroupPeakBlockStats]: ...

@@ -39,7 +39,7 @@ from .._common import (
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
-from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
+from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, SsmSnapshotIterationStatsDelta
 from .._storage._config import BufferId, SlotDesc, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
@@ -212,6 +212,7 @@ class KVCacheManager:
         "_stats_enabled",
         "_committed_stats",
         "_iteration_stats_by_life_cycle",
+        "_ssm_snapshot_iteration_stats_by_life_cycle",
         "_iteration_peak_num_blocks_by_cache_level",
         "_dirty_stats_kv_cache_ids",
         "_stats_excluded_kv_cache_ids",
@@ -241,6 +242,7 @@ class KVCacheManager:
     _stats_enabled: bool
     _committed_stats: KVCacheStatsDelta
     _iteration_stats_by_life_cycle: dict[LifeCycleId, KVCacheIterationStatsDelta]
+    _ssm_snapshot_iteration_stats_by_life_cycle: dict[LifeCycleId, SsmSnapshotIterationStatsDelta]
     _iteration_peak_num_blocks_by_cache_level: TypedIndexList[
         CacheLevel, TypedIndexList[PoolGroupIndex, PoolGroupPeakBlockStats]
     ]
@@ -284,6 +286,7 @@ class KVCacheManager:
         self._stats_enabled = config.enable_stats
         self._committed_stats = KVCacheStatsDelta()
         self._iteration_stats_by_life_cycle = {}
+        self._ssm_snapshot_iteration_stats_by_life_cycle = {}
         self._reset_iteration_peak_num_blocks()
         self._dirty_stats_kv_cache_ids = set()
         self._stats_excluded_kv_cache_ids = set()
@@ -537,6 +540,31 @@ class KVCacheManager:
             if not delta.empty
         }
         self._iteration_stats_by_life_cycle.clear()
+        return stats
+
+    def _commit_ssm_snapshot_iteration_stats(
+        self,
+        iteration_stats_by_life_cycle: dict[LifeCycleId, SsmSnapshotIterationStatsDelta],
+    ) -> None:
+        if not self._stats_enabled:
+            return
+        for life_cycle, iteration_stats in iteration_stats_by_life_cycle.items():
+            if iteration_stats.empty:
+                continue
+            destination = self._ssm_snapshot_iteration_stats_by_life_cycle.setdefault(
+                life_cycle, SsmSnapshotIterationStatsDelta()
+            )
+            destination.add(iteration_stats)
+
+    def get_and_reset_ssm_snapshot_iteration_stats(
+        self,
+    ) -> dict[LifeCycleId, SsmSnapshotIterationStatsDelta]:
+        stats = {
+            life_cycle: delta.copy()
+            for life_cycle, delta in self._ssm_snapshot_iteration_stats_by_life_cycle.items()
+            if not delta.empty
+        }
+        self._ssm_snapshot_iteration_stats_by_life_cycle.clear()
         return stats
 
     def get_and_reset_iteration_peak_block_stats(
