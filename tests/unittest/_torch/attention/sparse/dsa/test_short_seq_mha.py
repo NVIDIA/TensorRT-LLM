@@ -455,6 +455,7 @@ def test_threshold_zero_disables_mha():
 
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
+@torch.inference_mode()
 def test_standard_path_when_exceeds_threshold():
     """When total tokens > threshold, the standard absorption path is used."""
     device = torch.device("cuda")
@@ -483,6 +484,7 @@ def test_standard_path_when_exceeds_threshold():
 
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
+@torch.inference_mode()
 def test_agrees_with_absorption_path():
     """Short MHA and absorption paths produce numerically close results."""
     device = torch.device("cuda")
