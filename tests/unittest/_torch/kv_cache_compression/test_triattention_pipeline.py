@@ -33,11 +33,11 @@ import pytest
 import torch
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_bare_staging as _make_bare_staging
+from conftest import make_buffer_stubs as _make_buffer_stubs
 from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_request as _make_request
 from conftest import make_staging_manager as _make_staging_manager
 from conftest import make_triattention as _make_triattention
-from conftest import make_workspace_stubs as _make_workspace_stubs
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
 from conftest import torch_tri_score_oracle as _torch_tri_score_oracle
 from pydantic import ValidationError
@@ -432,17 +432,17 @@ class TestEvictionLifecycle:
             evicted_tokens=127,
             confirmed_kv_length=128,
         )
-        workspace = object()
-        manager._workspace = workspace
+        buffers = object()
+        manager._buffers = buffers
         manager._prepared_generation_batch = (SimpleNamespace(), {7: 1})
 
         manager.on_request_finish(_make_request(7))
 
         assert manager._request_states == {}
         assert manager._prepared_generation_batch[1] == {}
-        # The workspace is sized for the executor limits, not one cohort, so
-        # it stays resident for the next generation batch.
-        assert manager._workspace is workspace
+        # The buffers are sized for the executor limits, not one cohort, so
+        # they stay resident for the next generation batch.
+        assert manager._buffers is buffers
 
     @pytest.mark.parametrize("accepted", [0, 1, 2, 3])
     def test_overlap_tail_is_excluded_from_selection_and_compacted(self, accepted):
@@ -597,16 +597,16 @@ class TestFixedScoreMetadata:
         with pytest.raises(ValueError, match="normalize_scores=True"):
             _make_triattention(budget=4, eviction_mode="union", normalize_scores=False)
 
-    def test_workspace_build_receives_mode_and_capacity_kwargs(self):
+    def test_buffer_build_receives_mode_and_capacity_kwargs(self):
         # Mode/phase/pool-key threading and cached reuse are covered by the
-        # workspace-rebuild superset test in
+        # buffer-rebuild superset test in
         # test_triattention_draft_cocompaction.py.
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
         manager = _make_triattention(budget=4)
-        # The workspace follows the executor limits: eight requests (max batch
+        # The buffers follow the executor limits: eight requests (max batch
         # size) by 260 decode tokens (budget plus two eviction periods).
-        layout, workspace = _make_workspace_stubs(manager)
+        layout, buffers = _make_buffer_stubs(manager)
         prepared = [
             _prepared_eviction(
                 _make_request(7),
@@ -618,13 +618,13 @@ class TestFixedScoreMetadata:
 
         with mock.patch.object(
             module,
-            "prepare_eviction_workspace",
-            return_value=workspace,
-        ) as build_workspace:
-            resources = manager._workspace_for(layout, prepared)
+            "init_eviction_buffers",
+            return_value=buffers,
+        ) as build_buffers:
+            resources = manager._buffers_for(layout, prepared)
 
-        assert resources is workspace
-        kwargs = build_workspace.call_args.kwargs
+        assert resources is buffers
+        kwargs = build_buffers.call_args.kwargs
         assert kwargs["eviction_mode"] == "union"
         assert kwargs["max_requests"] == 8
         assert kwargs["decode_width"] == 260
@@ -790,7 +790,7 @@ class TestFixedScoreMetadata:
         # per-request moves are keep + tail = [6, 7]; padded rows repeat the
         # final offset out to the request capacity.
         args = internals.stage.call_args
-        assert args.args[0] is internals.workspace
+        assert args.args[0] is internals.buffers
         assert args.args[1] is manager.kv_cache_manager
         assert args.args[2:6] == ([7, 8], [8, 10], [3, 5], [8, 10])
         assert args.kwargs["draft_manager"] is None
@@ -798,7 +798,7 @@ class TestFixedScoreMetadata:
         assert args.kwargs["swa_move_offsets"] is None
         assert args.kwargs["draft_move_offsets"] is None
         internals.consumed.assert_called_once_with(
-            internals.workspace, manager.kv_cache_manager._stream
+            internals.buffers, manager.kv_cache_manager._stream
         )
 
     @requires_sm100
@@ -861,7 +861,7 @@ class TestFixedScoreMetadata:
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
         # One group per layer: slot i holds layer i's own block table.
-        ws = module.prepare_eviction_workspace(
+        bufs = module.init_eviction_buffers(
             eviction_mode="per_head",
             layer_pools=pools,
             dense_groups=[[layer] for layer in layer_order],
@@ -887,18 +887,22 @@ class TestFixedScoreMetadata:
         def stage_round():
             # Stage the round metadata straight into the fixed device rows
             # (the cohort staging path is covered by the staging test above).
-            ws.round_starts_device.copy_(round_device)
-            ws.valid_seq_lens_device[:request_count].copy_(valid_seq_lens)
-            ws.token_starts_device.fill_(prompt_len)
-            ws.block_offsets_device[:, :, :, :page_count].copy_(_encode_block_offsets(page_ids_3d))
+            bufs.round_starts_device.copy_(round_device)
+            bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens)
+            bufs.token_starts_device.fill_(prompt_len)
+            bufs.block_offsets_device[:, :, :, :page_count].copy_(
+                _encode_block_offsets(page_ids_3d)
+            )
 
         score_sentinel = -12345.0
+        # Isolate the score stage: an empty family list makes the compact
+        # stage a no-op (this synthetic round never stages move offsets).
+        bufs.compaction_families = []
         stage_round()
-        ws.score_output.fill_(score_sentinel)
-        with mock.patch.object(module, "run_cache_compactions"):
-            module.run_eviction_round(ws, normalize_scores=False)
-        fixed = ws.score_output.clone()
-        assert ws.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
+        bufs.score_output.fill_(score_sentinel)
+        module.run_eviction_round(bufs, normalize_scores=False)
+        fixed = bufs.score_output.clone()
+        assert bufs.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
         # The deployed fused score must agree with the independent Torch oracle
         # when every layer owns a distinct V2 block table.
@@ -935,12 +939,11 @@ class TestFixedScoreMetadata:
         )
         expected_second_widths = valid_seq_lens - prompt_len
         stage_round()
-        ws.score_output.fill_(score_sentinel)
-        ws.valid_widths.fill_(-1)
-        with mock.patch.object(module, "run_cache_compactions"):
-            module.run_eviction_round(ws, normalize_scores=False)
-        second_launch = ws.score_output.clone()
-        assert torch.equal(ws.valid_widths, expected_second_widths)
+        bufs.score_output.fill_(score_sentinel)
+        bufs.valid_widths.fill_(-1)
+        module.run_eviction_round(bufs, normalize_scores=False)
+        second_launch = bufs.score_output.clone()
+        assert torch.equal(bufs.valid_widths, expected_second_widths)
         assert not torch.equal(second_launch, fixed)
 
 

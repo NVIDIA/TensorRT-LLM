@@ -155,7 +155,7 @@ class _TriAttentionNormalizeUnionKernel:
         self,
         partial_stats: cute.Tensor,
         scores: cute.Tensor,
-        seg_seq_len: cute.Tensor,
+        valid_seq_lens: cute.Tensor,
         seg_out_offset: cute.Tensor,
         token_starts: cute.Tensor,
         union_scores: cute.Tensor,
@@ -165,7 +165,7 @@ class _TriAttentionNormalizeUnionKernel:
         kernel = self.kernel(
             partial_stats,
             scores,
-            seg_seq_len,
+            valid_seq_lens,
             seg_out_offset,
             token_starts,
             union_scores,
@@ -194,7 +194,7 @@ class _TriAttentionNormalizeUnionKernel:
         self,
         partial_stats: cute.Tensor,
         scores: cute.Tensor,
-        seg_seq_len: cute.Tensor,
+        valid_seq_lens: cute.Tensor,
         seg_out_offset: cute.Tensor,
         token_starts: cute.Tensor,
         union_scores: cute.Tensor,
@@ -218,7 +218,7 @@ class _TriAttentionNormalizeUnionKernel:
         # Per-request score window start: the normalization domain and the
         # union output row both cover [0, valid - start) for this request.
         score_start = cutlass.Int32(token_starts[request_idx])
-        valid_width = seg_seq_len[first_segment] - score_start
+        valid_width = valid_seq_lens[request_idx] - score_start
         warp_max_ptr = cute.arch.alloc_smem(
             cutlass.Float32,
             self.reduce_threads * self.tokens_per_lane * self.token_subtiles,

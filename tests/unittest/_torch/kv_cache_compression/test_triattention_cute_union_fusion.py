@@ -3,7 +3,7 @@
 """Equivalence coverage for the fused score+stats+union pipeline (two CuTe kernels).
 
 The reference side gathers the SAME production score rows (the fused pack's
-score-only entry, which every workspace runner compiles) and normalizes +
+score-only entry, which every buffer-namespace runner compiles) and normalizes +
 union-reduces them with a pure-torch float32 oracle. The fused-vs-reference
 comparison was always tolerance-based (the fused pipeline's reduction order
 differs from any reference); the tolerances are unchanged from the retired
@@ -19,7 +19,7 @@ _SM100_ONLY = pytest.mark.skipif(
 )
 
 
-def _make_union_workspace(
+def _make_union_buffers(
     *,
     layer_pools,
     max_requests,
@@ -33,17 +33,17 @@ def _make_union_workspace(
     offsets,
     decode_width=None,
 ):
-    """A union-mode workspace over one shared page-table slot.
+    """Union-mode buffers over one shared page-table slot.
 
-    The union runner also compiles the score-only entries, so one workspace
-    serves both the fused pipeline and the split reference leg.
+    The union runner also compiles the score-only entries, so one buffer
+    namespace serves both the fused pipeline and the split reference leg.
     """
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        prepare_eviction_workspace,
+        init_eviction_buffers,
     )
 
     num_layers = len(layer_pools)
-    return prepare_eviction_workspace(
+    return init_eviction_buffers(
         eviction_mode="union",
         layer_pools=layer_pools,
         dense_groups=[list(range(num_layers))],
@@ -66,69 +66,78 @@ def _make_union_workspace(
     )
 
 
-def _write_block_offsets(ws, encoded):
-    """Load a test page table into the workspace's staged block-offset plane."""
-    ws.block_offsets_device.zero_()
-    ws.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
+def _write_block_offsets(bufs, encoded):
+    """Load a test page table into the staged block-offset plane."""
+    bufs.block_offsets_device.zero_()
+    bufs.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
 
 
-def _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts):
-    """Stage the per-round score metadata exactly like ``run_eviction_round``."""
-    num_segments = request_count * ws.num_layers
+def _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts):
+    """Stage the per-round score metadata exactly like production.
+
+    The compiled runner reads valid lengths and window starts straight from
+    the staged metadata rows (pointer capture), so stage them like
+    ``stage_eviction_cohort`` does; the width subtraction mirrors what the
+    production phase-gather launch derives on device.
+    """
     torch.sub(
         valid_seq_lens[:request_count],
         token_starts[:request_count],
         out=valid_widths[:request_count],
     )
-    torch.index_select(
-        valid_seq_lens, 0, ws.seg_req[:num_segments], out=ws.seg_seq_len[:num_segments]
-    )
-    ws.cute_token_starts[:request_count].copy_(token_starts[:request_count])
+    bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
+    bufs.token_starts_device[:request_count].copy_(token_starts[:request_count])
 
 
 def _launch_split_scores(
-    ws, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
+    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
 ):
     """The production score-only leg plus the decode-window gather."""
-    _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts)
-    assert request_count in ws.runner._compiled
-    ws.runner.launch(request_count, mean_cos, mean_sin)
-    num_segments = request_count * ws.num_layers
-    group_size = ws.num_q_heads // ws.num_kv_heads
+    _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
+    assert request_count in bufs.runner._compiled
+    bufs.runner.launch(request_count, mean_cos, mean_sin)
+    num_segments = request_count * bufs.num_layers
+    group_size = bufs.num_q_heads // bufs.num_kv_heads
     source = (
-        ws.cute_scratch[: ws.num_kv_heads * 8 * num_segments * ws.bucket_seq_len]
-        .view(ws.num_kv_heads, 8, request_count, ws.num_layers, ws.bucket_seq_len)[:, :group_size]
+        bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
+        .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
+            :, :group_size
+        ]
         .permute(2, 3, 0, 1, 4)
     )
-    columns = token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + ws.gather_columns
-    columns = columns.clamp_(max=ws.bucket_seq_len - 1).expand(
-        request_count, ws.num_layers, ws.num_kv_heads, group_size, ws.decode_width
+    columns = (
+        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + bufs.gather_columns
+    )
+    columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
+        request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
     )
     output = torch.full(
-        (request_count, ws.num_layers, ws.num_q_heads, ws.decode_width),
+        (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
         float("nan"),
         dtype=torch.float32,
-        device=ws.device,
+        device=bufs.device,
     )
     torch.gather(
         source,
         4,
         columns,
-        out=output.view(request_count, ws.num_layers, ws.num_kv_heads, group_size, ws.decode_width),
+        out=output.view(
+            request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
+        ),
     )
     return output
 
 
 def _launch_union_fusion(
-    ws, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
+    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin, union_out
 ):
     """The fused score+stats+normalized-union pipeline (THE union path)."""
-    _stage_score_metadata(ws, request_count, valid_seq_lens, valid_widths, token_starts)
+    _stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts)
     assert (
-        request_count in ws.runner._compiled_stats
-        and request_count in ws.runner._compiled_normalize_union
+        request_count in bufs.runner._compiled_stats
+        and request_count in bufs.runner._compiled_normalize_union
     )
-    ws.runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_out[:request_count])
+    bufs.runner.launch_union_fusion(request_count, mean_cos, mean_sin, union_out[:request_count])
 
 
 def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:
@@ -193,7 +202,7 @@ def _check_union_fusion_matches_split_pipeline(
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
-    ws = _make_union_workspace(
+    bufs = _make_union_buffers(
         layer_pools=[pool],
         max_requests=2,
         seq_len=seq_len,
@@ -208,7 +217,7 @@ def _check_union_fusion_matches_split_pipeline(
     k_plane = [2 * page for page in page_permutation]
     v_plane = [2 * page + 1 for page in page_permutation]
     _write_block_offsets(
-        ws,
+        bufs,
         torch.tensor([[[k_plane, v_plane], [k_plane, v_plane]]], dtype=torch.int32, device=device),
     )
     if valid_lens is None:
@@ -224,7 +233,7 @@ def _check_union_fusion_matches_split_pipeline(
     split_widths = torch.empty(request_count, dtype=torch.int32, device=device)
     token_starts = torch.tensor(score_starts, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
-        ws,
+        bufs,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -241,7 +250,7 @@ def _check_union_fusion_matches_split_pipeline(
         (request_count, seq_len), float("nan"), dtype=torch.float32, device=device
     )
     _launch_union_fusion(
-        ws,
+        bufs,
         request_count,
         valid_seq_lens,
         fused_widths,
@@ -393,7 +402,7 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
 
-    ws = _make_union_workspace(
+    bufs = _make_union_buffers(
         layer_pools=layer_pools,
         max_requests=max_requests,
         seq_len=seq_len,
@@ -406,11 +415,11 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         offsets=offsets,
         decode_width=decode_window,
     )
-    assert (ws.cute_scratch.numel() > 2**31) == (max_requests == 64)
+    assert (bufs.cute_scratch.numel() > 2**31) == (max_requests == 64)
     page_ids = torch.arange(num_pages, dtype=torch.int32, device=device)
-    ws.block_offsets_device.zero_()
-    ws.block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
-    ws.block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
+    bufs.block_offsets_device.zero_()
+    bufs.block_offsets_device[0, :request_count, 0, :num_pages] = 2 * page_ids
+    bufs.block_offsets_device[0, :request_count, 1, :num_pages] = 2 * page_ids + 1
 
     valid_seq_lens = torch.zeros(max_requests, dtype=torch.int32, device=device)
     token_starts = torch.zeros(max_requests, dtype=torch.int32, device=device)
@@ -421,7 +430,7 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
     # the pure-torch union oracle.
     split_widths = torch.zeros(max_requests, dtype=torch.int32, device=device)
     per_head = _launch_split_scores(
-        ws,
+        bufs,
         request_count,
         valid_seq_lens,
         split_widths,
@@ -439,7 +448,7 @@ def test_union_fusion_giant_scratch_unaligned_start(max_requests: int) -> None:
         (max_requests, seq_len), float("nan"), dtype=torch.float32, device=device
     )
     _launch_union_fusion(
-        ws,
+        bufs,
         max_requests,
         valid_seq_lens,
         fused_widths,

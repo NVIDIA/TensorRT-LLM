@@ -236,7 +236,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         seg_page_off: cute.Tensor,
         seg_req_id: cute.Tensor,
         seg_layer_id: cute.Tensor,
-        seg_seq_len: cute.Tensor,
+        valid_seq_lens: cute.Tensor,
         seg_out_offset: cute.Tensor,
         token_starts: cute.Tensor,
         q_real: cute.Tensor,
@@ -411,7 +411,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
             seg_page_off,
             seg_req_id,
             seg_layer_id,
-            seg_seq_len,
+            valid_seq_lens,
             seg_out_offset,
             token_starts,
             q_real,
@@ -447,7 +447,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         seg_page_off: cute.Tensor,
         seg_req_id: cute.Tensor,
         seg_layer_id: cute.Tensor,
-        seg_seq_len: cute.Tensor,
+        valid_seq_lens: cute.Tensor,
         seg_out_offset: cute.Tensor,
         token_starts: cute.Tensor,
         q_real: cute.Tensor,
@@ -475,7 +475,7 @@ class _TriAttentionScoreKernel(_TriScoreEpilogue):
         kv_head = task % self.num_kv_heads
         req_id = seg_req_id[segment]
         layer_id = seg_layer_id[segment]
-        valid_seq_len = seg_seq_len[segment]
+        valid_seq_len = valid_seq_lens[req_id]
         page_off = seg_page_off[segment]
         out_base = seg_out_offset[segment]
         # Per-request score window start (the request's pinned prompt
@@ -1529,7 +1529,7 @@ class TriAttentionCuteScoreRunner:
         seg_page_off: torch.Tensor,
         seg_req_id: torch.Tensor,
         seg_layer_id: torch.Tensor,
-        seg_seq_len: torch.Tensor,
+        valid_seq_lens: torch.Tensor,
         seg_out_offset: torch.Tensor,
         token_starts: torch.Tensor,
         q_real: torch.Tensor,
@@ -1569,7 +1569,7 @@ class TriAttentionCuteScoreRunner:
             seg_page_off,
             seg_req_id,
             seg_layer_id,
-            seg_seq_len,
+            valid_seq_lens,
             seg_out_offset,
             token_starts,
             q_real,
@@ -1583,7 +1583,14 @@ class TriAttentionCuteScoreRunner:
             layer_pools[layer_indices[0]],
             self.descriptors,
         )
-        self._cute_prefix = tuple(_to_cute(tensor) for tensor in self._torch_prefix)
+        # valid_seq_lens/token_starts are row views into the staged metadata
+        # table (byte offset 4*(max_requests+1)*row): only 4-byte aligned,
+        # and only ever read as per-CTA scalars.
+        prefix_aligns = (16, 16, 16, 16, 4, 16, 4, 16, 16, 16)
+        self._cute_prefix = tuple(
+            _to_cute(tensor, assumed_align=align)
+            for tensor, align in zip(self._torch_prefix, prefix_aligns)
+        )
         self._cute_tail = (
             _to_cute(freq_scale_sq),
             _to_cute(output),
@@ -1603,9 +1610,9 @@ class TriAttentionCuteScoreRunner:
         )
         self._cute_selection_prefix = (
             _to_cute(output),
-            _to_cute(seg_seq_len),
+            _to_cute(valid_seq_lens, assumed_align=4),
             _to_cute(seg_out_offset),
-            _to_cute(token_starts),
+            _to_cute(token_starts, assumed_align=4),
         )
         static_geometry = (
             max_requests,

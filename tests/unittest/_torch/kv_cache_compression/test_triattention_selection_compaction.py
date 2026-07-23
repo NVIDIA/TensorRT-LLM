@@ -9,12 +9,9 @@ import torch
 from conftest import build_compaction as _build_compaction
 from conftest import encode_block_offsets as _encode_block_offsets
 from conftest import make_ramp_pools as _make_ramp_pools
+from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-    launch_move_pack,
-    run_cache_compactions,
-)
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import settle_top_tokens
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
     prepare_per_head_scores,
@@ -36,7 +33,7 @@ requires_sm100 = pytest.mark.skipif(
 )
 
 
-def _make_selection_ws(
+def _make_selection_buffers(
     *,
     eviction_mode,
     width,
@@ -47,10 +44,10 @@ def _make_selection_ws(
     num_query_heads=1,
     num_kv_heads=1,
 ):
-    """Selection-only workspace: exactly the buffers the one prepare allocates
+    """Selection-only buffers: exactly what the one constructor allocates
     for the mode, without the CuTe score state or compaction (the settle's
     pack half is compiled away)."""
-    ws = SimpleNamespace(
+    bufs = SimpleNamespace(
         eviction_mode=eviction_mode,
         device=device,
         max_requests=max_requests,
@@ -61,54 +58,64 @@ def _make_selection_ws(
         num_kv_heads=num_kv_heads,
         stream=None,
     )
-    ws.valid_widths = torch.full((max_requests,), width, dtype=torch.int32, device=device)
-    ws.prompt_offsets = torch.zeros(max_requests, dtype=torch.int32, device=device)
+    bufs.valid_widths = torch.full((max_requests,), width, dtype=torch.int32, device=device)
+    bufs.prompt_offsets = torch.zeros(max_requests, dtype=torch.int32, device=device)
     if eviction_mode == "union":
-        ws.selection_rows_per_request = 1
-        ws.row_prompt_offsets = ws.prompt_offsets
-        ws.combined = torch.empty((max_requests, width), dtype=torch.float32, device=device)
+        bufs.selection_rows_per_request = 1
+        bufs.row_prompt_offsets = bufs.prompt_offsets
+        bufs.combined = torch.empty((max_requests, width), dtype=torch.float32, device=device)
         # Padded rows carry zero valid width; their provisional TopK entries
         # must still be in-range ordinals for the finalizer's score gather.
-        ws.final_indices = torch.zeros((max_requests, keep_count), dtype=torch.int32, device=device)
-        ws.keep = torch.empty((max_requests, keep_count), dtype=torch.int32, device=device)
-        ws.selection_scores_rows = ws.combined
-        ws.selection_row_lengths = ws.valid_widths
-        ws.provisional_rows = ws.final_indices
-        ws.keep_rows = ws.keep
+        bufs.final_indices = torch.zeros(
+            (max_requests, keep_count), dtype=torch.int32, device=device
+        )
+        bufs.keep = torch.empty((max_requests, keep_count), dtype=torch.int32, device=device)
+        bufs.selection_scores_rows = bufs.combined
+        bufs.selection_row_lengths = bufs.valid_widths
+        bufs.provisional_rows = bufs.final_indices
+        bufs.keep_rows = bufs.keep
     else:
         selection_rows = num_kv_heads if eviction_mode == "per_head" else num_layers * num_kv_heads
-        ws.selection_rows_per_request = selection_rows
-        ws.row_prompt_offsets = torch.zeros(
+        bufs.selection_rows_per_request = selection_rows
+        bufs.row_prompt_offsets = torch.zeros(
             max_requests * selection_rows, dtype=torch.int32, device=device
         )
-        ws.row_mean = torch.empty(
+        bufs.row_mean = torch.empty(
             max_requests, num_layers, num_query_heads, 1, dtype=torch.float32, device=device
         )
-        ws.row_std = torch.empty_like(ws.row_mean)
-        ws.selection_scores = torch.empty(
+        bufs.row_std = torch.empty_like(bufs.row_mean)
+        bufs.selection_scores = torch.empty(
             (max_requests, selection_rows, width), dtype=torch.float32, device=device
         )
-        ws.row_seq_lens = torch.full(
+        bufs.row_seq_lens = torch.full(
             (max_requests, selection_rows), width, dtype=torch.int32, device=device
         )
-        ws.top_indices_i32 = torch.zeros(
+        bufs.top_indices_i32 = torch.zeros(
             (max_requests, selection_rows, keep_count), dtype=torch.int32, device=device
         )
-        ws.keep = torch.empty(
+        bufs.keep = torch.empty(
             (max_requests, selection_rows, keep_count), dtype=torch.int32, device=device
         )
-        ws.selection_scores_rows = ws.selection_scores.view(max_requests * selection_rows, width)
-        ws.selection_row_lengths = ws.row_seq_lens.view(-1)
-        ws.provisional_rows = ws.top_indices_i32.view(-1, keep_count)
-        ws.keep_rows = ws.keep.view(-1, keep_count)
-    ws.settle_grid = (max_requests, ws.selection_rows_per_request)
+        bufs.selection_scores_rows = bufs.selection_scores.view(
+            max_requests * selection_rows, width
+        )
+        bufs.selection_row_lengths = bufs.row_seq_lens.view(-1)
+        bufs.provisional_rows = bufs.top_indices_i32.view(-1, keep_count)
+        bufs.keep_rows = bufs.keep.view(-1, keep_count)
+    bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
     # The settle launch always packs now; zero per-request move counts mask
-    # every pack store off, so these workspaces stay selection-only.
+    # every pack store off, so these buffers stay selection-only.
     zero_offsets = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
     zero_lengths = torch.zeros(max_requests, dtype=torch.int32, device=device)
     zero_indices = torch.zeros(1, dtype=torch.int32, device=device)
-    ws.settle_pack_tensors = (zero_lengths, zero_offsets, zero_indices, zero_offsets, zero_indices)
-    ws.settle_pack_shape = dict(
+    bufs.settle_pack_tensors = (
+        zero_lengths,
+        zero_offsets,
+        zero_indices,
+        zero_offsets,
+        zero_indices,
+    )
+    bufs.settle_pack_shape = dict(
         DENSE_TOTAL=0,
         SWA_TOTAL=0,
         MOVE_CAPACITY=keep_count,
@@ -118,24 +125,24 @@ def _make_selection_ws(
         PER_LAYER=False,
         HAS_SWA=False,
     )
-    return ws
+    return bufs
 
 
-def _select_per_head(ws, scores, *, normalize_scores):
+def _select_per_head(bufs, scores, *, normalize_scores):
     """The per-head selection flow: reduce kernels, then top-k settle."""
     prepare_per_head_scores(
         scores,
-        ws.valid_widths,
-        ws.row_mean,
-        ws.row_std,
-        ws.selection_scores,
-        ws.row_seq_lens,
-        ws.max_requests,
-        num_kv_heads=ws.num_kv_heads,
-        per_layer=ws.eviction_mode == "per_layer_perhead",
+        bufs.valid_widths,
+        bufs.row_mean,
+        bufs.row_std,
+        bufs.selection_scores,
+        bufs.row_seq_lens,
+        bufs.max_requests,
+        num_kv_heads=bufs.num_kv_heads,
+        per_layer=bufs.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
-    settle_top_tokens(ws)
+    settle_top_tokens(bufs)
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
@@ -205,7 +212,7 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
     device = torch.device("cuda", torch.cuda.current_device())
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
-        ws = _make_selection_ws(
+        bufs = _make_selection_buffers(
             eviction_mode=eviction_mode,
             width=width,
             keep_count=keep_count,
@@ -215,12 +222,12 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
             num_query_heads=query_heads,
             num_kv_heads=kv_heads,
         )
-        ws.valid_widths.copy_(valid_widths.to(device))
+        bufs.valid_widths.copy_(valid_widths.to(device))
         scores = scores_cpu.to(device)
-        _select_per_head(ws, scores, normalize_scores=normalize_scores)
-        first = ws.keep.cpu()
-        _select_per_head(ws, scores, normalize_scores=normalize_scores)
-        second = ws.keep.cpu()
+        _select_per_head(bufs, scores, normalize_scores=normalize_scores)
+        first = bufs.keep.cpu()
+        _select_per_head(bufs, scores, normalize_scores=normalize_scores)
+        second = bufs.keep.cpu()
     stream.synchronize()
 
     assert torch.equal(first, expected)
@@ -246,23 +253,23 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         device=device,
     ).to(torch.float32)
     valid_widths = (width, width - 32)
-    ws = _make_selection_ws(
+    bufs = _make_selection_buffers(
         eviction_mode="union",
         width=width,
         keep_count=keep_count,
         device=device,
         max_requests=request_count,
     )
-    ws.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
+    bufs.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
     # Write the shared per-request prompt lengths the way production staging
     # does: the union row-major view aliases the per-request buffer.
-    ws.prompt_offsets[:request_count].copy_(
+    bufs.prompt_offsets[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
-    assert ws.row_prompt_offsets is ws.prompt_offsets
-    ws.combined.copy_(scores.amax(dim=1))
-    settle_top_tokens(ws)
-    actual = ws.keep.cpu()
+    assert bufs.row_prompt_offsets is bufs.prompt_offsets
+    bufs.combined.copy_(scores.amax(dim=1))
+    settle_top_tokens(bufs)
+    actual = bufs.keep.cpu()
 
     combined = scores.amax(dim=1).cpu()
     for request, valid_width in enumerate(valid_widths):
@@ -402,9 +409,9 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
     )
     _set_protected_tails(compaction, protected_tails)
     # Production packs these buffers inside the fused settle launch; with
-    # pre-settled ordinals the standalone pack call is its exact analog.
-    launch_move_pack(compaction["dense_pack"])
-    run_cache_compactions(compaction)
+    # pre-settled ordinals the standalone pack in run_compaction is its
+    # exact analog.
+    _run_compaction(compaction)
     torch.cuda.synchronize(device)
 
     for layer, (before_pool, after_pool) in enumerate(zip(initial_pools, pools)):
@@ -449,7 +456,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     """Keep score and compaction layer axes aligned across interleaved V2 pools."""
     pytest.importorskip("cutlass")
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        prepare_eviction_workspace,
+        init_eviction_buffers,
         run_eviction_round,
     )
 
@@ -501,7 +508,7 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     mlr_coef[:, :, 0] = 1
     freq_scale_sq = torch.zeros(num_freqs, dtype=torch.float32, device=device)
     freq_scale_sq[0] = 1
-    ws = prepare_eviction_workspace(
+    bufs = init_eviction_buffers(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
         dense_groups=dense_groups,
@@ -523,35 +530,41 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         layer_group_representative=layer_group_representative,
         layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
     )
-    ws.block_offsets_device.zero_()
-    ws.block_offsets_device[..., :2].copy_(_encode_block_offsets(torch.stack(page_tables)))
-    ws.round_starts_device.fill_(0)
-    ws.valid_seq_lens_device.fill_(seq_len)
-    ws.token_starts_device.fill_(0)
+    bufs.block_offsets_device.zero_()
+    bufs.block_offsets_device[..., :2].copy_(_encode_block_offsets(torch.stack(page_tables)))
+    bufs.round_starts_device.fill_(0)
+    bufs.valid_seq_lens_device.fill_(seq_len)
+    bufs.token_starts_device.fill_(0)
 
-    # This compaction packs its own move indices (the ordinals settle
-    # mid-round, so the pack rides the family slot exactly like the draft's
-    # own pack does in production); the workspace's fused pack stays masked
-    # off (its staged move-offsets row is all zeros).
-    ws.compaction = _build_compaction(
+    # Attach a standalone bundle wholesale (families AND the fused settle
+    # launch data), replacing the constructor-built one: the fused settle
+    # launch then packs this bundle's construction-time move offsets exactly
+    # like production packs the staged rows, and the round's inline C++
+    # moves consume the same buffers.
+    compaction = _build_compaction(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
         dense_layers=dense_layers,
         layer_group_representative=layer_group_representative,
         layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
-        kept_token_ordinals=ws.keep[:1],
-        valid_sequence_lengths=ws.valid_seq_lens_device[:1],
-        kv_block_offsets=ws.block_offsets_device,
-        page_table_slots=ws.representative_slots,
+        kept_token_ordinals=bufs.keep[:1],
+        valid_sequence_lengths=bufs.valid_seq_lens_device[:1],
+        kv_block_offsets=bufs.block_offsets_device,
+        page_table_slots=bufs.representative_slots,
         request_count=1,
         prompt_offsets=torch.zeros(1, dtype=torch.int32, device=device),
         decode_keep_count=keep_count,
         protected_tail_capacity=0,
     )
-    _set_protected_tails(ws.compaction, [0])
-    ws.compaction["families"][0]["pack"] = ws.compaction["dense_pack"]
-    run_eviction_round(ws, normalize_scores=False)
-    assert torch.equal(ws.keep, expected_keep)
+    _set_protected_tails(compaction, [0])
+    bufs.compaction_families = compaction["families"]
+    bufs.settle_pack_tensors = compaction["settle_pack_tensors"]
+    bufs.settle_pack_shape = compaction["settle_pack_shape"]
+    bufs.swa_destination_bases = compaction["swa_destination_bases"]
+    bufs.swa_rebase_delta = compaction["swa_rebase_delta"]
+    bufs.draft_pack = compaction["draft_pack"]
+    run_eviction_round(bufs, normalize_scores=False)
+    assert torch.equal(bufs.keep, expected_keep)
     torch.cuda.synchronize(device)
 
     for before_pool, after_pool, table, layer in zip(
@@ -580,8 +593,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     import tensorrt_llm
     import tensorrt_llm.bindings
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
+        init_eviction_buffers,
         mark_page_tables_consumed,
-        prepare_eviction_workspace,
         run_eviction_round,
         stage_eviction_cohort,
     )
@@ -694,7 +707,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         mlr_coef[..., 0] = 1
         freq_scale_sq = torch.zeros(num_freqs, dtype=torch.float32, device=device)
         freq_scale_sq[0] = 1
-        ws = prepare_eviction_workspace(
+        bufs = init_eviction_buffers(
             eviction_mode="union",
             layer_pools=[pool],
             dense_groups=[[0]],
@@ -723,7 +736,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         def evict_once() -> tuple[torch.Tensor, torch.Tensor]:
             before = snapshot(seq_len + protected_tail)
             stage_eviction_cohort(
-                ws,
+                bufs,
                 manager,
                 [request_id],
                 [0],
@@ -737,9 +750,9 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             # set (derived from raw scores) is unchanged. The settle launch
             # packs the move sources and the C++ compacts run in the same
             # round call; the kept ordinals stay readable afterwards.
-            run_eviction_round(ws, normalize_scores=True)
-            selected = ws.keep[0].clone().to(torch.long)
-            mark_page_tables_consumed(ws, manager._stream)
+            run_eviction_round(bufs, normalize_scores=True)
+            selected = bufs.keep[0].clone().to(torch.long)
+            mark_page_tables_consumed(bufs, manager._stream)
             torch.cuda.synchronize(device)
             assert cache.resize(compacted_capacity, None)
             after = snapshot(compacted_capacity)
@@ -840,8 +853,7 @@ def test_eager_compaction_rebases_masked_swa_window_and_tail():
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(compaction, protected_tails)
-    launch_move_pack(compaction["dense_pack"])
-    run_cache_compactions(compaction)
+    _run_compaction(compaction)
     torch.cuda.synchronize(device)
 
     for request, (valid_seq_len, tail_length) in enumerate(

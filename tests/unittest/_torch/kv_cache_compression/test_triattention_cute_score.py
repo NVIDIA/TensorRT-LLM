@@ -2,18 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """The SM100 TriAttention CuTe scorer (the only score path) vs PyTorch oracles.
 
-Two layers of coverage over the production score leg (workspace metadata
+Two layers of coverage over the production score leg (buffer metadata
 staging, the compiled runner launch, and the decode-window gather -- the same
 sequence ``run_eviction_round`` fires). The kernel-numerics matrix drives a
-single-layer workspace across the supported page geometries (permuted
+single-layer buffers across the supported page geometries (permuted
 physical pages, ragged valid lengths, GQA group 4 riding the padded MMA tile)
 against inline oracle math. The launch-path matrix drives multi-layer
-workspaces across the named production geometries (Qwen3, GPT-OSS, the
+buffers across the named production geometries (Qwen3, GPT-OSS, the
 originally validated 128-token-page shape) against the shared pure-PyTorch
-oracle, sweeps request counts up to the workspace capacity, and checks the
+oracle, sweeps request counts up to the buffer capacity, and checks the
 per-request decode-width metadata the selection reduce kernels consume. The
 contract test pins the loud-failure behavior: unsupported geometry raises
-from the CuTe runner's own validation at workspace construction -- there is
+from the CuTe runner's own validation at buffer construction -- there is
 no fallback score kernel.
 """
 
@@ -28,7 +28,7 @@ requires_sm100 = pytest.mark.skipif(
 )
 
 
-def _make_score_workspace(
+def _make_score_buffers(
     *,
     layer_pools,
     max_requests,
@@ -43,13 +43,13 @@ def _make_score_workspace(
     decode_width=None,
     eviction_mode="per_head",
 ):
-    """A score-only workspace over one shared page-table slot."""
+    """Score-only buffers over one shared page-table slot."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
-        prepare_eviction_workspace,
+        init_eviction_buffers,
     )
 
     num_layers = len(layer_pools)
-    return prepare_eviction_workspace(
+    return init_eviction_buffers(
         eviction_mode=eviction_mode,
         layer_pools=layer_pools,
         dense_groups=[list(range(num_layers))],
@@ -72,51 +72,58 @@ def _make_score_workspace(
     )
 
 
-def _write_block_offsets(ws, encoded):
-    """Load a test page table into the workspace's staged block-offset plane."""
-    ws.block_offsets_device.zero_()
-    ws.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
+def _write_block_offsets(bufs, encoded):
+    """Load a test page table into the staged block-offset plane."""
+    bufs.block_offsets_device.zero_()
+    bufs.block_offsets_device[:, : encoded.shape[1], :, : encoded.shape[-1]].copy_(encoded)
 
 
 def _launch_split_scores(
-    ws, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
+    bufs, request_count, valid_seq_lens, valid_widths, token_starts, mean_cos, mean_sin
 ):
     """The production score-only leg: stage metadata, fire the compiled
     runner, gather each request's decode window (``run_eviction_round``'s
     per-head sequence, parameterized by the request count)."""
-    num_segments = request_count * ws.num_layers
+    num_segments = request_count * bufs.num_layers
     torch.sub(
         valid_seq_lens[:request_count],
         token_starts[:request_count],
         out=valid_widths[:request_count],
     )
-    torch.index_select(
-        valid_seq_lens, 0, ws.seg_req[:num_segments], out=ws.seg_seq_len[:num_segments]
-    )
-    ws.cute_token_starts[:request_count].copy_(token_starts[:request_count])
-    assert request_count in ws.runner._compiled
-    ws.runner.launch(request_count, mean_cos, mean_sin)
-    group_size = ws.num_q_heads // ws.num_kv_heads
+    # The compiled runner reads valid lengths and window starts straight from
+    # the staged metadata rows (pointer capture), so stage them exactly like
+    # ``stage_eviction_cohort`` does.
+    bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens[:request_count])
+    bufs.token_starts_device[:request_count].copy_(token_starts[:request_count])
+    assert request_count in bufs.runner._compiled
+    bufs.runner.launch(request_count, mean_cos, mean_sin)
+    group_size = bufs.num_q_heads // bufs.num_kv_heads
     source = (
-        ws.cute_scratch[: ws.num_kv_heads * 8 * num_segments * ws.bucket_seq_len]
-        .view(ws.num_kv_heads, 8, request_count, ws.num_layers, ws.bucket_seq_len)[:, :group_size]
+        bufs.cute_scratch[: bufs.num_kv_heads * 8 * num_segments * bufs.bucket_seq_len]
+        .view(bufs.num_kv_heads, 8, request_count, bufs.num_layers, bufs.bucket_seq_len)[
+            :, :group_size
+        ]
         .permute(2, 3, 0, 1, 4)
     )
-    columns = token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + ws.gather_columns
-    columns = columns.clamp_(max=ws.bucket_seq_len - 1).expand(
-        request_count, ws.num_layers, ws.num_kv_heads, group_size, ws.decode_width
+    columns = (
+        token_starts[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1) + bufs.gather_columns
+    )
+    columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
+        request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
     )
     output = torch.full(
-        (request_count, ws.num_layers, ws.num_q_heads, ws.decode_width),
+        (request_count, bufs.num_layers, bufs.num_q_heads, bufs.decode_width),
         float("nan"),
         dtype=torch.float32,
-        device=ws.device,
+        device=bufs.device,
     )
     torch.gather(
         source,
         4,
         columns,
-        out=output.view(request_count, ws.num_layers, ws.num_kv_heads, group_size, ws.decode_width),
+        out=output.view(
+            request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
+        ),
     )
     return output
 
@@ -161,7 +168,7 @@ def _build_case(
     omega = torch.rand(num_freqs, device=device) * 0.05
     offsets_t = torch.tensor(offsets, dtype=torch.float32, device=device)
     capacity = page_count * tokens_per_block
-    ws = _make_score_workspace(
+    bufs = _make_score_buffers(
         layer_pools=pools,
         max_requests=max_requests,
         seq_len=capacity,
@@ -174,7 +181,7 @@ def _build_case(
         offsets=offsets_t,
         decode_width=capacity - prompt_len,
     )
-    _write_block_offsets(ws, _encode_block_offsets(page_ids))
+    _write_block_offsets(bufs, _encode_block_offsets(page_ids))
     round_starts = (torch.arange(max_requests, dtype=torch.int32, device=device) + 9).contiguous()
     token_starts = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
     # Ragged valid lengths: shallow tails land mid-page and mid-compute-tile;
@@ -198,7 +205,7 @@ def _build_case(
         offsets=offsets_t,
     )
     return (
-        ws,
+        bufs,
         pools,
         token_starts,
         valid_seq_lens,
@@ -241,7 +248,7 @@ def test_cute_kernel_matches_torch_oracle(case):
     max_requests = case["max_requests"]
     num_layers = case["num_layers"]
     (
-        ws,
+        bufs,
         pools,
         token_starts,
         valid_seq_lens,
@@ -250,7 +257,7 @@ def test_cute_kernel_matches_torch_oracle(case):
         mean_sin,
         oracle_inputs,
     ) = _build_case(prompt_len=prompt_len, seed=20260719, **case)
-    device = ws.device
+    device = bufs.device
 
     oracle = _torch_tri_score_oracle(
         pools,
@@ -266,14 +273,14 @@ def test_cute_kernel_matches_torch_oracle(case):
         list(range(num_layers)),
     )
 
-    # The compiled runner serves every request count up to the workspace
+    # The compiled runner serves every request count up to the buffer
     # capacity and nothing beyond it; cover one, an intermediate count, and
     # the capacity.
-    assert max_requests + 1 not in ws.runner._compiled
+    assert max_requests + 1 not in bufs.runner._compiled
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
         valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
         scores = _launch_split_scores(
-            ws,
+            bufs,
             request_count,
             valid_seq_lens,
             valid_widths,
@@ -285,7 +292,7 @@ def test_cute_kernel_matches_torch_oracle(case):
             request_count,
             num_layers,
             case["num_q_heads"],
-            ws.decode_width,
+            bufs.decode_width,
         )
         # The score leg owns the per-request decode widths the selection
         # reduce kernels consume.
@@ -304,9 +311,9 @@ def test_cute_kernel_matches_torch_oracle(case):
 
 
 # The loud-failure contract: unsupported geometry raises from the CuTe
-# runner's own validation during the eager compile at workspace
+# runner's own validation during the eager compile at buffer
 # construction, surfaced as the no-fallback RuntimeError.
-def test_unsupported_geometry_raises_at_workspace_construction():
+def test_unsupported_geometry_raises_at_buffer_construction():
     pytest.importorskip("cutlass")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(20260722)
@@ -320,7 +327,7 @@ def test_unsupported_geometry_raises_at_workspace_construction():
     ]
     calib = torch.randn(num_layers, 2, num_freqs, device=device)
     with pytest.raises(RuntimeError, match="no other score path exists"):
-        _make_score_workspace(
+        _make_score_buffers(
             layer_pools=pools,
             max_requests=max_requests,
             seq_len=page_count * tokens_per_block,

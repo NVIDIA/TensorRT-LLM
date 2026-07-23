@@ -10,7 +10,7 @@ appended as ordinals ``valid_seq_len + 0..tail-1``, and both caches land at
 ``destination_base = prompt_len``. These tests cover the physical draft moves,
 the packed move indices, stream ordering across both cache managers, the
 speculative admission gates (one representative per guard family), the
-published compressed-token invariant, and workspace rebuild/invalidation.
+published compressed-token invariant, and buffer rebuild/invalidation.
 """
 
 from types import SimpleNamespace
@@ -21,15 +21,15 @@ import torch
 from conftest import build_compaction as _build_compaction
 from conftest import compaction_family as _compaction_family
 from conftest import encode_block_offsets as _encode_block_offsets
+from conftest import make_buffer_stubs as _make_buffer_stubs
 from conftest import make_fake_v2 as _make_fake_v2
 from conftest import make_ramp_pools as _make_ramp_pools
 from conftest import make_request as _make_request
 from conftest import make_triattention as _make_triattention
-from conftest import make_workspace_stubs as _make_workspace_stubs
 from conftest import mocked_eviction_internals as _mocked_eviction_internals
+from conftest import run_compaction as _run_compaction
 from conftest import set_protected_tails as _set_protected_tails
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import run_cache_compactions
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     TriAttention,
     mark_page_tables_consumed,
@@ -90,7 +90,7 @@ def _launched_draft_compaction(draft_protected_tails):
         draft_page_table_slots={0: 0},
     )
     _set_protected_tails(compaction, target_protected_tails, draft_protected_tails)
-    run_cache_compactions(compaction)
+    _run_compaction(compaction)
     torch.cuda.synchronize(device)
 
     return SimpleNamespace(
@@ -193,7 +193,7 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
 
 def test_mark_page_tables_consumed_orders_both_manager_streams():
     event = mock.Mock()
-    workspace = SimpleNamespace(
+    buffers = SimpleNamespace(
         device=torch.device("cuda", torch.cuda.current_device()),
         page_tables_active=True,
         bulk_consume_done=event,
@@ -203,17 +203,17 @@ def test_mark_page_tables_consumed_orders_both_manager_streams():
     compute_stream = SimpleNamespace()
 
     with mock.patch.object(torch.cuda, "current_stream", return_value=compute_stream):
-        mark_page_tables_consumed(workspace, target_stream, draft_stream)
+        mark_page_tables_consumed(buffers, target_stream, draft_stream)
 
     # One event records the compact launches; BOTH cache managers wait on it,
     # so neither can free or reallocate pages this cohort is still reading.
     event.record.assert_called_once_with(compute_stream)
     target_stream.wait_event.assert_called_once_with(event)
     draft_stream.wait_event.assert_called_once_with(event)
-    assert workspace.page_tables_active is False
+    assert buffers.page_tables_active is False
 
     with pytest.raises(RuntimeError, match="not staged"):
-        mark_page_tables_consumed(workspace, target_stream, draft_stream)
+        mark_page_tables_consumed(buffers, target_stream, draft_stream)
 
 
 @pytest.mark.parametrize(
@@ -314,7 +314,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
                 assert confirmed == 2 + 4
                 # The staged logical position restores the uncompressed
                 # length: physical confirmed plus everything evicted so far
-                # (stage_eviction_cohort args: ws, manager, ids, round_starts,
+                # (stage_eviction_cohort args: bufs, manager, ids, round_starts,
                 # prompt lengths, seq lens, page-table lens).
                 round_starts = internals.stage.call_args.args[3]
                 assert round_starts[0] == uncompressed
@@ -330,7 +330,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     # streams are ordered after the compact launches.
     assert draft_cache.resize.call_args_list == [mock.call(7, None)] * eviction_rounds
     assert internals.consumed.call_args_list == (
-        [mock.call(internals.workspace, target._stream, draft_manager._stream)] * eviction_rounds
+        [mock.call(internals.buffers, target._stream, draft_manager._stream)] * eviction_rounds
     )
 
 
@@ -338,7 +338,7 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
     manager = _make_triattention(budget=4)
-    layout, workspace = _make_workspace_stubs(manager)
+    layout, buffers = _make_buffer_stubs(manager)
     # The one-time host block-offset table shape gate reads the real manager
     # tables (int32 [pools, slots, K/V, blocks]).
     manager.kv_cache_manager.host_kv_cache_block_offsets = torch.zeros(
@@ -373,42 +373,43 @@ def test_pool_change_rebuilds_buffers_and_drops_cached_compaction():
 
     with mock.patch.object(
         module,
-        "prepare_eviction_workspace",
-        return_value=workspace,
+        "init_eviction_buffers",
+        return_value=buffers,
     ) as prepare:
-        resources = manager._workspace_for(layout, prepared)
+        resources = manager._buffers_for(layout, prepared)
 
         # Request capacity follows the executor limits, while the score
         # bucket follows what the cohort actually presents (power-of-two,
         # 1024 floor) instead of pinning tens-of-GiB scratch to max_seq_len.
-        assert resources is workspace
+        assert resources is buffers
         assert prepare.call_args.kwargs["eviction_mode"] == "union"
         assert prepare.call_args.kwargs["max_requests"] == 8
         assert prepare.call_args.kwargs["decode_width"] == 4 + 2 * 128
         assert prepare.call_args.kwargs["seq_len"] == 1024
         assert prepare.call_args.kwargs["page_table_token_capacity"] == 1024 + 1
         assert prepare.call_args.kwargs["draft_page_table_token_capacity"] == 1024 + 1
-        # Migrated from the pipeline workspace-kwargs test: the budget, the
+        # Migrated from the pipeline buffer-kwargs test: the budget, the
         # shared phase-table dict, and the pool keys thread through unchanged.
         assert prepare.call_args.kwargs["keep_count"] == manager.budget
         assert prepare.call_args.kwargs["phase"] is manager._phase
         assert prepare.call_args.kwargs["layer_pool_keys"] == list(layout["layer_pool_keys"])
 
-        # A second round with unchanged pools reuses the resident workspace
-        # (and with it the compaction launch data it carries).
-        assert manager._workspace_for(layout, prepared) is resources
+        # A second round with unchanged pools reuses the resident buffers
+        # (and with them the compaction launch data they carry).
+        assert manager._buffers_for(layout, prepared) is resources
         assert prepare.call_count == 1
 
-        # A pool change invalidates the whole workspace, compaction included.
+        # A pool change invalidates the whole buffer namespace, compaction
+        # included.
         layout["pool_view_fingerprint"] = (("moved",),)
-        rebuilt_workspace = SimpleNamespace(
-            decode_width=workspace.decode_width,
-            page_table_token_capacity=workspace.page_table_token_capacity,
-            max_requests=workspace.max_requests,
+        rebuilt_buffers = SimpleNamespace(
+            decode_width=buffers.decode_width,
+            page_table_token_capacity=buffers.page_table_token_capacity,
+            max_requests=buffers.max_requests,
         )
-        prepare.return_value = rebuilt_workspace
-        rebuilt = manager._workspace_for(layout, prepared)
+        prepare.return_value = rebuilt_buffers
+        rebuilt = manager._buffers_for(layout, prepared)
         assert rebuilt is not resources
-        assert rebuilt is rebuilt_workspace
+        assert rebuilt is rebuilt_buffers
         assert prepare.call_count == 2
-        assert manager._workspace is rebuilt_workspace
+        assert manager._buffers is rebuilt_buffers

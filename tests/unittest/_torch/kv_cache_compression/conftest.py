@@ -136,10 +136,8 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``build_cache_compactions`` with the suite's default 2-layer geometry."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-        build_cache_compactions,
-    )
+    """``init_compaction_buffers`` with the suite's default 2-layer geometry."""
+    from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
 
     args = dict(
         eviction_mode="union",
@@ -153,16 +151,96 @@ def build_compaction(**overrides):
         swa_window=None,
     )
     args.update(overrides)
-    compaction = build_cache_compactions(**args)
-    # Production fuses the dense pack into the settle launch; standalone
-    # compaction tests re-attach it so run_cache_compactions packs the dense
-    # move buffers before the C++ moves (firing the pack twice is idempotent).
-    compaction_family(compaction, "dense")["pack"] = compaction["dense_pack"]
-    return compaction
+    return init_compaction_buffers(**args)
+
+
+def launch_family_pack(compaction, name):
+    """Standalone HAS_SETTLE=False pack launch for one family of a bundle.
+
+    Production packs dense/SWA inside the fused settle launch and fires the
+    draft pack inline in ``run_eviction_round``; standalone compaction tests
+    pack here from the bundle's own geometry so the C++ moves read
+    initialized indices. The settle-side pointer arguments are compiled away
+    (any well-formed tensor stands in).
+    """
+    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
+        _settle_ties_and_pack_compaction_sources_kernel,
+    )
+
+    family = compaction_family(compaction, name)
+    kept = compaction["kept_token_ordinals"]
+    valid = compaction["valid_sequence_lengths"]
+    keep_count = compaction["decode_keep_count"]
+    if name == "draft":
+        draft = compaction["draft_pack"]
+        rows = 1
+        shape = dict(
+            DENSE_TOTAL=draft["dense_total"],
+            SWA_TOTAL=0,
+            MOVE_CAPACITY=draft["move_capacity"],
+            NUM_KV_HEADS=draft["num_kv_heads"],
+            SWA_WINDOW=0,
+            UNION=True,
+            PER_LAYER=False,
+            HAS_SWA=False,
+        )
+        swa_offsets, swa_indices = family["offsets"], family["source"]
+    else:
+        rows = compaction["selection_rows"]
+        shape = compaction["settle_pack_shape"]
+        swa_family = compaction_family(compaction, "swa")
+        swa_offsets = swa_family["offsets"] if swa_family else family["offsets"]
+        swa_indices = swa_family["source"] if swa_family else family["source"]
+    _settle_ties_and_pack_compaction_sources_kernel[(compaction["request_count"], rows)](
+        kept,
+        valid,
+        family["offsets"],
+        kept,
+        kept,
+        valid,
+        family["offsets"],
+        family["source"],
+        swa_offsets,
+        swa_indices,
+        WIDTH=keep_count,
+        KEEP_COUNT=keep_count,
+        SELECTION_ROWS=rows,
+        **shape,
+        HAS_SETTLE=False,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+
+def run_compaction(compaction, pack=("dense", "draft")):
+    """Test-side replica of ``run_eviction_round``'s compact stage.
+
+    Optional standalone family packs, the SWA destination rebase, then every
+    family's C++ moves -- the same sequence production fires inline.
+    """
+    if compaction["swa_destination_bases"] is not None:
+        torch.add(
+            compaction["prompt_offsets"],
+            compaction["swa_rebase_delta"],
+            out=compaction["swa_destination_bases"],
+        )
+    for family in compaction["families"]:
+        if family["name"] in pack and family["name"] != "swa":
+            launch_family_pack(compaction, family["name"])
+        for group in family["groups"]:
+            torch.ops.trtllm.sparse_kv_cache_compact_layers(
+                group["pools"],
+                group["pool_pointers"],
+                group["page_table"],
+                family["source"],
+                family["offsets"],
+                family["destination_bases"],
+                group["source_layer_indices"],
+            )
 
 
 def make_bare_staging(device, *, max_requests, copy_block_count, page_count=None):
-    """A bare workspace namespace for the bulk page-table copy tests."""
+    """A bare buffer namespace for the bulk page-table copy tests."""
     staging = SimpleNamespace()
     staging.device = device
     staging.max_requests = max_requests
@@ -198,8 +276,8 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
     )
 
 
-def make_workspace_stubs(manager, *, decode_width=260):
-    """Stub the calibration/layout surfaces around ``_workspace_for``."""
+def make_buffer_stubs(manager, *, decode_width=260):
+    """Stub the calibration/layout surfaces around ``_buffers_for``."""
     manager._H = 2
     manager._F = 2
     manager._freq_scale_sq = torch.ones(2)
@@ -222,14 +300,14 @@ def make_workspace_stubs(manager, *, decode_width=260):
         layer_pool_keys=(("pool", 0), ("pool", 0)),
         pool_view_fingerprint=(("fixed",),),
     )
-    workspace = SimpleNamespace(
+    buffers = SimpleNamespace(
         decode_width=decode_width,
         page_table_token_capacity=65537,
         max_requests=8,
         token_starts_device=torch.zeros(8, dtype=torch.int32),
         valid_widths=torch.empty(8, dtype=torch.int32),
     )
-    return layout, workspace
+    return layout, buffers
 
 
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
@@ -297,17 +375,17 @@ def mocked_eviction_internals(manager):
     """Run the real ``_evict_requests`` body around mocked GPU launches."""
     from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
-    workspace = SimpleNamespace(max_requests=8)
+    buffers = SimpleNamespace(max_requests=8)
     layout = dict(swa_layers=[], swa_window=None)
     with (
         mock.patch.object(manager, "_runtime_kv_layout", return_value=layout),
-        mock.patch.object(manager, "_workspace_for", return_value=workspace),
+        mock.patch.object(manager, "_buffers_for", return_value=buffers),
         mock.patch.object(module, "stage_eviction_cohort") as stage,
         mock.patch.object(module, "run_eviction_round") as run_round,
         mock.patch.object(module, "mark_page_tables_consumed") as consumed,
     ):
         yield SimpleNamespace(
-            workspace=workspace,
+            buffers=buffers,
             stage=stage,
             run_round=run_round,
             consumed=consumed,

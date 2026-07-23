@@ -9,7 +9,7 @@ window starts. Any geometry outside that contract raises loudly at
 workspace construction. The per-head modes use the pack's score-only entry
 plus the row-stats kernel; union eviction runs the fused
 score+stats+union pipeline. One-time buffer staging and runner compilation
-live in ``triattention.prepare_eviction_workspace``; this module keeps the
+live in ``triattention.init_eviction_buffers``; this module keeps the
 Triton kernels, their launch helpers, and the mean-phase table builders.
 
 House rules honored throughout:
@@ -44,11 +44,18 @@ def _gather_mean_phase_kernel(
     table_sin,
     mean_cos,
     mean_sin,
+    valid_seq_lens,
+    token_starts,
+    valid_widths,
     table_rows,
     NUM_FREQS: tl.constexpr,
     F_BLOCK: tl.constexpr,
 ):
-    """Copy each request's precomputed phase-table row into the fixed buffers."""
+    """Copy each request's precomputed phase-table row into the fixed buffers.
+
+    The same launch derives the request's valid decode width (valid length
+    minus window start) so the round needs no separate subtraction launch.
+    """
     request = tl.program_id(0)
     frequency = tl.arange(0, F_BLOCK)
     frequency_mask = frequency < NUM_FREQS
@@ -62,6 +69,8 @@ def _gather_mean_phase_kernel(
     row_sin = tl.load(table_sin + source_offset, mask=frequency_mask, other=0.0)
     tl.store(mean_cos + output_offset, row_cos, mask=frequency_mask)
     tl.store(mean_sin + output_offset, row_sin, mask=frequency_mask)
+    width = tl.load(valid_seq_lens + request) - tl.load(token_starts + request)
+    tl.store(valid_widths + request, width)
 
 
 def build_mean_phase_table(
@@ -121,9 +130,12 @@ def gather_mean_phases(
     round_starts: torch.Tensor,
     mean_cos: torch.Tensor,
     mean_sin: torch.Tensor,
+    valid_seq_lens: torch.Tensor,
+    token_starts: torch.Tensor,
+    valid_widths: torch.Tensor,
     request_count: int,
 ) -> None:
-    """Refresh the fixed mean buffers in place from staged round starts.
+    """Refresh the fixed mean buffers and valid widths from staged metadata.
 
     Writes in place because the compiled CuTe score launch captured the
     destination buffers' device pointers. CUDA-only; eviction never runs
@@ -136,6 +148,9 @@ def gather_mean_phases(
         phase["sin"],
         mean_cos,
         mean_sin,
+        valid_seq_lens,
+        token_starts,
+        valid_widths,
         phase["rows"],
         NUM_FREQS=num_freqs,
         F_BLOCK=triton.next_power_of_2(num_freqs),
