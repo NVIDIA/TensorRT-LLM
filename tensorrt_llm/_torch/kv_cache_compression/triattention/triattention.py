@@ -279,6 +279,8 @@ def init_eviction_buffers(
     bufs.request_metadata_host = torch.empty(
         (6, max_requests + 1), dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
+    # numpy view over the pinned rows: per-round staging writes lists in place.
+    bufs.request_metadata_host_np = bufs.request_metadata_host.numpy()
     bufs._bulk_copy_idx_src = torch.arange(
         max_requests, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
@@ -563,9 +565,32 @@ def stage_eviction_cohort(
     stream = torch.cuda.current_stream(bufs.device)
     if bufs.page_tables_active:
         raise RuntimeError("previous page-table cohort is still active")
-    request_metadata = torch.as_tensor((round_starts, seq_lens, token_starts), dtype=torch.int32)
-    # Must grow while the round starts are still host integers.
-    grow_mean_phase_table(bufs.phase, int(max(round_starts)) + 1)
+    # int32 gate first (before buffers or device work): the in-place numpy
+    # writes below can wrap silently, and round starts and move offsets are
+    # the two proven overflow families.
+    max_round_start = max(round_starts)
+    rows = (
+        (0, round_starts),
+        (1, seq_lens),
+        (2, token_starts),
+        (3, dense_move_offsets),
+        (4, swa_move_offsets),
+        (5, draft_move_offsets),
+    )
+    for row, values in rows:
+        if values is not None and not -0x80000000 <= min(values) <= max(values) <= 0x7FFFFFFF:
+            raise ValueError(f"staged metadata row {row} exceeds the int32 range")
+    # The previous cohort's metadata H2D must complete before the pinned
+    # rows are rewritten (same guard _stage_block_offsets applies later).
+    if bufs.copy_pending and not bufs.copy_done.query():
+        bufs.copy_done.synchronize()
+    host_table = bufs.request_metadata_host_np
+    for row, values in rows:
+        if values is not None:
+            host_table[row, : len(values)] = values
+    # Zero lengths keep the score kernel and selection inert for padded rows.
+    host_table[:3, request_count:] = 0
+    grow_mean_phase_table(bufs.phase, int(max_round_start) + 1)
     _stage_block_offsets(
         bufs,
         manager,
@@ -585,18 +610,6 @@ def stage_eviction_cohort(
             bufs.draft_block_offsets_device,
             bufs.draft_copy_block_count,
         )
-    bufs.request_metadata_host[:3, :request_count].copy_(request_metadata)
-    # Zero lengths keep the score kernel and selection inert for padded rows.
-    bufs.request_metadata_host[:3, request_count:].zero_()
-    for row, family_offsets in (
-        (3, dense_move_offsets),
-        (4, swa_move_offsets),
-        (5, draft_move_offsets),
-    ):
-        if family_offsets is not None:
-            bufs.request_metadata_host[row, : len(family_offsets)].copy_(
-                torch.as_tensor(family_offsets, dtype=torch.int32)
-            )
     try:
         bufs.request_metadata_device.copy_(bufs.request_metadata_host, non_blocking=True)
     finally:
