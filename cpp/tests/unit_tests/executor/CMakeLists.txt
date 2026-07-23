@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -26,7 +26,7 @@ add_gtest(requestWithIdTest requestWithIdTest.cpp)
 add_gtest(loraConfigTest loraConfigTest.cpp)
 add_gtest(genUniqueAgentNameTest genUniqueAgentNameTest.cpp)
 target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
-add_gtest(ucxCommTest ucxCommTest.cpp)
+add_gtest(ucxCommTest ucxCommTest.cpp TIMEOUT 60)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
 target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 
