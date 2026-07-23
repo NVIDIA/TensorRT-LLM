@@ -194,7 +194,7 @@ RETURN_METRICS_HEADER = "X-TRTLLM-return-metrics"
 _RETURN_METRICS_HEADER_BYTES = RETURN_METRICS_HEADER.lower().encode()
 
 _SCHEMA_VERSION = 1
-_METRICS_PAYLOAD_BUDGET_BYTES = 80 * 1024
+_PERF_METRICS_HEADER_BUDGET_BYTES = 80 * 1024
 _WRITER_QUEUE_SIZE = 1024
 _WRITER_BATCH_SIZE = 64
 _WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5
@@ -420,11 +420,11 @@ def _limit_metrics_headers(headers: Dict[str, str]) -> Dict[str, str]:
     def size(values: Dict[str, str]) -> int:
         return sum(len(name.encode()) + len(value.encode()) + 4 for name, value in values.items())
 
-    if size(headers) <= _METRICS_PAYLOAD_BUDGET_BYTES:
+    if size(headers) <= _PERF_METRICS_HEADER_BUDGET_BYTES:
         return headers
     logger.warning(
         "Performance metrics payload exceeds %d bytes; omitting step and context-chunk metrics",
-        _METRICS_PAYLOAD_BUDGET_BYTES,
+        _PERF_METRICS_HEADER_BUDGET_BYTES,
     )
     return {
         name: value

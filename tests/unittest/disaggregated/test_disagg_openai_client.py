@@ -26,7 +26,7 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     UsageInfo,
 )
-from tensorrt_llm.serve.perf_metrics import SSE_METRICS_EVENT
+from tensorrt_llm.serve.perf_metrics import _PERF_METRICS_HEADER_BUDGET_BYTES, SSE_METRICS_EVENT
 from tensorrt_llm.serve.responses_utils import ResponseHooks
 from tensorrt_llm.serve.router import Router
 
@@ -117,6 +117,16 @@ class TestOpenAIHttpClient:
         assert client._role == ServerRole.GENERATION
         assert client._session == mock_session
         assert client._max_retries == 5
+
+    @pytest.mark.asyncio
+    async def test_internal_client_accepts_perf_metrics_header_size(self, mock_router):
+        with (
+            patch("tensorrt_llm.serve.openai_client.ClientMetricsCollector"),
+            patch("tensorrt_llm.serve.openai_client.aiohttp.ClientSession") as session,
+        ):
+            OpenAIHttpClient(router=mock_router, role=ServerRole.GENERATION)
+
+        assert session.call_args.kwargs["max_field_size"] == _PERF_METRICS_HEADER_BUDGET_BYTES
 
     @pytest.mark.asyncio
     async def test_non_streaming_completion_request(
