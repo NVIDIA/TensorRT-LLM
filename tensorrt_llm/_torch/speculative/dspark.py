@@ -29,6 +29,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -112,6 +113,24 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
+            # Assign a persistent rolling-window slot to every real generation
+            # request that never ran a context/seed forward on this worker. In
+            # disaggregated serving the prompt is prefilled (and the window
+            # seeded) on the *context* server, so ``_seed_context_windows`` never
+            # runs on the generation server and ``_req_to_slot`` stays empty;
+            # without this, all concurrent gen requests fall through to the shared
+            # scratch row below and corrupt each other's draft window at batch
+            # size > 1 (GitHub #16767). Context-prefix entries are left to
+            # ``_seed_context_windows``; the ADP-idle (id 0) and CUDA-graph
+            # padding dummies are kept on the scratch row.
+            num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            for rid in self.request_ids[num_contexts:]:
+                if (
+                    rid != ATTENTION_DP_DUMMY_REQUEST_ID
+                    and rid < worker._graph_dummy_id_floor
+                    and rid not in worker._req_to_slot
+                ):
+                    worker._assign_slot(rid, reset=False)
             # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
             # requests, or disagg seed forwards without a real id) map to the
             # dedicated throwaway scratch row so they cannot overwrite a live
@@ -261,6 +280,17 @@ class DSparkWorker(SpecWorkerBase):
         # ``_free_slots`` and its contents are throwaway.
         self._scratch_slot = max_batch
         num_rows = max_batch + 1
+
+        # CUDA-graph padding requests carry ids in
+        # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+        # while real request ids start at ``max_batch_size`` and grow, so a simple
+        # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
+        # (0) these dummies must route to the scratch row (see ``prepare()``) and
+        # never consume a real slot. Imported lazily to break the
+        # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
+        from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+        self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
 
         self._kv_windows = torch.zeros(
             (num_rows, num_stages, self._win, head_dim),
