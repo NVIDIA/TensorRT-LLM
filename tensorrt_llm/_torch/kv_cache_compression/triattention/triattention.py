@@ -265,6 +265,22 @@ def init_eviction_buffers(
     )
     # Compile the mode's SM100 CuTe entries; no other score path, no fallback.
     union = eviction_mode == "union"
+    # Persistent gather index (per-head modes): per round only the
+    # token-start base is re-added in place; the expanded view is fixed.
+    bufs.gather_index_base = None
+    bufs.gather_index = None
+    if not union:
+        num_kv_heads_early = int(layer_pools[dense_layers[0]].shape[2])
+        bufs.gather_index_base = torch.empty(
+            (max_requests, 1, 1, 1, decode_width), dtype=torch.int64, device=device
+        )
+        bufs.gather_index = bufs.gather_index_base.expand(
+            max_requests,
+            len(dense_layers),
+            num_kv_heads_early,
+            num_q_heads // num_kv_heads_early,
+            decode_width,
+        )
     bufs.union_rows = None
     if union:
         # Bucket-wide rows; consumers mask by the per-request widths.
@@ -640,13 +656,13 @@ def execute_eviction_round(
                     )[:, :group_size]
                     .permute(2, 3, 0, 1, 4)
                 )
-                columns = (
-                    bufs.token_starts_device[:request_count].to(torch.int64).view(-1, 1, 1, 1, 1)
-                    + bufs.gather_columns
+                torch.add(
+                    bufs.token_starts_device[:request_count].view(-1, 1, 1, 1, 1),
+                    bufs.gather_columns,
+                    out=bufs.gather_index_base[:request_count],
                 )
-                columns = columns.clamp_(max=bufs.bucket_seq_len - 1).expand(
-                    request_count, bufs.num_layers, bufs.num_kv_heads, group_size, bufs.decode_width
-                )
+                bufs.gather_index_base[:request_count].clamp_(max=bufs.bucket_seq_len - 1)
+                columns = bufs.gather_index[:request_count]
                 torch.gather(
                     source,
                     4,
