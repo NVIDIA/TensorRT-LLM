@@ -985,11 +985,15 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         """Model-specific defaults for NemotronH.
 
-        Disables block reuse due to SSM/hybrid architecture constraints.
+        Uses KV cache manager V2 for the hybrid state layout. Block reuse
+        remains opt-in because it also requires a Mamba snapshot policy.
         """
-        # TODO: Remove enable_block_reuse=False once KV cache block reuse
-        # is supported for Mamba/SSM-based models
-        return {"kv_cache_config": {"enable_block_reuse": False}}
+        return {
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": True,
+            }
+        }
 
     @classmethod
     def get_preferred_transceiver_runtime(cls,

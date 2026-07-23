@@ -991,9 +991,17 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        # TODO: Remove enable_block_reuse=False once KV cache block reuse
-        # is supported for Mamba/SSM-based models
-        return {"kv_cache_config": {"enable_block_reuse": False}}
+        """Use V2 for the hybrid state layout.
+
+        Block reuse remains opt-in because it also requires a recurrent-state
+        snapshot policy.
+        """
+        return {
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "use_kv_cache_manager_v2": True,
+            }
+        }
 
     @classmethod
     def get_preferred_transceiver_runtime(cls,

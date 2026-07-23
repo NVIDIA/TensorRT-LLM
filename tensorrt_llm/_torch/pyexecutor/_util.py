@@ -116,11 +116,11 @@ def get_kv_cache_manager_cls(
     Callers that don't care about disagg can omit ``is_disagg`` and get the
     unified-pool default.
 
-    V1 is the default for hybrid Mamba models. V2 is selected only by an
-    explicit ``kv_cache_config.use_kv_cache_manager_v2=True``. In
-    disaggregated serving, V2 additionally requires the Python transceiver
-    with the NIXL backend. Unsupported explicit V2 routes fail rather than
-    falling back to a different manager.
+    Model loading resolves ``use_kv_cache_manager_v2="auto"`` to V2 for
+    supported hybrid Mamba models. An explicit ``False`` selects a
+    compatibility manager. In disaggregated serving, V2 additionally requires
+    the Python transceiver with the NIXL backend. Unsupported V2 routes fail
+    rather than falling back to a different manager.
 
     Env-var overrides:
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager in aggregated serving.

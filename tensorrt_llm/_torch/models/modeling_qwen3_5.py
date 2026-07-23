@@ -669,9 +669,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         # model class (this VLM wrapper), not on the inner decoder. Both
         # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
         # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
-        # propagate `enable_block_reuse=False` — the hybrid Mamba/SSM path
-        # doesn't support KV-cache block reuse. Without this the VLM path
-        # would silently fall back to the global default (block reuse on).
+        # propagate the V2 manager selection and keep block reuse disabled
+        # until a recurrent-state snapshot policy is configured.
         return Qwen3NextForCausalLM.get_model_defaults(llm_args)
 
     @classmethod

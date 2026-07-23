@@ -62,6 +62,7 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.llm_utils import (
     _resolve_kv_cache_manager_v2_auto,
     _resolve_transceiver_runtime_auto,
+    apply_model_defaults_to_llm_args,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -570,7 +571,7 @@ def test_hybrid_cache_manager_factory_keeps_v1_disagg_route(monkeypatch, use_v2)
     )
 
 
-def test_hybrid_models_resolve_auto_to_python_transceiver(monkeypatch):
+def test_hybrid_models_default_to_v2_and_python_transceiver(monkeypatch):
     from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
     from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
@@ -588,7 +589,12 @@ def test_hybrid_models_resolve_auto_to_python_transceiver(monkeypatch):
             model="/tmp/dummy_model",
             cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
         )
+        model_defaults = model_cls.get_model_defaults(llm_args)
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
         _resolve_transceiver_runtime_auto(llm_args, model_cls)
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+        assert llm_args.kv_cache_config.enable_block_reuse is False
         assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
 
