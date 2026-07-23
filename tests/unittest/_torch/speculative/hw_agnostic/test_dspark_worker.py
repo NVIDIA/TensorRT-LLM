@@ -117,8 +117,11 @@ def test_worker_lazy_init_window_buffers():
     dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
     meta = _make_metadata(max_num_requests=8)
     worker._lazy_init(dm, meta)
-    assert worker._kv_windows.shape == (8, 3, 128, 64)
-    assert worker._ctx_len.shape == (8,)
+    # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
+    assert worker._kv_windows.shape == (9, 3, 128, 64)
+    assert worker._ctx_len.shape == (9,)
+    assert worker._scratch_slot == 8
+    # The scratch row is never handed out through the free pool.
     assert list(worker._free_slots) == list(range(8))
     assert worker._batch_to_slot is not None
     assert worker._batch_to_slot.shape == (8,)
@@ -253,6 +256,39 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert 100 not in worker._req_to_slot
     assert sa in worker._free_slots
     assert int(worker._ctx_len[sa]) == 0
+
+
+def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():
+    """Padded / unknown request IDs route to the scratch row, never a live slot.
+
+    Regression for the rolling-window aliasing bug (GitHub #16767): an unknown
+    request id (CUDA-graph padding, ADP idle request, or a disagg seed forward
+    without a real id) must not overwrite the request that owns slot 0.
+    """
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    # A live request takes the first free slot (0) and populates its window.
+    s_real = worker._assign_slot(100, reset=True)
+    assert s_real == 0
+    worker._ctx_len[s_real] = 17
+    worker._kv_windows[s_real].fill_(1.0)
+
+    # Batch contains the live request plus an unknown id (e.g. graph padding).
+    meta.request_ids = [100, 999]
+    meta.prepare()
+
+    # The unknown id maps to the scratch row, not to slot 0.
+    assert worker._batch_to_slot[:2].tolist() == [s_real, worker._scratch_slot]
+    assert worker._scratch_slot != s_real
+    # It is not silently registered as a real request and did not consume a slot.
+    assert 999 not in worker._req_to_slot
+    assert list(worker._free_slots) == [1, 2, 3]
+    # The live request's rolling window and position are untouched.
+    assert int(worker._ctx_len[s_real]) == 17
+    assert torch.all(worker._kv_windows[s_real] == 1.0)
 
 
 def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):

@@ -112,9 +112,13 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
-            # Unknown request IDs (e.g. synthetic warmup requests) default to slot 0.
+            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
+            # requests, or disagg seed forwards without a real id) map to the
+            # dedicated throwaway scratch row so they cannot overwrite a live
+            # request's rolling window (they previously aliased to slot 0).
+            scratch = worker._scratch_slot
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, 0) for rid in self.request_ids],
+                [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -212,6 +216,10 @@ class DSparkWorker(SpecWorkerBase):
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
+        # Index of the throwaway "scratch" window row that absorbs padded /
+        # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
+        # never handed out through ``_free_slots``.
+        self._scratch_slot = 0
 
         # The generation draft path is the batched, host-sync-free
         # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
@@ -244,19 +252,30 @@ class DSparkWorker(SpecWorkerBase):
         self._win = int(draft_model._attn_params["window_size"])
         head_dim = int(draft_model._attn_params["head_dim"])
 
+        # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
+        # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+        # padding, ADP idle requests, or disagg seed forwards that arrive without
+        # a real request id) so they can never overwrite a live request's rolling
+        # window. Previously such IDs aliased to slot 0 and corrupted whichever
+        # real request occupied it. The scratch row is never handed out through
+        # ``_free_slots`` and its contents are throwaway.
+        self._scratch_slot = max_batch
+        num_rows = max_batch + 1
+
         self._kv_windows = torch.zeros(
-            (max_batch, num_stages, self._win, head_dim),
+            (num_rows, num_stages, self._win, head_dim),
             dtype=torch.bfloat16,
             device="cuda",
         )
-        self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._win_inited = True
         logger.info(
             f"DSpark: allocated rolling KV windows "
-            f"[{max_batch}, {num_stages}, {self._win}, {head_dim}]"
+            f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+            f"({max_batch} request slots + 1 scratch row)"
         )
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
