@@ -74,10 +74,12 @@ std::tuple<at::Tensor, at::Tensor> fused_gated_rmsnorm_quant(at::Tensor const& x
     TORCH_CHECK(weight.sizes()[0] == N, "Weight size must match hidden dimension N.");
     TORCH_CHECK(N % group_size == 0, "Hidden dimension N must be divisible by group_size.");
     TORCH_CHECK(group_size >= 256 && group_size <= 8192, "group_size must be between 256 and 8192.");
-    // group_size must be a multiple of 256 so that numVecs (= group_size / 8) is a multiple of 32,
-    // ensuring full-warp participation in cvt_warp_fp16_to_fp4's __shfl_xor_sync(0xffffffff, ...).
-    TORCH_CHECK(group_size % 256 == 0,
-        "group_size must be a multiple of 256 for safe warp shuffles, got group_size=", group_size);
+    // group_size must be a multiple of 8 for vectorized uint4 loads (8 elements per vector).
+    // The kernel pads loop bounds to warp boundaries so that all 32 lanes always participate
+    // in cvt_warp_fp16_to_fp4's __shfl_xor_sync, even when numVecs (= group_size / 8) is not
+    // a multiple of 32 (e.g., group_size=960 from mamba_head_dim=80).
+    TORCH_CHECK(
+        group_size % 8 == 0, "group_size must be a multiple of 8 for vectorized loads, got group_size=", group_size);
     TORCH_CHECK(N % 16 == 0, "Hidden dimension N must be divisible by 16 for FP4 quantization.");
 
     // Validate sf_scale if provided
