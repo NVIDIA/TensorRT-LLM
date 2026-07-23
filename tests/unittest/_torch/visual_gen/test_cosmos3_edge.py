@@ -256,6 +256,58 @@ class TestArchRecipe:
         with pytest.raises(ValueError, match="patch_latent_dim"):
             resolve_arch_recipe(cfg)
 
+
+class TestRopeAxesResolution:
+    """The explicit top-level rope_axes_dim wins over the legacy
+    rope_scaling.mrope_section (diffusers precedence); disagreement and
+    head_dim mismatches are config errors."""
+
+    def _resolve(self, cfg):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+            resolve_rope_axes_dim,
+        )
+
+        return resolve_rope_axes_dim(cfg)
+
+    def test_top_level_only(self):
+        cfg = _reduced_edge_config()
+        cfg.rope_scaling = {}
+        assert self._resolve(cfg) == [2, 1, 1]
+
+    def test_nested_only(self):
+        cfg = _reduced_edge_config()
+        del cfg.rope_axes_dim
+        assert self._resolve(cfg) == [2, 1, 1]
+
+    def test_contradiction_raises(self):
+        cfg = _reduced_edge_config()
+        cfg.rope_axes_dim = [1, 2, 1]
+        with pytest.raises(ValueError, match="contradictory"):
+            self._resolve(cfg)
+
+    @pytest.mark.parametrize("axes", [[2, 2, 1], [2, 2], [4]])
+    def test_head_dim_mismatch_raises(self, axes):
+        cfg = _reduced_edge_config()
+        cfg.rope_axes_dim = axes
+        cfg.rope_scaling = {}
+        with pytest.raises(ValueError, match="head_dim"):
+            self._resolve(cfg)
+
+    def test_neither_declared_raises(self):
+        cfg = _reduced_edge_config()
+        del cfg.rope_axes_dim
+        cfg.rope_scaling = {}
+        with pytest.raises(ValueError, match="neither"):
+            self._resolve(cfg)
+
+    def test_transformer_builds_from_top_level_only(self):
+        cfg = _reduced_edge_config()
+        cfg.rope_scaling = {}
+        model_config = DiffusionModelConfig(pretrained_config=cfg)
+        model_config.attention.backend = "VANILLA"
+        model = Cosmos3VFMTransformer(model_config)
+        assert model.language_model.rotary_emb.mrope_section == [2, 1, 1]
+
     def test_qwen3_flag_contradiction_raises(self):
         cfg = SimpleNamespace(hidden_act="relu2")
         with pytest.raises(ValueError, match="hidden_act"):

@@ -62,6 +62,36 @@ def apply_pretrained_config_compat_defaults(
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
 
 
+def resolve_rope_axes_dim(pretrained_config) -> list:
+    """MRoPE axes: the explicit top-level ``rope_axes_dim`` wins (diffusers
+    precedence); the legacy ``rope_scaling["mrope_section"]`` is the fallback.
+    Both-declared-but-contradictory, wrong length, or a sum that does not
+    cover half the head dim are config errors.
+    """
+    top_level = getattr(pretrained_config, "rope_axes_dim", None)
+    rope_scaling = getattr(pretrained_config, "rope_scaling", None) or {}
+    nested = rope_scaling.get("mrope_section")
+
+    if top_level is not None and nested is not None and list(top_level) != list(nested):
+        raise ValueError(
+            f"Cosmos3 config declares contradictory MRoPE axes: rope_axes_dim="
+            f"{list(top_level)} vs rope_scaling.mrope_section={list(nested)}."
+        )
+    axes = top_level if top_level is not None else nested
+    if axes is None:
+        raise ValueError(
+            "Cosmos3 config declares neither rope_axes_dim nor rope_scaling.mrope_section."
+        )
+    axes = list(axes)
+    half_head_dim = pretrained_config.head_dim // 2
+    if len(axes) != 3 or sum(axes) != half_head_dim:
+        raise ValueError(
+            f"Cosmos3 MRoPE axes {axes} must have 3 entries summing to "
+            f"head_dim/2 = {half_head_dim}."
+        )
+    return axes
+
+
 @dataclass(frozen=True)
 class Cosmos3ArchRecipe:
     """Complete architecture combination selected by ``backbone_type``.
@@ -786,7 +816,7 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         self.max_seq_len_cached = model_config.pretrained_config.max_position_embeddings
         self.original_max_seq_len = model_config.pretrained_config.max_position_embeddings
 
-        self.mrope_section = model_config.pretrained_config.rope_scaling["mrope_section"]
+        self.mrope_section = resolve_rope_axes_dim(model_config.pretrained_config)
 
         inv_freq, self.attention_scaling = _compute_default_rope_parameters(model_config)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
