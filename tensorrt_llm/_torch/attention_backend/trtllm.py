@@ -1185,6 +1185,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        flashinfer_mla_backend: str = "trtllm-gen",
         **kwargs,
     ):
         """
@@ -1200,10 +1201,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          If None, positional embedding should be applied by the model before calling the backend.
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
+            flashinfer_mla_backend (str): FlashInfer MLA backend selected for
+                                         this attention instance.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.flashinfer_mla_backend = flashinfer_mla_backend
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
