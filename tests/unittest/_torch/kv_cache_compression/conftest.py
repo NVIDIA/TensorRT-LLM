@@ -114,9 +114,9 @@ def make_ramp_pools(
 
 def build_compaction(**overrides):
     """``init_compaction_buffers`` with the suite's 2-layer defaults:
-    translates ``eviction_mode`` into ``per_layer_sources``, allocates the
-    caller-owned move-offset rows (capacity cumsum), and mirrors the
-    decision inputs onto the returned contract."""
+    translates ``eviction_mode`` into ``per_layer_sources``/``decision_rows``,
+    allocates the caller-owned move-offset rows (capacity cumsum), and hands
+    the test's pre-settled ``kept_token_ordinals`` in as the decision rows."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
 
     args = dict(
@@ -153,6 +153,9 @@ def build_compaction(**overrides):
     if has_draft:
         args.setdefault("draft_move_offsets", capacity_offsets(keep_count + draft_tail))
     num_kv_heads = int(args["layer_pools"][args["dense_layers"][0]].shape[2])
+    selection_rows = (
+        1 if union else (len(args["dense_layers"]) * num_kv_heads if per_layer else num_kv_heads)
+    )
     draft = None
     if has_draft:
         draft = dict(
@@ -179,6 +182,9 @@ def build_compaction(**overrides):
             dense_move_offsets=args["dense_move_offsets"],
             swa_move_offsets=args["swa_move_offsets"],
             per_layer_sources=per_layer,
+            kept_ordinal_rows=kept.reshape(-1, keep_count),
+            decision_rows=selection_rows,
+            valid_seq_lens=args["valid_sequence_lengths"],
         ),
         capacities=dict(
             request_capacity=request_count,
@@ -188,13 +194,9 @@ def build_compaction(**overrides):
         draft=draft,
     )
     # Test-side mirror of the construction inputs: production reads only the
-    # contract's public keys; the standalone helpers here need the decision
-    # inputs and the caller-owned move-offset rows back.
+    # contract's public keys; the standalone helpers here need the
+    # caller-owned move-offset rows back.
     compaction.update(
-        union=union,
-        per_layer=per_layer,
-        kept_token_ordinals=kept,
-        valid_sequence_lengths=args["valid_sequence_lengths"],
         prompt_offsets=args["prompt_offsets"],
         request_count=request_count,
         decode_keep_count=keep_count,
@@ -203,90 +205,16 @@ def build_compaction(**overrides):
         dense_move_offsets=args["dense_move_offsets"],
         swa_move_offsets=args["swa_move_offsets"],
         draft_move_offsets=args["draft_move_offsets"] if has_draft else None,
-        selection_rows=(
-            1
-            if union
-            else (len(args["dense_layers"]) * num_kv_heads if per_layer else num_kv_heads)
-        ),
     )
     return compaction
 
 
-def launch_family_pack(compaction, name):
-    """Standalone HAS_SETTLE=False pack for one family ("dense" or "draft")
-    so the C++ moves read initialized indices (settle-side pointers are
-    compiled away); the dense launch also packs the SWA rows when present."""
-    from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-        SETTLE_PACK_BLOCK,
-        SETTLE_PACK_NUM_WARPS,
-        _settle_ties_and_pack_compaction_sources_kernel,
-    )
-
-    kept = compaction["kept_token_ordinals"]
-    valid = compaction["valid_sequence_lengths"]
-    keep_count = compaction["decode_keep_count"]
-    if name == "draft":
-        indices = compaction["draft_move_indices"]
-        offsets = compaction["draft_move_offsets"]
-        rows = 1
-        shape = dict(
-            DENSE_TOTAL=int(indices.shape[-1]),
-            SWA_TOTAL=0,
-            MOVE_CAPACITY=int(indices.shape[-1]) // compaction["request_count"],
-            NUM_KV_HEADS=int(indices.shape[0]),
-            SWA_WINDOW=0,
-            UNION=True,
-            PER_LAYER=False,
-            HAS_SWA=False,
-        )
-        swa_offsets, swa_indices = None, None
-    else:
-        indices = compaction["dense_move_indices"]
-        offsets = compaction["dense_move_offsets"]
-        rows = compaction["selection_rows"]
-        shape = dict(
-            DENSE_TOTAL=compaction["dense_total"],
-            SWA_TOTAL=compaction["swa_total"],
-            MOVE_CAPACITY=compaction["move_capacity"],
-            NUM_KV_HEADS=compaction["num_kv_heads"],
-            SWA_WINDOW=compaction["swa_window"],
-            UNION=compaction["union"],
-            PER_LAYER=compaction["per_layer"],
-            HAS_SWA=compaction["has_swa"],
-        )
-        swa_offsets = compaction["swa_move_offsets"] if compaction["has_swa"] else None
-        swa_indices = compaction["swa_move_indices"]
-    _settle_ties_and_pack_compaction_sources_kernel[(compaction["request_count"], rows)](
-        None,
-        None,
-        None,
-        None,
-        kept,
-        valid,
-        offsets,
-        indices,
-        swa_offsets,
-        swa_indices,
-        WIDTH=keep_count,
-        KEEP_COUNT=keep_count,
-        SELECTION_ROWS=rows,
-        **shape,
-        HAS_SETTLE=False,
-        BLOCK=SETTLE_PACK_BLOCK,
-        num_warps=SETTLE_PACK_NUM_WARPS,
-    )
-
-
-def run_compaction(compaction, pack=("dense", "draft")):
-    """Replica of the round's decision-plus-move stage in production order:
-    target pack, draft broadcast pack, SWA destination rebase, then
-    ``compact`` fires the native target and draft moves."""
+def run_compaction(compaction):
+    """Replica of the round's move stage in production order: SWA
+    destination rebase, then ``compact`` packs the decision rows into move
+    sources and fires the native target and draft moves."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import compact
 
-    if "dense" in pack:
-        launch_family_pack(compaction, "dense")
-    if "draft" in pack and compaction["has_draft"]:
-        launch_family_pack(compaction, "draft")
     if compaction["swa_destination_bases"] is not None:
         torch.add(
             compaction["prompt_offsets"],

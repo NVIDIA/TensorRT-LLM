@@ -1,23 +1,36 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fused settle-and-pack vs a pure-torch integer oracle (threshold
-recovery with sentinel-skip, strictly-greater count, lowest-index tie
-quota, ascending prompt-rebased emission, dense/SWA packing). All outputs
-are integers, so comparisons are ``torch.equal`` including stale regions."""
+"""The settle and pack kernels vs pure-torch integer oracles:
+``_settle_ties_kernel`` (threshold recovery with sentinel-skip,
+strictly-greater count, lowest-index tie quota, ascending prompt-rebased
+emission) and ``_pack_move_sources_kernel`` (dense/SWA packing, fed
+pre-settled rows). All outputs are integers, so comparisons are
+``torch.equal`` including stale regions."""
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.kv_cache_compression.compaction import PACK_BLOCK as _PACK_BLOCK
+from tensorrt_llm._torch.kv_cache_compression.compaction import PACK_NUM_WARPS as _PACK_NUM_WARPS
+from tensorrt_llm._torch.kv_cache_compression.compaction import _pack_move_sources_kernel
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    SETTLE_PACK_BLOCK as _BLOCK,
+    SETTLE_BLOCK as _SETTLE_BLOCK,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    SETTLE_PACK_NUM_WARPS as _NUM_WARPS,
+    SETTLE_NUM_WARPS as _SETTLE_NUM_WARPS,
 )
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    _settle_ties_and_pack_compaction_sources_kernel,
+    _settle_ties_kernel,
 )
+
+# Both kernels share the settle geometry parameter grid.
+_WIDTH_KEEP_CASES = [
+    # Small and ragged: rows shorter than the keep count, empty rows.
+    (21, 5),
+    # More than one 256-lane block along both the settle and move axes.
+    (350, 300),
+]
 
 
 def _settle_oracle(scores, row_lengths, row_prompt_offsets, provisional, output, keep_count):
@@ -99,18 +112,77 @@ def _staged_offsets(counts, device):
     return torch.tensor(offsets, dtype=torch.int32, device=device)
 
 
+def _make_settle_inputs(rows_total, width, keep_count, seed, device):
+    """One seeded settle problem: heavily tied scores, ragged rows, a
+    top-k stand-in, and per-row prompt rebases."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    # Heavily tied integer scores force the tie-quota emission path.
+    scores = torch.randint(
+        -2, 3, (rows_total, width), generator=generator, dtype=torch.int32, device=device
+    ).to(torch.float32)
+    # Ragged rows: empty, shorter than the keep count (stale output
+    # entries survive), and full width.
+    row_lengths = torch.tensor(
+        [[0, keep_count - 2, width - 4, width][row % 4] for row in range(rows_total)],
+        dtype=torch.int32,
+        device=device,
+    )
+    row_prompt_offsets = torch.tensor(
+        [3 * (row % 3) for row in range(rows_total)], dtype=torch.int32, device=device
+    )
+    # Stand-in for the CuTE top-k: in-range indices covering the top
+    # scores of each row with arbitrary tie breaking.
+    masked = scores.clone()
+    for row in range(rows_total):
+        masked[row, int(row_lengths[row]) :] = float("-inf")
+    provisional = torch.topk(masked, keep_count, dim=1).indices.to(torch.int32).contiguous()
+    return scores, row_lengths, row_prompt_offsets, provisional
+
+
+@pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
+@pytest.mark.parametrize("width,keep_count", _WIDTH_KEEP_CASES)
+def test_settle_matches_torch_oracle(eviction_mode, width, keep_count):
+    device = torch.device("cuda", torch.cuda.current_device())
+    request_count, num_layers, num_kv_heads = 3, 2, 2
+    selection_rows = _selection_rows_for(eviction_mode, num_layers, num_kv_heads)
+    rows_total = request_count * selection_rows
+
+    for seed in range(5):
+        scores, row_lengths, row_prompt_offsets, provisional = _make_settle_inputs(
+            rows_total, width, keep_count, seed, device
+        )
+        # Identical stale garbage on both sides so untouched regions must
+        # match too.
+        output_stale = torch.randint(
+            -(2**30), 2**30, (rows_total, keep_count), dtype=torch.int32, device=device
+        )
+        output_reference = output_stale.clone()
+        _settle_oracle(
+            scores, row_lengths, row_prompt_offsets, provisional, output_reference, keep_count
+        )
+
+        output_actual = output_stale.clone()
+        _settle_ties_kernel[(request_count, selection_rows)](
+            scores,
+            row_lengths,
+            row_prompt_offsets,
+            provisional,
+            output_actual,
+            WIDTH=width,
+            KEEP_COUNT=keep_count,
+            SELECTION_ROWS=selection_rows,
+            BLOCK=_SETTLE_BLOCK,
+            num_warps=_SETTLE_NUM_WARPS,
+        )
+        torch.cuda.synchronize(device)
+
+        assert torch.equal(output_actual, output_reference), f"kept ordinals differ (seed {seed})"
+
+
 @pytest.mark.parametrize("has_swa", [False, True])
 @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
-@pytest.mark.parametrize(
-    "width,keep_count",
-    [
-        # Small and ragged: rows shorter than the keep count, empty rows.
-        (21, 5),
-        # More than one 256-lane block along both the settle and move axes.
-        (350, 300),
-    ],
-)
-def test_fused_settle_pack_matches_torch_oracle(eviction_mode, has_swa, width, keep_count):
+@pytest.mark.parametrize("width,keep_count", _WIDTH_KEEP_CASES)
+def test_pack_matches_torch_oracle_on_pre_settled_rows(eviction_mode, has_swa, width, keep_count):
     device = torch.device("cuda", torch.cuda.current_device())
     request_count, num_layers, num_kv_heads = 3, 2, 2
     union = eviction_mode == "union"
@@ -135,48 +207,29 @@ def test_fused_settle_pack_matches_torch_oracle(eviction_mode, has_swa, width, k
     swa_offsets = _staged_offsets(swa_counts, device)
 
     for seed in range(5):
-        generator = torch.Generator(device=device).manual_seed(seed)
-        # Heavily tied integer scores force the tie-quota emission path.
-        scores = torch.randint(
-            -2, 3, (rows_total, width), generator=generator, dtype=torch.int32, device=device
-        ).to(torch.float32)
-        # Ragged rows: empty, shorter than the keep count (stale output
-        # entries survive), and full width.
-        row_lengths = torch.tensor(
-            [[0, keep_count - 2, width - 4, width][row % 4] for row in range(rows_total)],
-            dtype=torch.int32,
-            device=device,
+        scores, row_lengths, row_prompt_offsets, provisional = _make_settle_inputs(
+            rows_total, width, keep_count, seed, device
         )
-        row_prompt_offsets = torch.tensor(
-            [3 * (row % 3) for row in range(rows_total)], dtype=torch.int32, device=device
+        # Pre-settled decision rows straight from the settle oracle: short
+        # rows keep stale garbage past their emitted count, which the pack
+        # must forward verbatim.
+        settled = torch.randint(
+            -(2**30), 2**30, (rows_total, keep_count), dtype=torch.int32, device=device
         )
-        # Stand-in for the CuTE top-k: in-range indices covering the top
-        # scores of each row with arbitrary tie breaking.
-        masked = scores.clone()
-        for row in range(rows_total):
-            masked[row, int(row_lengths[row]) :] = float("-inf")
-        provisional = torch.topk(masked, keep_count, dim=1).indices.to(torch.int32).contiguous()
+        _settle_oracle(scores, row_lengths, row_prompt_offsets, provisional, settled, keep_count)
 
         # Identical stale garbage on both sides so untouched regions must
         # match too.
-        output_stale = torch.randint(
-            -(2**30), 2**30, (rows_total, keep_count), dtype=torch.int32, device=device
-        )
         dense_stale = torch.randint(
             -(2**30), 2**30, (packed_rows, dense_total), dtype=torch.int32, device=device
         )
         swa_stale = torch.randint(
             -(2**30), 2**30, (num_kv_heads, swa_total), dtype=torch.int32, device=device
         )
-
-        output_reference = output_stale.clone()
         dense_reference = dense_stale.clone()
         swa_reference = swa_stale.clone()
-        _settle_oracle(
-            scores, row_lengths, row_prompt_offsets, provisional, output_reference, keep_count
-        )
         _pack_oracle(
-            output_reference,
+            settled,
             valid_seq_lens,
             dense_offsets,
             dense_reference,
@@ -191,41 +244,32 @@ def test_fused_settle_pack_matches_torch_oracle(eviction_mode, has_swa, width, k
             has_swa=has_swa,
         )
 
-        output_fused = output_stale.clone()
-        dense_fused = dense_stale.clone()
-        swa_fused = swa_stale.clone()
-        swa_fused_arg = swa_fused if has_swa else dense_fused
-        _settle_ties_and_pack_compaction_sources_kernel[(request_count, selection_rows)](
-            scores,
-            row_lengths,
-            row_prompt_offsets,
-            provisional,
-            output_fused,
+        dense_actual = dense_stale.clone()
+        swa_actual = swa_stale.clone()
+        _pack_move_sources_kernel[(request_count, selection_rows)](
+            settled,
             valid_seq_lens,
             dense_offsets,
-            dense_fused,
-            swa_offsets if has_swa else dense_offsets,
-            swa_fused_arg,
-            WIDTH=width,
+            dense_actual,
+            swa_offsets if has_swa else None,
+            swa_actual if has_swa else None,
             KEEP_COUNT=keep_count,
-            SELECTION_ROWS=selection_rows,
+            DECISION_ROWS=selection_rows,
             DENSE_TOTAL=dense_total,
             SWA_TOTAL=swa_total if has_swa else 0,
             MOVE_CAPACITY=move_capacity,
             NUM_KV_HEADS=num_kv_heads,
             SWA_WINDOW=swa_window if has_swa else 0,
-            UNION=union,
+            BROADCAST=union,
             PER_LAYER=per_layer,
             HAS_SWA=has_swa,
-            HAS_SETTLE=True,
-            BLOCK=_BLOCK,
-            num_warps=_NUM_WARPS,
+            BLOCK=_PACK_BLOCK,
+            num_warps=_PACK_NUM_WARPS,
         )
         torch.cuda.synchronize(device)
 
-        assert torch.equal(output_fused, output_reference), f"kept ordinals differ (seed {seed})"
-        assert torch.equal(dense_fused, dense_reference), f"dense moves differ (seed {seed})"
-        assert torch.equal(swa_fused, swa_reference), f"SWA moves differ (seed {seed})"
+        assert torch.equal(dense_actual, dense_reference), f"dense moves differ (seed {seed})"
+        assert torch.equal(swa_actual, swa_reference), f"SWA moves differ (seed {seed})"
 
 
 def test_settle_handles_topk_sentinel_padding():
@@ -261,35 +305,17 @@ def test_settle_handles_topk_sentinel_padding():
 
     stale = 0x5EED
     output = torch.full((rows_total, keep_count), stale, dtype=torch.int32, device=device)
-    # The pack half always runs now; zero per-request move counts mask every
-    # pack store off, so the settle assertions below stay byte-exact.
-    dense_offsets = torch.zeros(rows_total + 1, dtype=torch.int32, device=device)
-    dense_indices = torch.zeros(1, dtype=torch.int32, device=device)
-    _settle_ties_and_pack_compaction_sources_kernel[(rows_total, 1)](
+    _settle_ties_kernel[(rows_total, 1)](
         scores,
         row_lengths,
         row_prompt_offsets,
         provisional,
         output,
-        row_lengths,
-        dense_offsets,
-        dense_indices,
-        dense_offsets,
-        dense_indices,
         WIDTH=width,
         KEEP_COUNT=keep_count,
         SELECTION_ROWS=1,
-        DENSE_TOTAL=0,
-        SWA_TOTAL=0,
-        MOVE_CAPACITY=keep_count,
-        NUM_KV_HEADS=1,
-        SWA_WINDOW=0,
-        UNION=False,
-        PER_LAYER=False,
-        HAS_SWA=False,
-        HAS_SETTLE=True,
-        BLOCK=_BLOCK,
-        num_warps=_NUM_WARPS,
+        BLOCK=_SETTLE_BLOCK,
+        num_warps=_SETTLE_NUM_WARPS,
     )
     torch.cuda.synchronize(device)
 

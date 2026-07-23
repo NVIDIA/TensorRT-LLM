@@ -15,8 +15,8 @@ from conftest import set_protected_tails as _set_protected_tails
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import settle_top_tokens
 from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
-    SETTLE_PACK_BLOCK,
-    SETTLE_PACK_NUM_WARPS,
+    SETTLE_BLOCK,
+    SETTLE_NUM_WARPS,
     prepare_per_head_scores,
 )
 
@@ -48,7 +48,7 @@ def _make_selection_buffers(
     num_kv_heads=1,
 ):
     """Selection-only buffers for the mode, without CuTe score state or
-    compaction (the settle's pack half is masked off)."""
+    compaction (the settle launch writes only the kept-ordinal rows)."""
     bufs = SimpleNamespace(
         eviction_mode=eviction_mode,
         device=device,
@@ -105,42 +105,22 @@ def _make_selection_buffers(
         bufs.provisional_rows = bufs.top_indices_i32.view(-1, keep_count)
         bufs.keep_rows = bufs.keep.view(-1, keep_count)
     bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
-    # The settle launch always packs now; zero per-request move counts mask
-    # every pack store off, so these buffers stay selection-only. The launch
-    # args mirror the product's ``bufs.settle_args``/``bufs.settle_kwargs``
-    # order and keys exactly (swa pointers are None without SWA layers).
-    zero_offsets = torch.zeros(max_requests + 1, dtype=torch.int32, device=device)
-    zero_lengths = torch.zeros(max_requests, dtype=torch.int32, device=device)
-    zero_indices = torch.zeros(1, dtype=torch.int32, device=device)
+    # The launch args mirror the product's ``bufs.settle_args``/
+    # ``bufs.settle_kwargs`` order and keys exactly.
     bufs.settle_args = (
         bufs.selection_scores_rows,
         bufs.selection_row_lengths,
         bufs.row_prompt_offsets,
         bufs.provisional_rows,
         bufs.keep_rows,
-        zero_lengths,
-        zero_offsets,
-        zero_indices,
-        None,
-        None,
     )
     bufs.settle_kwargs = dict(
         WIDTH=width,
         KEEP_COUNT=keep_count,
         SELECTION_ROWS=bufs.selection_rows_per_request,
-        DENSE_TOTAL=0,
-        SWA_TOTAL=0,
-        MOVE_CAPACITY=keep_count,
-        NUM_KV_HEADS=1,
-        SWA_WINDOW=0,
-        UNION=eviction_mode == "union",
-        PER_LAYER=eviction_mode == "per_layer_perhead",
-        HAS_SWA=False,
-        HAS_SETTLE=True,
-        BLOCK=SETTLE_PACK_BLOCK,
-        num_warps=SETTLE_PACK_NUM_WARPS,
+        BLOCK=SETTLE_BLOCK,
+        num_warps=SETTLE_NUM_WARPS,
     )
-    bufs.draft_pack_launch = None
     return bufs
 
 
@@ -418,9 +398,9 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
         protected_tail_capacity=max(protected_tails),
     )
     _set_protected_tails(compaction, protected_tails)
-    # Production packs these buffers inside the fused settle launch; with
-    # pre-settled ordinals the standalone pack in run_compaction is its
-    # exact analog.
+    # Production settles the kept ordinals into the contract's decision
+    # rows; with pre-settled ordinals the pack launch inside compact() is
+    # its exact analog.
     _run_compaction(compaction)
     torch.cuda.synchronize(device)
 
@@ -538,8 +518,8 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     bufs.valid_seq_lens_device.fill_(seq_len)
     bufs.token_starts_device.fill_(0)
     # Stage this round's move offsets into the buffers' OWN metadata row:
-    # the fused settle launch and the native moves consume the buffers'
-    # own contract (keep_count moves per request, no protected tail).
+    # the pack launch and the native moves consume the buffers' own
+    # contract (keep_count moves per request, no protected tail).
     bufs.request_metadata_device[3, :2].copy_(
         torch.tensor([0, keep_count], dtype=torch.int32, device=device)
     )

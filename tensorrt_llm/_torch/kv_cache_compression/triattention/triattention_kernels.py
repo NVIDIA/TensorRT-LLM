@@ -213,7 +213,7 @@ def prepare_per_head_scores(
     num_kv_heads = int(num_kv_heads)
     _, num_layers, num_query_heads, width = scores.shape
     selection_rows = num_layers * num_kv_heads if per_layer else num_kv_heads
-    # 256 lanes / 4 warps, matching the settle/pack shape.
+    # 256 lanes / 4 warps, matching the settle shape.
     stats_block = 256
     rows = num_layers * num_query_heads
     if normalize_scores:
@@ -251,158 +251,91 @@ def prepare_per_head_scores(
     )
 
 
-# ---- Compaction: pack the kept ordinals into per-request move indices ----
+# ---- Selection finalize: settle threshold ties into the kept-ordinal rows ----
 
 
-# Settle/pack launch shape, shared by every launch site.
-SETTLE_PACK_BLOCK = 256
-SETTLE_PACK_NUM_WARPS = 4
+# Settle launch shape, shared by every launch site.
+SETTLE_BLOCK = 256
+SETTLE_NUM_WARPS = 4
 
 
 @triton.jit
-def _settle_ties_and_pack_compaction_sources_kernel(
+def _settle_ties_kernel(
     scores,
     seq_lens,
     prompt_offsets,
     provisional_indices,
     output_indices,
-    valid_seq_lens,
-    dense_offsets,
-    dense_indices,
-    swa_offsets,
-    swa_indices,
     WIDTH: tl.constexpr,
     KEEP_COUNT: tl.constexpr,
     SELECTION_ROWS: tl.constexpr,
-    DENSE_TOTAL: tl.constexpr,
-    SWA_TOTAL: tl.constexpr,
-    MOVE_CAPACITY: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-    SWA_WINDOW: tl.constexpr,
-    UNION: tl.constexpr,
-    PER_LAYER: tl.constexpr,
-    HAS_SWA: tl.constexpr,
-    HAS_SETTLE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Settle one selection row's ties and pack its move sources (increasing
-    kept ordinals; C++ in-place copy contract)."""
+    """Settle one selection row's ties into its kept-ordinal output row
+    (threshold recovery with sentinel-skip, strictly-greater count,
+    lowest-index tie quota, ascending prompt-rebased emission; entries past
+    the emitted count keep their previous value)."""
     request = tl.program_id(0)
     selection_domain = tl.program_id(1)
     row = request * SELECTION_ROWS + selection_domain
     row_output = output_indices + row * KEEP_COUNT
-    if HAS_SETTLE:
-        row_scores = scores + row * WIDTH
-        row_selected = provisional_indices + row * KEEP_COUNT
-        # Rebases the decode-relative ordinals to absolute positions.
-        prompt_len = tl.load(prompt_offsets + row)
+    row_scores = scores + row * WIDTH
+    row_selected = provisional_indices + row * KEEP_COUNT
+    # Rebases the decode-relative ordinals to absolute positions.
+    prompt_len = tl.load(prompt_offsets + row)
 
-        threshold = float("inf")
-        for start in tl.static_range(0, KEEP_COUNT, BLOCK):
-            selected_offset = start + tl.arange(0, BLOCK)
-            selected_mask = selected_offset < KEEP_COUNT
-            token_index = tl.load(
-                row_selected + selected_offset,
-                mask=selected_mask,
-                other=0,
-            )
-            # Mask the top-k's -1 pad sentinels so no lane dereferences ``row_scores - 1``.
-            selected_valid = selected_mask & (token_index >= 0)
-            selected_score = tl.load(
-                row_scores + token_index,
-                mask=selected_valid,
-                other=float("inf"),
-            ).to(tl.float32)
-            threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
-
-        seq_len = tl.load(seq_lens + row)
-        greater_count = 0
-        for start in tl.static_range(0, WIDTH, BLOCK):
-            token_index = start + tl.arange(0, BLOCK)
-            valid = (token_index < WIDTH) & (token_index < seq_len)
-            score = tl.load(
-                row_scores + token_index,
-                mask=valid,
-                other=float("-inf"),
-            ).to(tl.float32)
-            greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
-
-        tie_quota = KEEP_COUNT - greater_count
-        output_count = 0
-        ties_seen = 0
-        for start in tl.static_range(0, WIDTH, BLOCK):
-            token_index = start + tl.arange(0, BLOCK)
-            valid = (token_index < WIDTH) & (token_index < seq_len)
-            score = tl.load(
-                row_scores + token_index,
-                mask=valid,
-                other=float("-inf"),
-            ).to(tl.float32)
-            greater = valid & (score > threshold)
-            tied = valid & (score == threshold)
-            tied_i32 = tied.to(tl.int32)
-            tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
-            selected = greater | (tied & (tie_rank < tie_quota))
-            selected_i32 = selected.to(tl.int32)
-            write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
-            tl.store(
-                row_output + write_offset,
-                token_index + prompt_len,
-                mask=selected,
-            )
-            output_count += tl.sum(selected_i32)
-            ties_seen += tl.sum(tied_i32)
-
-    if HAS_SETTLE:
-        # Make the settled row's scattered stores visible before the pack half.
-        tl.debug_barrier()
-    dense_begin = tl.load(dense_offsets + request)
-    dense_end = tl.load(dense_offsets + request + 1)
-    dense_count = dense_end - dense_begin
-    valid_len = tl.load(valid_seq_lens + request)
-    if HAS_SWA:
-        swa_begin = tl.load(swa_offsets + request)
-        swa_end = tl.load(swa_offsets + request + 1)
-        swa_count = swa_end - swa_begin
-    for move_start in tl.static_range(0, MOVE_CAPACITY, BLOCK):
-        move = move_start + tl.arange(0, BLOCK)
-        selected = tl.load(
-            row_output + move,
-            mask=move < KEEP_COUNT,
+    threshold = float("inf")
+    for start in tl.static_range(0, KEEP_COUNT, BLOCK):
+        selected_offset = start + tl.arange(0, BLOCK)
+        selected_mask = selected_offset < KEEP_COUNT
+        token_index = tl.load(
+            row_selected + selected_offset,
+            mask=selected_mask,
             other=0,
         )
-        dense_source = tl.where(move < KEEP_COUNT, selected, valid_len + move - KEEP_COUNT)
-        if UNION:
-            # The one union row per request feeds every KV head's packed row.
-            for head in tl.static_range(0, NUM_KV_HEADS):
-                tl.store(
-                    dense_indices + head * DENSE_TOTAL + dense_begin.to(tl.int64) + move,
-                    dense_source,
-                    mask=move < dense_count,
-                )
-        else:
-            dense_output = (
-                selection_domain.to(tl.int64) * DENSE_TOTAL + dense_begin.to(tl.int64) + move
-            )
-            tl.store(dense_indices + dense_output, dense_source, mask=move < dense_count)
-        if HAS_SWA:
-            swa_source = valid_len - SWA_WINDOW + move
-            if UNION:
-                for head in tl.static_range(0, NUM_KV_HEADS):
-                    tl.store(
-                        swa_indices + head * SWA_TOTAL + swa_begin.to(tl.int64) + move,
-                        swa_source,
-                        mask=move < swa_count,
-                    )
-            else:
-                swa_mask = move < swa_count
-                if PER_LAYER:
-                    # SWA has one shared row per head; first layer's domains write it.
-                    swa_mask = swa_mask & (selection_domain < NUM_KV_HEADS)
-                head = selection_domain % NUM_KV_HEADS
-                swa_output = head.to(tl.int64) * SWA_TOTAL + swa_begin.to(tl.int64) + move
-                tl.store(
-                    swa_indices + swa_output,
-                    swa_source,
-                    mask=swa_mask,
-                )
+        # Mask the top-k's -1 pad sentinels so no lane dereferences ``row_scores - 1``.
+        selected_valid = selected_mask & (token_index >= 0)
+        selected_score = tl.load(
+            row_scores + token_index,
+            mask=selected_valid,
+            other=float("inf"),
+        ).to(tl.float32)
+        threshold = tl.minimum(threshold, tl.min(selected_score, axis=0))
+
+    seq_len = tl.load(seq_lens + row)
+    greater_count = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater_count += tl.sum((valid & (score > threshold)).to(tl.int32))
+
+    tie_quota = KEEP_COUNT - greater_count
+    output_count = 0
+    ties_seen = 0
+    for start in tl.static_range(0, WIDTH, BLOCK):
+        token_index = start + tl.arange(0, BLOCK)
+        valid = (token_index < WIDTH) & (token_index < seq_len)
+        score = tl.load(
+            row_scores + token_index,
+            mask=valid,
+            other=float("-inf"),
+        ).to(tl.float32)
+        greater = valid & (score > threshold)
+        tied = valid & (score == threshold)
+        tied_i32 = tied.to(tl.int32)
+        tie_rank = ties_seen + tl.cumsum(tied_i32, axis=0) - tied_i32
+        selected = greater | (tied & (tie_rank < tie_quota))
+        selected_i32 = selected.to(tl.int32)
+        write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
+        tl.store(
+            row_output + write_offset,
+            token_index + prompt_len,
+            mask=selected,
+        )
+        output_count += tl.sum(selected_i32)
+        ties_seen += tl.sum(tied_i32)

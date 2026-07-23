@@ -41,10 +41,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
 from ..compaction import compact, init_compaction_buffers
 from .triattention_kernels import (
-    SETTLE_PACK_BLOCK,
-    SETTLE_PACK_NUM_WARPS,
+    SETTLE_BLOCK,
+    SETTLE_NUM_WARPS,
     _gather_mean_phase_kernel,
-    _settle_ties_and_pack_compaction_sources_kernel,
+    _settle_ties_kernel,
     grow_mean_phase_table,
     prepare_per_head_scores,
 )
@@ -406,6 +406,10 @@ def init_eviction_buffers(
             dense_move_offsets=dense_move_offsets_row,
             swa_move_offsets=swa_move_offsets_row,
             per_layer_sources=per_layer,
+            # The decision rows the contract packs into move sources.
+            kept_ordinal_rows=bufs.keep_rows,
+            decision_rows=bufs.selection_rows_per_request,
+            valid_seq_lens=bufs.valid_seq_lens_device,
         ),
         capacities=dict(
             request_capacity=max_requests,
@@ -417,68 +421,21 @@ def init_eviction_buffers(
     bufs.compaction = contract
     bufs.swa_destination_bases = contract["swa_destination_bases"]
     bufs.swa_rebase_delta = contract["swa_rebase_delta"]
-    # The decision side: settle+pack launch args against the agreed buffers.
+    # The decision side: the settle launch materializes the kept-ordinal rows.
     bufs.settle_args = (
         bufs.selection_scores_rows,
         bufs.selection_row_lengths,
         bufs.row_prompt_offsets,
         bufs.provisional_rows,
         bufs.keep_rows,
-        bufs.valid_seq_lens_device,
-        dense_move_offsets_row,
-        contract["dense_move_indices"],
-        swa_move_offsets_row if contract["has_swa"] else None,
-        contract["swa_move_indices"],
     )
     bufs.settle_kwargs = dict(
         WIDTH=decode_width,
         KEEP_COUNT=keep_count,
         SELECTION_ROWS=bufs.selection_rows_per_request,
-        DENSE_TOTAL=contract["dense_total"],
-        SWA_TOTAL=contract["swa_total"],
-        MOVE_CAPACITY=contract["move_capacity"],
-        NUM_KV_HEADS=contract["num_kv_heads"],
-        SWA_WINDOW=contract["swa_window"],
-        UNION=union,
-        PER_LAYER=per_layer,
-        HAS_SWA=contract["has_swa"],
-        HAS_SETTLE=True,
-        BLOCK=SETTLE_PACK_BLOCK,
-        num_warps=SETTLE_PACK_NUM_WARPS,
+        BLOCK=SETTLE_BLOCK,
+        num_warps=SETTLE_NUM_WARPS,
     )
-    bufs.draft_pack_launch = None
-    if draft is not None:
-        draft_move_indices = contract["draft_move_indices"]
-        # Pack-only decision broadcast (HAS_SETTLE=False): settle pointers are None.
-        broadcast_pack_args = (
-            None,
-            None,
-            None,
-            None,
-            bufs.keep,
-            bufs.valid_seq_lens_device,
-            draft_move_offsets_row,
-            draft_move_indices,
-            None,
-            None,
-        )
-        broadcast_pack_kwargs = dict(
-            WIDTH=keep_count,
-            KEEP_COUNT=keep_count,
-            SELECTION_ROWS=1,
-            DENSE_TOTAL=int(draft_move_indices.shape[-1]),
-            SWA_TOTAL=0,
-            MOVE_CAPACITY=int(draft_move_indices.shape[-1]) // max_requests,
-            NUM_KV_HEADS=int(draft_move_indices.shape[0]),
-            SWA_WINDOW=0,
-            UNION=True,
-            PER_LAYER=False,
-            HAS_SWA=False,
-            HAS_SETTLE=False,
-            BLOCK=SETTLE_PACK_BLOCK,
-            num_warps=SETTLE_PACK_NUM_WARPS,
-        )
-        bufs.draft_pack_launch = (broadcast_pack_args, broadcast_pack_kwargs)
 
     # ---- round-ordering events ----------------------------------------------
     bufs.copy_done = torch.cuda.Event()
@@ -605,8 +562,8 @@ def mark_page_tables_consumed(bufs: SimpleNamespace, *manager_streams: torch.cud
 
 
 def settle_top_tokens(bufs: SimpleNamespace) -> None:
-    """Pick the top-k, settle ties, and materialize the move-source decision
-    (target settle+pack, then the draft broadcast pack)."""
+    """Pick the top-k and settle ties into the kept-ordinal decision rows
+    (the compaction contract packs them into move sources)."""
     # The trailing 1 is next_n: decode scores one query token per request.
     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
         bufs.selection_scores_rows,
@@ -615,14 +572,7 @@ def settle_top_tokens(bufs: SimpleNamespace) -> None:
         bufs.keep_count,
         1,
     )
-    _settle_ties_and_pack_compaction_sources_kernel[bufs.settle_grid](
-        *bufs.settle_args, **bufs.settle_kwargs
-    )
-    if bufs.draft_pack_launch is not None:
-        broadcast_pack_args, broadcast_pack_kwargs = bufs.draft_pack_launch
-        _settle_ties_and_pack_compaction_sources_kernel[(bufs.max_requests, 1)](
-            *broadcast_pack_args, **broadcast_pack_kwargs
-        )
+    _settle_ties_kernel[bufs.settle_grid](*bufs.settle_args, **bufs.settle_kwargs)
 
 
 def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
