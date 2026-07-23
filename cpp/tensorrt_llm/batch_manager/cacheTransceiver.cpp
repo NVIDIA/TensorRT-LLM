@@ -77,8 +77,9 @@ namespace
 /// to uniquely identify a CacheTransceiver instance across gen instances.
 std::string generateInstanceId()
 {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
+    // The RNG state is comparatively expensive to construct/seed, so keep one
+    // per thread instead of building it on every call.
+    static thread_local std::mt19937_64 gen{std::random_device{}()};
     std::uniform_int_distribution<uint64_t> dis;
     uint64_t a = dis(gen);
     uint64_t b = dis(gen);
@@ -444,38 +445,55 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
 
     // Calibrate steady_clock across ranks so that cross-node allgather
     // in batchUpdateKVCacheTransferBW can compare time points.
-    // Python's _set_global_steady_clock_offset writes to the nanobind
-    // module's copy of sGlobalSteadyClockOffset, which is invisible to
-    // libtensorrt_llm.so (separate inline-static instances across .so
-    // boundaries).  We redo the calibration here in the C++ library.
-    if (!LlmRequest::sGlobalSteadyClockOffset.has_value())
+    // globalSteadyClockOffset() reads a single process-global copy shared with
+    // the nanobind module, so if the Python runtime already calibrated the offset
+    // (PyExecutor::_set_global_steady_clock_offset) it is visible here and we skip;
+    // the pure-C++ path performs the calibration below.
+    // The check-and-set is guarded by a mutex so that CacheTransceiver instances
+    // constructed concurrently in the same process (e.g. multi-engine serving) do
+    // not race on the shared offset or issue mismatched collectives.
     {
-        using Duration = LlmRequest::Duration;
-        // Barrier + take local timestamp
-        if (useMPI())
+        static std::mutex sSteadyClockCalibrationMutex;
+        std::lock_guard<std::mutex> lock(sSteadyClockCalibrationMutex);
+        if (!globalSteadyClockOffset().has_value())
         {
-            tensorrt_llm::mpi::MpiComm::session().barrier();
-        }
-        auto localNow = std::chrono::steady_clock::now();
-        auto localNs = std::chrono::duration_cast<std::chrono::nanoseconds>(localNow.time_since_epoch()).count();
+            using Duration = LlmRequest::Duration;
+            // Synchronize all ranks immediately before sampling the local clock so
+            // every rank measures from a consistent point.
+            if (useMPI())
+            {
+                tensorrt_llm::mpi::MpiComm::session().barrier();
+            }
+            else
+            {
+                // CacheTransceiverComm exposes no barrier primitive, so use a cheap
+                // allgather as a pseudo-barrier for the process-group path.
+                int64_t const dummy = 0;
+                std::vector<int64_t> dummyRecv(mGroupComm->getSize(), 0);
+                mGroupComm->allgather(dummy, std::ref(dummyRecv), {});
+            }
+            auto localNow = std::chrono::steady_clock::now();
+            auto localNs = std::chrono::duration_cast<std::chrono::nanoseconds>(localNow.time_since_epoch()).count();
 
-        // Allgather timestamps from all ranks
-        std::vector<int64_t> allNs(mGroupComm->getSize(), 0);
-        if (useMPI())
-        {
-            tensorrt_llm::mpi::MpiComm::session().allgather(&localNs, allNs.data(), 1, mpi::MpiType::kINT64);
-        }
-        else
-        {
-            mGroupComm->allgather(localNs, std::ref(allNs), {});
-        }
+            // Allgather timestamps from all ranks
+            std::vector<int64_t> allNs(mGroupComm->getSize(), 0);
+            if (useMPI())
+            {
+                tensorrt_llm::mpi::MpiComm::session().allgather(&localNs, allNs.data(), 1, mpi::MpiType::kINT64);
+            }
+            else
+            {
+                mGroupComm->allgather(localNs, std::ref(allNs), {});
+            }
 
-        // Offset = rank0's timestamp - my timestamp (same formula as Python)
-        auto offsetNs = allNs[0] - localNs;
-        LlmRequest::sGlobalSteadyClockOffset = Duration(offsetNs);
+            // Offset = rank0's timestamp - my timestamp (same formula as Python)
+            auto offsetNs = allNs[0] - localNs;
+            globalSteadyClockOffset() = Duration(offsetNs);
 
-        TLLM_LOG_INFO(mGroupComm->getRank(), "CacheTransceiver: set sGlobalSteadyClockOffset = %.6f sec for rank %d",
-            static_cast<double>(offsetNs) / 1e9, mGroupComm->getRank());
+            TLLM_LOG_INFO(mGroupComm->getRank(),
+                "CacheTransceiver: set global steady clock offset = %.6f sec for rank %d",
+                static_cast<double>(offsetNs) / 1e9, mGroupComm->getRank());
+        }
     }
 
     if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
@@ -1515,6 +1533,8 @@ void CacheTransceiver::writeGenTransferSummary(std::vector<LlmRequest*> const& c
         int rank = useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
         auto filePath = outputPath / (mInstanceId + "_" + std::to_string(rank) + "_gen_transfer_summary.csv");
         mGenTransferSummaryFile.open(filePath);
+        TLLM_CHECK_WITH_INFO(mGenTransferSummaryFile.is_open(), "Failed to open gen transfer summary file: %s",
+            filePath.string().c_str());
         mGenTransferSummaryFile << "RequestID,gen_side_transfer_time(ms),kv_cache_size" << '\n';
     }
     for (auto* req : completedRequests)

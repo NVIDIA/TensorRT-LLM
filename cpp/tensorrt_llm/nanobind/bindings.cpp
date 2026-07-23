@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -545,7 +545,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
     // Global (offset-normalized) steady clock, matching what
-    // LlmRequest::setKvCacheTransferStart/End expect. Uses this module's copy
-    // of sGlobalSteadyClockOffset, set by PyExecutor at startup.
+    // LlmRequest::setKvCacheTransferStart/End expect. Reads the process-global
+    // steady clock offset, set by PyExecutor at startup.
     m.def("global_steady_clock_now", []() { return tb::LlmRequest::getSteadyClockNow(); });
 }

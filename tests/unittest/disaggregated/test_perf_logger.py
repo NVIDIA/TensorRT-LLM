@@ -106,10 +106,9 @@ class TestPerfLogManager:
                 assert "12.345" in lines[1]
                 assert "1024" in lines[1]
 
+    @patch.dict("os.environ", {}, clear=False)
     def test_log_gen_transfer_summary_disabled_without_env(self):
-        import os as _os
-
-        _os.environ.pop("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", None)
+        os.environ.pop("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", None)
         from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfLogManager
 
         mgr = PerfLogManager()

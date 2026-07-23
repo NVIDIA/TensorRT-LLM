@@ -115,6 +115,7 @@ class TestSyncTransferTiming:
         assert req._end == 25
         assert req._kv_cache_size == 300
 
+    @patch.dict("os.environ", {}, clear=False)
     def test_skips_when_no_env(self):
         """Without TRTLLM_KVCACHE_TIME_OUTPUT_PATH, allgather is not called."""
         import os
