@@ -23,6 +23,7 @@ Two usage modes:
 
 import argparse
 import functools
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -69,6 +70,8 @@ def _compile(
     emit_xstate: bool = False,
     use_ext_cand: bool = False,
     cand_cap: int = 5120,
+    accept_cap: "int | None" = None,
+    kc_override: "int | None" = None,
 ):
     """JIT-compile the GVR kernel for a specific knob combination.
 
@@ -167,7 +170,7 @@ def _compile(
     )
     cand_ctl_fake = (
         cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32, (n_rows, 2), stride_order=(1, 0), assumed_align=8
+            cutlass.Int32, (n_rows, 4), stride_order=(1, 0), assumed_align=8
         )
         if use_ext_cand
         else None
@@ -202,6 +205,8 @@ def _compile(
         emit_xstate=emit_xstate,
         use_ext_cand=use_ext_cand,
         cand_cap=cand_cap,
+        accept_cap=accept_cap,
+        kc_override=kc_override,
         # ext counts need 3 rung slots (M_thr == 3): 2 qfracs + vseed. The
         # qfrac VALUES are irrelevant on this path (P1b is skipped) — only
         # the slot count matters.
@@ -405,6 +410,47 @@ def derive_seed_rungs(
     return torch.stack([prev_thr - d_lo, prev_thr, prev_thr + d], dim=1).contiguous()
 
 
+def derive_seed_lines_v4(
+    prev_anchor: torch.Tensor,
+    prev_sthr: "torch.Tensor | None" = None,
+    prev_ctl: "torch.Tensor | None" = None,
+    targets: "tuple[float, float, float]" = (8192.0, 5120.0, 2048.0),
+    fallback_spread: float = 0.5,
+) -> torch.Tensor:
+    """v4 host-side line placement: put [t0, t1, t2] at target COUNTS.
+
+    Slope of log2(count) vs threshold is fit from the previous step's
+    (t0, n0) / (t2, n2) pairs (counts ride in the widened control words);
+    each new line lands where the fit predicts its target count. Targets
+    descend (t0 loosest / largest count, t2 tightest).
+
+    Args:
+        prev_anchor: [rows] previous accepted cut value (xstate[:, 2]).
+        prev_sthr: [rows, 3] previous lines (or None -> fixed spread).
+        prev_ctl: [rows, 4] previous control words {n0, void, n1, n2}.
+        targets: (T0, T1, T2) target counts, T0 > T1 > T2.
+
+    Returns:
+        [rows, 3] fp32 lines ascending [t0, t1, t2].
+    """
+    t0_t, t1_t, t2_t = targets
+    if prev_sthr is None or prev_ctl is None:
+        d = torch.full_like(prev_anchor, fallback_spread)
+        return torch.stack([prev_anchor - d, prev_anchor, prev_anchor + d], dim=1).contiguous()
+    c0 = prev_ctl[:, 0].float().clamp(min=1.0)
+    c2 = prev_ctl[:, 3].float().clamp(min=1.0)
+    dthr = (prev_sthr[:, 2] - prev_sthr[:, 0]).clamp(min=1e-3)
+    slope = ((torch.log2(c0) - torch.log2(c2)) / dthr).clamp(min=0.05, max=64.0)
+    # anchor count estimate: slide the anchor onto the prev line fit
+    anch_c = (c2 * torch.exp2(-(prev_anchor - prev_sthr[:, 2]) * slope)).clamp(min=1.0, max=1e6)
+    lines = [prev_anchor + torch.log2(anch_c / tgt) / slope for tgt in (t0_t, t1_t, t2_t)]
+    out = torch.stack(lines, dim=1)
+    # enforce strictly ascending (degenerate slope guards)
+    out[:, 1] = torch.maximum(out[:, 1], out[:, 0] + 1e-4)
+    out[:, 2] = torch.maximum(out[:, 2], out[:, 1] + 1e-4)
+    return out.contiguous()
+
+
 def emu_seed_counts(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -452,11 +498,15 @@ def emu_cand(
     lf = logits.to(torch.float32)
     cand_vals = torch.full((R, cap), float("-inf"), dtype=torch.float32, device=dev)
     cand_idx = torch.full((R, cap), -1, dtype=torch.int32, device=dev)
-    ctl = torch.zeros((R, 2), dtype=torch.int32, device=dev)
+    ctl = torch.zeros((R, 4), dtype=torch.int32, device=dev)
     for r in range(R):
         ne = int(n_eff[r])
         hits = torch.nonzero(lf[r, :ne] >= seed_thr[r, 0], as_tuple=False).flatten()
         cnt = hits.numel()
+        # emitter-side counts: two extra compares per EMITTED element
+        # (t1, t2 > t0 so counting over the list == counting over the row)
+        ctl[r, 2] = int((lf[r, :ne] >= seed_thr[r, 1]).sum())
+        ctl[r, 3] = int((lf[r, :ne] >= seed_thr[r, 2]).sum())
         # unordered contract: shuffle, then interleave sentinels
         perm = hits[torch.randperm(cnt, device=dev)]
         ent = torch.full((cnt + sentinel_pad,), -1, dtype=torch.int64, device=dev)
@@ -649,8 +699,8 @@ def gvr_topk_decode(
             cand_ctl.dtype == torch.int32
             and cand_ctl.is_cuda
             and cand_ctl.is_contiguous()
-            and cand_ctl.shape == (num_rows, 2)
-        ), "cand_ctl must be contiguous CUDA int32 [num_rows, 2]"
+            and cand_ctl.shape == (num_rows, 4)
+        ), "cand_ctl must be contiguous CUDA int32 [num_rows, 4]"
         cand_cap = cand_vals.shape[1]
     emit_xstate = xstate is not None
     if emit_xstate:
@@ -742,6 +792,8 @@ def gvr_topk_decode(
         emit_xstate,
         use_ext_cand,
         cand_cap,
+        int(os.environ["GVR_BSTAR"]) if "GVR_BSTAR" in os.environ else None,
+        int(os.environ["GVR_KC"]) if "GVR_KC" in os.environ else None,
     )
     # When return_output_values=False the kernel was compiled to skip
     # STG.value and accepts None for the value-output slot.

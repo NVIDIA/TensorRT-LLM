@@ -264,6 +264,8 @@ class GvrTopKKernel:
         seqlen_sorted: bool = False,
         kc_diet: Optional[bool] = None,
         enable_r0: bool = True,
+        accept_cap: "int | None" = None,
+        kc_override: "int | None" = None,
         r0_qfracs: Optional[tuple] = None,
         mt_unroll: int = 4,
         p1b_cache: Optional[bool] = None,
@@ -565,6 +567,13 @@ class GvrTopKKernel:
         # <= cand_cap and the collect rung's exact count is in [K, kC];
         # ineligible rows fall through to the ext-counts path.
         self.use_ext_cand = bool(use_ext_cand)
+        if kc_override is not None:
+            # physical candidate-buffer capacity override (B* search)
+            self.kC = int(kc_override)
+        # acceptance band top B*: a cut whose count fits [K, B*] goes
+        # straight to Phase 4. Cost-bounded (refine ~1.9us/1k cands vs
+        # ~21-30us fallback), physically bounded by kC.
+        self.accept_cap = int(accept_cap) if accept_cap is not None else self.kC
         self.cand_cap = int(cand_cap)
         # list path: the score column is staged into a DEDICATED smem
         # region sized cand_cap fp32 (96KB at 24576). Budget note: this
@@ -4464,21 +4473,6 @@ class GvrTopKKernel:
         else:
             smem_input = None
 
-        # List-path score staging (SoA ext cand, cs=1, fp32 only).
-        if cutlass.const_expr(
-            self.use_ext_cand
-            and self.use_ext_counts
-            and cluster_size == 1
-            and self.dtype == cutlass.Float32
-        ):
-            smem_list = smem.allocate_tensor(
-                element_type=cutlass.Float32,
-                layout=cute.make_ordered_layout((self.list_cap,), order=(0,)),
-                byte_alignment=128,
-            )
-        else:
-            smem_list = None
-
         # op#26 R0 admission scratch (single-CTA fast path). Allocated only
         # when enable_r0; None otherwise so the base SMEM layout is byte-for-
         # byte unchanged and these propagate harmlessly through _run_phases'
@@ -4637,7 +4631,6 @@ class GvrTopKKernel:
                         xstate_row=xstate_row,
                         cand_vals_row=cand_vals_row,
                         cand_idx_row=cand_idx_row,
-                        smem_list=smem_list,
                         cand_ctl_row=cand_ctl_row,
                         smem_active=smem_active,
                         s_active_cnt=s_active_cnt,
@@ -4688,7 +4681,6 @@ class GvrTopKKernel:
                             xstate_row=xstate_row,
                             cand_vals_row=cand_vals_row,
                             cand_idx_row=cand_idx_row,
-                            smem_list=smem_list,
                             cand_ctl_row=cand_ctl_row,
                             smem_active=smem_active,
                             s_active_cnt=s_active_cnt,
@@ -4736,7 +4728,6 @@ class GvrTopKKernel:
                     xstate_row=xstate_row,
                     cand_vals_row=cand_vals_row,
                     cand_idx_row=cand_idx_row,
-                    smem_list=smem_list,
                     cand_ctl_row=cand_ctl_row,
                     smem_active=smem_active,
                     s_active_cnt=s_active_cnt,
@@ -4787,7 +4778,6 @@ class GvrTopKKernel:
         xstate_row=None,  # emit_xstate: this row's [8] fp32 state slot
         cand_vals_row=None,  # ext cand: this row's [CAP] fp32 scores
         cand_idx_row=None,  # ext cand: this row's [CAP] int32 positions
-        smem_list=None,  # list path: [list_cap] fp32 score staging
         cand_ctl_row=None,  # ext cand: this row's [2] int32 {claimed, void}
         smem_active=None,
         s_active_cnt=None,
@@ -4844,7 +4834,7 @@ class GvrTopKKernel:
                 void_p = cutlass.Int32(cand_ctl_row[1])
                 if (
                     void_p == cutlass.Int32(0)
-                    and claimed_p >= cutlass.Int32(self.top_k)
+                    and claimed_p >= cutlass.Int32(self.top_k + 64)
                     and claimed_p <= cutlass.Int32(self.list_cap)
                     and seed_thr_row[0] < cutlass.Float32(1e37)
                 ):
@@ -4942,17 +4932,24 @@ class GvrTopKKernel:
                     if cutlass.const_expr(self.emit_xstate):
                         xstate_row[0] = cutlass.Float32(0.0)  # degenerate
         else:
-            # ---- List path (SoA): complete candidate list -> on-chip ----
-            # Admission is the entry count alone: K <= claimed <= list_cap
-            # (and no overflow) guarantees the true top-K lives in the
-            # list (it holds every position >= t_lo = seed_thr[0]). The
-            # score column is staged into the slice-cache smem region
-            # (fp32 specs; the fallback re-scan never runs on list rows,
-            # so the alias is safe), one smem histogram finds an edge
-            # whose exact count lands in [K, kC], survivors compact into
-            # the standard kC candidate buffers and the stock Phase 4
-            # finishes. All gating values are CTA-uniform (gmem control
-            # words / smem scalars), so the barriers stay convergent.
+            # ---- List path v4: known-counts admission ----
+            # The emitter wrote the SoA list (score column + position
+            # column, sentinel score -inf) collected at t0 = seed_thr[0]
+            # and COUNTED the two tighter lines on the way out: the
+            # control words carry {n0, void, n1, n2} with n_i = #(>= t_i),
+            # n0 >= n1 >= n2. Admission and cut selection are pure scalar
+            # lookups - no in-kernel counting, no staging, no gamble:
+            #   1. some n_i lands in the acceptance band [K, B*]  ->
+            #      cut at the TIGHTEST such line, ONE filtered pass.
+            #   2. the band is straddled or overshot by every line ->
+            #      a histogram over the gmem list CLAMPED between the
+            #      two known bracket lines finds an in-band edge (the
+            #      narrow domain kills the long-tail bin collapse).
+            #   3. void, or n0 < K + 64 (64 = emitter sentinel bound,
+            #      so live coverage of K is proven)  ->  fallback.
+            # The K+64 slack also lets every accepted cut load run
+            # WITHOUT any overflow net: counts and load predicates are
+            # the same comparison on the same data.
             # cs>1 and 16-bit dtypes keep the plain fallback.
             take_cand = cutlass.Int32(0)
             list_used = cutlass.Int32(0)  # list path taken (xstate publish)
@@ -4965,265 +4962,264 @@ class GvrTopKKernel:
             ):
                 claimed_c = cutlass.Int32(cand_ctl_row[0])
                 void_c = cutlass.Int32(cand_ctl_row[1])
-                # claimed >= K + 64: sentinel slots are bounded by the
-                # emitter contract (<= 64 pad), so this guarantees the
-                # LIVE count covers K without counting anything.
+                n1_c = cutlass.Int32(cand_ctl_row[2])
+                n2_c = cutlass.Int32(cand_ctl_row[3])
+                bstar = cutlass.const_expr(min(self.accept_cap, self.kC))
+                if cutlass.const_expr(_P4_TAIL_DBG):
+                    ck0 = cute.arch.clock64()
+                    ck1 = ck0
+                usable = cutlass.Int32(0)
                 if (
                     void_c == cutlass.Int32(0)
                     and claimed_c >= cutlass.Int32(self.top_k + 64)
                     and claimed_c <= cutlass.Int32(self.list_cap)
                 ):
-                    take_cand = cutlass.Int32(1)
-                if cutlass.const_expr(_P4_TAIL_DBG):
-                    ck0 = cute.arch.clock64()
-                    ck1 = ck0
-                if take_cand == cutlass.Int32(1):
-                    t_lo = seed_thr_row[0]
-                    lane_c = tidx & cutlass.Int32(self.WARP_SIZE - 1)
-                    vbase = cand_vals_row.iterator.toint()
-                    NBL = cutlass.const_expr(self.kNumBins)
-                    # ---- 1) stage: pure copy of the score column into
-                    # the dedicated smem region. No ballots, no atomics
-                    # (128 serialized smem atomics per trip measured
-                    # ~1.1us/1k entries), no warp-uniform constraint.
-                    # Sentinels sanitize to t_lo - 1 (rank below all live
-                    # scores; the K+64 admission bound covers K).
-                    list_used = cutlass.Int32(1)
-                    if tidx == cutlass.Int32(0):
-                        s_iscalars[2] = cutlass.Int32(0)
-                    snt = t_lo - cutlass.Float32(1.0)
-                    lmax = cutlass.Float32(self.NEG_FLT_MAX)
-                    i_s = tidx
-                    while i_s < claimed_c:
-                        for _ju in cutlass.range_constexpr(4):
-                            i_sj = i_s + cutlass.Int32(_ju * num_threads)
-                            if i_sj < claimed_c:
-                                vp_l = cute.make_ptr(
-                                    cutlass.Float32,
-                                    vbase + cutlass.Int64(i_sj) * cutlass.Int64(4),
-                                    cute.AddressSpace.gmem,
-                                    assumed_align=4,
-                                )
-                                v_l = cute.make_tensor(vp_l, cute.make_layout((1,)))[0]
-                                if v_l < t_lo:
-                                    v_l = snt
-                                smem_list[i_sj] = v_l
-                                lmax = cute.arch.fmax(lmax, v_l)
-                        i_s = i_s + cutlass.Int32(4 * num_threads)
-                    wmax_l = self.warp_reduce_max_f32(lmax)
-                    if lane == cutlass.Int32(0):
-                        smem_wmax[warp_id] = wmax_l
-                    cute.arch.barrier()
-                    # ---- 2) zooming histogram on the smem scores: find
-                    # the edge whose exact count lands in [K, kC], as
-                    # close to K as the bins allow. Value-linear bins
-                    # collapse on long-tailed logits (vmax is an extreme
-                    # outlier), so each round re-bins INSIDE the crossing
-                    # bin - one cheap smem pass per round, NBL^3 total
-                    # resolution; only genuine ties fall through.
-                    vmax = cutlass.Float32(self.NEG_FLT_MAX)
-                    for _wr in cutlass.range_constexpr(self.num_warps):
-                        vmax = cute.arch.fmax(vmax, smem_wmax[_wr])
-                    rng_l = vmax - t_lo
-                    if rng_l <= cutlass.Float32(0.0):
-                        rng_l = cutlass.Float32(1.0)
-                    r_lo = t_lo
-                    r_w = rng_l / cutlass.Float32(NBL)
-                    w0 = r_w  # round-0 bin width (anchor edge recompute)
-                    base_c = cutlass.Int32(0)
-                    t_star = t_lo
-                    searching = cutlass.Int32(1)
-                    if tidx == cutlass.Int32(0):
-                        # smem_wcnt[1]: round-0 anchor bin (the ~3K
-                        # crossing; [0] is the descend base). -1 = not
-                        # found -> anchor falls back to t_star. P4
-                        # clobbers smem_wcnt only AFTER we read this.
-                        smem_wcnt[1] = cutlass.Int32(-1)
-                    for _rd in cutlass.range_constexpr(3):
-                        if searching == cutlass.Int32(1):
-                            jz_l = tidx
-                            while jz_l < cutlass.Int32(NBL):
-                                smem_hist[jz_l] = cutlass.Int32(0)
-                                jz_l = jz_l + cutlass.Int32(num_threads)
-                            if tidx == cutlass.Int32(0):
-                                s_iscalars[2] = cutlass.Int32(0)
-                            cute.arch.barrier()
-                            inv_wr = cutlass.Float32(1.0) / r_w
-                            r_hi = r_lo + r_w * cutlass.Float32(NBL)
-                            i_h = tidx
-                            while i_h < claimed_c:
-                                v_h = smem_list[i_h]
-                                if v_h >= r_lo and v_h < r_hi:
-                                    b_h = cutlass.Int32((v_h - r_lo) * inv_wr)
-                                    if b_h < cutlass.Int32(0):
-                                        b_h = cutlass.Int32(0)
-                                    if b_h > cutlass.Int32(NBL - 1):
-                                        b_h = cutlass.Int32(NBL - 1)
-                                    atomicAdd(smem_hist.iterator + b_h, cutlass.Int32(1))
-                                i_h = i_h + cutlass.Int32(num_threads)
-                            cute.arch.barrier()
-                            # warp-0 top-down cumulative scan (P1b idiom)
-                            if warp_id == cutlass.Int32(0):
-                                SEGL = cutlass.const_expr(NBL // self.WARP_SIZE)
-                                top_l = cutlass.Int32(NBL - 1) - lane * cutlass.Int32(SEGL)
-                                seg_l = cute.make_fragment((SEGL,), cutlass.Int32)
-                                part_l = cutlass.Int32(0)
-                                for _js in cutlass.range_constexpr(SEGL):
-                                    v8_l = smem_hist[top_l - cutlass.Int32(_js)]
-                                    seg_l[_js] = v8_l
-                                    part_l = part_l + v8_l
-                                tp_l = part_l
-                                for _os in cutlass.range_constexpr(5):
-                                    ov_l = cutlass.const_expr(1 << _os)
-                                    oth_l = cute.arch.shuffle_sync_up(tp_l, ov_l, mask_and_clamp=0)
-                                    if lane >= cutlass.Int32(ov_l):
-                                        tp_l = tp_l + oth_l
-                                excl_l = tp_l - part_l
-                                kneed = cutlass.Int32(self.top_k) - base_c
-                                kfit = cutlass.Int32(self.kC) - base_c
-                                run_l = cutlass.Int32(0)
-                                for _js in cutlass.range_constexpr(SEGL):
-                                    run_l = run_l + seg_l[_js]
-                                    cum_at = excl_l + run_l
-                                    cum_bef = cum_at - seg_l[_js]
-                                    if cum_bef < kneed and cum_at >= kneed:
-                                        s_iscalars[3] = top_l - cutlass.Int32(_js)
-                                        smem_wcnt[0] = cum_bef
-                                        if cum_at <= kfit:
-                                            s_iscalars[2] = cutlass.Int32(1)
-                                        else:
-                                            s_iscalars[2] = cutlass.Int32(2)
-                                    if cutlass.const_expr(_rd == 0):
-                                        # closed-loop ANCHOR: the ~3K
-                                        # crossing edge. Publishing the
-                                        # exact k-th made the next-step
-                                        # down-guard target only 4K -
-                                        # slope noise then undershoots K
-                                        # and forces ~26us fallbacks; a
-                                        # 3K-count anchor restores the
-                                        # old edge semantics (~12K guard
-                                        # target) at zero extra passes.
-                                        anch_n = cutlass.const_expr(
-                                            min(3 * self.top_k, (self.top_k + self.kC) // 2)
-                                        )
-                                        if cum_bef < cutlass.Int32(
-                                            anch_n
-                                        ) and cum_at >= cutlass.Int32(anch_n):
-                                            smem_wcnt[1] = top_l - cutlass.Int32(_js)
-                            cute.arch.barrier()
-                            st_l = s_iscalars[2]
-                            if st_l == cutlass.Int32(1):
-                                t_star = r_lo + cutlass.Float32(s_iscalars[3]) * r_w
-                                searching = cutlass.Int32(0)
-                            if st_l == cutlass.Int32(2):
-                                base_c = base_c + smem_wcnt[0]
-                                r_lo = r_lo + cutlass.Float32(s_iscalars[3]) * r_w
-                                r_w = r_w / cutlass.Float32(NBL)
-                                if r_w <= cutlass.Float32(0.0):
-                                    searching = cutlass.Int32(0)
-                            if st_l == cutlass.Int32(0):
-                                searching = cutlass.Int32(0)
-                            cute.arch.barrier()
-                    if tidx == cutlass.Int32(0):
-                        if s_iscalars[2] != cutlass.Int32(1):
-                            s_iscalars[2] = cutlass.Int32(0)
-                    cute.arch.barrier()
-                    fired_l = s_iscalars[2]
-                    t_anch = t_star
-                    anch_b = smem_wcnt[1]
-                    if anch_b >= cutlass.Int32(0):
-                        t_anch = t_lo + cutlass.Float32(anch_b) * w0
-                    if fired_l == cutlass.Int32(1):
-                        # ---- 3) compact survivors into the standard kC
-                        # buffers: score from smem, position streamed
-                        # from the gmem index column. The four unrolled
-                        # sub-ballots merge into ONE atomic per warp per
-                        # trip (the per-sub-ballot atomic serialized 128
-                        # adds per trip across 32 warps).
-                        if tidx == cutlass.Int32(0):
-                            s_iscalars[0] = cutlass.Int32(0)
-                            s_thr[0] = t_anch  # closed-loop anchor
-                            s_iscalars[1] = cutlass.Int32(1)  # done
-                        cute.arch.barrier()
-                        i_c = tidx
-                        while (i_c - lane_c) < claimed_c:
-                            pvals = []
-                            pidxs = []
-                            keeps = []
-                            for _ju in cutlass.range_constexpr(4):
-                                i_cj = i_c + cutlass.Int32(_ju * num_threads)
-                                pval = cutlass.Float32(self.NEG_FLT_MAX)
-                                # vals slot carries the LIST INDEX - a
-                                # register, not a second (cold) gmem pass
-                                # over the position column; the post-P4
-                                # repair gathers true positions for the K
-                                # winners only.
-                                pidx = i_cj
-                                keep = cutlass.Int32(0)
-                                if i_cj < claimed_c:
-                                    pval = smem_list[i_cj]
-                                    if pval >= t_star:
-                                        keep = cutlass.Int32(1)
-                                pvals.append(pval)
-                                pidxs.append(pidx)
-                                keeps.append(keep)
-                            m0 = cute.arch.vote_ballot_sync(keeps[0] != cutlass.Int32(0))
-                            m1 = cute.arch.vote_ballot_sync(keeps[1] != cutlass.Int32(0))
-                            m2 = cute.arch.vote_ballot_sync(keeps[2] != cutlass.Int32(0))
-                            m3 = cute.arch.vote_ballot_sync(keeps[3] != cutlass.Int32(0))
-                            nk = cutlass.Int32(
-                                cute.arch.popc(m0)
-                                + cute.arch.popc(m1)
-                                + cute.arch.popc(m2)
-                                + cute.arch.popc(m3)
-                            )
-                            bk = cutlass.Int32(0)
-                            if nk > cutlass.Int32(0):
-                                if lane_c == cutlass.Int32(0):
-                                    bk = atomicAdd(s_iscalars.iterator + cutlass.Int32(0), nk)
-                                bk = cute.arch.shuffle_sync(bk, cutlass.Int32(0))
-                                lmk = (
-                                    cutlass.Uint32(1) << cutlass.Uint32(lane_c)
-                                ) - cutlass.Uint32(1)
-                                off = bk
+                    usable = cutlass.Int32(1)
+                # pre-declared: the DSL forbids first-assigning inside a
+                # dynamic if when read outside it
+                kK_l = cutlass.Int32(self.top_k)
+                bs_l = cutlass.Int32(bstar)
+                cut_t = cutlass.Float32(0.0)
+                have = cutlass.Int32(0)
+                anch_t = cutlass.Float32(0.0)
+                if usable == cutlass.Int32(1):
+                    # cut = tightest line whose count is in [K, B*];
+                    # anchor (closed-loop publish) = loosest such line.
+                    if n2_c >= kK_l and n2_c <= bs_l:
+                        cut_t = seed_thr_row[2]
+                        anch_t = seed_thr_row[2]
+                        have = cutlass.Int32(1)
+                    if n1_c >= kK_l and n1_c <= bs_l:
+                        if have == cutlass.Int32(0):
+                            cut_t = seed_thr_row[1]
+                        anch_t = seed_thr_row[1]
+                        have = cutlass.Int32(1)
+                    if claimed_c <= bs_l:
+                        if have == cutlass.Int32(0):
+                            cut_t = seed_thr_row[0]
+                        anch_t = seed_thr_row[0]
+                        have = cutlass.Int32(1)
+                    if have == cutlass.Int32(0):
+                        # No line in band: bracket the cut between the
+                        # two known lines that straddle it and find an
+                        # in-band edge with a clamped gmem histogram.
+                        #   all counts > B*      -> (t2, +inf): one max
+                        #                           pass supplies the top;
+                        #   n1 > B* and n2 < K   -> (t1, t2);
+                        #   n0 > B* and n1 < K   -> (t0, t1).
+                        vbase = cand_vals_row.iterator.toint()
+                        b_lo = seed_thr_row[0]
+                        b_hi = seed_thr_row[1]
+                        base_c = n1_c
+                        if n1_c > bs_l:
+                            b_lo = seed_thr_row[1]
+                            b_hi = seed_thr_row[2]
+                            base_c = n2_c
+                        need_max = cutlass.Int32(0)
+                        if n2_c > bs_l:
+                            b_lo = seed_thr_row[2]
+                            base_c = cutlass.Int32(0)
+                            need_max = cutlass.Int32(1)
+                        if need_max == cutlass.Int32(1):
+                            lmax = cutlass.Float32(self.NEG_FLT_MAX)
+                            i_m = tidx
+                            while i_m < claimed_c:
                                 for _ju in cutlass.range_constexpr(4):
-                                    mj = (
-                                        m0
-                                        if _ju == 0
-                                        else m1
-                                        if _ju == 1
-                                        else m2
-                                        if _ju == 2
-                                        else m3
-                                    )
-                                    if keeps[_ju] != cutlass.Int32(0):
-                                        wpos = off + cutlass.Int32(cute.arch.popc(mj & lmk))
-                                        if wpos < cutlass.Int32(self.kC):
-                                            smem_keys[wpos] = pvals[_ju]
-                                            smem_vals[wpos] = pidxs[_ju]
-                                    off = off + cutlass.Int32(cute.arch.popc(mj))
-                            i_c = i_c + cutlass.Int32(4 * num_threads)
-                        cute.arch.barrier()
-                        # hard net: histogram binning and the compact
-                        # test round float edges independently
-                        cnt_l = s_iscalars[0]
-                        if cnt_l < cutlass.Int32(self.top_k) or cnt_l > cutlass.Int32(self.kC):
-                            take_cand = cutlass.Int32(0)
-                            list_used = cutlass.Int32(0)
-                            if tidx == cutlass.Int32(0):
-                                s_iscalars[1] = cutlass.Int32(0)
-                                s_iscalars[2] = cutlass.Int32(-1)
-                                s_iscalars[3] = cutlass.Int32(-1)
+                                    i_mj = i_m + cutlass.Int32(_ju * num_threads)
+                                    if i_mj < claimed_c:
+                                        vp_m = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vbase + cutlass.Int64(i_mj) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        lmax = cute.arch.fmax(
+                                            lmax, cute.make_tensor(vp_m, cute.make_layout((1,)))[0]
+                                        )
+                                i_m = i_m + cutlass.Int32(4 * num_threads)
+                            wmax_l = self.warp_reduce_max_f32(lmax)
+                            if lane == cutlass.Int32(0):
+                                smem_wmax[warp_id] = wmax_l
                             cute.arch.barrier()
-                    if fired_l == cutlass.Int32(0):
-                        take_cand = cutlass.Int32(0)
-                        list_used = cutlass.Int32(0)
+                            vmax_l = cutlass.Float32(self.NEG_FLT_MAX)
+                            for _wr in cutlass.range_constexpr(self.num_warps):
+                                vmax_l = cute.arch.fmax(vmax_l, smem_wmax[_wr])
+                            b_hi = vmax_l + cutlass.Float32(1e-3)
+                        # zooming clamped histogram (up to 3 rounds; the
+                        # bracket is narrow so round 0 almost always
+                        # fires). State broadcasts ride s_iscalars[2]/[3]
+                        # (P2's slots, re-sentineled on every exit path).
+                        NBL = cutlass.const_expr(self.kNumBins)
+                        r_lo = b_lo
+                        r_w = (b_hi - b_lo) / cutlass.Float32(NBL)
+                        if r_w <= cutlass.Float32(0.0):
+                            r_w = cutlass.Float32(1e-6)
+                        searching = cutlass.Int32(1)
+                        for _rd in cutlass.range_constexpr(3):
+                            if searching == cutlass.Int32(1):
+                                jz_l = tidx
+                                while jz_l < cutlass.Int32(NBL):
+                                    smem_hist[jz_l] = cutlass.Int32(0)
+                                    jz_l = jz_l + cutlass.Int32(num_threads)
+                                if tidx == cutlass.Int32(0):
+                                    s_iscalars[2] = cutlass.Int32(0)
+                                cute.arch.barrier()
+                                inv_wr = cutlass.Float32(1.0) / r_w
+                                r_hi = r_lo + r_w * cutlass.Float32(NBL)
+                                i_h = tidx
+                                while i_h < claimed_c:
+                                    for _ju in cutlass.range_constexpr(4):
+                                        i_hj = i_h + cutlass.Int32(_ju * num_threads)
+                                        if i_hj < claimed_c:
+                                            vp_h = cute.make_ptr(
+                                                cutlass.Float32,
+                                                vbase + cutlass.Int64(i_hj) * cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            v_h = cute.make_tensor(vp_h, cute.make_layout((1,)))[0]
+                                            if v_h >= r_lo and v_h < r_hi:
+                                                b_h = cutlass.Int32((v_h - r_lo) * inv_wr)
+                                                if b_h < cutlass.Int32(0):
+                                                    b_h = cutlass.Int32(0)
+                                                if b_h > cutlass.Int32(NBL - 1):
+                                                    b_h = cutlass.Int32(NBL - 1)
+                                                atomicAdd(
+                                                    smem_hist.iterator + b_h, cutlass.Int32(1)
+                                                )
+                                    i_h = i_h + cutlass.Int32(4 * num_threads)
+                                cute.arch.barrier()
+                                if warp_id == cutlass.Int32(0):
+                                    SEGL = cutlass.const_expr(NBL // self.WARP_SIZE)
+                                    top_l = cutlass.Int32(NBL - 1) - lane * cutlass.Int32(SEGL)
+                                    seg_l = cute.make_fragment((SEGL,), cutlass.Int32)
+                                    part_l = cutlass.Int32(0)
+                                    for _js in cutlass.range_constexpr(SEGL):
+                                        v8_l = smem_hist[top_l - cutlass.Int32(_js)]
+                                        seg_l[_js] = v8_l
+                                        part_l = part_l + v8_l
+                                    tp_l = part_l
+                                    for _os in cutlass.range_constexpr(5):
+                                        ov_l = cutlass.const_expr(1 << _os)
+                                        oth_l = cute.arch.shuffle_sync_up(
+                                            tp_l, ov_l, mask_and_clamp=0
+                                        )
+                                        if lane >= cutlass.Int32(ov_l):
+                                            tp_l = tp_l + oth_l
+                                    excl_l = tp_l - part_l
+                                    kneed = kK_l - base_c
+                                    kfit = bs_l - base_c
+                                    run_l = cutlass.Int32(0)
+                                    for _js in cutlass.range_constexpr(SEGL):
+                                        run_l = run_l + seg_l[_js]
+                                        cum_at = excl_l + run_l
+                                        cum_bef = cum_at - seg_l[_js]
+                                        if cum_bef < kneed and cum_at >= kneed:
+                                            s_iscalars[3] = top_l - cutlass.Int32(_js)
+                                            smem_wcnt[0] = cum_bef
+                                            if cum_at <= kfit:
+                                                s_iscalars[2] = cutlass.Int32(1)
+                                            else:
+                                                s_iscalars[2] = cutlass.Int32(2)
+                                cute.arch.barrier()
+                                st_l = s_iscalars[2]
+                                if st_l == cutlass.Int32(1):
+                                    cut_t = r_lo + cutlass.Float32(s_iscalars[3]) * r_w
+                                    anch_t = cut_t
+                                    have = cutlass.Int32(1)
+                                    searching = cutlass.Int32(0)
+                                if st_l == cutlass.Int32(2):
+                                    base_c = base_c + smem_wcnt[0]
+                                    r_lo = r_lo + cutlass.Float32(s_iscalars[3]) * r_w
+                                    r_w = r_w / cutlass.Float32(NBL)
+                                    if r_w <= cutlass.Float32(0.0):
+                                        searching = cutlass.Int32(0)
+                                if st_l == cutlass.Int32(0):
+                                    searching = cutlass.Int32(0)
+                                cute.arch.barrier()
                         if tidx == cutlass.Int32(0):
+                            # restore P2's cnt_lo/cnt_hi sentinels
                             s_iscalars[2] = cutlass.Int32(-1)
                             s_iscalars[3] = cutlass.Int32(-1)
                         cute.arch.barrier()
+                if usable == cutlass.Int32(1) and have == cutlass.Int32(1):
+                    # ---- single filtered load at the cut ----
+                    take_cand = cutlass.Int32(1)
+                    list_used = cutlass.Int32(1)
+                    if tidx == cutlass.Int32(0):
+                        s_iscalars[0] = cutlass.Int32(0)
+                        s_thr[0] = anch_t  # closed-loop anchor
+                        s_iscalars[1] = cutlass.Int32(1)  # done
+                    cute.arch.barrier()
+                    vbase = cand_vals_row.iterator.toint()
+                    lane_c = tidx & cutlass.Int32(self.WARP_SIZE - 1)
+                    i_c = tidx
+                    while (i_c - lane_c) < claimed_c:
+                        pvals = []
+                        pidxs = []
+                        keeps = []
+                        for _ju in cutlass.range_constexpr(4):
+                            i_cj = i_c + cutlass.Int32(_ju * num_threads)
+                            pval = cutlass.Float32(self.NEG_FLT_MAX)
+                            keep = cutlass.Int32(0)
+                            if i_cj < claimed_c:
+                                vp_l = cute.make_ptr(
+                                    cutlass.Float32,
+                                    vbase + cutlass.Int64(i_cj) * cutlass.Int64(4),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=4,
+                                )
+                                pval = cute.make_tensor(vp_l, cute.make_layout((1,)))[0]
+                                if pval >= cut_t:
+                                    keep = cutlass.Int32(1)
+                            pvals.append(pval)
+                            # vals slot carries the LIST INDEX (register;
+                            # the position column is only gathered for
+                            # the K winners after Phase 4)
+                            pidxs.append(i_cj)
+                            keeps.append(keep)
+                        m0 = cute.arch.vote_ballot_sync(keeps[0] != cutlass.Int32(0))
+                        m1 = cute.arch.vote_ballot_sync(keeps[1] != cutlass.Int32(0))
+                        m2 = cute.arch.vote_ballot_sync(keeps[2] != cutlass.Int32(0))
+                        m3 = cute.arch.vote_ballot_sync(keeps[3] != cutlass.Int32(0))
+                        nk = cutlass.Int32(
+                            cute.arch.popc(m0)
+                            + cute.arch.popc(m1)
+                            + cute.arch.popc(m2)
+                            + cute.arch.popc(m3)
+                        )
+                        bk = cutlass.Int32(0)
+                        if nk > cutlass.Int32(0):
+                            if lane_c == cutlass.Int32(0):
+                                bk = atomicAdd(s_iscalars.iterator + cutlass.Int32(0), nk)
+                            bk = cute.arch.shuffle_sync(bk, cutlass.Int32(0))
+                            lmk = (cutlass.Uint32(1) << cutlass.Uint32(lane_c)) - cutlass.Uint32(1)
+                            off = bk
+                            for _ju in cutlass.range_constexpr(4):
+                                mj = m0 if _ju == 0 else m1 if _ju == 1 else m2 if _ju == 2 else m3
+                                if keeps[_ju] != cutlass.Int32(0):
+                                    wpos = off + cutlass.Int32(cute.arch.popc(mj & lmk))
+                                    if wpos < cutlass.Int32(self.kC):
+                                        smem_keys[wpos] = pvals[_ju]
+                                        smem_vals[wpos] = pidxs[_ju]
+                                off = off + cutlass.Int32(cute.arch.popc(mj))
+                            i_c = i_c + cutlass.Int32(4 * num_threads)
+                        if nk == cutlass.Int32(0):
+                            i_c = i_c + cutlass.Int32(4 * num_threads)
+                    cute.arch.barrier()
+                    # histogram-edge cuts round float edges independently
+                    # of the load predicate: keep the demote net for them
+                    # (line cuts are exact by construction and never trip)
+                    cnt_l = s_iscalars[0]
+                    if cnt_l < cutlass.Int32(self.top_k) or cnt_l > cutlass.Int32(self.kC):
+                        take_cand = cutlass.Int32(0)
+                        list_used = cutlass.Int32(0)
+                        if tidx == cutlass.Int32(0):
+                            s_iscalars[1] = cutlass.Int32(0)
+                        cute.arch.barrier()
                 if cutlass.const_expr(_P4_TAIL_DBG):
                     ck1 = cute.arch.clock64()
+
             if take_cand == cutlass.Int32(0):
                 # Stage this CTA's slice into SMEM once before Phase 2's
                 # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
