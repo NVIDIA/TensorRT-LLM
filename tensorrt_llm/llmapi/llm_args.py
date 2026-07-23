@@ -5499,6 +5499,11 @@ class TorchLlmArgs(BaseLlmArgs):
                         value = dspark_cfg.get(key)
                         if value is None:
                             value = draft_cfg.get(top_level_key)
+                        if value is None:
+                            # DeepSpec-released dense drafter checkpoints
+                            # (e.g. Qwen3DSparkModel) use unprefixed top-level
+                            # keys in their own config.json.
+                            value = draft_cfg.get(key)
                         return value
 
                     # The checkpoint's ``dspark_target_layer_ids`` is
