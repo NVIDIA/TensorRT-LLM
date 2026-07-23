@@ -15,6 +15,7 @@ import importlib.util
 import logging
 import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -157,6 +158,40 @@ def _total_accumulated_cached_steps(stats: dict) -> int:
     return total
 
 
+def _cache_dit_captured_blocks(transformer: torch.nn.Module) -> list[torch.nn.Module]:
+    """Block modules cache_dit captured at enable time.
+
+    cache_dit replaces ``transformer.forward`` with a ``functools.partial``
+    whose closure holds the UnifiedBlocks mapping; each cached-blocks module
+    keeps the block list it captured on ``.transformer_blocks``. Walk the
+    closure graph to collect those blocks so tests can assert on the exact
+    module references cache_dit drives at denoise time.
+    """
+    fwd = transformer.forward
+    stack = [getattr(fwd, "func", fwd)]
+    seen: set[int] = set()
+    captured: list[torch.nn.Module] = []
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        closure = getattr(obj, "__closure__", None)
+        if closure:
+            for cell in closure:
+                try:
+                    stack.append(cell.cell_contents)
+                except ValueError:
+                    pass  # empty cell
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, torch.nn.ModuleList):
+            stack.extend(obj)
+        elif isinstance(obj, torch.nn.Module) and hasattr(obj, "transformer_blocks"):
+            captured.extend(obj.transformer_blocks)
+    return captured
+
+
 # ---------------------------------------------------------------------------
 # 1) Wan 2.2 high/low step split (no mocks)
 # ---------------------------------------------------------------------------
@@ -239,7 +274,12 @@ class TestCacheDiTRealPipelineForward:
             pipeline.cache_accelerator = None
 
     @staticmethod
-    def _load_visual_gen_pipeline(checkpoint_dir: str, *, text_encoder_path: str = ""):
+    def _load_visual_gen_pipeline(
+        checkpoint_dir: str,
+        *,
+        text_encoder_path: str = "",
+        enable_torch_compile: bool = False,
+    ):
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
         from tensorrt_llm.visual_gen.args import (
             CacheDiTConfig,
@@ -267,7 +307,7 @@ class TestCacheDiTRealPipelineForward:
                 residual_diff_threshold=0.25,
             ),
             torch_compile_config=TorchCompileConfig(
-                enable=False,
+                enable=enable_torch_compile,
                 enable_autotune=False,
             ),
             compilation_config=CompilationConfig(skip_warmup=True),
@@ -313,6 +353,66 @@ class TestCacheDiTRealPipelineForward:
             finally:
                 if pipeline is not None:
                     self._teardown_cache_dit(pipeline)
+
+    def test_wan_cache_dit_enabled_after_torch_compile(self):
+        """Locks the enable-after-compile ordering from PipelineLoader.load.
+
+        Cache-DiT captures block-module references at enable time. If it were
+        enabled before torch_compile() (which replaces the block lists with
+        compiled copies), it would keep driving the stale eager blocks and
+        torch.compile would contribute nothing — a perf-only regression that
+        is invisible to the correctness assertions of the compile-off tests.
+        """
+        ckpt = _resolve_wan_checkpoint()
+        if ckpt is None:
+            pytest.skip(
+                "Wan 2.1 1.3B not found: set TRTLLM_CACHE_DIT_WAN_CHECKPOINT, "
+                f"install under {_DEFAULT_WAN_CHECKPOINT}, "
+                f"or under $LLM_MODELS_ROOT/{_WAN_SUBPATH}"
+            )
+
+        pipeline = None
+        with _suppress_stdlib_logging_for_cache_dit():
+            try:
+                pipeline = self._load_visual_gen_pipeline(ckpt, enable_torch_compile=True)
+                assert pipeline.cache_accelerator is not None
+                assert pipeline.cache_accelerator.is_enabled()
+
+                # The blocks cache_dit holds must be the torch.compile wrappers,
+                # and exactly the ones currently installed on the transformer —
+                # not the eager blocks that torch_compile() replaced.
+                captured = _cache_dit_captured_blocks(pipeline.transformer)
+                assert captured, "no cache_dit-captured blocks found on the patched forward"
+                assert all(isinstance(b, torch._dynamo.OptimizedModule) for b in captured), (
+                    "cache_dit captured eager blocks; it was enabled before torch.compile"
+                )
+                assert {id(b) for b in captured} == {id(b) for b in pipeline.transformer.blocks}
+
+                # OptimizedModule blocks can still silently fall back to eager
+                # (LTX-2 does today): require dynamo to report compiled frames
+                # after a real forward.
+                counters = torch._dynamo.utils.counters
+                counters.clear()
+                with torch.inference_mode():
+                    pipeline.forward(
+                        prompt="cache dit compile ordering validation",
+                        negative_prompt="",
+                        height=480,
+                        width=832,
+                        num_frames=33,
+                        num_inference_steps=8,
+                        guidance_scale=5.0,
+                        seed=0,
+                        max_sequence_length=256,
+                    )
+                assert counters["frames"]["ok"] > 0, (
+                    "torch.compile produced no compiled frames during forward; "
+                    "compiled blocks fell back to eager"
+                )
+            finally:
+                if pipeline is not None:
+                    self._teardown_cache_dit(pipeline)
+                torch._dynamo.reset()
 
     def test_flux_cache_dit_skips_blocks_after_forward(self):
         ckpt = _resolve_flux_checkpoint()
@@ -410,3 +510,105 @@ class TestCacheDiTRealPipelineForward:
             finally:
                 if pipeline is not None:
                     self._teardown_cache_dit(pipeline)
+
+
+# ---------------------------------------------------------------------------
+# 3) FLUX enabler check flags for compiled vs. eager blocks (CPU)
+# ---------------------------------------------------------------------------
+
+
+class _IdentityBlock(torch.nn.Module):
+    def forward(self, hidden_states, encoder_hidden_states):
+        return hidden_states, encoder_hidden_states
+
+
+@requires_cache_dit
+class TestFluxEnablerCompiledBlockCheckFlags:
+    """enable_cache_dit_for_flux must disable cache_dit's inspect-based
+    forward-pattern checks exactly when blocks are torch.compile wrappers.
+
+    Compiled blocks expose a ``(*args, **kwargs)`` forward, so cache_dit's
+    checks would assert at enable time (server startup) if left on; eager
+    blocks must keep them on. torch.compile here is lazy — no compilation
+    happens, so this runs on CPU.
+    """
+
+    @staticmethod
+    def _make_flux_like_pipeline(*, compiled: bool) -> SimpleNamespace:
+        def _blocks() -> torch.nn.ModuleList:
+            blocks = [_IdentityBlock(), _IdentityBlock()]
+            if compiled:
+                blocks = [torch.compile(b) for b in blocks]
+            return torch.nn.ModuleList(blocks)
+
+        return SimpleNamespace(
+            transformer=SimpleNamespace(
+                transformer_blocks=_blocks(),
+                single_transformer_blocks=_blocks(),
+            )
+        )
+
+    def _block_adapter_kwargs(self, *, compiled: bool, is_flux2: bool) -> dict:
+        from tensorrt_llm._torch.visual_gen.cache import cache_dit_enablers
+        from tensorrt_llm.visual_gen.args import CacheDiTConfig
+
+        pipeline = self._make_flux_like_pipeline(compiled=compiled)
+        with (
+            patch.object(cache_dit_enablers, "BlockAdapter") as adapter_cls,
+            patch.object(cache_dit_enablers, "cache_dit"),
+        ):
+            cache_dit_enablers.enable_cache_dit_for_flux(
+                pipeline, CacheDiTConfig(), is_flux2=is_flux2
+            )
+        adapter_cls.assert_called_once()
+        return adapter_cls.call_args.kwargs
+
+    @pytest.mark.parametrize("is_flux2", [False, True])
+    def test_compiled_blocks_disable_pattern_checks(self, is_flux2):
+        kwargs = self._block_adapter_kwargs(compiled=True, is_flux2=is_flux2)
+        assert kwargs["check_forward_pattern"] is False
+        assert kwargs["check_num_outputs"] is False
+
+    @pytest.mark.parametrize("is_flux2", [False, True])
+    def test_eager_blocks_keep_pattern_checks(self, is_flux2):
+        kwargs = self._block_adapter_kwargs(compiled=False, is_flux2=is_flux2)
+        assert kwargs["check_forward_pattern"] is True
+        assert kwargs["check_num_outputs"] is True
+
+
+# ---------------------------------------------------------------------------
+# 4) Enabler registry: explicit raise + declaration consistency (CPU)
+# ---------------------------------------------------------------------------
+
+
+@requires_cache_dit
+class TestCacheDiTEnablerRegistry:
+    def test_unregistered_pipeline_class_raises(self):
+        """A pipeline without a Cache-DiT enabler must fail loudly at enable
+        time (e.g. LTX2TwoStagesPipeline + cache_backend=cache_dit), not warn
+        and continue at full denoise cost."""
+        from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import (
+            enable_cache_dit_for_pipeline,
+        )
+        from tensorrt_llm.visual_gen.args import CacheDiTConfig
+
+        class LTX2TwoStagesPipeline:  # same name as the real unregistered variant
+            pass
+
+        with pytest.raises(ValueError, match="no enabler registered.*LTX2TwoStagesPipeline"):
+            enable_cache_dit_for_pipeline(LTX2TwoStagesPipeline(), CacheDiTConfig())
+
+    def test_enabler_keys_name_registered_pipeline_classes(self):
+        """Every CUSTOM_CACHE_DIT_ENABLERS key must name a real registered
+        pipeline class; a typo or rename would otherwise turn every enable
+        attempt for that pipeline into the 'no enabler registered' error."""
+        import tensorrt_llm._torch.visual_gen.models  # noqa: F401  (populates the registry)
+        from tensorrt_llm._torch.visual_gen.cache.cache_dit_enablers import (
+            CUSTOM_CACHE_DIT_ENABLERS,
+        )
+        from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY
+
+        unknown = sorted(set(CUSTOM_CACHE_DIT_ENABLERS) - set(PIPELINE_REGISTRY))
+        assert not unknown, (
+            f"CUSTOM_CACHE_DIT_ENABLERS keys not in the pipeline registry: {unknown}"
+        )
