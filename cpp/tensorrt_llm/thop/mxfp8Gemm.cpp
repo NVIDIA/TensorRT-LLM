@@ -48,6 +48,156 @@ tkc::CutlassGemmConfig getDefaultMxfp8GemmConfig()
         tkc::EpilogueScheduleType::AUTO, tkc::ClusterShape::ClusterShape_4x4x1);
 }
 
+enum class MiniMaxM3Mxfp8GemmRole
+{
+    kAttentionQkv,
+    kAttentionOutput,
+    kSharedGateUp,
+    kSharedDown,
+    kDenseGateUp,
+    kDenseDown,
+    kOther,
+};
+
+enum class MiniMaxM3Mxfp8MBand
+{
+    k8k,
+    k16k,
+    k32k,
+    kOther,
+};
+
+MiniMaxM3Mxfp8GemmRole getMiniMaxM3Mxfp8GemmRole(int64_t const n, int64_t const k)
+{
+    constexpr int64_t kHiddenSize = 6144;
+    if (n == 9216 && k == kHiddenSize)
+    {
+        return MiniMaxM3Mxfp8GemmRole::kAttentionQkv;
+    }
+    if (n == kHiddenSize && k == 8192)
+    {
+        return MiniMaxM3Mxfp8GemmRole::kAttentionOutput;
+    }
+    if (n == kHiddenSize && k == kHiddenSize)
+    {
+        return MiniMaxM3Mxfp8GemmRole::kSharedGateUp;
+    }
+    if (n == kHiddenSize && k == 3072)
+    {
+        return MiniMaxM3Mxfp8GemmRole::kSharedDown;
+    }
+    if (n == 24576 && k == kHiddenSize)
+    {
+        return MiniMaxM3Mxfp8GemmRole::kDenseGateUp;
+    }
+    if (n == kHiddenSize && k == 12288)
+    {
+        return MiniMaxM3Mxfp8GemmRole::kDenseDown;
+    }
+    return MiniMaxM3Mxfp8GemmRole::kOther;
+}
+
+MiniMaxM3Mxfp8MBand getMiniMaxM3Mxfp8MBand(int64_t const m)
+{
+    // The 8K-input workload produces one-, two-, and three/four-request CTX
+    // batches in these disjoint bands. Both endpoints of every band are
+    // validated independently on SM100 and SM103.
+    if (m >= 6553 && m <= 8192)
+    {
+        return MiniMaxM3Mxfp8MBand::k8k;
+    }
+    if (m >= 13106 && m <= 16384)
+    {
+        return MiniMaxM3Mxfp8MBand::k16k;
+    }
+    if (m >= 19659 && m <= 32768)
+    {
+        return MiniMaxM3Mxfp8MBand::k32k;
+    }
+    return MiniMaxM3Mxfp8MBand::kOther;
+}
+
+tkc::CutlassGemmConfig getMxfp8GemmConfig(int64_t const m, int64_t const n, int64_t const k)
+{
+    auto const defaultConfig = getDefaultMxfp8GemmConfig();
+    auto const role = getMiniMaxM3Mxfp8GemmRole(n, k);
+    auto const mBand = getMiniMaxM3Mxfp8MBand(m);
+    if (role == MiniMaxM3Mxfp8GemmRole::kOther || mBand == MiniMaxM3Mxfp8MBand::kOther)
+    {
+        return defaultConfig;
+    }
+
+    constexpr int kSm100 = 100;
+    constexpr int kSm103 = 103;
+    // PyExecutor binds one GPU architecture per rank, so cache the query after the first eligible call.
+    static int const smVersion = tensorrt_llm::common::getSMVersion();
+    if (smVersion != kSm100 && smVersion != kSm103)
+    {
+        return defaultConfig;
+    }
+
+    auto const makeConfig = [smVersion](tkc::CutlassTileConfigSM100 const tile, tkc::ClusterShape const cluster)
+    {
+        return tkc::CutlassGemmConfig(tile, tkc::MainloopScheduleType::AUTO, tkc::EpilogueScheduleType::AUTO, cluster,
+            tkc::ClusterShape::Undefined, tkc::ClusterShape::Undefined, smVersion);
+    };
+
+    if (smVersion == kSm100)
+    {
+        if (mBand == MiniMaxM3Mxfp8MBand::k8k)
+        {
+            bool const useK128Tile = role == MiniMaxM3Mxfp8GemmRole::kSharedDown
+                || role == MiniMaxM3Mxfp8GemmRole::kDenseGateUp || role == MiniMaxM3Mxfp8GemmRole::kDenseDown;
+            return makeConfig(useK128Tile ? tkc::CutlassTileConfigSM100::CtaShape128x256x128B
+                                          : tkc::CutlassTileConfigSM100::CtaShape128x128x256B,
+                useK128Tile ? tkc::ClusterShape::ClusterShape_2x1x1 : tkc::ClusterShape::ClusterShape_2x2x1);
+        }
+        if (mBand == MiniMaxM3Mxfp8MBand::k16k)
+        {
+            if (role == MiniMaxM3Mxfp8GemmRole::kAttentionQkv)
+            {
+                return makeConfig(
+                    tkc::CutlassTileConfigSM100::CtaShape128x128x256B, tkc::ClusterShape::ClusterShape_2x2x1);
+            }
+            if (role == MiniMaxM3Mxfp8GemmRole::kAttentionOutput)
+            {
+                return makeConfig(
+                    tkc::CutlassTileConfigSM100::CtaShape128x128x256B, tkc::ClusterShape::ClusterShape_2x1x1);
+            }
+            return makeConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x128B, tkc::ClusterShape::ClusterShape_2x1x1);
+        }
+
+        auto const cluster = role == MiniMaxM3Mxfp8GemmRole::kDenseGateUp ? tkc::ClusterShape::ClusterShape_4x2x1
+                                                                          : tkc::ClusterShape::ClusterShape_2x1x1;
+        return makeConfig(tkc::CutlassTileConfigSM100::CtaShape128x256x128B, cluster);
+    }
+
+    if (mBand == MiniMaxM3Mxfp8MBand::k8k)
+    {
+        auto const cluster = role == MiniMaxM3Mxfp8GemmRole::kDenseGateUp ? tkc::ClusterShape::ClusterShape_2x1x1
+                                                                          : tkc::ClusterShape::ClusterShape_2x2x1;
+        return makeConfig(tkc::CutlassTileConfigSM100::CtaShape128x128x256B, cluster);
+    }
+    if (mBand == MiniMaxM3Mxfp8MBand::k16k)
+    {
+        auto const use2x4Cluster = role == MiniMaxM3Mxfp8GemmRole::kAttentionQkv
+            || role == MiniMaxM3Mxfp8GemmRole::kSharedGateUp || role == MiniMaxM3Mxfp8GemmRole::kSharedDown;
+        auto const use2x1Cluster = role == MiniMaxM3Mxfp8GemmRole::kAttentionOutput;
+        auto const cluster = use2x4Cluster
+            ? tkc::ClusterShape::ClusterShape_2x4x1
+            : (use2x1Cluster ? tkc::ClusterShape::ClusterShape_2x1x1 : tkc::ClusterShape::ClusterShape_2x2x1);
+        return makeConfig(tkc::CutlassTileConfigSM100::CtaShape128x128x256B, cluster);
+    }
+
+    auto const use4x4Cluster
+        = role == MiniMaxM3Mxfp8GemmRole::kDenseGateUp || role == MiniMaxM3Mxfp8GemmRole::kDenseDown;
+    auto const use2x2Cluster = role == MiniMaxM3Mxfp8GemmRole::kSharedGateUp;
+    auto const cluster = use4x4Cluster
+        ? tkc::ClusterShape::ClusterShape_4x4x1
+        : (use2x2Cluster ? tkc::ClusterShape::ClusterShape_2x2x1 : tkc::ClusterShape::ClusterShape_2x1x1);
+    return makeConfig(tkc::CutlassTileConfigSM100::CtaShape128x128x256B, cluster);
+}
+
 template <typename T>
 void runMxfp8Gemm(at::Tensor& out, at::Tensor const& act, at::Tensor const& weight, at::Tensor const& actScale,
     at::Tensor const& weightScale, at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k,
@@ -111,7 +261,7 @@ at::Tensor mxfp8_mxfp8_gemm(at::Tensor const& act, at::Tensor const& actScale, a
 
     at::Tensor out = at::detail::empty_cuda({m, n}, chosen_dtype, act.device(), std::nullopt);
 
-    auto const config = getDefaultMxfp8GemmConfig();
+    auto const config = getMxfp8GemmConfig(m, n, k);
     switch (chosen_dtype)
     {
     case at::ScalarType::Half:
