@@ -282,6 +282,14 @@ def _register_fake():
         return scores.new_empty((scores.shape[2], scores.shape[0], topk),
                                 dtype=torch.int32)
 
+    @torch.library.register_fake("trtllm::minimax_m3_fp8_indexer_qk_norm_rope")
+    def _(qk, index_k_cache, out_cache_loc, num_heads_q, head_dim, rotary_dim,
+          eps, q_weight, k_weight, base, position_ids):
+        del index_k_cache, out_cache_loc, rotary_dim, eps, q_weight, k_weight
+        del base, position_ids
+        return qk.new_empty((qk.shape[0], num_heads_q, head_dim),
+                            dtype=torch.float8_e4m3fn)
+
     @torch.library.register_fake("trtllm::userbuffers_allreduce_finalize")
     def _(input, force_applying_finalize):
         return torch.empty_like(input)

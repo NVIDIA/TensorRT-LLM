@@ -40,6 +40,7 @@ class MiniMaxM3SparseParams(SparseParams):
     score_type: str = "max"
     disable_index_value: bool = True
     implementation: Literal["triton", "msa"] = "triton"
+    indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
 
     @property
     def indices_block_size(self) -> int:
