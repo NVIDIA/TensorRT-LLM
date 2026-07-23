@@ -70,9 +70,11 @@ function(add_gtest test_name test_src)
   gtest_discover_tests(
     ${test_name}
     PROPERTIES ${test_properties}
-    DISCOVERY_MODE PRE_TEST # WAR for DLL discovery on windows.
-    DISCOVERY_TIMEOUT 30) # Longer timeout needed because discovery
-                          # can be slow on Windows
+               DISCOVERY_MODE
+               PRE_TEST # WAR for DLL discovery on windows.
+               DISCOVERY_TIMEOUT
+               30) # Longer timeout needed because discovery can be slow on
+                   # Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 
