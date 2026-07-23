@@ -9,7 +9,7 @@ flat offset that can exceed 2^31, mask every ragged tail, kernels vendored here.
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 import triton
@@ -65,25 +65,6 @@ def _gather_mean_phase_kernel(
         tl.store(swa_destination_bases + request, token_start + rebase_delta)
 
 
-def build_mean_phase_table(
-    offsets: torch.Tensor, omega: torch.Tensor, initial_rows: int
-) -> Dict[str, object]:
-    """Build the plain-dict mean-phase table shared (by reference) by every workspace.
-
-    Row ``p`` holds ``mean_o(trig((p + offset_o) * omega_f))`` per frequency.
-    """
-    phase: Dict[str, object] = {
-        "offsets": offsets.contiguous(),
-        "omega": omega.contiguous(),
-        "offset_values": offsets.tolist(),
-        "cos": None,
-        "sin": None,
-        "rows": 0,
-    }
-    grow_mean_phase_table(phase, max(int(initial_rows), 1))
-    return phase
-
-
 def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
     """Cover positions ``[0, rows)``, rebuilding the table if it must grow."""
     rows = int(rows)
@@ -108,42 +89,6 @@ def grow_mean_phase_table(phase: Dict[str, object], rows: int) -> None:
     phase["cos"] = cos_table.mul_(scale)
     phase["sin"] = sin_table.mul_(scale)
     phase["rows"] = target
-
-
-def gather_mean_phases(
-    phase: Dict[str, object],
-    round_starts: torch.Tensor,
-    mean_cos: torch.Tensor,
-    mean_sin: torch.Tensor,
-    valid_seq_lens: torch.Tensor,
-    token_starts: torch.Tensor,
-    valid_widths: torch.Tensor,
-    request_count: int,
-    *,
-    swa_destination_bases: Optional[torch.Tensor] = None,
-    rebase_delta: int = 0,
-) -> None:
-    """Refresh the mean buffers, valid widths, and (with SWA) the rebased
-    landing positions, in place: the compiled score launch captured the pointers.
-    """
-    num_freqs = phase["omega"].numel()
-    _gather_mean_phase_kernel[(request_count,)](
-        round_starts,
-        phase["cos"],
-        phase["sin"],
-        mean_cos,
-        mean_sin,
-        valid_seq_lens,
-        token_starts,
-        valid_widths,
-        swa_destination_bases,
-        phase["rows"],
-        rebase_delta,
-        NUM_FREQS=num_freqs,
-        F_BLOCK=triton.next_power_of_2(num_freqs),
-        HAS_SWA=swa_destination_bases is not None,
-        num_warps=1,
-    )
 
 
 # --------------------------------------------------------------------------- #

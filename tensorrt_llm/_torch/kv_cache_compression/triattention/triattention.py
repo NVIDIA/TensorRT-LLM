@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import triton
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -42,9 +43,8 @@ from ..compaction import init_compaction_buffers
 from .triattention_kernels import (
     SETTLE_PACK_BLOCK,
     SETTLE_PACK_NUM_WARPS,
+    _gather_mean_phase_kernel,
     _settle_ties_and_pack_compaction_sources_kernel,
-    build_mean_phase_table,
-    gather_mean_phases,
     grow_mean_phase_table,
     prepare_per_head_scores,
 )
@@ -299,8 +299,18 @@ def init_eviction_buffers(
     bufs.mean_sin = torch.empty_like(bufs.mean_cos)
     # ``phase=None`` is the one documented test seam (private table built here).
     if phase is None:
-        phase = build_mean_phase_table(offsets, omega, initial_rows=seq_len)
+        phase = {
+            "offsets": offsets.contiguous(),
+            "omega": omega.contiguous(),
+            "offset_values": offsets.tolist(),
+            "cos": None,
+            "sin": None,
+            "rows": 0,
+        }
+        grow_mean_phase_table(phase, max(int(seq_len), 1))
     bufs.phase = phase
+    bufs.phase_num_freqs = int(phase["omega"].numel())
+    bufs.phase_f_block = triton.next_power_of_2(bufs.phase_num_freqs)
 
     # ---- score state: one fused group across all dense layers --------------
     p0 = layer_pools[dense_layers[0]]
@@ -675,17 +685,23 @@ def run_eviction_round(bufs: SimpleNamespace, normalize_scores: bool) -> None:
     union = bufs.eviction_mode == "union"
     with nvtx_range("triattention.score", color="blue"):
         # In-place refresh: the compiled score launches captured these pointers.
-        gather_mean_phases(
-            bufs.phase,
+        # The phase table tensors are read at launch time (growth replaces them).
+        _gather_mean_phase_kernel[(request_count,)](
             bufs.round_starts_device,
+            bufs.phase["cos"],
+            bufs.phase["sin"],
             bufs.mean_cos,
             bufs.mean_sin,
             bufs.valid_seq_lens_device,
             bufs.token_starts_device,
             bufs.valid_widths,
-            request_count,
-            swa_destination_bases=bufs.swa_destination_bases,
-            rebase_delta=bufs.swa_rebase_delta,
+            bufs.swa_destination_bases,
+            bufs.phase["rows"],
+            bufs.swa_rebase_delta,
+            NUM_FREQS=bufs.phase_num_freqs,
+            F_BLOCK=bufs.phase_f_block,
+            HAS_SWA=bufs.swa_destination_bases is not None,
+            num_warps=1,
         )
         if union:
             bufs.runner.launch_union_fusion(
@@ -1588,13 +1604,17 @@ class TriAttention(BaseKVCacheCompressionManager):
                 dtype=torch.float32,
             )
         if self._phase is None:
-            self._phase = build_mean_phase_table(
-                self._offsets,
-                self.calibration["omega"]
+            self._phase = {
+                "offsets": self._offsets.contiguous(),
+                "omega": self.calibration["omega"]
                 .to(device=first_pool.device, dtype=torch.float32)
                 .contiguous(),
-                initial_rows=seq_capacity,
-            )
+                "offset_values": self._offsets.tolist(),
+                "cos": None,
+                "sin": None,
+                "rows": 0,
+            }
+            grow_mean_phase_table(self._phase, max(int(seq_capacity), 1))
         q_real, q_imag, mlr_coef = self._local_score_calibration(
             layout["num_layers"], layout["global_layers"]
         )
