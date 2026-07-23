@@ -1,36 +1,35 @@
 # Adding a New Model
 
-## Table of Contents
-1. [Introduction](#introduction)
-2. [Prerequisites](#prerequisites)
-3. [Step-by-Step Guide](#step-by-step-guide)
+This guide provides a step-by-step process for adding a new model to the PyTorch backend.
+
+The following sections describe the steps for adding a new model:
+
+1. [Prerequisites](#prerequisites)
+1. [Step-by-Step Guide](#step-by-step-guide)
     1. [Model Configuration](#model-configuration)
-    2. [Model Definition](#model-definition)
-    3. [Weight Loading](#weight-loading)
-    4. [Model Registration](#model-registration)
+    1. [Model Definition](#model-definition)
+    1. [Weight Loading](#weight-loading)
+    1. [Model Registration](#model-registration)
         1. [Core Models](#core-models)
-        2. [Out-of-Tree Models](#out-of-tree-models)
+        1. [Out-of-Tree Models](#out-of-tree-models)
 
-## Introduction
-
-This guide provides a step-by-step process for adding a new model in PyTorch Backend.
 
 ## Prerequisites
 
 Before you begin, ensure you have the following:
-- A working installation of TensorRT-LLM. Follow these [instructions](../installation/build-from-source.md).
+- A working installation of TensorRT-LLM. Follow the [Build from Source](../installation/build-from-source.md) install guide.
 
 ## Step-by-Step Guide
 
 ### Model Configuration
 
-Suppose you want to support a new model named `MyModel`. If the model is already supported in HuggingFace's transformers, you should bring the PyTorch modeling code and reuse HuggingFace's configuration class. For example, our `tensorrt_llm/_torch/models/modeling_llama.py` was adapted from HuggingFace's [modeling_llama.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py); in the modeling code, we reuse the configuration class:
+Suppose you want to support a new model named `MyModel`. If the model is already supported in Hugging Face Transformers, adapt the PyTorch modeling code and reuse the Hugging Face configuration class. For example, `tensorrt_llm/_torch/models/modeling_llama.py` was adapted from the Hugging Face [modeling_llama.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py) implementation and reuses its configuration class:
 
 ```python
 from transformers import LlamaConfig
 ```
 
-If the model is not registered in HuggingFace's transformers, you need to define the configuration class in your `configuration_mymodel.py` following HuggingFace's [configuration_llama.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/configuration_llama.py):
+If the model is not registered in Hugging Face Transformers, define the configuration class in `configuration_mymodel.py` by following the Hugging Face [configuration_llama.py](https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/configuration_llama.py) implementation:
 
 ```python
 from transformers.configuration_utils import PretrainedConfig
@@ -42,7 +41,7 @@ class MyConfig(PretrainedConfig):
 
 ### Model Definition
 
-Remove any unnecessary code (e.g., training-specific code), and then rewrite some PyTorch modules. For a typical Transformer decoder model, you need to implement your `modeling_mymodel.py` like this:
+Remove any unnecessary code, such as training-specific code, and then rewrite the required PyTorch modules. For a typical Transformer decoder model, implement `modeling_mymodel.py` as follows:
 
 ```python
 from typing import Optional
@@ -104,20 +103,20 @@ class MyModelForCausalLM(DecoderModelForCausalLM[MyModel, MyConfig]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 ```
 
-Note that `MyAttention` inherits from our `Attention` module (in `tensorrt_llm/_torch/modules/attention.py`), so that the attention computation is compatible with our PyTorch runtime. Related to this, module inputs should also be adapted:
+`MyAttention` inherits from the TensorRT-LLM `Attention` module in `tensorrt_llm/_torch/modules/attention.py`. This inheritance makes the attention computation compatible with the PyTorch runtime. Adapt the module inputs as follows:
 
-- The `attn_metadata` stores the metadata from the batched input and KV cache for the attention backend. It is created by and passed from the runtime, and model developers need to ensure that `attn_metadata` is correctly passed to the attention module.
-- The input tensors (i.e., `input_ids`, `position_ids`, `hidden_states`) are in the packed mode. The first dimension corresponds to the number of tokens in a batch.
+- The `attn_metadata` stores metadata from the batched input and key-value (KV) cache for the attention backend. The runtime creates and passes this metadata. Ensure that `attn_metadata` is passed correctly to the attention module.
+- The input tensors, such as `input_ids`, `position_ids`, and `hidden_states`, use packed mode. The first dimension corresponds to the number of tokens in a batch.
 
-Additionally, `MyDecoderLayer`, `MyModel`, and `MyModelForCausalLM` are subclasses of `DecoderLayer`, `DecoderModel`, and `DecoderModelForCausalLM` respectively. The base classes define interfaces and provide a generic scaffolding to define model layers, load weights, etc.
+Additionally, `MyDecoderLayer`, `MyModel`, and `MyModelForCausalLM` are subclasses of `DecoderLayer`, `DecoderModel`, and `DecoderModelForCausalLM`, respectively. The base classes define interfaces and provide generic scaffolding for defining model layers and loading weights.
 
-Optionally, you may replace the native PyTorch modules with our implementations to enable features or achieve higher performance:
+Optionally, you can replace the native PyTorch modules with TensorRT-LLM implementations to enable features or improve performance:
 - `Linear` (in `tensorrt_llm/_torch/modules/linear.py`): Enables tensor parallelism and quantization.
 - `Embedding` (in `tensorrt_llm/_torch/modules/embedding.py`): Enables tensor parallelism for embedding.
 - `RotaryEmbedding` (in `tensorrt_llm/_torch/modules/rotary_embedding.py`): Enables performant rotary embedding.
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
-For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.
+For a concrete example, refer to `tensorrt_llm/_torch/models/modeling_llama.py`.
 
 ### Weight Loading
 
@@ -131,7 +130,7 @@ class MyModelForCausalLM(DecoderModelForCausalLM[MyModel, MyConfig]):
         ...
 ```
 
-For example, Huggingface's LLaMA model uses three linear layers for Q/K/V projections, resulting in three weight tensors in the checkpoint:
+For example, the Hugging Face LLaMA model uses three linear layers for query, key, and value (Q/K/V) projections, resulting in three weight tensors in the checkpoint:
 
 ```python
 >>> weights
@@ -144,20 +143,20 @@ For example, Huggingface's LLaMA model uses three linear layers for Q/K/V projec
 }
 ```
 
-However, our LLaMA model fuses the three layers into one linear layer:
+However, the TensorRT-LLM LLaMA model fuses the three layers into one linear layer:
 
 ```python
 >>> llama.model.layers[0].self_attn.qkv_proj.weight.data
 torch.Tensor([hidden_size * 3, hidden_size])
 ```
 
-Hence, `load_weights` needs to collect the three weight tensors from the original checkpoint, concatenate them, and assign them to the fused linear layer. Considering tensor parallelism and quantization, the process would be more complicated. We recommend calling the predefined module-level `load_weights` (e.g., `Linear` and `Embedding`) when implementing your model-level `load_weights` method.
+The `load_weights` method must collect the three weight tensors from the original checkpoint, concatenate them, and assign them to the fused linear layer. Tensor parallelism and quantization add complexity to this process. Use the predefined module-level `load_weights` methods, such as those for `Linear` and `Embedding`, when implementing the model-level `load_weights` method.
 
 Overall, `load_weights` should handle any discrepancy between `MyModelForCausalLM` and the weights loaded from the checkpoint, so that `MyModelForCausalLM` can perform forward computation equivalent to the original model.
 
 ### Model Registration
 
-The new model needs to be registered so that it can be recognized by the PyTorch runtime. The registration can be done simply by adding the `register_auto_model` decorator for `MyModelForCausalLM`:
+Register the new model so that the PyTorch runtime can recognize it. Add the `register_auto_model` decorator to `MyModelForCausalLM`:
 
 ```python
 from tensorrt_llm._torch.models.modeling_utils import register_auto_model
@@ -170,7 +169,7 @@ class MyModelForCausalLM(DecoderModelForCausalLM[MyModel, MyConfig]):
 
 #### Core Models
 
-To add the new model to core models, `modeling_mymodel.py` (and potentially `configuration_mymodel.py`) should be placed in `tensorrt_llm/_torch/models`. Then, you need to import the modeling code in `tensorrt_llm/_torch/models/__init__.py`:
+To add the new model to the core models, place `modeling_mymodel.py` and, if needed, `configuration_mymodel.py` in `tensorrt_llm/_torch/models`. Then, import the modeling code in `tensorrt_llm/_torch/models/__init__.py`:
 
 ```python
 from .modeling_mymodel import MyModelForCausalLM
@@ -183,7 +182,7 @@ __all__ = [
 
 #### Out-of-Tree Models
 
-Alternatively, you can register the new model as an out-of-tree model, so that you can use the new model without touching the TensorRT LLM codebase. To do so, place `modeling_mymodel.py` (and potentially `configuration_mymodel.py`) in your working directory, and import the modeling code in your script:
+Alternatively, register the new model as an out-of-tree model to use it without modifying the TensorRT-LLM codebase. Place `modeling_mymodel.py` and, if needed, `configuration_mymodel.py` in your working directory, and import the modeling code in your script:
 
 ```python
 from tensorrt_llm import LLM
@@ -196,7 +195,7 @@ if __name__ == '__main__':
     main()
 ```
 
-We provide an out-of-tree modeling example in `examples/llm-api/out_of_tree_example`. The model is implemented in `modeling_opt.py` and you can run the example by:
+For an out-of-tree modeling example, refer to `examples/llm-api/out_of_tree_example`. The model is implemented in `modeling_opt.py`. Run the example with the following command:
 
 ```bash
 python examples/llm-api/out_of_tree_example/main.py
