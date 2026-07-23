@@ -1658,58 +1658,60 @@ class KVCacheManagerV2(BaseResourceManager):
         typical_step = None
         constraints = []
         if kv_cache_config.pool_ratio is None:
-            typical_seq_len = (
-                kv_cache_config.avg_seq_len
-                if kv_cache_config.avg_seq_len is not None
-                else self.max_seq_len
-            )
-            if typical_seq_len > self.max_seq_len:
+            typical_seq_len = self._get_typical_seq_len(kv_cache_config)
+            if typical_seq_len is not None and typical_seq_len > self.max_seq_len:
                 raise ValueError(
                     f"kv_cache_config.avg_seq_len ({typical_seq_len}) must be less than or "
                     f"equal to max_seq_len ({self.max_seq_len})"
                 )
 
-            # Model one context request and enough generation requests to fill
-            # max_batch_size without over-provisioning windowed cache pools.
-            context_capacity = (
-                self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
-            ) + self.num_extra_kv_tokens
-            generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
-            typical_step = BatchDesc(
-                [KVCacheDesc(capacity=context_capacity, history_length=0)]
-                + [
-                    KVCacheDesc(
-                        capacity=typical_seq_len,
-                        history_length=generation_history_length,
-                    )
-                ]
-                * (self.max_batch_size - 1)
-            )
-
-            # CUDA graph generation warmup uses one request at max_seq_len and
-            # enough minimal decode requests to fill max_batch_size.
-            min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
-            constraints.append(
-                BatchDesc(
-                    [KVCacheDesc(capacity=self.max_seq_len, history_length=self.max_seq_len - 1)]
-                    + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+            if typical_seq_len is not None:
+                # Model one context request and enough generation requests to fill
+                # max_batch_size without over-provisioning windowed cache pools.
+                context_capacity = (
+                    self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
+                ) + self.num_extra_kv_tokens
+                generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
+                typical_step = BatchDesc(
+                    [KVCacheDesc(capacity=context_capacity, history_length=0)]
+                    + [
+                        KVCacheDesc(
+                            capacity=typical_seq_len,
+                            history_length=generation_history_length,
+                        )
+                    ]
                     * (self.max_batch_size - 1)
                 )
-            )
 
-            # General and chunked-prefill warmup uses one fresh context request
-            # at the per-iteration token budget.
-            if self.max_num_tokens is not None:
+                # CUDA graph generation warmup uses one request at max_seq_len and
+                # enough minimal decode requests to fill max_batch_size.
+                min_decode_capacity = 1 + self.max_draft_len + self.num_extra_kv_tokens
                 constraints.append(
                     BatchDesc(
                         [
                             KVCacheDesc(
-                                capacity=self.max_num_tokens + self.num_extra_kv_tokens,
-                                history_length=0,
+                                capacity=self.max_seq_len,
+                                history_length=self.max_seq_len - 1,
                             )
                         ]
+                        + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                        * (self.max_batch_size - 1)
                     )
                 )
+
+                # General and chunked-prefill warmup uses one fresh context request
+                # at the per-iteration token budget.
+                if self.max_num_tokens is not None:
+                    constraints.append(
+                        BatchDesc(
+                            [
+                                KVCacheDesc(
+                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    history_length=0,
+                                )
+                            ]
+                        )
+                    )
 
         buffer_type = [Role.KEY]
         if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
@@ -1781,6 +1783,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Customize the general cache config for a specialized cache manager."""
         return config
+
+    def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
+        """Return the configured typical sequence length, if any."""
+        return kv_cache_config.avg_seq_len
 
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int
