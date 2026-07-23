@@ -268,9 +268,7 @@ def test_find_mm_token_lengths_accepts_video_data_numpy_frames():
     frames = np.zeros((2, 8, 10, 3), dtype=np.uint8)
 
     class FakeVideoProcessor:
-        def get_num_tokens_per_video(
-            self, *, video, video_grid_thw=None, video_metadata=None
-        ):
+        def get_num_tokens_per_video(self, *, video, video_grid_thw=None, video_metadata=None):
             assert isinstance(video, list)
             assert len(video) == 2
             assert all(isinstance(frame, np.ndarray) for frame in video)
@@ -289,9 +287,7 @@ def test_find_mm_token_lengths_preserves_video_data_tensor_frame_lists():
     frames = [torch.zeros((3, 8, 10)), torch.ones((3, 8, 10))]
 
     class FakeVideoProcessor:
-        def get_num_tokens_per_video(
-            self, *, video, video_grid_thw=None, video_metadata=None
-        ):
+        def get_num_tokens_per_video(self, *, video, video_grid_thw=None, video_metadata=None):
             assert video is frames
             assert video_metadata == {}
             return 16
