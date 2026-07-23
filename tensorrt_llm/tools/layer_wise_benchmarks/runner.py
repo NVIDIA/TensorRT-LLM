@@ -661,6 +661,21 @@ class Runner:
         )
         kwargs = {}
 
+        # DeepSeek-V4 (multi-head hyper-connection) decoder layers take the initial residual
+        # as ``hc_state`` shaped ``[num_tokens, hc_mult, hidden_size]`` (not a 2D hidden-states
+        # tensor), and their MoE routing requires ``input_ids``. Both are absent from the
+        # generic single-layer harness, so synthesize them when the model exposes ``hc_mult``.
+        hc_mult = getattr(pretrained_config, "hc_mult", None)
+        if hc_mult is not None:
+            hidden_states = hidden_states.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+            kwargs["input_ids"] = torch.randint(
+                0,
+                pretrained_config.vocab_size,
+                (batch_size * seq_len_q,),
+                dtype=torch.int32,
+                device="cuda",
+            )
+
         if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
             mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests,
@@ -678,7 +693,7 @@ class Runner:
                     hidden_states_out, residual_out = self.model(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
-            if check:
+            if check and isinstance(hidden_states_out, torch.Tensor):
                 if hidden_states_out.isnan().any():
                     raise ValueError("Has nan, please fix weights initialization")
                 if hidden_states_out.isinf().any():
@@ -816,6 +831,7 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
                 layer_mask=layer_mask,
+                vocab_size=config.vocab_size,
                 sparse_attention_config=model_config.sparse_attention_config,
                 pretrained_config=model_config.pretrained_config,
             )
