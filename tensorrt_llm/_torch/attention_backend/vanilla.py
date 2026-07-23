@@ -66,16 +66,30 @@ class VanillaAttentionMetadata(AttentionMetadata):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.kv_layout = "NHD"
+        self._uses_layer_specific_cache_indices_cache: Optional[bool] = None
 
     def _uses_layer_specific_cache_indices(self) -> bool:
         if self.kv_cache_manager is None:
             return False
-        return (getattr(self.kv_cache_manager, "is_vswa", False)
+        cached_result = getattr(self,
+                                "_uses_layer_specific_cache_indices_cache",
+                                None)
+        if cached_result is not None:
+            return cached_result
+        if (getattr(self.kv_cache_manager, "is_vswa", False)
                 or getattr(self.kv_cache_manager, "is_linear_attention", False)
-                or getattr(self.kv_cache_manager, "num_pools", 1) > 1
-                or callable(
-                    getattr(self.kv_cache_manager, "get_layer_page_index_scale",
-                            None)))
+                or getattr(self.kv_cache_manager, "num_pools", 1) > 1):
+            self._uses_layer_specific_cache_indices_cache = True
+            return self._uses_layer_specific_cache_indices_cache
+
+        get_scale = getattr(self.kv_cache_manager, "get_layer_page_index_scale",
+                            None)
+        layer_offsets = getattr(self.kv_cache_manager, "layer_offsets", ())
+        self._uses_layer_specific_cache_indices_cache = (
+            callable(get_scale) and len(layer_offsets) > 1
+            and len({get_scale(layer_idx)
+                     for layer_idx in layer_offsets}) > 1)
+        return self._uses_layer_specific_cache_indices_cache
 
     def prepare(self) -> None:
         super().prepare()
