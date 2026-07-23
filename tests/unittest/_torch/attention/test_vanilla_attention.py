@@ -25,7 +25,7 @@ class TestVanillaAttention(unittest.TestCase):
         "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
     )
     def test_prepare_defers_cache_indices_for_layer_specific_pools(
-            self, mock_prepare):
+            self, mock_prepare: MagicMock) -> None:
         for manager_attributes in ({
                 "is_vswa": True
         }, {
@@ -53,7 +53,8 @@ class TestVanillaAttention(unittest.TestCase):
     @patch(
         "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
     )
-    def test_single_pool_cache_indices_remain_prepared_once(self, mock_prepare):
+    def test_single_pool_cache_indices_remain_prepared_once(
+            self, mock_prepare: MagicMock) -> None:
         manager = MagicMock()
         manager.is_vswa = False
         manager.is_linear_attention = False
@@ -73,15 +74,16 @@ class TestVanillaAttention(unittest.TestCase):
         manager.get_batch_cache_indices.assert_called_once_with([11])
         mock_prepare.assert_called_once_with()
 
-    def test_layer_specific_cache_indices_follow_attention_layer(self):
+    def test_layer_specific_cache_indices_follow_attention_layer(self) -> None:
         events = []
         manager = MagicMock()
 
-        def get_batch_cache_indices(request_ids, layer_idx):
+        def get_batch_cache_indices(request_ids: list[int],
+                                    layer_idx: int) -> list[list[int]]:
             events.append(("indices", layer_idx))
             return [[10 + layer_idx]]
 
-        def get_buffers(layer_idx, *, kv_layout):
+        def get_buffers(layer_idx: int, *, kv_layout: str) -> torch.Tensor:
             events.append(("buffer", layer_idx))
             return torch.empty(1)
 
@@ -129,7 +131,7 @@ class TestVanillaAttention(unittest.TestCase):
             ("buffer", 1),
         ])
 
-    def test_mla_generation_uses_layer_specific_cache_indices(self):
+    def test_mla_generation_uses_layer_specific_cache_indices(self) -> None:
         layer_idx = 4
         mla_params = SimpleNamespace(
             kv_lora_rank=1,
