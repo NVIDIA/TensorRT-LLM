@@ -60,6 +60,31 @@ def _cache_device(meta) -> torch.device:
     return torch.device(f"cuda:{torch.cuda.current_device()}")
 
 
+def _stage_sparse_plan_kv_lens_host(plan: tuple, kv_lens_cpu: torch.Tensor) -> None:
+    """Keep the sparse-prefill plan's kv_segment_lens on the host.
+
+    The fmha_sm100 sparse-prefill plan (MM-SA-Nv) rebuilds its KV page table
+    every sparse layer in sparse_fmha._build_page_table, which reads
+    plan["kv_segment_lens"] on the host via .tolist(). The planner stores it on
+    the device, so that read is a blocking D2H sync per sparse layer. Store a
+    host copy of the per-request KV lengths (already available as kv_lens_cpu)
+    instead; the page table still builds on the device from kv_indices, so no
+    copy is added. Mirrors the in-place plan-dict edits in on_update_kv_lens.
+
+    Only the sparse-prefill sub-plan is MM-SA-Nv. Decode and dense plans keep
+    their device kv_segment_lens for the kernel.
+    """
+    has_mixed, split = plan[0], plan[1]
+    # Non-mixed batches are one sparse plan (plan[3]). Mixed batches place the
+    # sparse prefill rows in the second sub-plan (plan[4]), after split decode
+    # rows.
+    sparse_dict = plan[4] if has_mixed else plan[3]
+    if sparse_dict is None or not sparse_dict.get("MM-SA-Nv"):
+        return
+    lens = kv_lens_cpu[split:] if has_mixed else kv_lens_cpu
+    sparse_dict["kv_segment_lens"] = lens.to(torch.int32).contiguous()
+
+
 def _worst_case_proxy_max_k_tiles(
     fmha_sm100,
     *,
@@ -739,6 +764,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             self._msa_eager_proxy_plan = proxy_plan
             self._msa_eager_gqa_plan = gqa_plan
             self._msa_eager_dense_plan = dense_plan
+            # Avoid the per-layer page-table D2H sync in sparse prefill.
+            _stage_sparse_plan_kv_lens_host(gqa_plan, kv_lens_cpu)
             # Stage the valid-block count to the device once for the whole step
             # (see _msa_eager_n_valid_blocks). The empty-selection check runs
             # here on the host, so run_indexer can short-circuit cheaply.
