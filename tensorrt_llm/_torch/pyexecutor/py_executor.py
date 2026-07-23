@@ -586,6 +586,16 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
+        # Detached disk-onboard readiness (and its per-step cross-rank collective in
+        # _park_requests_awaiting_onboard) is only reachable when BOTH the disk pool and the async reader
+        # pool are enabled; otherwise are_blocks_ready() is always true, so the park is pure overhead. Capture
+        # once so non-disk models -- including every TP>1 model sharing this image -- pay nothing for it.
+        _kvc = getattr(self.llm_args, "kv_cache_config", None)
+        self._disk_onboard_active = bool(
+            _kvc is not None and getattr(_kvc, "disk_cache_size", None)
+            and int(os.environ.get("TLLM_KV_DISK_READERS", "0") or "0") > 0)
+        self._disk_tier_active = bool(
+            _kvc is not None and getattr(_kvc, "disk_cache_size", None))
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
@@ -2607,7 +2617,9 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._sync_retention_clock()
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._park_requests_awaiting_onboard(scheduled_batch)
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
@@ -3167,6 +3179,97 @@ class PyExecutor:
         if send_handles[microbatch_id] is not None:
             send_handles[microbatch_id].wait()
             send_handles[microbatch_id] = None
+
+    def _sync_retention_clock(self):
+        """All ranks anchor and evaluate retention against the same timestamp."""
+        if not self._disk_tier_active:
+            return
+        kv = getattr(self, "kv_cache_manager", None)
+        if kv is None or not hasattr(kv, "set_retention_clock"):
+            return
+        now_ns = time.time_ns()
+        if self.dist.tp_size > 1 and not self.enable_attention_dp:
+            now_ns = self.dist.tp_allreduce(
+                now_ns if self.dist.tp_rank == 0 else 0, op=ReduceOp.MAX)
+        kv.set_retention_clock(now_ns)
+
+    def _park_requests_awaiting_onboard(self, scheduled_batch):
+        """Hold context requests whose detached disk-onboard reads have not landed out of this forward.
+        Their KV blocks are allocated but not yet filled, so forwarding now would read stale KV. A parked
+        request stays active and is re-scheduled next step -- the capacity scheduler counts its already
+        allocated blocks (getRemainingBlocksToCompletion) and _context_seq_len skips re-adding it -- then it
+        is admitted once are_blocks_ready() reports its blocks landed."""
+        # No detached disk onboards possible (no disk pool or no async readers) -> are_blocks_ready() is
+        # always true and there is nothing to synchronize. Skip entirely so non-disk (esp. TP>1) models never
+        # pay the per-step cross-rank collective below.
+        if not self._disk_onboard_active:
+            return
+        kv = getattr(self, "kv_cache_manager", None)
+        if kv is None or not hasattr(kv, "are_blocks_ready"):
+            return
+        ctx = scheduled_batch.context_requests
+        if not ctx:
+            return
+        # Local readiness per context request, in batch order. The batch is
+        # broadcast from the leader and scheduling is deterministic, so ctx is
+        # identically ordered on every rank.
+        local_ready = [1 if kv.are_blocks_ready(req) else 0 for req in ctx]
+
+        # TP safety: a context request must be parked on EVERY rank or NONE. Each
+        # rank's detached disk-onboard reads land at slightly different times, so a
+        # per-rank park decision would give ranks different batches and the TP
+        # all-reduce in the forward would mismatch (hang/crash). AND readiness
+        # across the TP group: admit a request only once its KV has landed on all
+        # ranks. (pp_size==1 -> the TP group is the whole world; TP=1 is a no-op.)
+        # Cross-rank AND is only correct for plain TP, where every rank holds the identical batch
+        # (leader-broadcast + deterministic schedule). Under attention-DP the ranks schedule
+        # independent batches, and under PP the TP-group readiness misses PP peers' shards -- both
+        # break the collective (deadlock, or silent drops via zip-truncation). Do the cross-rank sync
+        # only for plain TP; otherwise gate locally (correct for TP=1, and a no-op under ADP/PP since
+        # disk onboards are refused there at KV-manager init).
+        tp_sync = (self.dist.tp_size > 1 and not self.enable_attention_dp
+                   and self.dist.pp_size == 1)
+        if tp_sync:
+            any_pending = self.dist.tp_allreduce(0 if all(local_ready) else 1,
+                                                 op=ReduceOp.MAX)
+            if not any_pending:
+                for req in ctx:
+                    req.py_onboard_pending = False
+                return
+            gathered = self.dist.tp_allgather(local_ready)
+            global_ready = [all(bits) for bits in zip(*gathered)]
+        else:
+            if self.dist.tp_size > 1 and not getattr(
+                    self, "_warned_park_local_only", False):
+                logger.warning(
+                    "disk-onboard readiness: cross-rank park sync is unsupported under "
+                    "attention-DP/PP; gating locally (disk onboards should be disabled here)"
+                )
+                self._warned_park_local_only = True
+            if all(local_ready):
+                for req in ctx:
+                    req.py_onboard_pending = False
+                return
+            global_ready = local_ready
+
+        kept = []
+        parked = 0
+        for req, ready in zip(ctx, global_ready):
+            if ready:
+                req.py_onboard_pending = False
+                kept.append(req)
+            else:
+                req.py_onboard_pending = True
+                parked += 1
+        if parked:
+            scheduled_batch.reset_context_requests(kept)
+            self._onboard_parked_total = getattr(self, "_onboard_parked_total",
+                                                 0) + parked
+            if self._onboard_parked_total <= 5 or self._onboard_parked_total % 500 == 0:
+                logger.info(
+                    f"disk-onboard: parked {parked} context request(s) "
+                    f"awaiting KV read (cumulative {self._onboard_parked_total})"
+                )
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:
@@ -4034,7 +4137,9 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._sync_retention_clock()
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._park_requests_awaiting_onboard(scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -4042,8 +4147,10 @@ class PyExecutor:
                 if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                # scheduled_batch may have shrunk since the gate above -- parking context requests whose
+                # disk onboard has not landed empties it, and a kv connector can change it too. Re-check
+                # before forwarding so we never forward on an empty batch.
+                if can_queue:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
@@ -4511,7 +4618,9 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    self._sync_retention_clock()
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    self._park_requests_awaiting_onboard(scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -4519,8 +4628,10 @@ class PyExecutor:
                 if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                # scheduled_batch may have shrunk since the gate above -- parking context requests whose
+                # disk onboard has not landed empties it, and a kv connector can change it too. Re-check
+                # before forwarding so we never forward on an empty batch.
+                if can_queue:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 

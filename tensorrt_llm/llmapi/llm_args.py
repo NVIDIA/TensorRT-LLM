@@ -3623,12 +3623,22 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
-        "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend."
+        "Size of the disk cache in bytes. Enables the disk KV cache tier in the PyTorch backend, for both the default KV cache manager and KV cache manager v2."
     )
     disk_cache_path: Optional[str] = Field(
         default=None,
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
+    )
+    disk_cache_retained_only: bool = Field(
+        default=False,
+        description=
+        "When true, only blocks whose request carried a disk retention TTL may enter the disk cache tier."
+    )
+    disk_cache_protect_unexpired: bool = Field(
+        default=False,
+        description=
+        "When true, unexpired disk blocks are never evicted to admit a new one; the new block is refused instead."
     )
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
@@ -3827,6 +3837,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+        if self.disk_cache_size:
+            config.disk_cache_size = self.disk_cache_size
+            config.disk_cache_path = self.disk_cache_path or ""
+            config.disk_cache_retained_only = bool(
+                self.disk_cache_retained_only)
+            config.disk_cache_protect_unexpired = bool(
+                self.disk_cache_protect_unexpired)
         return config
 
     @field_validator('free_gpu_memory_fraction')

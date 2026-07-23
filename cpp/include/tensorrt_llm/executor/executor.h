@@ -636,6 +636,8 @@ public:
     [[nodiscard]] std::optional<std::chrono::milliseconds> getDecodeDurationMs() const;
     [[nodiscard]] KvCacheTransferMode getTransferMode() const;
     [[nodiscard]] std::string const& getDirectory() const;
+    [[nodiscard]] std::optional<std::chrono::milliseconds> getDiskRetentionMs() const;
+    void setDiskRetentionMs(std::optional<std::chrono::milliseconds> diskRetentionMs);
 
     /// @brief Convert the token range data into an entry per kv block. Returns a tuple of vectors corresponding to the
     /// priorities and durations for each block.
@@ -647,7 +649,7 @@ public:
         return mTokenRangeRetentionConfigs == other.mTokenRangeRetentionConfigs
             && mDecodeRetentionPriority == other.mDecodeRetentionPriority
             && mDecodeDurationMs == other.mDecodeDurationMs && mTransferMode == other.mTransferMode
-            && mDirectory == other.mDirectory;
+            && mDirectory == other.mDirectory && mDiskRetentionMs == other.mDiskRetentionMs;
     }
 
 private:
@@ -663,6 +665,10 @@ private:
     KvCacheTransferMode mTransferMode;
     /// @brief Name of the directory if transfer mode is GDS or POSIX_DEBUG_FALLBACK.
     std::string mDirectory;
+
+    /// @brief How long this request's blocks stay eligible for (and protected in) the
+    /// disk cache tier. Unset = blocks never enter a retained-only disk tier.
+    std::optional<std::chrono::milliseconds> mDiskRetentionMs;
 };
 
 /// @brief A class that holds information about the request
@@ -1100,6 +1106,14 @@ public:
     void setUseUvm(bool useUvm);
     void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
     void setMaxGpuTotalBytes(uint64_t maxGpuTotalBytes);
+    [[nodiscard]] std::optional<size_t> getDiskCacheSize() const;
+    [[nodiscard]] std::string const& getDiskCachePath() const;
+    void setDiskCacheSize(std::optional<size_t> diskCacheSize);
+    void setDiskCachePath(std::string const& diskCachePath);
+    [[nodiscard]] bool getDiskCacheRetainedOnly() const;
+    void setDiskCacheRetainedOnly(bool diskCacheRetainedOnly);
+    [[nodiscard]] bool getDiskCacheProtectUnexpired() const;
+    void setDiskCacheProtectUnexpired(bool diskCacheProtectUnexpired);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1159,6 +1173,19 @@ private:
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
+
+    /// @brief Size in bytes of the disk tier backing explicit-cache blocks. Disabled when unset or 0.
+    std::optional<size_t> mDiskCacheSize;
+
+    /// @brief Directory holding the disk tier's block files. Must be non-empty when mDiskCacheSize > 0.
+    std::string mDiskCachePath;
+
+    /// @brief When true, only blocks whose request carried diskRetentionMs may enter the disk tier.
+    bool mDiskCacheRetainedOnly{false};
+
+    /// @brief When true, unexpired disk blocks are never evicted to admit a new one;
+    /// the new block is refused instead (only expired blocks are reclaimable).
+    bool mDiskCacheProtectUnexpired{false};
 };
 
 /// @brief Configuration class for the runtime perf knobs

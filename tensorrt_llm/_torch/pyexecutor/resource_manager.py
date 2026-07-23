@@ -638,6 +638,51 @@ class KVCacheManager(BaseResourceManager):
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size)
 
+        disk_cache_size = getattr(kv_cache_config, "disk_cache_size", None) or 0
+        if disk_cache_size and (mapping.enable_attention_dp
+                                or mapping.pp_size > 1 or mapping.cp_size > 1):
+            raise ValueError(
+                "disk KV-cache tier is not supported with attention-DP, pipeline parallelism, "
+                "or context parallelism (cross-rank onboard-readiness sync assumes identical "
+                "per-rank batches and covers only the plain-TP group); got "
+                f"enable_attention_dp={mapping.enable_attention_dp}, pp_size={mapping.pp_size}, "
+                f"cp_size={mapping.cp_size}. "
+                "Disable disk_cache_size or use plain tensor parallelism.")
+        if disk_cache_size and mapping.tp_size > 1 and os.environ.get(
+                "TLLM_KV_DISK_DROP_ON_PRESSURE", "0") not in ("", "0"):
+            raise ValueError(
+                "TLLM_KV_DISK_DROP_ON_PRESSURE is not supported with tensor parallelism: "
+                "the drop decision depends on each rank's write-queue depth at spill time, "
+                "so ranks diverge on which blocks remain reusable. Unset it or use TP=1."
+            )
+        blocks_in_disk_pool = 0
+        if disk_cache_size:
+            max_tokens_disk = disk_cache_size // self.get_cache_bytes_per_token(
+            )
+            blocks_in_disk_pool = int(max_tokens_disk // self.tokens_per_block)
+            logger.info(f"[disk-tier] {blocks_in_disk_pool} blocks "
+                        f"({disk_cache_size / (1 << 30):.1f} GiB)")
+        kwargs['blocks_in_disk_pool'] = blocks_in_disk_pool
+        disk_cache_path = getattr(kv_cache_config, "disk_cache_path",
+                                  None) or ""
+        if disk_cache_path and blocks_in_disk_pool:
+            # Per-rank subdir: all ranks share one container filesystem and one
+            # disk_cache_path mount, but each holds a different KV shard while the
+            # disk slot files (block_<id>_pool_<p>.bin) are named identically across
+            # ranks -> without namespacing the ranks clobber each other's KV on load.
+            # mapping.rank is the global rank (unique across TP and PP). Note:
+            # disk_cache_size is per-rank, so total disk = world_size * disk_cache_size.
+            disk_cache_path = os.path.join(disk_cache_path,
+                                           f"rank_{self.mapping.rank}")
+            os.makedirs(disk_cache_path, exist_ok=True)
+            logger.info(
+                f"[disk-tier] per-rank disk cache dir: {disk_cache_path} "
+                f"(rank {self.mapping.rank}/{self.mapping.world_size})")
+        kwargs['disk_cache_path'] = disk_cache_path
+        kwargs['disk_cache_retained_only'] = bool(
+            getattr(kv_cache_config, "disk_cache_retained_only", False))
+        kwargs['disk_cache_protect_unexpired'] = bool(
+            getattr(kv_cache_config, "disk_cache_protect_unexpired", False))
         self.impl = KVCacheManagerCpp(**kwargs)
         # Warmup baseline for cumulative counters (set by snapshot_warmup_baseline)
         self._warmup_reused_blocks = 0
@@ -755,6 +800,12 @@ class KVCacheManager(BaseResourceManager):
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
+        if getattr(req, "py_onboard_pending", False):
+            # Blocks were claimed on a prior step and the detached disk-onboard read is still in flight.
+            # Do not re-add; the request is held out of the forward until areBlocksReady()
+            # (see PyExecutor._park_requests_awaiting_onboard). Same "add once, forward later" path
+            # that chunked context already uses.
+            return None
         if is_cross:
             if (getattr(req, "py_skip_cross_kv_projection", False)
                     or not req.is_first_context_chunk
@@ -1448,6 +1499,14 @@ class KVCacheManager(BaseResourceManager):
             if beam and beam[-1] != beam0_last:
                 packed.append(beam[-1])
         return packed
+
+    def are_blocks_ready(self, request) -> bool:
+        """True when every KV block this request holds has its disk read landed (detached onboard).
+        Always True for requests with no in-flight disk read, so it is cheap for the common case."""
+        return self.impl.are_blocks_ready(request.py_request_id)
+
+    def set_retention_clock(self, now_ns: int) -> None:
+        self.impl.set_retention_clock(now_ns)
 
     def get_num_free_blocks(self) -> int:
         if self.is_linear_attention:

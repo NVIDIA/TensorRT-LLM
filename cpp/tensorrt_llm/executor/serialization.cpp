@@ -1354,10 +1354,18 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto eventBufferMaxSize = su::deserialize<size_t>(is);
     auto useUvm = su::deserialize<bool>(is);
     auto attentionDpEventsGatherPeriodMs = su::deserialize<SizeType32>(is);
+    auto diskCacheSize = su::deserialize<std::optional<size_t>>(is);
+    auto diskCachePath = su::deserialize<std::string>(is);
+    // retained-only flag is read after construction below
 
-    return KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength, freeGpuMemoryFraction,
-        hostCacheSize, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize, enablePartialReuse,
-        copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
+    auto kvCacheConfig = KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength,
+        freeGpuMemoryFraction, hostCacheSize, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize,
+        enablePartialReuse, copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
+    kvCacheConfig.setDiskCacheSize(diskCacheSize);
+    kvCacheConfig.setDiskCachePath(diskCachePath);
+    kvCacheConfig.setDiskCacheRetainedOnly(su::deserialize<bool>(is));
+    kvCacheConfig.setDiskCacheProtectUnexpired(su::deserialize<bool>(is));
+    return kvCacheConfig;
 }
 
 void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os)
@@ -1375,6 +1383,10 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getEventBufferMaxSize(), os);
     su::serialize(kvCacheConfig.getUseUvm(), os);
     su::serialize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs(), os);
+    su::serialize(kvCacheConfig.getDiskCacheSize(), os);
+    su::serialize(kvCacheConfig.getDiskCachePath(), os);
+    su::serialize(kvCacheConfig.getDiskCacheRetainedOnly(), os);
+    su::serialize(kvCacheConfig.getDiskCacheProtectUnexpired(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
@@ -1394,6 +1406,10 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
     totalSize += su::serializedSize(kvCacheConfig.getEventBufferMaxSize());
     totalSize += su::serializedSize(kvCacheConfig.getUseUvm());
     totalSize += su::serializedSize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCacheSize());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCachePath());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCacheRetainedOnly());
+    totalSize += su::serializedSize(kvCacheConfig.getDiskCacheProtectUnexpired());
     return totalSize;
 }
 
@@ -1792,8 +1808,11 @@ KvCacheRetentionConfig Serialization::deserializeKvCacheRetentionConfig(std::ist
     auto transferMode = su::deserialize<executor::KvCacheTransferMode>(is);
     auto directory = su::deserialize<std::string>(is);
 
-    return KvCacheRetentionConfig{
+    auto diskRetentionMs = intToDuration(su::deserialize<std::optional<size_t>>(is));
+    auto kvCacheRetentionConfig = KvCacheRetentionConfig{
         tokenRangeRetentionPriorities, decodePriority, decodeDurationMs, transferMode, directory};
+    kvCacheRetentionConfig.setDiskRetentionMs(diskRetentionMs);
+    return kvCacheRetentionConfig;
 }
 
 void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConfig, std::ostream& os)
@@ -1803,6 +1822,7 @@ void Serialization::serialize(KvCacheRetentionConfig const& kvCacheRetentionConf
     su::serialize(durationToInt(kvCacheRetentionConfig.getDecodeDurationMs()), os);
     su::serialize(kvCacheRetentionConfig.getTransferMode(), os);
     su::serialize(kvCacheRetentionConfig.getDirectory(), os);
+    su::serialize(durationToInt(kvCacheRetentionConfig.getDiskRetentionMs()), os);
 }
 
 size_t Serialization::serializedSize(KvCacheRetentionConfig const& config)
@@ -1813,6 +1833,7 @@ size_t Serialization::serializedSize(KvCacheRetentionConfig const& config)
     totalSize += su::serializedSize(durationToInt(config.getDecodeDurationMs()));
     totalSize += su::serializedSize(config.getTransferMode());
     totalSize += su::serializedSize(config.getDirectory());
+    totalSize += su::serializedSize(durationToInt(config.getDiskRetentionMs()));
     return totalSize;
 }
 
