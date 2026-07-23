@@ -27,7 +27,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
@@ -119,7 +118,6 @@ class OpenAIDisaggServer:
         # the coordinator at coordinator_url (CoordinatorClient). Otherwise this
         # process owns the routers + cluster state (DisaggCoordinatorService).
         self._coordinator_url = coordinator_url
-
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
         self._disagg_cluster_storage = None
@@ -223,8 +221,11 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/perf_metrics", self._perf_metrics_collector.get_perf_metrics, methods=["GET"])
         # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
-        from prometheus_client import make_asgi_app
-        self.app.mount("/prometheus/metrics", make_asgi_app())
+        from prometheus_client import (CollectorRegistry, make_asgi_app,
+                                       multiprocess)
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        self.app.mount("/prometheus/metrics", make_asgi_app(registry=registry))
         # Single-process (local coordinator): mount the in-process HTTP cluster
         # storage routes on this app. In worker mode the coordinator is remote and
         # owns those routes (CoordinatorClient has no cluster_storage).
