@@ -133,11 +133,11 @@ default pre-merge set:
 ```
 
 Both options accept stage names and wildcard patterns defined in
-`jenkins/L0_Test.groovy`. The broad `"*"` and `"*Post-Merge*"` selectors
-require the same approval label, including when they appear in a comma-separated
-list. Equivalent escaped or repeated-star forms are treated the same. Other
-stage selectors, including explicit stage names and limited patterns such as
-`"*PerfSanity*"`, retain their existing behavior.
+`jenkins/L0_Test.groovy`. The `"*"`, `"*Post-Merge*"`, and `"*PerfSanity*"`
+selectors require the same approval label, including when they appear in a
+comma-separated list. Equivalent escaped or repeated-star forms are treated the
+same. Other stage selectors, including explicit stage names and other limited
+wildcard patterns, retain their existing behavior.
 
 Being selective keeps CI turnaround fast and conserves hardware resources.
 
