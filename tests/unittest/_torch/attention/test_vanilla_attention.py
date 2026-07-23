@@ -53,12 +53,33 @@ class TestVanillaAttention(unittest.TestCase):
     @patch(
         "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
     )
+    def test_prepare_defers_cache_indices_for_layer_specific_scales(
+            self, mock_prepare: MagicMock) -> None:
+        manager = MagicMock()
+        manager.is_vswa = False
+        manager.is_linear_attention = False
+        manager.num_pools = 1
+        manager.get_layer_page_index_scale = MagicMock(return_value=2)
+        metadata = object.__new__(VanillaAttentionMetadata)
+        metadata.kv_cache_manager = manager
+        metadata.request_ids = [11]
+
+        metadata.prepare()
+
+        self.assertIsNone(metadata.block_ids_per_seq)
+        manager.get_batch_cache_indices.assert_not_called()
+        mock_prepare.assert_called_once_with()
+
+    @patch(
+        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
+    )
     def test_single_pool_cache_indices_remain_prepared_once(
             self, mock_prepare: MagicMock) -> None:
         manager = MagicMock()
         manager.is_vswa = False
         manager.is_linear_attention = False
         manager.num_pools = 1
+        manager.get_layer_page_index_scale = None
         manager.get_batch_cache_indices.return_value = [[7]]
         metadata = object.__new__(VanillaAttentionMetadata)
         metadata.kv_cache_manager = manager

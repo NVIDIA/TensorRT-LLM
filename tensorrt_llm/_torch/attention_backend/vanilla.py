@@ -72,7 +72,10 @@ class VanillaAttentionMetadata(AttentionMetadata):
             return False
         return (getattr(self.kv_cache_manager, "is_vswa", False)
                 or getattr(self.kv_cache_manager, "is_linear_attention", False)
-                or getattr(self.kv_cache_manager, "num_pools", 1) > 1)
+                or getattr(self.kv_cache_manager, "num_pools", 1) > 1
+                or callable(
+                    getattr(self.kv_cache_manager, "get_layer_page_index_scale",
+                            None)))
 
     def prepare(self) -> None:
         super().prepare()
