@@ -848,6 +848,9 @@ class TestFixedScoreMetadata:
             offsets=offsets,
             omega=omega,
             decode_width=seq_len - prompt_len,
+            page_table_keys=[("pool", layer) for layer in layer_order],
+            num_page_table_slots=num_layers,
+            page_table_token_capacity=seq_len,
             layer_group_representative={layer: layer for layer in layer_order},
             layer_pool_keys=[("pool", layer) for layer in layer_order],
         )

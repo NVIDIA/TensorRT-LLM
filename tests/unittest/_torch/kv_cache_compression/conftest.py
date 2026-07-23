@@ -524,6 +524,10 @@ def make_cute_buffers(
     )
 
     num_layers = len(layer_pools)
+    # The constructor takes every capacity explicitly (no test-only
+    # None-derive path); the widest window defaults keep old call sites.
+    if decode_width is None:
+        decode_width = seq_len
     return init_eviction_buffers(
         eviction_mode=eviction_mode,
         layer_pools=layer_pools,
@@ -542,6 +546,9 @@ def make_cute_buffers(
         offsets=offsets,
         omega=omega,
         decode_width=decode_width,
+        page_table_keys=[("pool", 0)],
+        num_page_table_slots=1,
+        page_table_token_capacity=seq_len,
         layer_group_representative={layer: 0 for layer in range(num_layers)},
         layer_pool_keys=[("pool", 0)] * num_layers,
     )

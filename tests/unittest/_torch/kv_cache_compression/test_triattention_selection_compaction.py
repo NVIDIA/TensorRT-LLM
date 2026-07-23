@@ -525,8 +525,10 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         freq_scale_sq=freq_scale_sq,
         offsets=torch.zeros(1, dtype=torch.float32, device=device),
         omega=torch.zeros(num_freqs, dtype=torch.float32, device=device),
+        decode_width=bucket_capacity,
         page_table_keys=[("pool", 0), ("pool", 1)],
         num_page_table_slots=2,
+        page_table_token_capacity=bucket_capacity,
         layer_group_representative=layer_group_representative,
         layer_pool_keys=[("pool", 0), ("pool", 1), ("pool", 0)],
     )

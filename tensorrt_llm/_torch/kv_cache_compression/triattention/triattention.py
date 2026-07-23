@@ -101,33 +101,6 @@ _OFFSET_MAX_LENGTH = 65536
 
 
 # Stream-affinity contract: the staged buffers and compiled launches are bound
-def _page_table_slot_layout(
-    page_representatives: List[int],
-    page_table_keys: List[object],
-) -> Tuple[Dict[int, int], int]:
-    """Map representative layers to page-table snapshot slots."""
-    use_pool_ids = all(
-        isinstance(key, tuple)
-        and len(key) == 2
-        and key[0] == "pool"
-        and isinstance(key[1], int)
-        and key[1] >= 0
-        for key in page_table_keys
-    )
-    unique_slots = []
-    key_to_slot = {}
-    representative_slots = {}
-    for representative, key in zip(page_representatives, page_table_keys):
-        slot = key_to_slot.get(key)
-        if slot is None:
-            slot = int(key[1]) if use_pool_ids else len(key_to_slot)
-            key_to_slot[key] = slot
-            unique_slots.append(slot)
-        representative_slots[representative] = slot
-    slot_count = max(unique_slots, default=-1) + 1
-    return representative_slots, slot_count
-
-
 def _protected_tail_capacity(manager: KVCacheManagerV2, what: str) -> int:
     """The V2 tail (extra KV + draft reserve + 1) moved with every compaction."""
     capacity = int(manager.num_extra_kv_tokens) + int(manager._kv_reserve_draft_tokens) + 1
@@ -140,18 +113,20 @@ def _allocate_page_table_plane(
     layer_pools: List[torch.Tensor],
     page_representatives: List[int],
     page_table_keys: List[object],
-    num_page_table_slots: Optional[int],
+    num_page_table_slots: int,
     token_capacity: int,
     max_requests: int,
     device: torch.device,
-    what: str,
 ) -> Tuple[Dict[int, int], int, torch.Tensor, torch.Tensor]:
-    """Allocate one staged block-offset plane (host pinned + device)."""
-    representative_slots, minimum_slots = _page_table_slot_layout(
-        page_representatives, page_table_keys
-    )
-    if num_page_table_slots is None:
-        num_page_table_slots = minimum_slots
+    """Allocate one staged block-offset plane (host pinned + device).
+
+    The ``("pool", id)`` page-table keys ARE the snapshot slot numbering:
+    one scheme, one constructor contract.
+    """
+    representative_slots = {
+        representative: int(key[1])
+        for representative, key in zip(page_representatives, page_table_keys)
+    }
     tokens_per_block = int(layer_pools[page_representatives[0]].shape[3])
     page_count = (token_capacity + tokens_per_block - 1) // tokens_per_block
     copy_block_count = (page_count + 3) // 4 * 4
@@ -184,10 +159,10 @@ def init_eviction_buffers(
     offsets: torch.Tensor,
     omega: torch.Tensor,
     phase: Optional[Dict[str, object]] = None,
-    page_table_keys: Optional[List[object]] = None,
-    num_page_table_slots: Optional[int] = None,
-    decode_width: Optional[int] = None,
-    page_table_token_capacity: Optional[int] = None,
+    page_table_keys: List[object],
+    num_page_table_slots: int,
+    decode_width: int,
+    page_table_token_capacity: int,
     protected_tail_capacity: int = 0,
     draft_layer_pools: Optional[List[torch.Tensor]] = None,
     draft_layers: Optional[List[int]] = None,
@@ -218,24 +193,16 @@ def init_eviction_buffers(
     device = layer_pools[page_representatives[0]].device
     max_requests = int(max_requests)
     seq_len = int(seq_len)
-    if page_table_token_capacity is None:
-        page_table_token_capacity = seq_len
     page_table_token_capacity = int(page_table_token_capacity)
     # Decode-width capacity of the score buffers; per-request prompt lengths
     # are staged runtime metadata.
-    if decode_width is None:
-        decode_width = seq_len
     decode_width = int(decode_width)
     keep_count = int(keep_count)
 
-    q_real = q_real.to(device=device, dtype=torch.float32).contiguous()
-    q_imag = q_imag.to(device=device, dtype=torch.float32).contiguous()
-    mlr_coef = mlr_coef.to(device=device, dtype=torch.float32).contiguous()
-    freq_scale_sq = freq_scale_sq.to(device=device, dtype=torch.float32).contiguous()
-    offsets = offsets.to(device=device, dtype=torch.float32).contiguous()
-    omega = omega.to(device=device, dtype=torch.float32).contiguous()
-    if page_table_keys is None:
-        page_table_keys = list(range(len(page_representatives)))
+    q_real, q_imag, mlr_coef, freq_scale_sq, offsets, omega = (
+        tensor.to(device=device, dtype=torch.float32).contiguous()
+        for tensor in (q_real, q_imag, mlr_coef, freq_scale_sq, offsets, omega)
+    )
 
     bufs = SimpleNamespace()
     bufs.eviction_mode = eviction_mode
@@ -260,16 +227,15 @@ def init_eviction_buffers(
         page_table_token_capacity,
         max_requests,
         device,
-        "",
     )
     # The draft is never scored: these offsets feed only the draft compacts.
     bufs.draft_block_offsets_device = None
     bufs._draft_bulk_offsets_src = None
-    bufs.draft_representative_slots = {}
     bufs.draft_copy_block_count = 0
+    draft_page_slots: Dict[int, int] = {}
     if draft_layer_pools is not None:
         (
-            bufs.draft_representative_slots,
+            draft_page_slots,
             bufs.draft_copy_block_count,
             bufs._draft_bulk_offsets_src,
             bufs.draft_block_offsets_device,
@@ -277,11 +243,10 @@ def init_eviction_buffers(
             draft_layer_pools,
             draft_page_representatives,
             draft_page_table_keys,
-            draft_num_page_table_slots,
+            int(draft_num_page_table_slots),
             int(draft_page_table_token_capacity),
             max_requests,
             device,
-            "draft ",
         )
 
     # ---- per-round metadata table: ONE host-to-device copy per round -------
@@ -304,14 +269,16 @@ def init_eviction_buffers(
     # Per-request pinned prompt lengths: the score kernel starts each
     # request's decode window here, so one bucket may mix prompt lengths.
     bufs.token_starts_device = bufs.request_metadata_device[2, :max_requests]
-    bufs.dense_move_offsets = bufs.request_metadata_device[3]
-    bufs.swa_move_offsets = bufs.request_metadata_device[4]
-    bufs.draft_move_offsets = bufs.request_metadata_device[5]
+    # Rows 3-5 carry the per-family move offsets; the compaction bundle holds
+    # these views as each family's ``offsets``, so they are wiring, not state.
+    dense_move_offsets_row = bufs.request_metadata_device[3]
+    swa_move_offsets_row = bufs.request_metadata_device[4]
+    draft_move_offsets_row = bufs.request_metadata_device[5]
     bufs.mean_cos = torch.empty((max_requests, num_freqs), dtype=torch.float32, device=device)
     bufs.mean_sin = torch.empty_like(bufs.mean_cos)
     # The phase table depends only on the shared calibration; the manager
-    # shares one dict with every buffer namespace (tests may pass None for a
-    # private table).
+    # shares one dict with every buffer namespace. ``phase=None`` is the ONE
+    # documented test seam: unit fixtures get a private table built here.
     if phase is None:
         phase = build_mean_phase_table(offsets, omega, initial_rows=seq_len)
     bufs.phase = phase
@@ -343,9 +310,7 @@ def init_eviction_buffers(
     )
     block_offsets = bufs.block_offsets_device
     slots_t = torch.tensor(page_table_slots, dtype=torch.int64, device=device)
-    req_idx = torch.arange(max_requests, dtype=torch.int64, device=device).repeat_interleave(
-        bufs.num_layers
-    )
+    req_idx = bufs.seg_req.to(torch.int64)
     slot_idx = slots_t.repeat(max_requests)
     seg_page_off = slot_idx * block_offsets.stride(0) + req_idx * block_offsets.stride(1)
 
@@ -519,8 +484,8 @@ def init_eviction_buffers(
             draft_layer_pool_keys=draft_layer_pool_keys,
             draft_protected_tail_capacity=int(draft_protected_tail_capacity),
             draft_kv_block_offsets=bufs.draft_block_offsets_device,
-            draft_page_table_slots=bufs.draft_representative_slots,
-            draft_move_offsets=bufs.draft_move_offsets,
+            draft_page_table_slots=draft_page_slots,
+            draft_move_offsets=draft_move_offsets_row,
         )
     compaction = init_compaction_buffers(
         union=union,
@@ -540,8 +505,8 @@ def init_eviction_buffers(
         protected_tail_capacity=int(protected_tail_capacity),
         # Tails vary per round (in-flight growth), so the per-family move
         # offsets ride the staged metadata rows each round.
-        dense_move_offsets=bufs.dense_move_offsets,
-        swa_move_offsets=bufs.swa_move_offsets,
+        dense_move_offsets=dense_move_offsets_row,
+        swa_move_offsets=swa_move_offsets_row,
         **draft_kwargs,
     )
     # Flatten the launch data to plain fields: ONE fused launch settles the
@@ -615,7 +580,7 @@ def stage_eviction_cohort(
     request_ids: List[int],
     round_starts: List[int],
     token_starts: List[int],
-    seq_lens: Optional[List[int]] = None,
+    seq_lens: List[int],
     draft_manager: Optional[KVCacheManagerV2] = None,
     dense_move_offsets: Optional[List[int]] = None,
     swa_move_offsets: Optional[List[int]] = None,
@@ -633,8 +598,6 @@ def stage_eviction_cohort(
     # would silently corrupt the in-flight compaction.
     if bufs.page_tables_active:
         raise RuntimeError("previous page-table cohort is still active")
-    if seq_lens is None:
-        seq_lens = [bufs.bucket_seq_len] * request_count
     request_metadata = torch.as_tensor((round_starts, seq_lens, token_starts), dtype=torch.int32)
     # Grow the phase table while this cohort's round starts are still host
     # integers: a stale-capacity gather is an out-of-bounds index_select on
