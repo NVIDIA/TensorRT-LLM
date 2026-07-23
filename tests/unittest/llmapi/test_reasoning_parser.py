@@ -378,6 +378,29 @@ TOOL_CALL_END = "</tool_call>"
          f"{TOOL_CALL}get_weather{TOOL_CALL_END}", "reasoning", {
              "enable_thinking": False
          }),
+        # GH issue #14502: when the caller asked for enable_thinking=False but
+        # the model leaks a complete <think>...</think> block anyway, the
+        # accidental reasoning should be swapped into content so OpenAI-style
+        # clients (which render only `content`) don't see an empty response.
+        (f"{R1_START}17 * 23 = 391{R1_END}", "17 * 23 = 391", "", {
+            "enable_thinking": False
+        }),
+        # Same fix, with a non-trivial reasoning body.
+        (f"{R1_START}some reasoning here{R1_END}", "some reasoning here", "", {
+            "enable_thinking": False
+        }),
+        # If the model leaks <think> but never emits </think>, partition leaves
+        # an empty `content` and the full body in `reasoning_content` — the
+        # fix still swaps it into content.
+        (f"{R1_START}unterminated answer", "unterminated answer", "", {
+            "enable_thinking": False
+        }),
+        # If content is already non-empty (model emitted some real content
+        # after a leaked think-block), the swap must NOT fire and the
+        # original split must be preserved.
+        (f"{R1_START}leak{R1_END} real content", " real content", "leak", {
+            "enable_thinking": False
+        }),
     ])
 def test_nano_v3_reasoning_parser(text: str, content: str,
                                   reasoning_context: str,
@@ -514,7 +537,15 @@ def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
         (["a", "b"], "", "", {
             "enable_thinking": False
         }),
-        ([f"{R1_START}a", "b"], "", "", {
+        # GH issue #14502: leaked <think> with no </think> at end of stream
+        # with enable_thinking=False — finish() now swaps the accumulated
+        # reasoning into content so OpenAI-style clients see a non-empty
+        # response. Previously returned empty content (the bug).
+        ([f"{R1_START}a", "b"], "ab", "", {
+            "enable_thinking": False
+        }),
+        # Same fix with a longer body.
+        ([f"{R1_START}answer", " is", " 391"], "answer is 391", "", {
             "enable_thinking": False
         }),
         (["a", "b"], "", "", {
