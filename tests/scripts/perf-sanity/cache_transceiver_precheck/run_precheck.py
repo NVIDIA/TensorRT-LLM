@@ -1347,6 +1347,19 @@ def _make_peer_failure_recorder(runner, disarm, current_cell):
     return record_peer_failure
 
 
+def _consensus_abort_reason(runner):
+    """Instance-wide agreed view of the fail-fast flag (leader reads, bcast).
+
+    The flag file can appear at any moment (any instance's failure drops it),
+    so per-rank reads can race it and disagree -- and the branches they select
+    (gen_run_peer vs gen_abort_peer, failure vs SKIP verdict) issue different
+    MPI collective sequences, deadlocking or cross-pairing the instance. Must
+    be called collectively by every rank.
+    """
+    reason = abort_flag_reason(runner.work_dir) if runner.is_leader else None
+    return runner.comm.bcast(reason, root=0)
+
+
 def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
     """Ctx role: bind per-peer REP sockets, publish addrs, serve each schedule.
 
@@ -1379,8 +1392,10 @@ def _serve_gen_peers(runner, plan, arm, disarm, record_peer_failure):
             # A gen driver that failed elsewhere aborts our session as part of
             # fail-fast: record a (non-failing) SKIP, not our own failure --
             # the real failure is recorded by whoever hit it. Absent the flag,
-            # a genuine peer abort is still a real failure.
-            if abort_flag_reason(runner.work_dir) is not None:
+            # a genuine peer abort is still a real failure. The consensus read
+            # is collectively safe here: _PeerAbort is only raised after a
+            # bcast (leader_recv), so every rank reaches this handler.
+            if _consensus_abort_reason(runner) is not None:
                 runner.recorder.record(f"gen_{gj}", 0, "SKIP", f"aborted by fail-fast: {e}")
             else:
                 record_peer_failure(f"gen_{gj}", e)
@@ -1404,7 +1419,7 @@ def _drive_ctx_peers(runner, arm, disarm, record_peer_failure):
     """
     open_sessions = []
     for ci in range(runner.side["num_peers"]):
-        reason = abort_flag_reason(runner.work_dir)
+        reason = _consensus_abort_reason(runner)
         if reason is not None:
             try:
                 gen_abort_peer(runner, ci, reason, arm, disarm)
