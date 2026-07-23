@@ -5304,11 +5304,12 @@ class TorchLlmArgs(BaseLlmArgs):
                 # SA is gated for every method; relaxed / parallel / guided gates
                 # apply only to the newly wired methods (vanilla MTP, PARD,
                 # DFlash, DraftTarget).
-                is_new_rejection_method = (
-                    spec_mode == TorchSpeculativeDecodingMode.MTP
-                    or spec_mode.is_pard() or spec_mode.is_dflash()
-                    or spec_mode.is_dspark()
-                    or spec_mode.is_draft_target())
+                is_new_rejection_method = (spec_mode
+                                           == TorchSpeculativeDecodingMode.MTP
+                                           or spec_mode.is_pard()
+                                           or spec_mode.is_dflash()
+                                           or spec_mode.is_dspark()
+                                           or spec_mode.is_draft_target())
                 # Plain tensor parallelism is supported (the draft path
                 # all-gathers vocab-sharded draft logits before rejection, see
                 # SpecWorkerBase.maybe_gather_sharded_draft_logits).

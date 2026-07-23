@@ -74,26 +74,18 @@ class _ExecutorMemoryMonitor:
         return bytes / (1024)**3
 
     memory_type_friendly_names = {
-        ExecutorMemoryType.SAMPLER:
-        "Sampler",
-        ExecutorMemoryType.DRAFTER:
-        "Drafter",
-        ExecutorMemoryType.GUIDED_DECODER:
-        "Guided Decoder",
-        ExecutorMemoryType.SPEC_RESOURCES:
-        "Speculative decoding resources",
+        ExecutorMemoryType.SAMPLER: "Sampler",
+        ExecutorMemoryType.DRAFTER: "Drafter",
+        ExecutorMemoryType.GUIDED_DECODER: "Guided Decoder",
+        ExecutorMemoryType.SPEC_RESOURCES: "Speculative decoding resources",
         ExecutorMemoryType.INIT_KV_CACHE:
         "Initial KV Cache (temporary for KV cache size estimation)",
         ExecutorMemoryType.INIT_EXTRA_RESOURCES:
         "Additional executor resources (temporary for KV cache size estimation)",
-        ExecutorMemoryType.MODEL_EXTRA:
-        "Model resources created during usage",
-        ExecutorMemoryType.EXTRA_RESOURCES:
-        "Additional executor resources",
-        ExecutorMemoryType.KV_CACHE:
-        "KV cache",
-        ExecutorMemoryType.MODEL_ENGINE_MAIN:
-        "Model",
+        ExecutorMemoryType.MODEL_EXTRA: "Model resources created during usage",
+        ExecutorMemoryType.EXTRA_RESOURCES: "Additional executor resources",
+        ExecutorMemoryType.KV_CACHE: "KV cache",
+        ExecutorMemoryType.MODEL_ENGINE_MAIN: "Model",
     }
 
     # Suggestion to reduce component memory usage

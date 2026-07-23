@@ -1663,10 +1663,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
 class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
-    def __init__(self,
-                 model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int,
-                 aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream]):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig],
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
+                                                       torch.cuda.Stream]):
         super().__init__(model_config, layer_idx, aux_stream_dict)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
