@@ -95,6 +95,9 @@ def _score_row_stats_kernel(
     ROWS: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr = 256,
+    # Triton rejects plain-global capture; the default binds the module float
+    # at def time (STD_EPSILON itself must stay a plain float for the CuTe import).
+    EPSILON: tl.constexpr = STD_EPSILON,
 ):
     """Compute one valid-prefix mean and inverse standard deviation per score row."""
     flat_row = tl.program_id(0)
@@ -118,7 +121,7 @@ def _score_row_stats_kernel(
         square_sum += tl.sum(centered * centered, axis=0)
     std = tl.sqrt(square_sum / valid_width)
     tl.store(row_mean + flat_row, mean)
-    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, STD_EPSILON))
+    tl.store(row_inv_std + flat_row, 1.0 / tl.maximum(std, EPSILON))
 
 
 @triton.jit
