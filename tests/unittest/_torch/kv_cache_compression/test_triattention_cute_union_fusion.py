@@ -1,14 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Equivalence coverage for the fused score+stats+union pipeline (two CuTe kernels).
+"""Equivalence coverage for the fused score+stats+union pipeline.
 
-The reference side gathers the SAME production score rows (the fused pack's
-score-only entry, which every buffer-namespace runner compiles) and normalizes +
-union-reduces them with a pure-torch float32 oracle. The fused-vs-reference
-comparison was always tolerance-based (the fused pipeline's reduction order
-differs from any reference); the tolerances are unchanged from the retired
-Triton reference copies.
-"""
+The reference leg gathers the production score rows and normalizes +
+union-reduces them with a pure-torch float32 oracle; tolerances are
+unchanged from the retired Triton reference copies."""
 
 import pytest
 import torch
@@ -36,12 +32,8 @@ def _launch_union_fusion(
 
 
 def _reference_union_scores(scores_rows: torch.Tensor, valid_widths: torch.Tensor) -> torch.Tensor:
-    """Pure-torch union oracle: z-normalize each row's valid prefix, union-max.
-
-    Mirrors the production union semantics: per-row mean and biased std over
-    the valid prefix (std clamped at 1e-6), then the per-token maximum across
-    the request's rows; tokens past the valid width stay ``-inf``.
-    """
+    """Union oracle: per-row mean/biased-std z-norm over the valid prefix
+    (std clamped at 1e-6), union-max across rows, ``-inf`` past the width."""
     request_count, _, width = scores_rows.shape
     combined = torch.full(
         (request_count, width), float("-inf"), dtype=torch.float32, device=scores_rows.device
@@ -90,23 +82,16 @@ def test_union_fusion_matches_split_pipeline(
     score_starts: "int | list",
     valid_lens: "list | None",
 ) -> None:
-    """The fused pipeline must reproduce the split score->normalize->union rows.
-
-    ``score_starts`` is either one uniform window start or a per-request
-    list (the fused kernels read the start per request at runtime). The
-    reference leg runs the production score-only launch over the same decode
-    windows, then the pure-torch union oracle.
-    """
+    """Fused rows must reproduce split score->normalize->union rows;
+    ``score_starts`` is uniform or per-request (read at runtime)."""
     pytest.importorskip("cutlass")
 
     torch.manual_seed(20260721)
     device = torch.device("cuda")
     seq_len = 256
     num_pages = seq_len // tokens_per_block
-    # 32-token pages: one 128-token compute tile spans four pages, so a
-    # shuffled physical-page table catches any fragment/page mix-up. The
-    # ragged valid lengths land mid-tile, exercising the clamped tail
-    # fragments.
+    # Shuffled pages catch fragment/page mix-ups; ragged lengths land
+    # mid-tile.
     page_permutation = {128: [0, 1], 32: [3, 1, 4, 7, 5, 0, 2, 6]}[tokens_per_block]
     assert sorted(page_permutation) == list(range(num_pages))
     pool = (

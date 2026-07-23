@@ -44,9 +44,8 @@ def _make_selection_buffers(
     num_query_heads=1,
     num_kv_heads=1,
 ):
-    """Selection-only buffers: exactly what the one constructor allocates
-    for the mode, without the CuTe score state or compaction (the settle's
-    pack half is compiled away)."""
+    """Selection-only buffers for the mode, without CuTe score state or
+    compaction (the settle's pack half is masked off)."""
     bufs = SimpleNamespace(
         eviction_mode=eviction_mode,
         device=device,
@@ -236,9 +235,8 @@ def test_per_head_selection_matches_torch_oracle_on_selector_stream(
 
 @pytest.mark.parametrize("keep_count,width", [(4, 64), (8192, 9216)])
 def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, width):
-    # Heavily tied integer scores with ragged valid widths and per-request
-    # prompt rebase: the strongest oracle over the direct union top-k path
-    # (it subsumes the sorted-output and exact-indices smoke variants).
+    # Tied integer scores, ragged widths, per-request prompt rebase; the
+    # 8192-keep row is the large-k coverage.
     _require_cute_topk_op()
     device = torch.device("cuda", torch.cuda.current_device())
     prompt_len = 17
@@ -261,8 +259,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         max_requests=request_count,
     )
     bufs.valid_widths.copy_(torch.tensor(valid_widths, dtype=torch.int32, device=device))
-    # Write the shared per-request prompt lengths the way production staging
-    # does: the union row-major view aliases the per-request buffer.
+    # The union row-major view aliases the per-request buffer.
     bufs.prompt_offsets[:request_count].copy_(
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
@@ -347,16 +344,13 @@ def test_fused_per_head_preparation_matches_ragged_torch_reference(per_layer, no
 
 @pytest.mark.parametrize("eviction_mode", ["union", "per_head", "per_layer_perhead"])
 def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode):
-    # The compact op ships only the pipelined bf16 kernels: pools use the
-    # supported geometry (bf16, 32-token pages, head_dim 64), and the kept
-    # ordinals are spread across all three pages per request so the moves
-    # still cross page boundaries.
+    # Supported bf16 geometry; kept ordinals span all three pages so moves
+    # cross page boundaries.
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     num_layers = 2
     num_kv_heads = 2
-    # Per-request pinned prompts: one cohort mixes prompt lengths, so the
-    # byte-exact oracle also proves per-request destination rebasing.
+    # Mixed prompt lengths prove per-request destination rebasing.
     prompt_lens = [2, 5]
     decode_keep_count = 4
     seq_len = 80
@@ -368,8 +362,7 @@ def test_eager_compaction_preserves_exact_selected_bytes_and_tail(eviction_mode)
     initial_pools = _make_ramp_pools(num_layers, device=device)
     pools = [pool.clone() for pool in initial_pools]
 
-    # Kept ordinals are decode-only but hold absolute positions; the pinned
-    # prompt tokens never appear in the selection rectangle.
+    # Decode-only kept ordinals holding absolute positions.
     union_decode = torch.tensor(
         [[16, 32, 56, 72], [24, 40, 48, 64]], dtype=torch.int64, device=device
     )
@@ -463,19 +456,15 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
 
     device = torch.device("cuda", torch.cuda.current_device())
     num_layers = 3
-    # The staged bucket capacity must be aligned to the score kernel's
-    # 64-token compute tile; the request itself stays 8 tokens long.
+    # Bucket capacity aligned to the 64-token compute tile; request stays 8.
     bucket_capacity = 64
     seq_len = 8
     keep_count = 2
-    # GQA group 8 (the smallest CuTe-supported group with one KV head); all
-    # query heads share one zero calibration query and one MLR coefficient,
-    # so every head row carries the same |K|-driven score.
+    # GQA group 8, zero calibration query, shared MLR: every head row
+    # carries the same |K|-driven score.
     num_q_heads = 8
-    # bf16 pools in the compact op's supported geometry. The scored tokens
-    # all live in each table's first entry, but the two tables still map the
-    # two storage groups onto different physical pages, which is what the
-    # layer-order alignment below depends on.
+    # The two tables map the storage groups onto different physical pages;
+    # the layer-order alignment below depends on it.
     tokens_per_block = 32
     head_dim = 64
     num_freqs = head_dim // 2
@@ -539,11 +528,8 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
     bufs.valid_seq_lens_device.fill_(seq_len)
     bufs.token_starts_device.fill_(0)
 
-    # Attach a standalone bundle wholesale (families AND the fused settle
-    # launch data), replacing the constructor-built one: the fused settle
-    # launch then packs this bundle's construction-time move offsets exactly
-    # like production packs the staged rows, and the round's inline C++
-    # moves consume the same buffers.
+    # Replace the constructor-built bundle wholesale; the settle launch
+    # packs this bundle's construction-time move offsets.
     compaction = _build_compaction(
         eviction_mode="per_layer_perhead",
         layer_pools=pools,
@@ -560,8 +546,6 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
         protected_tail_capacity=0,
     )
     _set_protected_tails(compaction, [0])
-    # Attach wholesale: the round consumes the PREBOUND launch args, so the
-    # bundle must land through the same helper production uses.
     attach_compaction_bundle(bufs, compaction)
     run_eviction_round(bufs, normalize_scores=False)
     assert torch.equal(bufs.keep, expected_keep)
@@ -581,14 +565,9 @@ def test_per_layer_score_selection_and_compaction_preserve_dense_layer_order():
 
 @requires_sm100
 def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
-    """Run two real eviction rounds through one live V2 cache.
-
-    The cache uses the score and compact kernels' supported geometry (bf16,
-    32-token pages, head_dim 64): the request spans three pages so that
-    compacting to two pages still releases one physical page for reuse.
-    Token scores are tracked in a host-side mirror and the expected keep
-    sets are derived from it.
-    """
+    """Two real eviction rounds through one live V2 cache: three pages
+    compact to two, releasing one physical page for reuse; expected keep
+    sets derive from a host-side score mirror."""
     pytest.importorskip("cutlass")
     import tensorrt_llm
     import tensorrt_llm.bindings
@@ -605,9 +584,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
     device = torch.device("cuda", torch.cuda.current_device())
     request_id = 7
     prompt_len = 2
-    # The bucket capacity equals the confirmed length here and must be
-    # aligned to the score kernel's 64-token compute tile; the protected
-    # tail rides beyond it.
+    # Bucket == confirmed length, 64-token-tile aligned; tail rides beyond.
     seq_len = 64
     protected_tail = 2
     compacted_capacity = 36
@@ -668,8 +645,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             pages = page_ids(request_id)
             page = pages[token // tokens_per_block]
             offset = token % tokens_per_block
-            # Shifted mod-251 ramp: bf16-exact and distinct per token, so the
-            # byte comparisons below catch any wrong move.
+            # Shifted mod-251 ramp: bf16-exact, distinct per token.
             payload = (
                 ((torch.arange(2 * head_dim, dtype=torch.int32, device=device) + token * 37) % 251)
                 .reshape(2, head_dim)
@@ -679,10 +655,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             payload[0, num_freqs] = 0
             pool[page, :, 0, offset].copy_(payload)
 
-        # Host-side mirror of each physical position's score; expected keep
-        # sets are derived from it. Scores are distinct within the decode
-        # window (7 is invertible mod 64 and the window spans one residue
-        # cycle), so the selection is tie-free and deterministic.
+        # Score mirror; 7 is invertible mod 64 so selection is tie-free.
         token_scores = [0] * (seq_len + protected_tail)
         for token in range(seq_len + protected_tail):
             token_scores[token] = (token * 7) % 64 + 1
@@ -697,9 +670,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
                 device=device,
             )
 
-        # GQA group 8 (the smallest CuTe-supported group with one KV head);
-        # zero calibration query and a shared MLR coefficient give every
-        # query head the same |K|-driven score.
+        # GQA group 8; zero calibration query and shared MLR coefficient.
         num_q_heads = 8
         q_real = torch.zeros(1, num_q_heads, num_freqs, dtype=torch.float32, device=device)
         q_imag = torch.zeros_like(q_real)
@@ -744,12 +715,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
                 [seq_len],
                 dense_move_offsets=[0, keep_count + protected_tail],
             )
-            # THE union path: the fused pipeline writes normalized union rows
-            # into ``combined``. Z-normalization is monotonic per row and all
-            # query heads carry identical scores here, so the expected keep
-            # set (derived from raw scores) is unchanged. The settle launch
-            # packs the move sources and the C++ compacts run in the same
-            # round call; the kept ordinals stay readable afterwards.
+            # THE union path (fused pipeline). Z-normalization is monotonic
+            # per row, so the raw-score keep set is unchanged.
             run_eviction_round(bufs, normalize_scores=True)
             selected = bufs.keep[0].clone().to(torch.long)
             mark_page_tables_consumed(bufs, manager._stream)
@@ -791,11 +758,8 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
         assert cache.history_length == prompt_len
         assert torch.equal(page_ids(request_id)[:2], retained_pages)
         assert torch.equal(page_ids(request_id)[2:], released_page)
-        # The first protected tail becomes confirmed input to round two. Only
-        # later generated tokens and the next protected tail are written
-        # here. Mirror the physical relayout, then give the fresh tokens a
-        # disjoint higher score band (11 invertible mod 64 over a shorter
-        # window) so round two must select differently from round one.
+        # Mirror the relayout; fresh tokens get a disjoint higher score band
+        # so round two must select differently.
         survivors = list(range(prompt_len)) + first_keep.tolist() + [seq_len, seq_len + 1]
         token_scores[:compacted_capacity] = [token_scores[source] for source in survivors]
         for token in range(compacted_capacity, seq_len + protected_tail):
@@ -822,9 +786,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
 
 
 def test_eager_compaction_rebases_masked_swa_window_and_tail():
-    # bf16 pools in the compact op's supported geometry (32-token pages,
-    # head_dim 64); the kept ordinals and valid lengths span all three pages
-    # per request so the dense and SWA moves stay page-crossing.
+    # Supported bf16 geometry; dense and SWA moves stay page-crossing.
     device = torch.device("cuda", torch.cuda.current_device())
     dense_tables = torch.tensor([[2, 0, 1], [5, 3, 4]], dtype=torch.int32, device=device)
     swa_tables = torch.tensor([[1, 2, 0], [4, 5, 3]], dtype=torch.int32, device=device)

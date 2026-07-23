@@ -21,11 +21,7 @@ import torch
 
 
 def encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
-    """Build the native V2 [pool, request, K/V, block] layout.
-
-    Accepts ``[request, block]`` page ids (one pool) or ``[pool, request,
-    block]``; K offsets encode as ``2*page`` and V as ``2*page + 1``.
-    """
+    """Native V2 [pool, request, K/V, block] layout: K = 2*page, V = K+1."""
     if page_ids.ndim == 2:
         page_ids = page_ids.unsqueeze(0)
     encoded = torch.empty(
@@ -59,11 +55,7 @@ def _write_move_offsets(compaction, offsets, moves_per_request):
 
 
 def set_protected_tails(compaction, tail_lengths, draft_tail_lengths=None):
-    """Load a cohort's per-request protected tails into the move offsets.
-
-    Production stages these rows through the single round-metadata upload;
-    tests drive the fixed buffers directly through this helper.
-    """
+    """Load per-request protected tails into the staged move offsets."""
     if len(tail_lengths) > compaction["request_count"]:
         raise ValueError("the cohort exceeds the compaction request capacity")
     if any(tail < 0 or tail > compaction["protected_tail_capacity"] for tail in tail_lengths):
@@ -109,13 +101,8 @@ def make_ramp_pools(
     base=0,
     device=None,
 ):
-    """bf16 pools carrying a shifted ``arange % 251`` ramp payload.
-
-    Every value is exact in bf16 and any wrong page/plane/head/token move
-    lands on a different byte pattern, so pool-equality checks in the
-    compaction tests stay conclusive. Geometry defaults to the compact op's
-    supported production shape (32-token pages, head_dim 64).
-    """
+    """bf16 pools with a shifted ``arange % 251`` ramp: every wrong move
+    lands on a different byte pattern (supported geometry defaults)."""
     return [
         (
             (
@@ -136,14 +123,9 @@ def make_ramp_pools(
 
 
 def build_compaction(**overrides):
-    """``init_compaction_buffers`` with the suite's default 2-layer geometry.
-
-    Accepts ``eviction_mode`` for test ergonomics (translated to the
-    builder's derived selection facts), allocates the caller-owned move
-    offset rows the production driver would stage (capacity cumsum), and
-    mirrors the geometry inputs onto the bundle for the standalone helpers
-    here -- production reads only the launch fields.
-    """
+    """``init_compaction_buffers`` with the suite's 2-layer defaults:
+    translates ``eviction_mode``, allocates the caller-owned offset rows
+    (capacity cumsum), and mirrors geometry inputs onto the bundle."""
     from tensorrt_llm._torch.kv_cache_compression.compaction import init_compaction_buffers
 
     args = dict(
@@ -200,14 +182,8 @@ def build_compaction(**overrides):
 
 
 def launch_family_pack(compaction, name):
-    """Standalone HAS_SETTLE=False pack launch for one family of a bundle.
-
-    Production packs dense/SWA inside the fused settle launch and fires the
-    draft pack inline in ``run_eviction_round``; standalone compaction tests
-    pack here from the bundle's own geometry so the C++ moves read
-    initialized indices. The settle-side pointer arguments are compiled away
-    (any well-formed tensor stands in).
-    """
+    """Standalone HAS_SETTLE=False pack for one family so the C++ moves
+    read initialized indices (settle-side pointers are compiled away)."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels import (
         SETTLE_PACK_BLOCK,
         SETTLE_PACK_NUM_WARPS,
@@ -260,11 +236,7 @@ def launch_family_pack(compaction, name):
 
 
 def run_compaction(compaction, pack=("dense", "draft")):
-    """Test-side replica of ``run_eviction_round``'s compact stage.
-
-    Optional standalone family packs, the SWA destination rebase, then every
-    family's C++ moves -- the same sequence production fires inline.
-    """
+    """Replica of the round's compact stage: packs, SWA rebase, C++ moves."""
     if compaction["swa_destination_bases"] is not None:
         torch.add(
             compaction["prompt_offsets"],
@@ -452,12 +424,8 @@ def torch_tri_score_oracle(
     offsets,
     layer_indices,
 ):
-    """Independent Torch implementation of the paged TriAttention mean score.
-
-    Covers GQA head mapping via ``head // group_size`` and the
-    position-independent MLR term. Mean aggregation only: it is the single
-    production aggregation (max was removed with the C++ score stack).
-    """
+    """Independent Torch oracle of the paged mean score (GQA mapping via
+    ``head // group_size`` plus the position-independent MLR term)."""
     scores = []
     num_q_heads = int(q_real.shape[1])
     for request, seq_len in enumerate(seq_lens):
@@ -513,12 +481,8 @@ def make_cute_buffers(
     offsets,
     decode_width=None,
 ):
-    """Real eviction buffers over one shared page-table slot.
-
-    Shared by the CuTe score and union-fusion tests. Union runners compile
-    only the fused pipeline, so split-reference legs build their own
-    score-only buffers with ``eviction_mode="per_head"`` over the same pools.
-    """
+    """Real eviction buffers over one shared page-table slot; split
+    reference legs use ``eviction_mode="per_head"`` over the same pools."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
         init_eviction_buffers,
     )
@@ -561,13 +525,8 @@ def write_block_offsets(bufs, encoded):
 
 
 def stage_score_metadata(bufs, request_count, valid_seq_lens, valid_widths, token_starts):
-    """Stage the per-round score metadata exactly like production.
-
-    The compiled runner reads valid lengths and window starts straight from
-    the staged metadata rows (pointer capture), so stage them like
-    ``stage_eviction_cohort`` does; the width subtraction mirrors what the
-    production phase-gather launch derives on device.
-    """
+    """Stage the per-round score metadata exactly like production (the
+    compiled runner reads the staged rows via pointer capture)."""
     torch.sub(
         valid_seq_lens[:request_count],
         token_starts[:request_count],

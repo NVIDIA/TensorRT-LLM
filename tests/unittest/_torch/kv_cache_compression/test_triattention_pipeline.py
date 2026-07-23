@@ -331,10 +331,8 @@ class TestTriAttentionClass:
 
 
 class TestCompressedTokenPublication:
-    # The cumulative/monotone publication contract itself (including the
-    # uncompressed round_start restoration) is covered end to end by
-    # test_triattention_draft_cocompaction.py::
-    # test_compressed_count_is_monotone_and_tracks_confirmed_length.
+    # The monotone publication contract is covered end to end in
+    # test_triattention_draft_cocompaction.py.
 
     def test_identity_compaction_is_rejected_instead_of_published(self):
         manager = _make_triattention(budget=4)
@@ -356,8 +354,7 @@ class TestCompressedTokenPublication:
         assert state["evicted_tokens"] == 0
         cache.resize.assert_not_called()
 
-        # A prepared entry that violates the keep contract fails loudly in the
-        # bookkeeping loop instead of publishing an identity compaction.
+        # A keep-contract violation fails loudly, never publishes.
         with _mocked_eviction_internals(manager):
             with pytest.raises(RuntimeError, match="identity compaction"):
                 manager._evict_requests(
@@ -465,9 +462,7 @@ class TestEvictionLifecycle:
         cache = mgr.kv_cache_manager.kv_cache_map[7]
         cache.capacity = confirmed + tail
         mgr.kv_cache_manager.num_extra_kv_tokens = reserve
-        # The configured tail capacity (reserve + draft reserve + 1) must
-        # cover this round's actual tail, as in production; the growth
-        # constant is 1 + _kv_reserve_draft_tokens for batch members.
+        # Growth constant = 1 + _kv_reserve_draft_tokens for batch members.
         mgr.kv_cache_manager._kv_reserve_draft_tokens = current_growth - 1
         mgr._prepared_generation_batch = SimpleNamespace(generation_requests=[request])
         draft_manager = _make_fake_v2(is_draft=True)
@@ -482,8 +477,7 @@ class TestEvictionLifecycle:
         with mock.patch.object(mgr, "_evict_requests", side_effect=compact) as evict:
             mgr._periodic_evict(batch)
 
-        # The resolved per-request metadata is threaded in as-is: the tail is
-        # excluded from seq_len and the keep target is prompt + budget.
+        # Tail excluded from seq_len; keep target = prompt + budget.
         evict.assert_called_once_with(
             [
                 {
@@ -501,8 +495,6 @@ class TestEvictionLifecycle:
             2,
         )
         cache.resize.assert_called_once_with(retained + tail, None)
-        # The draft cache shrinks in the same round, to the same retained
-        # length plus the draft's own protected tail.
         draft_cache.resize.assert_called_once_with(retained + 1, None)
 
     def test_confirmed_length_comes_from_capacity_ledger_not_logical_length(self):
@@ -536,10 +528,8 @@ class TestEvictionLifecycle:
         cache.resize.assert_not_called()
 
     def test_one_model_draft_co_compression_contract_is_accepted(self):
-        # Co-compression keeps the draft's physical length equal to the
-        # target's, so a draft with a smaller max_seq_len than the target's
-        # logical maximum is accepted, and both managers are marked as
-        # diverging from the logical length.
+        # Draft physical length tracks the target's: smaller draft
+        # max_seq_len is accepted and both managers are marked.
         draft_manager = _make_fake_v2(is_draft=True)
         draft_manager.max_seq_len = 8192
         manager = TriAttention(
@@ -552,7 +542,6 @@ class TestEvictionLifecycle:
         manager._validate_v2_compatibility()
         assert manager.kv_cache_manager.kv_compression_manages_history is True
         assert draft_manager.kv_compression_manages_history is True
-        # A one-model MTP contract also passes the call-site speculative gate.
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
@@ -760,10 +749,8 @@ class TestFixedScoreMetadata:
                 2,
             )
 
-        # One batched staging call carries the whole cohort: request ids,
-        # round starts, pinned prompt lengths, and valid lengths. budget=4:
-        # per-request moves are keep + tail = [6, 7]; padded rows repeat the
-        # final offset out to the request capacity.
+        # One batched staging call carries the whole cohort; budget=4 moves
+        # are keep + tail = [6, 7], padded rows repeat the final offset.
         args = internals.stage.call_args
         assert args.args[0] is internals.buffers
         assert args.args[1] is manager.kv_cache_manager
@@ -779,15 +766,9 @@ class TestFixedScoreMetadata:
     @requires_sm100
     @pytest.mark.parametrize("request_count", [1, 8])
     def test_fused_score_spans_distinct_storages_and_block_tables(self, request_count):
-        """ONE launch over layers in DISTINCT storages with DISTINCT block tables.
-
-        This is the production V2 shape: get_buffers wraps every layer as its
-        own TensorWrapper storage and every layer allocates its own pages, so
-        the fused path must not assume a shared storage anchor or a shared
-        per-request block table. The launch is checked against the independent
-        Torch oracle, then relaunched after a round-start advance and a block
-        table rebind.
-        """
+        """ONE launch over layers in DISTINCT storages with DISTINCT block
+        tables (the production V2 shape), checked against the Torch oracle,
+        then relaunched after a round-start advance and a table rebind."""
         pytest.importorskip("cutlass")
         from tensorrt_llm._torch.kv_cache_compression.triattention import triattention as module
 
@@ -802,7 +783,6 @@ class TestFixedScoreMetadata:
         seq_len = page_count * tokens_per_block
         prompt_len = 1
         num_layers = 3
-        # Three SEPARATE allocations (distinct storages, like V2 TensorWrapper).
         pools = [
             (
                 0.125
@@ -813,7 +793,6 @@ class TestFixedScoreMetadata:
             for _ in range(num_layers)
         ]
         assert len({pool.untyped_storage().data_ptr() for pool in pools}) == num_layers
-        # A DIFFERENT block table per layer (per-layer page allocation).
         generator = torch.Generator(device="cpu").manual_seed(7 + request_count)
         page_ids_3d = torch.stack(
             [
@@ -835,7 +814,6 @@ class TestFixedScoreMetadata:
         round_starts = round_device[:request_count].tolist()
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
-        # One group per layer: slot i holds layer i's own block table.
         bufs = module.init_eviction_buffers(
             eviction_mode="per_head",
             layer_pools=pools,
@@ -863,8 +841,6 @@ class TestFixedScoreMetadata:
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
         def stage_round():
-            # Stage the round metadata straight into the fixed device rows
-            # (the cohort staging path is covered by the staging test above).
             bufs.round_starts_device.copy_(round_device)
             bufs.valid_seq_lens_device[:request_count].copy_(valid_seq_lens)
             bufs.token_starts_device.fill_(prompt_len)
@@ -873,8 +849,7 @@ class TestFixedScoreMetadata:
             )
 
         score_sentinel = -12345.0
-        # Isolate the score stage: empty prebound launch args make the
-        # compact stage a no-op (this synthetic round never stages offsets).
+        # Empty prebound launch args: the compact stage is a no-op.
         bufs.compact_launch_args = ()
         stage_round()
         bufs.score_output.fill_(score_sentinel)
@@ -882,8 +857,6 @@ class TestFixedScoreMetadata:
         fixed = bufs.score_output.clone()
         assert bufs.valid_widths.tolist() == [seq_len - prompt_len for seq_len in seq_lens]
 
-        # The deployed fused score must agree with the independent Torch oracle
-        # when every layer owns a distinct V2 block table.
         oracle = _torch_tri_score_oracle(
             pools,
             {layer: page_ids_3d[layer, :request_count] for layer in layer_order},

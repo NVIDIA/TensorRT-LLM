@@ -1,17 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The SM100 TriAttention CuTe scorer (the only score path) vs PyTorch oracles.
+"""The SM100 TriAttention CuTe scorer (the only score path) vs oracles.
 
-The launch-path matrix drives multi-layer buffers across the named
-production geometries (Qwen3, GPT-OSS, the originally validated
-128-token-page shape) against the shared pure-PyTorch oracle -- permuted
-physical pages, ragged valid lengths, GQA group 4 riding the padded MMA
-tile -- sweeps request counts up to the buffer capacity, and checks the
-per-request decode-width metadata the selection reduce kernels consume. The
-contract test pins the loud-failure behavior: unsupported geometry raises
-from the CuTe runner's own validation at buffer construction -- there is
-no fallback score kernel.
-"""
+The launch matrix drives the named production geometries against the
+pure-PyTorch oracle; the contract test pins the no-fallback loud raise."""
 
 import pytest
 import torch
@@ -43,8 +35,7 @@ def _build_case(
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(seed)
     num_freqs = head_dim // 2
-    # The 0.125 scaling keeps the BF16 key/coefficient products small so the
-    # kernel-vs-oracle tolerance can stay tight across the frequency sum.
+    # 0.125 scaling keeps the kernel-vs-oracle tolerance tight.
     pools = [
         (
             0.125
@@ -84,17 +75,13 @@ def _build_case(
     _write_block_offsets(bufs, _encode_block_offsets(page_ids))
     round_starts = (torch.arange(max_requests, dtype=torch.int32, device=device) + 9).contiguous()
     token_starts = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
-    # Ragged valid lengths: shallow tails land mid-page and mid-compute-tile;
-    # the 58-deep tail leaves a whole trailing 32-token page fragment past the
-    # valid length, so the fully-invalid-fragment clamp stays covered.
+    # Mid-page/mid-tile tails; 58 leaves a fully-invalid trailing fragment.
     tail_cuts = (0, 58, 3, 33)
     seq_lens = [capacity - tail_cuts[request % len(tail_cuts)] for request in range(max_requests)]
     valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     phase = (round_starts.float()[:, None, None] + offsets_t[None, :, None]) * omega[None, None, :]
     mean_cos = torch.cos(phase).mean(dim=1).contiguous()
     mean_sin = torch.sin(phase).mean(dim=1).contiguous()
-    # Everything the PyTorch oracle needs to rebuild the reference leg
-    # independently (it recomputes its own mean phases from these).
     oracle_inputs = dict(
         page_ids=page_ids,
         q_real=q_real,
@@ -128,10 +115,7 @@ def _geometry(max_requests, num_layers, page_count, tokens_per_block, head_dim, 
     )
 
 
-# One entry per supported production geometry: the Qwen3 shape (64
-# frequencies, GQA group 4 riding the padded MMA tile), the GPT-OSS shape
-# (32 frequencies, group 8, 32-token pages spanning two page fragments per
-# compute tile), and the originally validated 128-token-page shape.
+# One entry per supported production geometry.
 _CASES = [
     pytest.param(_geometry(4, 2, 4, 32, 128, 8, 2), id="qwen3_f64_group4_tpb32"),
     pytest.param(_geometry(2, 3, 4, 32, 64, 8, 1), id="gptoss_f32_group8_tpb32"),
@@ -173,9 +157,7 @@ def test_cute_kernel_matches_torch_oracle(case):
         list(range(num_layers)),
     )
 
-    # The compiled runner serves every request count up to the buffer
-    # capacity and nothing beyond it; cover one, an intermediate count, and
-    # the capacity.
+    # Every count up to capacity is served, nothing beyond.
     assert max_requests + 1 not in bufs.runner._compiled
     for request_count in dict.fromkeys((1, max_requests - 1, max_requests)):
         valid_widths = torch.full((max_requests,), -1, dtype=torch.int32, device=device)
@@ -210,17 +192,13 @@ def test_cute_kernel_matches_torch_oracle(case):
                 )
 
 
-# The loud-failure contract: unsupported geometry raises from the CuTe
-# runner's own validation during the eager compile at buffer
-# construction, surfaced as the no-fallback RuntimeError.
 def test_unsupported_geometry_raises_at_buffer_construction():
     pytest.importorskip("cutlass")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(20260722)
     num_layers, max_requests, page_count, tokens_per_block, head_dim = 2, 2, 2, 4, 8
     num_freqs = head_dim // 2
-    # fp32 pools with a 4-token page and 4 frequencies sit far outside the
-    # CuTe contract on every device.
+    # fp32, 4-token pages, 4 freqs: outside the contract on every device.
     pools = [
         torch.randn(max_requests * page_count, 2, 1, tokens_per_block, head_dim, device=device)
         for _ in range(num_layers)

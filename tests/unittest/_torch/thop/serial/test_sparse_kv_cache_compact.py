@@ -15,10 +15,8 @@ _NUM_KV_HEADS = 2
 _BATCH_SIZE = 2
 _PAGE_INDEX_DIVISOR = 2
 
-# Kernel-name substrings for the profiler probes below. The pipelined bf16
-# kernels are the only shipped compaction path; the retired register-staging
-# kernel (still present for the sparse-attention updater) must never appear
-# in this op's launches.
+# Profiler probe names: the pipelined bf16 kernels are the only shipped
+# path; the retired register-staging kernel must never appear.
 _FAST_KERNEL_NAME = "sparseKvCacheCompactV2Bf16PipelineKernel"
 _RETIRED_KERNEL_NAME = "updateSparseKvCacheAfterFmha"
 
@@ -116,9 +114,8 @@ def _reference_compact(
     for group_layer, (source_pool, destination_pool, page_table) in enumerate(
         zip(original, expected, page_tables)
     ):
-        # The kernel decodes K offsets as offset // 2 (the V2 2*page+plane
-        # encoding) regardless of the scale the table was built with; the
-        # reference mirrors the kernel, not the encoder.
+        # The kernel decodes K offsets as offset // 2 regardless of the
+        # encoder's scale; the reference mirrors the kernel.
         raw_page_table = page_table // _PAGE_INDEX_DIVISOR
         if source_indices.ndim == 2:
             layer_sources = source_indices
@@ -184,10 +181,8 @@ def _compact(
 
 
 _SMALL_ROW = [2, 5, 8, 3, 7, 10]
-# One byte-equality case per launch shape the op serves: dtype/head_dim and
-# destination/page-scale sweeps, per-request destination bases (one launch
-# mixing pinned-prompt lengths), a 3-D per-layer source with layer routing,
-# and a multi-tile launch (40/35 moves across 24-page sequences).
+# One byte-equality case per launch shape: head_dim/destination/page-scale
+# sweep, per-request bases, 3-D per-layer routing, multi-tile.
 _LAYER_CASES = [
     pytest.param(
         dict(head_dim=head_dim, dest=dest, scale=scale),
@@ -300,22 +295,14 @@ def test_sparse_kv_cache_compact_layers_cuda_graph_replay():
 
 
 # --- Production-shaped geometry for the pipelined bf16 fast path ----------
-#
-# The fast path only dispatches for bf16 pools with head_dim 64/128 and
-# 32/128-token pages, so the cases below use their own builder instead of the
-# 3-page fixtures above.
 
 _FAST_BATCH_SIZE = 3
-# Per-request move counts: two ragged tiles plus a full one (pipeline steady
-# state), an empty request (kernel early-return), and a single ragged tile
-# (prologue/epilogue only).
+# Ragged+full tiles, an empty request, and a prologue/epilogue-only tile.
 _FAST_MOVE_COUNTS = (71, 0, 29)
 # Mixed prompt lengths: none tile- or page-aligned.
 _FAST_DESTINATION_BASES = [3, 9, 17]
-# The production move-index buffers are allocation-wide: pad the head-plane
-# width beyond this round's total move count so a kernel that derives the
-# stride on device (instead of honoring the explicit sourceHeadStride) reads
-# padding for heads > 0 and fails the byte-compare.
+# Allocation-wide index buffers: padding past the round's total move count
+# makes a device-derived stride read padding and fail the byte-compare.
 _FAST_SOURCE_PAD = 37
 _FAST_IDENTITY_MOVES = 5
 
@@ -443,10 +430,8 @@ def _run_fast_geometry_case(case: _FastGeometryCase) -> list[torch.Tensor]:
     return expected
 
 
-# The full fast-path gate matrix. 128-token pages are the geometry the ported
-# kernel was written for; 32-token pages and head_dim 128 are this tree's
-# production configuration. The per-layer-source row keeps the 3-D routing
-# path runnable through the fast kernel.
+# The full fast-path gate matrix; the per-layer-source row keeps the 3-D
+# routing path runnable through the fast kernel.
 _FAST_GEOMETRY_MATRIX = [(64, 32), (128, 32), (64, 128), (128, 128)]
 
 
@@ -455,19 +440,21 @@ _FAST_GEOMETRY_MATRIX = [(64, 32), (128, 32), (64, 128), (128, 128)]
     [(h, t, False) for h, t in _FAST_GEOMETRY_MATRIX] + [(64, 32, True)],
 )
 def test_sparse_kv_cache_compact_layers_fast_geometry(head_dim, tokens_per_block, per_layer):
-    # Eligible geometry always dispatches the pipelined kernel; the
-    # byte-compare against the CPU reference is the correctness net.
+    # Byte-compare against the CPU reference, plus the dispatch probe: the
+    # pipelined kernel must actually run (and the retired one must not) --
+    # every byte-equality here would still pass on a silent fallback.
     case = _make_fast_geometry_case(head_dim, tokens_per_block, per_layer_sources=per_layer)
-    expected = _run_fast_geometry_case(case)
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
+        expected = _run_fast_geometry_case(case)
+    names = [event.name for event in profiler.events()]
+    assert any(_FAST_KERNEL_NAME in name for name in names)
+    assert not any(_RETIRED_KERNEL_NAME in name for name in names)
     for actual, reference in zip(case.pools, expected):
         assert torch.equal(actual.cpu(), reference)
 
 
-# One representative per reject family: dtype outside the bf16-only gate,
-# head_dim outside the gate, page size outside the gate, and a flat 2-D
-# source combined with per-layer indices (which would silently read layer 0
-# for every launch). There is no fallback kernel: every reject must fail
-# loudly and leave the pools untouched.
+# One representative per reject family; no fallback kernel exists, so every
+# reject must fail loudly and leave the pools untouched.
 @pytest.mark.parametrize(
     "dtype,head_dim,tokens_per_block,flat_with_layer_indices,match",
     [
@@ -505,18 +492,3 @@ def test_sparse_kv_cache_compact_layers_rejects_invalid_launch(
     torch.cuda.synchronize()
     for actual, reference in zip(case.pools, case.pools_cpu):
         assert torch.equal(actual.cpu(), reference)
-
-
-@pytest.mark.parametrize("head_dim,tokens_per_block", _FAST_GEOMETRY_MATRIX)
-def test_sparse_kv_cache_compact_layers_fast_path_actually_runs(head_dim, tokens_per_block):
-    # Guard against the fast-path gate silently never firing: every
-    # byte-equality test in this module would still pass if the dispatcher
-    # fell through to the register-staging kernel. Assert via the profiler
-    # that the pipelined kernel ran (and the fallback did not) for each of
-    # the four static geometry dispatch branches.
-    case = _make_fast_geometry_case(head_dim, tokens_per_block)
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
-        _run_fast_geometry_case(case)
-    names = [event.name for event in profiler.events()]
-    assert any(_FAST_KERNEL_NAME in name for name in names)
-    assert not any(_RETIRED_KERNEL_NAME in name for name in names)

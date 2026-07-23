@@ -1,17 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Draft KV co-compression tests for TriAttention eviction.
-
-With one-model speculative decoding, TriAttention compacts the separate draft
-KV cache in the same round as the target: the target's union keep set is
-broadcast over the draft's own KV heads, the draft's own protected tail is
-appended as ordinals ``valid_seq_len + 0..tail-1``, and both caches land at
-``destination_base = prompt_len``. These tests cover the physical draft moves,
-the packed move indices, stream ordering across both cache managers, the
-speculative admission gates (one representative per guard family), the
-published compressed-token invariant, and buffer rebuild/invalidation.
-"""
+"""Draft KV co-compression: the target's union keep set broadcasts over
+the draft's own KV heads, the draft's tail appends as ordinals, both land
+at ``destination_base = prompt_len``. Covers the physical moves, packed
+indices, stream ordering, admission gates, the published compressed-token
+invariant, and buffer rebuild/invalidation."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -49,12 +43,8 @@ def _logical_view(pool: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
 
 
 def _launched_draft_compaction(draft_protected_tails):
-    """Build target and draft pools with distinct head counts, then compact.
-
-    The compact op ships only the pipelined bf16 kernels, so the pools use
-    the supported production geometry (bf16, 32-token pages, head_dim 64) and
-    the conclusive shifted ``arange % 251`` ramp payload.
-    """
+    """Target and draft pools with distinct head counts (supported bf16
+    geometry, mod-251 ramp payload), compacted in one round."""
     device = torch.device("cuda", torch.cuda.current_device())
     request_count = 2
     prompt_len = 2
@@ -69,8 +59,6 @@ def _launched_draft_compaction(draft_protected_tails):
     initial_target = [pool.clone() for pool in target_pools]
     initial_draft = draft_pool.clone()
 
-    # Kept ordinals are decode-only but absolute; the pinned prompt tokens
-    # never appear in the selection rectangle.
     keep = torch.tensor([[2, 4, 7, 9], [3, 5, 6, 8]], dtype=torch.int64, device=device)
 
     compaction = _build_compaction(
@@ -145,9 +133,7 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
                 before.index_select(2, target_source),
             )
 
-        # The draft compacts the SAME kept ordinals through its OWN page
-        # table, over its own head count, with its own protected tail, at
-        # destination_base = prompt_len.
+        # Same kept ordinals through the draft's OWN table/heads/tail.
         draft_pages = built.draft_tables[request].to(torch.long)
         draft_tail = torch.arange(
             valid,
@@ -174,14 +160,12 @@ def test_draft_moves_and_pack_match_keep_broadcast_and_tail_oracle(draft_protect
         expected_moves.append(draft_source.to(torch.int32))
         expected_offsets.append(expected_offsets[-1] + int(draft_source.numel()))
 
-    # The packed draft move indices must match the same broadcast-plus-tail
-    # oracle the physical moves followed.
+    # Packed indices must match the same broadcast-plus-tail oracle.
     draft_family = _compaction_family(built.compaction, "draft")
     expected_row = torch.cat(expected_moves)
     assert draft_family["offsets"].cpu().tolist() == expected_offsets
     draft_indices = draft_family["source"]
-    # The index buffer is sized for the widest tail (the capacity); this
-    # round's moves are packed at the front, where the offsets point.
+    # Capacity-sized buffer; this round's moves pack at the front.
     capacity_total = built.request_count * (
         int(built.keep.shape[1]) + max(built.draft_protected_tails)
     )
@@ -234,9 +218,7 @@ def test_draft_admission_gates_raise(gate, match):
     if gate == "full_attention_draft":
         draft_manager.max_attention_window_vec = [128]
     if gate.startswith("callsite_"):
-        # These draft contracts read cross-attention buffers or unvalidated
-        # paged tails; the call-site speculative gate rejects every one of
-        # them before any manager is created.
+        # Call-site speculative gate: rejected before any manager exists.
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import (
             DFlashDecodingConfig,

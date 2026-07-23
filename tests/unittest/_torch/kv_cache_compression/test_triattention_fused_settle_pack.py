@@ -1,18 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The fused settle-and-pack kernel must reproduce the settle/pack semantics
-exactly.
-
-The reference is a pure-torch oracle implementing the integer settle and
-pack semantics (threshold recovery with sentinel-skip, strictly-greater
-count, lowest-index tie quota, ascending prompt-rebased emission, then the
-dense/SWA move-source packing). Every output is integer-valued, so the
-comparisons remain ``torch.equal`` — including the buffer regions neither
-path overwrites (rows shorter than the keep count leave stale entries
-behind, and the packing forwards those stale entries the same way in both
-paths).
-"""
+"""Fused settle-and-pack vs a pure-torch integer oracle (threshold
+recovery with sentinel-skip, strictly-greater count, lowest-index tie
+quota, ascending prompt-rebased emission, dense/SWA packing). All outputs
+are integers, so comparisons are ``torch.equal`` including stale regions."""
 
 import pytest
 import torch
@@ -29,15 +21,9 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention_kernels 
 
 
 def _settle_oracle(scores, row_lengths, row_prompt_offsets, provisional, output, keep_count):
-    """Settle each row's provisional top-k in place (exact integer semantics).
-
-    Threshold = min score over the provisional lanes (``-1`` sentinel lanes
-    are skipped, contributing +inf, so an all-sentinel row settles inertly);
-    keep every strictly-greater score in the valid width, then fill the
-    remaining quota with threshold ties in increasing index order; emit the
-    kept ordinals ascending, rebased by the row's pinned prompt length.
-    Output entries past the emitted count keep their previous (stale) value.
-    """
+    """Settle in place: threshold = min over non-sentinel provisional
+    lanes; keep strictly-greater, fill quota with lowest-index ties, emit
+    ascending rebased by prompt; entries past the emitted count stay."""
     rows_total, width = scores.shape
     for row in range(rows_total):
         lanes = [int(i) for i in provisional[row, :keep_count] if int(i) >= 0]
@@ -71,15 +57,9 @@ def _pack_oracle(
     per_layer,
     has_swa,
 ):
-    """Pack dense/SWA move sources from the settled ordinals (in place).
-
-    Dense rows forward the settled output content verbatim for the first
-    ``keep_count`` moves (stale entries included, exactly like the kernel's
-    unconditional gather) and append the protected tail
-    ``seq_len + move - keep_count``; SWA rows write the latest-window
-    ordinals once per KV head (per-layer packs share one SWA row per head,
-    written only by the first layer's domains).
-    """
+    """Pack in place: dense rows forward settled content verbatim (stale
+    included) then append the tail ``seq_len + move - keep_count``; SWA
+    rows write latest-window ordinals once per KV head."""
     request_count = int(valid_seq_lens.shape[0])
     packed_rows = int(dense_out.shape[0])
     dense_total = int(dense_out.shape[1])
