@@ -229,6 +229,33 @@ class TestMalformedRecipeValidation:
         with pytest.raises(ValueError, match="Unsupported Cosmos3 sampling recipe"):
             Cosmos3SamplingPolicy.from_scheduler(scheduler)
 
+    @pytest.mark.parametrize("stochastic", [False, "absent"])
+    def test_non_stochastic_fixed_schedule_raises(self, stochastic):
+        """The distilled policy assumes SDE noise every step (seeded generator);
+        an ODE fixed-step recipe must not silently load as distilled."""
+        config = dict(DISTILLED_SCHEDULER_CONFIG)
+        if stochastic == "absent":
+            config.pop("stochastic_sampling")  # diffusers defaults it to False
+        else:
+            config["stochastic_sampling"] = stochastic
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
+
+        with pytest.raises(ValueError, match="stochastic_sampling"):
+            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+
+    def test_declared_non_sde_sample_type_raises(self):
+        config = {
+            **DISTILLED_SCHEDULER_CONFIG,
+            "fixed_step_sampler_config": {
+                "sample_type": "ode",
+                "t_list": list(DISTILLED_SIGMAS),
+            },
+        }
+        scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
+
+        with pytest.raises(ValueError, match="sample_type"):
+            Cosmos3SamplingPolicy.from_scheduler(scheduler)
+
 
 class TestValidateRequest:
     @pytest.mark.parametrize("steps", [None, 4])
@@ -436,6 +463,27 @@ class TestWarmupAndForwardValidation:
         pipeline = _bare_pipeline(sampling=_distilled_policy())
         with pytest.raises(ValueError, match="distilled"):
             pipeline.forward(prompt="x", seed=0, use_guardrails=False, **bad_kwargs)
+
+    def test_distilled_rejects_image_conditioning(self):
+        """Without per-step re-anchoring, the stochastic scheduler corrupts the
+        conditioned frame; the request must fail rather than degrade silently."""
+        pipeline = _bare_pipeline(sampling=_distilled_policy())
+        with pytest.raises(ValueError, match="re-anchor"):
+            pipeline.forward(
+                prompt="x",
+                seed=0,
+                use_guardrails=False,
+                image="frame.png",
+                num_inference_steps=4,
+                guidance_scale=1.0,
+            )
+
+    def test_base_still_accepts_image_conditioning_path(self):
+        """Base checkpoints must not be caught by the distilled image rejection:
+        forward proceeds past validation (fails later on the bare test double)."""
+        pipeline = _bare_pipeline(sampling=_base_policy())
+        with pytest.raises(AttributeError):
+            pipeline.forward(prompt="x", seed=0, use_guardrails=False, image="frame.png")
 
     @pytest.mark.parametrize("bad_output_type", ["imgae", "png", "", "both"])
     def test_invalid_output_type_raises(self, bad_output_type):
