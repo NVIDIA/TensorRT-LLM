@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from enum import IntEnum, auto
-from typing import Optional
 
 
 class KvCacheCompressionMode(IntEnum):
@@ -21,9 +20,7 @@ class KvCacheCompressionMode(IntEnum):
         return self == KvCacheCompressionMode.TRIATTENTION
 
     @staticmethod
-    def from_string(name: Optional[str]) -> "KvCacheCompressionMode":
-        if name is None:
-            return KvCacheCompressionMode.NONE
+    def from_string(name: str) -> "KvCacheCompressionMode":
         try:
             return KvCacheCompressionMode[name.upper()]
         except KeyError:

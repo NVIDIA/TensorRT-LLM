@@ -247,7 +247,6 @@ def make_bare_staging(device, *, max_requests, staged_blocks_per_seq):
     staging._block_offsets_ready_event = torch.cuda.Event()
     staging._compaction_done_event = torch.cuda.Event()
     staging._staging_reuse_event = torch.cuda.Event()
-    staging._copy_pending = False
     staging._block_offsets_host = torch.empty(
         1, max_requests, 2, staged_blocks_per_seq, dtype=torch.int32, device="cpu", pin_memory=True
     )

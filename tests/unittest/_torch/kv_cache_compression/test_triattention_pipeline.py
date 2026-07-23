@@ -149,7 +149,7 @@ class TestTriAttentionClass:
         manager.num_extra_kv_tokens = 4
         manager._kv_reserve_draft_tokens = 4
         triattention = TriAttention(manager, _make_tri_config(budget=8))
-        triattention._calibrated = True
+        triattention.calibration = {}
 
         triattention.on_request_init(_make_request(11))
         triattention.on_request_init(_make_request(12))
@@ -287,7 +287,7 @@ class TestCompressedTokenPublication:
             capacity=6, history_length=0, is_active=True, resize=mock.Mock(return_value=True)
         )
         manager.kv_cache_manager.kv_cache_map = {7: cache}
-        manager._calibrated = True
+        manager.calibration = {}
         state = _set_request_state(manager, 7, generation_steps=127)
 
         with _mocked_eviction_internals(manager) as internals:
@@ -329,7 +329,7 @@ class TestEvictionLifecycle:
         fake_v2.num_extra_kv_tokens = num_extra_kv_tokens
         fake_v2._kv_reserve_draft_tokens = kv_reserve_draft_tokens
         mgr = TriAttention(fake_v2, _make_tri_config(budget=8))
-        mgr._calibrated = True
+        mgr.calibration = {}
         cache = SimpleNamespace(
             capacity=seq_len,
             history_length=1024,
@@ -428,7 +428,7 @@ class TestEvictionLifecycle:
         # (capacity minus the protected tail), never the logical length.
         physical_confirmed = 6100
         manager = _make_triattention(beta=128)
-        manager._calibrated = True
+        manager.calibration = {}
         _set_request_state(manager, 7, generation_steps=127, evicted_tokens=100)
         cache = SimpleNamespace(
             capacity=physical_confirmed,

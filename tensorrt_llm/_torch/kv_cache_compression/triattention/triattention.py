@@ -140,7 +140,6 @@ class TriAttention(KVCacheCompressionManager):
         self.model_path = config.model_path
         self.calibration_path = config.calibration_path
         self.calibration: Optional[Dict[str, torch.Tensor]] = None
-        self._calibrated = False
         self._freq_scale_sq: Optional[torch.Tensor] = None
 
         # Mean-phase table dict; buffer builds bind its device tables in place.
@@ -243,7 +242,7 @@ class TriAttention(KVCacheCompressionManager):
             )
 
     def _ensure_calibrated(self) -> None:
-        if self._calibrated:
+        if self.calibration is not None:
             return
         self.calibration = self._resolve_calibration()
         self._freq_scale_sq = self.calibration["freq_scale_sq"].to(dtype=torch.float32)
@@ -254,7 +253,6 @@ class TriAttention(KVCacheCompressionManager):
         self._triattn_mlr_coef = (
             self.calibration["E_q_norm"].to(torch.float32) - _Eq.abs().to(torch.float32)
         ).contiguous()
-        self._calibrated = True
 
     def on_generation_step_end(self, scheduled_batch: "ScheduledRequests", **kwargs) -> None:
         """Compact after native KV-cache updates have finalized this iteration
@@ -332,13 +330,8 @@ class TriAttention(KVCacheCompressionManager):
                     continue
                 draft_kv_cache = None
                 if self.draft_kv_cache_manager is not None:
-                    draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map.get(request_id)
-                    if draft_kv_cache is None:
-                        # A missing draft cache is a wiring/lifecycle bug.
-                        raise RuntimeError(
-                            "TriAttention cannot co-compress a missing draft KV "
-                            f"cache for request {request_id}"
-                        )
+                    # A missing draft cache is a wiring bug: the dict's KeyError is the report.
+                    draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map[request_id]
                     if not draft_kv_cache.is_active:
                         # Target and draft defer together (pre-launch).
                         continue
@@ -372,38 +365,30 @@ class TriAttention(KVCacheCompressionManager):
             return
         with nvtx_range("triattention.resize", color="red"):
             with nvtx_range_debug("triattention.v2_resize", color="red"):
-                for item in prepared:
-                    kv_cache = item["kv_cache"]
-                    if not kv_cache.is_active:
-                        # Bytes already moved: skipping the ledger resize here
-                        # would leave silent corruption. The compact-to-resize
-                        # window is owned by this hook; a suspension inside it
-                        # breaks the lifecycle contract.
-                        raise RuntimeError(
-                            f"Request {item['request_id']} target KV cache was "
-                            "suspended between compact and resize"
-                        )
-                    resized_capacity = item["expected_keep_count"] + item["protected_tail"]
-                    if not kv_cache.resize(resized_capacity, None):
-                        raise RuntimeError(
-                            f"Failed to resize compacted KV cache for request "
-                            f"{item['request_id']} to {resized_capacity} tokens"
-                        )
+                families = [("target", "kv_cache", None)]
                 if self.draft_kv_cache_manager is not None:
-                    # Same kept set: the draft shrinks to the same retained length plus its own tail.
-                    draft_protected_tail = self._draft_protected_tail_capacity
+                    # Same kept set: the draft shrinks to the same retained
+                    # length plus its own fixed tail.
+                    families.append(
+                        ("draft", "draft_kv_cache", self._draft_protected_tail_capacity)
+                    )
+                for label, cache_key, fixed_tail in families:
                     for item in prepared:
-                        draft_kv_cache = item["draft_kv_cache"]
-                        if not draft_kv_cache.is_active:
+                        kv_cache = item[cache_key]
+                        if not kv_cache.is_active:
+                            # Bytes already moved: skipping the ledger resize would
+                            # leave silent corruption; the compact-to-resize window
+                            # is owned by this hook.
                             raise RuntimeError(
-                                f"Request {item['request_id']} draft KV cache was "
+                                f"Request {item['request_id']} {label} KV cache was "
                                 "suspended between compact and resize"
                             )
-                        draft_capacity = item["expected_keep_count"] + draft_protected_tail
-                        if not draft_kv_cache.resize(draft_capacity, None):
+                        tail = item["protected_tail"] if fixed_tail is None else fixed_tail
+                        resized_capacity = item["expected_keep_count"] + tail
+                        if not kv_cache.resize(resized_capacity, None):
                             raise RuntimeError(
-                                "Failed to resize co-compressed draft KV cache for "
-                                f"request {item['request_id']} to {draft_capacity} tokens"
+                                f"Failed to resize compacted {label} KV cache for "
+                                f"request {item['request_id']} to {resized_capacity} tokens"
                             )
 
     def _minimum_evictable_length(self, request: "LlmRequest", seq_len: int) -> int:
@@ -1188,7 +1173,7 @@ class TriAttention(KVCacheCompressionManager):
                 dense_move_offsets=draft_move_offsets_row,
                 protected_tail_capacity=int(draft["protected_tail_capacity"]),
             )
-        self.compaction_plan = init_compaction_buffers(
+        self._compaction_plan = init_compaction_buffers(
             target=dict(
                 layer_pools=layer_pools,
                 dense_layers=list(dense_layers),
@@ -1224,7 +1209,6 @@ class TriAttention(KVCacheCompressionManager):
         self._block_offsets_ready_event = torch.cuda.Event()
         # This cohort's compact is done: manager may resize/reuse pages.
         self._compaction_done_event = torch.cuda.Event()
-        self._copy_pending = False
 
     @staticmethod
     def _page_table_pool_ids(
@@ -1374,8 +1358,7 @@ class TriAttention(KVCacheCompressionManager):
             # The one host-staging reuse fence: the previous cohort's async copies
             # must complete before the pinned metadata rows AND the pinned
             # target/draft block-offset snapshots are rewritten.
-            if self._copy_pending and not self._staging_reuse_event.query():
-                self._staging_reuse_event.synchronize()
+            self._staging_reuse_event.synchronize()
             host_table = self._request_metadata_host_np
             for row, values in rows:
                 if values is not None:
@@ -1401,7 +1384,6 @@ class TriAttention(KVCacheCompressionManager):
             finally:
                 # Guards the pinned staging until the asynchronous copies complete.
                 self._staging_reuse_event.record(stream)
-                self._copy_pending = True
         request_count = len(prepared)
         union = self.eviction_mode == "union"
         try:
@@ -1508,7 +1490,7 @@ class TriAttention(KVCacheCompressionManager):
                     )
                 self._settle_top_tokens(request_count)
             with nvtx_range("triattention.compact", color="purple"):
-                compact(self.compaction_plan, request_count)
+                compact(self._compaction_plan, request_count)
         finally:
             # Order V2 page-table reuse and resize after this cohort's compact.
             self._compaction_done_event.record(stream)

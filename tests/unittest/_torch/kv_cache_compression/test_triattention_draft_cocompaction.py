@@ -177,9 +177,8 @@ def test_execute_eviction_round_orders_both_manager_streams():
     tri._keep_count = 4
     tri.eviction_mode = "union"
     tri._swa_window = None
-    tri.compaction_plan = ()
+    tri._compaction_plan = ()
     tri._draft_protected_tail_capacity = 1
-    tri._copy_pending = False
     tri._staging_reuse_event = mock.Mock()
     tri._compaction_done_event = event
     tri._request_metadata_host = host
@@ -272,7 +271,7 @@ def test_draft_admission_gates_raise(gate, match):
 
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager = _make_triattention(budget=4, beta=4)
-    manager._calibrated = True
+    manager.calibration = {}
     manager._layer_partition = ([0, 1], [], None)
     target = manager.kv_cache_manager
     target._stream = mock.Mock()
