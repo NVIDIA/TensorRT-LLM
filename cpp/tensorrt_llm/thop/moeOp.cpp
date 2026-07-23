@@ -476,38 +476,6 @@ public:
         ActivationType base_activation_type = activation_type.has_value()
             ? static_cast<ActivationType>(activation_type.value())
             : ActivationType::Swiglu;
-        if (mUseINT8WoqPerChannel)
-        {
-            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
-            // [num_experts, inter_size, hidden_size]
-	    // Mirror the non-woq else-branch below: gated activations (Swiglu/Geglu) require fc1's
-            // intermediate dim to be 2x fc2's (one half each for gate and up), while non-gated
-            // activations (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
-            if (isGatedActivation(base_activation_type))
-            {
-                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
-                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
-            }
-            else
-            {
-                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier,
-                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
-            }
-        }
-        else
-        {
-            if (isGatedActivation(base_activation_type))
-            {
-                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
-                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
-            }
-            else
-            {
-                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier,
-                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
-            }
-        }
-
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
@@ -568,6 +536,39 @@ public:
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
+
+        // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
+        // non-gated) is finalized: the swiglu_alpha/beta/limit handling above can promote the
+        // activation to SwigluBias, which is gated. INT8-woq uses a transposed weight layout, so
+        // its fc1/fc2 dim ordering differs from the non-woq path. Gated activations (Swiglu/Geglu)
+        // require fc1's intermediate dim to be 2x fc2's (one half each for gate and up); non-gated
+        // activations (Relu2/Identity/ReLU/SiLU/Gelu, e.g. Nemotron-H) require them to be equal.
+        if (mUseINT8WoqPerChannel)
+        {
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
+        }
+        else
+        {
+            if (isGatedActivation(base_activation_type))
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
+                    "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+            }
+            else
+            {
+                TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier,
+                    "fc1_expert_weights inter size must be equal to fc2_expert_weights inter size.");
+            }
+        }
 
         setRunnerProfiles(profile_ids);
 
@@ -831,7 +832,7 @@ public:
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
-	
+
         // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
         // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim
         // ordering differs from the non-woq path; both mirror the gated/non-gated split used in
