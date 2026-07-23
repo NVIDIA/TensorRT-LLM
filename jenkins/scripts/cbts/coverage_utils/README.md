@@ -13,10 +13,10 @@ not lines executed (far cheaper than line tracing).
 
 | File | Role |
 |---|---|
-| `cbts_pystart.py` | The tracker: a `sys.monitoring` (tool id 4) `PY_START` tool that records, per test context, the set of product `(file, qualname)` entered. Writes one `.cbtscov.<stage>.<suffix>.sqlite` per process; these leave the node only inside compressed tarballs, so the publish-artifacts guardword/secret scanner (which byte-matches product paths in raw files but does not recurse into archives) never sees the paths stored inside. |
-| `sitecustomize.py` | Starts the tracker in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, … — which opt out themselves and their spawned subtree). Reads `source` + `data_file` from the rcfile. Long-lived non-pytest processes (e.g. `trtllm-serve`) poll a marker file to switch context; `mpi4py.futures` pool workers use the inherited `CBTS_TEST_ID` context plus the atexit save. |
-| `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per test, writes the marker file, sets `CBTS_TEST_ID`, and switches the tracker context via `sitecustomize.switch_test_context`; also patches `mpi_session._start_mpi_pool` so workers inherit the coverage env. |
-| `pystart_report.py` | Merges all `.cbtscov.*.sqlite` (union per test; legacy `.json`/`.json.gz` also accepted) and emits any of: `--out-sqlite` (indexed `touch(test, file, qualname)` DB — the selector artifact), `--out-dir` (per-file split HTML report: index + one page per file), `--out-json` (full `test -> [file::qualname]` map). With `--source-root` also computes the file/function coverage rate. Prints a one-line touch-count summary. |
+| `cbts_pystart.py` | The tracker: a `sys.monitoring` (tool id 4) `PY_START` tool that records, per test context, the set of product `(file, qualname)` entered. Writes one `.cbtscov.<stage>.<suffix>.sqlite` per process, each carrying a `proc_meta` (stage) row and, in the coordinator, a `test_meta` (per-test outcome + spawned-worker count); these leave the node only inside compressed tarballs, so the publish-artifacts guardword/secret scanner (which byte-matches product paths in raw files but does not recurse into archives) never sees the paths stored inside. |
+| `sitecustomize.py` | Starts the tracker in each Python process under `CBTS_COVERAGE_CONFIG` (except dependency build/install tools — `pip`, `setup.py`, `cmake`, … — which opt out themselves and their spawned subtree). Reads `source` + `data_file` from the rcfile. Every instrumented process saves periodically so its coverage survives a non-clean exit (`mpi4py.futures` pool workers included — their pool is torn down at test end); long-lived non-pytest processes (e.g. `trtllm-serve`) additionally poll a marker file to switch context. |
+| `cbts_plugin.py` | Pytest plugin (`-p cbts_plugin`): per test, writes the marker file, sets `CBTS_TEST_ID`, switches the tracker context, and records the test outcome via `sitecustomize`; patches `mpi_session._start_mpi_pool` so workers inherit the coverage env, and patches `MPIPoolExecutor.__init__` to count the subprocess workers each test spawns. |
+| `pystart_report.py` | Merges all `.cbtscov.*.sqlite` (union per test; legacy `.json`/`.json.gz` also accepted) and emits any of: `--out-sqlite` (indexed `touch(test, file, qualname, stage)` + `test_meta` DB — the selector artifact), `--out-dir` (per-file split HTML report: index + one page per file), `--out-json` (full `test -> [file::qualname]` map). With `--source-root` also computes the file/function coverage rate. Prints touch-count and completeness summaries. |
 | `coveragerc.template` | Template for the runtime rcfile; only `[run] source` + `data_file` are used. |
 | `make_coveragerc.sh` | Substitutes `@...@` placeholders in the template; writes `$JOB_WORKSPACE/.coveragerc`. |
 
@@ -59,8 +59,20 @@ c.execute("SELECT DISTINCT test FROM touch WHERE file = ?",
 # function-level (phase 2): tests that entered a specific function/method
 c.execute("SELECT DISTINCT test FROM touch WHERE file = ? AND qualname = ?",
           ("tensorrt_llm/_torch/pyexecutor/py_executor.py", "PyExecutor.forward")).fetchall()
-# coverage rate
+# per-stage: coverage is attributed to the single-GPU stage it came from
+c.execute("SELECT DISTINCT test FROM touch WHERE file = ? AND stage = ?",
+          ("tensorrt_llm/_torch/pyexecutor/py_executor.py", "RTXPro6000D-PyTorch-1")).fetchall()
+# coverage rate + schema version
 dict(c.execute("SELECT key, value FROM meta"))
+```
+
+A `(test, stage)` is only safe to skip when its coverage is complete — the test passed and
+every process it spawned saved. Force-run anything else:
+
+```python
+# rows NOT safe to skip: non-passed, or a spawned worker/server never saved its coverage
+c.execute("SELECT test, stage FROM test_meta WHERE test != '' AND "
+          "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)").fetchall()
 ```
 
 ## Smoke test
