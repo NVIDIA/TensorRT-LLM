@@ -1029,8 +1029,7 @@ def find_mm_token_lengths(
                 if isinstance(item, np.ndarray):
                     if item.ndim != 4 or item.shape[-1] != 3:
                         raise ValueError(
-                            "Video NumPy frames must have shape (N, H, W, 3)"
-                        )
+                            "Video NumPy frames must have shape (N, H, W, 3)")
                     item = list(item)
                 if not isinstance(item, list):
                     raise TypeError(
