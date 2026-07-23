@@ -1499,6 +1499,7 @@ def populate_gen_deepseek_v4_kv_cache(
     return kv_cache_for_ref
 
 
+@torch.inference_mode()
 def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
                                         compressed_kv, k_pe, latent_cache,
                                         hidden_states, position_ids, dtype,
