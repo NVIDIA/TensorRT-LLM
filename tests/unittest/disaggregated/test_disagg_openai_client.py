@@ -204,6 +204,7 @@ class TestOpenAIHttpClient:
         metrics_data = f"event: {SSE_METRICS_EVENT}\ndata: not-json\n\n".encode()
 
         async def mock_iter_any():
+            yield b""
             yield response_data
             yield metrics_data
 
@@ -220,6 +221,7 @@ class TestOpenAIHttpClient:
         chunks = [chunk async for chunk in response_generator]
 
         assert b"".join(chunks) == response_data
+        hooks.on_first_token.assert_called_once_with("localhost:8000", streaming_completion_request)
         hooks.on_perf_metrics.assert_not_called()
         hooks.on_resp_done.assert_called_once_with(
             "localhost:8000", streaming_completion_request, None

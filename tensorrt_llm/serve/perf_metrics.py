@@ -585,7 +585,7 @@ class PerfMetricsJsonlWriter:
         if self._task is None:
             return
         try:
-            self._queue.put_nowait(_jsonl_record(record))
+            self._queue.put_nowait(record)
         except asyncio.QueueFull:
             self.dropped_records += 1
             if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
@@ -626,14 +626,24 @@ class PerfMetricsJsonlWriter:
                     stop = True
                     break
                 records.append(item)
+            serialized = []
+            for record in records:
+                try:
+                    item = _jsonl_record(record)
+                    serialized.append(
+                        json.dumps(item, separators=(",", ":"), allow_nan=False) + "\n"
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    self.dropped_records += 1
+                    if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
+                        logger.warning("Dropped malformed performance metrics record: %s", error)
+            if not serialized:
+                continue
             try:
-                data = "".join(
-                    json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n"
-                    for record in records
-                )
+                data = "".join(serialized)
                 await asyncio.to_thread(self._write, data)
-            except (OSError, TypeError, ValueError) as error:
-                self.dropped_records += len(records)
+            except OSError as error:
+                self.dropped_records += len(serialized)
                 self._write_error_count += 1
                 if self._write_error_count == 1:
                     logger.warning("Failed to write performance metrics JSONL: %s", error)
@@ -667,13 +677,14 @@ class PerfMetricsMiddleware:
             await self._app(scope, receive, send)
             return
         is_stream = False
+        metrics_headers = None
         return_metrics = self._expose_headers and any(
             name.lower() == _RETURN_METRICS_HEADER_BYTES and value.strip() == b"1"
             for name, value in scope.get("headers", [])
         )
 
         async def send_metrics(message: Dict[str, Any]) -> None:
-            nonlocal is_stream
+            nonlocal is_stream, metrics_headers
             if message["type"] == "http.response.start":
                 headers = list(message.get("headers", []))
                 is_stream = any(
@@ -682,7 +693,8 @@ class PerfMetricsMiddleware:
                 )
                 record = scope.get("state", {}).get("perf_metrics_record")
                 if record and return_metrics and not is_stream:
-                    public_headers = _limit_metrics_headers(build_metrics_headers(record))
+                    metrics_headers = build_metrics_headers(record)
+                    public_headers = _limit_metrics_headers(metrics_headers)
                     headers.extend(
                         (name.encode(), value.encode()) for name, value in public_headers.items()
                     )
@@ -691,11 +703,12 @@ class PerfMetricsMiddleware:
             elif message["type"] == "http.response.body" and not message.get("more_body", False):
                 record = scope.get("state", {}).get("perf_metrics_record")
                 if record:
-                    headers = build_metrics_headers(record)
+                    if metrics_headers is None:
+                        metrics_headers = build_metrics_headers(record)
                     if self._writer is not None:
                         details = {
                             name: value
-                            for name, value in headers.items()
+                            for name, value in metrics_headers.items()
                             if name
                             in (
                                 START_END_TIME_HEADER,
@@ -708,7 +721,7 @@ class PerfMetricsMiddleware:
                         )
                     if return_metrics and is_stream:
                         message["body"] = message.get("body", b"") + build_metrics_sse_event(
-                            headers
+                            metrics_headers
                         )
                         try:
                             await send(message)

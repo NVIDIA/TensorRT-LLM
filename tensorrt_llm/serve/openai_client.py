@@ -362,9 +362,9 @@ class OpenAIHttpClient(OpenAIClient):
             metrics_event = b""
             async for chunk in http_response.content.iter_any():
                 now_time = get_steady_clock_now_in_seconds()
-                if chunk_count == 0 and hooks:
-                    hooks.on_first_token(server, request)
                 if chunk:
+                    if chunk_count == 0 and hooks:
+                        hooks.on_first_token(server, request)
                     latency = now_time - last_token_time
                     metric = (
                         self._metrics_collector.first_token_latency_seconds

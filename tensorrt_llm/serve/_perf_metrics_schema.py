@@ -86,8 +86,8 @@ class DisaggPerfMetricsRecord(TypedDict):
     ctx_server: str
     gen_server: str
     disagg_server_arrival_time: float
-    disagg_ctx_dispatch_time: float
-    disagg_server_first_token_time: float
+    disagg_ctx_dispatch_time: Optional[float]
+    disagg_server_first_token_time: Optional[float]
     status: str
     disagg_request_id: NotRequired[int]
     ctx_perf_metrics: NotRequired[WorkerPerfMetrics]
