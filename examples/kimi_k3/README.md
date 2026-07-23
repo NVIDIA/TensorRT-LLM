@@ -38,6 +38,22 @@ data-parallel and the 896 experts shard across the expert-parallel group
   ```bash
   .venv-3.12/bin/python -m pip install fla-core einops
   ```
+- To use the optimized CuTeDSL MLA kernel, install the following FlashInfer
+  revision into the same in-place environment after installing TensorRT-LLM:
+
+  ```bash
+  python -u -m pip install --force-reinstall --no-deps --no-build-isolation \
+    "flashinfer-python[cu13] @ git+ssh://git@gitlab-master.nvidia.com:12051/jief/flashinfer.git@82eff087744246b16eab3b891edefd87e0d7b981"
+  ```
+
+  The TensorRT-LLM environment already provides FlashInfer's runtime
+  dependencies; `--no-deps` prevents pip from replacing its pinned PyTorch,
+  Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
+  currently pins `flashinfer-python==0.6.14`, so a later
+  dependency-resolving TensorRT-LLM install can replace this source revision.
+
+  > **Note:** This is a private repository; make sure a working,
+  > authorized SSH key is available before running the install command.
 
 ## Run the model
 

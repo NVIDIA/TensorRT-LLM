@@ -401,6 +401,7 @@ class KimiK3MLAAttention(nn.Module):
             num_kv_heads=1,
             mla_params=mla_params,
             pos_embd_params=pos_embd_params,
+            flashinfer_mla_backend="trtllm-gen",
         )
         # Generation backend: absorbed MQA path (same config as ctx).
         # Called by ``forward_decode`` for single-token cached decode.
@@ -411,6 +412,7 @@ class KimiK3MLAAttention(nn.Module):
             num_kv_heads=1,
             mla_params=mla_params,
             pos_embd_params=pos_embd_params,
+            flashinfer_mla_backend="cute-dsl",
         )
 
         # K3 NoPE contract — overwrite the actual cos/sin values with
