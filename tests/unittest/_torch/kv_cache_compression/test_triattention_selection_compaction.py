@@ -102,7 +102,6 @@ def _make_selection_buffers(
         bufs.selection_row_lengths = bufs.row_seq_lens.view(-1)
         bufs.provisional_rows = bufs.top_indices_i32.view(-1, keep_count)
         bufs.keep_rows = bufs.keep.view(-1, keep_count)
-    bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
     # The launch args mirror the product's ``bufs.settle_args``/
     # ``bufs.settle_kwargs`` order and keys exactly.
     bufs.settle_args = (
@@ -136,7 +135,7 @@ def _select_per_head(bufs, scores, *, normalize_scores):
         per_layer=bufs.eviction_mode == "per_layer_perhead",
         normalize_scores=normalize_scores,
     )
-    settle_top_tokens(bufs)
+    settle_top_tokens(bufs, bufs.max_requests)
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:
@@ -258,7 +257,7 @@ def test_union_eager_cuda_resolves_heavy_ties_and_ragged_lengths(keep_count, wid
         torch.tensor([prompt_len] * request_count, dtype=torch.int32, device=device)
     )
     bufs.combined.copy_(scores.amax(dim=1))
-    settle_top_tokens(bufs)
+    settle_top_tokens(bufs, bufs.max_requests)
     actual = bufs.keep.cpu()
 
     combined = scores.amax(dim=1).cpu()

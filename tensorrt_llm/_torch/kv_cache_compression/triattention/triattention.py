@@ -388,7 +388,6 @@ def init_eviction_buffers(
         bufs.top_indices_i32.zero_()
 
     # ---- compaction contract + decision-materialization prebinds ------------
-    bufs.settle_grid = (max_requests, bufs.selection_rows_per_request)
     per_layer = eviction_mode == "per_layer_perhead"
     draft_contract = None
     if draft is not None:
@@ -517,18 +516,21 @@ def _cohort_move_offsets(
     return dense, swa, draft
 
 
-def settle_top_tokens(bufs: SimpleNamespace) -> None:
+def settle_top_tokens(bufs: SimpleNamespace, request_count: int) -> None:
     """Pick the top-k and settle ties into the kept-ordinal decision rows
     (the compaction contract packs them into move sources)."""
+    rows = request_count * bufs.selection_rows_per_request
     # The trailing 1 is next_n: decode scores one query token per request.
     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-        bufs.selection_scores_rows,
-        bufs.selection_row_lengths,
-        bufs.provisional_rows,
+        bufs.selection_scores_rows[:rows],
+        bufs.selection_row_lengths[:rows],
+        bufs.provisional_rows[:rows],
         bufs.keep_count,
         1,
     )
-    _settle_ties_kernel[bufs.settle_grid](*bufs.settle_args, **bufs.settle_kwargs)
+    _settle_ties_kernel[(request_count, bufs.selection_rows_per_request)](
+        *bufs.settle_args, **bufs.settle_kwargs
+    )
 
 
 def execute_eviction_round(
@@ -601,7 +603,7 @@ def execute_eviction_round(
             # Guards the pinned metadata until the asynchronous copies complete.
             bufs.copy_done.record(stream)
             bufs.copy_pending = True
-    request_count = bufs.max_requests
+    request_count = len(prepared)
     union = bufs.eviction_mode == "union"
     try:
         with nvtx_range("triattention.score", color="blue"):
@@ -679,7 +681,7 @@ def execute_eviction_round(
                     per_layer=bufs.eviction_mode == "per_layer_perhead",
                     normalize_scores=normalize_scores,
                 )
-            settle_top_tokens(bufs)
+            settle_top_tokens(bufs, request_count)
         with nvtx_range("triattention.compact", color="purple"):
             compact(bufs.compaction, request_count)
     finally:
