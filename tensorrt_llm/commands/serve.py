@@ -1788,7 +1788,7 @@ def serve_embedding(
                   "--request_timeout",
                   type=int,
                   default=180,
-                  help="Request timeout",
+                  help="End-to-end disaggregated request timeout",
                   status="beta")
 @stability_option("-l",
                   '--log_level',

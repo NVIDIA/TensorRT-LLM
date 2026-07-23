@@ -73,6 +73,30 @@ using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
 
+template <typename T>
+void reserveForAppend(std::vector<T>& values, std::size_t additional)
+{
+    TLLM_CHECK_WITH_INFO(
+        additional <= values.max_size() - values.size(), "Cannot reserve %zu additional transfer records", additional);
+    auto const requiredCapacity = values.size() + additional;
+    if (requiredCapacity <= values.capacity())
+    {
+        return;
+    }
+
+    auto newCapacity = std::max<std::size_t>(1, values.capacity());
+    while (newCapacity < requiredCapacity)
+    {
+        if (newCapacity > values.max_size() / 2)
+        {
+            newCapacity = requiredCapacity;
+            break;
+        }
+        newCapacity *= 2;
+    }
+    values.reserve(newCapacity);
+}
+
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
 // backpressure by waiting up to the configured future timeout.
@@ -623,6 +647,10 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         }
         return;
     }
+    // Reserve the durable status record before handing the request to the
+    // sender. Once sendAsync succeeds it may own request-backed KV pages, and
+    // the noexcept moves below must not lose the only future that can reap it.
+    reserveForAppend(mSenderFutures, 1);
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
@@ -631,6 +659,7 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
 void CacheTransceiver::respondAndSendLayerWise(
     RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
 {
+    reserveForAppend(mSenderFutures, requests.size());
     for (auto const& llmRequest : requests)
     {
         TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
@@ -1289,6 +1318,10 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
     }
     if (llmRequest->isContextOnlyRequest())
     {
+        // Keep the high-level future until checkContextTransferStatus records
+        // this rank's terminal outcome. Queued/current classification can
+        // differ across model-parallel ranks, so rank-local reaping would
+        // remove the evidence needed by the existing transfer consensus.
         return mCacheSender->cancelRequest(*llmRequest);
     }
     else if (llmRequest->isGenerationOnlyRequest())

@@ -213,6 +213,29 @@ class KvCacheTransceiver(ABC):
     def supports_inflight_request_cancellation(self) -> bool:
         return False
 
+    def context_cancellation_reports_terminal_status(self) -> bool:
+        """Whether accepted CTX cancellation is completed by a status poll.
+
+        Implementations returning ``True`` retain request ownership until
+        ``check_context_transfer_status`` reports a rank-consistent terminal
+        result. Implementations returning ``False`` preserve the legacy
+        immediate-cleanup contract after ``cancel_request`` succeeds.
+        """
+        return False
+
+    def generation_cancellation_reports_terminal_status(self) -> bool:
+        """Whether GEN cancellation must be finalized by a status poll.
+
+        Implementations returning ``True`` retain request ownership until
+        ``check_gen_transfer_status`` reports a rank-consistent terminal
+        result. When in-flight cancellation is disabled, callers must not make
+        a rank-local queued-cancellation decision because another rank may
+        already be in the handshake. Implementations returning ``False``
+        preserve the legacy immediate-cleanup contract after
+        ``cancel_request`` succeeds.
+        """
+        return False
+
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
 
@@ -325,6 +348,19 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def supports_inflight_request_cancellation(self) -> bool:
         return self._supports_inflight_request_cancellation
+
+    def context_cancellation_reports_terminal_status(self) -> bool:
+        # C++ status polling performs TP/CP/PP consensus. Even when only a
+        # subset of ranks can cancel before the handshake, every rank retains
+        # ownership until the mixed local outcomes become one terminal result.
+        return True
+
+    def generation_cancellation_reports_terminal_status(self) -> bool:
+        # A queued receiver may be cancellable on one model-parallel rank while
+        # another is already in the handshake. Default-off callers therefore
+        # wait for natural terminal status instead of cancelling rank-locally;
+        # the opt-in path keeps ownership until C++ GEN status reaches consensus.
+        return True
 
     def has_poisoned_transfer_buffer(self) -> bool:
         if not is_disagg_inflight_cancel_enabled():

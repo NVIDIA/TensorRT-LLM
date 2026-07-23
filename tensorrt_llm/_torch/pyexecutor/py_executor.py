@@ -505,6 +505,7 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+    ASYNC_TRANSFER_POLL_INTERVAL_FALLBACK_MS = 1000
 
     def __init__(
             self,
@@ -822,7 +823,12 @@ class PyExecutor:
         self.is_shutdown = False
         self._fatal_error: Optional[BaseException] = None
         self._error_budget = ErrorBudget()
-        self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
+        # AsyncTransferManager also owns connector transfers. Track the
+        # transceiver's ownership separately so an idle executor polls C++
+        # sender futures even when no transfer timeout is configured.
+        self._async_context_transceiver_request_ids: set[int] = set()
+        self._disagg_ctx_cancel_requested_ids: set[int] = set()
+        self._disagg_gen_cancel_requested_ids: set[int] = set()
         self._disagg_timed_out_gen_cancelled_ids: set[int] = set()
         self._disagg_inflight_cancel_unsupported_logged = False
         self.max_batch_size = max_batch_size
@@ -1107,10 +1113,9 @@ class PyExecutor:
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
-            if transfer_failed:
-                return
             # Skip if the PP=1 early path already terminated this request;
-            # under PP>1 that path is off, so terminate here on transfer-complete.
+            # under PP>1 that path is off, so terminate here after either a
+            # successful or failed transfer releases its final async owner.
             if not self.force_terminate_ctx_for_partial_reuse:
                 self._terminate_request(request)
 
@@ -4250,10 +4255,24 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
-        if pending.control_requires_drain and (len(self.active_requests) != 0
-                                               or len(self.waiting_queue) != 0):
-            # drain=True: keep the sentinel parked until the engine drains.
-            return
+        if pending.control_requires_drain:
+            async_transfer_manager = getattr(self, "async_transfer_manager",
+                                             None)
+            local_has_work = (
+                len(self.active_requests) != 0 or len(self.waiting_queue) != 0
+                or (async_transfer_manager is not None
+                    and async_transfer_manager.has_any_inflight_requests()))
+            if getattr(self.dist, "world_size", 1) > 1:
+                has_work = bool(
+                    self.dist.allreduce(int(local_has_work), op=ReduceOp.MAX))
+            else:
+                has_work = local_has_work
+            if has_work:
+                # Context responses leave active_requests before their async
+                # KV send releases its final owner. Keep the control parked so
+                # sleep/update-weights cannot mutate GPU resources still read
+                # by a transfer on this or another model-parallel rank.
+                return
 
         logger.debug(f"[control_action] firing control request "
                      f"drain={pending.control_requires_drain} "
@@ -4896,16 +4915,55 @@ class PyExecutor:
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
+    def _has_async_context_transfer_work(self) -> bool:
+        """Return whether an idle executor must keep polling context sends."""
+        local_has_transfer = bool(
+            getattr(self, "_async_context_transceiver_request_ids", ()))
+
+        # Rank 0 performs the queue wait, so it must also observe transfers
+        # owned by another attention-DP or model-parallel rank. Every rank
+        # enters this reduction only after rank 0 propagated the poll bit in
+        # RequestBroadcaster's count header, avoiding a conditional-collective
+        # split when local scheduler state differs.
+        if getattr(self.dist, "world_size", 1) > 1:
+            return bool(
+                self.dist.allreduce(int(local_has_transfer), op=ReduceOp.MAX))
+        return local_has_transfer
+
+    def _async_context_transfer_poll_timeout(self) -> datetime.timedelta:
+        """Return a bounded queue wait while context sends remain in flight."""
+        poll_interval_ms = getattr(self.kv_cache_transceiver,
+                                   "kv_transfer_poll_interval_ms", None)
+        if poll_interval_ms is None:
+            poll_interval_ms = self.ASYNC_TRANSFER_POLL_INTERVAL_FALLBACK_MS
+        transfer_timeout_ms = getattr(self.kv_cache_transceiver,
+                                      "kv_transfer_timeout_ms", None)
+        if transfer_timeout_ms is not None:
+            poll_interval_ms = min(poll_interval_ms, transfer_timeout_ms)
+        return datetime.timedelta(milliseconds=poll_interval_ms)
+
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
-        # Block new requests while control requests are pending
-        if len(self.control_requests) != 0:
-            return
+        control_pending = len(self.control_requests) != 0
 
         # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
-        if idle:
+        scheduler_idle = (total_num_active_requests == 0
+                          and len(waiting_queue) == 0)
+        idle = not control_pending and scheduler_idle
+        draining_control_pending = (
+            control_pending and self.control_requests[0].control_requires_drain)
+        poll_async_context_transfer = (
+            scheduler_idle
+            and getattr(self, "kv_cache_transceiver", None) is not None
+            and (not control_pending or draining_control_pending))
+        if poll_async_context_transfer:
+            # Context sends are removed from active_requests while their KV
+            # blocks remain pinned. Keep the queue wait bounded so transfer
+            # completion and timeout cleanup do not depend on another request
+            # arriving. A positive wait avoids spinning on empty iterations.
+            timeout = self._async_context_transfer_poll_timeout()
+        elif idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             timeout = datetime.timedelta(
@@ -4917,20 +4975,64 @@ class PyExecutor:
         new_requests = []
         if self.dist.rank == 0:
             # Process accumulated requests that were queued during control request handling.
-            if len(self.request_accumulated) != 0:
+            if not control_pending and len(self.request_accumulated) != 0:
                 new_requests.extend(self.request_accumulated)
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
                 new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                    self.executor_request_queue.get_from_request_queue(
+                        timeout,
+                        cap_batch_wait_to_timeout=poll_async_context_transfer))
 
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
         # empty iterations.
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests)
+        new_requests, py_request_objects, poll_async_context_transfer = (
+            self.request_broadcaster.broadcast(new_requests,
+                                               poll_async_context_transfer))
+
+        # Run this after the request-count broadcast so every model-parallel
+        # rank enters the transceiver's internal status consensus in the same
+        # order. This also covers the PP loop when no batch is executed.
+        if poll_async_context_transfer:
+            has_async_context_transfer_work = (
+                self._has_async_context_transfer_work())
+            if has_async_context_transfer_work:
+                self._check_kv_transfer_timeout()
+                self._check_disagg_ctx_cache_transfer_status(0)
+
+        if control_pending:
+            # A draining control action must not admit ordinary work, but cancel
+            # sentinels still have to pass through. Otherwise a cancel queued
+            # behind the control cannot release the very request that the
+            # control is waiting to drain. Preserve all other items, including
+            # shutdown, in queue order until the control action completes.
+            deferred_requests = []
+            for request_item in new_requests:
+                if request_item.is_canceled_request:
+                    self.canceled_req_ids.append(request_item.id)
+                elif self.dist.rank == 0:
+                    deferred_requests.append(request_item)
+            if self.dist.rank == 0:
+                self.request_accumulated.extend(deferred_requests)
+
+            if self.canceled_req_ids:
+                canceled_waiting_items = waiting_queue.remove_by_ids(
+                    set(self.canceled_req_ids))
+                self._terminalize_canceled_waiting_requests(
+                    canceled_waiting_items)
+                if canceled_waiting_items:
+                    terminalized_ids = {
+                        request_item.id
+                        for request_item in canceled_waiting_items
+                    }
+                    self.canceled_req_ids[:] = [
+                        request_id for request_id in self.canceled_req_ids
+                        if request_id not in terminalized_ids
+                    ]
+            return
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -4942,6 +5044,23 @@ class PyExecutor:
             attach_py_objects_to_requests(new_requests, py_request_objects)
 
         waiting_queue.add_requests(new_requests)
+
+        # Terminalize queued cancellations before admission. This fetch path
+        # runs even when no model batch can make progress, so a waiting request
+        # cannot remain unresolved behind transfer or capacity pressure.
+        if self.canceled_req_ids:
+            canceled_waiting_items = waiting_queue.remove_by_ids(
+                set(self.canceled_req_ids))
+            self._terminalize_canceled_waiting_requests(canceled_waiting_items)
+            if canceled_waiting_items:
+                terminalized_ids = {
+                    request_item.id
+                    for request_item in canceled_waiting_items
+                }
+                self.canceled_req_ids[:] = [
+                    request_id for request_id in self.canceled_req_ids
+                    if request_id not in terminalized_ids
+                ]
 
     def _pop_from_waiting_queue(
         self,
@@ -5075,8 +5194,17 @@ class PyExecutor:
                 self.canceled_req_ids.append(req_item.id)
             elif req_item.is_control_request:
                 self.control_requests.append(req_item)
+                deferred_requests = []
+                for deferred_item in new_requests[idx + 1:]:
+                    # Cancellation must bypass the pending control action. A
+                    # control action may itself be waiting for this request to
+                    # drain, so parking the marker would deadlock both.
+                    if deferred_item.is_canceled_request:
+                        self.canceled_req_ids.append(deferred_item.id)
+                    elif self.dist.rank == 0:
+                        deferred_requests.append(deferred_item)
                 if self.dist.rank == 0:
-                    self.request_accumulated.extend(new_requests[idx + 1:])
+                    self.request_accumulated.extend(deferred_requests)
                 break
             else:
                 accepted_new_requests.append(req_item)
@@ -5476,6 +5604,22 @@ class PyExecutor:
             self._disagg_inflight_cancel_unsupported_logged = True
         return False
 
+    def _context_cancellation_reports_terminal_status(self) -> bool:
+        reports_status = getattr(
+            self.kv_cache_transceiver,
+            "context_cancellation_reports_terminal_status",
+            None,
+        )
+        return callable(reports_status) and reports_status() is True
+
+    def _generation_cancellation_reports_terminal_status(self) -> bool:
+        reports_status = getattr(
+            self.kv_cache_transceiver,
+            "generation_cancellation_reports_terminal_status",
+            None,
+        )
+        return callable(reports_status) and reports_status() is True
+
     def _request_kv_transfer_cancellation(self, request: LlmRequest) -> bool:
         """Best-effort cancellation that leaves ownership intact on errors."""
         try:
@@ -5510,7 +5654,7 @@ class PyExecutor:
                 continue
             elapsed_time = ((current_time - request.py_kv_transfer_start_time) *
                             1000)
-            if (elapsed_time > timeout_ms
+            if (elapsed_time >= timeout_ms
                     and not request.py_kv_transfer_timed_out):
                 logger.warning(
                     f"Requesting cancellation for generation request "
@@ -5554,6 +5698,7 @@ class PyExecutor:
 
             is_cancelled = self._request_kv_transfer_cancellation(request)
             if is_cancelled:
+                self._disagg_gen_cancel_requested_ids.add(request_id)
                 self._disagg_timed_out_gen_cancelled_ids.add(request_id)
                 logger.warning(
                     f"Cancelled timed-out generation KV transfer for request "
@@ -5595,18 +5740,22 @@ class PyExecutor:
             if req.py_kv_transfer_start_time is None:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
-            if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
+            if elapsed_time >= timeout_ms and not req.py_kv_transfer_timed_out:
                 verb = ("Requesting cancellation for"
                         if self._is_disagg_inflight_cancel_active() else
                         "Observed timeout on")
                 logger.warning(
                     f"{verb} {type} request {req.py_request_id} due to KV "
-                    f"cache transfer timeout: elapsed {elapsed_time:.0f}ms > "
+                    f"cache transfer timeout: elapsed {elapsed_time:.0f}ms >= "
                     f"kv_transfer_timeout_ms={timeout_ms}ms")
                 req.py_kv_transfer_timed_out = True
 
-        for req in self.async_transfer_manager.requests_in_transfer().values():
-            flag_if_kv_transfer_timed_out(req, "context")
+        transceiver_request_ids = getattr(
+            self, "_async_context_transceiver_request_ids", set())
+        for request_id, req in self.async_transfer_manager.requests_in_transfer(
+        ).items():
+            if request_id in transceiver_request_ids:
+                flag_if_kv_transfer_timed_out(req, "context")
 
         for req in self.active_requests:
             if req.is_disagg_generation_transmission_in_progress:
@@ -6056,16 +6205,22 @@ class PyExecutor:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
+                    request_id = req.py_request_id
+                    if request_id in self._async_context_transceiver_request_ids:
+                        # The native transceivers already treat duplicate
+                        # publication as a no-op. Avoid acquiring a duplicate
+                        # Python owner that would pin this request forever.
+                        continue
                     # Forward is done for this request — release the
                     # IndexMapper slot so new requests can reuse it.
                     # KV blocks stay allocated for the upcoming transfer.
                     if hasattr(self.kv_cache_manager, 'release_index_slot'):
-                        self.kv_cache_manager.release_index_slot(
-                            req.py_request_id)
+                        self.kv_cache_manager.release_index_slot(request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
+                    self._async_context_transceiver_request_ids.add(request_id)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
@@ -6134,13 +6289,19 @@ class PyExecutor:
 
         for request_id in completed_req_ids:
 
+            # A terminal status releases exactly the transceiver's ownership;
+            # connector ownership, if any, remains in AsyncTransferManager.
+            self._async_context_transceiver_request_ids.discard(request_id)
+            self._disagg_ctx_cancel_requested_ids.discard(request_id)
+
             if request_id not in requests_in_transfer:
                 logger.warning(
                     f"Request {request_id} not found in transfer manager")
                 continue
 
             request = requests_in_transfer[request_id]
-
+            request.py_kv_transfer_start_time = None
+            request.py_kv_transfer_timed_out = False
             self._end_transfer_and_maybe_terminate(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
@@ -6149,25 +6310,30 @@ class PyExecutor:
 
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
-            if (not request.py_kv_transfer_timed_out
+            if (request_id not in self._async_context_transceiver_request_ids
+                    or not request.py_kv_transfer_timed_out
                     or request_id in completed_req_ids
-                    or request_id in self._disagg_timed_out_ctx_cancelled_ids):
+                    or request_id in self._disagg_ctx_cancel_requested_ids):
                 continue
 
             is_cancelled = self._request_kv_transfer_cancellation(request)
             if not is_cancelled:
                 continue
 
-            if self._is_disagg_inflight_cancel_active():
-                self._disagg_timed_out_ctx_cancelled_ids.add(request_id)
+            if (self._is_disagg_inflight_cancel_active()
+                    or self._context_cancellation_reports_terminal_status()):
+                self._disagg_ctx_cancel_requested_ids.add(request_id)
                 logger.warning(f"Cancelled timed-out context KV transfer for "
                                f"request {request.py_request_id}; waiting for "
-                               "C++ transfer status to report final cleanup")
+                               "transfer status to report rank-consistent "
+                               "final cleanup")
             else:
                 # Preserve the legacy timeout behavior when in-flight
                 # cancellation is disabled: a queued transfer that can be
                 # cancelled is immediately released from the async manager.
+                self._async_context_transceiver_request_ids.discard(request_id)
                 request.py_kv_transfer_start_time = None
+                request.py_kv_transfer_timed_out = False
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
                 self._end_transfer_and_maybe_terminate(request)
 
@@ -6567,7 +6733,7 @@ class PyExecutor:
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
-        self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
+        self._disagg_gen_cancel_requested_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
         if self.gather_all_responses or self.dist.rank == 0:
@@ -6593,18 +6759,93 @@ class PyExecutor:
         if (getattr(request, "is_context_only_request", False) is True
                 and async_transfer_manager is not None and request.py_request_id
                 in async_transfer_manager.requests_in_transfer()):
-            if self._is_disagg_inflight_cancel_active():
-                self._request_kv_transfer_cancellation(request)
+            waits_for_status = (
+                self._is_disagg_inflight_cancel_active()
+                or self._context_cancellation_reports_terminal_status())
+            if (waits_for_status and request.py_request_id
+                    not in self._disagg_ctx_cancel_requested_ids
+                    and self._request_kv_transfer_cancellation(request)):
+                self._disagg_ctx_cancel_requested_ids.add(request.py_request_id)
             return False
 
         if not self._is_request_in_transmission(request):
             return True
+
+        if (request.is_generation_only_request()
+                and self._generation_cancellation_reports_terminal_status()):
+            request_id = request.py_request_id
+            # With default-off cancellation, one model-parallel rank may still
+            # be queued while another has entered the ready-signal handshake.
+            # Cancelling only the queued rank would prevent it from ever
+            # sending RequestInfo and strand the already-connected peers.
+            # The opt-in path can cancel every rank and finalizes through the
+            # C++ status consensus.
+            if (self._is_disagg_inflight_cancel_active()
+                    and request_id not in self._disagg_gen_cancel_requested_ids
+                    and self._request_kv_transfer_cancellation(request)):
+                self._disagg_gen_cancel_requested_ids.add(request_id)
+            return False
 
         if self._is_disagg_inflight_cancel_active():
             self._request_kv_transfer_cancellation(request)
             return False
 
         return self._request_kv_transfer_cancellation(request)
+
+    def _terminalize_canceled_waiting_requests(
+            self, request_items: List[RequestQueueItem]) -> None:
+        """Emit final cancellation responses for requests never activated."""
+        if not request_items:
+            return
+
+        # A terminalized queued request still counts as consumed from the
+        # executor input. Benchmark fill must not wait forever for a canceled
+        # request that can no longer be admitted.
+        self.num_fetch_requests += len(request_items)
+
+        if self.enable_iter_perf_stats and self.dist.rank == 0:
+            # Remove queue-timing entries without charging canceled requests
+            # to the latency metric for requests that became active.
+            self.executor_request_queue.calculate_queue_latency(
+                request_items, time.time())
+
+        adp_collective_required = (self.enable_attention_dp
+                                   and self.dist.world_size != 1)
+        # Waiting items are replicated before attention-DP routing. Let only
+        # rank 0 create their response so allgather does not duplicate it.
+        create_response_locally = (self.dist.rank == 0
+                                   or (self.gather_all_responses
+                                       and not adp_collective_required))
+
+        canceled_requests = []
+        if create_response_locally:
+            canceled_requests = merge_requests(
+                request_items,
+                cp_config=self.dist.cp_config,
+                cp_rank=self.dist.cp_rank,
+                cp_size=self.dist.cp_size,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits())
+
+        canceled_responses = []
+        for request in canceled_requests:
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            response = request.create_response(False, self.dist.rank)
+            if response is not None:
+                canceled_responses.append(
+                    (request.py_request_id if not request.is_child else
+                     request.parent_request_id, response))
+
+        if canceled_responses or adp_collective_required:
+            self._enqueue_responses(canceled_responses)
+
+        # These requests never reached resource preparation, so resource
+        # managers must not be asked to free them. Drop the response routing
+        # entries only after publishing the terminal responses.
+        if self.gather_all_responses or self.dist.rank == 0:
+            for request_item in request_items:
+                self.result_wait_queues.pop(request_item.id, None)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
@@ -6614,15 +6855,26 @@ class PyExecutor:
         # Create set from list of canceled request ids to speed up canceled test
         canceled_req_ids_set = set(self.canceled_req_ids)
 
-        # Remove canceled requests from the waiting queue
-        self.waiting_queue.remove_by_ids(canceled_req_ids_set)
+        # Requests canceled before activation still need a terminal response;
+        # otherwise their result waiters and request mappings remain live.
+        canceled_waiting_items = self.waiting_queue.remove_by_ids(
+            canceled_req_ids_set)
+        self._terminalize_canceled_waiting_requests(canceled_waiting_items)
+        handled_canceled_ids = {
+            request_item.id
+            for request_item in canceled_waiting_items
+        }
 
         still_pending_canceled_ids = []
+        still_pending_canceled_ids_set = set()
+        processed_request_ids = set()
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
                 continue
 
+            handled_canceled_ids.add(req_id)
+            processed_request_ids.add(request.py_request_id)
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:
                 # Mark requests as finished, then, we reuse all existing code
@@ -6631,7 +6883,45 @@ class PyExecutor:
                 request.finish_by_reason(FinishReason.CANCELLED)
                 request.decoding_iter = request.py_decoding_iter
             else:
-                still_pending_canceled_ids.append(req_id)
+                if req_id not in still_pending_canceled_ids_set:
+                    still_pending_canceled_ids.append(req_id)
+                    still_pending_canceled_ids_set.add(req_id)
+
+        # A context-only request may leave active_requests after its response
+        # while AsyncTransferManager still pins its KV blocks for the C++ send.
+        # Reconcile those manager-only requests so a later client cancellation
+        # can cancel a send that has not entered the peer handshake yet. C++
+        # keeps ownership until its rank-consistent status reports terminal.
+        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+        ) if getattr(self, "async_transfer_manager", None) is not None else {}
+        transceiver_request_ids = getattr(
+            self, "_async_context_transceiver_request_ids", set())
+        for request_id, request in requests_in_transfer.items():
+            req_id = self._request_vote_id(request)
+            if (req_id not in canceled_req_ids_set
+                    or request_id not in transceiver_request_ids
+                    or request_id in processed_request_ids):
+                continue
+
+            handled_canceled_ids.add(req_id)
+            if self._try_cancel_request(request):
+                request.py_kv_transfer_timed_out = False
+                request.finish_by_reason(FinishReason.CANCELLED)
+                request.decoding_iter = request.py_decoding_iter
+            else:
+                if req_id not in still_pending_canceled_ids_set:
+                    still_pending_canceled_ids.append(req_id)
+                    still_pending_canceled_ids_set.add(req_id)
+
+        # A draining control request parks ordinary input items on rank 0. Keep
+        # cancellation markers whose target has not appeared yet so they can
+        # terminalize the parked request when the control action completes.
+        if getattr(self, "control_requests", None):
+            for req_id in self.canceled_req_ids:
+                if (req_id not in handled_canceled_ids
+                        and req_id not in still_pending_canceled_ids_set):
+                    still_pending_canceled_ids.append(req_id)
+                    still_pending_canceled_ids_set.add(req_id)
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()
@@ -6777,6 +7067,20 @@ class PyExecutor:
 
             # Check if a generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
+                if (request.is_generation_only_request() and
+                        self._generation_cancellation_reports_terminal_status()
+                    ):
+                    if request.is_disagg_generation_transmission_in_progress:
+                        # Default-off timeout handling is observe-only. Do not
+                        # cancel a queued receiver rank-locally: another rank
+                        # may already be in the handshake. The opt-in timeout
+                        # driver requests cancellation separately and also waits
+                        # for C++ GEN status consensus.
+                        new_active_requests.append(request)
+                    else:
+                        timed_out_requests.append(request)
+                    continue
+
                 if self._is_disagg_inflight_cancel_active():
                     if (request.is_disagg_generation_transmission_in_progress
                             or request.state

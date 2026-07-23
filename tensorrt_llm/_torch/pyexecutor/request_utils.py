@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Utility functions for request processing."""
 
 import os
@@ -510,16 +513,26 @@ class RequestBroadcaster:
         self.hang_detector = hang_detector
         self.send_requests_handler = None
 
-    def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
-        """Broadcast requests and Python objects across ranks."""
-        request_count = len(new_requests) if self.dist.rank == 0 else 0
+    def broadcast(
+        self, new_requests: List, poll_context_transfers: bool = False
+    ) -> Tuple[List, Optional[Tuple], bool]:
+        """Broadcast requests, Python objects, and the rank-0 poll decision."""
+        # Encode the poll bit in the existing count probe so every rank makes
+        # the transfer-progress decision from the same rank-0 value without
+        # adding another scheduler-iteration collective.
+        request_header = (
+            (len(new_requests) << 1) | int(poll_context_transfers) if self.dist.rank == 0 else 0
+        )
         # Idle non-root ranks can wait here while rank 0 blocks in the
         # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
         with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count)
+            request_header = self._broadcast_request_header(request_header)
+
+        request_count = request_header >> 1
+        poll_context_transfers = bool(request_header & 1)
 
         if request_count == 0:
-            return [], None
+            return [], None, poll_context_transfers
 
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
@@ -535,31 +548,31 @@ class RequestBroadcaster:
                     new_requests, py_request_objects
                 )
 
-        return new_requests, py_request_objects
+        return new_requests, py_request_objects, poll_context_transfers
 
-    def _broadcast_request_count(self, request_count: int) -> int:
-        """Broadcast rank 0's request count using the same PP route as requests."""
+    def _broadcast_request_header(self, request_header: int) -> int:
+        """Broadcast rank 0's encoded request-count and transfer-poll bit."""
         if self.dist.world_size == 1:
-            return request_count
+            return request_header
 
         if not self.dist.has_pp:
-            return self.dist.broadcast(request_count, root=0)
+            return self.dist.broadcast(request_header, root=0)
 
         if self.dist.is_first_pp_rank:
-            with nvtx_range("tp_broadcast_request_count"):
-                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+            with nvtx_range("tp_broadcast_request_header"):
+                request_header = self.dist.tp_cp_broadcast(request_header, root=0)
 
         tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
 
         if not self.dist.is_first_pp_rank:
             with nvtx_range("recv_request_count_from_prev_pp"):
-                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+                request_header = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
             with nvtx_range("send_request_count_to_next_pp"):
-                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+                self.dist.send_object(request_header, self.dist.next_pp_rank, tag)
 
-        return request_count
+        return request_header
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
