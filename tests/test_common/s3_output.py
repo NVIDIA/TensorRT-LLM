@@ -72,8 +72,18 @@ class PendingUpload:
 @dataclass(frozen=True)
 class CapturedSection:
     content: str
-    message: str
+    attempt: int
+
+
+@dataclass
+class CapturedStream:
+    test_name: str
+    filename: str
+    source_path: str
+    filesize: int = 0
+    message: str = ""
     force_output: bool = False
+    finalized: bool = False
 
 
 def _create_s3_client(
@@ -251,7 +261,7 @@ class UploadLogPlugin:
         self._test_names: dict[str, str] = {}
         self._used_test_names: set[str] = set()
         self._captured_sections: dict[str, dict[tuple[str, str, int], CapturedSection]] = {}
-        self._capture_filename_counts: dict[str, dict[tuple[int, str, str], int]] = {}
+        self._captured_streams: dict[str, dict[tuple[int, str], CapturedStream]] = {}
         self._pending_reruns: set[str] = set()
         self._upload_failed = False
         self._executor = None
@@ -267,7 +277,7 @@ class UploadLogPlugin:
 
     def normalize_test_name(self, nodeid: str) -> str:
         test_name = re.sub(r"[^\w\-]", "_", nodeid)
-        suffix = hashlib.md5(nodeid.encode()).hexdigest()[:8]
+        suffix = hashlib.md5(nodeid.encode(), usedforsecurity=False).hexdigest()[:8]
         timestamp = int(time.time())
         if len(test_name) > 200:
             test_name = test_name[:200]
@@ -313,15 +323,6 @@ class UploadLogPlugin:
             object_key,
         )
 
-    def _should_inline(self, stream_name: str, content: str) -> bool:
-        if stream_name not in ("stdout", "stderr"):
-            return False
-        if self.inline_output_max_bytes == 0:
-            return False
-        if len(content) >= self.inline_output_max_bytes:
-            return False
-        return len(content.encode("utf-8")) < self.inline_output_max_bytes
-
     def _write_spool_file(self, test_name: str, filename: str, content: str) -> str:
         if not self.skip_upload and not os.path.exists(self._spool_config_path):
             self._write_spool_config()
@@ -338,6 +339,22 @@ class UploadLogPlugin:
                 output.write(content[offset : offset + _SPOOL_WRITE_CHARS])
         return source_path
 
+    def _append_spool_file(self, test_name: str, filename: str, content: str) -> str:
+        if not self.skip_upload and not os.path.exists(self._spool_config_path):
+            self._write_spool_config()
+        test_dir = os.path.join(self._spool_dir, test_name)
+        os.makedirs(test_dir, exist_ok=True)
+        source_path = os.path.join(test_dir, filename)
+        file_descriptor = os.open(
+            source_path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        with os.fdopen(file_descriptor, "a", encoding="utf-8", errors="replace") as output:
+            for offset in range(0, len(content), _SPOOL_WRITE_CHARS):
+                output.write(content[offset : offset + _SPOOL_WRITE_CHARS])
+        return source_path
+
     def _remove_source(self, source_path: str) -> None:
         path = Path(source_path)
         try:
@@ -348,6 +365,10 @@ class UploadLogPlugin:
             logger.warning("Failed to remove local S3 log file %s: %s", source_path, exc)
             return
         _remove_empty_parents(path, Path(self._spool_dir))
+        try:
+            Path(self._spool_dir).parent.rmdir()
+        except OSError:
+            pass
 
     def _upload_source(self, source_path: str, object_key: str) -> None:
         self.s3.upload_file(
@@ -400,94 +421,131 @@ class UploadLogPlugin:
             filename=filename,
         )
 
-    def _tail(self, content: str) -> str:
-        position = len(content)
-        lines = 0
-        while position > 0 and lines < _FAILED_OUTPUT_MAX_LINES:
-            position = content.rfind("\n", 0, position)
-            if position < 0:
-                position = 0
-                break
-            lines += 1
-        tail = content[position:]
-        truncated = len(tail) > _FAILED_OUTPUT_MAX_BYTES
-        if truncated:
-            tail = tail[-_FAILED_OUTPUT_MAX_BYTES:]
-        encoded = tail.encode("utf-8")
-        if len(encoded) > _FAILED_OUTPUT_MAX_BYTES:
-            tail = encoded[-_FAILED_OUTPUT_MAX_BYTES:].decode("utf-8", errors="replace")
+    def _tail(self, source_path: str) -> str:
+        filesize = os.path.getsize(source_path)
+        read_size = min(filesize, _FAILED_OUTPUT_MAX_BYTES)
+        with open(source_path, "rb") as source:
+            source.seek(filesize - read_size)
+            tail = source.read(read_size).decode("utf-8", errors="replace")
+
+        lines = tail.splitlines(keepends=True)
+        truncated = filesize > read_size
+        if len(lines) > _FAILED_OUTPUT_MAX_LINES:
+            lines = lines[-_FAILED_OUTPUT_MAX_LINES:]
             truncated = True
+        tail = "".join(lines)
         if truncated:
             tail = "... [truncated]\n" + tail
         return tail
 
-    def _format_report_content(self, message: str, content: str, failed: bool) -> str:
-        if not failed:
+    @staticmethod
+    def _format_report_content(message: str, tail: str | None = None) -> str:
+        if tail is None:
             return f"{message}\n"
-        formatted = f"{message}\n\nLast {_FAILED_OUTPUT_MAX_LINES} lines:\n{self._tail(content)}"
+        formatted = f"{message}\n\nLast {_FAILED_OUTPUT_MAX_LINES} lines:\n{tail}"
         if not formatted.endswith("\n"):
             formatted += "\n"
         return formatted
 
-    def _next_filename(
-        self,
-        nodeid: str,
-        stream_name: str,
-        phase: str,
-        attempt: int,
-    ) -> str:
-        counts = self._capture_filename_counts.setdefault(nodeid, {})
-        count_key = (attempt, stream_name, phase)
-        duplicate_index = counts.get(count_key, 0)
-        counts[count_key] = duplicate_index + 1
-
-        suffixes = []
+    @staticmethod
+    def _stream_filename(stream_name: str, attempt: int) -> str:
+        filename = _STREAM_FILENAMES[stream_name]
         if attempt > 1:
-            suffixes.append(f"attempt-{attempt}")
-        if duplicate_index:
-            suffixes.append(str(duplicate_index))
-
-        filename = f"{_STREAM_FILENAMES[stream_name]}-{phase}"
-        if suffixes:
-            filename += f"-{'-'.join(suffixes)}"
+            filename += f"-attempt-{attempt}"
         return f"{filename}.log"
 
-    def _upload_section(
-        self,
-        content: str,
-        test_name: str,
-        filename: str,
-    ) -> CapturedSection:
-        source_path = self._write_spool_file(test_name, filename, content)
-        filesize = os.path.getsize(source_path)
-        object_key = self._object_key(test_name, filename)
+    def _stream_message(self, stream: CapturedStream) -> str:
+        object_key = self._object_key(stream.test_name, stream.filename)
         file_url = self._file_url(object_key)
-
         if self.skip_upload:
-            message = f"{filesize} bytes (upload skipped, would upload to {file_url})"
-            return CapturedSection(content, message)
+            return f"{stream.filesize} bytes (upload skipped, would upload to {file_url})"
+        return f"{stream.filesize} bytes scheduled for upload to {file_url}"
 
+    def _append_capture(
+        self,
+        nodeid: str,
+        attempt: int,
+        stream_name: str,
+        content: str,
+    ) -> CapturedStream:
+        streams = self._captured_streams.setdefault(nodeid, {})
+        stream_key = (attempt, stream_name)
+        stream = streams.get(stream_key)
+        if stream is None:
+            test_name = self._test_name(nodeid)
+            filename = self._stream_filename(stream_name, attempt)
+            source_path = self._append_spool_file(test_name, filename, content)
+            stream = CapturedStream(
+                test_name=test_name,
+                filename=filename,
+                source_path=source_path,
+            )
+            streams[stream_key] = stream
+        else:
+            if stream.finalized:
+                raise RuntimeError(f"Captured output arrived after {stream.filename} was finalized")
+            self._append_spool_file(stream.test_name, stream.filename, content)
+
+        stream.filesize = os.path.getsize(stream.source_path)
+        stream.message = self._stream_message(stream)
+        return stream
+
+    def _should_inline_stream(self, stream_name: str, stream: CapturedStream) -> bool:
+        return (
+            stream_name in ("stdout", "stderr")
+            and self.inline_output_max_bytes > 0
+            and stream.filesize < self.inline_output_max_bytes
+        )
+
+    def _finalize_stream(self, stream_name: str, stream: CapturedStream) -> None:
+        if stream.finalized:
+            return
+        stream.finalized = True
+        if self._should_inline_stream(stream_name, stream):
+            self._remove_source(stream.source_path)
+            return
+
+        object_key = self._object_key(stream.test_name, stream.filename)
+        file_url = self._file_url(object_key)
+        if self.skip_upload:
+            stream.message = self._stream_message(stream)
+            return
         if self.upload_mode == "deferred":
-            self._schedule_upload(source_path, object_key, test_name, filename)
-            message = f"{filesize} bytes scheduled for upload to {file_url}"
-            return CapturedSection(content, message)
+            self._schedule_upload(
+                stream.source_path,
+                object_key,
+                stream.test_name,
+                stream.filename,
+            )
+            stream.message = f"{stream.filesize} bytes scheduled for upload to {file_url}"
+            return
 
         try:
-            self._upload_source(source_path, object_key)
+            self._upload_source(stream.source_path, object_key)
         except Exception as exc:
             self._upload_failed = True
             logger.warning(
                 "Upload failed. test_name: %s, filename: %s, error: %s",
-                test_name,
-                filename,
+                stream.test_name,
+                stream.filename,
                 exc,
             )
-            message = f"upload failed: {exc}\nsize: {filesize} bytes"
-            return CapturedSection(content, message, force_output=True)
+            stream.message = f"upload failed: {exc}\nsize: {stream.filesize} bytes"
+            stream.force_output = True
+            return
 
-        self._remove_source(source_path)
-        message = f"{filesize} bytes uploaded to {file_url}"
-        return CapturedSection(content, message)
+        self._remove_source(stream.source_path)
+        stream.message = f"{stream.filesize} bytes uploaded to {file_url}"
+
+    def _finalize_attempt(self, nodeid: str, attempt: int) -> None:
+        streams = self._captured_streams.get(nodeid, {})
+        for (stream_attempt, stream_name), stream in streams.items():
+            if stream_attempt == attempt:
+                self._finalize_stream(stream_name, stream)
+
+    def _finalize_node(self, nodeid: str) -> None:
+        for (_, stream_name), stream in self._captured_streams.get(nodeid, {}).items():
+            self._finalize_stream(stream_name, stream)
 
     @staticmethod
     def _attempt(report) -> int:
@@ -496,52 +554,80 @@ class UploadLogPlugin:
 
     def _process_report(self, report, default_phase: str) -> None:
         nodeid = getattr(report, "nodeid", "unknown")
-        test_name = self._test_name(nodeid)
         failed = getattr(report, "outcome", None) == "failed"
         if getattr(report, "outcome", None) == "rerun":
             self._pending_reruns.add(nodeid)
         attempt = self._attempt(report)
         captured_sections = self._captured_sections.setdefault(nodeid, {})
         duplicate_counts: dict[tuple[str, str], int] = {}
-        transformed_sections = []
+        section_entries = []
+        represented_streams = []
+        represented_stream_set = set()
         for section_name, content in report.sections:
             match = _CAPTURE_SECTION_PATTERN.fullmatch(section_name)
             if match is None:
-                transformed_sections.append((section_name, content))
+                section_entries.append((section_name, content, None))
                 continue
             stream_name = match.group(1)
             phase = match.group(2) or default_phase
             duplicate_key = (stream_name, phase)
             duplicate_index = duplicate_counts.get(duplicate_key, 0)
             duplicate_counts[duplicate_key] = duplicate_index + 1
-            if self._should_inline(stream_name, content):
-                transformed_sections.append((section_name, content))
-                continue
 
             section_key = (stream_name, phase, duplicate_index)
             captured_section = captured_sections.get(section_key)
             if captured_section is None or captured_section.content != content:
-                filename = self._next_filename(
+                self._append_capture(
                     nodeid,
-                    stream_name,
-                    phase,
                     attempt,
-                )
-                captured_section = self._upload_section(
+                    stream_name,
                     content,
-                    test_name,
-                    filename,
                 )
+                captured_section = CapturedSection(content, attempt)
                 captured_sections[section_key] = captured_section
 
+            stream_key = (captured_section.attempt, stream_name)
+            section_entries.append((section_name, content, stream_key))
+            if stream_key not in represented_stream_set:
+                represented_stream_set.add(stream_key)
+                represented_streams.append(stream_key)
+
+        failure_tails = {}
+        streams = self._captured_streams.get(nodeid, {})
+        if failed:
+            for stream_key in represented_streams:
+                stream_attempt, stream_name = stream_key
+                stream = streams[stream_key]
+                if stream_attempt == attempt and not self._should_inline_stream(
+                    stream_name, stream
+                ):
+                    failure_tails[stream_key] = self._tail(stream.source_path)
+
+        if default_phase in ("teardown", "collect"):
+            self._finalize_attempt(nodeid, attempt)
+
+        transformed_sections = []
+        reported_streams = set()
+        for section_name, content, stream_key in section_entries:
+            if stream_key is None:
+                transformed_sections.append((section_name, content))
+                continue
+            _, stream_name = stream_key
+            stream = streams[stream_key]
+            if self._should_inline_stream(stream_name, stream):
+                transformed_sections.append((section_name, content))
+                continue
+            if stream_key in reported_streams:
+                continue
+            reported_streams.add(stream_key)
+
+            tail = failure_tails.get(stream_key)
+            if tail is None and stream.force_output:
+                tail = self._tail(stream.source_path)
             transformed_sections.append(
                 (
-                    section_name,
-                    self._format_report_content(
-                        captured_section.message,
-                        content,
-                        failed or captured_section.force_output,
-                    ),
+                    f"Captured {stream_name}",
+                    self._format_report_content(stream.message, tail),
                 )
             )
         report.sections[:] = transformed_sections
@@ -560,19 +646,22 @@ class UploadLogPlugin:
         nodeid = getattr(report, "nodeid", "unknown")
         self._test_names.pop(nodeid, None)
         self._captured_sections.pop(nodeid, None)
-        self._capture_filename_counts.pop(nodeid, None)
+        self._captured_streams.pop(nodeid, None)
         self._pending_reruns.discard(nodeid)
 
     def pytest_runtest_logfinish(self, nodeid: str, location) -> None:
+        self._finalize_node(nodeid)
         self._test_names.pop(nodeid, None)
         if nodeid in self._pending_reruns:
             self._pending_reruns.remove(nodeid)
             return
         self._captured_sections.pop(nodeid, None)
-        self._capture_filename_counts.pop(nodeid, None)
+        self._captured_streams.pop(nodeid, None)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionfinish(self, session, exitstatus) -> None:
+        for nodeid in tuple(self._captured_streams):
+            self._finalize_node(nodeid)
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
@@ -585,7 +674,7 @@ class UploadLogPlugin:
             except OSError:
                 pass
         self._captured_sections.clear()
-        self._capture_filename_counts.clear()
+        self._captured_streams.clear()
         self._pending_reruns.clear()
 
 
