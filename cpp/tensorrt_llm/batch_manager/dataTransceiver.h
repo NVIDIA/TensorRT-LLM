@@ -16,6 +16,8 @@
  */
 
 #pragma once
+#include <chrono>
+#include <cstddef>
 #include <fstream>
 #include <future>
 #include <map>
@@ -37,6 +39,11 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+
+namespace tensorrt_llm::testing
+{
+class CacheSenderTestAccess;
+} // namespace tensorrt_llm::testing
 
 namespace tensorrt_llm::batch_manager
 {
@@ -330,6 +337,11 @@ public:
     virtual ~CacheSender();
 
 private:
+    friend class ::tensorrt_llm::testing::CacheSenderTestAccess;
+
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer,
+        std::size_t maxPendingPreHandshakeCancellations, std::chrono::milliseconds preHandshakeCancellationRetention);
+
     class Impl;
 
     struct ImplDeleter
