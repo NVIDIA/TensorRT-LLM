@@ -23,20 +23,30 @@ from ..logger import logger
 IS_FLASHINFER_AVAILABLE = False
 
 
-def get_env_enable_pdl() -> bool:
-    requested = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-    if not requested:
+def is_pdl_enabled() -> bool:
+    """Return whether PDL is requested and supported by the current GPU."""
+    env_value = os.environ.get("TRTLLM_ENABLE_PDL")
+    if env_value not in (None, "1"):
         return False
 
     sm_version = get_sm_version()
     enabled = sm_version >= 90
-    if not getattr(get_env_enable_pdl, "_printed", False):
+    if not enabled and env_value == "1":
+        detected_device = "no CUDA GPU" if sm_version < 0 else f"SM{sm_version}"
+        raise ValueError(
+            "TRTLLM_ENABLE_PDL=1 requires SM90 or newer, "
+            f"but detected {detected_device}. Unset TRTLLM_ENABLE_PDL to use "
+            "the architecture-aware default, or set it to 0.")
+
+    if not getattr(is_pdl_enabled, "_printed", False):
         if enabled:
             logger.info("PDL enabled")
+        elif sm_version < 0:
+            logger.info("PDL disabled: no CUDA GPU is available")
         else:
             logger.info(
                 f"PDL disabled on SM{sm_version}: requires SM90 or newer")
-        setattr(get_env_enable_pdl, "_printed", True)
+        setattr(is_pdl_enabled, "_printed", True)
     return enabled
 
 

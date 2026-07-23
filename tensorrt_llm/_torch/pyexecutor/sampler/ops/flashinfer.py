@@ -36,7 +36,7 @@ from typing import Any, Optional, Union
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, is_pdl_enabled
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.sampling
@@ -173,7 +173,7 @@ def softmax_op(
     temperature: Optional[torch.Tensor],
 ) -> torch.Tensor:
     probs: torch.Tensor = flashinfer.sampling.softmax(
-        logits, temperature, enable_pdl=get_env_enable_pdl()
+        logits, temperature, enable_pdl=is_pdl_enabled()
     )
     return probs
 
@@ -209,7 +209,7 @@ def compute_probs_from_logits_op(
     if top_k is not None:
         logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
     probs: torch.Tensor = flashinfer.sampling.softmax(
-        logits, temperatures, enable_pdl=get_env_enable_pdl()
+        logits, temperatures, enable_pdl=is_pdl_enabled()
     )
     if top_p is not None:
         probs = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
