@@ -153,7 +153,6 @@ inline size_t hash_combine(size_t hash, T const& value)
 
 TRTLLM_NAMESPACE_END
 
-// Specialization for iterable containers.
 template <typename T>
 struct std::hash<std::set<T>>
 {
@@ -169,7 +168,6 @@ struct std::hash<std::set<T>>
     }
 };
 
-// Specialization for tuple-like containers.
 template <class... Args>
 struct std::hash<std::tuple<Args...>>
 {
