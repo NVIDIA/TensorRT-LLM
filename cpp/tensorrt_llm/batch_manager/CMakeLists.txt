@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -30,36 +30,23 @@ set(SRCS
     capacityScheduler.cpp
     createNewDecoderRequests.cpp
     contextProgress.cpp
+    contextTransferCoordinator.cpp
     dataTransceiver.cpp
     decoderBuffers.cpp
-    encoderBuffers.cpp
-    guidedDecoder.cpp
-    handleContextLogits.cpp
-    handleGenerationLogits.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
-    logitsPostProcessor.cpp
-    loraBuffers.cpp
-    makeDecodingBatchInputOutput.cpp
     medusaBuffers.cpp
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp
-    promptTuningBuffers.cpp
-    rnnStateBuffers.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    runtimeBuffers.cpp
     sequenceSlotManager.cpp
-    transformerBuffers.cpp
-    trtEncoderModel.cpp
-    trtGptModelInflightBatching.cpp
-    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp

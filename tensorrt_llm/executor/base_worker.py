@@ -49,6 +49,7 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    bucket_responses_by_frontend, frontend_lane_index,
                     is_llm_response)
 
 if TYPE_CHECKING:
@@ -118,6 +119,9 @@ class BaseWorker(GenerationExecutor):
         self.engine = None
         self.result_queue: Optional[IpcQueue] = None
         self.postproc_queues: Optional[List[IpcQueue]] = None
+        # Multi-frontend serving: one result lane per frontend process,
+        # selected by the frontend id in client_id's top bits.
+        self.frontend_result_queues: Optional[List[IpcQueue]] = None
         self.rank = mpi_rank()
         self.global_rank = global_mpi_rank()
         # mapping: client_id -> GenerationResult
@@ -207,24 +211,8 @@ class BaseWorker(GenerationExecutor):
                 self.max_seq_len = _executor.max_seq_len
             return _executor
 
-        def _create_engine(executor_config):
-            engine = self._engine
-            if executor_config is None:
-                executor_config = tllm.ExecutorConfig(1)
-            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-                processor_batched=self._batched_logits_processor,
-                replicate=False)
-            comm_ranks, device_ids = self._get_comm_ranks_device_id()
-            executor_config.parallel_config = tllm.ParallelConfig(
-                participant_ids=comm_ranks, device_ids=device_ids)
-
-            assert not hasattr(executor_config, "backend")
-            return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                 executor_config)
-
-        self.engine = _create_py_executor(
-        ) if self.llm_args is not None else _create_engine(
-            self._executor_config)
+        assert self.llm_args is not None, "llm_args is required to set up the worker engine"
+        self.engine = _create_py_executor()
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
@@ -245,16 +233,10 @@ class BaseWorker(GenerationExecutor):
             seconds=timeout) if timeout is not None else None)
 
     def fetch_stats(self) -> list:
-        if isinstance(self.engine, tllm.Executor):
-            iter_stats = self.engine.get_latest_iteration_stats()
-            #TODO: Support req stats with TRT engine
-            #      This would require ensuring iter and req stats have same size
-            return [(iter_stat, None, None) for iter_stat in iter_stats]
-        else:
-            return self.engine.get_latest_iteration_stats()
+        return self.engine.get_latest_iteration_stats()
 
     def fetch_kv_cache_capacity(self) -> dict:
-        if self.engine is None or isinstance(self.engine, tllm.Executor):
+        if self.engine is None:
             return {}
 
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -264,20 +246,25 @@ class BaseWorker(GenerationExecutor):
         return {}
 
     def fetch_kv_cache_events(self) -> list:
-        if isinstance(self.engine, tllm.Executor):
-            return self.engine.get_latest_kv_cache_events()
-        else:
-            return self.engine.get_latest_kv_cache_events()
+        return self.engine.get_latest_kv_cache_events()
 
     def set_result_queue(self, queue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         assert self.postproc_queues is None
+        assert self.frontend_result_queues is None
         self.result_queue = queue
 
     def set_postproc_queues(self, queues: List["IpcQueue"]):
         """ Set the IPC queues for feeding post-processing processes. """
         assert self.result_queue is None
+        assert self.frontend_result_queues is None
         self.postproc_queues = queues
+
+    def set_frontend_result_queues(self, queues: List["IpcQueue"]):
+        """Multi-frontend serving: one result lane per frontend process."""
+        assert self.result_queue is None
+        assert self.postproc_queues is None
+        self.frontend_result_queues = queues
 
     def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
                                     queue: Union[Queue, FusedIpcQueue,
@@ -437,6 +424,10 @@ class BaseWorker(GenerationExecutor):
                                llm_args: Optional[BaseLlmArgs] = None) -> int:
             # deduce max_tokens when it's not set by user
             max_tokens = request.sampling_params.max_tokens
+            output_prefix_len = len(
+                request.sampling_params._decoder_output_token_prefix)
+            if max_tokens is not None:
+                max_tokens -= output_prefix_len
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
 
@@ -554,6 +545,8 @@ class BaseWorker(GenerationExecutor):
                     # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
+                if request.multimodal_params.mm_item_order:
+                    executor_request.py_mm_item_order = request.multimodal_params.mm_item_order
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
                 # For PyTorch backend, we attach logits processors as a dynamic Python attribute
@@ -1087,20 +1080,20 @@ class AwaitResponseHelper:
         HandlerKind = AwaitResponseHelper.HandlerKind
 
         if self.handler_kind is HandlerKind.unknown:
-            if not (self.worker.result_queue is not None
-                    or self.worker.postproc_queues is not None):
+            has_ipc_queues = (self.worker.result_queue is not None
+                              or self.worker.postproc_queues is not None
+                              or self.worker.frontend_result_queues is not None)
+            if not has_ipc_queues:
                 logger_debug(f"creating await_response helper for Worker\n",
                              color="yellow")
                 # When ExecutorBindingWorker is used in the main process
                 # aka the single process mode
                 self.handler_kind = HandlerKind.single_process_worker
-            elif self.worker.result_queue is not None or self.worker.postproc_queues is not None:
+            else:
                 # The ExecutorBindingProxy is used
                 logger_debug(f"creating await_response helper for IPC\n",
                              color="yellow")
                 self.handler_kind = HandlerKind.ipc_batched
-            else:
-                raise NotImplementedError
 
         match self.handler_kind:
             case HandlerKind.single_process_worker:
@@ -1279,7 +1272,13 @@ class AwaitResponseHelper:
                     self.worker.postproc_queues[wid].put(batch)
 
         if rsp_batch:
-            self.worker.result_queue.put(rsp_batch)
+            if (lanes := self.worker.frontend_result_queues) is not None:
+                for frontend_id, sub_batch in enumerate(
+                        bucket_responses_by_frontend(rsp_batch, len(lanes))):
+                    if sub_batch:
+                        lanes[frontend_id].put(sub_batch)
+            else:
+                self.worker.result_queue.put(rsp_batch)
 
 
 def _get_params_for_first_rsp(
@@ -1393,7 +1392,16 @@ def _send_rsp(
         rsp_batch: Optional[List[tllm.Response]] = None):
     # if postproc_batches is set, append to batch instead of putting to IpcQueue
 
-    if worker.result_queue is not None:
+    if worker.frontend_result_queues is not None:
+        # Route to the origin frontend's result lane; None/out-of-range ids
+        # fall back to lane 0 (see frontend_lane_index).
+        if rsp_batch is not None:
+            rsp_batch.append(response)
+        else:
+            lanes = worker.frontend_result_queues
+            lanes[frontend_lane_index(response.client_id,
+                                      len(lanes))].put(response)
+    elif worker.result_queue is not None:
         if rsp_batch is not None:
             rsp_batch.append(response)
         else:

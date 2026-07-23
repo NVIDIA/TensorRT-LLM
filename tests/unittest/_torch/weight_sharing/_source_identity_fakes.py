@@ -19,9 +19,14 @@ tests touch no real model, GPU, or weights. Used by both
 `test_source_identity.py` and `test_mx_source_identity_gate.py`.
 """
 
+import hashlib
 from typing import Optional, Sequence
 
-from tensorrt_llm._torch.weight_sharing import SourceIdentity
+from tensorrt_llm._torch.weight_sharing import (
+    ARTIFACT_IDENTITY_FORMAT_VERSION,
+    ArtifactIdentity,
+    SourceIdentity,
+)
 
 _UNSET = object()
 
@@ -204,16 +209,37 @@ class FakeModel:
         return list(self._buffers.items())
 
 
-def identity_from(config: FakeModelConfig, *, model_name: Optional[str] = None) -> SourceIdentity:
+def make_artifact_identity(key: str = "same") -> ArtifactIdentity:
+    """Build a deterministic local-checkpoint identity for tests."""
+    return ArtifactIdentity(
+        format_version=ARTIFACT_IDENTITY_FORMAT_VERSION,
+        scheme="checkpoint_manifest_sha256",
+        digest=hashlib.sha256(key.encode("utf-8")).hexdigest(),
+    )
+
+
+def identity_from(
+    config: FakeModelConfig,
+    *,
+    model_name: Optional[str] = None,
+    artifact_key: str = "same",
+) -> SourceIdentity:
     """Build a :class:`SourceIdentity` from a fake config and derived model."""
     return SourceIdentity.from_model_config(
-        config, FakeModel(config.pretrained_config), model_name=model_name
+        config,
+        FakeModel(config.pretrained_config),
+        artifact_identity=make_artifact_identity(artifact_key),
+        model_name=model_name,
     )
 
 
 def make_identity(
-    *, attn_backend: str = "TRTLLM", rank: int = 0, model_name: str = "m"
+    *,
+    attn_backend: str = "TRTLLM",
+    rank: int = 0,
+    model_name: str = "m",
+    artifact_key: str = "same",
 ) -> SourceIdentity:
     """Build a :class:`SourceIdentity` from a fake config for `rank`."""
     cfg = FakeModelConfig(mapping=FakeMapping(rank=rank, tp_rank=rank), attn_backend=attn_backend)
-    return identity_from(cfg, model_name=model_name)
+    return identity_from(cfg, model_name=model_name, artifact_key=artifact_key)

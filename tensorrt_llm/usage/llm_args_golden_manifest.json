@@ -88,6 +88,16 @@
       "path": "attention_dp_config.kv_cache_routing_max_sessions"
     },
     {
+      "allowed_values": [
+        "round_robin",
+        "least_queued"
+      ],
+      "annotation": "Literal['round_robin', 'least_queued']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "attention_dp_config.kv_cache_routing_new_conv_placement"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -187,9 +197,10 @@
     {
       "allowed_values": [
         "CPP",
-        "PYTHON"
+        "PYTHON",
+        "auto"
       ],
-      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "annotation": "Optional[Literal['CPP', 'PYTHON', 'auto']]",
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.transceiver_runtime"
@@ -560,9 +571,10 @@
     {
       "allowed_values": [
         "all_reusable",
-        "per_request"
+        "per_request",
+        "per_conversation"
       ],
-      "annotation": "Literal['all_reusable', 'per_request']",
+      "annotation": "Literal['all_reusable', 'per_request', 'per_conversation']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_policy"
@@ -976,6 +988,13 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
+      "path": "multimodal_config.encoder_cache_max_bytes"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
       "path": "multimodal_config.encoder_side_stream_max_ahead"
     },
     {
@@ -1007,6 +1026,13 @@
       "converter": "",
       "kind": "value",
       "path": "num_postprocess_workers"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "num_serve_frontends"
     },
     {
       "allowed_values": [
@@ -1382,6 +1408,16 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "allowed_values": [
+        "triton",
+        "msa"
+      ],
+      "annotation": "Literal['triton', 'msa']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.implementation"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
@@ -1442,6 +1478,20 @@
       "converter": "allowlist",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_attention_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_key_value_heads"
     },
     {
       "allowed_values": [],
@@ -1600,9 +1650,17 @@
       "path": "speculative_config.begin_thinking_phase_token"
     },
     {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.block_size"
+    },
+    {
       "allowed_values": [
         "AUTO",
         "DFlash",
+        "DSpark",
         "Draft_Target",
         "Eagle3",
         "Eagle",
@@ -1706,6 +1764,24 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.is_use_oldest"
+    },
+    {
+      "allowed_values": [
+        "vanilla",
+        "gated",
+        "rnn"
+      ],
+      "annotation": "Optional[Literal['vanilla', 'gated', 'rnn']]",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.markov_head_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.markov_rank"
     },
     {
       "allowed_values": [],

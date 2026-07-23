@@ -22,10 +22,12 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <cstddef>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -54,6 +56,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+class ContextTransferCoordinator;
 
 class CacheTransceiverComm
 {
@@ -148,6 +151,25 @@ public:
         TLLM_THROW("Input arguments only supported in mpi");
     }
 
+    [[nodiscard]] std::unique_ptr<mpi::MpiRequest> sendAsync(
+        void const* buffer, std::size_t size, mpi::MpiType dtype, int dest, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->sendAsync(buffer, size, dtype, dest, tag);
+    }
+
+    [[nodiscard]] bool iprobe(int source, mpi::MpiTag tag, MPI_Status* status) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->iprobe(source, tag, status);
+    }
+
+    void recv(void* buffer, std::size_t size, mpi::MpiType dtype, int source, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        static_cast<void>(mMpiComm->recv(buffer, size, dtype, source, tag));
+    }
+
     CacheTransceiverComm split(int color, int key)
     {
         if (isMpi())
@@ -238,7 +260,7 @@ class CacheTransceiver : public BaseCacheTransceiver
 public:
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
         executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
@@ -246,7 +268,7 @@ public:
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
-        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
@@ -306,6 +328,7 @@ private:
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
+    std::unique_ptr<ContextTransferCoordinator> mContextTransferCoordinator;
 
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
