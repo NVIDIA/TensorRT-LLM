@@ -29,6 +29,8 @@ from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import (
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
+_MAX_ASYNC_ULYSSES_SIZE = 4
+
 # =============================================================================
 # Joint Attention (shared by FLUX.1 and FLUX.2 dual-stream blocks)
 # =============================================================================
@@ -74,7 +76,7 @@ class FluxJointAttention(Attention):
         use_async_ulysses = bool(
             enable_async_ulysses
             and added_kv_proj_dim is None
-            and ulysses_size > 1
+            and 1 < ulysses_size <= _MAX_ASYNC_ULYSSES_SIZE
             and config.parallel.async_ulysses
         )
         qkv_mode = QKVMode.SEPARATE_QKV if use_async_ulysses else QKVMode.FUSE_QKV
