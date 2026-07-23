@@ -75,6 +75,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         primary_pretrained_config = pipeline_config.primary_pretrained_config
         self.audio_gen = False
         self.action_gen = False
+        # Pre-load placeholder; load_standard_components derives the real
+        # policy from the checkpoint's scheduler via from_scheduler().
         self.sampling = Cosmos3SamplingPolicy()
         if getattr(
             primary_pretrained_config,
@@ -631,6 +633,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_t2i = output_type == "image"
 
         self.sampling.validate_request(num_inference_steps, guidance_scale)
+
+        if image is not None and self.sampling.is_distilled:
+            raise ValueError(
+                "Image-conditioned generation is not supported on distilled Cosmos3 "
+                "checkpoints yet: the stochastic scheduler re-noises the conditioned "
+                "frame at every step, and this pipeline does not re-anchor it per step."
+            )
 
         guidance_interval = None
         if is_t2i:
