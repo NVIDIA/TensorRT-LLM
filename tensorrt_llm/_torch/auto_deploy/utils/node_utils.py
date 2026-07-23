@@ -919,30 +919,30 @@ def _precompute_weight_node_mapping(gm: GraphModule) -> None:
 
         # Forward-traverse through unary ops, tagging every node along the
         # way (intermediates like exp, neg, to.dtype AND the terminal consumer).
-        # Stops at multi-input nodes (the actual consumer) or dead ends.
-        current = node
-        while True:
+        # Stops each branch at multi-input nodes (the actual consumers) or dead
+        # ends. A shared parameter can have multiple consumers (for example tied
+        # embedding/lm_head weights), so follow every branch instead of picking
+        # an arbitrary first user.
+        stack = [node]
+        visited = set()
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
             if category not in current.meta:
                 current.meta[category] = []
-            current.meta[category].append(node)
+            if node not in current.meta[category]:
+                current.meta[category].append(node)
             if len(current.all_input_nodes) > 1:
-                break
+                continue
             if len(current.users) == 0:
                 ad_logger.debug(
                     f"Weight node {node.name} has no downstream consumer "
                     f"(chain ended at {current.name})"
                 )
-                break
-            current = next(iter(current.users))
-
-        # If the chain could not advance past the get_attr node itself
-        # (e.g. get_attr has 0 users, or get_attr directly feeds a
-        # multi-input consumer), tag each direct user as a fallback.
-        if current == node:
-            for user in node.users:
-                if category not in user.meta:
-                    user.meta[category] = []
-                user.meta[category].append(node)
+                continue
+            stack.extend(current.users)
 
 
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
@@ -1066,6 +1066,10 @@ def get_all_layer_subgraphs(
 
     # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
     _precompute_weight_node_mapping(gm)
+
+    if len(linear_nodes) == 0:
+        ad_logger.warning("Could not find any linear nodes in the graph.")
+        return [], set()
 
     # Cache weight shapes for all linear nodes
     for lin_node in linear_nodes:
@@ -1572,12 +1576,18 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     found, s = WeightBiasInfoCache.get_weight_shape(node)
     if not found:
         # Not in cache or caching not enabled - compute the shape
-        s = list(shape(extract_weight_nodes(node).weights[0].node))
-        if len(s) == 0:
+        weight_nodes = extract_weight_nodes(node).weights
+        if len(weight_nodes) == 0:
+            ad_logger.debug(f"Could not find a weight node for linear node {node.name}")
             s = None
-        elif is_fp4_op(node):
-            # FP4 weights are packed as uint8 type with 2 FP4 values per element
-            s[-1] *= 2
+        else:
+            weight_shape = shape(weight_nodes[0].node)
+            s = list(weight_shape) if weight_shape is not None else None
+            if s is not None and len(s) == 0:
+                s = None
+            elif s is not None and is_fp4_op(node):
+                # FP4 weights are packed as uint8 type with 2 FP4 values per element
+                s[-1] *= 2
         # Store in cache if caching is enabled
         WeightBiasInfoCache.set_weight_shape(node, s)
 
@@ -1585,8 +1595,10 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
         return None
     if dim is None:
         return s
-    else:
+
+    if -len(s) <= dim < len(s):
         return s[dim]
+    return None
 
 
 def get_layer_after_linear_node(
@@ -1636,6 +1648,12 @@ def get_layer_after_linear_node(
         LayerSubgraph containing opening nodes, subgraph nodes, and terminating node.
     """
 
+    def _linear_shape_dim(node: Node, dim: int) -> Optional[int]:
+        lin_node_shape = node.meta.get("lin_node_shape")
+        if lin_node_shape is None or not (-len(lin_node_shape) <= dim < len(lin_node_shape)):
+            return None
+        return lin_node_shape[dim]
+
     def boundary_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
             if is_any_lin_op(node):
@@ -1648,7 +1666,7 @@ def get_layer_after_linear_node(
                     attr_next="users",
                     include_root=False,
                 )
-                return node.meta["lin_node_shape"][dim] == embd and feeds_mla is None
+                return _linear_shape_dim(node, dim) == embd and feeds_mla is None
             return (
                 is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
@@ -1666,14 +1684,14 @@ def get_layer_after_linear_node(
         if match_on_shapes:
             if is_any_lin_op(node):
                 if dim == -1:
-                    in_dim = node.meta["lin_node_shape"][dim]
+                    in_dim = _linear_shape_dim(node, dim)
                     if in_dim == embd:
                         return True
                     if in_eagle_drafter and in_dim == 2 * embd:
                         # Eagle drafts feed attention with 2h-wide q/k/v inputs.
                         return any(is_any_attention_op(u) for u in node.users)
                     return False
-                return node.meta["lin_node_shape"][dim] == embd
+                return _linear_shape_dim(node, dim) == embd
             return False
         else:
             return is_any_lin_op(node)
