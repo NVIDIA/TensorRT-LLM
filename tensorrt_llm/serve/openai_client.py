@@ -33,6 +33,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UCompletionResponse,
 )
 from tensorrt_llm.serve.perf_metrics import (
+    _PERF_METRICS_HEADER_BUDGET_BYTES,
     RETURN_METRICS_HEADER,
     SSE_METRICS_EVENT,
     ClientMetricsCollector,
@@ -154,6 +155,7 @@ class OpenAIHttpClient(OpenAIClient):
                 keepalive_timeout=1,
             ),
             timeout=aiohttp.ClientTimeout(total=timeout_secs),
+            max_field_size=_PERF_METRICS_HEADER_BUDGET_BYTES,
         )
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
