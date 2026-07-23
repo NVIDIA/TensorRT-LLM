@@ -13,7 +13,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager,
+    KVCacheManager, PeftCacheManager, ResourceManager, ResourceManagerType,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -1012,6 +1012,102 @@ class TestResolveWindowSize(unittest.TestCase):
         with self.assertRaises(ValueError):
             mgr._resolve_window_size(None)
         self.assertEqual(mgr._resolve_window_size(8192), 8192)
+
+
+class TestRequestBudget(unittest.TestCase):
+    """Unit tests for the beam-aware KV block budget estimation and the
+    request admission budget check."""
+
+    TOKENS_PER_BLOCK = 8
+
+    @classmethod
+    def _make_kv_cache_manager(cls):
+        # Build a bare KVCacheManager without touching the GPU (mirrors
+        # TestResolveWindowSize) so we can exercise the pure block math.
+        mgr = KVCacheManager.__new__(KVCacheManager)
+        mgr.tokens_per_block = cls.TOKENS_PER_BLOCK
+        return mgr
+
+    @staticmethod
+    def _make_request(prompt_len, max_new_tokens, beam_width):
+        from types import SimpleNamespace
+        return SimpleNamespace(orig_prompt_len=prompt_len,
+                               max_new_tokens=max_new_tokens,
+                               py_beam_width=beam_width)
+
+    def test_num_blocks_beam_one_matches_needed_resource(self):
+        """For beam_width=1 the beam-aware estimate must equal the historical
+        beam-unaware get_needed_resource_to_completion value."""
+        mgr = self._make_kv_cache_manager()
+        for prompt_len, max_new_tokens in [(20, 5), (16, 0), (1, 100), (8, 8)]:
+            req = self._make_request(prompt_len, max_new_tokens, beam_width=1)
+            self.assertEqual(mgr.get_num_blocks(req),
+                             mgr.get_needed_resource_to_completion(req))
+
+    def test_num_blocks_shares_prompt_across_beams(self):
+        """Only the partial-last-prompt block and generated tokens scale with
+        beam width; full prompt blocks are shared."""
+        mgr = self._make_kv_cache_manager()
+        # prompt_len=20, tpb=8 -> 2 full shared blocks, 4 leftover prompt tokens.
+        # max_new_tokens=5 -> per-beam tokens = 4 + 5 = 9 -> ceil(9/8) = 2 blocks.
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        # shared(2) + per_beam(2) * beam(4) = 10
+        self.assertEqual(mgr.get_num_blocks(req), 10)
+
+        # Beam width only multiplies the per-beam portion, not the shared prompt.
+        req1 = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=1)
+        self.assertEqual(mgr.get_num_blocks(req1), 4)
+
+    def test_num_blocks_block_aligned_prompt(self):
+        """A block-aligned prompt contributes no per-beam partial block."""
+        mgr = self._make_kv_cache_manager()
+        # prompt_len=16 (2 full blocks, 0 leftover), max_new_tokens=1.
+        # per-beam tokens = 0 + 1 = 1 -> ceil(1/8) = 1 block per beam.
+        req = self._make_request(prompt_len=16, max_new_tokens=1, beam_width=3)
+        # shared(2) + per_beam(1) * beam(3) = 5
+        self.assertEqual(mgr.get_num_blocks(req), 5)
+
+    def test_container_delegates_to_kv_cache_manager(self):
+        mgr = self._make_kv_cache_manager()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: mgr})
+        # Stub out capacity so we don't need a live C++ pool.
+        mgr.impl = MagicMock()
+        mgr.impl.max_num_blocks = 42
+
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        self.assertEqual(resource_manager.get_num_blocks(req),
+                         mgr.get_num_blocks(req))
+        self.assertEqual(resource_manager.get_num_blocks_available(), 42)
+
+    def test_container_no_kv_cache_manager_is_noop(self):
+        """Without a KV cache manager the budget accessors return 0 so the
+        check is a no-op."""
+        resource_manager = ResourceManager({})
+        req = self._make_request(prompt_len=20, max_new_tokens=5, beam_width=4)
+        self.assertEqual(resource_manager.get_num_blocks(req), 0)
+        self.assertEqual(resource_manager.get_num_blocks_available(), 0)
+
+    def test_validate_request_budget_rejects_oversized_request(self):
+        """_validate_request_budget raises for a request that can never fit and
+        passes for one that fits."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        resource_manager = MagicMock()
+        resource_manager.get_num_blocks_available.return_value = 8
+        fake_self = MagicMock()
+        fake_self.resource_manager = resource_manager
+
+        req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
+
+        # Needs more blocks than the pool can ever hold -> rejected.
+        resource_manager.get_num_blocks.return_value = 9
+        with self.assertRaises(ValueError):
+            PyExecutor._validate_request_budget(fake_self, req)
+
+        # Fits within total capacity -> accepted (no raise).
+        resource_manager.get_num_blocks.return_value = 8
+        PyExecutor._validate_request_budget(fake_self, req)
 
 
 if __name__ == "__main__":

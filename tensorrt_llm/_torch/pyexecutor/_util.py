@@ -706,10 +706,8 @@ class KvCacheCreator:
                     set(self._kv_cache_config.max_attention_window))
         num_cache_blocks *= num_pool_groups
 
-        # Multiply by beam width, to prevent rescaling of the max_seq_len caused by the influence of beam width during the preparation for kv_cache_estimation
         max_num_tokens_for_estimation = (
-            num_cache_blocks * self._tokens_per_block *
-            self._dummy_reqs[0].sampling_config.beam_width)
+            num_cache_blocks * self._tokens_per_block)
         # V2 capacity is controlled by max_gpu_total_bytes; max_tokens only
         # describes the dummy workload needed for estimation.
         if self._is_kv_cache_manager_v2:

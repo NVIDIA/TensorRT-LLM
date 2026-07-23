@@ -4733,6 +4733,21 @@ class PyExecutor:
                     self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
+    def _validate_request_budget(self, request: LlmRequest):
+        # Worst-case KV blocks required to run the request to completion
+        # (beam-aware) vs. the total KV cache block capacity. Reject requests
+        # that can never fit so they fail cleanly instead of stalling the
+        # scheduler forever.
+        num_blocks = self.resource_manager.get_num_blocks(request)
+        num_blocks_available = self.resource_manager.get_num_blocks_available()
+        if num_blocks > num_blocks_available:
+            raise ValueError(
+                f"Request requires {num_blocks} KV cache blocks to complete, "
+                f"which exceeds the total capacity of {num_blocks_available} "
+                f"blocks (prompt_len={request.orig_prompt_len}, "
+                f"max_new_tokens={request.max_new_tokens}, "
+                f"beam_width={request.py_beam_width}).")
+
     def _validate_request(self, request: LlmRequest):
         # Validate beam width
         sampling_config = request.sampling_config
@@ -4748,6 +4763,9 @@ class PyExecutor:
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
+
+        # Check if request has enough budget
+        self._validate_request_budget(request)
 
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_active_requests: int) -> None:

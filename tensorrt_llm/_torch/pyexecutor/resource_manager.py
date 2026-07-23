@@ -697,6 +697,24 @@ class KVCacheManager(BaseResourceManager):
         # LlmRequest.get_num_tokens is out of sync with GenerationRequest when overlap scheduler is enabled.
         return self.impl.get_token_count(request.py_request_id)
 
+    def _num_blocks_for(self, prompt_len: int, max_new_tokens: int,
+                        beam_width: int) -> int:
+        # Beam-aware block estimate mirroring the C++ shared/unshared cost model
+        # (getNeededBlocksOneStep in kvCacheManager.cpp): the full prompt blocks
+        # are shared across all beams, while the partial-last-prompt block and
+        # the generated tokens are private to each beam.
+        shared_context_blocks = prompt_len // self.tokens_per_block
+        per_beam_tokens = prompt_len % self.tokens_per_block + max_new_tokens
+        per_beam_blocks = self.get_num_kv_blocks(per_beam_tokens) * beam_width
+        return shared_context_blocks + per_beam_blocks
+
+    def get_num_blocks(self, request: LlmRequest) -> int:
+        # Worst-case blocks required to run this request to completion, taking
+        # beam width into account. Used for admission budget validation.
+        return self._num_blocks_for(request.orig_prompt_len,
+                                    request.max_new_tokens,
+                                    request.py_beam_width)
+
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: the C++ implementation of this method can be used, but the
         # Python and C++ schedulers currently do not agree on what "needed
@@ -705,12 +723,12 @@ class KVCacheManager(BaseResourceManager):
         # the Python scheduler needs to be fixed.
         #
         # return self.impl.get_remaining_blocks_to_completion(request)
-        context_token_count = request.orig_prompt_len
-        num_context_blocks = context_token_count // self.tokens_per_block
-        remaining_tokens = context_token_count + request.max_new_tokens - num_context_blocks * self.tokens_per_block
-        need_blocks = num_context_blocks + math.ceil(
-            remaining_tokens / self.tokens_per_block)
-        return need_blocks
+        #
+        # This intentionally uses beam_width=1 to preserve the historical
+        # beam-unaware value the Python scheduler expects.
+        return self._num_blocks_for(request.orig_prompt_len,
+                                    request.max_new_tokens,
+                                    beam_width=1)
 
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
@@ -1244,8 +1262,7 @@ class KVCacheManager(BaseResourceManager):
                                          tokens_per_block, max_beam_width,
                                          max_seq_len: Optional[int]):
         token_capacity = blocks_in_primary_pool * tokens_per_block
-        max_blocks_per_seq = math.floor(token_capacity /
-                                        (max_beam_width * tokens_per_block))
+        max_blocks_per_seq = math.floor(token_capacity / tokens_per_block)
         assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
 
         max_atten_window_upper_bound = max_blocks_per_seq * tokens_per_block
@@ -2481,6 +2498,26 @@ class ResourceManager:
     def get_resource_manager(
             self, type: ResourceManagerType) -> Optional[BaseResourceManager]:
         return self.resource_managers.get(type)
+
+    def get_num_blocks(self, request: LlmRequest) -> int:
+        # Worst-case KV blocks required to run the request to completion.
+        # Returns 0 when there is no KV cache manager (e.g. non-KV models),
+        # which makes the budget check a no-op for those models.
+        kv_cache_manager = self.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is None:
+            return 0
+        return kv_cache_manager.get_num_blocks(request)
+
+    def get_num_blocks_available(self) -> int:
+        # Total KV block capacity of the pool (feasibility ceiling), not the
+        # transient free-block count: admission should only reject requests
+        # that can never fit, not ones that will fit once others drain.
+        kv_cache_manager = self.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is None:
+            return 0
+        return kv_cache_manager.get_max_resource_count()
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
