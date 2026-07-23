@@ -54,66 +54,6 @@ def es_post(url, documents):
     return indexed, errors
 
 
-def get_last_scan_results(report_type: str, branch: str):
-    data = ES_CLIENT.search(
-        index=ES_INDEX_BASE + "-*",
-        body={
-            "size": 0,  # only the latest
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"s_type": report_type}},
-                        {"term": {"s_branch": branch}},
-                    ]
-                }
-            },
-            "aggs": {"latest_ts": {"max": {"field": "ts_created"}}},
-        },
-    )
-    if "aggregations" not in data or not data["aggregations"]["latest_ts"]["value"]:
-        return {}
-    latest_ts = data["aggregations"]["latest_ts"]["value"]
-    scroll_size = 1000
-    docs = []
-
-    resp = ES_CLIENT.search(
-        index=ES_INDEX_BASE + "-*",
-        body={
-            "query": {
-                "bool": {
-                    "filter": [
-                        {"term": {"s_type": report_type}},
-                        {"term": {"s_branch": branch}},
-                        {"term": {"ts_created": int(latest_ts)}},
-                    ]
-                }
-            },
-        },
-        size=scroll_size,
-        scroll="2m",
-    )
-
-    scroll_id = resp["_scroll_id"]
-    hits = resp["hits"]["hits"]
-    docs.extend(hits)
-
-    while len(hits) > 0:
-        resp = ES_CLIENT.scroll(scroll_id=scroll_id, scroll="2m")
-        scroll_id = resp["_scroll_id"]
-        hits = resp["hits"]["hits"]
-        docs.extend(hits)
-
-    detected_dependencies = {}
-    for doc in docs:
-        package_name = doc["_source"]["s_package_name"]
-        package_version = doc["_source"]["s_package_version"]
-        if (package_name, package_version) not in detected_dependencies:
-            detected_dependencies[(package_name, package_version)] = 1
-        else:
-            detected_dependencies[(package_name, package_version)] += 1
-    return detected_dependencies
-
-
 def get_latest_license_preapproved_container_deps(scan_type: str):
     data = ES_CLIENT.search(
         index=ES_INDEX_PREAPPROVED_BASE + "-*",
@@ -137,11 +77,73 @@ def get_latest_license_preapproved_container_deps(scan_type: str):
     return data_source["nested_preapproved_deps"]
 
 
+def get_triaged_deps(scan_type: str, branch: str) -> dict:
+    """Return {package_name: ticket_url} for all packages that have a triage_record."""
+    try:
+        resp = ES_CLIENT.search(
+            index=ES_INDEX_BASE + "-*",
+            body={
+                "size": 10000,
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"s_type": "triage_record"}},
+                            {"term": {"s_scan_type": scan_type}},
+                            {"term": {"s_branch": branch}},
+                        ]
+                    }
+                },
+                "_source": ["s_package_name", "s_ticket_url"],
+            },
+        )
+    except Exception as exc:
+        print(f"Failed to query triaged deps for {scan_type}: {exc}", file=sys.stderr)
+        return {}
+    result = {}
+    for hit in resp["hits"]["hits"]:
+        src = hit["_source"]
+        pkg = src.get("s_package_name")
+        ticket = src.get("s_ticket_url")
+        if pkg and ticket:
+            result[pkg] = ticket
+    return result
+
+
+def save_triage_records(
+    post_url: str,
+    scan_type: str,
+    branch: str,
+    ts_created: int,
+    records: list,
+) -> None:
+    """Persist (package_name, ticket_url) triage records so future runs can skip re-triage.
+
+    Each record dict must have 'package_name' and 'ticket_url' keys.
+    """
+    docs = [
+        {
+            "s_type": "triage_record",
+            "s_scan_type": scan_type,
+            "s_branch": branch,
+            "ts_created": ts_created,
+            "s_package_name": rec["package_name"],
+            "s_ticket_url": rec["ticket_url"],
+        }
+        for rec in records
+        if rec.get("package_name") and rec.get("ticket_url")
+    ]
+    if not docs:
+        return
+    _, errors = es_post(post_url, docs)
+    if errors:
+        print(f"Failed to save some triage records for {scan_type}", file=sys.stderr)
+
+
 def get_dashboard_url(build_number, branch):
     starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     base = (
         "https://gpuwa.nvidia.com/kibana/s/tensorrt/app/dashboards"
-        "#/view/f90d586c-553a-468e-b064-48e846e983a2"
+        "#/view/4969f302-2d26-4a4f-bc80-3b69c4626945"
     )
     start_iso = starttime.replace(tzinfo=None).isoformat()
     g = f"(filters:!(),refreshInterval:(pause:!t,value:60000),time:(from:'{start_iso}Z',to:now))"
