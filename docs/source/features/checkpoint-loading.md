@@ -95,26 +95,13 @@ semantic model layer at a time. This bounds the live raw checkpoint tensors to
 top-level weights or one model layer instead of materializing the complete
 checkpoint in host memory before model-specific transformations finish.
 
-Enable the prototype option in the LLM configuration:
-
-```yaml
-enable_hf_layerwise_loading: true
-```
-
-For example, save the option as `config.yaml` and start the server with:
-
-```bash
-trtllm-serve --model <model_path> --config config.yaml
-```
-
 The loader groups tensors by semantic layer independently of safetensors shard
 boundaries, so inputs needed by same-layer projection and expert fusions remain
-available together. The default eager loading path is unchanged when the option
-is `false`.
+available together. DeepSeek V4 opts into layer-wise loading by default. Other
+models continue to use eager checkpoint loading.
 
 Current limitations:
 
-- Only DeepSeek V4 implements the required model-specific layer scoping.
 - Only safetensors checkpoints are supported; `.bin` and `.pth` checkpoints
   continue to use eager loading.
 - DSpark draft weights embedded as `mtp.*` tensors in the target checkpoint are
@@ -122,6 +109,26 @@ Current limitations:
   layer-wise mode.
 - Closing each bucket releases its mmap-backed tensor storage, but filesystem
   data may remain in the reclaimable Linux page cache.
+
+#### Adding Layer-wise Loading to Another Model
+
+Layer-wise loading is an internal model capability rather than a user-facing
+configuration option. To opt in another model:
+
+1. Set `supports_hf_layerwise_loading = True` on its `ForCausalLM` class.
+2. Add `initial_bucket_loading: bool = False` to `load_weights`.
+3. When `initial_bucket_loading` is true, validate that the input contains
+   exactly one semantic decoder layer or only top-level weights. Restrict model
+   traversal, synthesized defaults, fusions, and transforms to that scope.
+4. Keep finalization that requires the complete model in the normal model-level
+   post-load phase, after every bucket has been consumed.
+5. Add tests for top-level and single-layer success, mixed/multiple-layer
+   rejection, and any model-specific namespaces such as embedded draft layers.
+
+The shared safetensors loader currently recognizes `layers.N`,
+`model.layers.N`, and `mtp.N` checkpoint namespaces. Extend
+`HfWeightLoader._layer_bucket_name` and its tests if the new model uses a
+different layer namespace.
 
 ### ModelExpress (MX) Loading Path
 

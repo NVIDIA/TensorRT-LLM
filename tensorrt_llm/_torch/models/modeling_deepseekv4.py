@@ -2580,6 +2580,8 @@ class DeepseekV4Model(DecoderModel):
 
 @register_auto_model("DeepseekV4ForCausalLM")
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
+    supports_hf_layerwise_loading = True
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return {
@@ -2587,7 +2589,7 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
                 "tokens_per_block": 128,
                 "use_kv_cache_manager_v2": True,
                 "enable_swa_scratch_reuse": True,
-            }
+            },
         }
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):

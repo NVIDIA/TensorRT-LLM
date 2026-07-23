@@ -4806,15 +4806,6 @@ class TorchCompileConfig(StrictBaseModel):
 
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
-    enable_hf_layerwise_loading: bool = Field(
-        default=False,
-        description=
-        "Load supported Hugging Face safetensors checkpoints one semantic "
-        "model layer at a time to reduce peak host memory during model "
-        "startup. Currently supported only for DeepSeek V4 and incompatible "
-        "with a separate speculative draft checkpoint.",
-        status="prototype")
-
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=

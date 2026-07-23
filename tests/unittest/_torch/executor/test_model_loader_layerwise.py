@@ -18,6 +18,8 @@ from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 
 class _LayerwiseModel(nn.Module):
+    supports_hf_layerwise_loading = True
+
     def __init__(
         self, events: list[tuple[object, ...]], *, fail_on_bucket: str | None = None
     ) -> None:
@@ -53,6 +55,10 @@ class _UnsupportedModel(_LayerwiseModel):
         self._events.append(("load", next(iter(weights)), weight_mapper))
 
 
+class _NonLayerwiseModel(_LayerwiseModel):
+    supports_hf_layerwise_loading = False
+
+
 class _MapperlessLayerwiseModel(_LayerwiseModel):
     def load_weights(
         self, weights: dict[str, object], *, initial_bucket_loading: bool = False
@@ -73,9 +79,7 @@ class _EmbeddedDraftLayerwiseModel(_LayerwiseModel):
         *,
         initial_bucket_loading: bool = False,
     ) -> None:
-        self._events.append(
-            ("load_draft", next(iter(weights)), initial_bucket_loading)
-        )
+        self._events.append(("load_draft", next(iter(weights)), initial_bucket_loading))
 
 
 @contextmanager
@@ -88,12 +92,10 @@ def _make_loader(
     model: nn.Module,
     *,
     spec_config: object | None = None,
-    layerwise_loading: bool = True,
 ) -> ModelLoader:
     loader = ModelLoader(
         llm_args=SimpleNamespace(
             load_format=LoadFormat.AUTO,
-            enable_hf_layerwise_loading=layerwise_loading,
         ),
         mapping=MagicMock(name="mapping"),
         spec_config=spec_config,
@@ -181,12 +183,12 @@ def test_layerwise_model_loader_orders_mapper_buckets_sync_and_post_load(
     checkpoint_loader.load_weights.assert_not_called()
 
 
-def test_layerwise_model_loader_is_disabled_by_default_config(
+def test_model_without_layerwise_opt_in_uses_eager_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[tuple[object, ...]] = []
-    model = _LayerwiseModel(events)
-    loader = _make_loader(monkeypatch, model, layerwise_loading=False)
+    model = _NonLayerwiseModel(events)
+    loader = _make_loader(monkeypatch, model)
     checkpoint_loader, mapper = _make_checkpoint_loader(events, [{"layers.0.weight": object()}])
     checkpoint_loader.load_weights.return_value = {"eager.weight": object()}
     checkpoint_loader.is_weights_preloaded.return_value = False
@@ -207,7 +209,7 @@ def test_layerwise_model_loader_rejects_unsupported_model_before_iteration(
     loader = _make_loader(monkeypatch, _UnsupportedModel(events))
     checkpoint_loader, _mapper = _make_checkpoint_loader(events, [{"top.weight": object()}])
 
-    with pytest.raises(RuntimeError, match="does not support initial_bucket_loading"):
+    with pytest.raises(RuntimeError, match="opts into HF layer-wise loading"):
         loader.load("/checkpoint", checkpoint_loader)
 
     checkpoint_loader.get_initialized_weight_mapper.assert_not_called()

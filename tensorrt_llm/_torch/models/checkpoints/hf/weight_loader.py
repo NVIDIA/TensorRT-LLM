@@ -98,6 +98,11 @@ class HfWeightLoader(BaseWeightLoader):
         Raises:
             RuntimeError: If the selected safetensors files are missing or
                 their index/key metadata is incomplete or ambiguous.
+
+        Notes:
+            Bucket planning is shared, but safe partial consumption remains a
+            model opt-in contract. See
+            ``docs/source/features/checkpoint-loading.md#adding-layer-wise-loading-to-another-model``.
         """
         del mapping, kwargs
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")

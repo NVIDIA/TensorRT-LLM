@@ -163,8 +163,9 @@ def test_deepseek_v4_model_defaults():
             "tokens_per_block": 128,
             "use_kv_cache_manager_v2": True,
             "enable_swa_scratch_reuse": True,
-        }
+        },
     }
+    assert DeepseekV4ForCausalLM.supports_hf_layerwise_loading is True
 
 
 def test_deepseek_v4_weight_remap_for_mxfp4_routed_experts() -> None:

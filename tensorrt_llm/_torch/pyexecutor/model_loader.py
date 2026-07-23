@@ -601,10 +601,12 @@ class ModelLoader:
 
                 model_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
-                layerwise_loading = (checkpoint_loader.checkpoint_format == "HF"
-                                     and getattr(self.llm_args,
-                                                 'enable_hf_layerwise_loading',
-                                                 False))
+                # Layer-wise loading is model opt-in because consuming a
+                # partial bucket safely requires model-specific scoping. See
+                # docs/source/features/checkpoint-loading.md#adding-layer-wise-loading-to-another-model.
+                layerwise_loading = (
+                    checkpoint_loader.checkpoint_format == "HF" and getattr(
+                        model, "supports_hf_layerwise_loading", False))
                 if layerwise_loading:
                     supports_embedded_draft = getattr(
                         model, "supports_embedded_draft_weight_loading", None)
@@ -623,16 +625,17 @@ class ModelLoader:
                         model.load_weights).parameters
                     if "initial_bucket_loading" not in load_parameters:
                         raise RuntimeError(
-                            "enable_hf_layerwise_loading is enabled, but "
-                            f"{type(model).__name__}.load_weights does not support "
+                            f"{type(model).__name__} opts into HF layer-wise "
+                            "loading, but load_weights does not support "
                             "initial_bucket_loading.")
                     if embedded_draft_loading:
                         draft_load_parameters = inspect.signature(
                             model.load_draft_weights).parameters
                         if "initial_bucket_loading" not in draft_load_parameters:
                             raise RuntimeError(
-                                "enable_hf_layerwise_loading is enabled, but "
-                                f"{type(model).__name__}.load_draft_weights does not support "
+                                f"{type(model).__name__} opts into embedded "
+                                "draft layer-wise loading, but "
+                                "load_draft_weights does not support "
                                 "initial_bucket_loading.")
                     self.weight_mapper = (
                         checkpoint_loader.get_initialized_weight_mapper(
@@ -645,9 +648,11 @@ class ModelLoader:
                             model_checkpoint_dir, **load_weights_kwargs):
                         load_method = model.load_weights
                         weight_mapper = self.weight_mapper
-                        if (embedded_draft_loading
-                                and model.is_embedded_draft_weight_bucket(
-                                    weight_bucket)):
+                        is_draft_bucket = (
+                            embedded_draft_loading
+                            and model.is_embedded_draft_weight_bucket(
+                                weight_bucket))
+                        if is_draft_bucket:
                             load_method = model.load_draft_weights
                             weight_mapper = None
                             draft_weights_streamed = True
